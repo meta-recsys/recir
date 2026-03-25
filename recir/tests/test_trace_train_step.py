@@ -1,0 +1,508 @@
+# pyre-strict
+
+from copy import deepcopy
+from functools import wraps
+from typing import Any, Callable, List
+
+import torch
+import torch.distributed as dist
+import torch.fx as fx
+import torch.nn as nn
+from recir.api import compile, COMPILED_OBJECT_KEY, Override
+from torch.distributed.tensor._dtensor_spec import DTensorSpec
+from torch.distributed.tensor._op_schema import OpSchema, OutputSharding
+from torch.distributed.tensor._ops.utils import register_prop_rule
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.testing._internal.common_distributed import skip_if_lt_x_gpu
+from torch.testing._internal.common_utils import run_tests  # noqa: TCH001
+from torch.testing._internal.distributed._tensor.common_dtensor import (
+    DTensorTestBase,
+    with_comms as base_with_comms,
+)
+
+
+def with_comms(func: Callable[..., Any]) -> Callable[..., Any]:
+    @base_with_comms
+    @wraps(func)
+    def wrapper(self: Any, *args: Any, **kwargs: Any) -> Any:
+        # make sure we set different random seeds for each rank
+        # otherwise we dont need DDP / SPMD
+        # (we would have the same parameters and inputs everywhere)
+        torch.manual_seed(self.rank)
+        return func(self, *args, **kwargs)
+
+    return wrapper
+
+
+class DataDependentModule(nn.Module):
+    def __init__(self, world_size: int) -> None:
+        super().__init__()
+        self.world_size = world_size
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        raise RuntimeError(
+            "This eager implementation shouldn't be executed."
+            "This implementation is just an example of how to get around "
+            "data-dependant user-defined modules. "
+        )
+        shape = x.shape
+        x = x.view(-1)
+        positive = x[x >= 0]
+        negative = x[x < 0]
+
+        in_sizes = torch.tensor([positive.numel(), negative.numel()], dtype=torch.int32)
+        out_sizes = torch.empty_like(in_sizes)
+        dist.all_to_all_single(
+            out_sizes,
+            in_sizes,
+            output_split_sizes=[1, 1],
+            input_split_sizes=[1, 1],
+        )
+
+        xs = [positive, negative]
+        ys = [torch.Tensor(out_sizes[i].item()) for i in range(out_sizes.numel())]
+        dist.all_to_all(ys, xs)
+
+        # some dummy compute
+        for y in ys:
+            y.add_(1)
+
+        dist.all_to_all(xs, ys)
+
+        return torch.cat(xs).reshape(shape)
+
+
+class DummyModel(nn.Module):
+    def __init__(self, world_size: int) -> None:
+        super().__init__()
+        self.l1 = nn.Linear(10, 10)
+        self.ddm = DataDependentModule(world_size)
+        self.l2 = nn.Linear(10, 10)
+        self.relu = nn.ReLU()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        assert len(x.size()) == 2
+
+        return self.relu(self.l2(self.ddm(self.l1(x))))
+
+
+def ddm(x: torch.Tensor) -> torch.Tensor:
+    return x
+
+
+def ddm_backward(grad: torch.Tensor) -> torch.Tensor:
+    return grad
+
+
+dummy_lib: torch.library.Library = torch.library.Library("dummy", "DEF")  # noqa: TOR901
+dummy_lib.define("ddm(Tensor x) -> Tensor")
+dummy_lib.impl("ddm", ddm, "CompositeExplicitAutograd")
+dummy_lib.define("ddm_backward(Tensor x) -> Tensor")
+dummy_lib.impl("ddm_backward", ddm_backward, "CompositeExplicitAutograd")
+
+
+def _identity_prop_rule(op_schema: OpSchema) -> OutputSharding:
+    (x,) = op_schema.args_schema
+    assert isinstance(x, DTensorSpec), f"expecting DTensorSpec but got {x}"
+
+    return OutputSharding(output_spec=DTensorSpec(x.mesh, x.placements))
+
+
+@register_prop_rule(torch.ops.dummy.ddm.default)  # pyre-ignore[56]
+def _prop_ddm(op_schema: OpSchema) -> OutputSharding:
+    return _identity_prop_rule(op_schema)
+
+
+@register_prop_rule(torch.ops.dummy.ddm_backward.default)  # pyre-ignore[56]
+def _prop_ddm_backward(op_schema: OpSchema) -> OutputSharding:
+    return _identity_prop_rule(op_schema)
+
+
+class DDMFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx: Any, x: torch.Tensor) -> torch.Tensor:  # pyre-ignore [14]
+        return torch.ops.dummy.ddm(x)
+
+    @staticmethod
+    def backward(ctx: Any, grad_x: torch.Tensor) -> torch.Tensor:  # pyre-ignore [14]
+        return torch.ops.dummy.ddm_backward(grad_x)
+
+
+class DummyDDM(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return DDMFunction.apply(x)
+
+
+class TraceTrainStepTest(DTensorTestBase):
+    @property
+    def world_size(self) -> int:
+        return 2
+
+    def _test_optimizer(
+        self,
+        mod: nn.Module,
+        ddp_mod: nn.Module,
+        opt: torch.optim.Optimizer,
+        ddp_opt: torch.optim.Optimizer,
+        inp: torch.Tensor,
+        train_step: Callable[..., Any],
+    ) -> None:
+        ddp_inp = deepcopy(inp)
+
+        # materialize optimizer states
+        mod(inp).sum().backward()
+        opt.step()
+        opt.zero_grad()
+        # NB: In *normal* use cases you don't need to do this, but some
+        # of the tests setup buffers which require_grad=True which is weird
+        # and so work around it
+        for buf in mod.buffers():
+            buf.grad = None
+
+        ddp_mod(ddp_inp).sum().backward()
+        ddp_opt.step()
+        ddp_opt.zero_grad()
+        for buf in ddp_mod.buffers():
+            buf.grad = None
+
+        # test parameter parity
+        train_step(mod, opt, inp)
+
+        ddp_mod(ddp_inp).sum().backward()
+        ddp_opt.step()
+
+        for p1, p2 in zip(mod.parameters(), ddp_mod.parameters()):
+            self.assertEqual(p1, p2)
+
+    @skip_if_lt_x_gpu(2)
+    @with_comms
+    def test_sgd(self) -> None:
+        @compile()
+        def train_step(
+            mod: nn.Module, opt: torch.optim.Optimizer, inp: torch.Tensor
+        ) -> None:
+            mod(inp).sum().backward()
+            opt.step()
+
+        # FIXME(@mrshenli): remove manual seed once dist.compile can synchronize
+        # module parameters.
+        torch.manual_seed(1)
+        mod = nn.Linear(10, 10, bias=True).cuda(self.rank)
+        opt = torch.optim.SGD(mod.parameters(), lr=0.01, foreach=True)
+        inp = torch.randn(2, 10).cuda(self.rank)
+
+        ddp_mod = DDP(deepcopy(mod), device_ids=[self.rank])
+        ddp_opt = torch.optim.SGD(ddp_mod.parameters(), lr=0.01, foreach=True)
+        self._test_optimizer(mod, ddp_mod, opt, ddp_opt, inp, train_step)
+
+    def _test_adam(self, *, foreach: bool, fused: bool) -> None:
+        class AssertOverride(Override):
+            def __init__(self, outer: Any) -> None:
+                self.outer = outer
+
+            def replacement(
+                self, fqn: str, orig_submodule: torch.nn.Module
+            ) -> torch.nn.Module:
+                return orig_submodule
+
+            def transform(
+                self,
+                gm: fx.GraphModule,
+                flat_state: List[torch.Tensor],
+            ) -> fx.Graph:
+                # check dedup is successful, where there should only be 1 allreduce
+                all_reduce_nodes = [
+                    n
+                    for n in gm.graph.nodes
+                    if n.target == torch.ops._c10d_functional.all_reduce.default
+                ]
+                self.outer.assertEqual(
+                    len(all_reduce_nodes),
+                    1,
+                )
+
+                return gm
+
+        @compile(module_override=[AssertOverride(self)])
+        def train_step(
+            mod: nn.Module, opt: torch.optim.Optimizer, inp: torch.Tensor
+        ) -> None:
+            mod(inp).sum().backward()
+            opt.step()
+
+        # FIXME(@mrshenli): remove manual seed once dist.compile can synchronize
+        # module parameters.
+        torch.manual_seed(0)
+        # FIXME(@mrshenli): gradients for bias is missing
+        mod = nn.Sequential(nn.Linear(10, 10, bias=False)).cuda(self.rank)
+        opt = torch.optim.Adam(
+            mod.parameters(),
+            lr=0.01,
+            foreach=foreach,
+            fused=fused,
+            capturable=True,
+        )
+        inp = torch.randn(2, 10).cuda(self.rank)
+
+        ddp_mod = DDP(deepcopy(mod), device_ids=[self.rank])
+        ddp_opt = torch.optim.Adam(
+            ddp_mod.parameters(), lr=0.01, foreach=foreach, fused=fused
+        )
+        self._test_optimizer(mod, ddp_mod, opt, ddp_opt, inp, train_step)
+
+    @skip_if_lt_x_gpu(2)
+    @with_comms
+    def test_adam_foreach(self) -> None:
+        self._test_adam(foreach=True, fused=False)
+
+    @skip_if_lt_x_gpu(2)
+    @with_comms
+    def test_adam_fused(self) -> None:
+        self._test_adam(foreach=False, fused=True)
+
+    def _test_train_step_override(self) -> None:
+        transform_targets: list[Any] = []
+
+        class DDMOverride(Override):
+            def replacement(
+                self, fqn: str, orig_submodule: torch.nn.Module
+            ) -> torch.nn.Module:
+                return (
+                    DummyDDM()
+                    if isinstance(orig_submodule, DataDependentModule)
+                    else orig_submodule
+                )
+
+            def transform(
+                self,
+                gm: fx.GraphModule,
+                flat_state: List[torch.Tensor],
+            ) -> fx.Graph:
+                nonlocal transform_targets
+                for node in gm.graph.nodes:
+                    if node.target in [
+                        torch.ops.dummy.ddm.default,
+                        torch.ops.dummy.ddm_backward.default,
+                    ]:
+                        transform_targets.append(node.target)
+                        # N.B.: this is not a complete subgraph representing
+                        # original logic, as we are testing the ability to
+                        # modify graph after DTensor expansion.
+                        with gm.graph.inserting_before(node):
+                            new_node = gm.graph.call_function(torch.add, args=node.args)
+                        node.replace_all_uses_with(new_node)
+
+                gm.graph.lint()
+                gm.graph.eliminate_dead_code()
+
+                return gm
+
+        @compile(module_override=[DDMOverride()])
+        def train_step(
+            mod: nn.Module, opt: torch.optim.Optimizer, inp: torch.Tensor
+        ) -> None:
+            mod(inp).sum().backward()
+            opt.step()
+
+        mod = DummyModel(self.world_size).cuda(self.rank)
+        opt = torch.optim.SGD(mod.parameters(), lr=0.01, foreach=False)
+        # FIXME: symbolic tracing treats bs=1 as constant, have to use bs > 1.
+        inp = torch.randn(4, 10).cuda(self.rank)
+        train_step(mod, opt, inp)
+
+        # checking transforms are indeed invoked.
+        self.assertEqual(
+            transform_targets,
+            [torch.ops.dummy.ddm.default, torch.ops.dummy.ddm_backward.default],
+        )
+
+    @skip_if_lt_x_gpu(2)
+    @with_comms
+    def test_module_override(self) -> None:
+        self._test_train_step_override()
+
+    @skip_if_lt_x_gpu(2)
+    @with_comms
+    def test_module_multi_fqn_override(self) -> None:
+        transform_targets: list[Any] = []
+
+        class DDMOverride(Override):
+            def replacement(
+                self, fqn: str, orig_submodule: torch.nn.Module
+            ) -> torch.nn.Module:
+                return (
+                    DummyDDM()
+                    if isinstance(orig_submodule, DataDependentModule)
+                    else orig_submodule
+                )
+
+            def transform(
+                self,
+                gm: fx.GraphModule,
+                flat_state: List[torch.Tensor],
+            ) -> fx.Graph:
+                nonlocal transform_targets
+                for node in gm.graph.nodes:
+                    if node.target in [
+                        torch.ops.dummy.ddm.default,
+                        torch.ops.dummy.ddm_backward.default,
+                    ]:
+                        transform_targets.append(node.target)
+                        # N.B.: this is not a complete subgraph representing
+                        # original logic, as we are testing the ability to
+                        # modify graph after DTensor expansion.
+                        with gm.graph.inserting_before(node):
+                            new_node = gm.graph.call_function(torch.add, args=node.args)
+                        node.replace_all_uses_with(new_node)
+
+                gm.graph.eliminate_dead_code()
+
+                return gm
+
+        class MultiDDM(nn.Module):
+            def __init__(self, world_size: int) -> None:
+                super().__init__()
+                self.l1 = nn.Linear(10, 10)
+                self.ddm1 = DataDependentModule(world_size)
+                self.l2 = nn.Linear(10, 10)
+                self.ddm2 = DataDependentModule(world_size)
+                self.relu = nn.ReLU()
+
+            def forward(self, x: torch.Tensor) -> torch.Tensor:
+                assert len(x.size()) == 2
+
+                return self.relu(self.ddm2(self.l2(self.ddm1(self.l1(x)))))
+
+        @compile(module_override=[DDMOverride()])
+        def train_step(
+            mod: nn.Module, opt: torch.optim.Optimizer, inp: torch.Tensor
+        ) -> None:
+            mod(inp).sum().backward()
+            opt.step()
+
+        mod = MultiDDM(self.world_size).cuda(self.rank)
+        opt = torch.optim.SGD(mod.parameters(), lr=0.01, foreach=False)
+        inp = torch.randn(4, 10).cuda(self.rank)
+        train_step(mod, opt, inp)
+
+        # checking transforms are indeed invoked.
+        self.assertEqual(
+            transform_targets,
+            [
+                torch.ops.dummy.ddm.default,
+                torch.ops.dummy.ddm.default,
+                torch.ops.dummy.ddm_backward.default,
+                torch.ops.dummy.ddm_backward.default,
+            ],
+        )
+
+    @skip_if_lt_x_gpu(2)
+    @with_comms
+    def test_gm_cache_and_transformation(self) -> None:
+        class GraphOptimization:
+            def __init__(self) -> None:
+                self.call_count = 0
+
+            def __call__(self, gm: fx.GraphModule) -> fx.GraphModule:
+                self.call_count += 1
+                return gm
+
+        graph_optimization = GraphOptimization()
+
+        @compile(gm_transformation=graph_optimization)
+        def train_step(
+            mod: nn.Module, opt: torch.optim.Optimizer, inp: torch.Tensor
+        ) -> None:
+            mod(inp).sum().backward()
+            opt.step()
+
+        rank = torch.distributed.get_rank()
+        torch.manual_seed(0)
+        mod = nn.Linear(10, 10, bias=False).cuda(rank)
+        opt = torch.optim.Adam(
+            mod.parameters(), lr=0.01, foreach=False, capturable=True
+        )
+        inp = torch.randn(2, 10).cuda(rank)
+
+        # materialize optimizer states
+        mod(inp).sum().backward()
+        opt.step()
+        opt.zero_grad()
+
+        train_step(mod, opt, inp)
+        self.assertEqual(graph_optimization.call_count, 1)
+        gm = train_step.__dict__[COMPILED_OBJECT_KEY].gm
+        train_step(mod, opt, inp)
+        self.assertEqual(id(gm), id(train_step.__dict__[COMPILED_OBJECT_KEY].gm))
+        self.assertEqual(graph_optimization.call_count, 1)
+
+    @skip_if_lt_x_gpu(2)
+    @with_comms
+    def test_buffer(self) -> None:
+        class BufferModule(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.fc = nn.Linear(10, 10)
+                self.register_buffer("dummy_buffer", torch.ones(10, 10))
+
+            def forward(self, x: torch.Tensor) -> torch.Tensor:
+                # N.B.: setting requires_grad in forward, as deepcopy does not
+                # work for requires_grad=True buffers.
+                self.dummy_buffer.requires_grad = True
+                return torch.matmul(self.fc(x), self.dummy_buffer)
+
+        class AssertOptimizer(torch.optim.Optimizer):
+            def __init__(self, params: Any, lr: float) -> None:
+                super().__init__(params, dict(lr=lr))
+
+            def step(self) -> None:  # pyre-ignore[14]
+                assert len(self.param_groups[0]["params"]) == 2
+                with torch.no_grad():
+                    for p in self.param_groups[0]["params"]:
+                        p += p.grad
+
+        @compile()
+        def train_step(
+            mod: nn.Module, opt: torch.optim.Optimizer, inp: torch.Tensor
+        ) -> None:
+            mod(inp).sum().backward()
+            opt.step()
+
+        torch.manual_seed(0)
+        mod = BufferModule().cuda(self.rank)
+        inp = torch.randn(2, 10).cuda(self.rank)
+        opt = AssertOptimizer(mod.parameters(), lr=0.01)
+
+        ddp_mod = DDP(deepcopy(mod), device_ids=[self.rank])
+        ddp_opt = AssertOptimizer(ddp_mod.parameters(), lr=0.01)
+
+        self._test_optimizer(mod, ddp_mod, opt, ddp_opt, inp, train_step)
+        self.assertEqual(mod.dummy_buffer, ddp_mod.module.dummy_buffer)
+
+    @skip_if_lt_x_gpu(2)
+    @with_comms
+    def test_expand_dimension(self) -> None:
+        @compile()
+        def train_step(
+            mod: nn.Module, opt: torch.optim.Optimizer, inp: torch.Tensor
+        ) -> None:
+            mod(inp).sum().backward()
+            opt.step()
+
+        mod = nn.Linear(10, 10, bias=True).cuda(self.rank)
+        opt = torch.optim.SGD(mod.parameters(), lr=0.01, foreach=True)
+        inp = torch.randn(2, 10).cuda(self.rank)
+        train_step(mod, opt, inp)
+        for node in train_step._compiled_obj.gm.graph.nodes:  # pyre-ignore[16]
+            if node.target == torch.ops.aten.expand.default:
+                # backward grad expansion op should match local batch size
+                # instead of global batch size.
+                self.assertEqual(node.args[1], [2, 10])
+
+
+if __name__ == "__main__":
+    if False:
+        run_tests()

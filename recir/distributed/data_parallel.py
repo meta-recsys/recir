@@ -1,0 +1,1215 @@
+# pyre-strict
+import math
+import operator
+from contextlib import contextmanager
+from enum import Enum
+from functools import cached_property
+from typing import Any, Callable, cast, Dict, List, Optional, Set, Tuple, Union
+
+import torch
+import torch.fx as fx
+import torch.library
+import torch.nn as nn
+import torch.utils._pytree as pytree
+from recir.distributed.batch_dim_utils import BatchDimAnalyzer
+from torch.distributed.tensor import DeviceMesh, Replicate, Shard
+from torch.distributed.tensor._dtensor_spec import DTensorSpec
+from torch.distributed.tensor._op_schema import (
+    OpSpec,
+    OpStrategy,
+    StrategyType,
+    TupleStrategy,
+)
+from torch.distributed.tensor._redistribute import redistribute_local_tensor
+from torch.distributed.tensor._utils import compute_local_shape_and_global_offset
+from torch.distributed.tensor.placement_types import Partial
+from torch.fx import GraphModule
+from torch.fx.experimental.proxy_tensor import make_fx
+from torch.fx.passes.shape_prop import _extract_tensor_metadata
+
+
+def compute_local_shape(global_shape: Any, mesh: DeviceMesh, placements: Any) -> Any:
+    """Helper function to compute local shape (wrapper around compute_local_shape_and_global_offset)."""
+    if global_shape in [[], torch.Size([])]:
+        return global_shape
+    local_shape, _ = compute_local_shape_and_global_offset(
+        global_shape, mesh, placements, skip_offset=True
+    )
+    return local_shape
+
+
+aten: torch._ops._OpNamespace = torch.ops.aten
+
+# Dummy op used by data parallel to tag gradients.
+_spmd_lib_def = torch.library.Library("_spmd", "DEF")
+_spmd_lib_def.define("tag_grad(Tensor self) -> Tensor")
+
+_spmd_lib_impl = torch.library.Library("_spmd", "IMPL")
+_spmd_lib_impl.impl("tag_grad", lambda x: x, "CompositeExplicitAutograd")
+
+# Op to free the underlying storage of a tensor (used by per-op FSDP to release
+# allgathered weights immediately after their last consumer).
+_recir_lib_def = torch.library.Library("recir", "DEF")
+_recir_lib_def.define("free_storage(Tensor(a!) t) -> ()")
+
+
+def _free_storage_impl(t: torch.Tensor) -> None:
+    if t.untyped_storage().size() > 0:
+        t.untyped_storage().resize_(0)
+
+
+_recir_lib_impl = torch.library.Library("recir", "IMPL")
+_recir_lib_impl.impl(
+    "free_storage",
+    _free_storage_impl,
+    "CompositeExplicitAutograd",
+)
+
+# Mark as side-effectful so dead-code elimination doesn't remove it.
+torch.fx.node._side_effectful_functions.add(torch.ops.recir.free_storage.default)
+
+non_compute_ops: List[Any] = [
+    aten._to_copy.default,
+    aten.clone.default,
+    aten.detach.default,
+    aten.ones_like.default,
+    aten.reshape.default,
+    aten.t.default,
+    aten.view.default,
+    torch.ops._spmd.tag_grad.default,
+    operator.getitem,
+]
+fused_adam_op: Any = aten._fused_adam.default
+no_ops: List[Any] = [
+    torch.ops.profiler._record_function_exit._RecordFunction,
+    torch.ops.profiler._record_function_enter_new.default,
+]
+
+
+class DataParallelStyle(Enum):
+    """This enum represents the style of the data-parallel operation.
+
+    We have three types of Data Parallel style:
+    1. DEFAULT: the default data parallel style, which is to represent a mixed
+                replicate and fully shard behavior. For each parameter that is able
+                to be sharded evenly, we shard it, otherwise we would replicate the
+                parameter. This style avoids potential padding if the parameters
+                cannot be sharded evenly, but it would generate a mixed of all_reduce
+                and reduce_scatter.
+    2. REPLICATE: the data parallel style that replicates all model parameters.
+                  This is similar to the behavior of DistributedDataParallel.
+    3. FULLY_SHARD: the data parallel style that shards all model parameters. This
+                    is similar to the behavior of FullyShardedDataParallel, the
+                    difference is that FullyShardedDataParallel (ZERO-3), which
+                    shards the model using FlatParameter based sharding,
+                    while this style shards each parameter into DTensor.
+    """
+
+    DEFAULT = 0
+    REPLICATE = 1
+    FULLY_SHARD = 2
+
+
+class NodeType(Enum):
+    """NodeType is an enum that records the type of the tensors in the graph.
+
+    This is used to determine the data parallel strategy.
+    """
+
+    PARAM = 0
+    ACT = 1
+    GRAD = 2
+    STATE = 3
+    NON_TENSOR = 4  # NON_TENSOR is to tag non tensor node (i.e. graph output)
+    EMBEDDING_PARAM = 5  # Embedding param with model-parallel sharding (e.g., row-wise)
+
+
+class DataParallelStrategy(OpStrategy):
+    """DataParallelStrategy is a special case of OpStrategy that only records the "data parallel style" placement
+    strategy for each fx Node.
+
+    It takes a OpSpec, which describes one way to distribute the tensor and computation.
+    In the DataParallel case, there're two possible ways to distribute the parameters:
+        1. replicate the parameter over a set of devices (DDP like behavior)
+        2. shard the parameter on its tensor dimension 0 over a set of devices
+           (FSDP like behavior).
+
+    In addition to the strategy, we also need to:
+    1. `node_type`: record the type of each node in the graph, so that we can
+        determine how to propagate in a data parallel fashion.
+    2. `reduce_over_batch` is specifically tied to data parallel as the loss
+        calculation usually results in scalar tensor where it comes from a
+        reduction over the batch dimension. We need to know this information
+        so that we could keep the output as sharded.
+    """
+
+    def __init__(
+        self,
+        node_types: List[NodeType],
+        op_spec: Optional[OpSpec],
+        reduce_over_batch: bool = False,
+    ) -> None:
+        strategies = [] if op_spec is None else [op_spec]
+        super().__init__(strategies)
+        self.node_types = node_types
+        self.reduce_over_batch = reduce_over_batch
+
+    def __str__(self) -> str:
+        return f"type: {self.node_types}, {super().__str__()}"
+
+    @classmethod
+    def from_mesh(
+        cls,
+        node_types: List[NodeType],
+        mesh: DeviceMesh,
+        parallel_mode: DataParallelStyle,
+        num_outputs: int = 1,
+    ) -> "DataParallelStrategy":
+        assert parallel_mode in [
+            DataParallelStyle.REPLICATE,
+            DataParallelStyle.FULLY_SHARD,
+        ]
+        if parallel_mode == DataParallelStyle.REPLICATE:
+            return cls(
+                node_types,
+                _gen_replicate_spec(mesh, num_outputs=num_outputs),
+            )
+        else:
+            return cls(
+                node_types, _gen_shard_spec(mesh, shard_dim=0, num_outputs=num_outputs)
+            )
+
+    @cached_property
+    def node_type(self) -> NodeType:
+        assert len(self.node_types) == 1
+        return self.node_types[0]
+
+    @cached_property
+    def op_spec(self) -> OpSpec:
+        assert len(self.strategies) == 1
+        return self.strategies[0]
+
+
+def unique_spec(
+    input_spec: Union[DTensorSpec, Tuple[Optional[DTensorSpec], ...]],
+) -> DTensorSpec:
+    if isinstance(input_spec, DTensorSpec):
+        return input_spec
+    elif len(input_spec) == 1:
+        spec = input_spec[0]
+        assert spec is not None
+        return spec
+    else:
+        spec = input_spec[0]
+        assert spec is not None
+        for s in input_spec[1:]:
+            assert s is not None
+            assert s.mesh == spec.mesh
+            assert s.placements == spec.placements
+        return spec
+
+
+@contextmanager
+def gradients_tagging(params: Dict[str, torch.Tensor]) -> Any:
+    """Tag the gradient of the parameters with a special tag, so that we can identify them during SPMD expansion.
+
+    It's safe to trace those hooks and we would remove those nodes later.
+    """
+    tagging_hooks = []
+    try:
+        for p in params.values():
+            h = p.register_hook(torch.ops._spmd.tag_grad)
+            tagging_hooks.append(h)
+        yield
+    finally:
+        # remove those hooks after tracing
+        for h in tagging_hooks:
+            h.remove()
+
+
+def _gen_shard_spec(
+    mesh: DeviceMesh,
+    shard_dim: int,
+    input_specs: Optional[List[DTensorSpec]] = None,
+    num_outputs: int = 1,
+) -> OpSpec:
+    """Util function to generate a shard strategy on shard_dim."""
+    out_specs = tuple(
+        [DTensorSpec(mesh=mesh, placements=(Shard(shard_dim),))] * num_outputs
+    )
+    return OpSpec(output_specs=out_specs, input_specs=input_specs)  # pyre-ignore[6]
+
+
+def _gen_replicate_spec(
+    mesh: DeviceMesh,
+    input_specs: Optional[List[DTensorSpec]] = None,
+    num_outputs: int = 1,
+) -> OpSpec:
+    """Util function to generate a replicate strategy."""
+    out_specs = tuple([DTensorSpec(mesh=mesh, placements=(Replicate(),))] * num_outputs)
+    return OpSpec(output_specs=out_specs, input_specs=input_specs)  # pyre-ignore[6]
+
+
+def _gen_partial_strategy(mesh: DeviceMesh, grad_reduction: str = "avg") -> OpSpec:
+    """Util function to generate a partial strategy."""
+    # NOTE: The reduction type should match the loss function:
+    #   - "avg" (default): correct for sum-based losses (each rank's sum
+    #     is averaged to match DDP semantics).
+    #   - "sum": correct for mean-based losses (each rank's mean-backward
+    #     already normalises by local numel; a plain sum gives the
+    #     equivalent of a global-mean gradient without double-dividing).
+    # TODO: Only NCCL supports AVG so using backend like Gloo would
+    # crash, we should figure out a way to support avg reduction
+    # for non-NCCL backend
+    return OpSpec(
+        output_specs=DTensorSpec(mesh=mesh, placements=(Partial(grad_reduction),)),
+    )
+
+
+def user_to_index_map(node: fx.Node) -> Dict[fx.Node, int]:
+    """
+    Maps each user of a multi-output node to the output index it consumes.
+    """
+    user_to_index: Dict[fx.Node, int] = {}
+    for user in node.users:
+        if user.op == "call_function" and user.target == operator.getitem:
+            index = user.args[1]
+            user_to_index[user] = index  # pyre-ignore [6]
+    return user_to_index
+
+
+# Non-compute ops for which we can track how the shard dimension transforms.
+# Maps op target -> function(input_shard_dim) -> output_shard_dim.
+_SHARD_DIM_TRANSFORM: Dict[Any, Callable[[int], int]] = {
+    aten.t.default: lambda dim: 1 - dim,
+    aten.clone.default: lambda dim: dim,
+    aten.detach.default: lambda dim: dim,
+    aten._to_copy.default: lambda dim: dim,
+}
+
+
+def _propagate_param_non_compute_strategy(
+    node: fx.Node,
+    arg_strategy: DataParallelStrategy,
+    mesh: DeviceMesh,
+    parallel_mode: DataParallelStyle,
+) -> DataParallelStrategy:
+    """Propagate strategy for non-compute ops with PARAM or EMBEDDING_PARAM input.
+
+    In FULLY_SHARD mode (or for EMBEDDING_PARAM which is always sharded),
+    propagates the shard placement through ops that have a known
+    shard-dimension transformation (t, clone, detach, _to_copy). This
+    delays the allgather communication to right before the first compute op
+    instead of materializing it at the non-compute op boundary.
+
+    Falls back to Replicate for REPLICATE mode or ops where shard dimension
+    tracking is not supported (view, reshape, ones_like).
+    """
+    node_type = arg_strategy.node_type
+    # EMBEDDING_PARAM is always sharded (regardless of parallel_mode),
+    # so treat it like FULLY_SHARD for shard-dim tracking.
+    is_sharded = (
+        parallel_mode == DataParallelStyle.FULLY_SHARD
+        or node_type == NodeType.EMBEDDING_PARAM
+    )
+    if is_sharded:
+        output_specs = arg_strategy.op_spec.output_specs
+        assert output_specs is not None
+        input_spec = unique_spec(output_specs)
+        input_placement = input_spec.placements[0]
+        if isinstance(input_placement, Shard) and node.target in _SHARD_DIM_TRANSFORM:
+            input_shard_dim = input_placement.dim
+            output_shard_dim = _SHARD_DIM_TRANSFORM[node.target](input_shard_dim)
+            output_spec = _gen_shard_spec(
+                mesh,
+                shard_dim=output_shard_dim,
+                input_specs=[
+                    DTensorSpec(mesh=mesh, placements=(Shard(input_shard_dim),))
+                ],
+            )
+            return DataParallelStrategy([node_type], output_spec)
+    return DataParallelStrategy([node_type], _gen_replicate_spec(mesh))
+
+
+def _propagate_call_function_strategy(
+    node: fx.Node,
+    dp_strategy_map: Dict[fx.Node, StrategyType],
+    mesh: DeviceMesh,
+    parallel_mode: DataParallelStyle,
+    batch_dim_analyzer: BatchDimAnalyzer,
+    grad_type_dict: Dict[fx.Node, Set[int]],
+    grad_reduction: str = "avg",
+) -> None:
+    """Propagate sharding strategies through call_function nodes.
+
+    Handles four categories of ops:
+      1. Non-compute ops (view/reshape/getitem): inherit input strategy.
+      2. Fused optimizer ops (fused_adam): build TupleStrategy.
+      3. GRAD/STATE ops (optimizer step): inherit param/state type.
+      4. General compute ops (forward/backward): build input/output specs,
+         marking gradient outputs as GRAD.
+    """
+    input_nodes = node.all_input_nodes
+
+    # --- Category 1: non-compute ops (view, reshape, getitem, etc.) ---
+    if node.target in non_compute_ops:
+        assert node.target != torch.ops._spmd.tag_grad.default and len(input_nodes) == 1
+        arg_strategy = dp_strategy_map[input_nodes[0]]
+        if node.target == operator.getitem:
+            getitem_idx = node.args[1]
+            if isinstance(arg_strategy, TupleStrategy):
+                # pyre-ignore[6]: getitem_idx is always int at runtime
+                dp_strategy_map[node] = arg_strategy.children[getitem_idx]
+            else:
+                assert isinstance(arg_strategy, DataParallelStrategy)
+                out_spec = arg_strategy.op_spec.output_specs[  # pyre-ignore[16]
+                    getitem_idx
+                ]
+                dp_strategy_map[node] = DataParallelStrategy(
+                    [arg_strategy.node_types[getitem_idx]],  # pyre-ignore[6]
+                    OpSpec(output_specs=out_spec),
+                )
+        else:
+            # Non-getitem, non-compute ops (e.g. t, clone, detach, reshape,
+            # view, _to_copy). The handling depends on what kind of data
+            # flows through:
+            #   PARAM / EMBEDDING_PARAM → track shard dim through the op
+            #   GRAD → propagate gradient sharding
+            #   ACT  → propagate activation sharding
+            assert isinstance(arg_strategy, DataParallelStrategy)
+            arg_node_type = arg_strategy.node_type
+            assert arg_node_type in [
+                NodeType.PARAM,
+                NodeType.EMBEDDING_PARAM,
+                NodeType.GRAD,
+                NodeType.ACT,
+            ]
+            if arg_node_type in (NodeType.PARAM, NodeType.EMBEDDING_PARAM):
+                dp_strategy_map[node] = _propagate_param_non_compute_strategy(
+                    node, arg_strategy, mesh, parallel_mode
+                )
+            elif arg_node_type == NodeType.GRAD:
+                dp_strategy_map[node] = DataParallelStrategy(
+                    [NodeType.GRAD], _gen_partial_strategy(mesh, grad_reduction)
+                )
+            else:
+                arg_node_spec = batch_dim_analyzer.compute_act_spec(
+                    input_nodes[0], mesh
+                )
+                output_spec = batch_dim_analyzer.compute_act_spec(node, mesh)
+                shard_strategy = OpSpec(
+                    output_specs=output_spec, input_specs=[arg_node_spec]
+                )
+                dp_strategy_map[node] = DataParallelStrategy(
+                    [NodeType.ACT], shard_strategy
+                )
+        return
+
+    # --- Category 2: fused optimizer ops (e.g., fused_adam) ---
+    if node.target == fused_adam_op:
+        # ops that need to build tuple strategy instead of normal strategy. This should happen rarely and only needed
+        # when we need to generate different node strategy for multiple outputs (i.e. fused_adam op)
+        # TODO: Currently this specializes to fused optimizer ops, but we need to see how to generalize this strategy building logic
+        output_strategy_len = len(node.args) - 1
+        tuple_strategies = []
+        for i in range(output_strategy_len):
+            assert isinstance(node.args[i], list)
+            # for list/tuple arg, use the first one to find out the node type
+            if len(node.args[i]) > 0:  # pyre-ignore[6]
+                arg_strategy = dp_strategy_map[node.args[i][0]]  # pyre-ignore[16]
+                assert isinstance(arg_strategy, DataParallelStrategy)
+                assert arg_strategy.node_type in [
+                    NodeType.PARAM,
+                    NodeType.GRAD,
+                    NodeType.STATE,
+                ]
+                out_node_strategy: StrategyType = DataParallelStrategy.from_mesh(
+                    [arg_strategy.node_type] * len(node.args[i]),  # pyre-ignore[6]
+                    mesh,
+                    parallel_mode,
+                    num_outputs=len(node.args[i]),  # pyre-ignore[6]
+                )
+            else:
+                out_node_strategy = DataParallelStrategy([NodeType.NON_TENSOR], None)
+            tuple_strategies.append(out_node_strategy)
+        output_tuple_strategy = TupleStrategy(tuple(tuple_strategies))
+        dp_strategy_map[node] = output_tuple_strategy
+        return
+
+    # --- Category 3 & 4: general compute ops ---
+    # The same op (e.g. aten.add_) can appear in different contexts, so we
+    # dispatch based on the input node types:
+    #   - GRAD/STATE inputs → optimizer step (e.g. add_(weight, grad))
+    #   - PARAM/EMBEDDING_PARAM only → param-only ops (e.g. mul_(weight, scalar))
+    #   - ACT inputs → forward/backward compute (e.g. mm(activation, weight))
+    input_node_types = [
+        cast(DataParallelStrategy, dp_strategy_map[arg]).node_type
+        for arg in input_nodes
+    ]
+
+    # Category 3: ops with GRAD or STATE inputs (optimizer step ops)
+    if NodeType.GRAD in input_node_types or NodeType.STATE in input_node_types:
+        if NodeType.GRAD in input_node_types:
+            # Gradient applied to a param or state: e.g. add_(weight, grad).
+            # Output type is the non-grad input type (PARAM, EMBEDDING_PARAM,
+            # or STATE), since the result represents the updated
+            # param/embedding param/state, not a gradient.
+            non_grad_types = [t for t in input_node_types if t != NodeType.GRAD]
+            assert len(non_grad_types) != 0, (
+                f"Expected at least one non-GRAD input, "
+                f"but all input_node_types are GRAD for node {node.target}"
+            )
+            for non_grad_type in non_grad_types:
+                assert non_grad_type == non_grad_types[0]
+            assert non_grad_types[0] in [
+                NodeType.PARAM,
+                NodeType.EMBEDDING_PARAM,
+                NodeType.STATE,
+            ]
+            output_node_type = non_grad_types[0]
+        else:
+            # State-only update (no gradient): e.g. mul_(momentum, beta).
+            # Preserve the input's NodeType on the output so downstream
+            # nodes continue to apply the correct propagation logic
+            # (e.g. shard-dim tracking for params, replicate for state).
+            if NodeType.PARAM in input_node_types:
+                output_node_type = NodeType.PARAM
+            elif NodeType.EMBEDDING_PARAM in input_node_types:
+                output_node_type = NodeType.EMBEDDING_PARAM
+            else:
+                output_node_type = NodeType.STATE
+        num_outputs = (
+            len(node.meta["val"]) if isinstance(node.meta["val"], (tuple, list)) else 1
+        )
+        dp_strategy_map[node] = DataParallelStrategy.from_mesh(
+            [output_node_type] * num_outputs,
+            mesh,
+            parallel_mode,
+            num_outputs=num_outputs,
+        )
+        return
+
+    # Param-only ops: copy_, mul_, lift_fresh_copy, etc.
+    # By this point, ops with GRAD/STATE inputs (Category 3) have already
+    # returned. This catches ops with no ACT and no GRAD/STATE — i.e. inputs
+    # are only PARAM, EMBEDDING_PARAM, or NON_TENSOR. These are
+    # param-manipulation ops outside forward/backward and optimizer step
+    # (e.g. weight initialization, weight decay).
+    # If any input is a param, inherit its strategy; otherwise NON_TENSOR.
+    if NodeType.ACT not in input_node_types and len(input_nodes) > 0:
+        param_inputs = [
+            inp
+            for inp, ntype in zip(input_nodes, input_node_types)
+            if ntype in (NodeType.PARAM, NodeType.EMBEDDING_PARAM)
+        ]
+        if len(param_inputs) > 0:
+            dp_strategy_map[node] = dp_strategy_map[param_inputs[0]]
+        else:
+            dp_strategy_map[node] = DataParallelStrategy([NodeType.NON_TENSOR], None)
+        return
+
+    # Category 4: general compute ops (forward/backward with ACT inputs)
+    if len(input_nodes) > 0:
+        assert NodeType.ACT in input_node_types, (
+            f"input_node_types is {input_node_types}, node is {node.target}"
+        )
+    input_specs = []
+    for arg in input_nodes:
+        arg_strategy = dp_strategy_map[arg]
+        assert isinstance(arg_strategy, DataParallelStrategy)
+        node_type = arg_strategy.node_type
+        assert node_type in [
+            NodeType.ACT,
+            NodeType.PARAM,
+            NodeType.EMBEDDING_PARAM,
+            NodeType.NON_TENSOR,
+        ], (
+            f"Unexpected node_type {node_type} for input {arg.target} "
+            f"of node {node.target}"
+        )
+        if node_type == NodeType.ACT:
+            act_spec = batch_dim_analyzer.compute_act_spec(arg, mesh)
+            input_specs.append(act_spec)
+        else:
+            # PARAM, EMBEDDING_PARAM, and NON_TENSOR are all replicated
+            # for strategy propagation purposes. For EMBEDDING_PARAM, the
+            # aten.embedding node is rewritten to recir::row_wise_embedding
+            # before the partitioner runs, so these specs are not consumed.
+            input_specs.append(DTensorSpec(mesh=mesh, placements=(Replicate(),)))
+    node_type_len = (
+        len(node.meta["val"]) if isinstance(node.meta["val"], (tuple, list)) else 1
+    )
+    act_spec = batch_dim_analyzer.compute_act_spec(node, mesh)
+    grad_spec = DTensorSpec(mesh=mesh, placements=(Partial(grad_reduction),))
+    if node not in grad_type_dict:
+        out_specs = [act_spec for _ in range(node_type_len)]
+        node_types = [NodeType.ACT for _ in range(node_type_len)]
+    else:
+        out_specs = []
+        node_types = []
+        for i in range(node_type_len):
+            if i in grad_type_dict[node]:
+                out_specs.append(grad_spec)
+                node_types.append(NodeType.GRAD)
+            else:
+                out_specs.append(act_spec)
+                node_types.append(NodeType.ACT)
+    strategy = OpSpec(output_specs=tuple(out_specs), input_specs=input_specs)
+    dp_strategy_map[node] = DataParallelStrategy(node_types, strategy)
+
+
+def build_data_parallel_strategies(
+    train_step_graph: GraphModule,
+    num_params: int,
+    num_states: int,
+    mesh: DeviceMesh,
+    batch_dim: int = 0,
+    parallel_mode: DataParallelStyle = DataParallelStyle.FULLY_SHARD,
+    grad_reduction: str = "avg",
+    embedding_param_indices: Optional[Set[int]] = None,
+) -> Dict[fx.Node, StrategyType]:
+    activation_idx = num_params + num_states
+    # Map each node to outputs with NodeType.GRAD type
+    grad_type_dict: Dict[fx.Node, Set[int]] = {}
+    dp_strategy_map: Dict[fx.Node, StrategyType] = {}
+    batch_dim_analyzer = BatchDimAnalyzer(batch_dim)
+    placeholder_idx = 0
+    # Backward propagate to mark the param gradients sharding with tag_grad node helps and then delete the tag_grad nodes
+    for node in reversed(list(train_step_graph.graph.nodes)):
+        if not node.target == torch.ops._spmd.tag_grad.default:
+            continue
+        cur_node = node
+        while cur_node.target in non_compute_ops:
+            parent_node = cur_node.args[0]
+            if parent_node not in grad_type_dict:
+                grad_type_dict[parent_node] = set()
+            index = 0
+            if cur_node.target == operator.getitem:
+                index = cur_node.args[1]
+            grad_type_dict[parent_node].add(index)
+            cur_node = parent_node
+        node.replace_all_uses_with(node.args[0])
+        train_step_graph.graph.erase_node(node)
+    # Forward propagate to mark all the sharding
+    for node in train_step_graph.graph.nodes:
+        assert node.op in ["placeholder", "call_function", "output", "get_attr"]
+        if node.target in no_ops:
+            continue
+        elif node.op == "get_attr":
+            # get_attr nodes reference module attributes (e.g. buffers, constants
+            # lifted during tracing such as the step counter in capturable Adam).
+            # Treat them as non-tensor constants that don't require sharding.
+            dp_strategy_map[node] = DataParallelStrategy([NodeType.NON_TENSOR], None)
+        elif "val" not in node.meta:
+            # NOTE: There're certain cases where the nodes do not have real tensor values:
+            # 1. optimizer states can be None sometimes, i.e. SGD with no momentum, optimizer states populate `momentum` state
+            #    as None, the full graph we get from `compile` would have None as the placeholder value
+            # 2. function args might not only contain params or activations, but also contain other non-tensor inputs, i.e. the model
+            #    and optimizer instances baked in as a placeholder, there might also be some scalar argument which is not a tensor
+            # 3. some inplace ops (such as torch.ops.aten._foreach_lerp_.Scalar) will return None.
+            # For the above cases, we create a NON_TENSOR stratgy so that we know it's not a tensor and we don't need to shard it
+            dp_strategy_map[node] = DataParallelStrategy([NodeType.NON_TENSOR], None)
+        elif node.op == "output":
+            dp_strategy_map[node] = DataParallelStrategy([NodeType.NON_TENSOR], None)
+        elif node.op == "placeholder":
+            if placeholder_idx < activation_idx:
+                if (
+                    embedding_param_indices
+                    and placeholder_idx in embedding_param_indices
+                ):
+                    # Label embedding params as EMBEDDING_PARAM with Shard(0) on
+                    # the vocabulary dim, regardless of dense parallel_mode.
+                    # This label is the source of truth that downstream
+                    # _propagate_call_function_strategy reads to distinguish
+                    # embedding params from dense params during strategy
+                    # propagation through the graph.
+                    dp_strategy_map[node] = DataParallelStrategy(
+                        [NodeType.EMBEDDING_PARAM],
+                        _gen_shard_spec(mesh, shard_dim=0),
+                    )
+                elif placeholder_idx < num_params:
+                    dp_strategy_map[node] = DataParallelStrategy.from_mesh(
+                        [NodeType.PARAM], mesh, parallel_mode
+                    )
+                else:
+                    dp_strategy_map[node] = DataParallelStrategy.from_mesh(
+                        [NodeType.STATE], mesh, parallel_mode
+                    )
+            else:
+                activation_batch_dim_size = node.meta["val"].shape[batch_dim]
+                # find the first activation node and use its batch dim size
+                if batch_dim_analyzer.batch_dim_size == -1:
+                    batch_dim_analyzer.init_batch_dim_size(activation_batch_dim_size)
+                batch_dim_analyzer.set_batch_dim(node, batch_dim)
+                shard_strategy = _gen_shard_spec(mesh, batch_dim)
+                dp_strategy_map[node] = DataParallelStrategy(
+                    [NodeType.ACT], shard_strategy
+                )
+            placeholder_idx += 1
+        else:
+            _propagate_call_function_strategy(
+                node,
+                dp_strategy_map,
+                mesh,
+                parallel_mode,
+                batch_dim_analyzer,
+                grad_type_dict,
+                grad_reduction,
+            )
+    return dp_strategy_map
+
+
+def mark_data_parallel_shardings(
+    train_step_graph: GraphModule, dp_strategy_map: Dict[fx.Node, StrategyType]
+) -> None:
+    """Mark the sharding for the nodes in the train_step_graph."""
+    placeholder_idx = 0
+    for node in train_step_graph.graph.nodes:
+        assert node.op in ["placeholder", "call_function", "output", "get_attr"]
+        if node.target in no_ops or node.op in ("output", "get_attr"):
+            node.meta["sharding"] = None
+            continue
+        node_strategy = dp_strategy_map[node]
+        if (
+            isinstance(node_strategy, DataParallelStrategy)
+            and len(node_strategy.node_types) == 1
+            and node_strategy.node_type == NodeType.NON_TENSOR
+        ):
+            node.meta["sharding"] = None
+        elif node.op == "placeholder":
+            assert isinstance(node_strategy, DataParallelStrategy)
+            node.meta["sharding"] = node_strategy.strategies[0]  # type: ignore[possibly-undefined]
+            placeholder_idx += 1
+        elif isinstance(node_strategy, TupleStrategy):
+            # For tuple strategy in the data parallel mode, it should have the same strategy
+            # for all tuple elements, assert that then use the first element's strategy as sharding
+            first_strategy = cast(DataParallelStrategy, node_strategy.children[0])
+            for child_strategy in node_strategy.children:
+                assert isinstance(child_strategy, DataParallelStrategy)
+                assert (
+                    child_strategy.strategies == first_strategy.strategies
+                    or len(child_strategy.strategies) == 0
+                )
+            node.meta["sharding"] = first_strategy.strategies[0]
+        else:
+            assert isinstance(node_strategy, DataParallelStrategy)
+            node.meta["sharding"] = node_strategy.strategies[0]
+
+
+def partition_value(val: Any, spec: Union[DTensorSpec, Tuple[DTensorSpec]]) -> Any:
+    if val is None or isinstance(val, (int, float, bool, str)):
+        return val
+    if isinstance(val, torch.Tensor):
+        spec = unique_spec(spec)
+        local_shard = val
+        if val.ndim == 0:
+            return local_shard
+        for idx, placement in enumerate(spec.placements):
+            if placement.is_shard():
+                placement = cast(Shard, placement)
+                num_chunks = spec.mesh.size(mesh_dim=idx)
+                my_coord = spec.mesh.get_coordinate()
+                assert my_coord is not None, "current rank not in mesh!"
+                my_coord_on_mesh_dim = my_coord[idx]
+                local_shard = placement._split_tensor(
+                    local_shard, num_chunks, with_padding=False, contiguous=False
+                )[0][my_coord_on_mesh_dim]
+        return local_shard
+    elif isinstance(val, (tuple, list)):
+        if not isinstance(val[0], torch.Tensor):
+            # fused op (TupleStrategy), skip here
+            for i in range(len(val)):
+                assert not isinstance(val[i], torch.Tensor)
+            return val
+        elif isinstance(spec, DTensorSpec):
+            return val.__class__(partition_value(v, spec) for v in val)
+        else:
+            assert len(val) == len(spec)
+            return val.__class__(partition_value(v, s) for v, s in zip(val, spec))
+    elif isinstance(val, torch.ScriptObject):
+        return val  # ScriptObjects (e.g., profiler._RecordFunction) don't need partitioning
+    else:
+        raise RuntimeError(f"val type {type(val)} not supported")
+
+
+def partitioner(graph: GraphModule) -> GraphModule:
+    shape_adjustment_ops = {
+        aten._unsafe_view.default: 1,
+        aten.expand.default: 1,
+        aten.full.default: 0,
+        aten.new_zeros.default: 1,
+        aten.ones.default: 0,
+        aten.reshape.default: 1,
+        aten.slice_backward.default: 1,
+        aten.view.default: 1,
+        aten.zeros.default: 0,
+    }
+    # Maps op -> (start_arg_index or None, end_arg_index)
+    arange_ops: Dict[Any, Tuple[Optional[int], int]] = {
+        # arange(end, ...) - end is arg 0, no start
+        aten.arange.default: (None, 0),
+        # arange(start, end, ...) - start is arg 0, end is arg 1
+        aten.arange.start: (0, 1),
+        # arange(start, end, step, ...) - start is arg 0, end is arg 1
+        aten.arange.start_step: (0, 1),
+    }
+    for node in graph.graph.nodes:
+        node_sharding = node.meta["sharding"]
+        if node_sharding is None or "val" not in node.meta:
+            continue  # Skip nodes that don't have 'val' in meta (e.g., profiler nodes)
+        assert node.op in ["placeholder", "call_function", "output", "get_attr"]
+        if node.op == "output":
+            break
+        elif node.op == "placeholder":
+            out_spec: DTensorSpec = unique_spec(node_sharding.output_specs)
+            local_val = partition_value(node.meta["val"], out_spec)
+            node.meta["val"] = local_val
+        elif (
+            node.target == operator.getitem
+            and node.all_input_nodes[0].target == fused_adam_op
+        ):
+            continue
+        else:
+            for idx, input_node in enumerate(node.all_input_nodes):
+                if input_node.meta.get("sharding") is None:
+                    # Skip non-tensor inputs (e.g., get_attr constants)
+                    continue
+                input_spec: DTensorSpec = (
+                    input_node.meta["sharding"].output_specs[node.args[1]]
+                    if node.target == operator.getitem
+                    else unique_spec(input_node.meta["sharding"].output_specs)
+                )
+                desired_spec: DTensorSpec = (
+                    unique_spec(node_sharding.output_specs)
+                    if node_sharding.input_specs is None
+                    else node_sharding.input_specs[idx]
+                )
+                if (
+                    input_spec == desired_spec
+                    or "tensor_meta" not in input_node.meta
+                    or "val" not in input_node.meta
+                ):
+                    continue
+                input_spec.tensor_meta = input_node.meta["tensor_meta"]
+                desired_spec.tensor_meta = input_node.meta["tensor_meta"]
+                input_tensor = input_node.meta["val"]
+
+                def reshard_fn(local_tensor: torch.Tensor) -> torch.Tensor:
+                    return redistribute_local_tensor(
+                        local_tensor, input_spec, desired_spec
+                    )
+
+                reshard_gm = make_fx(reshard_fn)(input_tensor)
+                reshard_gm_nodes = list(reshard_gm.graph.nodes)
+                reshard_input_node = reshard_gm_nodes[0]
+                with graph.graph.inserting_before(node):
+                    output_node = graph.graph.graph_copy(
+                        reshard_gm.graph, val_map={reshard_input_node: input_node}
+                    )
+                node.replace_input_with(input_node, output_node)
+            output_val = node.meta["val"]
+            if node.target == torch.ops.aten.repeat.default:
+                out_spec: DTensorSpec = unique_spec(node_sharding.output_specs)
+                assert isinstance(output_val, torch.Tensor)
+                local_shape = compute_local_shape(
+                    output_val.shape, out_spec.mesh, out_spec.placements
+                )
+                input_shape = node.args[0].meta["val"].shape
+
+                def infer_repeat_sizes(
+                    repeated_shape: Any, input_shape: Any
+                ) -> List[int]:
+                    repeated_size = [1] * len(repeated_shape)
+                    padded_length = len(repeated_shape) - len(input_shape)
+                    for i in range(len(repeated_shape)):
+                        if i < padded_length:
+                            repeated_size[i] = repeated_shape[i]
+                        else:
+                            repeated_size[i] = (
+                                repeated_shape[i] // input_shape[i - padded_length]
+                            )
+                    return repeated_size
+
+                node.update_arg(1, infer_repeat_sizes(local_shape, input_shape))
+            elif node.target in shape_adjustment_ops:
+                out_spec: DTensorSpec = unique_spec(node_sharding.output_specs)
+                assert isinstance(output_val, torch.Tensor)
+                local_shape = compute_local_shape(
+                    output_val.shape, out_spec.mesh, out_spec.placements
+                )
+                shape_arg_num = shape_adjustment_ops[node.target]
+                node.update_arg(shape_arg_num, local_shape)
+            elif node.target in arange_ops:
+                out_spec: DTensorSpec = unique_spec(node_sharding.output_specs)
+                # Handle arange ops for data parallelism.
+                # This handles patterns like: torch.arange(x.numel(), ...).view(x.shape)
+                # where x.numel() is computed with global batch size but the view expects
+                # local shape after sharding.
+                # Unlike other factory ops, arange doesn't have tensor inputs to inherit
+                # sharding from. The BatchDimAnalyzer marks it as replicated (-1) because
+                # its 1D output shape doesn't match batch_dim_size. However, if arange
+                # output flows into a view/reshape that produces a sharded tensor, we
+                # need to adjust the arange end argument to produce the correct local size.
+                # This follows DTensor's approach where the output placement determines
+                # how operations should behave locally.
+                assert isinstance(output_val, torch.Tensor)
+                start_arg_idx, end_arg_idx = arange_ops[node.target]
+                global_start = (
+                    node.args[start_arg_idx] if start_arg_idx is not None else 0
+                )
+                for user in node.users:
+                    if user.target in shape_adjustment_ops:
+                        user_sharding = user.meta.get("sharding", None)
+                        if user_sharding is not None:
+                            user_output_val = user.meta["val"]
+                            assert isinstance(user_output_val, torch.Tensor)
+                            user_out_spec = unique_spec(user_sharding.output_specs)
+                            local_shape = compute_local_shape(
+                                user_output_val.shape,
+                                user_out_spec.mesh,
+                                user_out_spec.placements,
+                            )
+                            local_size = math.prod(local_shape)
+                            local_end = global_start + local_size
+                            node.update_arg(end_arg_idx, local_end)
+                            break
+            node.meta["val"] = partition_value(output_val, node_sharding.output_specs)
+    for node in graph.graph.nodes:
+        if "sharding" in node.meta:
+            del node.meta["sharding"]
+        if "val" in node.meta and isinstance(node.meta["val"], torch.Tensor):
+            local_tensor_meta = _extract_tensor_metadata(node.meta["val"])
+            node.meta["tensor_meta"] = local_tensor_meta
+    graph.graph.lint()
+    graph.recompile()
+    return graph
+
+
+def shard_params_and_states(
+    model: nn.Module,
+    params_buffers: Dict[str, torch.Tensor],
+    named_states: Dict[str, Any],
+    mesh: DeviceMesh,
+    parallel_style: DataParallelStyle,
+) -> None:
+    """Shard model parameters and optimizer states for FULLY_SHARD mode.
+
+    For FULLY_SHARD, the partitioner rewrites the graph to expect locally
+    sharded parameter/state tensors as inputs (and inserts allgather
+    collectives to reconstruct full tensors before compute). We must
+    actually shard the real tensors in params_buffers and named_states to
+    match, otherwise the allgather will double the already-full tensors.
+    """
+    if parallel_style != DataParallelStyle.FULLY_SHARD:
+        return
+
+    shard_spec = DTensorSpec(mesh=mesh, placements=(Shard(0),))
+    for key in params_buffers:
+        full_tensor = params_buffers[key]
+        local_shard = partition_value(full_tensor, shard_spec)
+        params_buffers[key] = local_shard
+        atoms = key.split(".")
+        parent = model
+        for atom in atoms[:-1]:
+            parent = getattr(parent, atom)
+        # Update the model parameters to store sharded data
+        setattr(
+            parent,
+            atoms[-1],
+            nn.Parameter(
+                local_shard,
+                requires_grad=full_tensor.requires_grad,
+            ),
+        )
+    for key in named_states:
+        if isinstance(named_states[key], torch.Tensor):
+            named_states[key] = partition_value(named_states[key], shard_spec)
+        elif isinstance(named_states[key], dict):
+            for s_key in named_states[key]:
+                if isinstance(named_states[key][s_key], torch.Tensor):
+                    named_states[key][s_key] = partition_value(
+                        named_states[key][s_key], shard_spec
+                    )
+
+
+def _clone_param_chains_for_backward(
+    graph: GraphModule, strategy_map: Dict[fx.Node, StrategyType]
+) -> None:
+    """Clone non-compute-op chains (t, view, reshape, ...) so each compute
+    consumer gets its own allgather, enabling per-op weight lifetime.
+
+    Without cloning, a shared chain like ``t(W)`` consumed by both forward
+    ``addmm`` and backward ``mm`` produces one allgather whose full weight
+    lives until all consumers finish. After cloning, each consumer gets a
+    separate chain with ``Shard(0)`` spec, triggering independent allgathers.
+
+    Algorithm:
+      1. Find PARAM placeholders from the strategy map.
+      2. Group each param's chain-op children into branches. Collect
+         ``(chain_node, [compute_consumers])`` pairs per branch.
+      3. Per branch, the earliest consumer keeps the original chain.
+         Later consumers get cloned chains with ``Shard(0)`` spec.
+      4. The partitioner sees ``Shard(0)`` vs ``Replicate()`` mismatches
+         and inserts separate allgathers for each clone.
+
+    Per-branch (not global) earliest preserves each branch's forward
+    consumer. Branch-level (not per-node) earliest handles linear chains
+    like ``W → t → t(t)`` where deeper nodes have only one consumer each.
+
+    Before::
+
+        W ─→ t(W) ─┬→ addmm (fwd)    One allgather, weight alive fwd→bwd.
+                    └→ mm    (bwd)
+
+    After::
+
+        W ─┬→ t(W)  ─→ addmm (fwd)   allgather #1, freed after addmm
+           └→ t(W)' ─→ mm    (bwd)   allgather #2, freed after mm
+    """
+    # Build topological ordering for finding earliest consumers.
+    node_order: Dict[fx.Node, int] = {}
+    for idx, node in enumerate(graph.graph.nodes):
+        node_order[node] = idx
+
+    param_chain_ops = {
+        aten._to_copy.default,
+        aten.clone.default,
+        aten.detach.default,
+        aten.reshape.default,
+        aten.t.default,
+        aten.view.default,
+    }
+
+    # Find PARAM placeholders using NodeType from the strategy map.
+    param_placeholders = []
+    for node in graph.graph.nodes:
+        if node.op != "placeholder":
+            break
+        strategy = strategy_map.get(node)
+        if not isinstance(strategy, DataParallelStrategy):
+            continue
+        if strategy.node_type == NodeType.PARAM:
+            param_placeholders.append(node)
+
+    for param_node in param_placeholders:
+        # Group chain nodes into branches (one per direct chain-op child).
+        branches: List[List[Tuple[fx.Node, List[fx.Node]]]] = []
+        for user in list(param_node.users):
+            if user.target not in param_chain_ops:
+                continue
+            branch_consumers: List[Tuple[fx.Node, List[fx.Node]]] = []
+            compute_consumers = [
+                c for c in list(user.users) if c.target not in param_chain_ops
+            ]
+            if compute_consumers:
+                branch_consumers.append((user, compute_consumers))
+            _collect_chain_nodes(user, param_chain_ops, branch_consumers)
+            if branch_consumers:
+                branches.append(branch_consumers)
+
+        # Direct compute consumers of param (no chain ops) form a branch too.
+        direct_compute = [
+            u
+            for u in list(param_node.users)
+            if u.target not in param_chain_ops and u.op == "call_function"
+        ]
+        if direct_compute and branches:
+            branches.append([(param_node, direct_compute)])
+
+        for branch_consumers in branches:
+            earliest_consumer = min(
+                (c for _, consumers in branch_consumers for c in consumers),
+                key=lambda c: node_order[c],
+            )
+
+            for chain_node, consumers in branch_consumers:
+                later_consumers = [c for c in consumers if c is not earliest_consumer]
+                if not later_consumers:
+                    continue
+
+                path = _build_chain_path(param_node, chain_node, param_chain_ops)
+                if path is None:
+                    continue
+
+                # Clone the path from param to chain_node.
+                clone_map = {param_node: param_node}
+                for path_node in path[1:]:
+                    with graph.graph.inserting_before(chain_node):
+                        new_args = tuple(
+                            clone_map.get(a, a) if isinstance(a, fx.Node) else a
+                            for a in path_node.args
+                        )
+                        new_kwargs = {
+                            k: clone_map.get(v, v) if isinstance(v, fx.Node) else v
+                            for k, v in path_node.kwargs.items()
+                        }
+                        cloned = graph.graph.call_function(
+                            cast(Callable[..., Any], path_node.target),
+                            args=new_args,
+                            kwargs=new_kwargs,
+                        )
+                        cloned.meta = {**path_node.meta}
+                        cloned.meta["sharding"] = path_node.meta["sharding"]
+                        clone_map[path_node] = cloned
+
+                # Redirect later consumers to the cloned chain end.
+                cloned_end = clone_map[chain_node]
+                for consumer in later_consumers:
+                    consumer.replace_input_with(chain_node, cloned_end)
+
+
+def _collect_chain_nodes(
+    node: fx.Node,
+    param_chain_ops: Set[Any],
+    result: List[Tuple[fx.Node, List[fx.Node]]],
+) -> None:
+    """Recursively walk non-compute-op users of *node* and collect those with compute consumers."""
+    for user in list(node.users):
+        if user.target in param_chain_ops:
+            compute_consumers = [
+                consumer
+                for consumer in list(user.users)
+                if consumer.target not in param_chain_ops
+            ]
+            if compute_consumers:
+                result.append((user, compute_consumers))
+            _collect_chain_nodes(user, param_chain_ops, result)
+
+
+def _build_chain_path(
+    start: fx.Node, end: fx.Node, param_chain_ops: Set[Any]
+) -> Optional[List[fx.Node]]:
+    """Return the list of nodes on the non-compute-op path from *start* to *end*, inclusive."""
+    if start is end:
+        return [start]
+    for user in start.users:
+        if user.target in param_chain_ops or user is end:
+            sub = _build_chain_path(user, end, param_chain_ops)
+            if sub is not None:
+                return [start] + sub
+    return None
+
+
+def _shard_param(
+    model: nn.Module,
+    params_buffers: Dict[str, torch.Tensor],
+    key: str,
+    shard_spec: DTensorSpec,
+) -> None:
+    """Shard a single parameter in-place and update the model attribute."""
+    full_tensor = params_buffers[key]
+    local_shard = partition_value(full_tensor, shard_spec)
+    params_buffers[key] = local_shard
+    atoms = key.split(".")
+    parent = model
+    for atom in atoms[:-1]:
+        parent = getattr(parent, atom)
+    setattr(
+        parent,
+        atoms[-1],
+        nn.Parameter(local_shard, requires_grad=full_tensor.requires_grad),
+    )
+
+
+def _shard_optimizer_state(
+    named_states: Dict[str, Any],
+    key: str,
+    shard_spec: DTensorSpec,
+) -> None:
+    """Shard optimizer states for a single parameter key."""
+    if key not in named_states:
+        return
+    if isinstance(named_states[key], torch.Tensor):
+        named_states[key] = partition_value(named_states[key], shard_spec)
+    elif isinstance(named_states[key], dict):
+        for s_key in named_states[key]:
+            if isinstance(named_states[key][s_key], torch.Tensor):
+                named_states[key][s_key] = partition_value(
+                    named_states[key][s_key], shard_spec
+                )
+
+
+def shard_params_by_plan(
+    model: nn.Module,
+    params_buffers: Dict[str, torch.Tensor],
+    named_states: Dict[str, Any],
+    mesh: DeviceMesh,
+    dense_style: DataParallelStyle,
+    embedding_param_fqns: Set[str],
+) -> None:
+    """Shard parameters and optimizer states with per-param logic.
+
+    Each parameter is sharded exactly once based on its role:
+      - Embedding params (in ``embedding_param_fqns``): always ``Shard(0)``
+        on the vocabulary dimension, regardless of ``dense_style``.
+      - Dense params: ``Shard(0)`` if ``dense_style`` is ``FULLY_SHARD``,
+        otherwise left unsharded (replicated).
+    """
+    shard_spec = DTensorSpec(mesh=mesh, placements=(Shard(0),))
+    for key in list(params_buffers.keys()):
+        if key in embedding_param_fqns:
+            _shard_param(model, params_buffers, key, shard_spec)
+            _shard_optimizer_state(named_states, key, shard_spec)
+        elif dense_style == DataParallelStyle.FULLY_SHARD:
+            _shard_param(model, params_buffers, key, shard_spec)
+    # Shard optimizer states for dense params in FULLY_SHARD mode.
+    if dense_style == DataParallelStyle.FULLY_SHARD:
+        for key in named_states:
+            if key not in embedding_param_fqns:
+                _shard_optimizer_state(named_states, key, shard_spec)
+
+
+def partition_data_parallel(
+    graph: GraphModule,
+    model: nn.Module,
+    optimizer: Optional[torch.optim.Optimizer],
+    params_buffers: Dict[str, torch.Tensor],
+    named_states: Dict[str, Any],
+    args: Tuple[Any, ...],
+    kwargs: Dict[str, Any],
+    mesh: DeviceMesh,
+    parallel_style: DataParallelStyle,
+    input_batch_dim: int,
+    grad_reduction: str = "avg",
+) -> GraphModule:
+    """Partition the graph into a data parallel graph."""
+    num_params_buffers = len(params_buffers)
+    flattened_states = pytree.tree_leaves(named_states)
+    num_states = len(flattened_states)
+    changed = graph.graph.eliminate_dead_code()
+    if changed:
+        graph.recompile()
+    strategy_map = build_data_parallel_strategies(
+        graph,
+        num_params_buffers,
+        num_states,
+        mesh=mesh,
+        batch_dim=input_batch_dim,
+        parallel_mode=parallel_style,
+        grad_reduction=grad_reduction,
+    )
+    mark_data_parallel_shardings(graph, dp_strategy_map=strategy_map)
+
+    # Clone param chains so backward gets its own allgathers (per-op FSDP).
+    if parallel_style == DataParallelStyle.FULLY_SHARD:
+        _clone_param_chains_for_backward(graph, strategy_map)
+        graph.graph.eliminate_dead_code()
+        graph.recompile()
+
+    partitioned_graph = partitioner(graph)
+    # preserve node types for the distributed graph
+    for node in partitioned_graph.graph.nodes:
+        if node in strategy_map:
+            node_strategy = strategy_map[node]
+            if isinstance(node_strategy, DataParallelStrategy):
+                node.meta["node_types"] = node_strategy.node_types
+            elif isinstance(node_strategy, TupleStrategy):
+                node.meta["node_types"] = [NodeType.NON_TENSOR]
+            else:
+                raise RuntimeError(f"Unknown node strategy {node_strategy}")
+        elif node.target not in no_ops:
+            # If the nodes are collectives, we mark them the same type as the input node.
+            input_node = node.all_input_nodes[0]
+            node.meta["node_types"] = input_node.meta["node_types"]
+
+    return partitioned_graph
