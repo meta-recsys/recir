@@ -1,3 +1,9 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-3-Clause license found in the
+# LICENSE file in the root directory of this source tree.
+
 # This file is copied from Meta internal repo and is not synced with the
 # internal version. Once the internal version is fully mature, we should
 # upstream again and retire the internal version. @yifuwang
