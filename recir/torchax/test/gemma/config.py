@@ -1,3 +1,9 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-3-Clause license found in the
+# LICENSE file in the root directory of this source tree.
+
 # From: https://github.com/google/gemma_pytorch/blob/main/gemma/config.py
 
 # Copyright 2024 Google LLC
