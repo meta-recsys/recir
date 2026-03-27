@@ -156,6 +156,58 @@ class TestPartialLowerXLA(unittest.TestCase):
                 self.assertIsInstance(mod.xla_hlo_text, str)
                 self.assertGreater(len(mod.xla_hlo_text), 0)
 
+    def test_full_like_is_xla_compatible(self) -> None:
+        """Verify aten.full_like.default is in the XLA allowlist and does not
+        cause a graph break despite lacking a Meta kernel registration."""
+        from recir.lowering.xla_lower import _is_xla_compatible
+
+        graph = torch.fx.Graph()
+        x = graph.placeholder("x")
+        full_like = graph.call_function(torch.ops.aten.full_like.default, args=(x, 0.0))
+        graph.output(full_like)
+
+        for node in graph.nodes:
+            if node.op == "call_function":
+                compatible, reason = _is_xla_compatible(node)
+                self.assertTrue(
+                    compatible,
+                    f"{node.target} should be XLA-compatible but got: {reason}",
+                )
+
+    def test_full_like_no_graph_break(self) -> None:
+        """Verify that a graph with full_like has no graph breaks during XLA lowering."""
+        gm = _get_test_graph_module()
+
+        # Inject a full_like node into the graph before the output
+        output_node = None
+        last_call = None
+        for node in gm.graph.nodes:
+            if node.op == "output":
+                output_node = node
+            elif node.op == "call_function":
+                last_call = node
+
+        assert output_node is not None and last_call is not None
+
+        with gm.graph.inserting_before(output_node):
+            gm.graph.call_function(
+                torch.ops.aten.full_like.default,
+                args=(last_call, 0.0),
+            )
+
+        gm.recompile()
+
+        lowered = partial_lower_xla(
+            gm,
+            backend_type=BackendType.XLA_SHARD_MAP,
+            subgraph_predicate=lambda nodes: len(nodes) >= 1,
+        )
+        # No graph breaks means the entire graph is lowered into exactly one _XLAModule
+        xla_modules = [mod for mod in lowered.modules() if isinstance(mod, _XLAModule)]
+        self.assertEqual(
+            len(xla_modules), 1, "Expected exactly one _XLAModule (no graph breaks)"
+        )
+
     def test_foreach_ops_are_xla_compatible(self) -> None:
         """Verify that foreach ops are no longer blocked by _is_xla_compatible."""
         from recir.lowering.xla_lower import _is_xla_compatible
