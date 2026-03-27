@@ -356,7 +356,12 @@ def _is_xla_compatible(node: torch.fx.Node) -> Tuple[bool, str]:
     This function is deliberately conservative; ops can be added to the
     allowlist as XLA coverage expands.
     """
-    if node.target == torch.ops.aten.flatten.using_ints:
+    # Ops that torchax supports but lack a Meta kernel registration.
+    _XLA_ALLOWLIST = {
+        torch.ops.aten.flatten.using_ints,
+        torch.ops.aten.full_like.default,
+    }
+    if node.target in _XLA_ALLOWLIST:
         return True, ""
 
     if isinstance(node.target, torch._ops.OpOverload):
