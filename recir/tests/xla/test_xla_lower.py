@@ -215,6 +215,72 @@ class TestPartialLowerXLA(unittest.TestCase):
             len(xla_modules), 1, "Expected exactly one _XLAModule (no graph breaks)"
         )
 
+    def test_strip_profiler_nodes(self) -> None:
+        """Verify _strip_profiler_nodes removes profiler ops from the graph.
+
+        Profiler ops like _record_function_enter_new return ScriptObject
+        handles that JAX cannot represent. _strip_profiler_nodes must
+        remove them from the subgraph before JAX lowering.
+        """
+        # Build a graph with profiler nodes interleaved with aten ops
+        graph = torch.fx.Graph()
+        x = graph.placeholder("x")
+        record_fn = graph.call_function(
+            torch.ops.profiler._record_function_enter_new.default,
+            args=("## test_block ##",),
+        )
+        relu = graph.call_function(torch.ops.aten.relu.default, args=(x,))
+        record_exit = graph.call_function(
+            torch.ops.profiler._record_function_exit.default,
+            args=(record_fn,),
+        )
+        graph.output((record_fn, relu))
+        gm = torch.fx.GraphModule(root={}, graph=graph)
+
+        # Before stripping: profiler nodes present
+        profiler_nodes = [
+            n
+            for n in gm.graph.nodes
+            if n.op == "call_function"
+            and isinstance(n.target, torch._ops.OpOverload)
+            and n.target.name().startswith("profiler::")
+        ]
+        self.assertGreater(len(profiler_nodes), 0)
+
+        # Strip
+        stripped = _XLAModule._strip_profiler_nodes(gm)
+
+        # After stripping: no profiler nodes remain
+        profiler_nodes_after = [
+            n
+            for n in stripped.graph.nodes
+            if n.op == "call_function"
+            and isinstance(n.target, torch._ops.OpOverload)
+            and n.target.name().startswith("profiler::")
+        ]
+        self.assertEqual(len(profiler_nodes_after), 0)
+
+        # The relu node should still be present
+        relu_nodes = [
+            n
+            for n in stripped.graph.nodes
+            if n.op == "call_function" and n.target == torch.ops.aten.relu.default
+        ]
+        self.assertEqual(len(relu_nodes), 1)
+
+    def test_strip_profiler_nodes_no_profiler(self) -> None:
+        """Verify _strip_profiler_nodes is a no-op on graphs without profiler ops."""
+        graph = torch.fx.Graph()
+        x = graph.placeholder("x")
+        relu = graph.call_function(torch.ops.aten.relu.default, args=(x,))
+        graph.output(relu)
+        gm = torch.fx.GraphModule(root={}, graph=graph)
+
+        node_count_before = len(list(gm.graph.nodes))
+        stripped = _XLAModule._strip_profiler_nodes(gm)
+        node_count_after = len(list(stripped.graph.nodes))
+        self.assertEqual(node_count_before, node_count_after)
+
 
 if __name__ == "__main__":
     unittest.main()
