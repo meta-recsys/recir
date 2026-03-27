@@ -81,6 +81,55 @@ class TestPartialLowerXLA(unittest.TestCase):
             if isinstance(mod, _XLAModule):
                 self.assertEqual(mod.backend_type, BackendType.XLA_SHARD_MAP)
 
+    def test_to_sharded_jax_bfloat16(self) -> None:
+        """Verify _to_sharded_jax handles bfloat16 tensors.
+
+        NumPy does not support bfloat16, so the conversion must cast to
+        float32 for the numpy() call and then back to jnp.bfloat16.
+        """
+        import jax
+        import jax.numpy as jnp
+        from jax.sharding import Mesh
+
+        devices = jax.local_devices()
+        mesh = Mesh(devices, axis_names=("torch_dist",))
+        bf16_tensor = torch.randn(4, 8).to(torch.bfloat16)
+        jax_array = _XLAModule._to_sharded_jax(bf16_tensor, mesh)
+        self.assertEqual(jax_array.dtype, jnp.bfloat16)
+        # Verify values are preserved (compare in float32 to avoid precision issues)
+        expected = bf16_tensor.float().cpu().numpy()
+        actual = jax_array.astype(jnp.float32).__array__()
+        torch.testing.assert_close(
+            torch.tensor(actual),
+            torch.tensor(expected),
+            atol=0,
+            rtol=0,
+        )
+
+    def test_to_sharded_jax_bool(self) -> None:
+        """Verify _to_sharded_jax handles bool tensors (existing behavior)."""
+        import jax
+        import jax.numpy as jnp
+        from jax.sharding import Mesh
+
+        devices = jax.local_devices()
+        mesh = Mesh(devices, axis_names=("torch_dist",))
+        bool_tensor = torch.tensor([True, False, True, False])
+        jax_array = _XLAModule._to_sharded_jax(bool_tensor, mesh)
+        self.assertEqual(jax_array.dtype, jnp.bool_)
+
+    def test_to_sharded_jax_float32(self) -> None:
+        """Verify _to_sharded_jax passes through float32 without extra casts."""
+        import jax
+        import jax.numpy as jnp
+        from jax.sharding import Mesh
+
+        devices = jax.local_devices()
+        mesh = Mesh(devices, axis_names=("torch_dist",))
+        f32_tensor = torch.randn(4, 8)
+        jax_array = _XLAModule._to_sharded_jax(f32_tensor, mesh)
+        self.assertEqual(jax_array.dtype, jnp.float32)
+
     def test_numerical_correctness_after_lowering(self) -> None:
         """Verify that a lowered graph produces numerically correct output.
         Compiles subgraphs through torchax -> JAX -> XLA and verifies
