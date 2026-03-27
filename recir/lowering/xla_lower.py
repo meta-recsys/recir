@@ -173,10 +173,14 @@ class _XLAModule(torch.nn.Module):
         t = tensor.detach()
         if t.dtype == torch.bool:
             t = t.to(torch.int8)
+        elif t.dtype == torch.bfloat16:
+            t = t.to(torch.float32)
         nparray = t.cpu().numpy()
         jax_array = jnp.asarray(nparray)
         if tensor.dtype == torch.bool:
             jax_array = jax_array.astype(jnp.bool_)
+        elif tensor.dtype == torch.bfloat16:
+            jax_array = jax_array.astype(jnp.bfloat16)
 
         local_devices = jax.local_devices()
         num_local = len(local_devices)
