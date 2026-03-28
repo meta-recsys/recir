@@ -531,8 +531,17 @@ class Environment(contextlib.ContextDecorator):
     def _is_same_device(self, the_tensor: Any, new_device: Any) -> bool:
         if new_device is None:
             return True
-        if new_device == "meta" and the_tensor.device.type == "jax":
-            return True
+        if the_tensor.device.type == "jax":
+            if new_device == "meta":
+                return True
+            # During jax.jit tracing, FX graphs traced on CPU carry
+            # device='cpu' annotations. The underlying JAX tracers cannot be
+            # materialised (numpy.asarray would raise
+            # TracerArrayConversionError), so treat the move as a no-op.
+            if new_device == "cpu" and isinstance(
+                getattr(the_tensor, "_elem", None), jax.core.Tracer
+            ):
+                return True
         if the_tensor.device.type != new_device:
             if the_tensor.device.type == "cuda":
                 return self.config.treat_cuda_as_jax_device
