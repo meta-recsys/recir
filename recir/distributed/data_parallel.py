@@ -13,6 +13,7 @@ from functools import cached_property
 from typing import Any, Callable, cast, Dict, List, Optional, Set, Tuple, Union
 
 import torch
+import torch.distributed._functional_collectives as funcol
 import torch.fx as fx
 import torch.library
 import torch.nn as nn
@@ -539,8 +540,9 @@ def _propagate_call_function_strategy(
         else:
             # PARAM, EMBEDDING_PARAM, and NON_TENSOR are all replicated
             # for strategy propagation purposes. For EMBEDDING_PARAM, the
-            # aten.embedding node is rewritten to recir::row_wise_embedding
-            # before the partitioner runs, so these specs are not consumed.
+            # aten.embedding node is decomposed into explicit AllToAll ops
+            # by _rewrite_row_wise_embeddings before the partitioner runs,
+            # so these specs are not consumed.
             input_specs.append(DTensorSpec(mesh=mesh, placements=(Replicate(),)))
     node_type_len = (
         len(node.meta["val"]) if isinstance(node.meta["val"], (tuple, list)) else 1
@@ -1165,6 +1167,169 @@ def shard_params_by_plan(
                 _shard_optimizer_state(named_states, key, shard_spec)
 
 
+def decomposed_row_wise_embedding(
+    sharded_weight: torch.Tensor,
+    indices: torch.Tensor,
+    num_embeddings: int,
+    group_name: str,
+    world_size: int,
+) -> torch.Tensor:
+    """Row-wise embedding lookup decomposed into traceable ops.
+
+    Steps:
+      1. Bucketize: map each index to the rank that owns it.
+      2. Index AllToAll: exchange indices so each rank gets the indices it owns.
+      3. Local embedding lookup on the local shard.
+      4. Embedding AllToAll: return results to the originating ranks.
+      5. Unbucketize: restore the original index order.
+
+    Args:
+        sharded_weight: local embedding shard, shape ``(local_V, D)``.
+        indices: input indices, shape ``(*batch_shape)``.
+        num_embeddings: global vocabulary size ``V``.
+        group_name: process-group name for collectives.
+        world_size: number of ranks in the group.
+    """
+    # Step 1: Bucketize
+    flat_indices = indices.reshape(-1)
+    local_rows = num_embeddings // world_size
+    ranks = flat_indices // local_rows
+    local_indices = flat_indices % local_rows
+    sort_order = torch.argsort(ranks, stable=True)
+    sorted_local_indices = local_indices[sort_order]
+    unsort_order = torch.argsort(sort_order)
+
+    split_sizes = torch.stack([(ranks == r).sum() for r in range(world_size)])
+    input_split_list = split_sizes.tolist()
+
+    # Step 2: Index AllToAll
+    # Exchange split sizes (equal-split, each rank sends world_size ints)
+    output_splits_tensor = torch.ops._c10d_functional.all_to_all_single(
+        split_sizes, [1] * world_size, [1] * world_size, group_name
+    )
+    output_splits_tensor = torch.ops._c10d_functional.wait_tensor(output_splits_tensor)
+    output_split_list = output_splits_tensor.tolist()
+
+    # Exchange indices
+    received_indices = torch.ops._c10d_functional.all_to_all_single(
+        sorted_local_indices, output_split_list, input_split_list, group_name
+    )
+    received_indices = torch.ops._c10d_functional.wait_tensor(received_indices)
+
+    # Step 3: Local embedding lookup
+    local_result = torch.ops.aten.embedding.default(sharded_weight, received_indices)
+
+    # Step 4: Embedding AllToAll
+    D = sharded_weight.shape[1]
+    result_input_splits = [s * D for s in output_split_list]
+    result_output_splits = [s * D for s in input_split_list]
+    returned_flat = torch.ops._c10d_functional.all_to_all_single(
+        local_result.reshape(-1),
+        result_output_splits,
+        result_input_splits,
+        group_name,
+    )
+    returned_flat = torch.ops._c10d_functional.wait_tensor(returned_flat)
+    returned = returned_flat.reshape(-1, D)
+
+    # Step 5: Unbucketize
+    result = returned[unsort_order]
+    return result.reshape(*indices.shape, D)
+
+
+def _rewrite_row_wise_embeddings(
+    graph: GraphModule,
+    mesh: DeviceMesh,
+    strategy_map: Dict[fx.Node, StrategyType],
+) -> None:
+    """Replace ``aten.embedding`` nodes whose weight is EMBEDDING_PARAM with
+    decomposed row-wise ops (bucketize → AllToAll → lookup → AllToAll → unbucketize).
+
+    Each replacement is produced by tracing :func:`decomposed_row_wise_embedding`
+    with ``make_fx(tracing_mode="symbolic")`` and inlining the resulting sub-graph.
+    The new nodes all get ``meta["sharding"] = None`` so the downstream partitioner
+    skips them (the AllToAll collectives are already explicit).
+
+    Must be called BEFORE the partitioner so that:
+      1. The partitioner never sees aten.embedding with mismatched specs.
+      2. meta["val"] still has global shapes (no need to reverse-engineer
+         global vocab size from local shard shapes).
+    """
+    from functools import partial
+
+    world_size = mesh.size()
+    group_name = funcol._resolve_group_name((mesh, 0))
+
+    # Identify embedding nodes by checking the weight input's strategy type
+    # in the strategy map, rather than relying on output node_types (which
+    # are always ACT for compute ops).
+    embedding_nodes: List[fx.Node] = []
+    for node in graph.graph.nodes:
+        if (
+            node.op == "call_function"
+            and node.target == torch.ops.aten.embedding.default
+        ):
+            weight_node = node.args[0]
+            weight_strategy = strategy_map.get(weight_node)
+            if (
+                isinstance(weight_strategy, DataParallelStrategy)
+                and weight_strategy.node_type == NodeType.EMBEDDING_PARAM
+            ):
+                embedding_nodes.append(node)
+
+    for emb_node in embedding_nodes:
+        weight_node = cast(fx.Node, emb_node.args[0])
+        indices_node = cast(fx.Node, emb_node.args[1])
+
+        weight_val = weight_node.meta["val"]
+        indices_val = indices_node.meta["val"]
+        num_embeddings = weight_val.shape[0]  # global vocab size
+
+        # Trace the decomposed function to get a sub-graph of raw ops.
+        # Create fresh example tensors (not FakeTensors) so make_fx can
+        # set up its own FakeTensorMode + ShapeEnv for symbolic tracing.
+        example_weight = torch.randn(
+            weight_val.shape, dtype=weight_val.dtype, device="cpu"
+        )
+        example_indices = torch.randint(
+            0, num_embeddings, indices_val.shape, device="cpu"
+        )
+        decomp_fn = partial(
+            decomposed_row_wise_embedding,
+            num_embeddings=num_embeddings,
+            group_name=group_name,
+            world_size=world_size,
+        )
+        subgraph_gm = make_fx(decomp_fn, tracing_mode="symbolic")(
+            example_weight, example_indices
+        )
+
+        # Map sub-graph placeholders to existing graph nodes.
+        placeholders = [n for n in subgraph_gm.graph.nodes if n.op == "placeholder"]
+        val_map: Dict[fx.Node, fx.Node] = {
+            placeholders[0]: weight_node,
+            placeholders[1]: indices_node,
+        }
+
+        # Inline sub-graph before the embedding node.
+        with graph.graph.inserting_before(emb_node):
+            output_value = graph.graph.graph_copy(subgraph_gm.graph, val_map=val_map)
+
+        # Mark newly-inlined nodes with sharding=None so the partitioner
+        # skips them.
+        for node in graph.graph.nodes:
+            if "sharding" not in node.meta:
+                node.meta["sharding"] = None
+                strategy_map[node] = DataParallelStrategy([NodeType.ACT], None)
+
+        # Replace the original embedding node.
+        assert isinstance(output_value, fx.Node)
+        emb_node.replace_all_uses_with(output_value)
+        graph.graph.erase_node(emb_node)
+        # Remove the now-dead strategy entry.
+        strategy_map.pop(emb_node, None)
+
+
 def partition_data_parallel(
     graph: GraphModule,
     model: nn.Module,
@@ -1177,6 +1342,7 @@ def partition_data_parallel(
     parallel_style: DataParallelStyle,
     input_batch_dim: int,
     grad_reduction: str = "avg",
+    embedding_param_indices: Optional[Set[int]] = None,
 ) -> GraphModule:
     """Partition the graph into a data parallel graph."""
     num_params_buffers = len(params_buffers)
@@ -1193,8 +1359,17 @@ def partition_data_parallel(
         batch_dim=input_batch_dim,
         parallel_mode=parallel_style,
         grad_reduction=grad_reduction,
+        embedding_param_indices=embedding_param_indices,
     )
     mark_data_parallel_shardings(graph, dp_strategy_map=strategy_map)
+
+    # Rewrite embedding nodes BEFORE the partitioner.  At this point
+    # meta["val"] still carries global shapes and meta["sharding"] has been
+    # set by mark_data_parallel_shardings.  Rewriting here guarantees the
+    # partitioner never sees aten.embedding with an EMBEDDING_PARAM weight
+    # (which would have mismatched Shard(0)/Replicate specs).
+    if embedding_param_indices is not None:
+        _rewrite_row_wise_embeddings(graph, mesh, strategy_map)
 
     # Clone param chains so backward gets its own allgathers (per-op FSDP).
     if parallel_style == DataParallelStyle.FULLY_SHARD:

@@ -14,16 +14,20 @@ from typing import Any, Callable, cast
 from unittest.mock import MagicMock
 
 import torch
+import torch.distributed._functional_collectives as funcol
 import torch.fx as fx
 import torch.nn as nn
 from parameterized import parameterized
 from recir.api import compile
 from recir.distributed.data_parallel import (
     _clone_param_chains_for_backward,
+    _rewrite_row_wise_embeddings,
     _shard_optimizer_state,
     build_data_parallel_strategies,
     DataParallelStrategy,
     DataParallelStyle,
+    decomposed_row_wise_embedding,
+    mark_data_parallel_shardings,
     NodeType,
     partition_value,
     shard_params_by_plan,
@@ -1513,6 +1517,280 @@ class TestBuildStrategiesWithEmbedding(unittest.TestCase):
         self.assertIsNotNone(output_specs)
         self.assertEqual(len(output_specs), 1)
         self.assertEqual(output_specs[0].placements, (Shard(0),))
+
+
+class TestRewriteRowWiseEmbeddings(unittest.TestCase):
+    """Tests for _rewrite_row_wise_embeddings graph transformation.
+
+    These tests use a MagicMock DeviceMesh; no real distributed setup needed
+    because make_fx(tracing_mode="symbolic") uses Meta implementations.
+    """
+
+    def _create_mock_mesh(self, world_size: int = 2) -> DeviceMesh:
+        mesh = MagicMock(spec=DeviceMesh)
+        mesh.ndim = 1
+        mesh.shape = (world_size,)
+        mesh.device_type = "cpu"
+        mesh.mesh = torch.arange(world_size)
+        mesh._flatten.return_value = mesh
+        mesh.size.return_value = world_size
+        mesh._dim_group_names = ["fake_test_group"]
+        return mesh
+
+    def _build_embedding_graph(self, V: int = 100, D: int = 16, batch: int = 8):
+        """Build a minimal graph: placeholder(weight) + placeholder(indices) → aten.embedding → output."""
+        graph = fx.Graph()
+        emb_w = graph.placeholder("emb_weight")
+        emb_w.meta["val"] = torch.randn(V, D)
+        indices = graph.placeholder("indices")
+        indices.meta["val"] = torch.randint(0, V, (batch,))
+        emb_out = graph.call_function(
+            torch.ops.aten.embedding.default, args=(emb_w, indices)
+        )
+        emb_out.meta["val"] = torch.randn(batch, D)
+        graph.output(emb_out)
+        return fx.GraphModule(nn.Module(), graph), emb_w, indices, emb_out
+
+    def test_original_embedding_replaced(self):
+        """After rewrite, the original aten.embedding node consuming the
+        EMBEDDING_PARAM weight is replaced.  The decomposed sub-graph contains
+        its own local aten.embedding (step 3), but it consumes received_indices
+        from the AllToAll, NOT the original indices placeholder directly."""
+        gm, emb_w, indices, emb_out = self._build_embedding_graph()
+        mesh = self._create_mock_mesh()
+        strategy_map = build_data_parallel_strategies(
+            gm,
+            num_params=1,
+            num_states=0,
+            mesh=mesh,
+            batch_dim=0,
+            parallel_mode=DataParallelStyle.FULLY_SHARD,
+            embedding_param_indices={0},
+        )
+        mark_data_parallel_shardings(gm, dp_strategy_map=strategy_map)
+        _rewrite_row_wise_embeddings(gm, mesh, strategy_map)
+        # The decomposed sub-graph contains a local aten.embedding (step 3),
+        # but its indices arg must come from a wait_tensor (AllToAll result),
+        # NOT from the original indices placeholder.
+        for node in gm.graph.nodes:
+            if (
+                node.op == "call_function"
+                and node.target == torch.ops.aten.embedding.default
+            ):
+                # The indices arg (args[1]) should be a wait_tensor node.
+                indices_arg = node.args[1]
+                self.assertEqual(
+                    indices_arg.target,
+                    torch.ops._c10d_functional.wait_tensor.default,
+                )
+
+    def test_decomposed_graph_structure(self):
+        """Verify the decomposed graph has the expected node structure and print it."""
+        gm, emb_w, indices, emb_out = self._build_embedding_graph()
+        mesh = self._create_mock_mesh()
+        strategy_map = build_data_parallel_strategies(
+            gm,
+            num_params=1,
+            num_states=0,
+            mesh=mesh,
+            batch_dim=0,
+            parallel_mode=DataParallelStyle.FULLY_SHARD,
+            embedding_param_indices={0},
+        )
+        mark_data_parallel_shardings(gm, dp_strategy_map=strategy_map)
+        _rewrite_row_wise_embeddings(gm, mesh, strategy_map)
+        # Print the decomposed graph for manual inspection.
+        print("\nDecomposed row-wise embedding graph:")
+        for node in gm.graph.nodes:
+            args_str = ", ".join(
+                a.name if isinstance(a, torch.fx.Node) else repr(a)
+                for a in (node.args if node.args else ())
+            )
+            print(
+                f"  {node.op:15s} | {str(node.target):55s} | {node.name:30s} | ({args_str})"
+            )
+        # Sanity-check: more than the original 4 nodes (2 placeholders + 1 embedding + 1 output).
+        call_nodes = [n for n in gm.graph.nodes if n.op == "call_function"]
+        self.assertGreater(len(call_nodes), 10)
+
+    def test_alltoall_nodes_present(self):
+        """After rewrite, _c10d_functional.all_to_all_single nodes are present."""
+        gm, emb_w, indices, emb_out = self._build_embedding_graph()
+        mesh = self._create_mock_mesh()
+        strategy_map = build_data_parallel_strategies(
+            gm,
+            num_params=1,
+            num_states=0,
+            mesh=mesh,
+            batch_dim=0,
+            parallel_mode=DataParallelStyle.FULLY_SHARD,
+            embedding_param_indices={0},
+        )
+        mark_data_parallel_shardings(gm, dp_strategy_map=strategy_map)
+        _rewrite_row_wise_embeddings(gm, mesh, strategy_map)
+        a2a_nodes = [
+            n
+            for n in gm.graph.nodes
+            if n.op == "call_function"
+            and n.target == torch.ops._c10d_functional.all_to_all_single.default
+        ]
+        # 3 all_to_all_single calls: split sizes, indices, results
+        self.assertEqual(len(a2a_nodes), 3)
+
+    def test_wait_tensor_nodes_present(self):
+        """After rewrite, wait_tensor nodes match all_to_all_single nodes."""
+        gm, emb_w, indices, emb_out = self._build_embedding_graph()
+        mesh = self._create_mock_mesh()
+        strategy_map = build_data_parallel_strategies(
+            gm,
+            num_params=1,
+            num_states=0,
+            mesh=mesh,
+            batch_dim=0,
+            parallel_mode=DataParallelStyle.FULLY_SHARD,
+            embedding_param_indices={0},
+        )
+        mark_data_parallel_shardings(gm, dp_strategy_map=strategy_map)
+        _rewrite_row_wise_embeddings(gm, mesh, strategy_map)
+        wait_nodes = [
+            n
+            for n in gm.graph.nodes
+            if n.op == "call_function"
+            and n.target == torch.ops._c10d_functional.wait_tensor.default
+        ]
+        self.assertEqual(len(wait_nodes), 3)
+
+    def test_new_nodes_have_sharding_none(self):
+        """All newly-inlined nodes have meta['sharding'] = None."""
+        gm, emb_w, indices, emb_out = self._build_embedding_graph()
+        mesh = self._create_mock_mesh()
+        strategy_map = build_data_parallel_strategies(
+            gm,
+            num_params=1,
+            num_states=0,
+            mesh=mesh,
+            batch_dim=0,
+            parallel_mode=DataParallelStyle.FULLY_SHARD,
+            embedding_param_indices={0},
+        )
+        mark_data_parallel_shardings(gm, dp_strategy_map=strategy_map)
+        # Nodes that existed before the rewrite.
+        pre_rewrite_nodes = set(gm.graph.nodes)
+        _rewrite_row_wise_embeddings(gm, mesh, strategy_map)
+        for node in gm.graph.nodes:
+            if node not in pre_rewrite_nodes and node.op == "call_function":
+                self.assertIn("sharding", node.meta)
+                self.assertIsNone(node.meta["sharding"])
+
+    def test_non_embedding_param_untouched(self):
+        """aten.embedding with a non-EMBEDDING_PARAM weight is NOT rewritten."""
+        graph = fx.Graph()
+        dense_w = graph.placeholder("dense_weight")
+        dense_w.meta["val"] = torch.randn(100, 16)
+        indices = graph.placeholder("indices")
+        indices.meta["val"] = torch.randint(0, 100, (8,))
+        act = graph.placeholder("act_0")
+        act.meta["val"] = torch.randn(8, 3)
+        emb_out = graph.call_function(
+            torch.ops.aten.embedding.default, args=(dense_w, indices)
+        )
+        emb_out.meta["val"] = torch.randn(8, 16)
+        graph.output(emb_out)
+        gm = fx.GraphModule(nn.Module(), graph)
+        mesh = self._create_mock_mesh()
+        strategy_map = build_data_parallel_strategies(
+            gm,
+            num_params=1,
+            num_states=1,
+            mesh=mesh,
+            batch_dim=0,
+            parallel_mode=DataParallelStyle.FULLY_SHARD,
+            # NOT marking index 0 as embedding param
+            embedding_param_indices=set(),
+        )
+        mark_data_parallel_shardings(gm, dp_strategy_map=strategy_map)
+        _rewrite_row_wise_embeddings(gm, mesh, strategy_map)
+        targets = [n.target for n in gm.graph.nodes if n.op == "call_function"]
+        # Should still have aten.embedding since weight is PARAM, not EMBEDDING_PARAM
+        self.assertIn(torch.ops.aten.embedding.default, targets)
+
+
+class TestRowWiseEmbeddingE2E(DTensorTestBase):
+    """End-to-end tests for decomposed_row_wise_embedding with real distributed comms."""
+
+    @property
+    def world_size(self):
+        return 2
+
+    def _setup_embedding(self, num_embeddings=16, embedding_dim=8):
+        """Create full weight, shard it, and return (full_weight, local_shard, mesh, group_name)."""
+        torch.manual_seed(42)
+        device = f"cuda:{self.rank}"
+        full_weight = torch.randn(num_embeddings, embedding_dim, device=device)
+        rows_per_rank = num_embeddings // self.world_size
+        local_weight = full_weight[
+            self.rank * rows_per_rank : (self.rank + 1) * rows_per_rank
+        ].contiguous()
+        mesh = DeviceMesh("cuda", torch.arange(self.world_size))
+        group_name = funcol._resolve_group_name((mesh, 0))
+        return full_weight, local_weight, num_embeddings, group_name
+
+    @skip_if_lt_x_gpu(2)
+    @with_comms
+    def test_row_wise_matches_full_embedding(self):
+        """Row-wise result matches single-device embedding lookup."""
+        full_weight, local_weight, num_emb, group_name = self._setup_embedding()
+        device = f"cuda:{self.rank}"
+        indices = torch.tensor([0, 5, 15, 3, 8], device=device)
+        expected = torch.nn.functional.embedding(indices, full_weight)
+        result = decomposed_row_wise_embedding(
+            local_weight, indices, num_emb, group_name, self.world_size
+        )
+        torch.testing.assert_close(result, expected)
+
+    @skip_if_lt_x_gpu(2)
+    @with_comms
+    def test_2d_indices(self):
+        """Row-wise embedding with 2D indices (batch, seq) returns correct shape and values."""
+        full_weight, local_weight, num_emb, group_name = self._setup_embedding()
+        device = f"cuda:{self.rank}"
+        indices = torch.tensor([[0, 5, 15], [3, 8, 1]], device=device)
+        expected = torch.nn.functional.embedding(indices, full_weight)
+        result = decomposed_row_wise_embedding(
+            local_weight, indices, num_emb, group_name, self.world_size
+        )
+        self.assertEqual(result.shape, (2, 3, 8))
+        torch.testing.assert_close(result, expected)
+
+    @skip_if_lt_x_gpu(2)
+    @with_comms
+    def test_indices_all_on_one_rank(self):
+        """All indices map to rank 0's shard (tests uneven AllToAll splits)."""
+        full_weight, local_weight, num_emb, group_name = self._setup_embedding()
+        device = f"cuda:{self.rank}"
+        # All indices in [0, 7] → rank 0's shard
+        indices = torch.tensor([0, 1, 2, 3, 7], device=device)
+        expected = torch.nn.functional.embedding(indices, full_weight)
+        result = decomposed_row_wise_embedding(
+            local_weight, indices, num_emb, group_name, self.world_size
+        )
+        torch.testing.assert_close(result, expected)
+
+    @skip_if_lt_x_gpu(2)
+    @with_comms
+    def test_large_embedding_table(self):
+        """Row-wise with larger table and random indices."""
+        full_weight, local_weight, num_emb, group_name = self._setup_embedding(
+            num_embeddings=128, embedding_dim=32
+        )
+        device = f"cuda:{self.rank}"
+        torch.manual_seed(self.rank + 100)
+        indices = torch.randint(0, 128, (8, 5), device=device)
+        expected = torch.nn.functional.embedding(indices, full_weight)
+        result = decomposed_row_wise_embedding(
+            local_weight, indices, num_emb, group_name, self.world_size
+        )
+        torch.testing.assert_close(result, expected)
 
 
 class TestShardOptimizerState(unittest.TestCase):
