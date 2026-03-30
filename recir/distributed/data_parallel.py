@@ -399,7 +399,7 @@ def _propagate_call_function_strategy(
                 dp_strategy_map[node] = DataParallelStrategy(
                     [NodeType.GRAD], _gen_partial_strategy(mesh, grad_reduction)
                 )
-            else:
+            else:  # ACT: propagate batch-dim sharding
                 arg_node_spec = batch_dim_analyzer.compute_act_spec(
                     input_nodes[0], mesh
                 )

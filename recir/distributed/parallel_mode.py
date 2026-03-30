@@ -6,7 +6,7 @@
 
 # pyre-strict
 from abc import ABC, abstractmethod
-from typing import Any, Callable, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, Optional, Set, Tuple
 
 import torch
 import torch.distributed as dist
@@ -15,7 +15,9 @@ from recir.distributed.data_parallel import (
     DataParallelStyle,
     partition_data_parallel,
     shard_params_and_states,
+    shard_params_by_plan,
 )
+from recir.sharding_plan import EmbeddingShardingPlan
 from torch.distributed.tensor import DeviceMesh
 from torch.fx import GraphModule
 
@@ -26,6 +28,8 @@ class ParallelMode(ABC):
     this interface to describe how to partition and compile the graph in the
     spmd compiler.
     """
+
+    input_batch_dim: int
 
     @property
     @abstractmethod
@@ -366,4 +370,138 @@ class DataParallel(ParallelMode):
     def transform_and_compile(self, gm: GraphModule) -> GraphModule:
         """optimize a distributed graph with a set of optimization passes"""
         # TODO: add more necessary arguments to this interface.
+        return self._gm_passes(gm)
+
+
+class HybridParallel(ParallelMode):
+    """Hybrid parallel mode: data parallelism for dense params + model
+    parallelism for embedding params.
+
+    Dense parameters use FSDP or DDP (controlled by ``dense_style``).
+    Embedding parameters are sharded according to ``embedding_plan``
+    (e.g., row-wise sharding splits the vocabulary across ranks).
+
+    Example::
+
+        from recir.sharding_plan import EmbeddingShardingPlan, EmbeddingShardingType
+
+        plan = EmbeddingShardingPlan(sharding_map={
+            "emb.weight": EmbeddingShardingType.ROW_WISE,
+        })
+        mode = HybridParallel(
+            dense_style="fully_shard",
+            embedding_plan=plan,
+        )
+
+    The ``partition()`` method orchestrates two passes:
+      1. ``partition_data_parallel`` for dense params (with embedding params
+         marked as EMBEDDING_PARAM so the partitioner skips allgather for them).
+      2. ``partition_embeddings`` for embedding params (TODO: Component 3).
+    """
+
+    def __init__(
+        self,
+        dense_style: str = "fully_shard",
+        *,
+        embedding_plan: Optional[EmbeddingShardingPlan] = None,
+        input_batch_dim: int = 0,
+        custom_passes: Optional[Callable[[GraphModule], GraphModule]] = None,
+    ) -> None:
+        self.dense_style: DataParallelStyle
+        if dense_style == "replicate":
+            self.dense_style = DataParallelStyle.REPLICATE
+        elif dense_style == "fully_shard":
+            self.dense_style = DataParallelStyle.FULLY_SHARD
+        elif dense_style == "default":
+            self.dense_style = DataParallelStyle.DEFAULT
+        else:
+            raise RuntimeError(f"Unknown dense parallel style: {dense_style}")
+
+        self.embedding_plan: EmbeddingShardingPlan = (
+            embedding_plan or EmbeddingShardingPlan()
+        )
+        self.input_batch_dim = input_batch_dim
+
+        if custom_passes is not None:
+            self._gm_passes: Callable[[GraphModule], GraphModule] = custom_passes
+        else:
+            self._gm_passes = lambda gm: gm
+
+        self._mesh: Optional[DeviceMesh] = None
+
+    @property
+    def num_ranks(self) -> int:
+        return dist.get_world_size() if dist.is_initialized() else 1
+
+    @property
+    def num_processes(self) -> int:
+        return dist.get_world_size() if dist.is_initialized() else 1
+
+    @property
+    def mesh(self) -> DeviceMesh:
+        if self._mesh is None:
+            self._mesh = DeviceMesh("cuda", torch.arange(dist.get_world_size()))
+        return self._mesh
+
+    def _compute_embedding_param_indices(
+        self, params_and_buffers: Dict[str, Any]
+    ) -> Optional[Set[int]]:
+        """Map embedding param FQNs to their placeholder indices in the graph."""
+        if not self.embedding_plan.param_fqns:
+            return None
+        indices: Set[int] = set()
+        for idx, key in enumerate(params_and_buffers):
+            if self.embedding_plan.is_embedding_param(key):
+                indices.add(idx)
+        return indices if indices else None
+
+    def shard_params(
+        self,
+        model: torch.nn.Module,
+        params_and_buffers: Dict[str, Any],
+        named_states: Dict[str, Any],
+    ) -> None:
+        # Each param is sharded exactly once based on its role:
+        #   - Embedding params: always Shard(0) on vocabulary dim
+        #   - Dense params: Shard(0) if FULLY_SHARD, unsharded if REPLICATE
+        shard_params_by_plan(
+            model,
+            params_and_buffers,
+            named_states,
+            self.mesh,
+            self.dense_style,
+            self.embedding_plan.param_fqns,
+        )
+
+    def partition(
+        self,
+        gm: GraphModule,
+        model: torch.nn.Module,
+        optimizer: Optional[torch.optim.Optimizer],
+        params_and_buffers: Dict[str, Any],
+        named_states: Dict[str, Any],
+        args: Tuple[Any, ...],
+        kwargs: Dict[str, Any],
+    ) -> GraphModule:
+        embedding_param_indices = self._compute_embedding_param_indices(
+            params_and_buffers
+        )
+
+        gm = partition_data_parallel(
+            gm,
+            model,
+            optimizer,
+            params_and_buffers,
+            named_states,
+            args,
+            kwargs,
+            self.mesh,
+            self.dense_style,
+            self.input_batch_dim,
+            embedding_param_indices=embedding_param_indices,
+        )
+
+        return gm
+
+    def transform_and_compile(self, gm: GraphModule) -> GraphModule:
         return self._gm_passes(gm)
