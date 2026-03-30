@@ -165,6 +165,8 @@ class _XLAModule(torch.nn.Module):
         tensor: Any, mesh: Any, is_batch_input: bool = False, input_batch_dim: int = 0
     ) -> Any:
         """Convert a PyTorch tensor to a properly sharded JAX array."""
+        if tensor is None:
+            return None
         if not isinstance(tensor, torch.Tensor):
             assert isinstance(tensor, jax.Array), (
                 f"Expected torch.Tensor or jax.Array, got {type(tensor)}"
@@ -240,6 +242,15 @@ class _XLAModule(torch.nn.Module):
 
         return lowered, run
 
+    @staticmethod
+    def _t2j_safe(a: Any, jax_device: Any) -> Any:
+        """Convert a torch.Tensor to a JAX array, passing through None."""
+        if a is None:
+            return None
+        if not isinstance(a, torch.Tensor):
+            return a
+        return jax.device_put(t2j(a), jax_device)
+
     def _jit_plain(
         self,
         jax_fn: Callable[..., Any],
@@ -248,17 +259,12 @@ class _XLAModule(torch.nn.Module):
         jax_device: Any,
     ) -> Any:
         """Plain jax.jit on a single device (no collectives)."""
-        example_jax_args = tuple(jax.device_put(t2j(a), jax_device) for a in args)
+        example_jax_args = tuple(self._t2j_safe(a, jax_device) for a in args)
         lowered = jax.jit(jax_fn).lower(*example_jax_args)
         compiled: Any = lowered.compile()
 
         def run(*run_args: torch.Tensor) -> List[torch.Tensor]:
-            jax_args = tuple(
-                a
-                if not isinstance(a, torch.Tensor)
-                else jax.device_put(t2j(a), jax_device)
-                for a in run_args
-            )
+            jax_args = tuple(self._t2j_safe(a, jax_device) for a in run_args)
             jax_out = compiled(*jax_args)
             return self._postprocess_jax_output(jax_out, input_device)
 
@@ -383,6 +389,24 @@ def _is_xla_compatible(node: torch.fx.Node) -> Tuple[bool, str]:
     return True, ""
 
 
+def _jax_to_numpy(t: Any) -> Any:
+    """Convert a JAX array to a numpy array, handling bfloat16.
+
+    Transfers data to host (CPU) first via jax.device_get() to avoid
+    allocating extra device memory for dtype conversion. Then converts
+    bfloat16 to float32 on CPU since torch.tensor() doesn't accept
+    ml_dtypes.bfloat16.
+    """
+    import numpy as np
+
+    # Transfer from device to host first to avoid OOM on device
+    host_arr = np.asarray(jax.device_get(t))
+    # ml_dtypes.bfloat16 dtype name is 'bfloat16'
+    if host_arr.dtype.name == "bfloat16":
+        host_arr = host_arr.astype(np.float32)
+    return host_arr
+
+
 def _jax_to_torch(t: Any, device: torch.device) -> Any:
     """Convert a JAX output (array, None, or nested list/tuple) to a torch tensor."""
     if t is None:
@@ -392,8 +416,8 @@ def _jax_to_torch(t: Any, device: torch.device) -> Any:
     if isinstance(t, tuple):
         return tuple(_jax_to_torch(x, device) for x in t)
     if hasattr(t, "addressable_shards") and t.addressable_shards:
-        return torch.tensor(t.addressable_shards[0].data.__array__(), device=device)
-    return torch.tensor(t.__array__(), device=device)
+        return torch.tensor(_jax_to_numpy(t.addressable_shards[0].data), device=device)
+    return torch.tensor(_jax_to_numpy(t), device=device)
 
 
 def partial_lower_xla(
