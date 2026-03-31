@@ -94,8 +94,15 @@ class TestSingleProcessMultiDevice(unittest.TestCase):
         compiled_obj = train_step.__dict__["_compiled_obj"]
         assert_hlo_has_collective(self, compiled_obj, "all-reduce", "XLA_GSPMD")
 
-    @parameterized.expand([("sum",), ("mean",)])
-    def test_shard_map_single_process(self, loss_reduction):
+    @parameterized.expand(
+        [
+            ("sum", True),
+            ("sum", False),
+            ("mean", True),
+            ("mean", False),
+        ]
+    )
+    def test_shard_map_single_process(self, loss_reduction, use_parametrization):
         """DataParallel + XLA_SHARD_MAP with 1 process, N devices."""
         torch.manual_seed(42)
         model = SimpleMLP().cpu()
@@ -114,6 +121,7 @@ class TestSingleProcessMultiDevice(unittest.TestCase):
                 num_processes=1,
                 device_type="cpu",
                 backend=BackendType.XLA_SHARD_MAP,
+                use_parametrization=use_parametrization,
             ),
             gm_transformation=GraphModuleTransformation(
                 backend=BackendType.XLA_SHARD_MAP

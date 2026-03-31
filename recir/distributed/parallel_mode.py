@@ -65,11 +65,12 @@ class ParallelMode(ABC):
         self,
         model: torch.nn.Module,
         params_and_buffers: Dict[str, Any],
-        named_states: Dict[str, Any],
+        opt: Optional[torch.optim.Optimizer],
     ) -> None:
         """
         Shard model parameters and optimizer states according to the
-        parallel mode's strategy.
+        parallel mode's strategy.  Updates ``opt.state`` in-place so
+        that parameter→state mappings remain valid after sharding.
         """
         raise NotImplementedError
 
@@ -141,7 +142,7 @@ class GSPMDParallel(ParallelMode):
         self,
         model: torch.nn.Module,
         params_and_buffers: Dict[str, Any],
-        named_states: Dict[str, Any],
+        opt: Optional[torch.optim.Optimizer],
     ) -> None:
         pass  # No-op: GSPMD handles sharding via annotations
 
@@ -195,6 +196,7 @@ class DataParallel(ParallelMode):
     """
 
     parallel_style: DataParallelStyle
+    _use_parametrization: bool
 
     def __init__(
         self,
@@ -207,6 +209,7 @@ class DataParallel(ParallelMode):
         device_type: str = "cuda",
         backend: Optional[BackendType] = None,
         custom_passes: Optional[Callable[[GraphModule], GraphModule]] = None,
+        use_parametrization: bool = False,
     ) -> None:
         if parallel_style == "replicate":
             self.parallel_style = DataParallelStyle.REPLICATE
@@ -238,6 +241,7 @@ class DataParallel(ParallelMode):
 
         self._process_mesh: Optional[DeviceMesh] = None
         self._device_mesh: Optional[DeviceMesh] = None
+        self._use_parametrization = use_parametrization
 
     @property
     def num_ranks(self) -> int:
@@ -332,12 +336,12 @@ class DataParallel(ParallelMode):
         self,
         model: torch.nn.Module,
         params_and_buffers: Dict[str, Any],
-        named_states: Dict[str, Any],
+        opt: Optional[torch.optim.Optimizer],
     ) -> None:
         shard_params_and_states(
             model,
             params_and_buffers,
-            named_states,
+            opt,
             self.process_mesh,
             self.parallel_style,
         )
@@ -459,15 +463,12 @@ class HybridParallel(ParallelMode):
         self,
         model: torch.nn.Module,
         params_and_buffers: Dict[str, Any],
-        named_states: Dict[str, Any],
+        opt: Optional[torch.optim.Optimizer],
     ) -> None:
-        # Each param is sharded exactly once based on its role:
-        #   - Embedding params: always Shard(0) on vocabulary dim
-        #   - Dense params: Shard(0) if FULLY_SHARD, unsharded if REPLICATE
         shard_params_by_plan(
             model,
             params_and_buffers,
-            named_states,
+            opt,
             self.mesh,
             self.dense_style,
             self.embedding_plan.param_fqns,

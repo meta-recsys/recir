@@ -213,31 +213,33 @@ def _scatter_wait_result(
     # Scatter the split result.
     need_sort_nodes = []
     last_split_reshape_node = split_node
-    with gm.graph.inserting_after(split_node):
-        for idx, comm_block in enumerate(comm_blocks):
-            # Some users of the original allreduce and wait are scheduled
-            # before the fused allreduce. We must move these users to a
-            # correct topological sort order -- right after the last fused
-            # allreduce result, the `last_split_reshape_node` variable.
-            orig_wait = comm_block.wait_nodes[0]
-            nodes = collections.deque(list(orig_wait.users))
-            while nodes:
-                user_node = nodes.popleft()
-                if not isinstance(user_node, fx.Node):
-                    continue
-                if node_indices[user_node] < last_wait_node_idx:
-                    need_sort_nodes.append(user_node)
-                    nodes.extend(list(user_node.users))
+    cursor = split_node
+    for idx, comm_block in enumerate(comm_blocks):
+        # Some users of the original allreduce and wait are scheduled
+        # before the fused allreduce. We must move these users to a
+        # correct topological sort order -- right after the last fused
+        # allreduce result, the `last_split_reshape_node` variable.
+        orig_wait = comm_block.wait_nodes[0]
+        nodes = collections.deque(list(orig_wait.users))
+        while nodes:
+            user_node = nodes.popleft()
+            if not isinstance(user_node, fx.Node):
+                continue
+            if node_indices[user_node] < last_wait_node_idx:
+                need_sort_nodes.append(user_node)
+                nodes.extend(list(user_node.users))
 
+        with gm.graph.inserting_after(cursor):
             split_idx_node = gm.graph.call_function(operator.getitem, (split_node, idx))
-            with gm.graph.inserting_after(split_idx_node):
-                wait_output_node = gm.graph.call_function(
-                    aten.reshape, (split_idx_node, comm_block.shape)
-                )
-            gm.graph.node_replace_all_uses_with(orig_wait, wait_output_node)
+        with gm.graph.inserting_after(split_idx_node):
+            wait_output_node = gm.graph.call_function(
+                aten.reshape, (split_idx_node, comm_block.shape)
+            )
+        cursor = wait_output_node
+        gm.graph.node_replace_all_uses_with(orig_wait, wait_output_node)
 
-        if last_split_reshape_node == split_node:
-            last_split_reshape_node = wait_output_node  # type: ignore[possibly-undefined]
+    if last_split_reshape_node == split_node:
+        last_split_reshape_node = wait_output_node  # type: ignore[possibly-undefined]
 
     need_sort_nodes = sorted(need_sort_nodes, key=lambda node: node_indices[node])
     gm.graph.move_after(need_sort_nodes, last_split_reshape_node)

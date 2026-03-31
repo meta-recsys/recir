@@ -101,8 +101,15 @@ class TestDLRMSingleProcess(unittest.TestCase):
         compiled_obj = train_step.__dict__["_compiled_obj"]
         assert_hlo_has_collective(self, compiled_obj, "all-reduce", "XLA_GSPMD")
 
-    @parameterized.expand([("sum",), ("mean",)])
-    def test_dlrm_shard_map(self, loss_reduction):
+    @parameterized.expand(
+        [
+            ("sum", True),
+            ("sum", False),
+            ("mean", True),
+            ("mean", False),
+        ]
+    )
+    def test_dlrm_shard_map(self, loss_reduction, use_parametrization):
         self.assertGreaterEqual(self.num_ranks, 2)
         torch.manual_seed(42)
         global_bs = LOCAL_BS * self.num_ranks
@@ -128,6 +135,7 @@ class TestDLRMSingleProcess(unittest.TestCase):
                 num_processes=1,
                 device_type="cpu",
                 backend=BackendType.XLA_SHARD_MAP,
+                use_parametrization=use_parametrization,
             ),
             gm_transformation=GraphModuleTransformation(
                 backend=BackendType.XLA_SHARD_MAP,

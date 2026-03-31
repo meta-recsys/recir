@@ -6,7 +6,7 @@
 
 # pyre-strict
 from abc import ABC, abstractmethod
-from contextlib import contextmanager, nullcontext
+from contextlib import contextmanager, ExitStack, nullcontext
 from copy import copy
 from dataclasses import dataclass
 from functools import partial, wraps
@@ -20,7 +20,11 @@ import torch.nn as nn
 import torch.utils._pytree as pytree
 from functorch import make_fx
 from recir.decompositions import DEDUP_TARGETS, SPMD_DECOMP_TABLE
-from recir.distributed.data_parallel import gradients_tagging
+from recir.distributed.data_parallel import (
+    collectives_insertion,
+    gradients_tagging,
+    parametrize_params,
+)
 from recir.distributed.parallel_mode import DataParallel, GSPMDParallel, ParallelMode
 from recir.lowering.device_state import DeviceStateManager
 from torch import fx
@@ -216,6 +220,8 @@ def _local_compile(
     func: Callable[..., Any],
     module_override: Optional[List[Override]],
     *args: Any,
+    fake_mode: FakeTensorMode,
+    _parametrize_fns: Optional[List[Callable[[torch.Tensor], torch.Tensor]]] = None,
     _stateless_func_wrapper: Optional[Callable[..., Any]] = None,
     _input_transform: Optional[Callable[[Any], Any]] = None,
     **kwargs: Any,
@@ -234,12 +240,20 @@ def _local_compile(
         func: The train_step function to trace.
         module_override: Optional list of Override instances for submodule replacement.
         *args: Arguments to the train_step function (must include nn.Module and Optimizer).
-        _stateless_func_wrapper: Optional context manager factory to wrap the traced
-            function execution (e.g., gradients_tagging for DataParallel mode).
-            If None, no additional wrapping is applied.
+        fake_mode: The FakeTensorMode to use for tracing. Each compile path creates
+            its own mode and passes it here. This mode wraps the make_fx call
+            and is used to convert inputs when no _input_transform is provided.
+        _parametrize_fns: Optional list of per-parameter transform functions.
+            Each ``fn(param) -> param`` is registered via :func:`parametrize_params`
+            on the module during tracing, and deregistered after.  Multiple
+            functions are stacked in order (first fn applied first).
+        _stateless_func_wrapper: Optional context manager factory to wrap the
+            traced function execution (e.g., gradients_tagging for the v1/GSPMD
+            DataParallel path).  Receives the ``params`` dict and returns a
+            context manager.  If None, no additional wrapping is applied.
         _input_transform: Optional function to transform input tensors before tracing
             (e.g., FakeTensor conversion with batch expansion for DataParallel).
-            If None, inputs are converted to FakeTensors without modification.
+            If None, inputs are converted to FakeTensors using fake_mode.
         **kwargs: Keyword arguments to the train_step function.
     """
     # 1. Extract nn.Module and Optimizer from args and kwargs
@@ -282,15 +296,11 @@ def _local_compile(
     params = dict(mod.named_parameters(remove_duplicate=False))
     buffers = dict(mod.named_buffers(remove_duplicate=False))
 
-    named_states: Dict[str, Any] = {}
+    named_states: Dict[str, Any]
+    named_states = {}
     if opt is not None:
-        # Pass named_states instead of opt.state to stateless_func, because
-        # the later uses nn.Parameter as key. During tracing, we need to
-        # make sure optimizers can find the states using proxy tensors.
         for n, p in params.items():
             if p in opt.state:
-                # opt.state's key type is string, but optimizer uses
-                # Parameter as keys
                 named_states[n] = opt.state[p]  # type: ignore[index]
 
     # Lift states and parameters as function arguments so that make_fx
@@ -309,23 +319,21 @@ def _local_compile(
             if _opt
             else nullcontext(),
         ):
-            wrapper_ctx = (
-                _stateless_func_wrapper(params)
-                if _stateless_func_wrapper
-                else nullcontext()
-            )
-            with wrapper_ctx:
+            with ExitStack() as stack:
+                for fn in _parametrize_fns or []:
+                    stack.enter_context(parametrize_params(_mod, fn))
+                if _stateless_func_wrapper:
+                    stack.enter_context(_stateless_func_wrapper(params))
                 ret = func(*args, **kwargs)
 
             # make sure updated parameters are returned
             return ret, list(_mod.parameters()), list(named_states.values())
 
-    # Convert inputs (default: simple FakeTensor conversion)
+    # Convert inputs (default: simple FakeTensor conversion).
     if _input_transform is not None:
         args = pytree.tree_map_only(torch.Tensor, _input_transform, args)
         kwargs = pytree.tree_map_only(torch.Tensor, _input_transform, kwargs)
     else:
-        fake_mode: FakeTensorMode = FakeTensorMode()
         args = pytree.tree_map_only(
             torch.Tensor, lambda t: fake_mode.from_tensor(t), args
         )
@@ -333,7 +341,7 @@ def _local_compile(
             torch.Tensor, lambda t: fake_mode.from_tensor(t), kwargs
         )
 
-    with _enable_compile(), torch.autograd.detect_anomaly(check_nan=False):
+    with fake_mode, _enable_compile(), torch.autograd.detect_anomaly(check_nan=False):
         # FIXME(@mrshenli): functionalization does not work for our use
         # case yet. Use explicit decompositions for foreach ops.
         # Remove this when the following issue is addressed.
@@ -348,18 +356,29 @@ def _local_compile(
     return _LocalCompiledResult(gm, mod, opt, params, buffers, named_states)
 
 
-def _make_full_batch_transform(
+def _make_batch_transform(
     input_batch_dim: int,
-    num_processes: int,
+    ratio: float,
+    fake_mode: FakeTensorMode,
 ) -> Callable[[torch.Tensor], torch.Tensor]:
-    """Create an input transform that expands mini-batch tensors to global batch size."""
-    fake_mode: FakeTensorMode = FakeTensorMode()
+    """Create an input transform that expands or shrinks mini-batch tensors.
+
+    For ratio > 1 (e.g., v1 path: local → global batch), ``repeat`` expands.
+    For ratio < 1 (e.g., v2 XLA path: multi-device local → per-device batch),
+    ``narrow`` shrinks.  For ratio == 1 the tensor is unchanged.
+    """
 
     def _get_full_batch_arg(arg: torch.Tensor) -> torch.Tensor:
         fake_arg = fake_mode.from_tensor(arg)
-        arg_dims = [1] * arg.ndim
-        arg_dims[input_batch_dim] *= num_processes
-        return fake_arg.repeat(arg_dims)
+        curr_batch = fake_arg.shape[input_batch_dim]
+        target_batch = max(1, int(curr_batch * ratio))
+        if target_batch > curr_batch:
+            repeat_dims = [1] * arg.ndim
+            repeat_dims[input_batch_dim] = target_batch // curr_batch
+            return fake_arg.repeat(repeat_dims)
+        elif target_batch < curr_batch:
+            return fake_arg.narrow(input_batch_dim, 0, target_batch)
+        return fake_arg
 
     return _get_full_batch_arg
 
@@ -382,6 +401,29 @@ def _tag_batch_inputs(
             node.meta["is_batch_input"] = False
 
 
+def _finalize_graph(
+    gm: fx.GraphModule,
+    mod: nn.Module,
+    opt: Optional[torch.optim.Optimizer],
+    params_and_buffers: Dict[str, Any],
+    named_states: Dict[str, Any],
+    module_override: Optional[List[Override]],
+    input_batch_dim: int,
+    *,
+    dedup: bool = True,
+) -> _CompiledResult:
+    """Flatten state, dedup collectives, apply overrides, and tag batch inputs."""
+    flat_state = pytree.tree_leaves([params_and_buffers, named_states])
+    gm = _to_caller_flattened_graph_module(gm)
+    if dedup:
+        gm = _dedup_collectives(gm)
+    if module_override:
+        for override in module_override:
+            gm = override.transform(gm, flat_state)
+    _tag_batch_inputs(gm, len(flat_state), input_batch_dim)
+    return _CompiledResult(gm, mod, opt, flat_state, DeviceStateManager())
+
+
 def _compile_and_transform(
     func: Callable[..., Any],
     module_override: Optional[List[Override]],
@@ -392,6 +434,10 @@ def _compile_and_transform(
 ) -> _CompiledResult:
     if isinstance(parallel_mode, GSPMDParallel):
         result = _compile_gspmd(func, module_override, parallel_mode, *args, **kwargs)
+    elif isinstance(parallel_mode, DataParallel) and parallel_mode._use_parametrization:
+        result = _compile_data_parallel_v2(
+            func, module_override, parallel_mode, *args, **kwargs
+        )
     else:
         result = _compile_data_parallel(
             func, module_override, cast(DataParallel, parallel_mode), *args, **kwargs
@@ -421,13 +467,17 @@ def _compile_data_parallel(
       7. Deduplicate collective ops
       8. Apply module overrides
     """
+    fake_mode: FakeTensorMode = FakeTensorMode()
     local_result = _local_compile(
         func,
         module_override,
         *args,
+        fake_mode=fake_mode,
         _stateless_func_wrapper=gradients_tagging,
-        _input_transform=_make_full_batch_transform(
-            parallel_mode.input_batch_dim, parallel_mode.num_processes
+        _input_transform=_make_batch_transform(
+            parallel_mode.input_batch_dim,
+            ratio=parallel_mode.num_processes,
+            fake_mode=fake_mode,
         ),
         **kwargs,
     )
@@ -436,13 +486,19 @@ def _compile_data_parallel(
     opt = local_result.opt
     params = local_result.params
     buffers = local_result.buffers
-    named_states = local_result.named_states
     params_and_buffers: Dict[str, Union[torch.Tensor, nn.Parameter]] = {
         **params,
         **buffers,
     }
     # 4. Shard parameters and optimizer states before partitioning
-    parallel_mode.shard_params(mod, params_and_buffers, named_states)
+    parallel_mode.shard_params(mod, params_and_buffers, opt)
+    # Re-extract named_states from opt.state (now has correct sharded
+    # states keyed by the new parameter objects).
+    named_states: Dict[str, Any] = {}
+    if opt is not None:
+        for n, p in mod.named_parameters(remove_duplicate=False):
+            if p in opt.state:
+                named_states[n] = opt.state[p]  # type: ignore[index]
     # 5. parallel mode to expand a single device graph to a distributed graph
     gm = parallel_mode.partition(
         gm,
@@ -453,20 +509,83 @@ def _compile_data_parallel(
         args,
         kwargs,
     )
-    # 6. Flatten args for the caller.
-    flat_state = pytree.tree_leaves([params_and_buffers, named_states])
-    gm = _to_caller_flattened_graph_module(gm)
-    # 7. Dedup comm operators.
-    gm = _dedup_collectives(gm)
-    # 8. Replace previously inserted dummy ones with real graphs.
-    if module_override:
-        for override in module_override:
-            gm = override.transform(gm, flat_state)
+    return _finalize_graph(
+        gm,
+        mod,
+        opt,
+        params_and_buffers,
+        named_states,
+        module_override,
+        parallel_mode.input_batch_dim,
+    )
 
-    # 9. Tag placeholders with batch metadata for XLA lowering.
-    _tag_batch_inputs(gm, len(flat_state), parallel_mode.input_batch_dim)
 
-    return _CompiledResult(gm, mod, opt, flat_state, DeviceStateManager())
+def _compile_data_parallel_v2(
+    func: Callable[..., Any],
+    module_override: Optional[List[Override]],
+    parallel_mode: DataParallel,
+    *args: Any,
+    **kwargs: Any,
+) -> _CompiledResult:
+    """Compile with autograd-based collective insertion (no DTensor partition).
+
+    Both replicate and fully_shard use external FakeTensorMode + DTensor
+    redistribute for collective insertion during tracing.
+    """
+    mesh = parallel_mode.device_mesh
+    world_size: int = parallel_mode.num_ranks
+
+    # 1. Pre-extract mod/opt (need originals for pre-trace sharding).
+    mod: Optional[nn.Module] = None
+    opt: Optional[torch.optim.Optimizer] = None
+    for arg in pytree.arg_tree_leaves(*args, **kwargs):
+        if isinstance(arg, nn.Module):
+            mod = arg
+        if isinstance(arg, torch.optim.Optimizer):
+            opt = arg
+    assert mod is not None
+    _mod: nn.Module = mod
+
+    # 2. Shard params on the module and optimizer states (FSDP only).
+    #    Extract params_and_buffers first so shard_params can mutate both
+    #    the dict and the module in-place.  shard_params also updates
+    #    opt.state in-place so that parameter→state mappings remain valid.
+    params_and_buffers: Dict[str, Any] = {
+        **dict(_mod.named_parameters(remove_duplicate=False)),
+        **dict(_mod.named_buffers(remove_duplicate=False)),
+    }
+    parallel_mode.shard_params(_mod, params_and_buffers, opt)
+
+    # 3. Set up external fake mode and input transform.
+    fake_mode: FakeTensorMode = FakeTensorMode(allow_non_fake_inputs=True)
+
+    # 4. Set up parametrize fns and trace via _local_compile.
+    local_result = _local_compile(
+        func,
+        module_override,
+        *args,
+        fake_mode=fake_mode,
+        _parametrize_fns=[
+            collectives_insertion(parallel_mode.parallel_style, mesh),
+        ],
+        _input_transform=_make_batch_transform(
+            parallel_mode.input_batch_dim,
+            ratio=1 / (world_size // parallel_mode.num_processes),
+            fake_mode=fake_mode,
+        ),
+        **kwargs,
+    )
+
+    # 5. Finalize.
+    return _finalize_graph(
+        local_result.gm,
+        local_result.mod,
+        local_result.opt,
+        {**local_result.params, **local_result.buffers},
+        local_result.named_states,
+        module_override,
+        parallel_mode.input_batch_dim,
+    )
 
 
 def _compile_gspmd(
@@ -483,18 +602,22 @@ def _compile_gspmd(
     mini-batch by world_size) and metadata is attached for the GSPMD
     lowering step.
     """
+    fake_mode: FakeTensorMode = FakeTensorMode()
     local_result = _local_compile(
         func,
         module_override,
         *args,
+        fake_mode=fake_mode,
         _stateless_func_wrapper=gradients_tagging,
-        _input_transform=_make_full_batch_transform(
-            parallel_mode.input_batch_dim, parallel_mode.num_processes
+        _input_transform=_make_batch_transform(
+            parallel_mode.input_batch_dim,
+            ratio=parallel_mode.num_processes,
+            fake_mode=fake_mode,
         ),
         **kwargs,
     )
     gm = local_result.gm
-    # GSPMD auto-inserts all-reduce sum for gradients, but DDP uses
+    # GSPMD auto-inserts all-reduce sum for gradients
     # all-reduce average. Use the tag_grad markers to find gradient tensors
     # and scale them by 1/num_ranks to match DDP's averaging semantics.
     # For mean loss (grad_reduction="sum"), skip the scaling since the
@@ -524,18 +647,16 @@ def _compile_gspmd(
             gm.graph.erase_node(node)
     gm.recompile()
 
-    mod = local_result.mod
-    opt = local_result.opt
-    params = local_result.params
-    buffers = local_result.buffers
-    named_states = local_result.named_states
-
-    params_and_buffers: Dict[str, Any] = {**params, **buffers}
-    flat_state = pytree.tree_leaves([params_and_buffers, named_states])
-    gm = _to_caller_flattened_graph_module(gm)
-    _tag_batch_inputs(gm, len(flat_state), parallel_mode.input_batch_dim)
-
-    return _CompiledResult(gm, mod, opt, flat_state, DeviceStateManager())
+    return _finalize_graph(
+        gm,
+        local_result.mod,
+        local_result.opt,
+        {**local_result.params, **local_result.buffers},
+        local_result.named_states,
+        module_override=None,
+        input_batch_dim=parallel_mode.input_batch_dim,
+        dedup=False,
+    )
 
 
 # Note that the Python convention of __dict__ requires the key to be str.
