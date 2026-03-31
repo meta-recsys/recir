@@ -40,7 +40,7 @@ from torch.testing._internal.distributed._tensor.common_dtensor import (
 
 # Port offsets per (test, reduction) to avoid JAX coordinator collisions
 # between parameterized variants running in separate subprocesses.
-_SHARD_MAP_PORT_OFFSETS = {"sum": 1000, "mean": 1100}
+_SHARD_MAP_PORT_OFFSETS = {"sum": 1000, "mean": 1100, "sum_v1": 1200, "mean_v1": 1300}
 _GSPMD_PORT_OFFSETS = {"sum": 2000, "mean": 2100}
 
 
@@ -56,10 +56,17 @@ class TestGSPMDMultiDevice(DestroyPGMixin, DTensorTestBase):
     def world_size(self):
         return 2
 
-    @parameterized.expand([("sum",), ("mean",)])
+    @parameterized.expand(
+        [
+            ("sum", True),
+            ("sum", False),
+            ("mean", True),
+            ("mean", False),
+        ]
+    )
     @skip_if_lt_x_gpu(2)
     @with_comms
-    def test_2gpu_shard_map(self, loss_reduction):
+    def test_2gpu_shard_map(self, loss_reduction, use_parametrization):
         """Test @compile with DataParallel + XLA_SHARD_MAP vs DDP baseline."""
         model_xla, opt_xla = _create_model_and_warmup(self.rank)
         inputs = _generate_inputs(self.rank)
@@ -67,7 +74,8 @@ class TestGSPMDMultiDevice(DestroyPGMixin, DTensorTestBase):
             self.rank, inputs, loss_reduction=loss_reduction
         )
         reduce_fn = torch.sum if loss_reduction == "sum" else torch.mean
-        port_offset = _SHARD_MAP_PORT_OFFSETS[loss_reduction]
+        port_key = loss_reduction if use_parametrization else f"{loss_reduction}_v1"
+        port_offset = _SHARD_MAP_PORT_OFFSETS[port_key]
         with jax_distributed(port_offset=port_offset):
 
             @compile(
@@ -75,6 +83,7 @@ class TestGSPMDMultiDevice(DestroyPGMixin, DTensorTestBase):
                     "replicate",
                     loss_reduction=loss_reduction,
                     backend=BackendType.XLA_SHARD_MAP,
+                    use_parametrization=use_parametrization,
                 ),
                 gm_transformation=GraphModuleTransformation(
                     backend=BackendType.XLA_SHARD_MAP

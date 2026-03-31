@@ -10,7 +10,7 @@ import operator
 from contextlib import contextmanager
 from enum import Enum
 from functools import cached_property
-from typing import Any, Callable, cast, Dict, List, Optional, Set, Tuple, Union
+from typing import Any, Callable, cast, Dict, List, Optional, Set, Tuple, Type, Union
 
 import torch
 import torch.distributed._functional_collectives as funcol
@@ -19,7 +19,7 @@ import torch.library
 import torch.nn as nn
 import torch.utils._pytree as pytree
 from recir.distributed.batch_dim_utils import BatchDimAnalyzer
-from torch.distributed.tensor import DeviceMesh, Replicate, Shard
+from torch.distributed.tensor import DeviceMesh, DTensor, Replicate, Shard
 from torch.distributed.tensor._dtensor_spec import DTensorSpec
 from torch.distributed.tensor._op_schema import (
     OpSpec,
@@ -232,6 +232,139 @@ def gradients_tagging(params: Dict[str, torch.Tensor]) -> Any:
         # remove those hooks after tracing
         for h in tagging_hooks:
             h.remove()
+
+
+_PARAMETRIZATION_CLASS_CACHE: Dict[Type[nn.Module], Type[nn.Module]] = {}
+
+
+def _register_parametrization(
+    module: nn.Module,
+    parametrize_fn: Callable[[torch.Tensor], torch.Tensor],
+    recurse: bool = True,
+) -> None:
+    """Register a parametrization on all parameters of *module*.
+
+    When ``module.weight`` is accessed, the raw value from
+    ``self._parameters["weight"]`` is passed through every registered
+    ``parametrize_fn`` in order.  Multiple calls **stack** — each new
+    function is appended to the chain.
+
+    Args:
+        module: The module (and optionally its submodules) to parametrize.
+        parametrize_fn: ``(Tensor) -> Tensor`` applied to the raw parameter.
+        recurse: If True, also parametrize all submodules.
+    """
+    modules = module.named_modules() if recurse else [("", module)]
+    for _fqn, submod in modules:
+        param_names = [
+            name for name in submod._parameters if submod._parameters[name] is not None
+        ]
+        if not param_names:
+            continue
+
+        base_class = submod.__class__
+        if not hasattr(base_class, "_recir_parametrized_base"):
+            # First parametrization on this module — create class + storage.
+            submod._parametrizations = {}  # type: ignore[assignment]
+            for pn in param_names:
+                submod._parametrizations[pn] = []  # type: ignore[index]
+
+            if base_class not in _PARAMETRIZATION_CLASS_CACHE:
+                properties: Dict[str, Any] = {}
+
+                def _make_getter(param_name: str) -> property:
+                    def getter(self: nn.Module) -> torch.Tensor:
+                        value = self._parameters[param_name]
+                        for p in self._parametrizations[param_name]:  # type: ignore[index]
+                            value = p(value)
+                        return value
+
+                    return property(getter)
+
+                for pn in param_names:
+                    properties[pn] = _make_getter(pn)
+
+                new_cls = type(
+                    base_class.__name__,
+                    (base_class,),
+                    properties,
+                )
+                new_cls._recir_parametrized_base = base_class  # type: ignore[attr-defined]
+                _PARAMETRIZATION_CLASS_CACHE[base_class] = new_cls
+
+            submod.__class__ = _PARAMETRIZATION_CLASS_CACHE[base_class]
+
+        for pn in param_names:
+            submod._parametrizations[pn].append(parametrize_fn)  # type: ignore[index]
+
+
+def _deregister_parametrization(
+    module: nn.Module,
+    parametrize_fn: Callable[[torch.Tensor], torch.Tensor],
+    recurse: bool = True,
+) -> None:
+    """Remove *parametrize_fn* from *module* (inverse of :func:`_register_parametrization`)."""
+    modules = module.named_modules() if recurse else [("", module)]
+    for _fqn, submod in modules:
+        if not hasattr(submod, "_parametrizations"):
+            continue
+        for pn in list(submod._parametrizations):  # type: ignore[union-attr]
+            plist = submod._parametrizations[pn]  # type: ignore[index]
+            if parametrize_fn in plist:
+                plist.remove(parametrize_fn)
+
+        # Restore original class if no parametrizations remain.
+        if all(
+            len(plist) == 0
+            for plist in submod._parametrizations.values()  # type: ignore[union-attr]
+        ):
+            orig_cls = getattr(submod.__class__, "_recir_parametrized_base", None)
+            if orig_cls is not None:
+                submod.__class__ = orig_cls
+            del submod._parametrizations  # type: ignore[union-attr]
+
+
+@contextmanager
+def parametrize_params(
+    module: nn.Module,
+    parametrize_fn: Callable[[torch.Tensor], torch.Tensor],
+) -> Any:
+    """Temporarily register *parametrize_fn* on *module*; remove on exit.
+
+    Supports nesting — each layer appends to the parametrization chain::
+        with parametrize_params(module, collectives_fn):
+            with parametrize_params(module, mixed_precision_fn):
+                # module.weight → mixed_precision_fn(collectives_fn(raw_weight))
+                ...
+    """
+    _register_parametrization(module, parametrize_fn)
+    try:
+        yield
+    finally:
+        _deregister_parametrization(module, parametrize_fn)
+
+
+# ---------------------------------------------------------------------------
+# Autograd-based collective insertion (replaces gradients_tagging + partition)
+# ---------------------------------------------------------------------------
+
+
+def collectives_insertion(
+    parallel_style: DataParallelStyle,
+    mesh: DeviceMesh,
+) -> Callable[[torch.Tensor], torch.Tensor]:
+    """Return a per-parameter transform that inserts DTensor collectives."""
+
+    def _parametrize_fn(param: torch.Tensor) -> torch.Tensor:
+        if parallel_style == DataParallelStyle.FULLY_SHARD:
+            dtensor = DTensor.from_local(param, mesh, [Shard(0)], run_check=False)
+            full = dtensor.redistribute(mesh, [Replicate()])
+            return full.to_local(grad_placements=[Partial("avg")])
+        else:
+            dtensor = DTensor.from_local(param, mesh, [Replicate()], run_check=False)
+            return dtensor.to_local(grad_placements=[Partial("avg")])
+
+    return _parametrize_fn
 
 
 def _gen_shard_spec(
@@ -896,7 +1029,7 @@ def partitioner(graph: GraphModule) -> GraphModule:
 def shard_params_and_states(
     model: nn.Module,
     params_buffers: Dict[str, torch.Tensor],
-    named_states: Dict[str, Any],
+    opt: Optional[torch.optim.Optimizer],
     mesh: DeviceMesh,
     parallel_style: DataParallelStyle,
 ) -> None:
@@ -905,39 +1038,30 @@ def shard_params_and_states(
     For FULLY_SHARD, the partitioner rewrites the graph to expect locally
     sharded parameter/state tensors as inputs (and inserts allgather
     collectives to reconstruct full tensors before compute). We must
-    actually shard the real tensors in params_buffers and named_states to
-    match, otherwise the allgather will double the already-full tensors.
+    actually shard the real tensors in params_buffers to match, otherwise
+    the allgather will double the already-full tensors.
     """
     if parallel_style != DataParallelStyle.FULLY_SHARD:
         return
 
     shard_spec = DTensorSpec(mesh=mesh, placements=(Shard(0),))
-    for key in params_buffers:
-        full_tensor = params_buffers[key]
-        local_shard = partition_value(full_tensor, shard_spec)
+    for key in list(params_buffers.keys()):
+        old_param = params_buffers[key]
+        local_shard = partition_value(old_param, shard_spec)
         params_buffers[key] = local_shard
         atoms = key.split(".")
         parent = model
         for atom in atoms[:-1]:
             parent = getattr(parent, atom)
-        # Update the model parameters to store sharded data
-        setattr(
-            parent,
-            atoms[-1],
-            nn.Parameter(
-                local_shard,
-                requires_grad=full_tensor.requires_grad,
-            ),
+        new_param = nn.Parameter(
+            local_shard,
+            requires_grad=old_param.requires_grad,
         )
-    for key in named_states:
-        if isinstance(named_states[key], torch.Tensor):
-            named_states[key] = partition_value(named_states[key], shard_spec)
-        elif isinstance(named_states[key], dict):
-            for s_key in named_states[key]:
-                if isinstance(named_states[key][s_key], torch.Tensor):
-                    named_states[key][s_key] = partition_value(
-                        named_states[key][s_key], shard_spec
-                    )
+        setattr(parent, atoms[-1], new_param)
+        if opt is not None and old_param in opt.state:
+            state = opt.state.pop(old_param)
+            _shard_state_dict(state, shard_spec)
+            opt.state[new_param] = state
 
 
 def _clone_param_chains_for_backward(
@@ -1119,28 +1243,21 @@ def _shard_param(
     )
 
 
-def _shard_optimizer_state(
-    named_states: Dict[str, Any],
-    key: str,
+def _shard_state_dict(
+    state: Any,
     shard_spec: DTensorSpec,
 ) -> None:
-    """Shard optimizer states for a single parameter key."""
-    if key not in named_states:
-        return
-    if isinstance(named_states[key], torch.Tensor):
-        named_states[key] = partition_value(named_states[key], shard_spec)
-    elif isinstance(named_states[key], dict):
-        for s_key in named_states[key]:
-            if isinstance(named_states[key][s_key], torch.Tensor):
-                named_states[key][s_key] = partition_value(
-                    named_states[key][s_key], shard_spec
-                )
+    """Shard tensor values inside an optimizer state entry in-place."""
+    if isinstance(state, dict):
+        for key in state:
+            if isinstance(state[key], torch.Tensor):
+                state[key] = partition_value(state[key], shard_spec)
 
 
 def shard_params_by_plan(
     model: nn.Module,
     params_buffers: Dict[str, torch.Tensor],
-    named_states: Dict[str, Any],
+    opt: Optional[torch.optim.Optimizer],
     mesh: DeviceMesh,
     dense_style: DataParallelStyle,
     embedding_param_fqns: Set[str],
@@ -1155,16 +1272,18 @@ def shard_params_by_plan(
     """
     shard_spec = DTensorSpec(mesh=mesh, placements=(Shard(0),))
     for key in list(params_buffers.keys()):
-        if key in embedding_param_fqns:
+        if key in embedding_param_fqns or dense_style == DataParallelStyle.FULLY_SHARD:
+            old_param = params_buffers[key]
             _shard_param(model, params_buffers, key, shard_spec)
-            _shard_optimizer_state(named_states, key, shard_spec)
-        elif dense_style == DataParallelStyle.FULLY_SHARD:
-            _shard_param(model, params_buffers, key, shard_spec)
-    # Shard optimizer states for dense params in FULLY_SHARD mode.
-    if dense_style == DataParallelStyle.FULLY_SHARD:
-        for key in named_states:
-            if key not in embedding_param_fqns:
-                _shard_optimizer_state(named_states, key, shard_spec)
+            if opt is not None and old_param in opt.state:
+                state = opt.state.pop(old_param)
+                _shard_state_dict(state, shard_spec)
+                # Retrieve the nn.Parameter that _shard_param set on the model
+                # (params_buffers[key] is a plain tensor, not the Parameter).
+                obj: Any = model
+                for atom in key.split("."):
+                    obj = getattr(obj, atom)
+                opt.state[obj] = state
 
 
 def decomposed_row_wise_embedding(
