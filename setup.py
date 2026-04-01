@@ -16,7 +16,6 @@ setup(
     long_description_content_type="text/markdown",
     license="BSD-3-Clause",
     url="https://github.com/meta-recsys/recir",
-    package_dir={"": "../.."},
     packages=[
         "recir",
         "recir.distributed",
@@ -36,6 +35,13 @@ setup(
             "flax>=0.10.5",
             "optax>=0.2.5",
         ],
+        "tpu": [
+            "jax>=0.8.0",
+            "jaxlib>=0.8.0",
+            "flax>=0.10.5",
+            "optax>=0.2.5",
+            "libtpu",
+        ],
         "rec": [
             "torchrec",
         ],
@@ -48,6 +54,7 @@ setup(
             "jaxlib>=0.8.0",
             "flax>=0.10.5",
             "optax>=0.2.5",
+            "libtpu",
             "torchrec",
             "expecttest>=0.3.0",
             "parameterized>=0.9.0",
