@@ -23,10 +23,12 @@
 # pyre-strict
 
 
+import unittest
 from copy import deepcopy
 from typing import Callable, List, Tuple
 
 import torch
+from functorch import make_fx
 from generative_recommenders.common import HammerKernel, set_dev_mode
 from generative_recommenders.modules.stu import STU, STULayer, STULayerConfig, STUStack
 from recir.api import compile
@@ -114,6 +116,82 @@ class Model(torch.nn.Module):
                 num_targets=num_targets,
             )
         )
+
+
+class STUInferenceTest(unittest.TestCase):
+    """Test STU inference by tracing the forward pass into an FX graph via make_fx.
+
+    This mirrors how recir.api.compile works internally: it uses functorch.make_fx
+    to trace a stateless version of the model into an fx.GraphModule. Here we trace
+    only the forward pass (no backward/optimizer) and verify the traced graph
+    produces output identical to eager execution.
+    """
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")  # pyre-ignore[56]
+    def test_fx_traced_forward(self) -> None:
+        """Trace STU forward into an FX graph and verify it matches eager output."""
+        torch.manual_seed(42)
+        set_dev_mode(True)
+
+        model: STUStack = build_stu_model()
+        model.recursive_setattr("_hammer_kernel", HammerKernel.TRITON)
+        model.cuda()
+        model.eval()
+
+        max_seq_len: int
+        x, x_lengths, x_offsets, max_seq_len, num_targets = build_inputs()
+        x = x.cuda()
+        x_lengths = x_lengths.cuda()
+        x_offsets = x_offsets.cuda()
+        num_targets = num_targets.cuda()
+
+        # Lift params/buffers as function args (same pattern as recir._local_compile)
+        params = dict(model.named_parameters())
+        buffers = dict(model.named_buffers())
+
+        def forward_fn(
+            params: dict[str, torch.nn.Parameter],
+            buffers: dict[str, torch.Tensor],
+            x: torch.Tensor,
+            x_lengths: torch.Tensor,
+            x_offsets: torch.Tensor,
+            num_targets: torch.Tensor,
+        ) -> torch.Tensor:
+            return torch.func.functional_call(
+                model,
+                {**params, **buffers},
+                args=(),
+                kwargs={
+                    "x": x,
+                    "x_lengths": x_lengths,
+                    "x_offsets": x_offsets,
+                    "max_seq_len": max_seq_len,
+                    "num_targets": num_targets,
+                },
+            )
+
+        # Trace into FX graph (same primitive recir uses internally)
+        gm = make_fx(forward_fn)(params, buffers, x, x_lengths, x_offsets, num_targets)
+
+        # Eager reference
+        with torch.no_grad():
+            eager_out = model(
+                x=x,
+                x_lengths=x_lengths,
+                x_offsets=x_offsets,
+                max_seq_len=max_seq_len,
+                num_targets=num_targets,
+            )
+
+        # Run traced FX graph
+        with torch.no_grad():
+            traced_out = gm(params, buffers, x, x_lengths, x_offsets, num_targets)
+
+        self.assertEqual(eager_out.shape, traced_out.shape)
+        self.assertEqual(eager_out.dtype, traced_out.dtype)
+        self.assertFalse(torch.isnan(traced_out).any().item())
+        self.assertFalse(torch.isinf(traced_out).any().item())
+        torch.testing.assert_close(eager_out, traced_out)
 
 
 class STUTest(DTensorTestBase):
