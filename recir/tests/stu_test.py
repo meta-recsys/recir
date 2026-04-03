@@ -33,6 +33,7 @@ from generative_recommenders.common import HammerKernel, set_dev_mode
 from generative_recommenders.modules.stu import STU, STULayer, STULayerConfig, STUStack
 from recir.api import compile, COMPILED_OBJECT_KEY
 from recir.distributed.parallel_mode import DataParallel
+from recir.graph_utils import get_output, rebuild_graph
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.testing._internal.common_distributed import skip_if_lt_x_gpu
@@ -307,6 +308,111 @@ class STUInferenceTest(unittest.TestCase):
 
         self.assertEqual(eager_out.shape, traced_out.shape)
         torch.testing.assert_close(eager_out, traced_out)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")  # pyre-ignore[56]
+    def test_detach_inference_from_training(self) -> None:
+        """Detach the inference graph from a training graph via DCE.
+
+        Given a training graph that returns (loss, forward_output), modify
+        the output to only keep forward_output and run dead code elimination.
+        The loss reduction ops (aten.sum) become unreachable and get removed,
+        producing a clean inference graph from the training graph.
+        """
+        torch.manual_seed(42)
+        set_dev_mode(True)
+
+        model: STUStack = build_stu_model()
+        model.recursive_setattr("_hammer_kernel", HammerKernel.TRITON)
+        model.cuda()
+        model.eval()
+
+        max_seq_len: int
+        x, x_lengths, x_offsets, max_seq_len, num_targets = build_inputs()
+        x = x.cuda()
+        x_lengths = x_lengths.cuda()
+        x_offsets = x_offsets.cuda()
+        num_targets = num_targets.cuda()
+
+        params = dict(model.named_parameters())
+        buffers = dict(model.named_buffers())
+
+        # Shared forward
+        def forward_fn(
+            params: dict[str, torch.nn.Parameter],
+            buffers: dict[str, torch.Tensor],
+            x: torch.Tensor,
+            x_lengths: torch.Tensor,
+            x_offsets: torch.Tensor,
+            num_targets: torch.Tensor,
+        ) -> torch.Tensor:
+            return torch.func.functional_call(
+                model,
+                {**params, **buffers},
+                args=(),
+                kwargs={
+                    "x": x,
+                    "x_lengths": x_lengths,
+                    "x_offsets": x_offsets,
+                    "max_seq_len": max_seq_len,
+                    "num_targets": num_targets,
+                },
+            )
+
+        # Training returns BOTH loss and forward output
+        def train_with_output_fn(
+            params: dict[str, torch.nn.Parameter],
+            buffers: dict[str, torch.Tensor],
+            x: torch.Tensor,
+            x_lengths: torch.Tensor,
+            x_offsets: torch.Tensor,
+            num_targets: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            out = forward_fn(params, buffers, x, x_lengths, x_offsets, num_targets)
+            return out.sum(), out
+
+        inp = (params, buffers, x, x_lengths, x_offsets, num_targets)
+
+        # Trace training graph (returns (loss, forward_output))
+        train_gm = make_fx(train_with_output_fn)(*inp)
+        train_node_count: int = len(list(train_gm.graph.nodes))
+
+        # --- Detach inference graph via output modification + DCE ---
+        infer_gm = deepcopy(train_gm)
+        output_node = get_output(infer_gm.graph)
+        # output_node.args[0] is [loss, forward_output]
+        # Replace loss with forward_output so both slots return the same tensor.
+        # This preserves the pytree output spec (still a 2-tuple) while making
+        # the loss node unreachable for DCE to remove.
+        original_output = output_node.args[0]
+        assert isinstance(original_output, (list, tuple))
+        self.assertEqual(len(original_output), 2)
+        forward_output = original_output[1]
+        output_node.args = ([forward_output, forward_output],)
+        rebuild_graph(infer_gm)
+
+        infer_node_count: int = len(list(infer_gm.graph.nodes))
+        self.assertLess(
+            infer_node_count,
+            train_node_count,
+            "DCE should have removed training-only ops (aten.sum)",
+        )
+
+        # Verify no aten.sum in the detached graph
+        detached_ops = {
+            str(n.target) for n in infer_gm.graph.nodes if n.op == "call_function"
+        }
+        sum_ops = {op for op in detached_ops if "sum" in op}
+        self.assertEqual(len(sum_ops), 0, f"aten.sum should be removed: {sum_ops}")
+
+        # --- Verify numerical parity with separately traced inference graph ---
+        ref_gm = make_fx(forward_fn)(*inp)
+
+        with torch.no_grad():
+            detached_out = infer_gm(*inp)[0]  # both tuple elements are identical
+            ref_out = ref_gm(*inp)
+
+        self.assertEqual(detached_out.shape, ref_out.shape)
+        torch.testing.assert_close(detached_out, ref_out)
 
 
 class STUTest(DTensorTestBase):
