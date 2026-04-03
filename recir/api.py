@@ -326,8 +326,9 @@ def _local_compile(
                     stack.enter_context(_stateless_func_wrapper(params))
                 ret = func(*args, **kwargs)
 
-            # make sure updated parameters are returned
-            return ret, list(_mod.parameters()), list(named_states.values())
+            # Return updated state in the same pytree structure used to build
+            # flat_state so DeviceStateManager can copy outputs back by index.
+            return ret, params, buffers, named_states
 
     # Convert inputs (default: simple FakeTensor conversion).
     if _input_transform is not None:
