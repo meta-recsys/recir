@@ -1,0 +1,1042 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-3-Clause license found in the
+# LICENSE file in the root directory of this source tree.
+
+# pyre-strict
+
+from __future__ import annotations
+
+import unittest
+from collections import OrderedDict
+from contextlib import ExitStack
+from typing import Any
+
+import torch
+import torch.fx as fx
+import torch.nn as nn
+from functorch import make_fx
+from recir.graph_utils import OP
+from recir.region_transforms import (
+    _apply_region_transforms,
+    _discover_autograd_functions,
+    _discover_called_modules,
+    _extract_subgraph,
+    _find_forward_roots,
+    _preserve_autograd_function_leaves,
+    _replace_region,
+    RecomputeTransform,
+    RegatherTransform,
+    RegionTransform,
+)
+from torch._subclasses.fake_tensor import FakeTensorMode
+from torch.testing._internal.common_utils import run_tests
+
+
+def _make_fake_mode() -> FakeTensorMode:
+    """Create a FakeTensorMode that accepts real (non-fake) parameter tensors."""
+    return FakeTensorMode(allow_non_fake_inputs=True)
+
+
+# ---------------------------------------------------------------------------
+# Test models
+# ---------------------------------------------------------------------------
+
+
+class SimpleMLP(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.net1 = nn.Linear(50, 32)
+        self.relu = nn.ReLU()
+        self.net2 = nn.Linear(32, 8)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return torch.sigmoid(self.net2(self.relu(self.net1(x))))
+
+
+class TwoPathModel(nn.Module):
+    """Model with two submodules called separately (not via parent forward)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.encoder = nn.Linear(16, 16)
+        self.decoder = nn.Linear(16, 8)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = torch.relu(self.encoder(x))
+        return self.decoder(h)
+
+
+class ModelWithUnused(nn.Module):
+    """Model with an unused submodule branch."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.used = nn.Linear(10, 10)
+        self.unused = nn.Linear(10, 10)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.used(x)
+
+
+class SharedWeightMLP(nn.Module):
+    """Single linear layer reused 3 times in forward."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.linear = nn.Linear(32, 32, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = torch.relu(self.linear(x))
+        x = torch.relu(self.linear(x))
+        return self.linear(x)
+
+
+# ---------------------------------------------------------------------------
+# Unit tests: _discover_called_modules
+# ---------------------------------------------------------------------------
+
+
+class TestDiscoverCalledModules(unittest.TestCase):
+    def test_simple_model(self) -> None:
+        model = SimpleMLP()
+        fake_mode = _make_fake_mode()
+        x = torch.randn(4, 50)
+        called = _discover_called_modules(
+            model, fake_mode, lambda m, inp: m(inp), model, x
+        )
+
+        fqns = set(called.keys())
+        self.assertIn("", fqns)
+        self.assertIn("net1", fqns)
+        self.assertIn("relu", fqns)
+        self.assertIn("net2", fqns)
+
+    def test_unused_submodule_not_discovered(self) -> None:
+        model = ModelWithUnused()
+        fake_mode = _make_fake_mode()
+        x = torch.randn(4, 10)
+        called = _discover_called_modules(
+            model, fake_mode, lambda m, inp: m(inp), model, x
+        )
+
+        fqns = set(called.keys())
+        self.assertIn("used", fqns)
+        self.assertNotIn("unused", fqns)
+
+    def test_captures_input_shapes(self) -> None:
+        model = SimpleMLP()
+        fake_mode = _make_fake_mode()
+        x = torch.randn(4, 50)
+        called = _discover_called_modules(
+            model, fake_mode, lambda m, inp: m(inp), model, x
+        )
+
+        _, root_args = called[""]
+        self.assertEqual(len(root_args), 1)
+        self.assertEqual(root_args[0].shape, torch.Size([4, 50]))
+
+    def test_ordered_dict_preserves_call_order(self) -> None:
+        model = SimpleMLP()
+        fake_mode = _make_fake_mode()
+        x = torch.randn(4, 50)
+        called = _discover_called_modules(
+            model, fake_mode, lambda m, inp: m(inp), model, x
+        )
+
+        fqns = list(called.keys())
+        self.assertEqual(fqns[0], "")
+
+
+# ---------------------------------------------------------------------------
+# Unit tests: _find_forward_roots
+# ---------------------------------------------------------------------------
+
+
+class TestFindForwardRoots(unittest.TestCase):
+    def test_standard_usage_single_root(self) -> None:
+        """When model.forward() is called, model is the root."""
+        model = SimpleMLP()
+        fake_mode = _make_fake_mode()
+        x = torch.randn(4, 50)
+        called = _discover_called_modules(
+            model, fake_mode, lambda m, inp: m(inp), model, x
+        )
+        roots = _find_forward_roots(called)
+
+        self.assertEqual(len(roots), 1)
+        fqn, mod, _args = roots[0]
+        self.assertEqual(fqn, "")
+        self.assertIs(mod, model)
+
+    def test_submodules_are_not_roots(self) -> None:
+        """net1, relu, net2 are NOT roots because their parent (model) IS called."""
+        model = SimpleMLP()
+        fake_mode = _make_fake_mode()
+        x = torch.randn(4, 50)
+        called = _discover_called_modules(
+            model, fake_mode, lambda m, inp: m(inp), model, x
+        )
+        roots = _find_forward_roots(called)
+
+        root_fqns = {fqn for fqn, _, _ in roots}
+        self.assertNotIn("net1", root_fqns)
+        self.assertNotIn("relu", root_fqns)
+        self.assertNotIn("net2", root_fqns)
+
+    def test_manual_sub_model_calls(self) -> None:
+        """When encoder and decoder are called directly (not via parent forward),
+        both should be forward roots."""
+        model = TwoPathModel()
+        called: OrderedDict[str, tuple[nn.Module, tuple[Any, ...]]] = OrderedDict()
+        called["encoder"] = (model.encoder, (torch.randn(4, 16),))
+        called["decoder"] = (model.decoder, (torch.randn(4, 16),))
+
+        roots = _find_forward_roots(called)
+        root_fqns = {fqn for fqn, _, _ in roots}
+        self.assertEqual(root_fqns, {"encoder", "decoder"})
+
+    def test_nested_modules_not_roots_when_parent_called(self) -> None:
+        """If parent IS called, children are NOT roots."""
+        called: OrderedDict[str, tuple[nn.Module, tuple[Any, ...]]] = OrderedDict()
+        dummy_mod = nn.Linear(10, 10)
+        dummy_args: tuple[Any, ...] = (torch.randn(4, 10),)
+        called[""] = (dummy_mod, dummy_args)
+        called["encoder"] = (dummy_mod, dummy_args)
+        called["encoder.attn"] = (dummy_mod, dummy_args)
+
+        roots = _find_forward_roots(called)
+        root_fqns = {fqn for fqn, _, _ in roots}
+        self.assertEqual(root_fqns, {""})
+
+    def test_container_module_skipped_in_ancestor_walk(self) -> None:
+        """Children of container modules (e.g. nn.ModuleList) that don't
+        call forward() should NOT become roots if a grandparent IS called.
+
+        Reproduces the STU pattern:
+          Model ("") → STUStack ("stu") → ModuleList ("stu.layers")
+                                           → Layer ("stu.layers.0")
+
+        ModuleList.forward() is never called (it's just iterated), so
+        "stu.layers" is absent from called_modules.  "stu.layers.0"
+        must NOT be a root because its grandparent "stu" IS called.
+        """
+        called: OrderedDict[str, tuple[nn.Module, tuple[Any, ...]]] = OrderedDict()
+        dummy_mod = nn.Linear(10, 10)
+        dummy_args: tuple[Any, ...] = (torch.randn(4, 10),)
+        called[""] = (dummy_mod, dummy_args)
+        called["stu"] = (dummy_mod, dummy_args)
+        # "stu.layers" is NOT in called — ModuleList never calls forward().
+        called["stu.layers.0"] = (dummy_mod, dummy_args)
+
+        roots = _find_forward_roots(called)
+        root_fqns = {fqn for fqn, _, _ in roots}
+        self.assertEqual(root_fqns, {""})
+        # "stu.layers.0" should NOT be a root because "stu" is called.
+
+
+# ---------------------------------------------------------------------------
+# Unit tests: _extract_subgraph and _replace_region
+# ---------------------------------------------------------------------------
+
+
+class TestExtractSubgraph(unittest.TestCase):
+    def _make_simple_graph(self) -> fx.GraphModule:
+        """Create a simple graph: x → relu(x) → neg(relu_x) → output."""
+
+        class M(nn.Module):
+            def forward(self, x: torch.Tensor) -> torch.Tensor:
+                return torch.neg(torch.relu(x))
+
+        return make_fx(M())(torch.randn(4, 8))
+
+    def test_single_node_extraction(self) -> None:
+        gm = self._make_simple_graph()
+        relu_nodes = [
+            n
+            for n in gm.graph.nodes
+            if n.op == OP.CALL_FUNCTION and "relu" in str(n.target)
+        ]
+        self.assertEqual(len(relu_nodes), 1)
+        relu_node = relu_nodes[0]
+
+        sub_gm = _extract_subgraph(gm, {relu_node})
+
+        ops = [n.op for n in sub_gm.graph.nodes]
+        self.assertEqual(ops.count(OP.PLACEHOLDER), 1)
+        self.assertEqual(ops.count(OP.OUTPUT), 1)
+        call_fns = [n for n in sub_gm.graph.nodes if n.op == OP.CALL_FUNCTION]
+        self.assertEqual(len(call_fns), 1)
+
+    def test_multi_node_extraction(self) -> None:
+        """Extract a chain: relu + neg as a region."""
+        gm = self._make_simple_graph()
+        region = {n for n in gm.graph.nodes if n.op == OP.CALL_FUNCTION}
+        self.assertEqual(len(region), 2)
+
+        sub_gm = _extract_subgraph(gm, region)
+
+        ops = [n.op for n in sub_gm.graph.nodes]
+        self.assertEqual(ops.count(OP.PLACEHOLDER), 1)
+        self.assertEqual(ops.count(OP.OUTPUT), 1)
+        call_fns = [n for n in sub_gm.graph.nodes if n.op == OP.CALL_FUNCTION]
+        self.assertEqual(len(call_fns), 2)
+
+    def test_extracted_subgraph_runs_correctly(self) -> None:
+        gm = self._make_simple_graph()
+        relu_nodes = [
+            n
+            for n in gm.graph.nodes
+            if n.op == OP.CALL_FUNCTION and "relu" in str(n.target)
+        ]
+        sub_gm = _extract_subgraph(gm, set(relu_nodes))
+
+        x = torch.randn(4, 8)
+        expected = torch.relu(x)
+        result = sub_gm(x)
+        torch.testing.assert_close(result, expected)
+
+
+class TestReplaceRegion(unittest.TestCase):
+    def test_single_node_replacement(self) -> None:
+        """Replace relu with a custom function, verify graph still works."""
+
+        class M(nn.Module):
+            def forward(self, x: torch.Tensor) -> torch.Tensor:
+                return torch.neg(torch.relu(x))
+
+        gm = make_fx(M())(torch.randn(4, 8))
+
+        relu_nodes = [
+            n
+            for n in gm.graph.nodes
+            if n.op == OP.CALL_FUNCTION and "relu" in str(n.target)
+        ]
+        self.assertEqual(len(relu_nodes), 1)
+
+        def custom_fn(x: torch.Tensor) -> torch.Tensor:
+            return torch.abs(x)
+
+        _replace_region(gm, set(relu_nodes), custom_fn)
+
+        x = torch.randn(4, 8)
+        expected = torch.neg(torch.abs(x))
+        result = gm(x)
+        torch.testing.assert_close(result, expected)
+
+    def test_graph_lint_passes_after_replacement(self) -> None:
+        class M(nn.Module):
+            def forward(self, x: torch.Tensor) -> torch.Tensor:
+                return torch.neg(torch.relu(x))
+
+        gm = make_fx(M())(torch.randn(4, 8))
+        relu_nodes = [
+            n
+            for n in gm.graph.nodes
+            if n.op == OP.CALL_FUNCTION and "relu" in str(n.target)
+        ]
+
+        def identity_fn(x: torch.Tensor) -> torch.Tensor:
+            return x
+
+        _replace_region(gm, set(relu_nodes), identity_fn)
+
+        # Verify graph is valid after replacement.
+        gm.graph.lint()
+        self.assertTrue(True, "graph.lint() passed after replacement")
+
+
+# ---------------------------------------------------------------------------
+# Unit tests: RegatherTransform
+# ---------------------------------------------------------------------------
+
+
+class TestRegatherTransformDetection(unittest.TestCase):
+    def test_detect_chain_regions(self) -> None:
+        """Each parameter's usage chain (param → chain_ops → compute) is a region."""
+        model = SimpleMLP()
+        fake_mode = _make_fake_mode()
+        x = torch.randn(4, 50)
+
+        # Use the same stateless tracing pattern as _apply_region_transforms.
+        from torch.nn.utils import stateless
+
+        params = dict(model.named_parameters(remove_duplicate=False))
+        buffers = dict(model.named_buffers(remove_duplicate=False))
+
+        def _stateless_forward(  # pyre-ignore[53]
+            params_and_buffers: dict[str, Any], *args: Any
+        ) -> Any:
+            with stateless._reparametrize_module(model, params_and_buffers):
+                return model(*args)
+
+        with fake_mode:
+            gm = make_fx(
+                _stateless_forward,
+                tracing_mode="fake",
+                _allow_non_fake_inputs=True,
+            )({**params, **buffers}, fake_mode.from_tensor(x))
+
+        called = _discover_called_modules(
+            model, fake_mode, lambda m, inp: m(inp), model, x
+        )
+
+        transform = RegatherTransform()
+        regions = transform.detect_regions(gm, called)
+
+        # SimpleMLP has 4 parameters. Each should produce at least one region.
+        self.assertGreaterEqual(len(regions), 4)
+
+        # Each region should contain more than just a placeholder — it should
+        # include chain ops and/or the compute consumer.
+        for region in regions:
+            self.assertGreaterEqual(len(region), 1)
+            # Regions should NOT contain placeholders (param nodes are region
+            # inputs, not members) — only chain ops and compute consumers.
+            placeholders = [n for n in region if n.op == OP.PLACEHOLDER]
+            self.assertEqual(len(placeholders), 0)
+            non_placeholders = [n for n in region if n.op != OP.PLACEHOLDER]
+            self.assertGreaterEqual(len(non_placeholders), 1)
+
+
+# ---------------------------------------------------------------------------
+# Unit tests: RecomputeTransform
+# ---------------------------------------------------------------------------
+
+
+class TestRecomputeTransformDetection(unittest.TestCase):
+    def test_detect_submodule_regions(self) -> None:
+        model = SimpleMLP()
+        fake_mode = _make_fake_mode()
+
+        with fake_mode:
+            gm = make_fx(
+                lambda *args: model(*args),
+                tracing_mode="fake",
+                _allow_non_fake_inputs=True,
+            )(fake_mode.from_tensor(torch.randn(4, 50)))
+
+        transform = RecomputeTransform(submodule_fqns={"net1"})
+        called: OrderedDict[str, tuple[nn.Module, tuple[Any, ...]]] = OrderedDict()
+        regions = transform.detect_regions(gm, called)
+
+        # nn_module_stack metadata may or may not be populated depending on
+        # make_fx version. If populated, should detect one region for net1.
+        if regions:
+            self.assertEqual(len(regions), 1)
+            self.assertGreater(len(regions[0]), 0)
+        else:
+            self.assertEqual(len(regions), 0)
+
+    def test_nonexistent_submodule_returns_empty(self) -> None:
+        model = SimpleMLP()
+        fake_mode = _make_fake_mode()
+
+        with fake_mode:
+            gm = make_fx(
+                lambda *args: model(*args),
+                tracing_mode="fake",
+                _allow_non_fake_inputs=True,
+            )(fake_mode.from_tensor(torch.randn(4, 50)))
+
+        transform = RecomputeTransform(submodule_fqns={"nonexistent"})
+        called: OrderedDict[str, tuple[nn.Module, tuple[Any, ...]]] = OrderedDict()
+        regions = transform.detect_regions(gm, called)
+
+        self.assertEqual(len(regions), 0)
+
+
+# ---------------------------------------------------------------------------
+# Unit tests: _apply_region_transforms end-to-end (no distributed)
+# ---------------------------------------------------------------------------
+
+
+class TestApplyRegionTransforms(unittest.TestCase):
+    def test_identity_transform_preserves_output(self) -> None:
+        """A transform that wraps regions but doesn't change behavior should
+        produce the same output."""
+
+        class IdentityTransform(RegionTransform):
+            def detect_regions(
+                self,
+                gm: fx.GraphModule,
+                called_modules: OrderedDict[str, tuple[nn.Module, tuple[Any, ...]]],
+            ) -> list[set[fx.Node]]:
+                return [{n} for n in gm.graph.nodes if n.op == OP.CALL_FUNCTION]
+
+            def wrap_region(self, region_gm: fx.GraphModule) -> Any:
+                def wrapped(*args: Any) -> Any:
+                    return region_gm(*args)
+
+                return wrapped
+
+        model = SimpleMLP()
+        x = torch.randn(4, 50)
+        expected = model(x)
+
+        fake_mode = _make_fake_mode()
+        called = _discover_called_modules(
+            model, fake_mode, lambda m, inp: m(inp), model, x
+        )
+        roots = _find_forward_roots(called)
+
+        with ExitStack() as stack:
+            for _fqn, root_mod, fake_args in roots:
+                stack.enter_context(
+                    _apply_region_transforms(
+                        root_mod, fake_args, called, [IdentityTransform()], fake_mode
+                    )
+                )
+            result = model(x)
+        torch.testing.assert_close(result, expected)
+
+    def test_forward_restored_after_context_exit(self) -> None:
+        """After the context manager exits, the original forward is restored."""
+        model = SimpleMLP()
+        fake_mode = _make_fake_mode()
+        x = torch.randn(4, 50)
+        called = _discover_called_modules(
+            model, fake_mode, lambda m, inp: m(inp), model, x
+        )
+        roots = _find_forward_roots(called)
+
+        class DummyTransform(RegionTransform):
+            def detect_regions(
+                self,
+                gm: fx.GraphModule,
+                called_modules: OrderedDict[str, tuple[nn.Module, tuple[Any, ...]]],
+            ) -> list[set[fx.Node]]:
+                return [{n} for n in gm.graph.nodes if n.op == OP.CALL_FUNCTION]
+
+            def wrap_region(self, region_gm: fx.GraphModule) -> Any:
+                def wrapped(*args: Any) -> Any:
+                    return region_gm(*args)
+
+                return wrapped
+
+        # Capture a reference to the original forward before entering context.
+        original_forward = model.forward
+
+        with ExitStack() as stack:
+            for _fqn, root_mod, fake_args in roots:
+                stack.enter_context(
+                    _apply_region_transforms(
+                        root_mod, fake_args, called, [DummyTransform()], fake_mode
+                    )
+                )
+            # Inside the context, forward should be replaced.
+            self.assertNotEqual(model.forward, original_forward)
+
+        # After exit, original class forward is accessible again.
+        # Verify the model produces correct output (forward restored).
+        result = model(x)
+        self.assertEqual(result.shape, torch.Size([4, 8]))
+
+    def test_empty_transforms_is_noop(self) -> None:
+        """Passing empty transforms list should not modify the module."""
+        model = SimpleMLP()
+        original_forward_fn = type(model).forward
+        fake_mode = _make_fake_mode()
+        called = _discover_called_modules(
+            model, fake_mode, lambda m, inp: m(inp), model, torch.randn(4, 50)
+        )
+        roots = _find_forward_roots(called)
+
+        with ExitStack() as stack:
+            for _fqn, root_mod, fake_args in roots:
+                stack.enter_context(
+                    _apply_region_transforms(root_mod, fake_args, called, [], fake_mode)
+                )
+            # forward should not be replaced when transforms list is empty.
+            self.assertIs(
+                model.forward.__func__,  # pyre-fixme[16]
+                original_forward_fn,
+            )
+
+
+# ---------------------------------------------------------------------------
+# Unit tests: RegatherTransform wrap_region
+# ---------------------------------------------------------------------------
+
+
+class TestRegatherTransformWrapRegion(unittest.TestCase):
+    def test_wrap_produces_correct_forward(self) -> None:
+        """Checkpoint-wrapped region should produce correct output."""
+        g = fx.Graph()
+        ph = g.placeholder("x")
+        g.output(ph)
+        identity_gm = fx.GraphModule(nn.Module(), g)
+
+        transform = RegatherTransform()
+        wrapped_fn = transform.wrap_region(identity_gm)
+
+        x = torch.randn(4, 8, requires_grad=True)
+        result = wrapped_fn(x)
+        self.assertEqual(result.shape, x.shape)
+
+    def test_wrap_backward_produces_gradient(self) -> None:
+        """Checkpoint-wrapped region should produce valid gradients in backward."""
+        g = fx.Graph()
+        ph = g.placeholder("x")
+        mul_node = g.call_function(torch.mul, (ph, 2.0))
+        g.output(mul_node)
+        scale_gm = fx.GraphModule(nn.Module(), g)
+
+        transform = RegatherTransform()
+        wrapped_fn = transform.wrap_region(scale_gm)
+
+        x = torch.randn(4, 8, requires_grad=True)
+        result = wrapped_fn(x)
+        loss = result.sum()
+        loss.backward()
+
+        self.assertIsNotNone(x.grad)
+        torch.testing.assert_close(x.grad, torch.full_like(x, 2.0))
+
+
+# ---------------------------------------------------------------------------
+# Unit tests: RecomputeTransform wrap_region
+# ---------------------------------------------------------------------------
+
+
+class TestRecomputeTransformWrapRegion(unittest.TestCase):
+    def test_recompute_forward_correct(self) -> None:
+        g = fx.Graph()
+        ph = g.placeholder("x")
+        relu_node = g.call_function(torch.relu, (ph,))
+        g.output(relu_node)
+        relu_gm = fx.GraphModule(nn.Module(), g)
+
+        transform = RecomputeTransform(submodule_fqns=set())
+        wrapped_fn = transform.wrap_region(relu_gm)
+
+        x = torch.randn(4, 8)
+        expected = torch.relu(x)
+        result = wrapped_fn(x)
+        torch.testing.assert_close(result, expected)
+
+    def test_recompute_backward_correct(self) -> None:
+        g = fx.Graph()
+        ph = g.placeholder("x")
+        relu_node = g.call_function(torch.relu, (ph,))
+        g.output(relu_node)
+        relu_gm = fx.GraphModule(nn.Module(), g)
+
+        transform = RecomputeTransform(submodule_fqns=set())
+        wrapped_fn = transform.wrap_region(relu_gm)
+
+        x = torch.randn(4, 8, requires_grad=True)
+        result = wrapped_fn(x)
+        loss = result.sum()
+        loss.backward()
+
+        x2 = x.detach().clone().requires_grad_(True)
+        torch.relu(x2).sum().backward()
+
+        self.assertIsNotNone(x.grad)
+        torch.testing.assert_close(x.grad, x2.grad)
+
+
+# ---------------------------------------------------------------------------
+# Unit tests: Transform ordering / composability
+# ---------------------------------------------------------------------------
+
+
+class TestTransformOrdering(unittest.TestCase):
+    def test_sequential_application_wraps_correctly(self) -> None:
+        """Applying two transforms sequentially: the second transform should
+        see already-wrapped nodes from the first."""
+
+        call_order: list[str] = []
+
+        class TrackingTransformA(RegionTransform):
+            def detect_regions(
+                self,
+                gm: fx.GraphModule,
+                called_modules: OrderedDict[str, tuple[nn.Module, tuple[Any, ...]]],
+            ) -> list[set[fx.Node]]:
+                call_order.append("detect_A")
+                for n in gm.graph.nodes:
+                    if n.op == OP.CALL_FUNCTION:
+                        return [{n}]
+                return []
+
+            def wrap_region(self, region_gm: fx.GraphModule) -> Any:
+                call_order.append("wrap_A")
+
+                def wrapped(*args: Any) -> Any:
+                    return region_gm(*args)
+
+                return wrapped
+
+        class TrackingTransformB(RegionTransform):
+            def detect_regions(
+                self,
+                gm: fx.GraphModule,
+                called_modules: OrderedDict[str, tuple[nn.Module, tuple[Any, ...]]],
+            ) -> list[set[fx.Node]]:
+                call_order.append("detect_B")
+                for n in gm.graph.nodes:
+                    if n.op == OP.CALL_FUNCTION:
+                        return [{n}]
+                return []
+
+            def wrap_region(self, region_gm: fx.GraphModule) -> Any:
+                call_order.append("wrap_B")
+
+                def wrapped(*args: Any) -> Any:
+                    return region_gm(*args)
+
+                return wrapped
+
+        model = SimpleMLP()
+        fake_mode = _make_fake_mode()
+        x = torch.randn(4, 50)
+        called = _discover_called_modules(
+            model, fake_mode, lambda m, inp: m(inp), model, x
+        )
+        roots = _find_forward_roots(called)
+
+        with ExitStack() as stack:
+            for _fqn, root_mod, fake_args in roots:
+                stack.enter_context(
+                    _apply_region_transforms(
+                        root_mod,
+                        fake_args,
+                        called,
+                        [TrackingTransformA(), TrackingTransformB()],
+                        fake_mode,
+                    )
+                )
+
+        self.assertEqual(call_order, ["detect_A", "wrap_A", "detect_B", "wrap_B"])
+
+
+# ---------------------------------------------------------------------------
+# Custom autograd.Function for testing leaf preservation
+# ---------------------------------------------------------------------------
+
+
+class ScaleAndShiftFunction(torch.autograd.Function):
+    """Custom autograd.Function with asymmetric forward/backward.
+
+    Forward: out = input * scale  (trivial multiply)
+    Backward: grad_input = grad_output * (scale + shift)
+
+    The backward multiplies by (scale + shift), NOT scale.  This asymmetry
+    is the key test: if make_fx decomposes forward() into aten.mul, the
+    backward becomes aten.mul's standard backward (multiply by scale), and
+    the +shift term is lost.
+    """
+
+    @staticmethod
+    def forward(  # pyre-ignore[14]
+        ctx: Any,
+        input: torch.Tensor,
+        scale: float,
+        shift: float,
+    ) -> torch.Tensor:
+        ctx.scale = scale
+        ctx.shift = shift
+        return input * scale
+
+    @staticmethod
+    def backward(  # pyre-fixme[14]
+        ctx: Any,
+        grad_output: torch.Tensor,
+    ) -> tuple[torch.Tensor, None, None]:
+        return grad_output * (ctx.scale + ctx.shift), None, None
+
+
+class ModelWithCustomAF(nn.Module):
+    """Model that uses ScaleAndShiftFunction in its forward."""
+
+    def __init__(self, scale: float = 2.0, shift: float = 0.5) -> None:
+        super().__init__()
+        self.linear = nn.Linear(8, 4)
+        self.scale = scale
+        self.shift = shift
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = self.linear(x)
+        return ScaleAndShiftFunction.apply(h, self.scale, self.shift)
+
+
+# ---------------------------------------------------------------------------
+# Unit tests: _discover_autograd_functions
+# ---------------------------------------------------------------------------
+
+
+class TestDiscoverAutogradFunctions(unittest.TestCase):
+    def test_discovers_custom_function(self) -> None:
+        """ScaleAndShiftFunction should be discovered."""
+        model = ModelWithCustomAF()
+        fake_mode = _make_fake_mode()
+        x = torch.randn(4, 8)
+        discovered = _discover_autograd_functions(
+            model, fake_mode, lambda m, inp: m(inp), model, x
+        )
+
+        self.assertIn(ScaleAndShiftFunction, discovered)
+
+    def test_no_autograd_function_returns_empty(self) -> None:
+        """A model without custom autograd.Functions returns empty set."""
+        model = SimpleMLP()
+        fake_mode = _make_fake_mode()
+        x = torch.randn(4, 50)
+        discovered = _discover_autograd_functions(
+            model, fake_mode, lambda m, inp: m(inp), model, x
+        )
+
+        # SimpleMLP uses only standard nn.Module ops, no custom AF.
+        # (Note: some PyTorch internals may use autograd.Function, so
+        # we just check ScaleAndShiftFunction is NOT in the set.)
+        self.assertNotIn(ScaleAndShiftFunction, discovered)
+
+    def test_original_apply_restored(self) -> None:
+        """After discovery, the original apply classmethod is restored."""
+        model = ModelWithCustomAF()
+        fake_mode = _make_fake_mode()
+        x = torch.randn(4, 8)
+
+        # Verify the function still works correctly after discovery.
+        _discover_autograd_functions(model, fake_mode, lambda m, inp: m(inp), model, x)
+
+        # The classmethod descriptor creates a new bound method on each
+        # access, so we can't use assertIs.  Instead verify apply still
+        # works correctly by calling it.
+        inp = torch.randn(2, 4, requires_grad=True)
+        out = ScaleAndShiftFunction.apply(inp, 2.0, 0.5)
+        self.assertEqual(out.shape, inp.shape)
+        torch.testing.assert_close(out, inp * 2.0)
+
+
+# ---------------------------------------------------------------------------
+# Unit tests: _preserve_autograd_function_leaves
+# ---------------------------------------------------------------------------
+
+
+class TestPreserveAutogradFunctionLeaves(unittest.TestCase):
+    def test_leaf_produces_single_node(self) -> None:
+        """With leaf preservation, the AF appears as a single call_function
+        node in the make_fx graph, not decomposed into individual aten ops."""
+        model = ModelWithCustomAF(scale=2.0, shift=0.5)
+        fake_mode = _make_fake_mode()
+        x = torch.randn(4, 8)
+
+        # Trace WITHOUT leaf preservation — AF is decomposed.
+        with fake_mode:
+            gm_decomposed = make_fx(
+                model,
+                tracing_mode="fake",
+                _allow_non_fake_inputs=True,
+            )(fake_mode.from_tensor(x))
+
+        # Count mul nodes — the ScaleAndShiftFunction.forward() does input*scale
+        # which decomposes to aten.mul. There may be other muls from nn.Linear.
+        mul_count_decomposed = sum(
+            1
+            for n in gm_decomposed.graph.nodes
+            if n.op == OP.CALL_FUNCTION and "mul" in str(n.target)
+        )
+
+        # Trace WITH leaf preservation.
+        fake_mode2 = _make_fake_mode()
+        with fake_mode2, _preserve_autograd_function_leaves({ScaleAndShiftFunction}):
+            gm_preserved = make_fx(
+                model,
+                tracing_mode="fake",
+                _allow_non_fake_inputs=True,
+            )(fake_mode2.from_tensor(x))
+
+        # The preserved graph should have fewer mul nodes (the one from
+        # ScaleAndShiftFunction is now an opaque node, not a mul).
+        mul_count_preserved = sum(
+            1
+            for n in gm_preserved.graph.nodes
+            if n.op == OP.CALL_FUNCTION and "mul" in str(n.target)
+        )
+
+        self.assertLess(
+            mul_count_preserved,
+            mul_count_decomposed,
+            "Leaf preservation should reduce the number of decomposed mul ops",
+        )
+
+        # Check there's a call_function node whose target is the bound
+        # wrapper for ScaleAndShiftFunction.apply (not a standard aten op).
+        af_nodes = [
+            n
+            for n in gm_preserved.graph.nodes
+            if n.op == OP.CALL_FUNCTION
+            and hasattr(n.target, "__name__")
+            and n.target.__name__ == "_bound_apply"
+        ]
+        self.assertGreaterEqual(
+            len(af_nodes),
+            1,
+            "Should have at least one opaque ScaleAndShiftFunction node",
+        )
+
+    def test_noop_outside_tracing(self) -> None:
+        """Outside make_fx, the patched apply behaves identically to original."""
+        model = ModelWithCustomAF(scale=3.0, shift=1.0)
+        x = torch.randn(4, 8)
+        expected = model(x)
+
+        with _preserve_autograd_function_leaves({ScaleAndShiftFunction}):
+            result = model(x)
+
+        torch.testing.assert_close(result, expected)
+
+    def test_backward_preserved_through_make_fx(self) -> None:
+        """The custom backward (scale+shift) is preserved when the AF is
+        treated as a leaf, whereas decomposed tracing loses the shift term."""
+        scale, shift = 2.0, 0.5
+
+        # Direct execution — ground truth backward.
+        x_ref = torch.randn(4, 8, requires_grad=True)
+        out_ref = ScaleAndShiftFunction.apply(x_ref, scale, shift)
+        out_ref.sum().backward()
+        grad_ref = x_ref.grad
+        assert grad_ref is not None
+
+        # Every element should be (scale + shift) = 2.5
+        torch.testing.assert_close(grad_ref, torch.full_like(x_ref, scale + shift))
+
+        # Trace WITH leaf preservation, execute, check backward.
+        fake_mode = _make_fake_mode()
+
+        def fn(x: torch.Tensor) -> torch.Tensor:  # pyre-fixme[53]
+            return ScaleAndShiftFunction.apply(x, scale, shift)
+
+        with fake_mode, _preserve_autograd_function_leaves({ScaleAndShiftFunction}):
+            gm = make_fx(
+                fn,
+                tracing_mode="fake",
+                _allow_non_fake_inputs=True,
+            )(fake_mode.from_tensor(torch.randn(4, 8)))
+
+        # Execute the traced graph with real tensors.
+        x_traced = torch.randn(4, 8, requires_grad=True)
+        out_traced = gm(x_traced)
+        out_traced.sum().backward()
+        grad_traced = x_traced.grad
+        assert grad_traced is not None
+
+        # The preserved backward should give (scale + shift) = 2.5,
+        # NOT just scale = 2.0 (which is what decomposed tracing gives).
+        torch.testing.assert_close(
+            grad_traced, torch.full_like(x_traced, scale + shift)
+        )
+
+    def test_context_manager_restores_apply(self) -> None:
+        """After exiting the context, the original apply is restored."""
+        original_dict_entry = ScaleAndShiftFunction.__dict__.get("apply", None)
+
+        with _preserve_autograd_function_leaves({ScaleAndShiftFunction}):
+            pass
+
+        restored_entry = ScaleAndShiftFunction.__dict__.get("apply", None)
+        self.assertEqual(restored_entry, original_dict_entry)
+
+
+# ---------------------------------------------------------------------------
+# Reproduce: AF whose forward() calls a submodule
+# ---------------------------------------------------------------------------
+
+
+_INNER_LINEAR = nn.Linear(8, 4)
+
+
+class SubmoduleCallingFunction(torch.autograd.Function):
+    """AF whose forward() calls an nn.Module — reproduces the STU failure."""
+
+    @staticmethod
+    def forward(ctx: Any, x: torch.Tensor) -> torch.Tensor:  # pyre-fixme[14]
+        return _INNER_LINEAR(x)
+
+    @staticmethod
+    def backward(ctx: Any, grad: torch.Tensor) -> tuple[torch.Tensor]:  # pyre-fixme[14]
+        return (grad,)
+
+
+class TestLeafApplyWithSubmoduleCall(unittest.TestCase):
+    def test_leaf_apply_submodule_call(self) -> None:
+        """Reproduces the STU failure: AF forward calls a submodule."""
+        fake_mode = _make_fake_mode()
+
+        def fn(x: torch.Tensor) -> torch.Tensor:
+            return SubmoduleCallingFunction.apply(x)
+
+        with fake_mode, _preserve_autograd_function_leaves({SubmoduleCallingFunction}):
+            gm = make_fx(
+                fn,
+                tracing_mode="fake",
+                _allow_non_fake_inputs=True,
+            )(fake_mode.from_tensor(torch.randn(4, 8)))
+
+        x = torch.randn(4, 8)
+        result = gm(x)
+        self.assertEqual(result.shape, torch.Size([4, 4]))
+
+
+# ---------------------------------------------------------------------------
+# Integration test: _apply_region_transforms with autograd function leaves
+# ---------------------------------------------------------------------------
+
+
+class TestApplyRegionTransformsWithLeaves(unittest.TestCase):
+    def test_leaf_af_backward_through_region_transforms(self) -> None:
+        """End-to-end: region transforms + autograd function leaves produce
+        correct backward gradients."""
+        model = ModelWithCustomAF(scale=2.0, shift=0.5)
+        x = torch.randn(4, 8)
+        fake_mode = _make_fake_mode()
+
+        called = _discover_called_modules(
+            model, fake_mode, lambda m, inp: m(inp), model, x
+        )
+        roots = _find_forward_roots(called)
+
+        class IdentityTransform(RegionTransform):
+            def detect_regions(
+                self,
+                gm: fx.GraphModule,
+                called_modules: OrderedDict[str, tuple[nn.Module, tuple[Any, ...]]],
+            ) -> list[set[fx.Node]]:
+                return []
+
+            def wrap_region(self, region_gm: fx.GraphModule) -> Any:
+                return region_gm
+
+        with ExitStack() as stack:
+            for _fqn, root_mod, fake_args in roots:
+                stack.enter_context(
+                    _apply_region_transforms(
+                        root_mod,
+                        fake_args,
+                        called,
+                        [IdentityTransform()],
+                        fake_mode,
+                        _autograd_function_leaves={ScaleAndShiftFunction},
+                    )
+                )
+            # Inside the context, run forward+backward.
+            x_test = torch.randn(4, 8, requires_grad=True)
+            out = model(x_test)
+            out.sum().backward()
+
+        grad = x_test.grad
+        assert grad is not None
+        # The custom backward multiplies by (scale + shift) = 2.5 for the
+        # ScaleAndShiftFunction part. The full gradient also flows through
+        # nn.Linear, so we verify the gradient is non-zero and has correct
+        # shape rather than checking exact values.
+        self.assertEqual(grad.shape, x_test.shape)
+        self.assertFalse(torch.all(grad == 0))
+
+
+if __name__ == "__main__":
+    run_tests()

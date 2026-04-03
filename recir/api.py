@@ -22,11 +22,20 @@ from functorch import make_fx
 from recir.decompositions import DEDUP_TARGETS, SPMD_DECOMP_TABLE
 from recir.distributed.data_parallel import (
     collectives_insertion,
+    DataParallelStyle,
     gradients_tagging,
     parametrize_params,
 )
 from recir.distributed.parallel_mode import DataParallel, GSPMDParallel, ParallelMode
 from recir.lowering.device_state import DeviceStateManager
+from recir.region_transforms import (
+    _apply_region_transforms,
+    _discover_autograd_functions,
+    _discover_called_modules,
+    _find_forward_roots,
+    RegatherTransform,
+    RegionTransform,
+)
 from torch import fx
 from torch._subclasses.fake_tensor import FakeTensorMode
 from torch.fx.graph import _PyTreeCodeGen, _PyTreeInfo, CodeGen
@@ -547,7 +556,27 @@ def _compile_data_parallel_v2(
     assert mod is not None
     _mod: nn.Module = mod
 
-    # 2. Shard params on the module and optimizer states (FSDP only).
+    # 2. Discover called modules and user autograd functions BEFORE sharding.
+    #    Discovery runs the train step under FakeTensorMode with hooks;
+    #    it must see unsharded parameters to avoid shape mismatches when
+    #    a parameter is reused multiple times in forward (shared weights).
+    transforms: list[RegionTransform] = []
+    if parallel_mode.parallel_style == DataParallelStyle.FULLY_SHARD:
+        transforms.append(RegatherTransform())
+    called_modules = None
+    autograd_function_leaves: set[type] = set()  # pyre-fixme[24]
+    if transforms:
+        called_modules = _discover_called_modules(
+            _mod, FakeTensorMode(allow_non_fake_inputs=True), func, *args, **kwargs
+        )
+        autograd_function_leaves = _discover_autograd_functions(
+            _mod, FakeTensorMode(allow_non_fake_inputs=True), func, *args, **kwargs
+        )
+
+    # 3. Set up external fake mode for tracing.
+    fake_mode: FakeTensorMode = FakeTensorMode(allow_non_fake_inputs=True)
+
+    # 4. Shard params on the module and optimizer states (FSDP only).
     #    Extract params_and_buffers first so shard_params can mutate both
     #    the dict and the module in-place.  shard_params also updates
     #    opt.state in-place so that parameter→state mappings remain valid.
@@ -557,27 +586,53 @@ def _compile_data_parallel_v2(
     }
     parallel_mode.shard_params(_mod, params_and_buffers, opt)
 
-    # 3. Set up external fake mode and input transform.
-    fake_mode: FakeTensorMode = FakeTensorMode(allow_non_fake_inputs=True)
+    # 5. Apply region transforms AFTER sharding, with parametrization.
+    #    The traced forward includes allgather ops from collectives_insertion
+    #    so each per-parameter region encompasses allgather + chain + compute.
+    #    _patched_forward reads raw sharded params via named_parameters()
+    #    (bypassing the property-based parametrization); the allgather then
+    #    happens inside each checkpoint-wrapped region in gm_fwd.
+    collectives_fn = collectives_insertion(parallel_mode.parallel_style, mesh)
+    with ExitStack() as region_stack:
+        if transforms and called_modules:
+            forward_roots = _find_forward_roots(called_modules)
+            for _fqn, root_mod, root_fake_args in forward_roots:
+                region_stack.enter_context(
+                    _apply_region_transforms(
+                        root_mod,
+                        root_fake_args,
+                        called_modules,
+                        transforms,
+                        fake_mode,
+                        _parametrize_cm_factories=[
+                            partial(parametrize_params, root_mod, collectives_fn),
+                        ],
+                        _autograd_function_leaves=autograd_function_leaves,
+                    )
+                )
 
-    # 4. Set up parametrize fns and trace via _local_compile.
-    local_result = _local_compile(
-        func,
-        module_override,
-        *args,
-        fake_mode=fake_mode,
-        _parametrize_fns=[
-            collectives_insertion(parallel_mode.parallel_style, mesh),
-        ],
-        _input_transform=_make_batch_transform(
-            parallel_mode.input_batch_dim,
-            ratio=1 / (world_size // parallel_mode.num_processes),
+        # 6. Set up parametrize fns and trace via _local_compile.
+        #    Region transform context managers scope the rewritten forwards
+        #    to this block — originals are restored when the ExitStack exits.
+        #    When region transforms are active, gm_fwd already contains the
+        #    allgather ops (baked in during the parametrized trace), so we
+        #    must NOT also pass collectives_fn to _local_compile — that would
+        #    double-allgather and corrupt gradients.
+        local_result = _local_compile(
+            func,
+            module_override,
+            *args,
             fake_mode=fake_mode,
-        ),
-        **kwargs,
-    )
+            _parametrize_fns=[] if transforms else [collectives_fn],
+            _input_transform=_make_batch_transform(
+                parallel_mode.input_batch_dim,
+                ratio=1 / (world_size // parallel_mode.num_processes),
+                fake_mode=fake_mode,
+            ),
+            **kwargs,
+        )
 
-    # 5. Finalize.
+    # 7. Finalize.
     return _finalize_graph(
         local_result.gm,
         local_result.mod,

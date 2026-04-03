@@ -519,16 +519,21 @@ class TestPerOpFSDP(DTensorTestBase):
                     reduce_scatter_count += 1
 
         # SimpleMLP has 4 params, each accessed once in forward.
-        # v2 inserts one allgather per parameter *access* during tracing
-        # (via the parametrize_fn property getter); since each param is
-        # accessed once, expect exactly 4.
+        # v2 inserts one allgather per parameter *access* during tracing.
+        # Region transforms checkpoint-wrap each per-param chain (allgather +
+        # chain ops + compute) using use_reentrant=True.  Reentrant
+        # checkpoint recomputes ALL regions in backward (both weight and
+        # bias chains), adding 4 backward allgathers.
+        # Total: 4 forward + 4 backward = 8.
         # v1 inserts allgathers per strategy mismatch at each use site,
         # plus additional backward allgathers via chain cloning.
         if use_parametrization:
+            expected = 8  # 4 forward + 4 backward (reentrant checkpoint)
             self.assertEqual(
                 allgather_count,
-                4,
-                f"Expected 4 allgathers (one per param access), got {allgather_count}",
+                expected,
+                f"Expected {expected} allgathers (4 forward + 4 backward "
+                f"reentrant checkpoint recompute), got {allgather_count}",
             )
         else:
             self.assertGreaterEqual(
@@ -729,13 +734,17 @@ class TestPerOpFSDP(DTensorTestBase):
                 if "all_gather_into_tensor" in str(node.target):
                     allgather_count += 1
 
-        # SimpleMLP has 4 params.  v2 allgathers once per param (4).
+        # SimpleMLP has 4 params.  v2 allgathers once per param (4) in forward.
+        # Region transforms checkpoint-wrap each per-param chain using
+        # use_reentrant=True; all regions recompute in backward, adding
+        # 4 more allgathers.  Total: 4 forward + 4 backward = 8.
         # v1 may produce more due to chain cloning.
         if use_parametrization:
             self.assertEqual(
                 allgather_count,
-                4,
-                f"Expected 4 allgathers (one per param), got {allgather_count}",
+                8,
+                f"Expected 8 allgathers (4 forward + 4 backward "
+                f"reentrant checkpoint recompute), got {allgather_count}",
             )
         else:
             self.assertGreaterEqual(
@@ -1376,8 +1385,10 @@ class EmbeddingMLP(nn.Module):
         return self.linear(emb_out.mean(dim=1))  # (batch, 4)
 
 
-def embedding_train_step(model, optim, train_batch):
-    def loss_fn(out, labels):
+def embedding_train_step(
+    model: nn.Module, optim: torch.optim.Optimizer, train_batch: Any
+) -> torch.Tensor:
+    def loss_fn(out: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
         return (out - labels).sum()
 
     optim.zero_grad()
@@ -1392,21 +1403,25 @@ def embedding_train_step(model, optim, train_batch):
 class MultiEmbeddingMLP(nn.Module):
     """Model with two embedding tables and a dense layer for multi-table tests."""
 
-    def __init__(self, num_emb1=16, num_emb2=32, emb_dim=8):
+    def __init__(
+        self, num_emb1: int = 16, num_emb2: int = 32, emb_dim: int = 8
+    ) -> None:
         super().__init__()
         self.emb1 = nn.Embedding(num_emb1, emb_dim)
         self.emb2 = nn.Embedding(num_emb2, emb_dim)
         self.linear = nn.Linear(emb_dim, 4)
 
-    def forward(self, indices1, indices2):
+    def forward(self, indices1: torch.Tensor, indices2: torch.Tensor) -> torch.Tensor:
         e1 = self.emb1(indices1)  # (batch, seq, emb_dim)
         e2 = self.emb2(indices2)  # (batch, seq, emb_dim)
         combined = (e1.mean(dim=1) + e2.mean(dim=1)) / 2  # (batch, emb_dim)
         return self.linear(combined)  # (batch, 4)
 
 
-def multi_embedding_train_step(model, optim, train_batch):
-    def loss_fn(out, labels):
+def multi_embedding_train_step(
+    model: nn.Module, optim: torch.optim.Optimizer, train_batch: Any
+) -> torch.Tensor:
+    def loss_fn(out: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
         return (out - labels).sum()
 
     optim.zero_grad()
@@ -1421,7 +1436,7 @@ def multi_embedding_train_step(model, optim, train_batch):
 class TestComputeEmbeddingParamIndices(unittest.TestCase):
     """Unit tests for HybridParallel._compute_embedding_param_indices."""
 
-    def test_no_embedding_params(self):
+    def test_no_embedding_params(self) -> None:
         """Empty plan returns None."""
         mode = HybridParallel(dense_style="fully_shard")
         params = OrderedDict(
@@ -1432,7 +1447,7 @@ class TestComputeEmbeddingParamIndices(unittest.TestCase):
         )
         self.assertIsNone(mode._compute_embedding_param_indices(params))
 
-    def test_single_embedding_param(self):
+    def test_single_embedding_param(self) -> None:
         """Plan with one FQN returns correct index."""
         plan = EmbeddingShardingPlan(
             sharding_map={"emb.weight": EmbeddingShardingType.ROW_WISE}
@@ -1447,7 +1462,7 @@ class TestComputeEmbeddingParamIndices(unittest.TestCase):
         )
         self.assertEqual(mode._compute_embedding_param_indices(params), {1})
 
-    def test_multiple_embedding_params(self):
+    def test_multiple_embedding_params(self) -> None:
         """Plan with two FQNs returns correct index set."""
         plan = EmbeddingShardingPlan(
             sharding_map={
@@ -1466,7 +1481,7 @@ class TestComputeEmbeddingParamIndices(unittest.TestCase):
         )
         self.assertEqual(mode._compute_embedding_param_indices(params), {1, 2})
 
-    def test_fqn_not_in_params(self):
+    def test_fqn_not_in_params(self) -> None:
         """Plan FQN not matching any key returns None."""
         plan = EmbeddingShardingPlan(
             sharding_map={"nonexistent.weight": EmbeddingShardingType.ROW_WISE}
@@ -1479,17 +1494,17 @@ class TestComputeEmbeddingParamIndices(unittest.TestCase):
 class TestHybridParallelInit(unittest.TestCase):
     """Unit tests for HybridParallel.__init__ validation."""
 
-    def test_unknown_dense_style_raises(self):
+    def test_unknown_dense_style_raises(self) -> None:
         """HybridParallel with invalid dense_style raises RuntimeError."""
         with self.assertRaises(RuntimeError):
             HybridParallel(dense_style="invalid")
 
-    def test_default_embedding_plan_is_empty(self):
+    def test_default_embedding_plan_is_empty(self) -> None:
         """Constructing without embedding_plan gives an empty plan."""
         mode = HybridParallel(dense_style="fully_shard")
         self.assertEqual(mode.embedding_plan.param_fqns, set())
 
-    def test_dense_style_mapping(self):
+    def test_dense_style_mapping(self) -> None:
         """'replicate'/'fully_shard'/'default' map to correct DataParallelStyle values."""
         mode_rep = HybridParallel(dense_style="replicate")
         self.assertEqual(mode_rep.dense_style, DataParallelStyle.REPLICATE)
@@ -1565,7 +1580,7 @@ class TestShardParamsByPlan(DTensorTestBase):
         mesh = DeviceMesh("cuda", torch.arange(self.world_size))
         shard_params_by_plan(
             model,
-            params,
+            params,  # pyre-fixme[6]
             None,
             mesh,
             DataParallelStyle.REPLICATE,
@@ -1595,7 +1610,7 @@ class TestShardParamsByPlan(DTensorTestBase):
         mesh = DeviceMesh("cuda", torch.arange(self.world_size))
         shard_params_by_plan(
             model,
-            params,
+            params,  # pyre-fixme[6]
             opt,
             mesh,
             DataParallelStyle.REPLICATE,
@@ -1647,14 +1662,14 @@ class TestShardParamsByPlan(DTensorTestBase):
 class TestEmbeddingShardingPlan(unittest.TestCase):
     """Unit tests for EmbeddingShardingPlan."""
 
-    def test_empty_plan(self):
+    def test_empty_plan(self) -> None:
         """Default-constructed plan has empty param_fqns, is_embedding_param returns False."""
         plan = EmbeddingShardingPlan()
         self.assertEqual(plan.param_fqns, set())
         self.assertFalse(plan.is_embedding_param("anything"))
         self.assertFalse(plan.is_row_wise("anything"))
 
-    def test_param_fqns_returns_set_of_keys(self):
+    def test_param_fqns_returns_set_of_keys(self) -> None:
         """Plan with 2 entries returns correct set of FQNs."""
         plan = EmbeddingShardingPlan(
             sharding_map={
@@ -1664,7 +1679,7 @@ class TestEmbeddingShardingPlan(unittest.TestCase):
         )
         self.assertEqual(plan.param_fqns, {"emb1.weight", "emb2.weight"})
 
-    def test_is_row_wise_true(self):
+    def test_is_row_wise_true(self) -> None:
         """is_row_wise returns True for ROW_WISE entries."""
         plan = EmbeddingShardingPlan(
             sharding_map={
@@ -1674,7 +1689,7 @@ class TestEmbeddingShardingPlan(unittest.TestCase):
         self.assertTrue(plan.is_row_wise("emb.weight"))
         self.assertTrue(plan.is_embedding_param("emb.weight"))
 
-    def test_is_row_wise_false_for_missing(self):
+    def test_is_row_wise_false_for_missing(self) -> None:
         """is_row_wise returns False for FQNs not in the plan."""
         plan = EmbeddingShardingPlan(
             sharding_map={
@@ -1697,7 +1712,7 @@ class TestBuildStrategiesWithEmbedding(unittest.TestCase):
         mesh._flatten.return_value = mesh
         return mesh
 
-    def test_embedding_param_placeholder_type(self):
+    def test_embedding_param_placeholder_type(self) -> None:
         """Placeholder in embedding_param_indices gets EMBEDDING_PARAM type."""
         graph = fx.Graph()
         emb_w = graph.placeholder("emb_weight")
@@ -1719,7 +1734,7 @@ class TestBuildStrategiesWithEmbedding(unittest.TestCase):
         emb_strategy = cast(DataParallelStrategy, strategy_map[emb_w])
         self.assertEqual(emb_strategy.node_type, NodeType.EMBEDDING_PARAM)
 
-    def test_non_embedding_placeholder_stays_param(self):
+    def test_non_embedding_placeholder_stays_param(self) -> None:
         """Placeholder NOT in embedding_param_indices stays PARAM."""
         graph = fx.Graph()
         dense_w = graph.placeholder("dense_weight")
@@ -1741,7 +1756,7 @@ class TestBuildStrategiesWithEmbedding(unittest.TestCase):
         dense_strategy = cast(DataParallelStrategy, strategy_map[dense_w])
         self.assertEqual(dense_strategy.node_type, NodeType.PARAM)
 
-    def test_non_compute_propagation_preserves_embedding_param(self):
+    def test_non_compute_propagation_preserves_embedding_param(self) -> None:
         """Non-compute ops (view/reshape) on EMBEDDING_PARAM stay EMBEDDING_PARAM."""
         graph = fx.Graph()
         emb_w = graph.placeholder("emb_weight")
@@ -1765,7 +1780,7 @@ class TestBuildStrategiesWithEmbedding(unittest.TestCase):
         t_strategy = cast(DataParallelStrategy, strategy_map[t_node])
         self.assertEqual(t_strategy.node_type, NodeType.EMBEDDING_PARAM)
 
-    def test_mixed_param_and_embedding_param(self):
+    def test_mixed_param_and_embedding_param(self) -> None:
         """PARAM and EMBEDDING_PARAM placeholders are typed correctly."""
         graph = fx.Graph()
         dense_w = graph.placeholder("dense_weight")
@@ -1791,7 +1806,7 @@ class TestBuildStrategiesWithEmbedding(unittest.TestCase):
         emb_strategy = cast(DataParallelStrategy, strategy_map[emb_w])
         self.assertEqual(emb_strategy.node_type, NodeType.EMBEDDING_PARAM)
 
-    def test_embedding_param_with_replicate_mode(self):
+    def test_embedding_param_with_replicate_mode(self) -> None:
         """EMBEDDING_PARAM gets Shard(0) even when parallel_mode is REPLICATE."""
         graph = fx.Graph()
         emb_w = graph.placeholder("emb_weight")
@@ -1815,8 +1830,8 @@ class TestBuildStrategiesWithEmbedding(unittest.TestCase):
         # Embedding params must be sharded on dim 0 regardless of parallel_mode
         output_specs = emb_strategy.op_spec.output_specs
         self.assertIsNotNone(output_specs)
-        self.assertEqual(len(output_specs), 1)
-        self.assertEqual(output_specs[0].placements, (Shard(0),))
+        self.assertEqual(len(output_specs), 1)  # pyre-fixme[6]
+        self.assertEqual(output_specs[0].placements, (Shard(0),))  # pyre-fixme[16]
 
 
 class TestRewriteRowWiseEmbeddings(unittest.TestCase):
@@ -1835,9 +1850,11 @@ class TestRewriteRowWiseEmbeddings(unittest.TestCase):
         mesh._flatten.return_value = mesh
         mesh.size.return_value = world_size
         mesh._dim_group_names = ["fake_test_group"]
-        return mesh
+        return mesh  # pyre-fixme[7]
 
-    def _build_embedding_graph(self, V: int = 100, D: int = 16, batch: int = 8):
+    def _build_embedding_graph(
+        self, V: int = 100, D: int = 16, batch: int = 8
+    ) -> tuple[fx.GraphModule, fx.Node, fx.Node, fx.Node]:
         """Build a minimal graph: placeholder(weight) + placeholder(indices) → aten.embedding → output."""
         graph = fx.Graph()
         emb_w = graph.placeholder("emb_weight")
@@ -1851,7 +1868,7 @@ class TestRewriteRowWiseEmbeddings(unittest.TestCase):
         graph.output(emb_out)
         return fx.GraphModule(nn.Module(), graph), emb_w, indices, emb_out
 
-    def test_original_embedding_replaced(self):
+    def test_original_embedding_replaced(self) -> None:
         """After rewrite, the original aten.embedding node consuming the
         EMBEDDING_PARAM weight is replaced.  The decomposed sub-graph contains
         its own local aten.embedding (step 3), but it consumes received_indices
@@ -1884,7 +1901,7 @@ class TestRewriteRowWiseEmbeddings(unittest.TestCase):
                     torch.ops._c10d_functional.wait_tensor.default,
                 )
 
-    def test_decomposed_graph_structure(self):
+    def test_decomposed_graph_structure(self) -> None:
         """Verify the decomposed graph has the expected node structure and print it."""
         gm, emb_w, indices, emb_out = self._build_embedding_graph()
         mesh = self._create_mock_mesh()
@@ -1913,7 +1930,7 @@ class TestRewriteRowWiseEmbeddings(unittest.TestCase):
         call_nodes = [n for n in gm.graph.nodes if n.op == "call_function"]
         self.assertGreater(len(call_nodes), 10)
 
-    def test_alltoall_nodes_present(self):
+    def test_alltoall_nodes_present(self) -> None:
         """After rewrite, _c10d_functional.all_to_all_single nodes are present."""
         gm, emb_w, indices, emb_out = self._build_embedding_graph()
         mesh = self._create_mock_mesh()
@@ -1937,7 +1954,7 @@ class TestRewriteRowWiseEmbeddings(unittest.TestCase):
         # 3 all_to_all_single calls: split sizes, indices, results
         self.assertEqual(len(a2a_nodes), 3)
 
-    def test_wait_tensor_nodes_present(self):
+    def test_wait_tensor_nodes_present(self) -> None:
         """After rewrite, wait_tensor nodes match all_to_all_single nodes."""
         gm, emb_w, indices, emb_out = self._build_embedding_graph()
         mesh = self._create_mock_mesh()
@@ -1960,7 +1977,7 @@ class TestRewriteRowWiseEmbeddings(unittest.TestCase):
         ]
         self.assertEqual(len(wait_nodes), 3)
 
-    def test_new_nodes_have_sharding_none(self):
+    def test_new_nodes_have_sharding_none(self) -> None:
         """All newly-inlined nodes have meta['sharding'] = None."""
         gm, emb_w, indices, emb_out = self._build_embedding_graph()
         mesh = self._create_mock_mesh()
@@ -1982,7 +1999,7 @@ class TestRewriteRowWiseEmbeddings(unittest.TestCase):
                 self.assertIn("sharding", node.meta)
                 self.assertIsNone(node.meta["sharding"])
 
-    def test_non_embedding_param_untouched(self):
+    def test_non_embedding_param_untouched(self) -> None:
         """aten.embedding with a non-EMBEDDING_PARAM weight is NOT rewritten."""
         graph = fx.Graph()
         dense_w = graph.placeholder("dense_weight")
@@ -2019,9 +2036,10 @@ class TestRowWiseEmbeddingE2E(DTensorTestBase):
     """End-to-end tests for decomposed_row_wise_embedding with real distributed comms."""
 
     @property
-    def world_size(self):
+    def world_size(self) -> int:
         return 2
 
+    # pyre-fixme[2,3]
     def _setup_embedding(self, num_embeddings=16, embedding_dim=8):
         """Create full weight, shard it, and return (full_weight, local_shard, mesh, group_name)."""
         torch.manual_seed(42)
@@ -2037,7 +2055,7 @@ class TestRowWiseEmbeddingE2E(DTensorTestBase):
 
     @skip_if_lt_x_gpu(2)
     @with_comms
-    def test_row_wise_matches_full_embedding(self):
+    def test_row_wise_matches_full_embedding(self) -> None:
         """Row-wise result matches single-device embedding lookup."""
         full_weight, local_weight, num_emb, group_name = self._setup_embedding()
         device = f"cuda:{self.rank}"
@@ -2050,7 +2068,7 @@ class TestRowWiseEmbeddingE2E(DTensorTestBase):
 
     @skip_if_lt_x_gpu(2)
     @with_comms
-    def test_2d_indices(self):
+    def test_2d_indices(self) -> None:
         """Row-wise embedding with 2D indices (batch, seq) returns correct shape and values."""
         full_weight, local_weight, num_emb, group_name = self._setup_embedding()
         device = f"cuda:{self.rank}"
@@ -2064,7 +2082,7 @@ class TestRowWiseEmbeddingE2E(DTensorTestBase):
 
     @skip_if_lt_x_gpu(2)
     @with_comms
-    def test_indices_all_on_one_rank(self):
+    def test_indices_all_on_one_rank(self) -> None:
         """All indices map to rank 0's shard (tests uneven AllToAll splits)."""
         full_weight, local_weight, num_emb, group_name = self._setup_embedding()
         device = f"cuda:{self.rank}"
@@ -2078,7 +2096,7 @@ class TestRowWiseEmbeddingE2E(DTensorTestBase):
 
     @skip_if_lt_x_gpu(2)
     @with_comms
-    def test_large_embedding_table(self):
+    def test_large_embedding_table(self) -> None:
         """Row-wise with larger table and random indices."""
         full_weight, local_weight, num_emb, group_name = self._setup_embedding(
             num_embeddings=128, embedding_dim=32
@@ -2131,12 +2149,12 @@ class TestHybridParallelE2E(DTensorTestBase):
     """End-to-end tests for HybridParallel with recir.compile."""
 
     @property
-    def world_size(self):
+    def world_size(self) -> int:
         return 2
 
     @skip_if_lt_x_gpu(2)
     @with_comms
-    def test_compile_and_run(self):
+    def test_compile_and_run(self) -> None:
         """HybridParallel compiles and runs one train step without error."""
         model = EmbeddingMLP().cuda(self.rank)
         opt = torch.optim.SGD(model.parameters(), lr=0.1)
@@ -2161,7 +2179,7 @@ class TestHybridParallelE2E(DTensorTestBase):
 
     @skip_if_lt_x_gpu(2)
     @with_comms
-    def test_graph_has_decomposed_embedding(self):
+    def test_graph_has_decomposed_embedding(self) -> None:
         """Compiled graph contains decomposed AllToAll ops for row-wise embedding."""
         model = EmbeddingMLP().cuda(self.rank)
         opt = torch.optim.SGD(model.parameters(), lr=0.1)
@@ -2202,7 +2220,7 @@ class TestHybridParallelE2E(DTensorTestBase):
 
     @skip_if_lt_x_gpu(2)
     @with_comms
-    def test_no_allgather_on_embedding_params(self):
+    def test_no_allgather_on_embedding_params(self) -> None:
         """Embedding params should not have allgather (they use row-wise sharding, not FSDP)."""
         model = EmbeddingMLP().cuda(self.rank)
         opt = torch.optim.SGD(model.parameters(), lr=0.1)
@@ -2256,13 +2274,13 @@ class TestHybridParallelNumericalCorrectness(DTensorTestBase):
     """Numerical correctness E2E tests for HybridParallel."""
 
     @property
-    def world_size(self):
+    def world_size(self) -> int:
         return 2
 
     @skip_if_lt_x_gpu(2)
     @with_comms
     @unittest.expectedFailure
-    def test_hybrid_parallel_numerical_correctness(self):
+    def test_hybrid_parallel_numerical_correctness(self) -> None:
         """Compare HybridParallel output against single-GPU reference.
 
         TODO: The decomposed row-wise embedding backward accumulates partial
@@ -2335,7 +2353,7 @@ class TestHybridParallelNumericalCorrectness(DTensorTestBase):
     @skip_if_lt_x_gpu(2)
     @with_comms
     @unittest.expectedFailure
-    def test_hybrid_parallel_replicate_dense_style(self):
+    def test_hybrid_parallel_replicate_dense_style(self) -> None:
         """HybridParallel with dense_style='replicate': dense params replicated, embeddings row-wise.
 
         TODO: Same backward mismatch as test_hybrid_parallel_numerical_correctness.
@@ -2400,12 +2418,12 @@ class TestMultipleEmbeddingTables(DTensorTestBase):
     """E2E test for models with multiple embedding tables."""
 
     @property
-    def world_size(self):
+    def world_size(self) -> int:
         return 2
 
     @skip_if_lt_x_gpu(2)
     @with_comms
-    def test_multiple_embedding_tables(self):
+    def test_multiple_embedding_tables(self) -> None:
         """Model with 2 nn.Embedding layers: both decomposed into AllToAll ops."""
         model = MultiEmbeddingMLP(num_emb1=16, num_emb2=32, emb_dim=8).cuda(self.rank)
         opt = torch.optim.SGD(model.parameters(), lr=0.1)

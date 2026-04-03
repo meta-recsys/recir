@@ -1,0 +1,129 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-3-Clause license found in the
+# LICENSE file in the root directory of this source tree.
+
+# pyre-strict
+
+"""RegatherTransform — per-op FSDP weight regathering via activation checkpointing."""
+
+from __future__ import annotations
+
+from collections import OrderedDict
+from typing import Any, Callable
+
+import torch
+import torch.fx as fx
+import torch.nn as nn
+import torch.utils._pytree as pytree
+from recir.graph_utils import OP
+from recir.region_transforms.base import RegionTransform
+
+
+def _collect_chain_regions(
+    param_node: fx.Node,
+) -> list[set[fx.Node]]:
+    """Walk users of *param_node* and collect per-branch regions.
+
+    A region is the set of nodes on one usage path from the parameter through
+    chain ops to (and including) the first compute consumer.  The parameter
+    placeholder itself is excluded so that it remains a region *input* (not a
+    member), avoiding issues with subgraph extraction and replacement.
+
+    A node is classified as a "chain op" if ALL its ``fx.Node`` inputs come
+    from the current chain path (including the parameter itself).  This
+    criterion automatically handles ATen ops (t, view, clone, detach) *and*
+    DTensor collective ops (all_gather_into_tensor, wait_tensor) without an
+    explicit whitelist.
+
+    Example graph::
+
+        param → t() ─┬→ addmm (fwd)
+                      └→ mm    (bwd)
+
+    Produces two regions: ``{t, addmm}`` and ``{t, mm}``.
+    (The ``t`` node is duplicated across regions so each region is
+    self-contained.)
+
+    .. note::
+
+       **TODO:** When regions share chain nodes (e.g. ``t`` appears in
+       both ``{t, addmm}`` and ``{t, mm}``), sequential replacement
+       causes the shared node to become a checkpoint output saved by
+       subsequent regions — the full weight stays in memory, defeating
+       the memory saving.  The fix is to **clone shared chain nodes**
+       before replacement so each region has its own copy:
+       ``{t_clone1, addmm}`` and ``{t_clone2, mm}``.  This keeps
+       regions as simple linear single-output chains whose only saved
+       input is the small sharded parameter.
+    """
+    regions: list[set[fx.Node]] = []
+    chain_set: set[fx.Node] = {param_node}
+
+    def _walk(
+        node: fx.Node,
+        path: list[fx.Node],
+    ) -> None:
+        """DFS through chain-op users, emitting a region at each compute consumer."""
+        for user in node.users:
+            if not isinstance(user, fx.Node):
+                continue
+            if user.op == "output":
+                continue
+            has_outside_input = False
+            for arg in pytree.arg_tree_leaves(*user.args, **user.kwargs):
+                if (
+                    isinstance(arg, fx.Node)
+                    and arg not in chain_set
+                    # get_attr nodes are graph constants (e.g. DeviceMesh,
+                    # process group metadata) stored as GraphModule attributes.
+                    # They are always available and don't consume checkpoint
+                    # memory, so they should not terminate the chain.  Without
+                    # this exclusion, DTensor collective ops (which take
+                    # DeviceMesh as a get_attr input) would be misclassified
+                    # as compute consumers, stopping the chain prematurely.
+                    and arg.op != "get_attr"
+                ):
+                    has_outside_input = True
+                    break
+            if not has_outside_input:
+                chain_set.add(user)
+                _walk(user, path + [user])
+            else:
+                regions.append({*path, user})
+
+    _walk(param_node, [])
+    return regions
+
+
+class RegatherTransform(RegionTransform):
+    """Per-op FSDP: recompute the allgather + reshape chain in backward."""
+
+    def detect_regions(
+        self,
+        gm: fx.GraphModule,
+        called_modules: OrderedDict[str, tuple[nn.Module, tuple[Any, ...]]],
+    ) -> list[set[fx.Node]]:
+        root_mod, _root_args = next(iter(called_modules.values()))
+        num_params = sum(1 for _ in root_mod.named_parameters())
+        placeholders = [n for n in gm.graph.nodes if n.op == OP.PLACEHOLDER]
+        param_placeholders = placeholders[:num_params]
+        regions: list[set[fx.Node]] = []
+        for node in param_placeholders:
+            param_regions = _collect_chain_regions(node)
+            regions.extend(param_regions)
+        return regions
+
+    def wrap_region(
+        self,
+        region_gm: fx.GraphModule,
+    ) -> Callable[..., Any]:
+        def _apply(*inputs: Any) -> Any:
+            return torch.utils.checkpoint.checkpoint(
+                region_gm,
+                *inputs,
+                use_reentrant=True,
+            )
+
+        return _apply
