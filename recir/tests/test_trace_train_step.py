@@ -508,6 +508,54 @@ class TraceTrainStepTest(DTensorTestBase):
                 # instead of global batch size.
                 self.assertEqual(node.args[1], [2, 10])
 
+    @skip_if_lt_x_gpu(2)
+    @with_comms
+    def test_tied_parameters(self) -> None:
+        """Verify multi-step compiled training with tied (shared) parameters.
+
+        Models with tied parameters (e.g., tie_word_embeddings in Gemma3)
+        have fewer entries from list(_mod.parameters()) (which deduplicates)
+        than from named_parameters(remove_duplicate=False) (used to build
+        flat_state).  Without the pytree alignment fix in stateless_func,
+        step 2 crashes because the return structure doesn't match flat_state.
+        """
+
+        class TiedModel(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.embed = nn.Embedding(32, 10)
+                self.fc = nn.Linear(10, 10, bias=False)
+                self.head = nn.Linear(10, 32, bias=False)
+                # Tie head.weight to embed.weight (same as tie_word_embeddings)
+                self.head.weight = self.embed.weight
+
+            def forward(self, x: torch.Tensor) -> torch.Tensor:
+                return self.head(self.fc(self.embed(x)))
+
+        @compile()
+        def train_step(
+            mod: nn.Module, opt: torch.optim.Optimizer, inp: torch.Tensor
+        ) -> None:
+            mod(inp).sum().backward()
+            opt.step()
+
+        torch.manual_seed(0)
+        mod = TiedModel().cuda(self.rank)
+        opt = torch.optim.Adam(
+            mod.parameters(), lr=0.01, foreach=False, capturable=True
+        )
+        inp = torch.randint(0, 32, (4, 8)).cuda(self.rank)
+
+        # Materialize optimizer states
+        mod(inp).sum().backward()
+        opt.step()
+        opt.zero_grad()
+
+        # Step 1 triggers make_fx tracing
+        train_step(mod, opt, inp)
+        # Step 2 exercises DeviceStateManager output copy-back
+        train_step(mod, opt, inp)
+
 
 if __name__ == "__main__":
     if False:
