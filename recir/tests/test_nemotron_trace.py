@@ -111,6 +111,37 @@ class TestMamba2Trace(unittest.TestCase):
             msg="Traced Mamba2 output should match eager",
         )
 
+    def test_mamba2_rmsnorm_trace(self):
+        """Verify make_fx traces gated RMSNorm (rmsnorm_fn) without errors."""
+        patch_mamba_for_tracing()
+
+        from mamba_ssm.ops.triton.layernorm_gated import RMSNorm as RMSNormGated
+
+        torch.manual_seed(0)
+
+        class RMSNormModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.fc = nn.Linear(256, 256)
+                self.norm = RMSNormGated(256, group_size=256)
+
+            def forward(self, x):
+                h = self.fc(x)
+                gate = torch.sigmoid(h)
+                return self.norm(h, z=gate).sum()
+
+        model = RMSNormModel().eval()
+        x = torch.randn(2, 32, 256)
+
+        gm = make_fx(
+            lambda x: model(x),
+            tracing_mode="fake",
+            _allow_non_fake_inputs=True,
+        )(x)
+
+        num_nodes = len(list(gm.graph.nodes))
+        self.assertGreater(num_nodes, 0)
+
 
 if __name__ == "__main__":
     unittest.main()
