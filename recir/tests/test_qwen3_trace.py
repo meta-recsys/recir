@@ -286,6 +286,146 @@ class TestQwen3MakeFxTrace(unittest.TestCase):
         )
 
 
+# ── Gemma3 model constants ──
+GEMMA3_VOCAB_SIZE = 1000
+GEMMA3_HIDDEN_SIZE = 256
+GEMMA3_INTERMEDIATE_SIZE = 512
+GEMMA3_NUM_LAYERS = 2
+GEMMA3_NUM_HEADS = 4
+GEMMA3_NUM_KV_HEADS = 2
+GEMMA3_HEAD_DIM = 64
+
+
+class Gemma3LMWrapper(nn.Module):
+    """Wrapper around Gemma3ForCausalLM that returns a scalar loss."""
+
+    def __init__(self, llm):
+        super().__init__()
+        self.llm = llm
+
+    def forward(self, input_ids, attention_mask, labels):
+        outputs = self.llm(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            use_cache=False,
+        )
+        logits = outputs.logits.float()
+        shift_logits = logits[:, :-1, :].contiguous()
+        shift_labels = labels[:, 1:].contiguous()
+        loss = F.cross_entropy(
+            shift_logits.view(-1, shift_logits.size(-1)),
+            shift_labels.view(-1),
+            ignore_index=-100,
+        )
+        return loss
+
+
+def _create_gemma3():
+    """Create a tiny Gemma3 text model for testing."""
+    from transformers import Gemma3TextConfig
+    from transformers.models.gemma3.modeling_gemma3 import (
+        Gemma3ForCausalLM as Gemma3CausalLM,
+    )
+
+    config = Gemma3TextConfig(
+        vocab_size=GEMMA3_VOCAB_SIZE,
+        hidden_size=GEMMA3_HIDDEN_SIZE,
+        intermediate_size=GEMMA3_INTERMEDIATE_SIZE,
+        num_hidden_layers=GEMMA3_NUM_LAYERS,
+        num_attention_heads=GEMMA3_NUM_HEADS,
+        num_key_value_heads=GEMMA3_NUM_KV_HEADS,
+        head_dim=GEMMA3_HEAD_DIM,
+        max_position_embeddings=512,
+        use_cache=False,
+        attn_implementation="eager",
+    )
+    return Gemma3CausalLM(config)
+
+
+def _create_gemma3_data():
+    """Create synthetic data for Gemma3 testing."""
+    torch.manual_seed(42)
+    input_ids = torch.randint(1, GEMMA3_VOCAB_SIZE, (BATCH_SIZE, SEQ_LEN))
+    attention_mask = torch.ones_like(input_ids)
+    labels = input_ids.clone()
+    labels[:, :8] = -100
+    return input_ids, attention_mask, labels
+
+
+class TestGemma3MakeFxTrace(unittest.TestCase):
+    """CPU-only smoke test: verify make_fx can trace Gemma3 as a full graph."""
+
+    def test_gemma3_make_fx_forward(self) -> None:
+        """Verify make_fx traces Gemma3 forward without errors."""
+        from torch.fx.experimental.proxy_tensor import make_fx
+
+        torch.manual_seed(0)
+        llm = _create_gemma3()
+        model = Gemma3LMWrapper(llm).eval()
+        input_ids, attention_mask, labels = _create_gemma3_data()
+
+        def forward_fn(input_ids, attention_mask, labels):
+            return model(input_ids, attention_mask, labels)
+
+        gm = make_fx(
+            forward_fn,
+            tracing_mode="fake",
+            _allow_non_fake_inputs=True,
+        )(input_ids, attention_mask, labels)
+        num_nodes = len(list(gm.graph.nodes))
+        self.assertGreater(num_nodes, 0, "Traced graph should have nodes")
+
+    def test_gemma3_make_fx_train_step(self) -> None:
+        """Verify make_fx traces Gemma3 forward+backward without errors."""
+        from torch.fx.experimental.proxy_tensor import make_fx
+
+        torch.manual_seed(0)
+        llm = _create_gemma3()
+        model = Gemma3LMWrapper(llm).train()
+        input_ids, attention_mask, labels = _create_gemma3_data()
+
+        def forward_fn(input_ids, attention_mask, labels):
+            return model(input_ids, attention_mask, labels)
+
+        gm = make_fx(
+            forward_fn,
+            tracing_mode="fake",
+            _allow_non_fake_inputs=True,
+        )(input_ids, attention_mask, labels)
+        num_nodes = len(list(gm.graph.nodes))
+        self.assertGreater(num_nodes, 0, "Traced graph should have nodes")
+
+    def test_gemma3_make_fx_numerics(self) -> None:
+        """Verify traced Gemma3 graph produces same output as eager."""
+        from torch.fx.experimental.proxy_tensor import make_fx
+
+        torch.manual_seed(0)
+        llm = _create_gemma3()
+        model = Gemma3LMWrapper(llm).eval()
+        input_ids, attention_mask, labels = _create_gemma3_data()
+
+        def forward_fn(input_ids, attention_mask, labels):
+            return model(input_ids, attention_mask, labels)
+
+        with torch.no_grad():
+            eager_out = forward_fn(input_ids, attention_mask, labels)
+
+        gm = make_fx(forward_fn, tracing_mode="real")(
+            input_ids,
+            attention_mask,
+            labels,
+        )
+
+        with torch.no_grad():
+            traced_out = gm(input_ids, attention_mask, labels)
+
+        torch.testing.assert_close(
+            traced_out,
+            eager_out,
+            msg="Traced Gemma3 output should match eager",
+        )
+
+
 if __name__ == "__main__":
     if False:
         run_tests()
