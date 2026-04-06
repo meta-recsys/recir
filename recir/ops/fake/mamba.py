@@ -21,9 +21,14 @@ See https://pytorch.org/tutorials/advanced/custom_ops_landing_page.html
 import logging
 from typing import Optional
 
+import causal_conv1d as conv1d_mod
 import mamba_ssm.modules.mamba2 as mamba2_mod
 import mamba_ssm.ops.triton.ssd_combined as ssd_mod
 import torch
+from causal_conv1d import (
+    causal_conv1d_fn as _original_conv1d,
+    causal_conv1d_update as _original_conv1d_update,
+)
 from mamba_ssm.ops.triton.ssd_combined import (
     mamba_split_conv1d_scan_combined as _original_split,
 )
@@ -179,6 +184,47 @@ def register_mamba_split_conv1d_scan_combined_custom_op(original_fn):
     return wrapper
 
 
+def register_causal_conv1d_custom_op(original_fn):
+    """Wrap causal_conv1d_fn as a custom op."""
+
+    @torch.library.custom_op("recir_mamba::causal_conv1d_fwd", mutates_args=())
+    def op(
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        bias: Optional[torch.Tensor],
+        activation: str,
+    ) -> torch.Tensor:
+        return original_fn(x=x, weight=weight, bias=bias, activation=activation)
+
+    @op.register_fake
+    def _(x, weight, bias, activation):
+        return x.new_empty(x.shape)
+
+    return op
+
+
+def register_causal_conv1d_update_custom_op(original_fn):
+    """Wrap causal_conv1d_update as a custom op."""
+
+    @torch.library.custom_op(
+        "recir_mamba::causal_conv1d_update", mutates_args=("conv_state",)
+    )
+    def op(
+        x: torch.Tensor,
+        conv_state: torch.Tensor,
+        weight: torch.Tensor,
+        bias: Optional[torch.Tensor],
+        activation: str,
+    ) -> torch.Tensor:
+        return original_fn(x, conv_state, weight, bias, activation)
+
+    @op.register_fake
+    def _(x, conv_state, weight, bias, activation):
+        return x.new_empty(x.shape)
+
+    return op
+
+
 def patch_mamba_for_tracing():
     """Monkey-patch mamba-ssm ops with custom_op wrappers for make_fx tracing.
 
@@ -199,3 +245,19 @@ def patch_mamba_for_tracing():
     if hasattr(mamba2_mod, "mamba_split_conv1d_scan_combined"):
         mamba2_mod.mamba_split_conv1d_scan_combined = wrapper_split
     logger.info("Patched mamba_split_conv1d_scan_combined for tracing")
+
+    # --- causal_conv1d_fn ---
+    wrapper_conv1d = register_causal_conv1d_custom_op(_original_conv1d)
+    conv1d_mod.causal_conv1d_fn = wrapper_conv1d
+    if hasattr(mamba2_mod, "causal_conv1d_fn"):
+        mamba2_mod.causal_conv1d_fn = wrapper_conv1d
+    logger.info("Patched causal_conv1d_fn for tracing")
+
+    # --- causal_conv1d_update ---
+    wrapper_conv1d_update = register_causal_conv1d_update_custom_op(
+        _original_conv1d_update
+    )
+    conv1d_mod.causal_conv1d_update = wrapper_conv1d_update
+    if hasattr(mamba2_mod, "causal_conv1d_update"):
+        mamba2_mod.causal_conv1d_update = wrapper_conv1d_update
+    logger.info("Patched causal_conv1d_update for tracing")
