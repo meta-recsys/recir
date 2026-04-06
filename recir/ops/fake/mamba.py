@@ -24,6 +24,7 @@ from typing import Optional, Tuple
 import causal_conv1d as conv1d_mod
 import mamba_ssm.modules.mamba2 as mamba2_mod
 import mamba_ssm.ops.selective_scan_interface as sscan_mod
+import mamba_ssm.ops.triton.layernorm_gated as ln_mod
 import mamba_ssm.ops.triton.selective_state_update as ssu_mod
 import mamba_ssm.ops.triton.ssd_combined as ssd_mod
 import torch
@@ -32,6 +33,7 @@ from causal_conv1d import (
     causal_conv1d_update as _original_conv1d_update,
 )
 from mamba_ssm.ops.selective_scan_interface import selective_scan_fn as _original_sscan
+from mamba_ssm.ops.triton.layernorm_gated import layernorm_fn as _original_ln
 from mamba_ssm.ops.triton.selective_state_update import (
     selective_state_update as _original_ssu,
 )
@@ -490,6 +492,54 @@ def register_mamba_chunk_scan_combined_custom_op(original_fn):
     return wrapper
 
 
+def register_layernorm_fn_custom_op(original_fn):
+    """Wrap layernorm_fn / rmsnorm_fn as a custom op.
+
+    Used by MambaRMSNormGated in NemotronH for gated RMS normalization.
+    """
+
+    @torch.library.custom_op("recir_mamba::layernorm_fn", mutates_args=())
+    def op(
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        bias: Optional[torch.Tensor],
+        z: Optional[torch.Tensor],
+        eps: float,
+        group_size: int,
+        norm_before_gate: bool,
+        is_rms_norm: bool,
+    ) -> torch.Tensor:
+        return original_fn(
+            x,
+            weight,
+            bias,
+            z=z,
+            eps=eps,
+            group_size=group_size,
+            norm_before_gate=norm_before_gate,
+            is_rms_norm=is_rms_norm,
+        )
+
+    @op.register_fake
+    def _(x, weight, bias, z, eps, group_size, norm_before_gate, is_rms_norm):
+        return x.new_empty(x.shape)
+
+    def wrapper(
+        x,
+        weight,
+        bias,
+        z=None,
+        eps=1e-6,
+        group_size=None,
+        norm_before_gate=True,
+        is_rms_norm=False,
+    ):
+        gs = group_size if group_size is not None else x.shape[-1]
+        return op(x, weight, bias, z, eps, gs, norm_before_gate, is_rms_norm)
+
+    return wrapper
+
+
 def patch_mamba_for_tracing():
     """Monkey-patch mamba-ssm ops with custom_op wrappers for make_fx tracing.
 
@@ -543,3 +593,26 @@ def patch_mamba_for_tracing():
     wrapper_ssu = register_selective_state_update_custom_op(_original_ssu)
     ssu_mod.selective_state_update = wrapper_ssu
     logger.info("Patched selective_state_update for tracing")
+
+    # --- layernorm_fn / rmsnorm_fn (gated RMSNorm used by Mamba2) ---
+    wrapper_ln = register_layernorm_fn_custom_op(_original_ln)
+    ln_mod.layernorm_fn = wrapper_ln
+    ln_mod.rmsnorm_fn = (
+        lambda x,
+        weight,
+        bias,
+        z=None,
+        eps=1e-6,
+        group_size=None,
+        norm_before_gate=True: wrapper_ln(
+            x,
+            weight,
+            bias,
+            z=z,
+            eps=eps,
+            group_size=group_size,
+            norm_before_gate=norm_before_gate,
+            is_rms_norm=True,
+        )
+    )
+    logger.info("Patched layernorm_fn/rmsnorm_fn for tracing")
