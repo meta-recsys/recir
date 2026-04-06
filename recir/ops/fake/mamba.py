@@ -19,17 +19,24 @@ See https://pytorch.org/tutorials/advanced/custom_ops_landing_page.html
 """
 
 import logging
-from typing import Optional
+from typing import Optional, Tuple
 
 import causal_conv1d as conv1d_mod
 import mamba_ssm.modules.mamba2 as mamba2_mod
+import mamba_ssm.ops.selective_scan_interface as sscan_mod
+import mamba_ssm.ops.triton.selective_state_update as ssu_mod
 import mamba_ssm.ops.triton.ssd_combined as ssd_mod
 import torch
 from causal_conv1d import (
     causal_conv1d_fn as _original_conv1d,
     causal_conv1d_update as _original_conv1d_update,
 )
+from mamba_ssm.ops.selective_scan_interface import selective_scan_fn as _original_sscan
+from mamba_ssm.ops.triton.selective_state_update import (
+    selective_state_update as _original_ssu,
+)
 from mamba_ssm.ops.triton.ssd_combined import (
+    mamba_chunk_scan_combined as _original_chunk,
     mamba_split_conv1d_scan_combined as _original_split,
 )
 
@@ -225,6 +232,264 @@ def register_causal_conv1d_update_custom_op(original_fn):
     return op
 
 
+def register_selective_scan_custom_op(original_fn):
+    """Wrap selective_scan_fn as a custom op (Mamba1 SSM)."""
+
+    @torch.library.custom_op("recir_mamba::selective_scan_fwd", mutates_args=())
+    def op(
+        u: torch.Tensor,
+        delta: torch.Tensor,
+        A: torch.Tensor,
+        B: torch.Tensor,
+        C: torch.Tensor,
+        D: Optional[torch.Tensor],
+        z: Optional[torch.Tensor],
+        delta_bias: Optional[torch.Tensor],
+        delta_softplus: bool,
+        return_last_state: bool,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        result = original_fn(
+            u,
+            delta,
+            A,
+            B,
+            C,
+            D,
+            z=z,
+            delta_bias=delta_bias,
+            delta_softplus=delta_softplus,
+            return_last_state=return_last_state,
+        )
+        if return_last_state:
+            return result
+        batch, dim, seqlen = u.shape
+        d_state = A.shape[1]
+        dummy_state = u.new_zeros(batch, dim, d_state)
+        return result, dummy_state
+
+    @op.register_fake
+    def _(u, delta, A, B, C, D, z, delta_bias, delta_softplus, return_last_state):
+        batch, dim, seqlen = u.shape
+        d_state = A.shape[1]
+        out = u.new_empty((batch, dim, seqlen))
+        last_state = u.new_empty((batch, dim, d_state))
+        return out, last_state
+
+    def wrapper(
+        u,
+        delta,
+        A,
+        B,
+        C,
+        D=None,
+        z=None,
+        delta_bias=None,
+        delta_softplus=False,
+        return_last_state=False,
+    ):
+        out, last_state = op(
+            u,
+            delta,
+            A,
+            B,
+            C,
+            D,
+            z,
+            delta_bias,
+            delta_softplus,
+            return_last_state,
+        )
+        if return_last_state:
+            return out, last_state
+        return out
+
+    return wrapper
+
+
+def register_selective_state_update_custom_op(original_fn):
+    """Wrap selective_state_update as a custom op."""
+
+    @torch.library.custom_op(
+        "recir_mamba::selective_state_update", mutates_args=("ssm_state",)
+    )
+    def op(
+        ssm_state: torch.Tensor,
+        x: torch.Tensor,
+        dt: torch.Tensor,
+        A: torch.Tensor,
+        B: torch.Tensor,
+        C: torch.Tensor,
+        D: Optional[torch.Tensor],
+        z: Optional[torch.Tensor],
+        dt_bias: Optional[torch.Tensor],
+        dt_softplus: bool,
+    ) -> torch.Tensor:
+        return original_fn(
+            ssm_state,
+            x,
+            dt,
+            A,
+            B,
+            C,
+            D,
+            z=z,
+            dt_bias=dt_bias,
+            dt_softplus=dt_softplus,
+        )
+
+    @op.register_fake
+    def _(ssm_state, x, dt, A, B, C, D, z, dt_bias, dt_softplus):
+        return x.new_empty(x.shape)
+
+    def wrapper(
+        ssm_state,
+        x,
+        dt,
+        A,
+        B,
+        C,
+        D=None,
+        z=None,
+        dt_bias=None,
+        dt_softplus=False,
+    ):
+        return op(ssm_state, x, dt, A, B, C, D, z, dt_bias, dt_softplus)
+
+    return wrapper
+
+
+def register_mamba_chunk_scan_combined_custom_op(original_fn):
+    """Wrap mamba_chunk_scan_combined as a custom op.
+
+    Used in the non-fused Mamba2 path (inference or when use_mem_eff_path=False).
+    """
+
+    @torch.library.custom_op("recir_mamba::mamba_chunk_scan_combined", mutates_args=())
+    def op(
+        x: torch.Tensor,
+        dt: torch.Tensor,
+        A: torch.Tensor,
+        B: torch.Tensor,
+        C: torch.Tensor,
+        chunk_size: int,
+        D: Optional[torch.Tensor],
+        z: Optional[torch.Tensor],
+        dt_bias: Optional[torch.Tensor],
+        initial_states: Optional[torch.Tensor],
+        seq_idx: Optional[torch.Tensor],
+        dt_softplus: bool,
+        dt_limit_min: float,
+        dt_limit_max: float,
+        return_final_states: bool,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        result = original_fn(
+            x,
+            dt,
+            A,
+            B,
+            C,
+            chunk_size,
+            D=D,
+            z=z,
+            dt_bias=dt_bias,
+            initial_states=initial_states,
+            seq_idx=seq_idx,
+            dt_softplus=dt_softplus,
+            dt_limit=(dt_limit_min, dt_limit_max),
+            return_final_states=return_final_states,
+        )
+        if return_final_states:
+            return result
+        batch, seqlen, nheads, headdim = x.shape
+        dstate = B.shape[-1]
+        dummy_states = x.new_zeros(batch, nheads, headdim, dstate)
+        return result, dummy_states
+
+    @op.register_fake
+    def _(
+        x,
+        dt,
+        A,
+        B,
+        C,
+        chunk_size,
+        D,
+        z,
+        dt_bias,
+        initial_states,
+        seq_idx,
+        dt_softplus,
+        dt_limit_min,
+        dt_limit_max,
+        return_final_states,
+    ):
+        batch, seqlen, nheads, headdim = x.shape
+        dstate = B.shape[-1]
+        out = x.new_empty(x.shape)
+        final_states = x.new_empty(batch, nheads, headdim, dstate)
+        return out, final_states
+
+    def wrapper(
+        x,
+        dt,
+        A,
+        B,
+        C,
+        chunk_size,
+        D=None,
+        z=None,
+        dt_bias=None,
+        initial_states=None,
+        seq_idx=None,
+        cu_seqlens=None,
+        dt_softplus=False,
+        dt_limit=(0.0, float("inf")),
+        return_final_states=False,
+        return_varlen_states=False,
+    ):
+        if return_varlen_states:
+            return original_fn(
+                x,
+                dt,
+                A,
+                B,
+                C,
+                chunk_size,
+                D=D,
+                z=z,
+                dt_bias=dt_bias,
+                initial_states=initial_states,
+                seq_idx=seq_idx,
+                cu_seqlens=cu_seqlens,
+                dt_softplus=dt_softplus,
+                dt_limit=dt_limit,
+                return_final_states=return_final_states,
+                return_varlen_states=True,
+            )
+        out, final_states = op(
+            x,
+            dt,
+            A,
+            B,
+            C,
+            chunk_size,
+            D,
+            z,
+            dt_bias,
+            initial_states,
+            seq_idx,
+            dt_softplus,
+            dt_limit[0],
+            dt_limit[1],
+            return_final_states,
+        )
+        if return_final_states:
+            return out, final_states
+        return out
+
+    return wrapper
+
+
 def patch_mamba_for_tracing():
     """Monkey-patch mamba-ssm ops with custom_op wrappers for make_fx tracing.
 
@@ -261,3 +526,20 @@ def patch_mamba_for_tracing():
     if hasattr(mamba2_mod, "causal_conv1d_update"):
         mamba2_mod.causal_conv1d_update = wrapper_conv1d_update
     logger.info("Patched causal_conv1d_update for tracing")
+
+    # --- mamba_chunk_scan_combined (non-fused Mamba2 path) ---
+    wrapper_chunk = register_mamba_chunk_scan_combined_custom_op(_original_chunk)
+    ssd_mod.mamba_chunk_scan_combined = wrapper_chunk
+    if hasattr(mamba2_mod, "mamba_chunk_scan_combined"):
+        mamba2_mod.mamba_chunk_scan_combined = wrapper_chunk
+    logger.info("Patched mamba_chunk_scan_combined for tracing")
+
+    # --- selective_scan_fn (Mamba1) ---
+    wrapper_sscan = register_selective_scan_custom_op(_original_sscan)
+    sscan_mod.selective_scan_fn = wrapper_sscan
+    logger.info("Patched selective_scan_fn for tracing")
+
+    # --- selective_state_update ---
+    wrapper_ssu = register_selective_state_update_custom_op(_original_ssu)
+    ssu_mod.selective_state_update = wrapper_ssu
+    logger.info("Patched selective_state_update for tracing")
