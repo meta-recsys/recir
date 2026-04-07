@@ -23,6 +23,8 @@ setup(
         "recir",
         "recir.distributed",
         "recir.lowering",
+        "recir.ops",
+        "recir.ops.fake",
         "recir.passes",
         "recir.torchax",
         "recir.torchax.ops",
