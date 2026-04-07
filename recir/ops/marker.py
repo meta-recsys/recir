@@ -101,10 +101,12 @@ def _attach_inject_hooks(
 ) -> None:
     """Register forward_pre_hooks for inject specs."""
     for spec in inject_specs:
-        fqn = spec.at
-        submodule = model.get_submodule(fqn)
-        handle = submodule.register_forward_pre_hook(_make_pre_hook(fqn))
-        handles.append(handle)
+        at = spec.at
+        fqns = [at] if isinstance(at, str) else list(at)
+        for fqn in fqns:
+            submodule = model.get_submodule(fqn)
+            handle = submodule.register_forward_pre_hook(_make_pre_hook(fqn))
+            handles.append(handle)
 
 
 def _attach_derive_hooks(
@@ -130,10 +132,12 @@ def _attach_aux_hooks(
 ) -> None:
     """Register forward_hooks for aux specs."""
     for spec in aux_specs:
-        fqn = spec.at
-        submodule = model.get_submodule(fqn)
-        handle = submodule.register_forward_hook(_make_output_hook(fqn))
-        handles.append(handle)
+        at = spec.at
+        fqns = [at] if isinstance(at, str) else list(at)
+        for fqn in fqns:
+            submodule = model.get_submodule(fqn)
+            handle = submodule.register_forward_hook(_make_output_hook(fqn))
+            handles.append(handle)
 
 
 def attach_markers(
