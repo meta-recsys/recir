@@ -177,10 +177,17 @@ def _enable_compile() -> Generator[None, None, None]:
 
     orig_is_compiling_code = torch._utils.is_compiling.__code__  # pyre-ignore[16]
     torch._utils.is_compiling.__code__ = f_true.__code__  # pyre-ignore[16]
+    # PyTorch also checks torch.compiler.is_compiling() which
+    # reads _is_compiling_flag.  Setting this flag lets the optimizer skip
+    # device assertions for capturable mode and avoid .item() calls in
+    # _get_value() during tracing.
+    orig_compiling_flag = torch.compiler._is_compiling_flag  # pyre-ignore[16]
+    torch.compiler._is_compiling_flag = True  # pyre-ignore[16]
     try:
         yield
     finally:
         torch._utils.is_compiling.__code__ = orig_is_compiling_code  # pyre-ignore[16]
+        torch.compiler._is_compiling_flag = orig_compiling_flag  # pyre-ignore[16]
 
 
 def _dedup_collectives(gm: fx.GraphModule) -> fx.GraphModule:

@@ -431,6 +431,9 @@ def _aten_stack(tensors: Any, dim: Any = 0) -> Any:
 @op(torch.ops.aten.softmax)
 @op(torch.ops.aten.softmax.int)  # pyre-ignore[56]
 def _aten_softmax(x: Any, dim: Any, halftofloat: Any = False) -> Any:
+    # Use dtype check instead of halftofloat flag
+    if x.dtype in (jnp.float16, jnp.bfloat16):
+        x = x.astype(jnp.float32)
     if x.shape == ():
         return jax.nn.softmax(x.reshape([1]), axis=0).reshape([])
     return jax.nn.softmax(x, dim)
@@ -3196,6 +3199,9 @@ def _aten_logical_not(self: Any) -> Any:
 # aten.log_softmax
 @op(torch.ops.aten._log_softmax)  # pyre-ignore[56]
 def _aten_log_softmax(self: Any, axis: Any = -1, half_to_float: Any = False) -> Any:
+    # Use dtype check instead of half_to_float flag
+    if self.dtype in (jnp.float16, jnp.bfloat16):
+        self = self.astype(jnp.float32)
     if self.shape == ():
         return jnp.astype(0.0, self.dtype)
     return jax.nn.log_softmax(self, axis)
