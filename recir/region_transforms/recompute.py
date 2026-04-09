@@ -29,6 +29,7 @@ class RecomputeTransform(RegionTransform):
     """
 
     def __init__(self, submodule_fqns: set[str]) -> None:
+        super().__init__()
         self.submodule_fqns = submodule_fqns
 
     def detect_regions(

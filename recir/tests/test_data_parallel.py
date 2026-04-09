@@ -2487,6 +2487,435 @@ class TestMultipleEmbeddingTables(DTensorTestBase):
                         break
 
 
+class TestHybridParallelV2E2E(DTensorTestBase):
+    """End-to-end tests for HybridParallel with use_parametrization=True (v2)."""
+
+    @property
+    def world_size(self) -> int:
+        return 2
+
+    @skip_if_lt_x_gpu(2)
+    @with_comms
+    def test_compile_and_run(self) -> None:
+        """HybridParallel v2 compiles and runs one train step without error."""
+        model = EmbeddingMLP().cuda(self.rank)
+        opt = torch.optim.SGD(model.parameters(), lr=0.1, foreach=True)
+        device = f"cuda:{self.rank}"
+        train_batch = (
+            torch.randint(0, 16, (8, 3), device=device),
+            torch.randn(8, 4, device=device),
+        )
+
+        plan = EmbeddingShardingPlan(
+            sharding_map={"emb.weight": EmbeddingShardingType.ROW_WISE}
+        )
+        compiled_fn = compile(
+            parallel_mode=HybridParallel(
+                dense_style="fully_shard",
+                embedding_plan=plan,
+                use_parametrization=True,
+            )
+        )(embedding_train_step)
+        loss = compiled_fn(model, opt, train_batch)
+        self.assertIsNotNone(loss)
+
+    @skip_if_lt_x_gpu(2)
+    @with_comms
+    def test_graph_has_decomposed_embedding(self) -> None:
+        """v2 compiled graph contains decomposed AllToAll ops for row-wise embedding."""
+        model = EmbeddingMLP().cuda(self.rank)
+        opt = torch.optim.SGD(model.parameters(), lr=0.1, foreach=True)
+        device = f"cuda:{self.rank}"
+        train_batch = (
+            torch.randint(0, 16, (8, 3), device=device),
+            torch.randn(8, 4, device=device),
+        )
+
+        plan = EmbeddingShardingPlan(
+            sharding_map={"emb.weight": EmbeddingShardingType.ROW_WISE}
+        )
+        compiled_fn = compile(
+            parallel_mode=HybridParallel(
+                dense_style="fully_shard",
+                embedding_plan=plan,
+                use_parametrization=True,
+            )
+        )(embedding_train_step)
+        compiled_fn(model, opt, train_batch)
+
+        from recir.api import COMPILED_OBJECT_KEY
+
+        compiled_obj = compiled_fn.__dict__[COMPILED_OBJECT_KEY]
+        gm = compiled_obj.gm
+
+        a2a_nodes = [
+            n
+            for n in gm.graph.nodes
+            if n.op == "call_function"
+            and n.target == torch.ops._c10d_functional.all_to_all_single.default
+        ]
+        self.assertGreaterEqual(
+            len(a2a_nodes),
+            3,
+            "Expected at least 3 all_to_all_single nodes from decomposed embedding",
+        )
+
+    @skip_if_lt_x_gpu(2)
+    @with_comms
+    def test_no_allgather_on_embedding_params(self) -> None:
+        """Embedding params should not have allgather in v2 (they use AllToAll)."""
+        model = EmbeddingMLP().cuda(self.rank)
+        opt = torch.optim.SGD(model.parameters(), lr=0.1, foreach=True)
+        device = f"cuda:{self.rank}"
+        train_batch = (
+            torch.randint(0, 16, (8, 3), device=device),
+            torch.randn(8, 4, device=device),
+        )
+
+        plan = EmbeddingShardingPlan(
+            sharding_map={"emb.weight": EmbeddingShardingType.ROW_WISE}
+        )
+        compiled_fn = compile(
+            parallel_mode=HybridParallel(
+                dense_style="fully_shard",
+                embedding_plan=plan,
+                use_parametrization=True,
+            )
+        )(embedding_train_step)
+        compiled_fn(model, opt, train_batch)
+
+        from recir.api import COMPILED_OBJECT_KEY
+
+        compiled_obj = compiled_fn.__dict__[COMPILED_OBJECT_KEY]
+        gm = compiled_obj.gm
+
+        # The decomposed embedding uses local aten.embedding on received
+        # indices (inside the AllToAll protocol).  The weight input to this
+        # local lookup should NOT go through allgather.
+        for node in gm.graph.nodes:
+            if (
+                node.op == "call_function"
+                and node.target == torch.ops.aten.embedding.default
+            ):
+                weight_node = node.args[0]
+                current = weight_node
+                while current.op != "placeholder":
+                    target_str = str(getattr(current, "target", ""))
+                    self.assertNotIn(
+                        "all_gather_into_tensor",
+                        target_str,
+                        "Embedding param should not be allgathered in v2",
+                    )
+                    if current.args:
+                        current = current.args[0]
+                    else:
+                        break
+
+    @skip_if_lt_x_gpu(2)
+    @with_comms
+    def test_multiple_embedding_tables(self) -> None:
+        """v2: two embedding tables both decomposed into AllToAll ops."""
+        model = MultiEmbeddingMLP(num_emb1=16, num_emb2=32, emb_dim=8).cuda(self.rank)
+        opt = torch.optim.SGD(model.parameters(), lr=0.1, foreach=True)
+        device = f"cuda:{self.rank}"
+        train_batch = (
+            torch.randint(0, 16, (8, 3), device=device),
+            torch.randint(0, 32, (8, 3), device=device),
+            torch.randn(8, 4, device=device),
+        )
+
+        plan = EmbeddingShardingPlan(
+            sharding_map={
+                "emb1.weight": EmbeddingShardingType.ROW_WISE,
+                "emb2.weight": EmbeddingShardingType.ROW_WISE,
+            }
+        )
+        compiled_fn = compile(
+            parallel_mode=HybridParallel(
+                dense_style="fully_shard",
+                embedding_plan=plan,
+                use_parametrization=True,
+            )
+        )(multi_embedding_train_step)
+        compiled_fn(model, opt, train_batch)
+
+        from recir.api import COMPILED_OBJECT_KEY
+
+        compiled_obj = compiled_fn.__dict__[COMPILED_OBJECT_KEY]
+        gm = compiled_obj.gm
+
+        # Each table → 3 all_to_all_single nodes = 6 total
+        a2a_nodes = [
+            n
+            for n in gm.graph.nodes
+            if n.op == "call_function"
+            and n.target == torch.ops._c10d_functional.all_to_all_single.default
+        ]
+        self.assertGreaterEqual(
+            len(a2a_nodes),
+            6,
+            f"Expected at least 6 all_to_all_single nodes for 2 tables, got {len(a2a_nodes)}",
+        )
+
+
+class TestHybridParallelV2GraphStructure(DTensorTestBase):
+    """Verify the compiled graph structure: embedding decomposition ops
+    and dense FSDP allgather coexist correctly."""
+
+    @property
+    def world_size(self) -> int:
+        return 2
+
+    def _compile_and_get_gm(
+        self,
+        model: nn.Module,
+        opt: torch.optim.Optimizer,
+        train_batch: Any,
+        plan: EmbeddingShardingPlan,
+        train_step_fn: Callable[..., Any] = embedding_train_step,
+    ) -> fx.GraphModule:
+        """Compile with HybridParallel v2 and return the GraphModule."""
+        compiled_fn = compile(
+            parallel_mode=HybridParallel(
+                dense_style="fully_shard",
+                embedding_plan=plan,
+                use_parametrization=True,
+            )
+        )(train_step_fn)
+        compiled_fn(model, opt, train_batch)
+
+        from recir.api import COMPILED_OBJECT_KEY
+
+        return compiled_fn.__dict__[COMPILED_OBJECT_KEY].gm
+
+    @skip_if_lt_x_gpu(2)
+    @with_comms
+    def test_embedding_decomposition_dataflow(self) -> None:
+        """Verify embedding placeholder flows through the expected decomposition
+        ops: argsort, bincount, all_to_all_single (sizes), all_to_all_single
+        (indices), aten.embedding (local), all_to_all_single (results), argsort
+        (unsort)."""
+        model = EmbeddingMLP().cuda(self.rank)
+        opt = torch.optim.SGD(model.parameters(), lr=0.1, foreach=True)
+        device = f"cuda:{self.rank}"
+        train_batch = (
+            torch.randint(0, 16, (8, 3), device=device),
+            torch.randn(8, 4, device=device),
+        )
+        plan = EmbeddingShardingPlan(
+            sharding_map={"emb.weight": EmbeddingShardingType.ROW_WISE}
+        )
+        gm = self._compile_and_get_gm(model, opt, train_batch, plan)
+
+        # Collect all op targets in the graph.
+        op_targets = set()
+        for node in gm.graph.nodes:
+            if node.op == "call_function":
+                op_targets.add(str(node.target))
+
+        # Key ops from decomposed_row_wise_embedding must be present.
+        # Note: argsort decomposes to aten.sort.stable in the traced graph.
+        expected_ops = [
+            "aten.sort",  # sort by rank + unsort (decomposed from argsort)
+            "aten.embedding",  # local lookup on received indices
+            "_c10d_functional.all_to_all_single",  # index/result exchange
+        ]
+        for expected in expected_ops:
+            found = any(expected in t for t in op_targets)
+            self.assertTrue(
+                found,
+                f"Expected '{expected}' in graph ops for decomposed "
+                f"embedding, got: {sorted(op_targets)}",
+            )
+
+        # Verify the dataflow: aten.embedding should consume indices from
+        # all_to_all_single (received indices), not directly from an input
+        # placeholder.
+        for node in gm.graph.nodes:
+            if (
+                node.op == "call_function"
+                and node.target == torch.ops.aten.embedding.default
+            ):
+                indices_input = node.args[1]
+                # The indices input should come from wait_tensor
+                # (after all_to_all_single), not from a placeholder.
+                self.assertNotEqual(
+                    indices_input.op,
+                    "placeholder",
+                    "aten.embedding indices should come from AllToAll "
+                    "(decomposed), not directly from input placeholder",
+                )
+
+    @skip_if_lt_x_gpu(2)
+    @with_comms
+    def test_dense_params_use_allgather(self) -> None:
+        """Dense params (linear.weight, linear.bias) go through allgather."""
+        model = EmbeddingMLP().cuda(self.rank)
+        opt = torch.optim.SGD(model.parameters(), lr=0.1, foreach=True)
+        device = f"cuda:{self.rank}"
+        train_batch = (
+            torch.randint(0, 16, (8, 3), device=device),
+            torch.randn(8, 4, device=device),
+        )
+        plan = EmbeddingShardingPlan(
+            sharding_map={"emb.weight": EmbeddingShardingType.ROW_WISE}
+        )
+        gm = self._compile_and_get_gm(model, opt, train_batch, plan)
+
+        allgather_count = 0
+        for node in gm.graph.nodes:
+            if node.op == "call_function":
+                if "all_gather_into_tensor" in str(node.target):
+                    allgather_count += 1
+
+        # EmbeddingMLP has 2 dense params (linear.weight, linear.bias).
+        # With FULLY_SHARD + region transforms, each gets forward + backward
+        # allgather (reentrant checkpoint recompute) = 4 total.
+        self.assertGreaterEqual(
+            allgather_count,
+            2,
+            f"Expected at least 2 allgathers for dense params, got {allgather_count}",
+        )
+
+    @skip_if_lt_x_gpu(2)
+    @with_comms
+    def test_dense_and_embedding_coexist(self) -> None:
+        """Both allgather (dense) and all_to_all (embedding) ops coexist."""
+        model = EmbeddingMLP().cuda(self.rank)
+        opt = torch.optim.SGD(model.parameters(), lr=0.1, foreach=True)
+        device = f"cuda:{self.rank}"
+        train_batch = (
+            torch.randint(0, 16, (8, 3), device=device),
+            torch.randn(8, 4, device=device),
+        )
+        plan = EmbeddingShardingPlan(
+            sharding_map={"emb.weight": EmbeddingShardingType.ROW_WISE}
+        )
+        gm = self._compile_and_get_gm(model, opt, train_batch, plan)
+
+        allgather_count = 0
+        a2a_count = 0
+        reduce_scatter_count = 0
+        for node in gm.graph.nodes:
+            if node.op == "call_function":
+                target_str = str(node.target)
+                if "all_gather_into_tensor" in target_str:
+                    allgather_count += 1
+                elif "all_to_all_single" in target_str:
+                    a2a_count += 1
+                elif "reduce_scatter_tensor" in target_str:
+                    reduce_scatter_count += 1
+
+        self.assertGreater(
+            allgather_count, 0, "Expected allgather ops for dense params"
+        )
+        self.assertGreaterEqual(
+            a2a_count, 3, "Expected at least 3 all_to_all ops for embedding"
+        )
+        self.assertGreater(
+            reduce_scatter_count, 0, "Expected reduce_scatter for gradient reduction"
+        )
+
+
+class TestHybridParallelV2NumericalCorrectness(DTensorTestBase):
+    """Compare HybridParallel v2 output against unsharded single-rank reference."""
+
+    @property
+    def world_size(self) -> int:
+        return 2
+
+    @skip_if_lt_x_gpu(2)
+    @with_comms
+    def test_loss_matches_unsharded_reference(self) -> None:
+        """v2 compiled loss matches unsharded single-device forward."""
+        torch.manual_seed(42 + self.rank)
+        device = f"cuda:{self.rank}"
+
+        # Create model with deterministic weights (same on all ranks).
+        torch.manual_seed(0)
+        model = EmbeddingMLP(num_embeddings=16, embedding_dim=8).cuda(self.rank)
+        # Save unsharded weights for reference.
+        ref_state = deepcopy(model.state_dict())
+
+        opt = torch.optim.SGD(model.parameters(), lr=0.0, foreach=True)
+
+        # Use the same input on all ranks so the reference is deterministic.
+        torch.manual_seed(123)
+        indices = torch.randint(0, 16, (8, 3), device=device)
+        labels = torch.randn(8, 4, device=device)
+        train_batch = (indices, labels)
+
+        plan = EmbeddingShardingPlan(
+            sharding_map={"emb.weight": EmbeddingShardingType.ROW_WISE}
+        )
+        compiled_fn = compile(
+            parallel_mode=HybridParallel(
+                dense_style="fully_shard",
+                embedding_plan=plan,
+                use_parametrization=True,
+            )
+        )(embedding_train_step)
+        compiled_loss = compiled_fn(model, opt, train_batch)
+
+        # Reference: unsharded forward on same device.
+        ref_model = EmbeddingMLP(num_embeddings=16, embedding_dim=8).cuda(self.rank)
+        ref_model.load_state_dict(ref_state)
+        ref_out = ref_model(indices)
+        ref_loss = (ref_out - labels).sum()
+
+        self.assertTrue(
+            torch.allclose(compiled_loss, ref_loss, atol=1e-4, rtol=1e-4),
+            f"Compiled loss {compiled_loss.item():.6f} does not match "
+            f"reference {ref_loss.item():.6f}",
+        )
+
+    @skip_if_lt_x_gpu(2)
+    @with_comms
+    def test_multi_table_loss_matches_reference(self) -> None:
+        """v2 compiled loss with two embedding tables matches unsharded reference."""
+        device = f"cuda:{self.rank}"
+
+        torch.manual_seed(0)
+        model = MultiEmbeddingMLP(num_emb1=16, num_emb2=32, emb_dim=8).cuda(self.rank)
+        ref_state = deepcopy(model.state_dict())
+
+        opt = torch.optim.SGD(model.parameters(), lr=0.0, foreach=True)
+
+        torch.manual_seed(123)
+        indices1 = torch.randint(0, 16, (8, 3), device=device)
+        indices2 = torch.randint(0, 32, (8, 3), device=device)
+        labels = torch.randn(8, 4, device=device)
+        train_batch = (indices1, indices2, labels)
+
+        plan = EmbeddingShardingPlan(
+            sharding_map={
+                "emb1.weight": EmbeddingShardingType.ROW_WISE,
+                "emb2.weight": EmbeddingShardingType.ROW_WISE,
+            }
+        )
+        compiled_fn = compile(
+            parallel_mode=HybridParallel(
+                dense_style="fully_shard",
+                embedding_plan=plan,
+                use_parametrization=True,
+            )
+        )(multi_embedding_train_step)
+        compiled_loss = compiled_fn(model, opt, train_batch)
+
+        ref_model = MultiEmbeddingMLP(num_emb1=16, num_emb2=32, emb_dim=8).cuda(
+            self.rank
+        )
+        ref_model.load_state_dict(ref_state)
+        ref_out = ref_model(indices1, indices2)
+        ref_loss = (ref_out - labels).sum()
+
+        self.assertTrue(
+            torch.allclose(compiled_loss, ref_loss, atol=1e-4, rtol=1e-4),
+            f"Compiled loss {compiled_loss.item():.6f} does not match "
+            f"reference {ref_loss.item():.6f}",
+        )
+
+
 if __name__ == "__main__":
     if False:
         run_tests()

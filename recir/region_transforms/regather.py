@@ -11,7 +11,7 @@
 from __future__ import annotations
 
 from collections import OrderedDict
-from typing import Any, Callable
+from typing import Any, Callable, Optional, Set
 
 import torch
 import torch.fx as fx
@@ -100,6 +100,9 @@ def _collect_chain_regions(
 class RegatherTransform(RegionTransform):
     """Per-op FSDP: recompute the allgather + reshape chain in backward."""
 
+    def __init__(self, skip_param_indices: Optional[Set[int]] = None) -> None:
+        super().__init__(skip_param_indices=skip_param_indices)
+
     def detect_regions(
         self,
         gm: fx.GraphModule,
@@ -110,7 +113,9 @@ class RegatherTransform(RegionTransform):
         placeholders = [n for n in gm.graph.nodes if n.op == OP.PLACEHOLDER]
         param_placeholders = placeholders[:num_params]
         regions: list[set[fx.Node]] = []
-        for node in param_placeholders:
+        for i, node in enumerate(param_placeholders):
+            if i in self.skip_param_indices:
+                continue
             param_regions = _collect_chain_regions(node)
             regions.extend(param_regions)
         return regions
