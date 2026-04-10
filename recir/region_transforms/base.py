@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from collections import OrderedDict
-from typing import Any, Callable
+from typing import Any, Callable, Optional, Set
 
 import torch.fx as fx
 import torch.nn as nn
@@ -25,6 +25,9 @@ class RegionTransform(ABC):
     - detect_regions: which subgraphs to target
     - wrap_region: how to wrap each subgraph (the autograd.Function)
     """
+
+    def __init__(self, skip_param_indices: Optional[Set[int]] = None) -> None:
+        self.skip_param_indices: Set[int] = skip_param_indices or set()
 
     @abstractmethod
     def detect_regions(
