@@ -152,6 +152,10 @@ def _collect_ops_missing_meta_kernel(compiled_obj):
     Checks both outer graph nodes and _XLAModule inner subgraphs.
     Ops without a Meta kernel cause segment_and_lower to emit
     'partial_lower: graph break' warnings and fragment the XLA computation.
+
+    Profiler ops (``profiler::*``) are excluded because they are stripped
+    by ``_strip_profiler_nodes()`` before XLA lowering and never cause
+    real graph breaks.
     """
     missing = []
     for gm_name in ("setup_gm", "main_gm", "cleanup_gm"):
@@ -161,6 +165,10 @@ def _collect_ops_missing_meta_kernel(compiled_obj):
                 if node.op == "call_function" and isinstance(
                     node.target, torch._ops.OpOverload
                 ):
+                    # Profiler ops are stripped before XLA lowering by
+                    # _strip_profiler_nodes() and don't cause real graph breaks.
+                    if node.target.name().startswith("profiler::"):
+                        continue
                     if not node.target.has_kernel_for_dispatch_key(
                         torch._C.DispatchKey.Meta
                     ):
@@ -249,15 +257,9 @@ class TestRankingCompile(unittest.TestCase):
         """
         compiled_obj = self._compile_ranking_model()
         missing_meta = _collect_ops_missing_meta_kernel(compiled_obj)
-        # len(missing_meta) should be 0, set to 4 to pass the test, as it is a known issue:
-        # AssertionError: 4 != 0 : Found 4 ops without Meta kernel (will cause partial_lower graph breaks):
-        # [main_gm/xla] _record_function_enter_new -- profiler._record_function_enter_new.default
-        # [main_gm/xla] _record_function_exit -- profiler._record_function_exit._RecordFunction
-        # [cleanup_gm/xla] _record_function_enter_new -- profiler._record_function_enter_new.default
-        # [cleanup_gm/xla] _record_function_exit -- profiler._record_function_exit._RecordFunction
         self.assertEqual(
             len(missing_meta),
-            4,
+            0,
             f"Found {len(missing_meta)} ops without Meta kernel "
             f"(will cause partial_lower graph breaks):\n" + "\n".join(missing_meta),
         )
