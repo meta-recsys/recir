@@ -32,17 +32,25 @@ from functorch import make_fx
 from generative_recommenders.common import HammerKernel, set_dev_mode
 from generative_recommenders.modules.stu import STU, STULayer, STULayerConfig, STUStack
 from recir.api import compile, COMPILED_OBJECT_KEY
-from recir.distributed.parallel_mode import DataParallel
-from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.testing._internal.common_distributed import skip_if_lt_x_gpu
-from torch.testing._internal.distributed._tensor.common_dtensor import (
-    DTensorTestBase,
-    with_comms,
-)
+from recir.backend import BackendType
+from recir.distributed.parallel_mode import DataParallel, GSPMDParallel
+from recir.gm_transformation import GraphModuleTransformation
 
 
-def build_stu_model() -> STUStack:
+def _has_gpu() -> bool:
+    return torch.cuda.is_available() and torch.cuda.device_count() >= 2
+
+
+def _has_jax() -> bool:
+    try:
+        import jax  # @manual
+
+        return len(jax.devices()) >= 1
+    except ImportError:
+        return False
+
+
+def build_stu_model(kernel: HammerKernel = HammerKernel.TRITON) -> STUStack:
     stu_layers: List[STU] = [
         STULayer(
             config=STULayerConfig(
@@ -70,15 +78,17 @@ def build_stu_model() -> STUStack:
         stu_list=stu_layers,
         is_inference=False,
     )
-    stu.recursive_setattr("_hammer_kernel", HammerKernel.TRITON)
+    stu.recursive_setattr("_hammer_kernel", kernel)
     return stu
 
 
-def build_inputs() -> Tuple[
-    torch.Tensor, torch.Tensor, torch.Tensor, int, torch.Tensor
-]:
+def build_inputs(
+    num_devices: int = 1,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, torch.Tensor]:
     max_uih_len = 64
-    batch_size = 8
+    batch_size = max(8, num_devices)
+    if batch_size % num_devices != 0:
+        batch_size = num_devices * ((batch_size + num_devices - 1) // num_devices)
     contextual_seq_len = 0
     embedding_dim = 16
     x_lengths = torch.randint(max_uih_len + 1, (batch_size,))
@@ -88,16 +98,17 @@ def build_inputs() -> Tuple[
     num_targets = torch.randint(1, max_targets, size=(batch_size,))
     x_lengths = x_lengths + num_targets
     max_seq_len = max_seq_len + max_targets
-    x_offsets = torch.ops.fbgemm.asynchronous_complete_cumsum(x_lengths)
+    x_offsets = torch.zeros(x_lengths.numel() + 1, dtype=x_lengths.dtype)
+    x_offsets[1:] = torch.cumsum(x_lengths, dim=0)
     total_seq_len = int(x_offsets[-1].cpu().item())
     x = torch.randn(int(total_seq_len), embedding_dim, dtype=torch.bfloat16)
     return x, x_lengths, x_offsets, max_seq_len, num_targets
 
 
 class Model(torch.nn.Module):
-    def __init__(self) -> None:
+    def __init__(self, kernel: HammerKernel = HammerKernel.TRITON) -> None:
         super().__init__()
-        self.stu: STUStack = build_stu_model()
+        self.stu: STUStack = build_stu_model(kernel)
 
     def forward(
         self,
@@ -309,7 +320,28 @@ class STUInferenceTest(unittest.TestCase):
         torch.testing.assert_close(eager_out, traced_out)
 
 
-class STUTest(DTensorTestBase):
+# Guard GPU-only imports to avoid import errors on TPU-only machines.
+if _has_gpu():
+    from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+    from torch.nn.parallel import DistributedDataParallel as DDP
+    from torch.testing._internal.common_distributed import skip_if_lt_x_gpu
+    from torch.testing._internal.distributed._tensor.common_dtensor import (
+        DTensorTestBase,
+        with_comms,
+    )
+else:
+    # Stubs so STUDTensorTest can be defined on non-GPU machines.
+    DTensorTestBase = unittest.TestCase  # type: ignore[misc]
+
+    def skip_if_lt_x_gpu(n: int) -> Callable:  # type: ignore[assignment]
+        return unittest.skip("No GPU")
+
+    def with_comms(fn: Callable) -> Callable:  # type: ignore[assignment]
+        return fn
+
+
+@unittest.skipUnless(_has_gpu(), "Requires at least 2 GPUs")
+class STUDTensorTest(DTensorTestBase):
     @property
     def world_size(self) -> int:
         return 2
@@ -468,3 +500,71 @@ class STUTest(DTensorTestBase):
                     num_targets,
                     data_parallel_mode,
                 )
+
+
+# ---------------------------------------------------------------------------
+# XLA/TPU tests (single-process multi-device, requires JAX)
+# ---------------------------------------------------------------------------
+
+
+@unittest.skipUnless(_has_jax(), "Requires JAX with at least 1 device")
+class STUXLATest(unittest.TestCase):
+    """Single-process STU smoke tests for XLA (TPU or GPU via JAX).
+
+    Runs in a single process — no torchrun needed. JAX sees all local
+    devices and handles placement. Uses PYTORCH kernel (no Triton on TPU).
+    """
+
+    def setUp(self) -> None:
+        import jax  # @manual
+
+        # Register fbgemm fallbacks if available
+        try:
+            import recir.lowering.fbgemm_fallback  # noqa: F401
+        except ImportError:
+            pass
+
+        self.devices = jax.devices()
+        if len(self.devices) < 1:
+            self.skipTest("No JAX devices available")
+
+    def test_stu_train(self) -> None:
+        """Test STU forward+backward on XLA via GSPMD single-process."""
+        torch.manual_seed(42)
+        set_dev_mode(True)
+
+        num_devices = len(self.devices)
+        mod = Model(kernel=HammerKernel.PYTORCH).cpu()
+        opt = torch.optim.SGD(mod.parameters(), lr=0.01, foreach=False)
+        x, x_lengths, x_offsets, max_seq_len, num_targets = build_inputs(num_devices)
+
+        @compile(
+            parallel_mode=GSPMDParallel(
+                "replicate",
+                loss_reduction="sum",
+                num_ranks=num_devices,
+                num_processes=1,
+            ),
+            # pyre-ignore[6]: GraphModuleTransformation is callable
+            gm_transformation=GraphModuleTransformation(
+                backend=BackendType.XLA_GSPMD,
+            ),
+        )
+        def train_step(
+            mod: torch.nn.Module,
+            opt: torch.optim.Optimizer,
+            x: torch.Tensor,
+            x_lengths: torch.Tensor,
+            x_offsets: torch.Tensor,
+            max_seq_len: int,
+            num_targets: torch.Tensor,
+        ) -> None:
+            mod(x, x_lengths, x_offsets, max_seq_len, num_targets).sum().backward()
+            opt.step()
+
+        train_step(mod, opt, x, x_lengths, x_offsets, max_seq_len, num_targets)
+
+        # Verify parameters were updated and are valid
+        for p in mod.parameters():
+            self.assertFalse(torch.isnan(p).any().item())
+            self.assertFalse(torch.isinf(p).any().item())
