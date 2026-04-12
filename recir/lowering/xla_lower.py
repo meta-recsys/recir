@@ -52,15 +52,22 @@ class _XLAModule(torch.nn.Module):
         self.compiled: Optional[Callable[..., List[torch.Tensor]]] = None
         self.xla_hlo_text: Optional[str] = None
         self.keep_jax_output: bool = False
+        self.torch_output_indices: Optional[set[int]] = None
 
     def _postprocess_jax_output(
         self, jax_out: Any, input_device: torch.device
-    ) -> List[torch.Tensor]:
-        if self.keep_jax_output:
-            if isinstance(jax_out, (list, tuple)):
-                return list(jax_out)
-            return [jax_out]
-        return _jax_to_torch(jax_out, input_device)
+    ) -> List[Any]:
+        if not self.keep_jax_output:
+            return _jax_to_torch(jax_out, input_device)
+
+        items = list(jax_out) if isinstance(jax_out, (list, tuple)) else [jax_out]
+        torch_indices = self.torch_output_indices
+        if not torch_indices:
+            return items
+        return [
+            _jax_to_torch(item, input_device) if i in torch_indices else item
+            for i, item in enumerate(items)
+        ]
 
     def _compile_dynamo_bridge(
         self, *args: torch.Tensor
