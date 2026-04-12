@@ -72,6 +72,7 @@ def lower_subgraph_nodes(
     subgraph_nodes: List[torch.fx.Node],
     module_factory: Callable[[torch.fx.GraphModule], torch.nn.Module],
     dumper: Callable[[str], str],
+    all_lowered_nodes: Set[torch.fx.Node],
 ) -> None:
     """Extract subgraph_nodes from gm, wrap via module_factory, and splice back.
 
@@ -135,9 +136,18 @@ def lower_subgraph_nodes(
     assert len(inputs) == len(set(inputs))
     assert len(outputs) == len(set(outputs))
 
+    lowered = visible | all_lowered_nodes
+    torch_output_indices = {
+        idx
+        for idx, output in enumerate(outputs)
+        if any(u not in lowered and u.op != "output" for u in output.users)
+    }
     subgraph_module = create_subgraph_module(inputs, body, outputs)
     readable_tag = dumper(str(subgraph_module.graph))
-    setattr(gm, subgraph_name, module_factory(subgraph_module))
+    module = module_factory(subgraph_module)
+    if torch_output_indices:
+        module.torch_output_indices = torch_output_indices  # pyre-ignore[16]
+    setattr(gm, subgraph_name, module)
 
     insertion_point = subgraph_nodes[-1].next
     for node in prologue:
@@ -228,9 +238,14 @@ def segment_and_lower(
         if subgraph_predicate(nodes) and default_subgraph_predicate(nodes)
     ]
 
+    all_lowered_nodes: Set[torch.fx.Node] = set()
+    for nodes in nodes_per_subgraph:
+        all_lowered_nodes.update(nodes)
     for idx, subgraph_nodes in enumerate(nodes_per_subgraph):
         subgraph_name = f"{subgraph_prefix}_{idx}"
-        lower_subgraph_nodes(gm, subgraph_name, subgraph_nodes, module_factory, dumper)
+        lower_subgraph_nodes(
+            gm, subgraph_name, subgraph_nodes, module_factory, dumper, all_lowered_nodes
+        )
 
     gm.graph.lint()
     gm.recompile()
