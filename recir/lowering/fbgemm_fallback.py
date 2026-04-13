@@ -27,7 +27,7 @@ Usage:
     import recir.lowering.fbgemm_fallback  # noqa: F401 -- registers ops as side effect
 """
 
-from typing import List, Optional, Sequence
+from typing import List, Optional, Sequence, Tuple
 
 import torch
 from recir.decompositions import SPMD_DECOMP_TABLE
@@ -303,3 +303,75 @@ def register_fbgemm_fallbacks() -> bool:
 
 # Auto-register on import
 register_fbgemm_fallbacks()
+
+
+# ── Static-shape jagged op swaps ───────────────────────────────────────
+# The generative_recommenders jagged ops use data-dependent masking that
+# produces tensors with data-dependent shapes, failing make_fx tracing.
+# We monkey-patch the pytorch implementations to use static-shape
+# alternatives when max_len_left/max_len_right are provided.
+
+from generative_recommenders.ops.pytorch import (  # noqa: E402
+    pt_jagged_tensors as _pt_jt,
+)
+
+_orig_concat_2D_jagged_jagged = _pt_jt._concat_2D_jagged_jagged
+_orig_split_2D_jagged_jagged = _pt_jt._split_2D_jagged_jagged
+
+
+def _static_concat_2D_jagged_jagged(
+    values_left: torch.Tensor,
+    values_right: torch.Tensor,
+    max_len_left: int,
+    max_len_right: int,
+    offsets_left: torch.Tensor,
+    offsets_right: torch.Tensor,
+) -> torch.Tensor:
+    B = offsets_left.shape[0] - 1
+    D = values_left.shape[-1]
+    left_3d = values_left.reshape(B, max_len_left, D)
+    right_3d = values_right.reshape(B, max_len_right, D)
+    return torch.cat([left_3d, right_3d], dim=1).reshape(-1, D)
+
+
+_pt_jt._concat_2D_jagged_jagged = _static_concat_2D_jagged_jagged  # type: ignore[assignment]
+
+
+def _static_pytorch_split_2D_jagged(
+    max_seq_len: int,
+    values: torch.Tensor,
+    max_len_left: Optional[int],
+    max_len_right: Optional[int],
+    offsets_left: Optional[torch.Tensor],
+    offsets_right: Optional[torch.Tensor],
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    if offsets_left is None:
+        assert max_len_left is not None
+        assert offsets_right is not None
+        offsets_left = max_len_left * torch.arange(
+            offsets_right.shape[0], device=values.device
+        )
+    if offsets_right is None:
+        assert max_len_right is not None
+        assert offsets_left is not None
+        offsets_right = max_len_right * torch.arange(
+            offsets_left.shape[0], device=values.device
+        )
+    if max_len_left is not None and max_len_right is not None:
+        B = offsets_left.shape[0] - 1
+        D = values.shape[-1]
+        values_3d = values.reshape(B, max_seq_len, D)
+        left = values_3d[:, :max_len_left, :].reshape(-1, D)
+        right = values_3d[:, max_len_left : max_len_left + max_len_right, :].reshape(
+            -1, D
+        )
+        return left, right
+    return _orig_split_2D_jagged_jagged(
+        max_seq_len=max_seq_len,
+        values=values,
+        offsets_left=offsets_left,
+        offsets_right=offsets_right,
+    )
+
+
+_pt_jt.pytorch_split_2D_jagged = torch.fx.wrap(_static_pytorch_split_2D_jagged)  # type: ignore[assignment]
