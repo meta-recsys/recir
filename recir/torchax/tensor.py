@@ -542,6 +542,11 @@ class Environment(contextlib.ContextDecorator):
                 getattr(the_tensor, "_elem", None), jax.core.Tracer
             ):
                 return True
+            # When treat_cuda_as_jax_device is set, jax→cuda is a no-op
+            # (both live on the same accelerator). Without this, _to_copy
+            # would call j2t_copy which fails on JAX tracers.
+            if new_device == "cuda" and self.config.treat_cuda_as_jax_device:
+                return True
         if the_tensor.device.type != new_device:
             if the_tensor.device.type == "cuda":
                 return self.config.treat_cuda_as_jax_device
