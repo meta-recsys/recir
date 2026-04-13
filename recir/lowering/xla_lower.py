@@ -299,7 +299,14 @@ class _XLAModule(torch.nn.Module):
                 break
         in_shardings = [batch_sharded if b else replicated for b in is_batch]
         out_node = next(n for n in self.gm.graph.nodes if n.op == "output")
-        out_shardings = jax.tree.map(lambda _: replicated, out_node.args[0])
+        torch_indices: set[int] = self.torch_output_indices or set()
+        out_leaves, out_treedef = jax.tree.flatten(out_node.args[0])
+        out_shardings = out_treedef.unflatten(
+            [
+                batch_sharded if i in torch_indices else replicated
+                for i in range(len(out_leaves))
+            ]
+        )
         logger.info(
             "Compiling with GSPMD: %d inputs (%d batch-sharded), mesh=%s",
             len(args),
@@ -377,6 +384,7 @@ def _is_xla_compatible(node: torch.fx.Node) -> Tuple[bool, str]:
     _XLA_ALLOWLIST = {
         torch.ops.aten.flatten.using_ints,
         torch.ops.aten.full_like.default,
+        torch.ops.aten.select.int,
     }
     if node.target in _XLA_ALLOWLIST:
         return True, ""
@@ -392,6 +400,11 @@ def _is_xla_compatible(node: torch.fx.Node) -> Tuple[bool, str]:
             return True, ""
         if not target.has_kernel_for_dispatch_key(torch._C.DispatchKey.Meta):
             return False, f"{target} doesn't have a meta kernel registered"
+
+    # Override dispatch functions inserted by replace_override_anchors
+    # are marked with xla_graph_break metadata — they must not be absorbed.
+    if node.meta.get("xla_graph_break", False):
+        return False, "graph break (override dispatch)"
 
     return True, ""
 
@@ -415,7 +428,14 @@ def _jax_to_numpy(t: Any) -> Any:
 
 
 def _jax_to_torch(t: Any, device: torch.device) -> Any:
-    """Convert a JAX output (array, None, or nested list/tuple) to a torch tensor."""
+    """Convert a JAX output (array, None, or nested list/tuple) to a torch tensor.
+
+    For batch-sharded arrays (shards differ), concatenates all addressable
+    shards to reconstruct the per-process tensor.  For replicated arrays
+    (all shards identical), takes a single shard.
+    """
+    import numpy as np
+
     if t is None:
         return None
     if isinstance(t, list):
@@ -423,8 +443,23 @@ def _jax_to_torch(t: Any, device: torch.device) -> Any:
     if isinstance(t, tuple):
         return tuple(_jax_to_torch(x, device) for x in t)
     if hasattr(t, "addressable_shards") and t.addressable_shards:
-        return torch.tensor(_jax_to_numpy(t.addressable_shards[0].data), device=device)
-    return torch.tensor(_jax_to_numpy(t), device=device)
+        shards = t.addressable_shards
+        if len(shards) > 1 and shards[0].data.shape != t.shape:
+            # Batch-sharded: each shard is a slice. Concatenate to
+            # reconstruct the per-process tensor.
+            sorted_shards = sorted(shards, key=lambda s: s.index)
+            arrays = [_jax_to_numpy(s.data) for s in sorted_shards]
+            np_arr = np.concatenate(arrays, axis=0)
+        else:
+            # Replicated: all shards identical, take one.
+            np_arr = _jax_to_numpy(shards[0].data)
+        if np_arr.ndim == 0:
+            return torch.tensor(np_arr.item(), device=device)
+        return torch.tensor(np_arr, device=device)
+    np_arr = _jax_to_numpy(t)
+    if np_arr.ndim == 0:
+        return torch.tensor(np_arr.item(), device=device)
+    return torch.tensor(np_arr, device=device)
 
 
 def partial_lower_xla(

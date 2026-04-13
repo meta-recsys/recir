@@ -55,6 +55,11 @@ class Override(ABC):
     :meth:`torch.distributed._spmd.Override.transform` to transform the traced
     graph, where the dummy placeholder operator serves as an anchor to insert
     new sub-graphs.
+
+    For overrides that need integrated backward support (i.e., the override's
+    backward should fire within the compiled ``train_step`` automatically),
+    use :func:`recir.override_ops.replace_override_anchors` inside
+    ``transform()`` to replace anchor ops with runtime dispatch calls.
     """
 
     @abstractmethod
@@ -716,7 +721,7 @@ def _compile_gspmd(
         local_result.opt,
         {**local_result.params, **local_result.buffers},
         local_result.named_states,
-        module_override=None,
+        module_override=module_override,
         input_batch_dim=parallel_mode.input_batch_dim,
         dedup=False,
     )
