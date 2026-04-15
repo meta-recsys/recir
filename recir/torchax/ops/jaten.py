@@ -799,6 +799,21 @@ def _aten_index_put(
 ) -> Any:
     indexes = [slice(None, None, None) if i is None else i for i in indexes]
     indexes = tuple(indexes)
+    # Boolean indices are not supported by JAX's .at[].set() under JIT because
+    # boolean indexing produces data-dependent output shapes.  When the index
+    # is a single boolean mask with the same shape as self, fall back to
+    # jnp.where which is JIT-compatible.
+    non_slice = [i for i in indexes if not isinstance(i, slice)]
+    if (
+        len(non_slice) == 1
+        and hasattr(non_slice[0], "dtype")
+        and non_slice[0].dtype == jnp.bool_
+    ):
+        mask = non_slice[0]
+        if accumulate:
+            return jnp.where(mask, self + values, self)
+        else:
+            return jnp.where(mask, values, self)
     if accumulate:
         return self.at[indexes].add(values)
     else:
