@@ -26,6 +26,7 @@ setup(
         "recir.ops",
         "recir.ops.fake",
         "recir.passes",
+        "recir.region_transforms",
         "recir.torchax",
         "recir.torchax.ops",
     ],
