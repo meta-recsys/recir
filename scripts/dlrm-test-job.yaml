@@ -1,0 +1,29 @@
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  name: dlrm-test
+  namespace: default
+spec:
+  replicatedJobs:
+  - name: worker
+    replicas: 1
+    template:
+      spec:
+        parallelism: 2
+        completions: 2
+        template:
+          spec:
+            containers:
+            - name: dlrm
+              image: us-central1-docker.pkg.dev/mrs-tpu-y317h/recml/recml_base_image:latest
+              imagePullPolicy: Always
+              command: ["python", "recml/examples/dlrm_experiment_test.py"]
+              ports:
+              - containerPort: 8471
+              resources:
+                limits:
+                  google.com/tpu: 4
+            nodeSelector:
+              cloud.google.com/gke-tpu-accelerator: tpu7x
+              cloud.google.com/gke-tpu-topology: 2x2x1
+            restartPolicy: Never
