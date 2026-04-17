@@ -50,6 +50,18 @@ def _has_jax() -> bool:
         return False
 
 
+def _has_accelerator() -> bool:
+    return torch.cuda.is_available() or _has_jax()
+
+
+def _get_test_device() -> str:
+    return "cuda" if torch.cuda.is_available() else "cpu"
+
+
+def _get_test_kernel() -> HammerKernel:
+    return HammerKernel.TRITON if torch.cuda.is_available() else HammerKernel.PYTORCH
+
+
 def build_stu_model(kernel: HammerKernel = HammerKernel.TRITON) -> STUStack:
     stu_layers: List[STU] = [
         STULayer(
@@ -138,23 +150,33 @@ class STUInferenceTest(unittest.TestCase):
     produces output identical to eager execution.
     """
 
-    @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")  # pyre-ignore[56]
+    def setUp(self) -> None:
+        # Register fbgemm CPU fallbacks so these tests can run on TPU/CPU
+        try:
+            import recir.lowering.fbgemm_fallback  # noqa: F401
+        except ImportError:
+            pass
+
+    @unittest.skipUnless(_has_accelerator(), "Requires CUDA or TPU")  # pyre-ignore[56]
     def test_fx_traced_forward(self) -> None:
         """Trace STU forward into an FX graph and verify it matches eager output."""
         torch.manual_seed(42)
         set_dev_mode(True)
 
+        device = _get_test_device()
+        kernel = _get_test_kernel()
+
         model: STUStack = build_stu_model()
-        model.recursive_setattr("_hammer_kernel", HammerKernel.TRITON)
-        model.cuda()
+        model.recursive_setattr("_hammer_kernel", kernel)
+        model.to(device)
         model.eval()
 
         max_seq_len: int
         x, x_lengths, x_offsets, max_seq_len, num_targets = build_inputs()
-        x = x.cuda()
-        x_lengths = x_lengths.cuda()
-        x_offsets = x_offsets.cuda()
-        num_targets = num_targets.cuda()
+        x = x.to(device)
+        x_lengths = x_lengths.to(device)
+        x_offsets = x_offsets.to(device)
+        num_targets = num_targets.to(device)
 
         # Lift params/buffers as function args (same pattern as recir._local_compile)
         params = dict(model.named_parameters())
@@ -204,7 +226,7 @@ class STUInferenceTest(unittest.TestCase):
         self.assertFalse(torch.isinf(traced_out).any().item())
         torch.testing.assert_close(eager_out, traced_out)
 
-    @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")  # pyre-ignore[56]
+    @unittest.skipUnless(_has_accelerator(), "Requires CUDA or TPU")  # pyre-ignore[56]
     def test_training_graph_to_inference(self) -> None:
         """Show how RecIR's training graph relates to the inference graph.
 
@@ -219,17 +241,20 @@ class STUInferenceTest(unittest.TestCase):
         torch.manual_seed(42)
         set_dev_mode(True)
 
+        device = _get_test_device()
+        kernel = _get_test_kernel()
+
         model: STUStack = build_stu_model()
-        model.recursive_setattr("_hammer_kernel", HammerKernel.TRITON)
-        model.cuda()
+        model.recursive_setattr("_hammer_kernel", kernel)
+        model.to(device)
         model.eval()
 
         max_seq_len: int
         x, x_lengths, x_offsets, max_seq_len, num_targets = build_inputs()
-        x = x.cuda()
-        x_lengths = x_lengths.cuda()
-        x_offsets = x_offsets.cuda()
-        num_targets = num_targets.cuda()
+        x = x.to(device)
+        x_lengths = x_lengths.to(device)
+        x_offsets = x_offsets.to(device)
+        num_targets = num_targets.to(device)
 
         params = dict(model.named_parameters())
         buffers = dict(model.named_buffers())
@@ -527,6 +552,18 @@ class STUXLATest(unittest.TestCase):
         self.devices = jax.devices()
         if len(self.devices) < 1:
             self.skipTest("No JAX devices available")
+        # On machines with TPUs, verify JAX is actually using them.
+        platform = self.devices[0].platform
+        if platform != "tpu":
+            try:
+                tpu_devices = jax.devices("tpu")
+                if tpu_devices:
+                    self.fail(
+                        f"TPU devices available but JAX defaulted to "
+                        f"{platform}: {self.devices}"
+                    )
+            except RuntimeError:
+                pass
 
     def test_stu_train(self) -> None:
         """Test STU forward+backward on XLA via GSPMD single-process."""
