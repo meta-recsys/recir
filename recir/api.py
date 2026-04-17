@@ -25,8 +25,14 @@ from recir.distributed.data_parallel import (
     DataParallelStyle,
     gradients_tagging,
     parametrize_params,
+    rewrite_sparse_embeddings,
 )
-from recir.distributed.parallel_mode import DataParallel, GSPMDParallel, ParallelMode
+from recir.distributed.parallel_mode import (
+    DataParallel,
+    GSPMDParallel,
+    HybridParallel,
+    ParallelMode,
+)
 from recir.lowering.device_state import DeviceStateManager
 from recir.region_transforms import (
     _apply_region_transforms,
@@ -243,6 +249,7 @@ def _local_compile(
     *args: Any,
     fake_mode: FakeTensorMode,
     _parametrize_fns: Optional[List[Callable[[torch.Tensor], torch.Tensor]]] = None,
+    _exclude_param_fqns: Optional[set[str]] = None,
     _stateless_func_wrapper: Optional[Callable[..., Any]] = None,
     _input_transform: Optional[Callable[[Any], Any]] = None,
     **kwargs: Any,
@@ -342,7 +349,11 @@ def _local_compile(
         ):
             with ExitStack() as stack:
                 for fn in _parametrize_fns or []:
-                    stack.enter_context(parametrize_params(_mod, fn))
+                    stack.enter_context(
+                        parametrize_params(
+                            _mod, fn, exclude_param_fqns=_exclude_param_fqns
+                        )
+                    )
                 if _stateless_func_wrapper:
                     stack.enter_context(_stateless_func_wrapper(params))
                 ret = func(*args, **kwargs)
@@ -456,7 +467,10 @@ def _compile_and_transform(
 ) -> _CompiledResult:
     if isinstance(parallel_mode, GSPMDParallel):
         result = _compile_gspmd(func, module_override, parallel_mode, *args, **kwargs)
-    elif isinstance(parallel_mode, DataParallel) and parallel_mode._use_parametrization:
+    elif (
+        isinstance(parallel_mode, (DataParallel, HybridParallel))
+        and parallel_mode._use_parametrization
+    ):
         result = _compile_data_parallel_v2(
             func, module_override, parallel_mode, *args, **kwargs
         )
@@ -545,16 +559,24 @@ def _compile_data_parallel(
 def _compile_data_parallel_v2(
     func: Callable[..., Any],
     module_override: Optional[List[Override]],
-    parallel_mode: DataParallel,
+    parallel_mode: Union[DataParallel, HybridParallel],
     *args: Any,
     **kwargs: Any,
 ) -> _CompiledResult:
     """Compile with autograd-based collective insertion (no DTensor partition).
 
-    Both replicate and fully_shard use external FakeTensorMode + DTensor
-    redistribute for collective insertion during tracing.
+    Handles both ``DataParallel`` (dense-only) and ``HybridParallel``
+    (dense + embedding sharding) v2 paths.  For ``HybridParallel``,
+    embedding parameters are excluded from collective insertion and
+    instead rewritten post-trace into decomposed AllToAll ops.
     """
-    mesh = parallel_mode.device_mesh
+    # Extract mesh and DP style from the parallel mode.
+    if isinstance(parallel_mode, HybridParallel):
+        mesh = parallel_mode.mesh
+        dp_style = parallel_mode.dense_style
+    else:
+        mesh = parallel_mode.device_mesh
+        dp_style = parallel_mode.parallel_style
     world_size: int = parallel_mode.num_ranks
 
     # 1. Pre-extract mod/opt (need originals for pre-trace sharding).
@@ -568,13 +590,32 @@ def _compile_data_parallel_v2(
     assert mod is not None
     _mod: nn.Module = mod
 
-    # 2. Discover called modules and user autograd functions BEFORE sharding.
+    # 2. Extract params_and_buffers (used for embedding index computation
+    #    and shard_params).
+    params_and_buffers: Dict[str, Any] = {
+        **dict(_mod.named_parameters(remove_duplicate=False)),
+        **dict(_mod.named_buffers(remove_duplicate=False)),
+    }
+
+    # 3. Compute embedding-related values (HybridParallel only).
+    #    Must happen before sharding, which may change parameter objects
+    #    but not FQN order.
+    embedding_param_fqns: Optional[set[str]] = None
+    embedding_param_indices: Optional[set[int]] = None
+    if isinstance(parallel_mode, HybridParallel):
+        fqns = parallel_mode.embedding_plan.param_fqns
+        embedding_param_fqns = fqns if fqns else None
+        embedding_param_indices = parallel_mode._compute_embedding_param_indices(
+            params_and_buffers
+        )
+
+    # 4. Discover called modules and user autograd functions BEFORE sharding.
     #    Discovery runs the train step under FakeTensorMode with hooks;
     #    it must see unsharded parameters to avoid shape mismatches when
     #    a parameter is reused multiple times in forward (shared weights).
     transforms: list[RegionTransform] = []
-    if parallel_mode.parallel_style == DataParallelStyle.FULLY_SHARD:
-        transforms.append(RegatherTransform())
+    if dp_style == DataParallelStyle.FULLY_SHARD:
+        transforms.append(RegatherTransform(skip_param_fqns=embedding_param_fqns))
     called_modules = None
     autograd_function_leaves: set[type] = set()  # pyre-fixme[24]
     if transforms:
@@ -585,26 +626,23 @@ def _compile_data_parallel_v2(
             _mod, FakeTensorMode(allow_non_fake_inputs=True), func, *args, **kwargs
         )
 
-    # 3. Set up external fake mode for tracing.
+    # 5. Set up external fake mode for tracing.
     fake_mode: FakeTensorMode = FakeTensorMode(allow_non_fake_inputs=True)
 
-    # 4. Shard params on the module and optimizer states (FSDP only).
-    #    Extract params_and_buffers first so shard_params can mutate both
-    #    the dict and the module in-place.  shard_params also updates
-    #    opt.state in-place so that parameter→state mappings remain valid.
-    params_and_buffers: Dict[str, Any] = {
-        **dict(_mod.named_parameters(remove_duplicate=False)),
-        **dict(_mod.named_buffers(remove_duplicate=False)),
-    }
+    # 6. Shard params on the module and optimizer states.
+    #    shard_params mutates both the dict and the module in-place.
+    #    It also updates opt.state so that parameter→state mappings remain valid.
     parallel_mode.shard_params(_mod, params_and_buffers, opt)
 
-    # 5. Apply region transforms AFTER sharding, with parametrization.
+    # 7. Apply region transforms AFTER sharding, with parametrization.
     #    The traced forward includes allgather ops from collectives_insertion
     #    so each per-parameter region encompasses allgather + chain + compute.
-    #    _patched_forward reads raw sharded params via named_parameters()
-    #    (bypassing the property-based parametrization); the allgather then
-    #    happens inside each checkpoint-wrapped region in gm_fwd.
-    collectives_fn = collectives_insertion(parallel_mode.parallel_style, mesh)
+    #    Embedding params (if any) are excluded from collectives — they use
+    #    AllToAll (inserted in step 9), not allgather.
+    collectives_fn = collectives_insertion(dp_style, mesh)
+    parametrize_kwargs: Dict[str, Any] = {}
+    if embedding_param_fqns:
+        parametrize_kwargs["exclude_param_fqns"] = embedding_param_fqns
     with ExitStack() as region_stack:
         if transforms and called_modules:
             forward_roots = _find_forward_roots(called_modules)
@@ -617,13 +655,18 @@ def _compile_data_parallel_v2(
                         transforms,
                         fake_mode,
                         _parametrize_cm_factories=[
-                            partial(parametrize_params, root_mod, collectives_fn),
+                            partial(
+                                parametrize_params,
+                                root_mod,
+                                collectives_fn,
+                                **parametrize_kwargs,
+                            ),
                         ],
                         _autograd_function_leaves=autograd_function_leaves,
                     )
                 )
 
-        # 6. Set up parametrize fns and trace via _local_compile.
+        # 8. Set up parametrize fns and trace via _local_compile.
         #    Region transform context managers scope the rewritten forwards
         #    to this block — originals are restored when the ExitStack exits.
         #    When region transforms are active, gm_fwd already contains the
@@ -636,6 +679,7 @@ def _compile_data_parallel_v2(
             *args,
             fake_mode=fake_mode,
             _parametrize_fns=[] if transforms else [collectives_fn],
+            _exclude_param_fqns=embedding_param_fqns if not transforms else None,
             _input_transform=_make_batch_transform(
                 parallel_mode.input_batch_dim,
                 ratio=1 / (world_size // parallel_mode.num_processes),
@@ -644,7 +688,17 @@ def _compile_data_parallel_v2(
             **kwargs,
         )
 
-    # 7. Finalize.
+    # 9. Embedding rewrite on the compiled graph (HybridParallel only).
+    #    Pattern-match aten.embedding nodes on sharded embedding params
+    #    and replace with decomposed AllToAll ops via secondary symbolic trace.
+    if embedding_param_indices:
+        rewrite_sparse_embeddings(
+            local_result.gm,
+            mesh,
+            embedding_param_indices,
+        )
+
+    # 10. Finalize.
     return _finalize_graph(
         local_result.gm,
         local_result.mod,

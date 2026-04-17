@@ -241,6 +241,7 @@ def _register_parametrization(
     module: nn.Module,
     parametrize_fn: Callable[[torch.Tensor], torch.Tensor],
     recurse: bool = True,
+    exclude_param_fqns: Optional[Set[str]] = None,
 ) -> None:
     """Register a parametrization on all parameters of *module*.
 
@@ -253,11 +254,20 @@ def _register_parametrization(
         module: The module (and optionally its submodules) to parametrize.
         parametrize_fn: ``(Tensor) -> Tensor`` applied to the raw parameter.
         recurse: If True, also parametrize all submodules.
+        exclude_param_fqns: Optional set of fully-qualified parameter names
+            to exclude from parametrization (e.g., embedding params that
+            use AllToAll instead of allgather).
     """
     modules = module.named_modules() if recurse else [("", module)]
     for _fqn, submod in modules:
-        param_names = [
+        exclude_param_fqns = exclude_param_fqns or set()
+        all_param_names = [
             name for name in submod._parameters if submod._parameters[name] is not None
+        ]
+        param_names = [
+            pn
+            for pn in all_param_names
+            if (f"{_fqn}.{pn}" if _fqn else pn) not in exclude_param_fqns
         ]
         if not param_names:
             continue
@@ -266,7 +276,7 @@ def _register_parametrization(
         if not hasattr(base_class, "_recir_parametrized_base"):
             # First parametrization on this module — create class + storage.
             submod._parametrizations = {}  # type: ignore[assignment]
-            for pn in param_names:
+            for pn in all_param_names:
                 submod._parametrizations[pn] = []  # type: ignore[index]
 
             if base_class not in _PARAMETRIZATION_CLASS_CACHE:
@@ -281,7 +291,7 @@ def _register_parametrization(
 
                     return property(getter)
 
-                for pn in param_names:
+                for pn in all_param_names:
                     properties[pn] = _make_getter(pn)
 
                 new_cls = type(
@@ -328,6 +338,7 @@ def _deregister_parametrization(
 def parametrize_params(
     module: nn.Module,
     parametrize_fn: Callable[[torch.Tensor], torch.Tensor],
+    exclude_param_fqns: Optional[Set[str]] = None,
 ) -> Any:
     """Temporarily register *parametrize_fn* on *module*; remove on exit.
 
@@ -336,8 +347,14 @@ def parametrize_params(
             with parametrize_params(module, mixed_precision_fn):
                 # module.weight → mixed_precision_fn(collectives_fn(raw_weight))
                 ...
+
+    Args:
+        exclude_param_fqns: Optional set of fully-qualified parameter names
+            to exclude from parametrization.
     """
-    _register_parametrization(module, parametrize_fn)
+    _register_parametrization(
+        module, parametrize_fn, exclude_param_fqns=exclude_param_fqns
+    )
     try:
         yield
     finally:
@@ -1447,6 +1464,93 @@ def _rewrite_row_wise_embeddings(
         graph.graph.erase_node(emb_node)
         # Remove the now-dead strategy entry.
         strategy_map.pop(emb_node, None)
+
+
+def rewrite_sparse_embeddings(
+    gm: fx.GraphModule,
+    mesh: DeviceMesh,
+    embedding_param_indices: Set[int],
+) -> None:
+    """Replace ``aten.embedding`` nodes on sharded embedding params with
+    decomposed row-wise AllToAll ops.
+
+    This is the v2 counterpart of :func:`_rewrite_row_wise_embeddings`.
+    It identifies embedding weight nodes by **placeholder index** (rather
+    than the v1 strategy map) and inlines the decomposed sub-graph via
+    ``make_fx(tracing_mode="symbolic")`` + ``graph_copy``.
+
+    Must be called on the compiled graph returned by ``_local_compile``,
+    **before** ``_finalize_graph``, so that the inlined AllToAll nodes are
+    never re-traced under FakeTensorMode (where ``.tolist()`` would crash).
+    """
+    from functools import partial
+
+    world_size = mesh.size()
+    group_name = funcol._resolve_group_name((mesh, 0))
+
+    graph_placeholders = [n for n in gm.graph.nodes if n.op == "placeholder"]
+    embedding_weight_nodes: Set[fx.Node] = {
+        graph_placeholders[i]
+        for i in embedding_param_indices
+        if i < len(graph_placeholders)
+    }
+
+    embedding_nodes: List[fx.Node] = []
+    for node in gm.graph.nodes:
+        if (
+            node.op == "call_function"
+            and node.target == torch.ops.aten.embedding.default
+        ):
+            weight_node = node.args[0]
+            if weight_node in embedding_weight_nodes:
+                embedding_nodes.append(node)
+
+    for emb_node in embedding_nodes:
+        weight_node = cast(fx.Node, emb_node.args[0])
+        indices_node = cast(fx.Node, emb_node.args[1])
+
+        weight_val = weight_node.meta["val"]
+        indices_val = indices_node.meta["val"]
+        # In v2, weights are already sharded — local_V is the shard size.
+        local_V = weight_val.shape[0]
+        num_embeddings = local_V * world_size
+
+        # Create fresh example tensors (not FakeTensors) for symbolic trace.
+        example_weight = torch.randn(
+            weight_val.shape, dtype=weight_val.dtype, device="cpu"
+        )
+        example_indices = torch.randint(
+            0, num_embeddings, indices_val.shape, device="cpu"
+        )
+        decomp_fn = partial(
+            decomposed_row_wise_embedding,
+            num_embeddings=num_embeddings,
+            group_name=group_name,
+            world_size=world_size,
+        )
+        subgraph_gm = make_fx(decomp_fn, tracing_mode="symbolic")(
+            example_weight, example_indices
+        )
+
+        # Map sub-graph placeholders to existing graph nodes.
+        placeholders = [n for n in subgraph_gm.graph.nodes if n.op == "placeholder"]
+        val_map: Dict[fx.Node, fx.Node] = {
+            placeholders[0]: weight_node,
+            placeholders[1]: indices_node,
+        }
+
+        # Inline sub-graph before the embedding node.
+        with gm.graph.inserting_before(emb_node):
+            output_value = gm.graph.graph_copy(subgraph_gm.graph, val_map=val_map)
+
+        # Replace the original embedding node.
+        assert isinstance(output_value, fx.Node)
+        emb_node.replace_all_uses_with(output_value)
+        gm.graph.erase_node(emb_node)
+
+    if embedding_nodes:
+        gm.graph.lint()
+        gm.recompile()
 
 
 def partition_data_parallel(
