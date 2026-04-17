@@ -61,6 +61,31 @@ def _bwd_anchor_fake(
     return torch.empty_like(grad)
 
 
+# ---------------------------------------------------------------------------
+# Input anchor op — marks inputs to an overridden module so that
+# replace_override_anchors can use the correct dispatch inputs instead
+# of all batch placeholders.  Needed for deeply nested overrides whose
+# inputs differ from the train_step batch inputs.
+# ---------------------------------------------------------------------------
+
+
+def _input_anchor_cpu(
+    x: torch.Tensor, override_id: int, input_idx: int
+) -> torch.Tensor:
+    return x
+
+
+_lib.define("input_anchor(Tensor x, int override_id, int input_idx) -> Tensor")
+_lib.impl("input_anchor", _input_anchor_cpu, "CPU")
+
+
+@torch.library.impl_abstract("recir_override::input_anchor")
+def _input_anchor_fake(
+    x: torch.Tensor, override_id: int, input_idx: int
+) -> torch.Tensor:
+    return torch.empty_like(x)
+
+
 def default_override_transform(
     gm: fx.GraphModule,
     flat_state: list[torch.Tensor],
@@ -172,16 +197,33 @@ def replace_override_anchors(
     _OVERRIDE_FWD[override_id] = fwd_fn
     _OVERRIDE_BWD[override_id] = bwd_fn
 
-    # Batch input placeholders (after model state tensors).
-    placeholders = [n for n in gm.graph.nodes if n.op == "placeholder"]
-    tensor_placeholders = [
-        (i, n)
-        for i, n in enumerate(placeholders)
-        if isinstance(n.meta.get("val", None), torch.Tensor)
+    # Determine dispatch input nodes.
+    # If input_anchor nodes exist for this override_id, use them as the
+    # dispatch inputs (the actual inputs to the overridden module).
+    # Otherwise, fall back to all batch input placeholders
+    input_anchors = [
+        n
+        for n in gm.graph.nodes
+        if n.op == "call_function"
+        and n.target is torch.ops.recir_override.input_anchor.default
+        and n.args[1] == override_id
     ]
-    input_nodes = [
-        placeholders[i] for i, _ in tensor_placeholders if i >= num_state_tensors
-    ]
+    if input_anchors:
+        sorted_inputs = sorted(input_anchors, key=lambda n: n.args[2])
+        input_nodes = [a.args[0] for a in sorted_inputs]
+        for a in input_anchors:
+            a.replace_all_uses_with(a.args[0])
+            gm.graph.erase_node(a)
+    else:
+        placeholders = [n for n in gm.graph.nodes if n.op == "placeholder"]
+        tensor_placeholders = [
+            (i, n)
+            for i, n in enumerate(placeholders)
+            if isinstance(n.meta.get("val", None), torch.Tensor)
+        ]
+        input_nodes = [
+            placeholders[i] for i, _ in tensor_placeholders if i >= num_state_tensors
+        ]
 
     # Replace forward anchors.
     if fwd_anchors:
@@ -191,11 +233,12 @@ def replace_override_anchors(
                 args=(input_nodes, override_id),
             )
             fwd_node.meta["xla_graph_break"] = True
-        for idx, anchor in enumerate(fwd_anchors):
+        for anchor in fwd_anchors:
+            output_idx = anchor.args[2]
             with gm.graph.inserting_before(anchor):
                 getitem_node = gm.graph.call_function(
                     operator.getitem,
-                    args=(fwd_node, idx),
+                    args=(fwd_node, output_idx),
                 )
                 getitem_node.meta = anchor.meta.copy()
                 getitem_node.meta["is_batch_input"] = True
@@ -267,3 +310,39 @@ def anchor_output(
     nodes in the make_fx-traced FX graph.
     """
     return OverrideAnchorFn.apply(tensor, override_id, output_idx)
+
+
+class InputAnchorFn(torch.autograd.Function):
+    """Wrap a single input tensor with input_anchor.
+
+    The forward inserts a findable ``input_anchor`` node in the FX graph.
+    The backward is a trivial pass-through so make_fx can trace through it.
+    """
+
+    @staticmethod
+    def forward(
+        ctx: torch.autograd.function.FunctionCtx,
+        x: torch.Tensor,
+        override_id: int,
+        input_idx: int,
+    ) -> torch.Tensor:
+        return torch.ops.recir_override.input_anchor(x, override_id, input_idx)
+
+    @staticmethod
+    def backward(
+        ctx: torch.autograd.function.FunctionCtx,
+        grad: torch.Tensor,
+    ) -> Tuple[torch.Tensor, None, None]:
+        return grad, None, None
+
+
+def anchor_input(
+    tensor: torch.Tensor, override_id: int, input_idx: int
+) -> torch.Tensor:
+    """Wrap an input tensor with InputAnchorFn.
+
+    Creates an identifiable input_anchor node in the make_fx-traced FX graph.
+    Used by replace_override_anchors to determine the correct dispatch inputs
+    for deeply nested overridden modules.
+    """
+    return InputAnchorFn.apply(tensor, override_id, input_idx)
