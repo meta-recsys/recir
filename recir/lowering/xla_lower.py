@@ -100,29 +100,6 @@ class _XLAModule(torch.nn.Module):
                     return True
         return False
 
-    @staticmethod
-    def _strip_profiler_nodes(gm: torch.fx.GraphModule) -> torch.fx.GraphModule:
-        """Remove profiler ops from the graph.
-
-        Profiler ops like ``_record_function_enter_new`` and
-        ``_record_function_exit`` return ``torch.ScriptObject`` handles
-        that JAX cannot represent.  They are no-ops at execution time,
-        so stripping them is safe.
-        """
-        changed = False
-        for node in list(gm.graph.nodes):
-            if node.op == "call_function" and isinstance(
-                node.target, torch._ops.OpOverload
-            ):
-                if node.target.name().startswith("profiler::"):
-                    node.replace_all_uses_with(None)  # type: ignore[arg-type]
-                    gm.graph.erase_node(node)
-                    changed = True
-        if changed:
-            gm.graph.eliminate_dead_code()
-            gm.recompile()
-        return gm
-
     def _compile_xla(self, *args: torch.Tensor) -> Callable[..., List[torch.Tensor]]:
         """Compile the subgraph via torchax/JAX for XLA_SHARD_MAP or XLA_GSPMD.
 
@@ -140,7 +117,6 @@ class _XLAModule(torch.nn.Module):
           ``out_shardings`` read from per-node ``node.meta`` attributes.
         """
         torchax.default_env()
-        self.gm = self._strip_profiler_nodes(self.gm)
         gm: torch.fx.GraphModule = self.gm
         input_device: torch.device = args[0].device if args else torch.device("cpu")
         local_devs = jax.local_devices()
@@ -462,6 +438,32 @@ def _jax_to_torch(t: Any, device: torch.device) -> Any:
     return torch.tensor(np_arr, device=device)
 
 
+def _strip_profiler_nodes(gm: torch.fx.GraphModule) -> torch.fx.GraphModule:
+    """Remove profiler ops from the graph.
+
+    Profiler ops like ``_record_function_enter_new`` and
+    ``_record_function_exit`` return ``torch.ScriptObject`` handles
+    that JAX cannot represent.  They are no-ops at execution time,
+    so stripping them is safe.
+
+    Must run on the parent graph *before* segmentation so that the
+    ScriptObject handles never become XLA subgraph inputs.
+    """
+    changed = False
+    for node in list(gm.graph.nodes):
+        if node.op == "call_function" and isinstance(
+            node.target, torch._ops.OpOverload
+        ):
+            if node.target.name().startswith("profiler::"):
+                node.replace_all_uses_with(None)  # type: ignore[arg-type]
+                gm.graph.erase_node(node)
+                changed = True
+    if changed:
+        gm.graph.eliminate_dead_code()
+        gm.recompile()
+    return gm
+
+
 def partial_lower_xla(
     gm: torch.fx.GraphModule,
     backend_type: BackendType = BackendType.XLA_SHARD_MAP,
@@ -472,6 +474,9 @@ def partial_lower_xla(
 ) -> torch.fx.GraphModule:
     if op_swap_map is not None:
         gm = swap_ops(gm, op_swap_map)
+    # Strip profiler ops before segmentation so their ScriptObject
+    # handles never become XLA subgraph inputs.
+    gm = _strip_profiler_nodes(gm)
     return segment_and_lower(
         gm,
         compatibility_fn=_is_xla_compatible,
