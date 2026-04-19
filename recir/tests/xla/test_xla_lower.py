@@ -320,9 +320,12 @@ class TestPartialLowerXLA(unittest.TestCase):
         """Verify _strip_profiler_nodes removes profiler ops from the graph.
 
         Profiler ops like _record_function_enter_new return ScriptObject
-        handles that JAX cannot represent. _strip_profiler_nodes must
-        remove them from the subgraph before JAX lowering.
+        handles that JAX cannot represent. _strip_profiler_nodes runs on
+        the parent graph before segmentation so ScriptObject handles never
+        become XLA subgraph inputs.
         """
+        from recir.lowering.xla_lower import _strip_profiler_nodes
+
         # Build a graph with profiler nodes interleaved with aten ops
         graph = torch.fx.Graph()
         x = graph.placeholder("x")
@@ -348,8 +351,8 @@ class TestPartialLowerXLA(unittest.TestCase):
         ]
         self.assertGreater(len(profiler_nodes), 0)
 
-        # Strip
-        stripped = _XLAModule._strip_profiler_nodes(gm)
+        # Strip using module-level function (called by partial_lower_xla)
+        stripped = _strip_profiler_nodes(gm)
 
         # After stripping: no profiler nodes remain
         profiler_nodes_after = [
@@ -369,8 +372,20 @@ class TestPartialLowerXLA(unittest.TestCase):
         ]
         self.assertEqual(len(relu_nodes), 1)
 
+        # ScriptObject handles (produced by profiler ops) should be cleaned
+        # up by eliminate_dead_code since their only consumers were removed.
+        for n in stripped.graph.nodes:
+            val = n.meta.get("val", None)
+            self.assertNotIsInstance(
+                val,
+                torch.ScriptObject,
+                f"ScriptObject handle should be removed but found in node {n.name}",
+            )
+
     def test_strip_profiler_nodes_no_profiler(self) -> None:
         """Verify _strip_profiler_nodes is a no-op on graphs without profiler ops."""
+        from recir.lowering.xla_lower import _strip_profiler_nodes
+
         graph = torch.fx.Graph()
         x = graph.placeholder("x")
         relu = graph.call_function(torch.ops.aten.relu.default, args=(x,))
@@ -378,7 +393,7 @@ class TestPartialLowerXLA(unittest.TestCase):
         gm = torch.fx.GraphModule(root={}, graph=graph)
 
         node_count_before = len(list(gm.graph.nodes))
-        stripped = _XLAModule._strip_profiler_nodes(gm)
+        stripped = _strip_profiler_nodes(gm)
         node_count_after = len(list(stripped.graph.nodes))
         self.assertEqual(node_count_before, node_count_after)
 

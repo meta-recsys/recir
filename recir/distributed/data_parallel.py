@@ -225,8 +225,9 @@ def gradients_tagging(params: Dict[str, torch.Tensor]) -> Any:
     tagging_hooks = []
     try:
         for p in params.values():
-            h = p.register_hook(torch.ops._spmd.tag_grad)
-            tagging_hooks.append(h)
+            if p.requires_grad:
+                h = p.register_hook(torch.ops._spmd.tag_grad)
+                tagging_hooks.append(h)
         yield
     finally:
         # remove those hooks after tracing
