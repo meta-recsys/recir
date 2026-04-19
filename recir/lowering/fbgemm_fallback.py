@@ -44,6 +44,16 @@ def _is_fbgemm_available() -> bool:
 # ── Pure PyTorch implementations ────────────────────────────────────────
 
 
+def _batched_complete_cumsum_impl(values: torch.Tensor) -> torch.Tensor:
+    # values: (B, N, ...) -> output: (B, N+1, ...)
+    # Batched version of asynchronous_complete_cumsum: prepend zero slice on dim=1.
+    # Use zeros_like(narrow) instead of zeros(shape) so the FX graph doesn't
+    # hardcode concrete shape literals that break when XLA runtime shapes differ.
+    cumsum = torch.cumsum(values, dim=1)
+    zeros = torch.zeros_like(values.narrow(1, 0, 1))
+    return torch.cat([zeros, cumsum], dim=1)
+
+
 def _jagged_to_padded_dense_impl(
     values: torch.Tensor,
     offsets: List[torch.Tensor],
