@@ -280,15 +280,25 @@ def _torch_binary_scalar_type(scalar: Any, tensor: Any) -> Any:
 
 
 @op(torch.ops.aten.searchsorted.Tensor)  # pyre-ignore[56]
-def _aten_searchsorted(sorted_sequence: Any, values: Any) -> Any:
+def _aten_searchsorted(
+    sorted_sequence: Any,
+    values: Any,
+    *,
+    out_int32: bool = False,
+    right: bool = False,
+    side: str | None = None,
+    sorter: Any = None,
+) -> Any:
     mappings.t2j_dtype(torch.get_default_dtype())
-    res = jnp.searchsorted(sorted_sequence, values)
-    if sorted_sequence.dtype == np.dtype(np.int32) or sorted_sequence.dtype == np.dtype(
-        np.int32
-    ):
-        # res = res.astype(new_dtype)
+    jax_side = "right" if right else "left"
+    if side is not None:
+        jax_side = side
+    res = jnp.searchsorted(sorted_sequence, values, side=jax_side, sorter=sorter)
+    if out_int32:
+        res = res.astype(np.dtype(np.int32))
+    elif sorted_sequence.dtype == np.dtype(np.int32):
         res = res.astype(np.dtype(np.int64))
-    return res  # jnp.searchsorted(sorted_sequence, values)
+    return res
 
 
 @op(torch.ops.aten.sub.Tensor)
@@ -400,8 +410,12 @@ def _aten_resize_as_(x: Any, y: Any) -> Any:
 
 
 @op(torch.ops.aten.repeat_interleave.Tensor)
-def repeat_interleave(repeats: Any, dim: Any = 0) -> Any:
-    return jnp.repeat(np.arange(repeats.shape[dim]), repeats)
+def repeat_interleave(repeats: Any, dim: Any = 0, *, output_size: Any = None) -> Any:
+    return jnp.repeat(
+        np.arange(repeats.shape[dim]),
+        repeats,
+        total_repeat_length=output_size,
+    )
 
 
 @op(torch.ops.aten.repeat_interleave.self_int)
@@ -658,48 +672,83 @@ def _aten__embedding_bag(
             output = jnp.max(embedded, axis=1)
         return output, None, None, None  # pyre-ignore[61]
 
-    if isinstance(offsets, jax.Array):
-        offsets_np = np.array(offsets)
+    # When include_last_offset is True, the last offset is the total number
+    # of indices (a sentinel), so num_bags = len(offsets) - 1.
+    if include_last_offset:
+        bag_offsets = offsets[:-1]
+        next_offsets = offsets[1:]
+        num_bags = offsets.shape[0] - 1
     else:
-        offsets_np = offsets
+        bag_offsets = offsets
+        num_bags = offsets.shape[0]
+        next_offsets = jnp.concatenate(
+            [offsets[1:], jnp.array([indices.shape[0]], dtype=offsets.dtype)]
+        )
 
-    num_bags = offsets_np.shape[0]
-    embedding_dim = embedded.shape[-1]
-    output_array = jnp.zeros((num_bags, embedding_dim), dtype=embedded.dtype)
+    bag_size = next_offsets - bag_offsets
 
-    offset2bag = np.zeros(indices.shape[0], dtype=np.int64)
-    bag_size = np.zeros(num_bags, dtype=np.int64)
-    max_indices = jnp.full_like(indices, -1)
+    # Build segment_ids: map each index position to its bag.
+    # searchsorted(bag_offsets, positions, side='right') - 1 gives the bag id.
+    positions = jnp.arange(indices.shape[0], dtype=offsets.dtype)
+    segment_ids = jnp.searchsorted(bag_offsets, positions, side="right") - 1
+    segment_ids = jnp.clip(segment_ids, 0, num_bags - 1)
 
-    for bag in range(num_bags):
-        start = int(offsets_np[bag])
+    if per_sample_weights is not None:
+        embedded = embedded * per_sample_weights[:, None]
 
-        end = int(indices.shape[0] if bag + 1 == num_bags else offsets_np[bag + 1])
-        bag_size[bag] = end - start
-        offset2bag[start:end] = bag
+    if mode == 0:  # sum
+        output = jax.ops.segment_sum(embedded, segment_ids, num_segments=num_bags)
+    elif mode == 1:  # mean
+        output = jax.ops.segment_sum(embedded, segment_ids, num_segments=num_bags)
+        safe_sizes = jnp.maximum(bag_size, 1).astype(embedded.dtype)
+        output = output / safe_sizes[:, None]
+    elif mode == 2:  # max
+        output = jax.ops.segment_max(embedded, segment_ids, num_segments=num_bags)
+    else:
+        raise ValueError(
+            f"mode can only be 0 (sum), 1 (mean) or 2 (max) but got {mode=}"
+        )
 
-        if end - start > 0:
-            if mode == 0:
-                output_bag = jnp.sum(embedded[start:end], axis=0)
-            elif mode == 1:
-                output_bag = jnp.mean(embedded[start:end], axis=0)
-            elif mode == 2:
-                output_bag = jnp.max(embedded[start:end], axis=0)
-                max_indices = max_indices.at[start:end].set(
-                    jnp.argmax(embedded[start:end], axis=0)
-                )
-            else:
-                raise ValueError(
-                    f"mode can only be 0 (sum), 1 (mean) or 2 (max) but got {mode=}"
-                )
-            output_array = output_array.at[bag].set(output_bag)
+    offset2bag = segment_ids
+    max_indices = jnp.zeros_like(indices)
 
-    # The original code returned offset2bag, bag_size, and max_indices as numpy arrays.
-    # Converting them to JAX arrays for consistency.
-    offset2bag = jnp.array(offset2bag)
-    bag_size = jnp.array(bag_size)
+    return output, offset2bag, bag_size, max_indices
 
-    return output_array, offset2bag, bag_size, max_indices
+
+@op(torch.ops.aten._embedding_bag_backward)  # pyre-ignore[56]
+def _aten__embedding_bag_backward(
+    grad: Any,
+    indices: Any,
+    offsets: Any,
+    offset2bag: Any,
+    bag_size: Any,
+    maximum_indices: Any,
+    num_weights: int,
+    scale_grad_by_freq: bool = False,
+    mode: int = 0,
+    sparse: bool = False,
+    per_sample_weights: Any = None,
+    padding_idx: int = -1,
+) -> Any:
+    """Backward for _embedding_bag: scatter gradients back to weight matrix."""
+    embedding_dim = grad.shape[-1]
+
+    # Expand grad from (num_bags, D) to per-index (num_indices, D)
+    grad_per_index = grad[offset2bag]
+
+    if mode == 1:  # mean: scale by 1/bag_size
+        safe_sizes = jnp.maximum(bag_size[offset2bag], 1).astype(grad.dtype)
+        grad_per_index = grad_per_index / safe_sizes[:, None]
+
+    if per_sample_weights is not None:
+        grad_per_index = grad_per_index * per_sample_weights[:, None]
+
+    # Scatter-add into grad_weight of shape (num_weights, embedding_dim).
+    # indices is 1-D (num_indices,); each entry selects a row in grad_weight.
+    grad_weight = jnp.zeros((num_weights, embedding_dim), dtype=grad.dtype)
+    grad_weight = grad_weight.at[indices].add(grad_per_index)
+
+    return grad_weight
 
 
 @op(torch.ops.aten.rsqrt)  # pyre-ignore[56]
