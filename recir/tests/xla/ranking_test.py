@@ -64,12 +64,22 @@ class DDROWrapper(nn.Module):
 
         # Flatten for LLM forward
         flat_ids = input_ids.view(batch_size * num_items, seq_len).contiguous()
-        flat_mask = attention_mask.view(batch_size * num_items, seq_len).contiguous()
         flat_labels = labels.view(batch_size * num_items, seq_len).contiguous()
+
+        # Pre-compute a simple 4D causal mask so that transformers >=4.46
+        # skips its create_causal_mask() utility (which introduces ops
+        # without Meta dispatch kernels, causing XLA graph breaks).
+        bsz = flat_ids.shape[0]
+        min_dtype = torch.finfo(torch.float32).min
+        causal_mask = torch.triu(
+            torch.full((seq_len, seq_len), min_dtype, device=flat_ids.device),
+            diagonal=1,
+        )
+        causal_mask = causal_mask[None, None, :, :].expand(bsz, 1, -1, -1)
 
         outputs = self.llm(
             input_ids=flat_ids,
-            attention_mask=flat_mask,
+            attention_mask=causal_mask,
             use_cache=False,
         )
         logits = outputs.logits.float()
