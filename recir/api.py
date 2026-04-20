@@ -41,6 +41,7 @@ from torch._subclasses.fake_tensor import FakeTensorMode
 from torch.fx.graph import _PyTreeCodeGen, _PyTreeInfo, CodeGen
 from torch.nn.utils import stateless
 from torch.nn.utils._named_member_accessor import NamedMemberAccessor
+import traceback as _traceback_mod
 
 
 class Override(ABC):
@@ -416,11 +417,13 @@ def _tag_batch_inputs(
         if isinstance(val, torch.Tensor):
             is_batch = tensor_idx >= num_model_tensors
             node.meta["is_batch_input"] = is_batch
+            node.meta["is_weight"] = not is_batch
             if is_batch:
                 node.meta["batch_dim"] = input_batch_dim
             tensor_idx += 1
         else:
             node.meta["is_batch_input"] = False
+            node.meta["is_weight"] = False
 
 
 def _finalize_graph(
@@ -669,6 +672,9 @@ def _compile_gspmd(
     The graph is traced with global batch shapes (expanded from the local
     mini-batch by world_size) and metadata is attached for the GSPMD
     lowering step.
+
+    For fully_shard mode, parameters are sharded on CPU before tracing
+    so that the FX graph has consistent sharded shapes throughout.
     """
     fake_mode: FakeTensorMode = FakeTensorMode()
     local_result = _local_compile(
@@ -715,16 +721,68 @@ def _compile_gspmd(
             gm.graph.erase_node(node)
     gm.recompile()
 
-    return _finalize_graph(
+    params_and_buffers = {**local_result.params, **local_result.buffers}
+    result = _finalize_graph(
         gm,
         local_result.mod,
         local_result.opt,
-        {**local_result.params, **local_result.buffers},
+        params_and_buffers,
         local_result.named_states,
         module_override=module_override,
         input_batch_dim=parallel_mode.input_batch_dim,
         dedup=False,
     )
+    # FSDP: shard model params AFTER tracing (graph uses global shapes,
+    # but runtime inputs are local shards — _to_sharded_jax bridges the gap)
+    if parallel_mode.parallel_style == "fully_shard":
+        # Capture shapes before sharding to detect which tensors changed
+        pre_shapes = [t.shape if isinstance(t, torch.Tensor) else None
+                      for t in result.flat_state]
+        parallel_mode.shard_params(
+            local_result.mod, params_and_buffers, local_result.opt
+        )
+        # Recreate flat_state: shard_params replaces optimizer state dict
+        # entries with new tensors (state[key] = narrow()), but the old
+        # flat_state still references the pre-shard tensors. Re-extract
+        # to pick up the sharded optimizer states.
+        named_states_updated: Dict[str, Any] = {}
+        if local_result.opt is not None:
+            for n, p in dict(local_result.mod.named_parameters(remove_duplicate=False)).items():
+                if p in local_result.opt.state:
+                    named_states_updated[n] = local_result.opt.state[p]
+        result.flat_state = pytree.tree_leaves([params_and_buffers, named_states_updated])
+        # Set is_fsdp_sharded metadata on placeholder nodes so _jit_gspmd
+        # knows exactly which inputs are local shards (no shape guessing).
+        post_shapes = [t.shape if isinstance(t, torch.Tensor) else None
+                       for t in result.flat_state]
+        tensor_idx = 0
+        for node in result.gm.graph.nodes:
+            if node.op != "placeholder":
+                continue
+            val = node.meta.get("val", None)
+            if isinstance(val, torch.Tensor):
+                sharded = (tensor_idx < len(pre_shapes)
+                           and pre_shapes[tensor_idx] is not None
+                           and post_shapes[tensor_idx] is not None
+                           and pre_shapes[tensor_idx] != post_shapes[tensor_idx])
+                node.meta["is_fsdp_sharded"] = sharded
+                tensor_idx += 1
+        import logging as _api_log
+        _fsdp_logger = _api_log.getLogger(__name__)
+        n_fsdp_true = sum(1 for n in result.gm.graph.nodes if n.op == "placeholder" and n.meta.get("is_fsdp_sharded", False))
+        n_fsdp_false = sum(1 for n in result.gm.graph.nodes if n.op == "placeholder" and isinstance(n.meta.get("val", None), torch.Tensor) and not n.meta.get("is_fsdp_sharded", False) and not n.meta.get("is_batch_input", False))
+        _fsdp_logger.info("FSDP metadata: %d sharded, %d non-sharded weights, flat_state=%d entries", n_fsdp_true, n_fsdp_false, len(result.flat_state))
+        # Log FQN names of large unsharded entries
+        pb_keys = list(params_and_buffers.keys())
+        large_unsharded = []
+        for idx, t in enumerate(result.flat_state):
+            if isinstance(t, torch.Tensor) and t.numel() * t.element_size() > 1024*1024:
+                if idx < len(pre_shapes) and pre_shapes[idx] == post_shapes[idx]:
+                    name = pb_keys[idx] if idx < len(pb_keys) else f"state_{idx}"
+                    large_unsharded.append((idx, name, list(t.shape), f"{t.numel()*t.element_size()/1024/1024:.1f}MB"))
+        large_unsharded.sort(key=lambda x: float(x[3].rstrip("MB")), reverse=True)
+        _fsdp_logger.info("Large unsharded flat_state (>1MB, top 20): %s", large_unsharded[:20])
+    return result
 
 
 # Note that the Python convention of __dict__ requires the key to be str.
@@ -785,31 +843,32 @@ def compile(
             with torch.no_grad():
                 # N.B.: we don't need autograd as backward has already been
                 # captured in the graph.
-                if not last_train_step:
-                    output_all = compiled_obj.gm(*flat_inps)
-                else:
-                    # This is the last train step. Call IterGraphModule.forward()
-                    # with the `last_iter` argument and catch the exception in
-                    # case the compiled_obj is not wrapped with IterGraphModule.
-                    try:
-                        output_all = compiled_obj.gm(
-                            *flat_inps, last_iter=last_train_step
-                        )
-                    except TypeError as e:
-                        if "last_iter" not in str(e):
-                            raise e
+                try:
+                    if not last_train_step:
                         output_all = compiled_obj.gm(*flat_inps)
+                    else:
+                        try:
+                            output_all = compiled_obj.gm(
+                                *flat_inps, last_iter=last_train_step
+                            )
+                        except TypeError as e:
+                            if "last_iter" not in str(e):
+                                raise e
+                            output_all = compiled_obj.gm(*flat_inps)
 
-                output = output_all[0]
-                updated_flat = pytree.tree_leaves(output_all[1:])
-                output = compiled_obj.state_manager.process_outputs(
-                    compiled_obj.flat_state,
-                    output,
-                    updated_flat,
-                    last_train_step,
-                )
+                    output = output_all[0]
+                    updated_flat = pytree.tree_leaves(output_all[1:])
+                    output = compiled_obj.state_manager.process_outputs(
+                        compiled_obj.flat_state,
+                        output,
+                        updated_flat,
+                        last_train_step,
+                    )
 
-                return output
+                    return output
+                except Exception as _e:
+                    _traceback_mod.print_exc()
+                    raise
 
         return wrapper
 

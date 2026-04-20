@@ -36,6 +36,25 @@ class XLADeviceStateManager(DeviceStateManager):
             self._set_keep_jax_output(gm, False)
             return flat_state + user_inps
 
+    @staticmethod
+    def _to_local_shard(tensor: torch.Tensor, target_shape: torch.Size) -> torch.Tensor:
+        """Narrow a global tensor back to the local shard shape.
+
+        After GSPMD execution with replicated output shardings,
+        _jax_to_torch produces full global tensors. This narrows dim 0
+        to match the local shard size from shard_params, so that
+        device_state entries have the same shapes as flat_state.
+        """
+        if tensor.shape == target_shape:
+            return tensor
+        if (
+            tensor.ndim >= 1
+            and target_shape[0] < tensor.shape[0]
+            and tensor.shape[1:] == target_shape[1:]
+        ):
+            return tensor.narrow(0, 0, target_shape[0]).contiguous()
+        return tensor
+
     def process_outputs(
         self,
         flat_state: List[torch.Tensor],
@@ -49,7 +68,18 @@ class XLADeviceStateManager(DeviceStateManager):
         if last_train_step:
             self.device_state = None
         else:
-            self.device_state = updated_flat[:num_state]
+            # Re-shard outputs to match flat_state shapes (FSDP fix).
+            # Step 1 outputs are global (replicated out_shardings), but
+            # step 2 needs local shards to match _jit_gspmd expectations.
+            device_state = []
+            for i in range(min(num_state, len(updated_flat))):
+                val = updated_flat[i]
+                if not isinstance(val, torch.Tensor):
+                    val = _jax_to_torch(val, self.torch_device)
+                if i < len(flat_state):
+                    val = self._to_local_shard(val, flat_state[i].shape)
+                device_state.append(val)
+            self.device_state = device_state
         if not isinstance(output, torch.Tensor) and output is not None:
             output = _jax_to_torch(output, self.torch_device)
         return output
@@ -63,11 +93,15 @@ class XLADeviceStateManager(DeviceStateManager):
         for i, state_tensor in enumerate(flat_state):
             if i < len(updated_flat):
                 updated = updated_flat[i]
-                if isinstance(updated, torch.Tensor):
-                    if updated.data_ptr() != state_tensor.data_ptr():
+                if not isinstance(updated, torch.Tensor):
+                    updated = _jax_to_torch(updated, self.torch_device)
+                if updated.data_ptr() != state_tensor.data_ptr():
+                    # For FSDP, output may be global while flat_state is
+                    # a local shard. Narrow to match before copying.
+                    if updated.shape != state_tensor.shape:
+                        updated = self._to_local_shard(updated, state_tensor.shape)
+                    if updated.shape == state_tensor.shape:
                         state_tensor.copy_(updated)
-                else:
-                    state_tensor.copy_(_jax_to_torch(updated, self.torch_device))
 
     def sync_to_torch(
         self,

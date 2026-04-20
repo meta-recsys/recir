@@ -24,7 +24,11 @@ from recir.passes import (
 from torch import fx
 
 
-def lower_iter_gm(iter_gm: IterGraphModule, backend: Optional[BackendType]) -> None:
+def lower_iter_gm(
+    iter_gm: IterGraphModule,
+    backend: Optional[BackendType],
+    parallel_style: str = "replicate",
+) -> None:
     """Lower all graph modules in an IterGraphModule for the given backend.
 
     Each graph module (setup, main, cleanup) is lowered independently
@@ -42,9 +46,9 @@ def lower_iter_gm(iter_gm: IterGraphModule, backend: Optional[BackendType]) -> N
         BackendType.XLA_SHARD_MAP,
         BackendType.XLA_GSPMD,
     ):
-        iter_gm.setup_gm = partial_lower_xla(iter_gm.setup_gm, backend_type=backend)
-        iter_gm.main_gm = partial_lower_xla(iter_gm.main_gm, backend_type=backend)
-        iter_gm.cleanup_gm = partial_lower_xla(iter_gm.cleanup_gm, backend_type=backend)
+        iter_gm.setup_gm = partial_lower_xla(iter_gm.setup_gm, backend_type=backend, parallel_style=parallel_style)
+        iter_gm.main_gm = partial_lower_xla(iter_gm.main_gm, backend_type=backend, parallel_style=parallel_style)
+        iter_gm.cleanup_gm = partial_lower_xla(iter_gm.cleanup_gm, backend_type=backend, parallel_style=parallel_style)
 
 
 class GraphModuleTransformation:
@@ -56,12 +60,14 @@ class GraphModuleTransformation:
         backend: Optional[BackendType] = None,
         dump_graphs: bool = False,
         enable_device_state: bool = False,
+        parallel_style: str = "replicate",
     ) -> None:
         self.enable_graph_optimization = enable_graph_optimization
         self.enable_weight_free = enable_weight_free
         self.backend = backend
         self.dump_graphs = dump_graphs
         self.enable_device_state = enable_device_state
+        self.parallel_style = parallel_style
 
     @property
     def device_state_manager(self) -> DeviceStateManager:
@@ -89,7 +95,7 @@ class GraphModuleTransformation:
             schedule_comm_wait(iter_gm)
             remove_copy_from_optimizer(iter_gm)
         iter_gm.finalize_setup()
-        lower_iter_gm(iter_gm, self.backend)
+        lower_iter_gm(iter_gm, self.backend, self.parallel_style)
 
         if self.dump_graphs:
             dump_graphs_to_files(

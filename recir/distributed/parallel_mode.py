@@ -144,7 +144,52 @@ class GSPMDParallel(ParallelMode):
         params_and_buffers: Dict[str, Any],
         opt: Optional[torch.optim.Optimizer],
     ) -> None:
-        pass  # No-op: GSPMD handles sharding via annotations
+        if self.parallel_style != "fully_shard":
+            return
+        # FSDP: shard model parameters in-place along dim 0.
+        # Called AFTER tracing so the graph has global shapes.
+        # Each process holds 1/num_processes of the tensor. Then
+        # _to_sharded_jax splits across local devices and reconstructs
+        # the global array: process_shard / num_local * num_global = full.
+        num_procs = self.num_processes
+        num_devs = self.num_ranks  # total devices (256)
+        # Only shard tensors where the local shard can be evenly split
+        # across local devices. This ensures _to_sharded_jax and
+        # _jit_gspmd agree on which tensors are FSDP-sharded.
+        def _can_fsdp(dim0: int) -> bool:
+            return dim0 >= num_devs and dim0 % num_devs == 0
+        import logging as _log
+        _shard_logger = _log.getLogger(__name__)
+        _n_sharded_p = 0
+        _n_skipped_p = 0
+        for name, param in model.named_parameters():
+            if param.ndim >= 1 and _can_fsdp(param.shape[0]):
+                _n_sharded_p += 1
+                chunk_size = param.shape[0] // num_procs
+                param.data = param.data.narrow(0, 0, chunk_size).contiguous()
+        _shard_logger.info("shard_params: sharded %d params, skipped %d (num_devs=%d)", _n_sharded_p, _n_skipped_p, num_devs)
+        _n_sharded_b = 0
+        _n_skipped_b = 0
+        for name, buf in model.named_buffers():
+            if buf.ndim >= 1 and _can_fsdp(buf.shape[0]):
+                _n_sharded_b += 1
+                chunk_size = buf.shape[0] // num_procs
+                buf.data = buf.data.narrow(0, 0, chunk_size).contiguous()
+        _shard_logger.info("shard_params: sharded %d buffers, skipped %d", _n_sharded_b, _n_skipped_b)
+        # Shard optimizer states to match
+        if opt is not None:
+            for param_group in opt.param_groups:
+                for p in param_group["params"]:
+                    if p in opt.state:
+                        state = opt.state[p]
+                        for key, val in list(state.items()):
+                            if (
+                                isinstance(val, torch.Tensor)
+                                and val.ndim >= 1
+                                and _can_fsdp(val.shape[0])
+                            ):
+                                chunk_size = val.shape[0] // num_procs
+                                state[key] = val.narrow(0, 0, chunk_size).contiguous()
 
     def partition(
         self,

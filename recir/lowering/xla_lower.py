@@ -45,10 +45,12 @@ class _XLAModule(torch.nn.Module):
         self,
         gm: torch.fx.GraphModule,
         backend_type: BackendType = BackendType.XLA_SHARD_MAP,
+        parallel_style: str = "replicate",
     ) -> None:
         super().__init__()
         self.gm = gm
         self.backend_type = backend_type
+        self.parallel_style = parallel_style
         self.compiled: Optional[Callable[..., List[torch.Tensor]]] = None
         self.xla_hlo_text: Optional[str] = None
         self.keep_jax_output: bool = False
@@ -169,9 +171,18 @@ class _XLAModule(torch.nn.Module):
 
     @staticmethod
     def _to_sharded_jax(
-        tensor: Any, mesh: Any, is_batch_input: bool = False, input_batch_dim: int = 0
+        tensor: Any,
+        mesh: Any,
+        is_batch_input: bool = False,
+        input_batch_dim: int = 0,
+        is_fsdp_weight: bool = False,
     ) -> Any:
-        """Convert a PyTorch tensor to a properly sharded JAX array."""
+        """Convert a PyTorch tensor to a properly sharded JAX array.
+
+        Args:
+            is_batch_input: Shard along batch_dim (data parallelism).
+            is_fsdp_weight: Shard along dim 0 (FSDP weight sharding).
+        """
         if tensor is None:
             return None
         if not isinstance(tensor, torch.Tensor):
@@ -203,6 +214,27 @@ class _XLAModule(torch.nn.Module):
             global_shape[input_batch_dim] *= num_global // num_local
             return jax.make_array_from_single_device_arrays(
                 tuple(global_shape), NamedSharding(mesh, P("torch_dist")), local_buffers
+            )
+        if is_fsdp_weight and jax_array.ndim >= 1:
+            # FSDP: input is a local shard (after shard_params).
+            # Treat like batch sharding: split local shard across local devices,
+            # then declare global shape = local_dim * num_global/num_local.
+            if jax_array.shape[0] >= num_local and jax_array.shape[0] % num_local == 0:
+                local_shards = jnp.split(jax_array, num_local, axis=0)
+                local_buffers = [
+                    jax.device_put(s, d) for s, d in zip(local_shards, local_devices)
+                ]
+                global_shape = list(jax_array.shape)
+                global_shape[0] *= num_global // num_local
+                ndim = len(global_shape)
+                spec = P("torch_dist", *([None] * (ndim - 1)))
+                return jax.make_array_from_single_device_arrays(
+                    tuple(global_shape), NamedSharding(mesh, spec), local_buffers
+                )
+            # Fallback: shard not divisible by num_local, replicate
+            local_buffers = [jax.device_put(jax_array, d) for d in local_devices]
+            return jax.make_array_from_single_device_arrays(
+                jax_array.shape, NamedSharding(mesh, P()), local_buffers
             )
         local_buffers = [jax.device_put(jax_array, d) for d in local_devices]
         return jax.make_array_from_single_device_arrays(
@@ -283,7 +315,12 @@ class _XLAModule(torch.nn.Module):
         args: Tuple[torch.Tensor, ...],
         input_device: torch.device,
     ) -> Any:
-        """jax.jit with GSPMD in_shardings/out_shardings."""
+        """jax.jit with GSPMD in_shardings/out_shardings.
+
+        Supports two parallel styles:
+        - "replicate": all weights replicated on every device (DDP)
+        - "fully_shard": weights sharded along dim 0 across devices (FSDP)
+        """
         devices = jax.devices()
         mesh: Any = Mesh(devices, axis_names=("torch_dist",))
         replicated = NamedSharding(mesh, P())
@@ -292,12 +329,33 @@ class _XLAModule(torch.nn.Module):
         is_batch: List[bool] = [
             n.meta.get("is_batch_input", False) for n in placeholders
         ]
+        is_weight: List[bool] = [
+            n.meta.get("is_weight", False) for n in placeholders
+        ]
+        use_fsdp = self.parallel_style == "fully_shard"
         input_batch_dim: int = 0
         for n in placeholders:
             if n.meta.get("is_batch_input", False):
                 input_batch_dim = n.meta.get("batch_dim", 0)
                 break
-        in_shardings = [batch_sharded if b else replicated for b in is_batch]
+        # Read FSDP metadata set by _compile_gspmd after shard_params.
+        # This tells us exactly which inputs are local shards.
+        is_fsdp_meta: List[bool] = [
+            n.meta.get("is_fsdp_sharded", False) for n in placeholders
+        ]
+        # Build per-input sharding specs
+        in_shardings = []
+        num_weight_sharded = 0
+        for i, node in enumerate(placeholders):
+            if is_batch[i]:
+                in_shardings.append(batch_sharded)
+            elif use_fsdp and is_fsdp_meta[i] and i < len(args) and isinstance(args[i], torch.Tensor) and args[i].ndim >= 1:
+                ndim = args[i].ndim
+                spec = P("torch_dist", *([None] * (ndim - 1)))
+                in_shardings.append(NamedSharding(mesh, spec))
+                num_weight_sharded += 1
+            else:
+                in_shardings.append(replicated)
         out_node = next(n for n in self.gm.graph.nodes if n.op == "output")
         torch_indices: set[int] = self.torch_output_indices or set()
         out_leaves, out_treedef = jax.tree.flatten(out_node.args[0])
@@ -307,21 +365,71 @@ class _XLAModule(torch.nn.Module):
                 for i in range(len(out_leaves))
             ]
         )
+        # Diagnostic: memory breakdown
+        n_tensor_args = sum(1 for a in args if isinstance(a, torch.Tensor))
+        n_tensor_weight = sum(1 for i, a in enumerate(args) if isinstance(a, torch.Tensor) and i < len(is_fsdp_meta) and not is_batch[i])
+        replicated_sizes = []
+        total_replicated_mb = 0.0
+        total_sharded_mb = 0.0
+        for i in range(min(len(placeholders), len(args))):
+            if not isinstance(args[i], torch.Tensor):
+                continue
+            size_mb = args[i].numel() * args[i].element_size() / (1024 * 1024)
+            if is_batch[i]:
+                pass
+            elif use_fsdp and i < len(is_fsdp_meta) and is_fsdp_meta[i]:
+                total_sharded_mb += size_mb
+            else:
+                total_replicated_mb += size_mb
+                if size_mb > 1.0:
+                    replicated_sizes.append((i, list(args[i].shape), f"{size_mb:.1f}MB"))
+        replicated_sizes.sort(key=lambda x: float(x[2].rstrip("MB")), reverse=True)
         logger.info(
-            "Compiling with GSPMD: %d inputs (%d batch-sharded), mesh=%s",
-            len(args),
+            "Compiling with GSPMD: %d placeholders (%d tensor args, %d tensor weights, %d batch-sharded, %d weight-sharded [%s]), mesh=%s",
+            len(placeholders), n_tensor_args, n_tensor_weight,
             sum(is_batch),
+            num_weight_sharded,
+            self.parallel_style,
             mesh.axis_names,
         )
+        logger.info(
+            "FSDP memory: sharded=%.1f MB (per-device=%.2f MB), replicated=%.1f MB (per-device=%.1f MB)",
+            total_sharded_mb, total_sharded_mb / len(devices),
+            total_replicated_mb, total_replicated_mb,
+        )
+        if replicated_sizes:
+            logger.info("Largest replicated inputs (>1MB): %s", replicated_sizes[:10])
+            # Diagnostic: print placeholder names for large replicated inputs
+            named_repls = []
+            for i, node in enumerate(placeholders):
+                if i < len(args) and isinstance(args[i], torch.Tensor):
+                    size_mb = args[i].numel() * args[i].element_size() / (1024**2)
+                    if size_mb > 1.0 and not is_batch[i] and not (use_fsdp and i < len(is_fsdp_meta) and is_fsdp_meta[i]):
+                        named_repls.append((i, node.name, list(args[i].shape), f"{size_mb:.1f}MB"))
+            named_repls.sort(key=lambda x: float(x[3].rstrip("MB")), reverse=True)
+            logger.info("Replicated input details (name, shape): %s", named_repls[:15])
         jitted: Any = jax.jit(
             jax_fn, in_shardings=in_shardings, out_shardings=out_shardings
         )
+
+        # Track which inputs actually got FSDP sharding (from metadata)
+        is_fsdp_sharded: List[bool] = []
+        for i, node in enumerate(placeholders):
+            if is_batch[i]:
+                is_fsdp_sharded.append(False)
+            elif use_fsdp and is_fsdp_meta[i] and i < len(args) and isinstance(args[i], torch.Tensor) and args[i].ndim >= 1:
+                is_fsdp_sharded.append(True)
+            else:
+                is_fsdp_sharded.append(False)
 
         _hlo_captured: List[bool] = [False]
 
         def run(*run_args: torch.Tensor) -> List[torch.Tensor]:
             jax_args = tuple(
-                self._to_sharded_jax(a, mesh, is_batch[j], input_batch_dim)
+                self._to_sharded_jax(
+                    a, mesh, is_batch[j], input_batch_dim,
+                    is_fsdp_weight=is_fsdp_sharded[j],
+                )
                 for j, a in enumerate(run_args)
             )
             if not _hlo_captured[0]:
@@ -334,7 +442,10 @@ class _XLAModule(torch.nn.Module):
         run.hlo_text = None  # pyre-ignore[16]
 
         example_args = tuple(
-            self._to_sharded_jax(a, mesh, is_batch[j], input_batch_dim)
+            self._to_sharded_jax(
+                a, mesh, is_batch[j], input_batch_dim,
+                is_fsdp_weight=is_fsdp_sharded[j],
+            )
             for j, a in enumerate(args)
         )
         lowered = jitted.lower(*example_args)
@@ -385,6 +496,7 @@ def _is_xla_compatible(node: torch.fx.Node) -> Tuple[bool, str]:
         torch.ops.aten.flatten.using_ints,
         torch.ops.aten.full_like.default,
         torch.ops.aten.select.int,
+        torch.ops.aten.lift_fresh_copy.default,
     }
     if node.target in _XLA_ALLOWLIST:
         return True, ""
@@ -469,13 +581,14 @@ def partial_lower_xla(
     subgraph_predicate: Callable[[List[torch.fx.Node]], bool] = lambda x: True,
     dumper: Callable[[str], str] = lambda x: "subgraph",
     op_swap_map: Optional[OpSwapRegistry] = None,
+    parallel_style: str = "replicate",
 ) -> torch.fx.GraphModule:
     if op_swap_map is not None:
         gm = swap_ops(gm, op_swap_map)
     return segment_and_lower(
         gm,
         compatibility_fn=_is_xla_compatible,
-        module_factory=lambda sub_gm: _XLAModule(sub_gm, backend_type),
+        module_factory=lambda sub_gm: _XLAModule(sub_gm, backend_type, parallel_style),
         subgraph_prefix="xla_subgraph",
         node_predicate=node_predicate,
         subgraph_predicate=subgraph_predicate,
