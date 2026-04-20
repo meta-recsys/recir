@@ -1,0 +1,44 @@
+# DLRMv3 full-scale training on 128-chip unified TPU slice (32 nodes, 4x4x8)
+# Requires recir-v7-128 cluster with workload policy
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  name: dlrmv3-128chip
+  namespace: default
+spec:
+  replicatedJobs:
+  - name: worker
+    replicas: 1
+    template:
+      spec:
+        parallelism: 32
+        completions: 32
+        template:
+          spec:
+            containers:
+            - name: dlrmv3
+              image: us-central1-docker.pkg.dev/mrs-tpu-y317h/recml/dlrmv3_tpu:latest
+              imagePullPolicy: Always
+              env:
+              - name: PYTHONUNBUFFERED
+                value: "1"
+              - name: MASTER_PORT
+                value: "29500"
+              command:
+              - python3
+              - -u
+              - -m
+              - recir.examples.dlrmv3.train
+              - --max_steps
+              - "20"
+              - --local_batch_size
+              - "32"
+              ports:
+              - containerPort: 8471
+              resources:
+                limits:
+                  google.com/tpu: 4
+            nodeSelector:
+              cloud.google.com/gke-tpu-accelerator: tpu7x
+              cloud.google.com/gke-tpu-topology: 4x4x8
+            restartPolicy: Never
