@@ -164,6 +164,34 @@ class TestMarkBoundary(unittest.TestCase):
         handles = attach_markers(model, inject_specs=[], derive_specs=[], aux_specs=[])
         self.assertEqual(len(handles), 0)
 
+    def test_mark_boundary_autograd(self) -> None:
+        """Gradient passes through mark_boundary unchanged."""
+        x = torch.randn(3, 4, requires_grad=True)
+        y = mark_boundary(x, "test")
+        loss = y.sum()
+        loss.backward()
+        self.assertIsNotNone(x.grad)
+        self.assertTrue(torch.equal(x.grad, torch.ones_like(x)))
+
+    def test_mark_boundary_backward_in_model(self) -> None:
+        """mark_boundary inside a model's forward does not block backward."""
+
+        class ModelWithMarker(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.linear = nn.Linear(4, 4)
+
+            def forward(self, x):
+                x = torch.ops.recir.mark_boundary(x, "input")
+                return self.linear(x)
+
+        model = ModelWithMarker()
+        x = torch.randn(2, 4)
+        out = model(x)
+        loss = out.sum()
+        loss.backward()
+        self.assertIsNotNone(model.linear.weight.grad)
+
 
 if __name__ == "__main__":
     unittest.main()

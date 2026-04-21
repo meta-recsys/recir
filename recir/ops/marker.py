@@ -70,6 +70,23 @@ def _mark_boundary_fake(x: torch.Tensor, name: str) -> torch.Tensor:
     return torch.empty_like(x)
 
 
+def _mark_boundary_setup_context(ctx, inputs, output):
+    # register_autograd requires a setup_context function. This is where
+    # you would call ctx.save_for_backward() if the backward needed any
+    # saved tensors. Since mark_boundary is identity, the backward needs
+    # no saved state — so this is a no-op.
+    pass
+
+
+def _mark_boundary_backward(ctx, grad_output):
+    return grad_output, None  # identity backward, None for name
+
+
+mark_boundary.register_autograd(
+    _mark_boundary_backward, setup_context=_mark_boundary_setup_context
+)
+
+
 # ---------------------------------------------------------------------------
 # Hook helpers
 # ---------------------------------------------------------------------------
