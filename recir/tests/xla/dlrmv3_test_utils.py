@@ -588,22 +588,15 @@ class DlrmV3SparseOverride(Override):
     runtime.
     """
 
-    def __init__(
-        self, dummy_preprocess: DummyPreprocess, dense_mod: Optional[nn.Module] = None
-    ) -> None:
+    def __init__(self, dummy_preprocess: DummyPreprocess) -> None:
         self._dummy = dummy_preprocess
         self._orig_preprocess: nn.Module | None = None
-        self._dense_mod: nn.Module | None = dense_mod
-        self._saved_batch_inputs: tuple[torch.Tensor, ...] | None = None
-        self._saved_autograd_outputs: list[torch.Tensor] | None = None
         self._num_ranks: int = 1  # Set by compile() or test for loss scaling
 
     def replacement(self, fqn: str, orig_submodule: nn.Module) -> nn.Module:
         if isinstance(orig_submodule, DlrmV3Preprocess):
             self._orig_preprocess = orig_submodule
             return self._dummy
-        if isinstance(orig_submodule, DlrmV3Dense):
-            self._dense_mod = orig_submodule
         return orig_submodule
 
     def transform(
