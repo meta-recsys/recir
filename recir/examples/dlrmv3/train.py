@@ -296,14 +296,19 @@ def _run_training_loop(
         loss.backward()
         opt.step()
 
-    # JAX profiler setup
-    jax_profiling = False
+    # JAX profiler setup — enabled when on TPU and profile_start_step > 0
     profiling_active = False
+    jax_profiling = False
     try:
-        if jax.devices()[0].platform == "tpu":
-            jax_profiling = True
+        is_tpu = len(jax.devices()) > 0 and jax.devices()[0].platform == "tpu"
+        jax_profiling = is_tpu and cfg.profile_start_step > 0
     except (RuntimeError, IndexError):
         logger.warning("Could not detect JAX TPU platform, profiling disabled")
+    if jax_profiling:
+        logger.info(
+            f"JAX profiling enabled: steps {cfg.profile_start_step}-{cfg.profile_end_step}, "
+            f"dir={cfg.profile_dir}"
+        )
 
     # Training loop
     model_to_train = dmp.module if isinstance(dmp, DistributedModelParallel) else dmp
@@ -322,7 +327,8 @@ def _run_training_loop(
 
         # Profiling
         if jax_profiling and step == cfg.profile_start_step:
-            os.makedirs(cfg.profile_dir, exist_ok=True)
+            if not cfg.profile_dir.startswith("gs://"):
+                os.makedirs(cfg.profile_dir, exist_ok=True)
             jax.profiler.start_trace(cfg.profile_dir)
             profiling_active = True
             logger.info(f"[PROFILE] Started trace at step {step}")
