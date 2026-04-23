@@ -1050,7 +1050,8 @@ def shard_params_and_states(
     opt: Optional[torch.optim.Optimizer],
     mesh: DeviceMesh,
     parallel_style: DataParallelStyle,
-) -> None:
+    shard_filter: Optional[Callable[[str, torch.Tensor], bool]] = None,
+) -> Set[str]:
     """Shard model parameters and optimizer states for FULLY_SHARD mode.
 
     For FULLY_SHARD, the partitioner rewrites the graph to expect locally
@@ -1060,11 +1061,15 @@ def shard_params_and_states(
     the allgather will double the already-full tensors.
     """
     if parallel_style != DataParallelStyle.FULLY_SHARD:
-        return
+        return set()
 
+    sharded_keys: Set[str] = set()
     shard_spec = DTensorSpec(mesh=mesh, placements=(Shard(0),))
     for key in list(params_buffers.keys()):
         old_param = params_buffers[key]
+        if shard_filter is not None and not shard_filter(key, old_param):
+            continue
+        sharded_keys.add(key)
         local_shard = partition_value(old_param, shard_spec)
         params_buffers[key] = local_shard
         atoms = key.split(".")
@@ -1080,6 +1085,7 @@ def shard_params_and_states(
             state = opt.state.pop(old_param)
             _shard_state_dict(state, shard_spec)
             opt.state[new_param] = state
+    return sharded_keys
 
 
 def _clone_param_chains_for_backward(
@@ -1279,7 +1285,7 @@ def shard_params_by_plan(
     mesh: DeviceMesh,
     dense_style: DataParallelStyle,
     embedding_param_fqns: Set[str],
-) -> None:
+) -> Set[str]:
     """Shard parameters and optimizer states with per-param logic.
 
     Each parameter is sharded exactly once based on its role:
@@ -1288,9 +1294,11 @@ def shard_params_by_plan(
       - Dense params: ``Shard(0)`` if ``dense_style`` is ``FULLY_SHARD``,
         otherwise left unsharded (replicated).
     """
+    sharded_keys: Set[str] = set()
     shard_spec = DTensorSpec(mesh=mesh, placements=(Shard(0),))
     for key in list(params_buffers.keys()):
         if key in embedding_param_fqns or dense_style == DataParallelStyle.FULLY_SHARD:
+            sharded_keys.add(key)
             old_param = params_buffers[key]
             _shard_param(model, params_buffers, key, shard_spec)
             if opt is not None and old_param in opt.state:
@@ -1302,6 +1310,7 @@ def shard_params_by_plan(
                 for atom in key.split("."):
                     obj = getattr(obj, atom)
                 opt.state[obj] = state
+    return sharded_keys
 
 
 def decomposed_row_wise_embedding(
