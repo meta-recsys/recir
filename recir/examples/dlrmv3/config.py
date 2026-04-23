@@ -34,8 +34,8 @@ class DLRMv3Config:
 
     # Data
     local_batch_size: int = 128
-    uih_len: int = 200
-    num_candidates: int = 16
+    uih_len: int = 50
+    num_candidates: int = 4
     max_seq_len: int = 256
 
     # Training

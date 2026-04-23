@@ -384,7 +384,12 @@ def create_dlrmv3_wrapper(
 
 
 def create_static_batch(
-    hstu_config: DlrmHSTUConfig, batch_size: int, seed: int = 42
+    hstu_config: DlrmHSTUConfig,
+    batch_size: int,
+    seed: int = 42,
+    uih_len: int = STATIC_UIH_LEN,
+    num_candidates: int = STATIC_NUM_CANDIDATES,
+    hash_size: int = SMALL_HASH_SIZE,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Create a synthetic batch with STATIC EQUAL lengths.
 
@@ -407,18 +412,18 @@ def create_static_batch(
     uih_lengths = []
     uih_values_parts = []
     for key in uih_keys:
-        L = 1 if key in contextual_features else STATIC_UIH_LEN
+        L = 1 if key in contextual_features else uih_len
         uih_lengths.extend([L] * batch_size)
-        uih_values_parts.append(torch.randint(1, SMALL_HASH_SIZE, (batch_size * L,)))
+        uih_values_parts.append(torch.randint(1, hash_size, (batch_size * L,)))
     uih_values_t = torch.cat(uih_values_parts)
     uih_lengths_t = torch.tensor(uih_lengths, dtype=torch.long)
     cand_keys = hstu_config.hstu_candidate_feature_names
     cand_lengths = []
     cand_values_parts = []
     for _ in cand_keys:
-        cand_lengths.extend([STATIC_NUM_CANDIDATES] * batch_size)
+        cand_lengths.extend([num_candidates] * batch_size)
         cand_values_parts.append(
-            torch.randint(1, SMALL_HASH_SIZE, (batch_size * STATIC_NUM_CANDIDATES,))
+            torch.randint(1, hash_size, (batch_size * num_candidates,))
         )
     cand_values_t = torch.cat(cand_values_parts)
     cand_lengths_t = torch.tensor(cand_lengths, dtype=torch.long)
