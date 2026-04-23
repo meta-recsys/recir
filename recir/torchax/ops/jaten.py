@@ -1885,7 +1885,7 @@ def _aten_sqrt(self: Any) -> Any:
 
 @op(torch.ops.aten.tan)
 @op_base.promote_int_input
-def _aten_tanh(self: Any) -> Any:
+def _aten_tan(self: Any) -> Any:
     res = jnp.tan(self)
     return res
 
@@ -2708,7 +2708,48 @@ def _aten_constant_pad_nd(input: Any, padding: Any, value: Any = 0) -> Any:
     return jax.lax.pad(input, padding_value=value_casted, padding_config=pad_dim)
 
 
-# aten.convolution_backward
+@op(torch.ops.aten.convolution_backward.default)  # pyre-ignore[56]
+def _aten_convolution_backward(
+    grad_output: Any,
+    input: Any,
+    weight: Any,
+    bias_sizes: Any,
+    stride: Any,
+    padding: Any,
+    dilation: Any,
+    transposed: Any,
+    output_padding: Any,
+    groups: Any,
+    output_mask: Any,
+) -> Any:
+    def fwd(inp: Any, w: Any) -> Any:
+        return _aten_convolution(
+            inp,
+            w,
+            None,
+            stride,
+            padding,
+            dilation,
+            transposed,
+            output_padding,
+            groups,
+        )
+
+    _, vjp_fn = jax.vjp(fwd, input, weight)
+    grad_input, grad_weight = vjp_fn(grad_output)
+
+    grad_bias = None
+    if output_mask[2] and bias_sizes is not None and len(bias_sizes) > 0:
+        sum_dims = (0,) + tuple(range(2, grad_output.ndim))
+        grad_bias = jnp.sum(grad_output, axis=sum_dims)
+
+    return (
+        grad_input if output_mask[0] else None,
+        grad_weight if output_mask[1] else None,
+        grad_bias,
+    )
+
+
 @op(torch.ops.aten.lift_fresh_copy)  # pyre-ignore[56]
 def _aten_lift_fresh_copy(x: Any) -> Any:
     return jnp.copy(x)
