@@ -1107,6 +1107,47 @@ class TestCoreAtenOps(unittest.TestCase):
         kwargs = {}
         run_export_and_compare(self, torch.ops.aten.convolution, args, kwargs)
 
+    def test_aten_convolution_backward_1d(self) -> None:
+        # Mamba2 / Conv1d use case: input [N, C_in, L], weight [C_out, C_in, K]
+        grad_output = torch.randn((3, 2, 9)).to(torch.float32)
+        input = torch.randn((3, 2, 10)).to(torch.float32)
+        weight = torch.randn((2, 2, 2)).to(torch.float32)
+        args = (
+            grad_output,
+            input,
+            weight,
+            [2],  # bias_sizes
+            [1],  # stride
+            [0],  # padding
+            [1],  # dilation
+            False,  # transposed
+            [0],  # output_padding
+            1,  # groups
+            [True, True, True],  # output_mask: grad_input, grad_weight, grad_bias
+        )
+        kwargs = {}
+        run_export_and_compare(self, torch.ops.aten.convolution_backward, args, kwargs)
+
+    def test_aten_convolution_backward_2d(self) -> None:
+        grad_output = torch.randn((2, 4, 6, 6)).to(torch.float32)
+        input = torch.randn((2, 3, 8, 8)).to(torch.float32)
+        weight = torch.randn((4, 3, 3, 3)).to(torch.float32)
+        args = (
+            grad_output,
+            input,
+            weight,
+            [4],  # bias_sizes
+            [1, 1],  # stride
+            [0, 0],  # padding
+            [1, 1],  # dilation
+            False,  # transposed
+            [0, 0],  # output_padding
+            1,  # groups
+            [True, True, True],
+        )
+        kwargs = {}
+        run_export_and_compare(self, torch.ops.aten.convolution_backward, args, kwargs)
+
     def test_aten_copy_0(self) -> None:
         args = (
             torch.randn((10, 10)).to(torch.float32),
