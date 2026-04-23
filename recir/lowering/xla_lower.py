@@ -361,6 +361,7 @@ def _is_xla_compatible(node: torch.fx.Node) -> Tuple[bool, str]:
         torch.ops.aten.flatten.using_ints,
         torch.ops.aten.full_like.default,
         torch.ops.aten.select.int,
+        torch.ops.aten.lift_fresh_copy.default,
     }
     if node.target in _XLA_ALLOWLIST:
         return True, ""
