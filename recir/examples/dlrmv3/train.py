@@ -145,9 +145,20 @@ def create_model_and_data(
     wrapper, hstu_config, _, emb_keys = create_dlrmv3_wrapper(
         global_bs, table_configs=table_configs
     )
+    # Sync hstu_config with user-configurable values so the model,
+    # DummyPreprocess, and batch all agree on sequence lengths.
+    hstu_config.max_num_candidates = cfg.num_candidates
+    hstu_config.max_seq_len = cfg.uih_len + cfg.num_candidates + 16
 
     gloo_rank = dist.get_rank() if dist.is_initialized() else 0
-    batch = create_static_batch(hstu_config, cfg.local_batch_size, seed=42 + gloo_rank)
+    batch = create_static_batch(
+        hstu_config,
+        cfg.local_batch_size,
+        seed=42 + gloo_rank,
+        uih_len=cfg.uih_len,
+        num_candidates=cfg.num_candidates,
+        hash_size=cfg.hash_size,
+    )
 
     param_count = sum(p.numel() for p in wrapper.parameters())
     emb_count = sum(t.num_embeddings * t.embedding_dim for t in table_configs)

@@ -33,8 +33,7 @@ spec:
               - >-
                 python3 -u -m recir.examples.dlrmv3.train
                 --max_steps 20
-                --local_batch_size 2048
-                --embedding_backend sparsecore
+                --local_batch_size 32
                 --hash_size 1000
                 --profile_start_step 3
                 --profile_end_step 8
