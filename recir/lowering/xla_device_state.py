@@ -65,6 +65,7 @@ class XLADeviceStateManager(DeviceStateManager):
                 updated = updated_flat[i]
                 if isinstance(updated, torch.Tensor):
                     if updated.data_ptr() != state_tensor.data_ptr():
+                        assert updated.shape == state_tensor.shape
                         state_tensor.copy_(updated)
                 else:
                     state_tensor.copy_(_jax_to_torch(updated, self.torch_device))

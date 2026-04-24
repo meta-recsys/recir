@@ -145,7 +145,11 @@ class _XLAModule(torch.nn.Module):
 
     @staticmethod
     def _to_sharded_jax(
-        tensor: Any, mesh: Any, is_batch_input: bool = False, input_batch_dim: int = 0
+        tensor: Any,
+        mesh: Any,
+        is_batch_input: bool = False,
+        input_batch_dim: int = 0,
+        is_fsdp_weight: bool = False,
     ) -> Any:
         """Convert a PyTorch tensor to a properly sharded JAX array."""
         if tensor is None:
@@ -179,6 +183,19 @@ class _XLAModule(torch.nn.Module):
             global_shape[input_batch_dim] *= num_global // num_local
             return jax.make_array_from_single_device_arrays(
                 tuple(global_shape), NamedSharding(mesh, P("torch_dist")), local_buffers
+            )
+        if is_fsdp_weight:
+            # FSDP: input is a local shard (after shard_params).
+            local_shards = jnp.split(jax_array, num_local, axis=0)
+            local_buffers = [
+                jax.device_put(s, d) for s, d in zip(local_shards, local_devices)
+            ]
+            global_shape = list(jax_array.shape)
+            global_shape[0] *= num_global // num_local
+            ndim = len(global_shape)
+            spec = P("torch_dist", *([None] * (ndim - 1)))
+            return jax.make_array_from_single_device_arrays(
+                tuple(global_shape), NamedSharding(mesh, spec), local_buffers
             )
         local_buffers = [jax.device_put(jax_array, d) for d in local_devices]
         return jax.make_array_from_single_device_arrays(
@@ -253,6 +270,29 @@ class _XLAModule(torch.nn.Module):
 
         return lowered, run
 
+    @staticmethod
+    def _find_fsdp_source(
+        node: torch.fx.Node,
+        placeholder_indices: dict[torch.fx.Node, int],
+        is_fsdp_sharded: List[bool],
+    ) -> Optional[int]:
+        visited: set[torch.fx.Node] = set()
+        queue = [node]
+        while queue:
+            n = queue.pop(0)
+            if n in visited:
+                continue
+            visited.add(n)
+            if n.op == "placeholder":
+                idx = placeholder_indices.get(n)
+                if idx is not None and is_fsdp_sharded[idx]:
+                    return idx
+                continue  # don't traverse beyond any placeholder
+            for inp in n.all_input_nodes:
+                if inp not in visited:
+                    queue.append(inp)
+        return None
+
     def _jit_gspmd(
         self,
         jax_fn: Callable[..., Any],
@@ -273,20 +313,65 @@ class _XLAModule(torch.nn.Module):
             if n.meta.get("is_batch_input", False):
                 input_batch_dim = n.meta.get("batch_dim", 0)
                 break
-        in_shardings = [batch_sharded if b else replicated for b in is_batch]
+        is_fsdp_meta: List[bool] = [
+            n.meta.get("is_fsdp_sharded", False) for n in placeholders
+        ]
+        # Build per-input sharding specs and track which inputs are FSDP-sharded.
+        in_shardings = []
+        is_fsdp_sharded: List[bool] = []
+        for i, _node in enumerate(placeholders):
+            if is_batch[i]:
+                in_shardings.append(batch_sharded)
+                is_fsdp_sharded.append(False)
+            elif is_fsdp_meta[i] and i < len(args) and hasattr(args[i], "ndim"):
+                ndim = args[i].ndim
+                spec = P("torch_dist", *([None] * (ndim - 1)))
+                in_shardings.append(NamedSharding(mesh, spec))
+                is_fsdp_sharded.append(True)
+            else:
+                in_shardings.append(replicated)
+                is_fsdp_sharded.append(False)
         out_node = next(n for n in self.gm.graph.nodes if n.op == "output")
         torch_indices: set[int] = self.torch_output_indices or set()
         out_leaves, out_treedef = jax.tree.flatten(out_node.args[0])
-        out_shardings = out_treedef.unflatten(
-            [
-                batch_sharded if i in torch_indices else replicated
-                for i in range(len(out_leaves))
-            ]
-        )
+        # Build per-output sharding specs using data-flow tracing.
+        placeholder_indices = {n: i for i, n in enumerate(placeholders)}
+        out_sharding_list = []
+        for i in range(len(out_leaves)):
+            if i in torch_indices:
+                out_sharding_list.append(batch_sharded)
+                continue
+            leaf = out_leaves[i]
+            fsdp_src = (
+                self._find_fsdp_source(leaf, placeholder_indices, is_fsdp_sharded)
+                if isinstance(leaf, torch.fx.Node)
+                else None
+            )
+            if fsdp_src is not None:
+                out_val = (
+                    leaf.meta.get("val", None)
+                    if isinstance(leaf, torch.fx.Node)
+                    else None
+                )
+                if out_val is not None and hasattr(out_val, "ndim"):
+                    ndim = out_val.ndim
+                elif fsdp_src < len(args) and hasattr(args[fsdp_src], "ndim"):
+                    ndim = args[fsdp_src].ndim
+                else:
+                    ndim = 1
+                if ndim >= 1:
+                    spec = P("torch_dist", *([None] * (ndim - 1)))
+                    out_sharding_list.append(NamedSharding(mesh, spec))
+                else:
+                    out_sharding_list.append(replicated)
+            else:
+                out_sharding_list.append(replicated)
+        out_shardings = out_treedef.unflatten(out_sharding_list)
         logger.info(
-            "Compiling with GSPMD: %d inputs (%d batch-sharded), mesh=%s",
-            len(args),
+            "Compiling with GSPMD: %d placeholders, %d batch-sharded, %d weight-sharded, mesh=%s",
+            len(placeholders),
             sum(is_batch),
+            sum(is_fsdp_sharded),
             mesh.axis_names,
         )
         jitted: Any = jax.jit(
@@ -297,7 +382,13 @@ class _XLAModule(torch.nn.Module):
 
         def run(*run_args: torch.Tensor) -> List[torch.Tensor]:
             jax_args = tuple(
-                self._to_sharded_jax(a, mesh, is_batch[j], input_batch_dim)
+                self._to_sharded_jax(
+                    a,
+                    mesh,
+                    is_batch[j],
+                    input_batch_dim,
+                    is_fsdp_weight=is_fsdp_sharded[j],
+                )
                 for j, a in enumerate(run_args)
             )
             if not _hlo_captured[0]:
@@ -310,7 +401,9 @@ class _XLAModule(torch.nn.Module):
         run.hlo_text = None  # pyre-ignore[16]
 
         example_args = tuple(
-            self._to_sharded_jax(a, mesh, is_batch[j], input_batch_dim)
+            self._to_sharded_jax(
+                a, mesh, is_batch[j], input_batch_dim, is_fsdp_weight=is_fsdp_sharded[j]
+            )
             for j, a in enumerate(args)
         )
         lowered = jitted.lower(*example_args)

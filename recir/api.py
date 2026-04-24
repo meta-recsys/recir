@@ -5,6 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 # pyre-strict
+import logging
 from abc import ABC, abstractmethod
 from contextlib import contextmanager, ExitStack, nullcontext
 from copy import copy
@@ -47,6 +48,8 @@ from torch._subclasses.fake_tensor import FakeTensorMode
 from torch.fx.graph import _PyTreeCodeGen, _PyTreeInfo, CodeGen
 from torch.nn.utils import stateless
 from torch.nn.utils._named_member_accessor import NamedMemberAccessor
+
+logger: logging.Logger = logging.getLogger(__name__)
 
 
 class Override(ABC):
@@ -427,11 +430,13 @@ def _tag_batch_inputs(
         if isinstance(val, torch.Tensor):
             is_batch = tensor_idx >= num_model_tensors
             node.meta["is_batch_input"] = is_batch
+            node.meta["is_weight"] = not is_batch
             if is_batch:
                 node.meta["batch_dim"] = input_batch_dim
             tensor_idx += 1
         else:
             node.meta["is_batch_input"] = False
+            node.meta["is_weight"] = False
 
 
 def _finalize_graph(
@@ -769,16 +774,51 @@ def _compile_gspmd(
             gm.graph.erase_node(node)
     gm.recompile()
 
-    return _finalize_graph(
+    params_and_buffers = {**local_result.params, **local_result.buffers}
+    # FSDP: shard model params AFTER tracing but BEFORE _finalize_graph.
+    # The graph retains global shapes; runtime inputs are local shards
+    # (_to_sharded_jax bridges the gap). Sharding before _finalize_graph
+    # means flat_state is built from already-sharded tensors.
+    sharded_keys = parallel_mode.shard_params(
+        local_result.mod, params_and_buffers, local_result.opt
+    )
+    result = _finalize_graph(
         gm,
         local_result.mod,
         local_result.opt,
-        {**local_result.params, **local_result.buffers},
+        params_and_buffers,
         local_result.named_states,
         module_override=module_override,
         input_batch_dim=parallel_mode.input_batch_dim,
         dedup=False,
     )
+    # Set is_fsdp_sharded on placeholder nodes so _jit_gspmd knows
+    # which inputs are local shards.
+    if sharded_keys:
+        is_sharded: list[bool] = [key in sharded_keys for key in params_and_buffers]
+        for fqn, state in local_result.named_states.items():
+            is_sharded.extend([fqn in sharded_keys] * len(state))
+        tensor_idx = 0
+        for node in result.gm.graph.nodes:
+            if node.op != "placeholder":
+                continue
+            val = node.meta.get("val", None)
+            if isinstance(val, torch.Tensor):
+                node.meta["is_fsdp_sharded"] = (
+                    is_sharded[tensor_idx] if tensor_idx < len(is_sharded) else False
+                )
+                tensor_idx += 1
+        logger.info(
+            "FSDP: %d sharded keys, %d sharded placeholders, flat_state=%d entries",
+            len(sharded_keys),
+            sum(
+                1
+                for n in result.gm.graph.nodes
+                if n.op == "placeholder" and n.meta.get("is_fsdp_sharded", False)
+            ),
+            len(result.flat_state),
+        )
+    return result
 
 
 # Note that the Python convention of __dict__ requires the key to be str.

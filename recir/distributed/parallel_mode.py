@@ -5,6 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 # pyre-strict
+import logging
 from abc import ABC, abstractmethod
 from typing import Any, Callable, Dict, Optional, Set, Tuple
 
@@ -20,6 +21,31 @@ from recir.distributed.data_parallel import (
 from recir.sharding_plan import EmbeddingShardingPlan
 from torch.distributed.tensor import DeviceMesh
 from torch.fx import GraphModule
+
+logger: logging.Logger = logging.getLogger(__name__)
+
+
+def _create_fake_mesh(
+    device_type: str,
+    size: int,
+    group_name: str,
+) -> DeviceMesh:
+    """Create a DeviceMesh backed by a FakeProcessGroup.
+
+    Used for XLA backends where process coordination happens at runtime.
+    """
+    from torch._C._distributed_c10d import FakeProcessGroup
+
+    fake_pg = FakeProcessGroup._create_internal(0, size)
+    mesh = DeviceMesh(
+        device_type,
+        torch.arange(size),
+        _init_backend=False,
+        _rank=0,
+    )
+    mesh._dim_group_names = [group_name]
+    mesh._pg_registry[group_name] = fake_pg  # pyre-ignore[6]
+    return mesh
 
 
 class ParallelMode(ABC):
@@ -54,9 +80,6 @@ class ParallelMode(ABC):
     ) -> GraphModule:
         """
         Partition a single device graph to a distributed graph.
-
-        TODO(@wanchaol): some of these arguments are not necessary for
-        partitioning, remove the unnecessary ones later.
         """
         raise NotImplementedError
 
@@ -66,11 +89,14 @@ class ParallelMode(ABC):
         model: torch.nn.Module,
         params_and_buffers: Dict[str, Any],
         opt: Optional[torch.optim.Optimizer],
-    ) -> None:
+    ) -> Set[str]:
         """
         Shard model parameters and optimizer states according to the
         parallel mode's strategy.  Updates ``opt.state`` in-place so
         that parameter→state mappings remain valid after sharding.
+
+        Returns:
+            Set of keys in ``params_and_buffers`` that were actually sharded.
         """
         raise NotImplementedError
 
@@ -121,6 +147,7 @@ class GSPMDParallel(ParallelMode):
         self.grad_reduction = "sum" if loss_reduction == "mean" else "avg"
         self._num_ranks = num_ranks
         self._num_processes = num_processes
+        self._process_mesh: Optional[DeviceMesh] = None
 
     @property
     def num_ranks(self) -> int:
@@ -138,13 +165,47 @@ class GSPMDParallel(ParallelMode):
 
         return jax.process_count()
 
+    @property
+    def process_mesh(self) -> DeviceMesh:
+        """Mesh sized to ``num_processes`` for physical model/state sharding.
+
+        Uses a FakeProcessGroup since XLA handles process coordination
+        at runtime.
+        """
+        if self._process_mesh is None:
+            self._process_mesh = _create_fake_mesh(
+                "cpu", self.num_processes, "fake_gspmd_process_mesh"
+            )
+        return self._process_mesh
+
     def shard_params(
         self,
         model: torch.nn.Module,
         params_and_buffers: Dict[str, Any],
         opt: Optional[torch.optim.Optimizer],
-    ) -> None:
-        pass  # No-op: GSPMD handles sharding via annotations
+    ) -> Set[str]:
+        if self.parallel_style != "fully_shard":
+            return set()
+
+        # Only shard tensors where the local shard can be evenly split
+        # across local devices. This ensures _to_sharded_jax and
+        # _jit_gspmd agree on which tensors are FSDP-sharded.
+        def _can_fsdp(_key: str, t: torch.Tensor) -> bool:
+            return (
+                t.ndim >= 1
+                and t.shape[0] >= self.num_ranks
+                and t.shape[0] % self.num_ranks == 0
+                and t.shape[0] % self.num_processes == 0
+            )
+
+        return shard_params_and_states(
+            model,
+            params_and_buffers,
+            opt,
+            self.process_mesh,
+            DataParallelStyle.FULLY_SHARD,
+            shard_filter=_can_fsdp,
+        )
 
     def partition(
         self,
@@ -282,19 +343,11 @@ class DataParallel(ParallelMode):
         """
         if self._process_mesh is None:
             if self._is_xla_backend:
-                from torch._C._distributed_c10d import FakeProcessGroup
-
-                fake_pg = FakeProcessGroup._create_internal(0, self.num_processes)
-                mesh = DeviceMesh(
+                self._process_mesh = _create_fake_mesh(
                     self._device_type,
-                    torch.arange(self.num_processes),
-                    _init_backend=False,
-                    _rank=0,
+                    self.num_processes,
+                    "fake_recir_process_mesh",
                 )
-                group_name = "fake_recir_process_mesh"
-                mesh._dim_group_names = [group_name]
-                mesh._pg_registry[group_name] = fake_pg  # pyre-ignore[6]
-                self._process_mesh = mesh
             else:
                 self._process_mesh = DeviceMesh(
                     self._device_type, torch.arange(self.num_processes)
@@ -313,19 +366,11 @@ class DataParallel(ParallelMode):
         """
         if self._device_mesh is None:
             if self._is_xla_backend:
-                from torch._C._distributed_c10d import FakeProcessGroup
-
-                fake_pg = FakeProcessGroup._create_internal(0, self.num_ranks)
-                mesh = DeviceMesh(
+                self._device_mesh = _create_fake_mesh(
                     self._device_type,
-                    torch.arange(self.num_ranks),
-                    _init_backend=False,
-                    _rank=0,
+                    self.num_ranks,
+                    "fake_recir_device_mesh",
                 )
-                group_name = "fake_recir_device_mesh"
-                mesh._dim_group_names = [group_name]
-                mesh._pg_registry[group_name] = fake_pg  # pyre-ignore[6]
-                self._device_mesh = mesh
             else:
                 self._device_mesh = DeviceMesh(
                     self._device_type, torch.arange(self.num_ranks)
@@ -337,8 +382,8 @@ class DataParallel(ParallelMode):
         model: torch.nn.Module,
         params_and_buffers: Dict[str, Any],
         opt: Optional[torch.optim.Optimizer],
-    ) -> None:
-        shard_params_and_states(
+    ) -> Set[str]:
+        return shard_params_and_states(
             model,
             params_and_buffers,
             opt,
@@ -466,8 +511,8 @@ class HybridParallel(ParallelMode):
         model: torch.nn.Module,
         params_and_buffers: Dict[str, Any],
         opt: Optional[torch.optim.Optimizer],
-    ) -> None:
-        shard_params_by_plan(
+    ) -> Set[str]:
+        return shard_params_by_plan(
             model,
             params_and_buffers,
             opt,
