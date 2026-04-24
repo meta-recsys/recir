@@ -2873,6 +2873,234 @@ class TestHybridParallelV2GraphStructure(DTensorTestBase):
         )
 
 
+class TestHybridParallelV2Backward(DTensorTestBase):
+    """Verify backward decomposition in v2 HybridParallel compilation."""
+
+    @property
+    def world_size(self) -> int:
+        return 2
+
+    def _compile_and_get_gm(
+        self,
+        model: nn.Module,
+        opt: torch.optim.Optimizer,
+        train_batch: Any,
+        plan: EmbeddingShardingPlan,
+        train_step_fn: Callable[..., Any] = embedding_train_step,
+    ) -> fx.GraphModule:
+        compiled_fn = compile(
+            parallel_mode=HybridParallel(
+                dense_style="fully_shard",
+                embedding_plan=plan,
+                use_parametrization=True,
+            )
+        )(train_step_fn)
+        compiled_fn(model, opt, train_batch)
+
+        from recir.api import COMPILED_OBJECT_KEY
+
+        return compiled_fn.__dict__[COMPILED_OBJECT_KEY].gm
+
+    @skip_if_lt_x_gpu(2)
+    @with_comms
+    def test_no_undecomposed_embedding_dense_backward(self) -> None:
+        """Original aten.embedding_dense_backward (on global indices) should
+        be replaced.  Only the local version (on AllToAll-received indices)
+        should remain."""
+        model = EmbeddingMLP().cuda(self.rank)
+        opt = torch.optim.SGD(model.parameters(), lr=0.1, foreach=True)
+        device = f"cuda:{self.rank}"
+        train_batch = (
+            torch.randint(0, 16, (8, 3), device=device),
+            torch.randn(8, 4, device=device),
+        )
+        plan = EmbeddingShardingPlan(
+            sharding_map={"emb.weight": EmbeddingShardingType.ROW_WISE}
+        )
+        gm = self._compile_and_get_gm(model, opt, train_batch, plan)
+
+        for node in gm.graph.nodes:
+            if (
+                node.op == "call_function"
+                and node.target == torch.ops.aten.embedding_dense_backward.default
+            ):
+                indices_input = node.args[1]
+                self.assertNotEqual(
+                    indices_input.op,
+                    "placeholder",
+                    "embedding_dense_backward should not take indices directly "
+                    "from a placeholder (should be decomposed with AllToAll)",
+                )
+
+    @skip_if_lt_x_gpu(2)
+    @with_comms
+    def test_backward_has_alltoall(self) -> None:
+        """Backward decomposition should have AllToAll ops beyond those in forward."""
+        model = EmbeddingMLP().cuda(self.rank)
+        opt = torch.optim.SGD(model.parameters(), lr=0.1, foreach=True)
+        device = f"cuda:{self.rank}"
+        train_batch = (
+            torch.randint(0, 16, (8, 3), device=device),
+            torch.randn(8, 4, device=device),
+        )
+        plan = EmbeddingShardingPlan(
+            sharding_map={"emb.weight": EmbeddingShardingType.ROW_WISE}
+        )
+        gm = self._compile_and_get_gm(model, opt, train_batch, plan)
+
+        a2a_nodes = [
+            n
+            for n in gm.graph.nodes
+            if n.op == "call_function"
+            and n.target == torch.ops._c10d_functional.all_to_all_single.default
+        ]
+        # Forward: 3 AllToAll (sizes, indices, results) per table.
+        # Backward: 3 AllToAll (sizes, indices, gradients) per table.
+        # Total: 6 for one table.
+        self.assertGreaterEqual(
+            len(a2a_nodes),
+            6,
+            f"Expected at least 6 all_to_all_single nodes (3 fwd + 3 bwd), got {len(a2a_nodes)}",
+        )
+
+    @skip_if_lt_x_gpu(2)
+    @with_comms
+    def test_backward_has_local_embedding_dense_backward(self) -> None:
+        """Backward decomposition should contain a local embedding_dense_backward
+        (on received indices/gradients, not the original)."""
+        model = EmbeddingMLP().cuda(self.rank)
+        opt = torch.optim.SGD(model.parameters(), lr=0.1, foreach=True)
+        device = f"cuda:{self.rank}"
+        train_batch = (
+            torch.randint(0, 16, (8, 3), device=device),
+            torch.randn(8, 4, device=device),
+        )
+        plan = EmbeddingShardingPlan(
+            sharding_map={"emb.weight": EmbeddingShardingType.ROW_WISE}
+        )
+        gm = self._compile_and_get_gm(model, opt, train_batch, plan)
+
+        edb_nodes = [
+            n
+            for n in gm.graph.nodes
+            if n.op == "call_function"
+            and n.target == torch.ops.aten.embedding_dense_backward.default
+        ]
+        # Should have exactly 1 local embedding_dense_backward (from the
+        # decomposed backward, operating on received indices/gradients).
+        self.assertEqual(
+            len(edb_nodes),
+            1,
+            f"Expected exactly 1 local embedding_dense_backward, got {len(edb_nodes)}",
+        )
+        # Its indices input should come from an AllToAll (not a placeholder).
+        indices_input = edb_nodes[0].args[1]
+        self.assertEqual(
+            indices_input.target,
+            torch.ops._c10d_functional.wait_tensor.default,
+            "Local backward indices should come from AllToAll wait_tensor",
+        )
+
+    @skip_if_lt_x_gpu(2)
+    @with_comms
+    def test_backward_multiple_tables(self) -> None:
+        """Two embedding tables: both forward and backward decomposed."""
+        model = MultiEmbeddingMLP(num_emb1=16, num_emb2=32, emb_dim=8).cuda(self.rank)
+        opt = torch.optim.SGD(model.parameters(), lr=0.1, foreach=True)
+        device = f"cuda:{self.rank}"
+        train_batch = (
+            torch.randint(0, 16, (8, 3), device=device),
+            torch.randint(0, 32, (8, 3), device=device),
+            torch.randn(8, 4, device=device),
+        )
+        plan = EmbeddingShardingPlan(
+            sharding_map={
+                "emb1.weight": EmbeddingShardingType.ROW_WISE,
+                "emb2.weight": EmbeddingShardingType.ROW_WISE,
+            }
+        )
+        gm = self._compile_and_get_gm(
+            model, opt, train_batch, plan, train_step_fn=multi_embedding_train_step
+        )
+
+        a2a_nodes = [
+            n
+            for n in gm.graph.nodes
+            if n.op == "call_function"
+            and n.target == torch.ops._c10d_functional.all_to_all_single.default
+        ]
+        # 2 tables * 6 AllToAll (3 fwd + 3 bwd) = 12
+        self.assertGreaterEqual(
+            len(a2a_nodes),
+            12,
+            f"Expected at least 12 all_to_all_single for 2 tables (fwd+bwd), got {len(a2a_nodes)}",
+        )
+
+        edb_nodes = [
+            n
+            for n in gm.graph.nodes
+            if n.op == "call_function"
+            and n.target == torch.ops.aten.embedding_dense_backward.default
+        ]
+        self.assertEqual(
+            len(edb_nodes),
+            2,
+            f"Expected 2 local embedding_dense_backward (one per table), got {len(edb_nodes)}",
+        )
+
+    @skip_if_lt_x_gpu(2)
+    @with_comms
+    def test_embedding_weights_updated_by_backward(self) -> None:
+        """v2 backward correctly updates embedding weights via optimizer."""
+        torch.manual_seed(0)
+        device = f"cuda:{self.rank}"
+        model = EmbeddingMLP(num_embeddings=16, embedding_dim=8).cuda(self.rank)
+
+        # Save initial embedding weights for comparison.
+        initial_emb_weight = model.emb.weight.detach().clone()
+
+        opt = torch.optim.SGD(model.parameters(), lr=0.1, foreach=True)
+
+        torch.manual_seed(123 + self.rank)
+        train_batch = (
+            torch.randint(0, 16, (8, 3), device=device),
+            torch.randn(8, 4, device=device),
+        )
+
+        plan = EmbeddingShardingPlan(
+            sharding_map={"emb.weight": EmbeddingShardingType.ROW_WISE}
+        )
+        compiled_fn = compile(
+            parallel_mode=HybridParallel(
+                dense_style="fully_shard",
+                embedding_plan=plan,
+                use_parametrization=True,
+            )
+        )(embedding_train_step)
+        compiled_fn(model, opt, train_batch)
+
+        # After sharding, each rank has local_V rows.
+        local_V = model.emb.weight.shape[0]
+        self.assertEqual(local_V, 8, "Expected 16 / 2 = 8 rows per rank")
+
+        # Weights should have changed (optimizer applied gradients).
+        self.assertFalse(
+            torch.equal(
+                model.emb.weight,
+                initial_emb_weight[:local_V]
+                if self.rank == 0
+                else initial_emb_weight[local_V:],
+            ),
+            "Embedding weights should change after backward + optimizer step",
+        )
+
+        # Weights should be finite (no NaN/Inf from incorrect backward).
+        self.assertTrue(
+            torch.isfinite(model.emb.weight).all(),
+            "Embedding weights should be finite after backward",
+        )
+
+
 class TestHybridParallelV2NumericalCorrectness(DTensorTestBase):
     """Compare HybridParallel v2 output against unsharded single-rank reference."""
 
