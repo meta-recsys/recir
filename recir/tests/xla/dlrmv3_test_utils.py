@@ -320,18 +320,31 @@ def get_table_configs() -> List[EmbeddingConfig]:
     ]
 
 
-def get_hstu_config() -> DlrmHSTUConfig:
-    """Return the tiny HSTU config used by the DLRMv3 test model."""
+def get_hstu_config(
+    embedding_dim: int = SMALL_EMBEDDING_DIM,
+    hidden_dim: int = SMALL_HIDDEN_DIM,
+    transducer_dim: int = SMALL_TRANSDUCER_DIM,
+    attn_dim: int = SMALL_ATTN_DIM,
+    num_layers: int = NUM_LAYERS,
+    num_heads: int = NUM_HEADS,
+    uih_len: int = STATIC_UIH_LEN,
+    num_candidates: int = STATIC_NUM_CANDIDATES,
+) -> DlrmHSTUConfig:
+    """Return an HSTU config with configurable dimensions.
+
+    Defaults match the original tiny/debug config for backward compatibility.
+    Pass larger values for medium/large model benchmarks.
+    """
     hstu_config = get_hstu_configs("debug")
-    hstu_config.hstu_embedding_table_dim = SMALL_EMBEDDING_DIM
-    hstu_config.hstu_preprocessor_hidden_dim = SMALL_HIDDEN_DIM
-    hstu_config.hstu_transducer_embedding_dim = SMALL_TRANSDUCER_DIM
-    hstu_config.hstu_attn_linear_dim = SMALL_ATTN_DIM
-    hstu_config.hstu_attn_qk_dim = SMALL_ATTN_DIM
-    hstu_config.hstu_attn_num_layers = NUM_LAYERS
-    hstu_config.hstu_num_heads = NUM_HEADS
-    hstu_config.max_seq_len = 128
-    hstu_config.max_num_candidates = STATIC_NUM_CANDIDATES
+    hstu_config.hstu_embedding_table_dim = embedding_dim
+    hstu_config.hstu_preprocessor_hidden_dim = hidden_dim
+    hstu_config.hstu_transducer_embedding_dim = transducer_dim
+    hstu_config.hstu_attn_linear_dim = attn_dim
+    hstu_config.hstu_attn_qk_dim = attn_dim
+    hstu_config.hstu_attn_num_layers = num_layers
+    hstu_config.hstu_num_heads = num_heads
+    hstu_config.max_seq_len = uih_len + num_candidates + 16
+    hstu_config.max_num_candidates = num_candidates
     hstu_config.contextual_feature_to_min_uih_length = {
         "viewer_id": 10,
         "dummy_contexual": 10,
@@ -347,6 +360,7 @@ def create_dlrmv3_wrapper(
     batch_size: int,
     hstu_config: Optional[DlrmHSTUConfig] = None,
     table_configs: Optional[List[EmbeddingConfig]] = None,
+    is_inference: bool = False,
 ) -> Tuple["DlrmV3Wrapper", DlrmHSTUConfig, List[EmbeddingConfig], List[str]]:
     if hstu_config is None:
         hstu_config = get_hstu_config()
@@ -356,7 +370,7 @@ def create_dlrmv3_wrapper(
     model = DlrmHSTU(
         hstu_configs=hstu_config,
         embedding_tables=table_config_dict,
-        is_inference=False,
+        is_inference=is_inference,
     )
     # Materialize embedding collection on CPU
     model._embedding_collection = EmbeddingCollection(
@@ -387,9 +401,9 @@ def create_static_batch(
     hstu_config: DlrmHSTUConfig,
     batch_size: int,
     seed: int = 42,
-    uih_len: int = STATIC_UIH_LEN,
-    num_candidates: int = STATIC_NUM_CANDIDATES,
-    hash_size: int = SMALL_HASH_SIZE,
+    uih_len_override: Optional[int] = None,
+    num_candidates_override: Optional[int] = None,
+    hash_size_override: Optional[int] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Create a synthetic batch with STATIC EQUAL lengths.
 
@@ -404,6 +418,15 @@ def create_static_batch(
             for multiprocess tests.
     """
     torch.manual_seed(seed)
+    uih_len = uih_len_override if uih_len_override is not None else STATIC_UIH_LEN
+    num_cands = (
+        num_candidates_override
+        if num_candidates_override is not None
+        else STATIC_NUM_CANDIDATES
+    )
+    hash_size = (
+        hash_size_override if hash_size_override is not None else SMALL_HASH_SIZE
+    )
     contextual_features = list(hstu_config.contextual_feature_to_max_length.keys())
     uih_seq_features = [
         k for k in hstu_config.hstu_uih_feature_names if k not in contextual_features
@@ -421,10 +444,8 @@ def create_static_batch(
     cand_lengths = []
     cand_values_parts = []
     for _ in cand_keys:
-        cand_lengths.extend([num_candidates] * batch_size)
-        cand_values_parts.append(
-            torch.randint(1, hash_size, (batch_size * num_candidates,))
-        )
+        cand_lengths.extend([num_cands] * batch_size)
+        cand_values_parts.append(torch.randint(1, hash_size, (batch_size * num_cands,)))
     cand_values_t = torch.cat(cand_values_parts)
     cand_lengths_t = torch.tensor(cand_lengths, dtype=torch.long)
     return uih_values_t, uih_lengths_t, cand_values_t, cand_lengths_t
