@@ -434,6 +434,44 @@ class TransformationTest(DTensorTestBase):
         )
 
 
+class EnableIterGraphTest(unittest.TestCase):
+    """CPU-only tests for the `enable_iter_graph` flag in GraphModuleTransformation."""
+
+    def _make_simple_gm(self) -> torch.fx.GraphModule:
+        class SimpleModel(nn.Module):
+            def forward(self, x: torch.Tensor) -> torch.Tensor:
+                return x + 1
+
+        return torch.fx.symbolic_trace(SimpleModel())
+
+    def test_enable_graph_optimization_requires_iter_graph(self) -> None:
+        with self.assertRaisesRegex(ValueError, "enable_graph_optimization"):
+            GraphModuleTransformation(
+                enable_graph_optimization=True,
+                enable_iter_graph=False,
+            )
+
+    def test_default_returns_iter_graph_module(self) -> None:
+        gm = self._make_simple_gm()
+        transform = GraphModuleTransformation()
+        result = transform(gm)
+        self.assertIsInstance(result, IterGraphModule)
+
+    def test_disable_iter_graph_returns_plain_gm(self) -> None:
+        gm = self._make_simple_gm()
+        transform = GraphModuleTransformation(enable_iter_graph=False)
+        result = transform(gm)
+        self.assertNotIsInstance(result, IterGraphModule)
+        self.assertIsInstance(result, torch.fx.GraphModule)
+
+    def test_disable_iter_graph_no_backend_preserves_gm(self) -> None:
+        gm = self._make_simple_gm()
+        transform = GraphModuleTransformation(enable_iter_graph=False, backend=None)
+        result = transform(gm)
+        # Without a backend, lowering is a no-op, so the same gm is returned.
+        self.assertIs(result, gm)
+
+
 if __name__ == "__main__":
     if False:
         run_tests()
