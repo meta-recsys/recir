@@ -38,7 +38,7 @@ from recir.tests.xla.dlrmv3_test_utils import (
     create_static_batch,
     DlrmV3SparseOverride,
     DummyPreprocess,
-    SMALL_EMBEDDING_DIM,
+    get_hstu_config,
 )
 from torchrec.distributed.embedding import EmbeddingCollectionSharder
 from torchrec.distributed.embedding_types import EmbeddingComputeKernel
@@ -112,14 +112,13 @@ def create_model_and_data(
 ) -> Tuple[nn.Module, List[EmbeddingConfig], List[str], Tuple[torch.Tensor, ...], Any]:
     """Create DLRMv3 model with debug HSTU config and synthetic batch.
 
-    Uses the default get_hstu_config() (debug gin config) which includes all
-    temporal features needed by DummyPreprocess and DlrmV3Dense. Custom
-    embedding table sizes come from cfg.hash_size / cfg.embedding_dim.
+    Uses get_hstu_config() with dimensions from cfg, so medium/large presets
+    produce correspondingly larger models.
     """
     table_configs = [
         EmbeddingConfig(
             num_embeddings=cfg.hash_size,
-            embedding_dim=SMALL_EMBEDDING_DIM,
+            embedding_dim=cfg.embedding_dim,
             name="post_id",
             feature_names=[
                 "uih_post_id",
@@ -130,20 +129,30 @@ def create_model_and_data(
         ),
         EmbeddingConfig(
             num_embeddings=cfg.hash_size,
-            embedding_dim=SMALL_EMBEDDING_DIM,
+            embedding_dim=cfg.embedding_dim,
             name="viewer_id",
             feature_names=["viewer_id"],
         ),
         EmbeddingConfig(
             num_embeddings=cfg.hash_size,
-            embedding_dim=SMALL_EMBEDDING_DIM,
+            embedding_dim=cfg.embedding_dim,
             name="dummy_contexual",
             feature_names=["dummy_contexual"],
         ),
     ]
 
+    hstu_cfg = get_hstu_config(
+        embedding_dim=cfg.embedding_dim,
+        hidden_dim=cfg.hidden_dim,
+        transducer_dim=cfg.transducer_dim,
+        attn_dim=cfg.attn_dim,
+        num_layers=cfg.num_layers,
+        num_heads=cfg.num_heads,
+        uih_len=cfg.uih_len,
+        num_candidates=cfg.num_candidates,
+    )
     wrapper, hstu_config, _, emb_keys = create_dlrmv3_wrapper(
-        global_bs, table_configs=table_configs
+        global_bs, hstu_config=hstu_cfg, table_configs=table_configs
     )
     # Sync hstu_config with user-configurable values so the model,
     # DummyPreprocess, and batch all agree on sequence lengths.
@@ -155,9 +164,9 @@ def create_model_and_data(
         hstu_config,
         cfg.local_batch_size,
         seed=42 + gloo_rank,
-        uih_len=cfg.uih_len,
-        num_candidates=cfg.num_candidates,
-        hash_size=cfg.hash_size,
+        uih_len_override=cfg.uih_len,
+        num_candidates_override=cfg.num_candidates,
+        hash_size_override=cfg.hash_size,
     )
 
     param_count = sum(p.numel() for p in wrapper.parameters())
@@ -264,7 +273,7 @@ def _run_training_loop(
     dummy = DummyPreprocess(
         emb_keys=emb_keys,
         batch_size=global_bs,
-        embedding_dim=SMALL_EMBEDDING_DIM,
+        embedding_dim=cfg.embedding_dim,
         static_uih_len=cfg.uih_len,
         static_num_candidates=cfg.num_candidates,
         user_emb_feature_names=hstu_config.user_embedding_feature_names,
