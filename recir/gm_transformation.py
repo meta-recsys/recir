@@ -5,7 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 # pyre-strict
-from typing import Optional
+from typing import Optional, Union
 
 from recir.backend import BackendType
 from recir.graph_utils import dump_graphs_to_files
@@ -24,6 +24,22 @@ from recir.passes import (
 from torch import fx
 
 
+def lower_gm(gm: fx.GraphModule, backend: Optional[BackendType]) -> fx.GraphModule:
+    """Lower a single graph module for the given backend."""
+    if backend is None:
+        return gm
+
+    if backend == BackendType.INDUCTOR:
+        return partial_lower(gm)
+    elif backend in (
+        BackendType.XLA_DYNAMO_BRIDGE,
+        BackendType.XLA_SHARD_MAP,
+        BackendType.XLA_GSPMD,
+    ):
+        return partial_lower_xla(gm, backend_type=backend)
+    return gm
+
+
 def lower_iter_gm(iter_gm: IterGraphModule, backend: Optional[BackendType]) -> None:
     """Lower all graph modules in an IterGraphModule for the given backend.
 
@@ -33,18 +49,9 @@ def lower_iter_gm(iter_gm: IterGraphModule, backend: Optional[BackendType]) -> N
     if backend is None:
         return
 
-    if backend == BackendType.INDUCTOR:
-        iter_gm.setup_gm = partial_lower(iter_gm.setup_gm)
-        iter_gm.main_gm = partial_lower(iter_gm.main_gm)
-        iter_gm.cleanup_gm = partial_lower(iter_gm.cleanup_gm)
-    elif backend in (
-        BackendType.XLA_DYNAMO_BRIDGE,
-        BackendType.XLA_SHARD_MAP,
-        BackendType.XLA_GSPMD,
-    ):
-        iter_gm.setup_gm = partial_lower_xla(iter_gm.setup_gm, backend_type=backend)
-        iter_gm.main_gm = partial_lower_xla(iter_gm.main_gm, backend_type=backend)
-        iter_gm.cleanup_gm = partial_lower_xla(iter_gm.cleanup_gm, backend_type=backend)
+    iter_gm.setup_gm = lower_gm(iter_gm.setup_gm, backend)
+    iter_gm.main_gm = lower_gm(iter_gm.main_gm, backend)
+    iter_gm.cleanup_gm = lower_gm(iter_gm.cleanup_gm, backend)
 
 
 class GraphModuleTransformation:
@@ -56,12 +63,19 @@ class GraphModuleTransformation:
         backend: Optional[BackendType] = None,
         dump_graphs: bool = False,
         enable_device_state: bool = False,
+        enable_iter_graph: bool = True,
     ) -> None:
+        if enable_graph_optimization and not enable_iter_graph:
+            raise ValueError(
+                "enable_graph_optimization=True requires enable_iter_graph=True "
+                "because cross-iteration optimization passes operate on IterGraphModule."
+            )
         self.enable_graph_optimization = enable_graph_optimization
         self.enable_weight_free = enable_weight_free
         self.backend = backend
         self.dump_graphs = dump_graphs
         self.enable_device_state = enable_device_state
+        self.enable_iter_graph = enable_iter_graph
 
     @property
     def device_state_manager(self) -> DeviceStateManager:
@@ -73,7 +87,7 @@ class GraphModuleTransformation:
             return XLADeviceStateManager()
         return DeviceStateManager()
 
-    def __call__(self, gm: fx.GraphModule) -> IterGraphModule:
+    def __call__(self, gm: fx.GraphModule) -> Union[IterGraphModule, fx.GraphModule]:
         if self.dump_graphs:
             graph_folder = dump_graphs_to_files(
                 {"before_transformation_gm": gm.print_readable(False)}
@@ -82,6 +96,18 @@ class GraphModuleTransformation:
 
         if self.enable_weight_free:
             insert_weight_free_nodes(gm)
+
+        if not self.enable_iter_graph:
+            # Skip IterGraphModule wrapping to avoid 3X compilation overhead
+            # from lowering setup/main/cleanup graphs separately.
+            gm = lower_gm(gm, self.backend)
+
+            if self.dump_graphs:
+                dump_graphs_to_files(
+                    {"transformed_gm": gm.print_readable(False)},
+                    graph_folder,  # type: ignore[possibly-undefined]
+                )
+            return gm
 
         iter_gm = IterGraphModule(gm)
         if self.enable_graph_optimization:
