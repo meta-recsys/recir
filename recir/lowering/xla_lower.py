@@ -489,6 +489,13 @@ def _jax_to_numpy(t: Any) -> Any:
     """
     import numpy as np
 
+    # If `t` is a torch.Tensor (e.g. torchax-wrapped), np.asarray below
+    # would route through Tensor.numpy() which raises TypeError for bf16 tensors.
+    # Cast to fp32 in torch first; the bf16 fallback at the end of this
+    # function preserves the same return-shape contract.
+    if isinstance(t, torch.Tensor) and t.dtype == torch.bfloat16:
+        t = t.float()
+
     # Transfer from device to host first to avoid OOM on device
     host_arr = np.asarray(jax.device_get(t))
     # ml_dtypes.bfloat16 dtype name is 'bfloat16'
