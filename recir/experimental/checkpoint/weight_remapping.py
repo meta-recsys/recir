@@ -55,6 +55,8 @@ def remap_click_head_state_dict(
         - ``mlp.net.{0,3}.{weight,bias}`` → ``mlp.{0,3}.{weight,bias}``
         - ``skip.a`` → ``skip_a``
         - ``skip.b`` → ``skip_b``
+        - ``dense_fusion.<X>`` → ``dense_fusion.mlp.<X>`` (skipped when key is
+          already in the ``dense_fusion.mlp.`` form, so the rule is idempotent).
 
     Args:
         state_dict: Raw state dict from ``click_head.pt``.
@@ -73,5 +75,7 @@ def remap_click_head_state_dict(
             new_k = "skip_a"
         elif k == "skip.b":
             new_k = "skip_b"
+        elif k.startswith("dense_fusion.") and not k.startswith("dense_fusion.mlp."):
+            new_k = "dense_fusion.mlp." + k[len("dense_fusion.") :]
         remapped[new_k] = v
     return remapped
