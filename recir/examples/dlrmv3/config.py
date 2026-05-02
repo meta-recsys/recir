@@ -43,6 +43,9 @@ class DLRMv3Config:
     dense_lr: float = 0.01
     embedding_lr: float = 0.1
 
+    # Embedding backend
+    embedding_backend: str = "tpu"  # "cpu" (torchrec DMP) | "tpu" (JAX/SparseCore)
+
     # Profiling
     profile_start_step: int = -1
     profile_end_step: int = -1
@@ -81,6 +84,13 @@ class DLRMv3Config:
         p.add_argument("--profile_end_step", type=int, default=cfg.profile_end_step)
         p.add_argument("--profile_dir", type=str, default=cfg.profile_dir)
         p.add_argument("--enable_memory_log", action="store_true")
+        p.add_argument(
+            "--embedding_backend",
+            type=str,
+            default=cfg.embedding_backend,
+            choices=["cpu", "tpu"],
+            help="'cpu': torchrec DMP on CPU; 'tpu': JAX/SparseCore (default)",
+        )
 
         # Preset: small (for smoke testing)
         p.add_argument(
@@ -131,6 +141,7 @@ class DLRMv3Config:
             max_steps=args.max_steps,
             dense_lr=args.dense_lr,
             embedding_lr=args.embedding_lr,
+            embedding_backend=args.embedding_backend,
             profile_start_step=args.profile_start_step,
             profile_end_step=args.profile_end_step,
             profile_dir=args.profile_dir,

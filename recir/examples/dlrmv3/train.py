@@ -7,13 +7,19 @@
 # pyre-strict
 
 """
-DLRMv3 E2E training on GKE TPU v7x with:
-- torchrec DMP ROW_WISE embedding sharding on CPU (gloo PG)
-- recir @compile XLA GSPMD dense path on TPU (JAX PJRT)
+DLRMv3 E2E training on GKE TPU v7x.
+
+Supports two embedding backends (--embedding_backend):
+  cpu        torchrec DMP ROW_WISE on CPU + gloo PG
+  tpu JAX-native tables + JAX gather / tpu_sparse_dense_matmul
+
+Dense HSTU path always runs on TPU via recir @compile + XLA GSPMD.
 
 Usage:
     python -u -m recir.examples.dlrmv3.train --preset small --max_steps 10
     python -u -m recir.examples.dlrmv3.train --max_steps 20 --profile_start_step 5 --profile_end_step 10
+    python -u -m recir.examples.dlrmv3.train --preset small --max_steps 5 \\
+        --embedding_backend tpu
 """
 
 from __future__ import annotations
@@ -21,7 +27,7 @@ from __future__ import annotations
 import logging
 import os
 import time
-from typing import Any, Dict, List, Tuple
+from typing import Any
 
 import fbgemm_gpu  # noqa: F401 -- force C++ op registration before fallback
 import jax
@@ -36,20 +42,14 @@ from recir.gm_transformation import GraphModuleTransformation
 from recir.tests.xla.dlrmv3_test_utils import (
     create_dlrmv3_wrapper,
     create_static_batch,
-    DlrmV3SparseOverride,
     DummyPreprocess,
     get_hstu_config,
 )
-from torchrec.distributed.embedding import EmbeddingCollectionSharder
-from torchrec.distributed.embedding_types import EmbeddingComputeKernel
 from torchrec.distributed.model_parallel import DistributedModelParallel
-from torchrec.distributed.planner import EmbeddingShardingPlanner, Topology
-from torchrec.distributed.types import ShardingEnv, ShardingType
 from torchrec.modules.embedding_configs import EmbeddingConfig
-from torchrec.optim.keyed import KeyedOptimizerWrapper
-from torchrec.optim.optimizers import in_backward_optimizer_filter
 
 from .config import DLRMv3Config
+from .embedding import build_embedding_backend, EmbeddingBackend, JAXTPUBackend
 
 logger: logging.Logger = logging.getLogger(__name__)
 
@@ -63,53 +63,9 @@ def _setup_logging() -> None:
     )
 
 
-def init_dual_pg() -> Tuple[int, int]:
-    """Initialize gloo PG alongside JAX PJRT on GKE TPU.
-
-    JAX is auto-initialized by GKE env vars.
-    Gloo uses TPU_PROCESS_ADDRESSES for discovery and JOB_COMPLETION_INDEX for rank.
-
-    Returns (gloo_rank, gloo_world_size).
-    """
-    jax_rank = jax.process_index()
-    jax_world = jax.process_count()
-    logger.info(
-        f"JAX: process_index={jax_rank}, process_count={jax_world}, "
-        f"devices={len(jax.devices())}, platform={jax.devices()[0].platform}"
-    )
-
-    tpu_addrs = os.environ.get("TPU_PROCESS_ADDRESSES", "")
-    addr_list = [a.strip() for a in tpu_addrs.split(",") if a.strip()]
-
-    if not addr_list or len(addr_list) <= 1:
-        logger.info("Single-node mode: skipping gloo PG init")
-        return 0, 1
-
-    coordinator = addr_list[0].split(":")[0]
-    gloo_rank = int(os.environ.get("JOB_COMPLETION_INDEX", "0"))
-    gloo_world = len(addr_list)
-    gloo_port = int(os.environ.get("MASTER_PORT", "29500"))
-
-    logger.info(
-        f"Gloo init: rank={gloo_rank}, world={gloo_world}, "
-        f"coordinator={coordinator}:{gloo_port}"
-    )
-    dist.init_process_group(
-        backend="gloo",
-        init_method=f"tcp://{coordinator}:{gloo_port}",
-        world_size=gloo_world,
-        rank=gloo_rank,
-        timeout=torch.distributed.distributed_c10d.timedelta(seconds=300),
-    )
-    logger.info(
-        f"Gloo PG initialized: rank={dist.get_rank()}, world={dist.get_world_size()}"
-    )
-    return gloo_rank, gloo_world
-
-
 def create_model_and_data(
     cfg: DLRMv3Config, global_bs: int
-) -> Tuple[nn.Module, List[EmbeddingConfig], List[str], Tuple[torch.Tensor, ...], Any]:
+) -> tuple[nn.Module, list[EmbeddingConfig], list[str], tuple[torch.Tensor, ...], Any]:
     """Create DLRMv3 model with debug HSTU config and synthetic batch.
 
     Uses get_hstu_config() with dimensions from cfg, so medium/large presets
@@ -179,92 +135,15 @@ def create_model_and_data(
     return wrapper, table_configs, emb_keys, batch, hstu_config
 
 
-def setup_dmp(
-    wrapper: nn.Module,
-    table_configs: List[EmbeddingConfig],
-    cfg: DLRMv3Config,
-    gloo_world: int,
-) -> Tuple[nn.Module, torch.optim.Optimizer]:
-    """Shard embeddings with DMP ROW_WISE on CPU, create dense optimizer."""
-
-    if not dist.is_initialized():
-        logger.info("Single-node: skipping DMP, using model directly")
-        dense_opt = torch.optim.SGD(
-            wrapper.parameters(), lr=cfg.dense_lr, foreach=False
-        )
-        return wrapper, dense_opt
-
-    pg = dist.distributed_c10d._get_default_group()
-
-    sharders = [
-        _TestSharder(
-            sharding_type=ShardingType.ROW_WISE.value,
-            kernel_type=EmbeddingComputeKernel.FUSED.value,
-            fused_params={"learning_rate": cfg.embedding_lr},
-        )
-    ]
-
-    planner = EmbeddingShardingPlanner(
-        topology=Topology(world_size=gloo_world, compute_device="cpu"),
-    )
-    plan = planner.collective_plan(wrapper, sharders, pg)
-
-    logger.info("DMP sharding plan:")
-    for module_path, module_plan in plan.plan.items():
-        for param_name, param_sharding in module_plan.items():
-            logger.info(f"  {module_path}.{param_name}: {param_sharding.sharding_type}")
-
-    dmp = DistributedModelParallel(
-        wrapper,
-        env=ShardingEnv.from_process_group(pg),
-        plan=plan,
-        # pyre-ignore[6]: _TestSharder is a valid ModuleSharder subclass
-        sharders=sharders,
-        device=torch.device("cpu"),
-        init_data_parallel=False,
-    )
-
-    dense_opt = KeyedOptimizerWrapper(
-        dict(in_backward_optimizer_filter(dmp.named_parameters())),
-        lambda params: torch.optim.SGD(params, lr=cfg.dense_lr, foreach=False),
-    )
-
-    logger.info("DMP initialized with ROW_WISE embedding sharding on CPU")
-    return dmp, dense_opt
-
-
-class _TestSharder(EmbeddingCollectionSharder):
-    def __init__(
-        self,
-        sharding_type: str,
-        kernel_type: str,
-        fused_params: Dict[str, Any] | None = None,
-    ) -> None:
-        self._sharding_type = sharding_type
-        self._kernel_type = kernel_type
-        if fused_params is None:
-            fused_params = {}
-        if "learning_rate" not in fused_params:
-            fused_params["learning_rate"] = 0.1
-        super().__init__(fused_params=fused_params)
-
-    def sharding_types(self, compute_device_type: str) -> List[str]:
-        return [self._sharding_type]
-
-    def compute_kernels(
-        self, sharding_type: str, compute_device_type: str
-    ) -> List[str]:
-        return [self._kernel_type]
-
-
 def _run_training_loop(
     cfg: DLRMv3Config,
-    dmp: nn.Module,
+    backend: EmbeddingBackend,
+    model: nn.Module,
     dense_opt: torch.optim.Optimizer,
-    local_batch: Tuple[torch.Tensor, ...],
+    local_batch: tuple[torch.Tensor, ...],
     hstu_config: Any,
-    emb_keys: List[str],
-    gloo_world: int,
+    emb_keys: list[str],
+    num_ranks: int,
     is_main: bool,
     global_bs: int,
 ) -> None:
@@ -272,7 +151,7 @@ def _run_training_loop(
     # Create sparse override for @compile
     dummy = DummyPreprocess(
         emb_keys=emb_keys,
-        batch_size=global_bs,
+        batch_size=cfg.local_batch_size,
         embedding_dim=cfg.embedding_dim,
         static_uih_len=cfg.uih_len,
         static_num_candidates=cfg.num_candidates,
@@ -280,20 +159,20 @@ def _run_training_loop(
         item_emb_feature_names=hstu_config.item_embedding_feature_names,
         hstu_configs=hstu_config,
     )
-    sparse_override = DlrmV3SparseOverride(dummy)
-    sparse_override._num_ranks = gloo_world
+    module_override = backend.get_override(dummy, num_ranks=num_ranks)
 
-    # Compile dense path
+    # compile_ranks: use all JAX devices when on TPU (device_count > 1 on TPU,
+    # = 1 on CPU-only machines where we fall back to the gloo world size).
     num_tpu_devices = jax.device_count()
-    num_ranks = num_tpu_devices if num_tpu_devices > 1 else gloo_world
+    compile_ranks = num_tpu_devices if num_tpu_devices > 1 else num_ranks
 
     @compile(
-        module_override=[sparse_override],
+        module_override=[module_override],
         parallel_mode=GSPMDParallel(
             "replicate",
             loss_reduction="sum",
-            num_ranks=num_ranks,
-            num_processes=gloo_world,
+            num_ranks=compile_ranks,
+            num_processes=num_ranks,
         ),
         # pyre-ignore[6]: GraphModuleTransformation is callable
         gm_transformation=GraphModuleTransformation(
@@ -309,7 +188,7 @@ def _run_training_loop(
         cand_values: torch.Tensor,
         cand_lengths: torch.Tensor,
     ) -> None:
-        aux_losses: Dict[str, torch.Tensor] = mod(
+        aux_losses: dict[str, torch.Tensor] = mod(
             uih_values, uih_lengths, cand_values, cand_lengths
         )
         loss: torch.Tensor = torch.stack(list(aux_losses.values())).sum()
@@ -331,7 +210,9 @@ def _run_training_loop(
         )
 
     # Training loop
-    model_to_train = dmp.module if isinstance(dmp, DistributedModelParallel) else dmp
+    model_to_train = (
+        model.module if isinstance(model, DistributedModelParallel) else model
+    )
     model_to_train.train(True)
 
     logger.info(f"Starting training: {cfg.max_steps} steps, global_bs={global_bs}")
@@ -386,12 +267,25 @@ def _run_training_loop(
 
 
 def main() -> None:
+    # Must be called before any JAX operation. On GKE TPU the PJRT plugin reads
+    # coordinator address and process index from TPU runtime metadata automatically.
+    # Without this, each pod runs as jax.process_count()=1 and the SparseCore
+    # hardware collective (which spans all 128 chips) deadlocks.
+    jax.distributed.initialize()
     _setup_logging()
+    logger.info(
+        f"[DIST] jax.distributed.initialize() done: "
+        f"process_count={jax.process_count()}, "
+        f"device_count={jax.device_count()}, "
+        f"local_device_count={jax.local_device_count()}, "
+        f"process_index={jax.process_index()}"
+    )
     cfg = DLRMv3Config.from_args()
     logger.info(f"Config: {cfg}")
 
-    # --- 1. Dual PG init ---
-    gloo_rank, gloo_world = init_dual_pg()
+    # --- 1. Build embedding backend and init PG ---
+    backend = build_embedding_backend(cfg.embedding_backend)
+    gloo_rank, gloo_world = backend.init_pg()
     is_main = gloo_rank == 0
     global_bs = cfg.local_batch_size * gloo_world
 
@@ -401,23 +295,38 @@ def main() -> None:
         cfg, global_bs
     )
 
-    # --- 3. DMP embedding sharding ---
-    dmp, dense_opt = setup_dmp(wrapper, table_configs, cfg, gloo_world)
+    # --- 3. Set up embedding storage ---
+    if isinstance(backend, JAXTPUBackend):
+        # UIH seq features: uih_len tokens per sample (token-as-sample trick)
+        # Candidate features: num_candidates IDs per sample (same trick)
+        # Contextual features (viewer_id, dummy_contexual): pooled, stay at default 1
+        backend.seq_lens = {
+            "uih_post_id": cfg.uih_len,
+            "uih_owner_id": cfg.uih_len,
+            "item_post_id": cfg.num_candidates,
+            "item_owner_id": cfg.num_candidates,
+        }
+        backend.global_batch_size = global_bs
+    model, dense_opt = backend.setup(
+        wrapper, table_configs, cfg.embedding_lr, cfg.dense_lr, gloo_world
+    )
 
     # --- 4. Compile and train ---
     _run_training_loop(
         cfg,
-        dmp,
+        backend,
+        model,
         dense_opt,
         local_batch,
         hstu_config,
         emb_keys,
-        gloo_world,
-        is_main,
-        global_bs,
+        num_ranks=gloo_world,
+        is_main=is_main,
+        global_bs=global_bs,
     )
 
     # Cleanup
+
     if dist.is_initialized():
         dist.destroy_process_group()
 
