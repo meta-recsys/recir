@@ -30,6 +30,9 @@ RUN git clone https://github.com/facebookresearch/generative-recommenders.git /a
     pip install -e /app/generative-recommenders --no-deps && \
     pip install gin-config matplotlib pybind11
 
+# jax_tpu_embedding: SparseCore primitives (tpu_sparse_dense_matmul, etc.)
+RUN pip install jax-tpu-embedding
+
 # Copy and install recir with XLA + rec extras
 COPY . /app/recir
 RUN pip install -e "/app/recir[xla,rec]"
