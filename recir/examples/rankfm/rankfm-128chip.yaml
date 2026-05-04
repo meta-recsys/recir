@@ -1,0 +1,52 @@
+# RankFM (xsurface V3) full-scale training on 128-chip unified TPU slice (32 nodes, 4x4x8)
+# Requires recir-v7-128 cluster with workload policy.
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  generateName: rankfm-128chip-
+  namespace: default
+spec:
+  replicatedJobs:
+  - name: worker
+    replicas: 1
+    template:
+      spec:
+        parallelism: 32
+        completions: 32
+        template:
+          spec:
+            containers:
+            - name: rankfm
+              image: us-central1-docker.pkg.dev/mrs-tpu-y317h/recml/rankfm_tpu:latest
+              imagePullPolicy: Always
+              env:
+              - name: PYTHONUNBUFFERED
+                value: "1"
+              - name: MASTER_PORT
+                value: "29500"
+              - name: JOBSET_NAME
+                valueFrom:
+                  fieldRef:
+                    fieldPath: metadata.labels['jobset.sigs.k8s.io/jobset-name']
+              command:
+              - sh
+              - -c
+              - >-
+                python3 -u -m recir.examples.rankfm.train
+                --max_steps 20
+                --local_batch_size 4
+                --hash_size_cap 1000000
+                --l1_num_layers 3
+                --l2_num_layers 11
+                --profile_start_step 3
+                --profile_end_step 8
+                --profile_dir "gs://mrs-tpu-y317h/tpu-profiles/${JOBSET_NAME}"
+              ports:
+              - containerPort: 8471
+              resources:
+                limits:
+                  google.com/tpu: 4
+            nodeSelector:
+              cloud.google.com/gke-tpu-accelerator: tpu7x
+              cloud.google.com/gke-tpu-topology: 4x4x8
+            restartPolicy: Never
