@@ -630,14 +630,20 @@ def _compile_data_parallel(
             if p in opt.state:
                 named_states[n] = opt.state[p]  # type: ignore[index]
     # 5. parallel mode to expand a single device graph to a distributed graph
+    # Re-split params/buffers from the (possibly re-keyed) module after
+    # shard_params, since shard_params may have replaced parameter objects.
+    sharded_params: Dict[str, nn.Parameter] = {}
+    sharded_buffers: Dict[str, torch.Tensor] = {}
+    for fqn, val in params_and_buffers.items():
+        if isinstance(val, nn.Parameter):
+            sharded_params[fqn] = val
+        else:
+            sharded_buffers[fqn] = val
     gm = parallel_mode.partition(
         gm,
-        mod,
-        opt,
-        params_and_buffers,
-        named_states,
-        args,
-        kwargs,
+        params=sharded_params,
+        buffers=sharded_buffers,
+        named_states=named_states,
     )
     return _finalize_graph(
         gm,
