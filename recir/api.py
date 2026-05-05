@@ -7,6 +7,7 @@
 # pyre-strict
 import logging
 from abc import ABC, abstractmethod
+from collections import OrderedDict
 from contextlib import contextmanager, ExitStack, nullcontext
 from copy import copy
 from dataclasses import dataclass
@@ -462,22 +463,124 @@ def _finalize_graph(
     return _CompiledResult(gm, mod, opt, flat_state, DeviceStateManager())
 
 
+@dataclass
+class _RegionDiscovery:
+    """Result of `_discover_for_region_transforms`.
+
+    Holds the called-module map and the autograd-function leaves discovered
+    by running the train step under FakeTensorMode hooks.
+    """
+
+    called_modules: OrderedDict[str, Tuple[nn.Module, Tuple[Any, ...]]]
+    autograd_function_leaves: set[type]  # pyre-fixme[24]
+
+
+def _discover_for_region_transforms(
+    transforms: List[RegionTransform],
+    func: Callable[..., Any],
+    args: Tuple[Any, ...],
+    kwargs: Dict[str, Any],
+    *,
+    mod: Optional[nn.Module] = None,
+) -> Optional[_RegionDiscovery]:
+    """Run `_discover_called_modules` and `_discover_autograd_functions`.
+
+    Returns ``None`` (no-op) when ``transforms`` is empty.  When ``mod`` is
+    not provided the first :class:`nn.Module` in ``args``/``kwargs`` is used.
+    """
+    if not transforms:
+        return None
+    if mod is None:
+        for arg in pytree.arg_tree_leaves(*args, **kwargs):
+            if isinstance(arg, nn.Module):
+                mod = arg
+                break
+        assert mod is not None, (
+            "region_transforms requires an nn.Module in the arguments"
+        )
+    return _RegionDiscovery(
+        called_modules=_discover_called_modules(
+            mod,
+            FakeTensorMode(allow_non_fake_inputs=True),
+            func,
+            *args,
+            **kwargs,
+        ),
+        autograd_function_leaves=_discover_autograd_functions(
+            mod,
+            FakeTensorMode(allow_non_fake_inputs=True),
+            func,
+            *args,
+            **kwargs,
+        ),
+    )
+
+
+def _enter_region_transform_contexts(
+    region_stack: ExitStack,  # pyre-ignore
+    transforms: List[RegionTransform],
+    discovery: Optional[_RegionDiscovery],
+    fake_mode: FakeTensorMode,
+    *,
+    parametrize_cm_factory: Optional[Callable[[nn.Module], Callable[[], Any]]] = None,
+) -> None:
+    """Enter `_apply_region_transforms` once per forward root on `region_stack`.
+
+    No-op when ``discovery`` is None or ``transforms`` is empty.
+    ``parametrize_cm_factory(root_mod)`` returns a context-manager factory
+    used during the per-root trace inside ``_apply_region_transforms``;
+    pass ``None`` when no parametrization is needed (e.g. GSPMD path).
+    """
+    if discovery is None or not transforms:
+        return
+    for _fqn, root_mod, root_fake_args in _find_forward_roots(discovery.called_modules):
+        cm_factories = (
+            [parametrize_cm_factory(root_mod)]
+            if parametrize_cm_factory is not None
+            else []
+        )
+        region_stack.enter_context(
+            _apply_region_transforms(
+                root_mod,
+                root_fake_args,
+                discovery.called_modules,
+                transforms,
+                fake_mode,
+                _parametrize_cm_factories=cm_factories,
+                _autograd_function_leaves=discovery.autograd_function_leaves,
+            )
+        )
+
+
 def _compile_and_transform(
     func: Callable[..., Any],
     module_override: Optional[List[Override]],
     parallel_mode: ParallelMode,
     gm_transformation: Optional[Callable[[fx.GraphModule], fx.GraphModule]],
     *args: Any,
+    region_transforms: Optional[List[RegionTransform]] = None,
     **kwargs: Any,
 ) -> _CompiledResult:
     if isinstance(parallel_mode, GSPMDParallel):
-        result = _compile_gspmd(func, module_override, parallel_mode, *args, **kwargs)
+        result = _compile_gspmd(
+            func,
+            module_override,
+            parallel_mode,
+            *args,
+            region_transforms=region_transforms,
+            **kwargs,
+        )
     elif (
         isinstance(parallel_mode, (DataParallel, HybridParallel))
         and parallel_mode._use_parametrization
     ):
         result = _compile_data_parallel_v2(
-            func, module_override, parallel_mode, *args, **kwargs
+            func,
+            module_override,
+            parallel_mode,
+            *args,
+            region_transforms=region_transforms,
+            **kwargs,
         )
     else:
         result = _compile_data_parallel(
@@ -566,6 +669,7 @@ def _compile_data_parallel_v2(
     module_override: Optional[List[Override]],
     parallel_mode: Union[DataParallel, HybridParallel],
     *args: Any,
+    region_transforms: Optional[List[RegionTransform]] = None,
     **kwargs: Any,
 ) -> _CompiledResult:
     """Compile with autograd-based collective insertion (no DTensor partition).
@@ -574,6 +678,11 @@ def _compile_data_parallel_v2(
     (dense + embedding sharding) v2 paths.  For ``HybridParallel``,
     embedding parameters are excluded from collective insertion and
     instead rewritten post-trace into decomposed AllToAll ops.
+
+    Caller-supplied ``region_transforms`` (e.g. activation checkpointing via
+    :class:`RecomputeTransform`) are appended to the path-internal transforms
+    (``RegatherTransform`` for FULLY_SHARD).  All transforms share a single
+    discovery + ``_apply_region_transforms`` pass.
     """
     # Extract mesh and DP style from the parallel mode.
     if isinstance(parallel_mode, HybridParallel):
@@ -621,15 +730,11 @@ def _compile_data_parallel_v2(
     transforms: list[RegionTransform] = []
     if dp_style == DataParallelStyle.FULLY_SHARD:
         transforms.append(RegatherTransform(skip_param_fqns=embedding_param_fqns))
-    called_modules = None
-    autograd_function_leaves: set[type] = set()  # pyre-fixme[24]
-    if transforms:
-        called_modules = _discover_called_modules(
-            _mod, FakeTensorMode(allow_non_fake_inputs=True), func, *args, **kwargs
-        )
-        autograd_function_leaves = _discover_autograd_functions(
-            _mod, FakeTensorMode(allow_non_fake_inputs=True), func, *args, **kwargs
-        )
+    if region_transforms:
+        transforms.extend(region_transforms)
+    discovery = _discover_for_region_transforms(
+        transforms, func, args, kwargs, mod=_mod
+    )
 
     # 5. Set up external fake mode for tracing.
     fake_mode: FakeTensorMode = FakeTensorMode(allow_non_fake_inputs=True)
@@ -649,27 +754,18 @@ def _compile_data_parallel_v2(
     if embedding_param_fqns:
         parametrize_kwargs["exclude_param_fqns"] = embedding_param_fqns
     with ExitStack() as region_stack:
-        if transforms and called_modules:
-            forward_roots = _find_forward_roots(called_modules)
-            for _fqn, root_mod, root_fake_args in forward_roots:
-                region_stack.enter_context(
-                    _apply_region_transforms(
-                        root_mod,
-                        root_fake_args,
-                        called_modules,
-                        transforms,
-                        fake_mode,
-                        _parametrize_cm_factories=[
-                            partial(
-                                parametrize_params,
-                                root_mod,
-                                collectives_fn,
-                                **parametrize_kwargs,
-                            ),
-                        ],
-                        _autograd_function_leaves=autograd_function_leaves,
-                    )
-                )
+        _enter_region_transform_contexts(
+            region_stack,
+            transforms,
+            discovery,
+            fake_mode,
+            parametrize_cm_factory=lambda root_mod: partial(
+                parametrize_params,
+                root_mod,
+                collectives_fn,
+                **parametrize_kwargs,
+            ),
+        )
 
         # 8. Set up parametrize fns and trace via _local_compile.
         #    Region transform context managers scope the rewritten forwards
@@ -720,6 +816,7 @@ def _compile_gspmd(
     module_override: Optional[List[Override]],
     parallel_mode: GSPMDParallel,
     *args: Any,
+    region_transforms: Optional[List[RegionTransform]] = None,
     **kwargs: Any,
 ) -> _CompiledResult:
     """Compile a train step with GSPMD auto-parallelism.
@@ -728,21 +825,30 @@ def _compile_gspmd(
     The graph is traced with global batch shapes (expanded from the local
     mini-batch by world_size) and metadata is attached for the GSPMD
     lowering step.
+
+    When ``region_transforms`` is provided, region-level rewrites (e.g.
+    activation checkpointing via :class:`RecomputeTransform`) are applied
+    to the user's forward methods during tracing.  They are scoped to the
+    trace via an ``ExitStack`` and reverted before this function returns.
     """
     fake_mode: FakeTensorMode = FakeTensorMode()
-    local_result = _local_compile(
-        func,
-        module_override,
-        *args,
-        fake_mode=fake_mode,
-        _stateless_func_wrapper=gradients_tagging,
-        _input_transform=_make_batch_transform(
-            parallel_mode.input_batch_dim,
-            ratio=parallel_mode.num_processes,
+    transforms = region_transforms or []
+    discovery = _discover_for_region_transforms(transforms, func, args, kwargs)
+    with ExitStack() as region_stack:
+        _enter_region_transform_contexts(region_stack, transforms, discovery, fake_mode)
+        local_result = _local_compile(
+            func,
+            module_override,
+            *args,
             fake_mode=fake_mode,
-        ),
-        **kwargs,
-    )
+            _stateless_func_wrapper=gradients_tagging,
+            _input_transform=_make_batch_transform(
+                parallel_mode.input_batch_dim,
+                ratio=parallel_mode.num_processes,
+                fake_mode=fake_mode,
+            ),
+            **kwargs,
+        )
     gm = local_result.gm
     # GSPMD auto-inserts all-reduce sum for gradients
     # all-reduce average. Use the tag_grad markers to find gradient tensors
@@ -830,6 +936,7 @@ def compile(
     module_override: Optional[List[Override]] = None,
     gm_transformation: Optional[Callable[[fx.GraphModule], fx.GraphModule]] = None,
     parallel_mode: Optional[ParallelMode] = None,
+    region_transforms: Optional[List[RegionTransform]] = None,
 ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
     r"""Compile and optimize a callable, which can be a train step within a training loop.
 
@@ -850,6 +957,10 @@ def compile(
             that specifies how to parallelize the callable. Each ParallelMode
             would have its own strategy to partition the model and the captured
             graph (Default: ``None``)
+        region_transforms (Optional[List[RegionTransform]]): a list of
+            :class:`RegionTransform` instances applied during tracing to rewrite
+            sub-regions of the forward graph (e.g. activation checkpointing via
+            :class:`RecomputeTransform`). (Default: ``None``)
 
     """
 
@@ -865,7 +976,13 @@ def compile(
                     DataParallel() if parallel_mode is None else parallel_mode
                 )
                 compiled_obj = _compile_and_transform(
-                    func, module_override, mode, gm_transformation, *args, **kwargs
+                    func,
+                    module_override,
+                    mode,
+                    gm_transformation,
+                    *args,
+                    region_transforms=region_transforms,
+                    **kwargs,
                 )
                 wrapper.__dict__[COMPILED_OBJECT_KEY] = compiled_obj
 
