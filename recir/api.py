@@ -21,6 +21,7 @@ import torch.distributed._functional_collectives
 import torch.nn as nn
 import torch.utils._pytree as pytree
 from functorch import make_fx
+from recir.batch_dim_propagation import propagate_batch_input_meta
 from recir.decompositions import DEDUP_TARGETS, SPMD_DECOMP_TABLE
 from recir.distributed.data_parallel import (
     collectives_insertion,
@@ -444,6 +445,11 @@ def _finalize_graph(
         for override in module_override:
             gm = override.transform(gm, flat_state)
     _tag_batch_inputs(gm, len(flat_state), input_batch_dim)
+    # Propagate batch-input meta through ops so intermediate FX nodes that
+    # become subgraph boundaries (after segment_and_lower) inherit
+    # is_batch_input / batch_dim. Without this, downstream subgraph
+    # placeholders default to replicated and JAX sees per-process shape
+    propagate_batch_input_meta(gm)
     return _CompiledResult(gm, mod, opt, flat_state, DeviceStateManager())
 
 
