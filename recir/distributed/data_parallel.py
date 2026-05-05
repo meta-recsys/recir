@@ -1735,20 +1735,25 @@ def rewrite_sparse_embeddings(
 
 def partition_data_parallel(
     graph: GraphModule,
-    model: nn.Module,
-    optimizer: Optional[torch.optim.Optimizer],
-    params_buffers: Dict[str, torch.Tensor],
-    named_states: Dict[str, Any],
-    args: Tuple[Any, ...],
-    kwargs: Dict[str, Any],
+    *,
+    params: Dict[str, nn.Parameter],
+    buffers: Dict[str, torch.Tensor],
+    named_states: Dict[str, Dict[str, Any]],
     mesh: DeviceMesh,
     parallel_style: DataParallelStyle,
     input_batch_dim: int,
     grad_reduction: str = "avg",
     embedding_param_indices: Optional[Set[int]] = None,
 ) -> GraphModule:
-    """Partition the graph into a data parallel graph."""
-    num_params_buffers = len(params_buffers)
+    """Partition the graph into a data parallel graph.
+
+    Inputs are FQN-keyed dicts so callers without a live ``nn.Module`` (e.g.
+    a bundle-runtime consumer that loads safetensors at MAST start) can drive
+    partitioning directly.  ``named_states`` maps each parameter FQN to its
+    optimizer state dict; ``step`` may be an int scalar, a tensor, or ``None``
+    depending on the optimizer flavor.
+    """
+    num_params_buffers = len(params) + len(buffers)
     flattened_states = pytree.tree_leaves(named_states)
     num_states = len(flattened_states)
     changed = graph.graph.eliminate_dead_code()

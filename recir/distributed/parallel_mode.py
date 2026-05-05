@@ -7,10 +7,11 @@
 # pyre-strict
 import logging
 from abc import ABC, abstractmethod
-from typing import Any, Callable, Dict, Optional, Set, Tuple
+from typing import Any, Callable, Dict, Optional, Set
 
 import torch
 import torch.distributed as dist
+import torch.nn as nn
 from recir.backend import BackendType
 from recir.distributed.data_parallel import (
     DataParallelStyle,
@@ -71,17 +72,56 @@ class ParallelMode(ABC):
     def partition(
         self,
         gm: GraphModule,
+        *,
+        params: Dict[str, nn.Parameter],
+        buffers: Dict[str, torch.Tensor],
+        named_states: Dict[str, Dict[str, Any]],
+    ) -> GraphModule:
+        """
+        Partition a single device graph to a distributed graph.
+
+        Inputs are FQN-keyed dicts so callers without a live ``nn.Module``
+        (e.g. a bundle-runtime consumer that loads safetensors at MAST start)
+        can drive partitioning directly.  ``named_states`` maps each parameter
+        FQN to its optimizer state dict; ``step`` may be an int scalar, a
+        tensor, or ``None`` depending on the optimizer flavor.
+        """
+        raise NotImplementedError
+
+    def partition_from_module(
+        self,
+        gm: GraphModule,
         model: torch.nn.Module,
         optimizer: Optional[torch.optim.Optimizer],
         params_and_buffers: Dict[str, Any],
         named_states: Dict[str, Any],
-        args: Tuple[Any, ...],
-        kwargs: Dict[str, Any],
     ) -> GraphModule:
+        """Instance-method adapter for callers still holding a live ``nn.Module`` + ``Optimizer``.
+
+        A legacy caller of ``mode.partition(gm, model, opt, params_and_buffers, named_states, args, kwargs)``
+        migrates by renaming ``.partition`` to ``.partition_from_module`` and
+        dropping the trailing positional ``args`` / ``kwargs`` (the example
+        inputs were never read by any partition implementation).  Splits
+        ``params_and_buffers`` into ``params`` / ``buffers`` via an
+        ``isinstance(v, nn.Parameter)`` check and forwards to the kwargs-only
+        ``partition`` method.  ``model`` and ``optimizer`` are accepted for
+        API back-compat but are not used (they were unused even before the
+        kwargs-only refactor).
         """
-        Partition a single device graph to a distributed graph.
-        """
-        raise NotImplementedError
+        params: Dict[str, nn.Parameter] = {
+            k: v for k, v in params_and_buffers.items() if isinstance(v, nn.Parameter)
+        }
+        buffers: Dict[str, torch.Tensor] = {
+            k: v
+            for k, v in params_and_buffers.items()
+            if not isinstance(v, nn.Parameter)
+        }
+        return self.partition(
+            gm,
+            params=params,
+            buffers=buffers,
+            named_states=named_states,
+        )
 
     @abstractmethod
     def shard_params(
@@ -210,12 +250,10 @@ class GSPMDParallel(ParallelMode):
     def partition(
         self,
         gm: GraphModule,
-        model: torch.nn.Module,
-        optimizer: Optional[torch.optim.Optimizer],
-        params_and_buffers: Dict[str, Any],
-        named_states: Dict[str, Any],
-        args: Tuple[Any, ...],
-        kwargs: Dict[str, Any],
+        *,
+        params: Dict[str, nn.Parameter],
+        buffers: Dict[str, torch.Tensor],
+        named_states: Dict[str, Dict[str, Any]],
     ) -> GraphModule:
         # No DTensor expansion. Return the graph as-is.
         return gm
@@ -394,25 +432,20 @@ class DataParallel(ParallelMode):
     def partition(
         self,
         gm: GraphModule,
-        model: torch.nn.Module,
-        optimizer: Optional[torch.optim.Optimizer],
-        params_and_buffers: Dict[str, Any],
-        named_states: Dict[str, Any],
-        args: Tuple[Any, ...],
-        kwargs: Dict[str, Any],
+        *,
+        params: Dict[str, nn.Parameter],
+        buffers: Dict[str, torch.Tensor],
+        named_states: Dict[str, Dict[str, Any]],
     ) -> GraphModule:
         gm = partition_data_parallel(
             gm,
-            model,
-            optimizer,
-            params_and_buffers,
-            named_states,
-            args,
-            kwargs,
-            self.device_mesh,
-            self.parallel_style,
-            self.input_batch_dim,
-            self.grad_reduction,
+            params=params,
+            buffers=buffers,
+            named_states=named_states,
+            mesh=self.device_mesh,
+            parallel_style=self.parallel_style,
+            input_batch_dim=self.input_batch_dim,
+            grad_reduction=self.grad_reduction,
         )
         return gm
 
@@ -524,28 +557,26 @@ class HybridParallel(ParallelMode):
     def partition(
         self,
         gm: GraphModule,
-        model: torch.nn.Module,
-        optimizer: Optional[torch.optim.Optimizer],
-        params_and_buffers: Dict[str, Any],
-        named_states: Dict[str, Any],
-        args: Tuple[Any, ...],
-        kwargs: Dict[str, Any],
+        *,
+        params: Dict[str, nn.Parameter],
+        buffers: Dict[str, torch.Tensor],
+        named_states: Dict[str, Dict[str, Any]],
     ) -> GraphModule:
+        # Embedding indices are computed against the same FQN ordering used
+        # by partition_data_parallel: params first, then buffers.
+        params_and_buffers: Dict[str, Any] = {**params, **buffers}
         embedding_param_indices = self._compute_embedding_param_indices(
             params_and_buffers
         )
 
         gm = partition_data_parallel(
             gm,
-            model,
-            optimizer,
-            params_and_buffers,
-            named_states,
-            args,
-            kwargs,
-            self.mesh,
-            self.dense_style,
-            self.input_batch_dim,
+            params=params,
+            buffers=buffers,
+            named_states=named_states,
+            mesh=self.mesh,
+            parallel_style=self.dense_style,
+            input_batch_dim=self.input_batch_dim,
             embedding_param_indices=embedding_param_indices,
         )
 
