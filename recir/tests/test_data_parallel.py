@@ -18,7 +18,7 @@ import torch.distributed._functional_collectives as funcol
 import torch.fx as fx
 import torch.nn as nn
 from parameterized import parameterized
-from recir.api import compile
+from recir.api import _local_compile, compile
 from recir.distributed.data_parallel import (
     _clone_param_chains_for_backward,
     _register_parametrization,
@@ -36,10 +36,12 @@ from recir.distributed.data_parallel import (
 from recir.distributed.parallel_mode import DataParallel, HybridParallel
 from recir.gm_transformation import GraphModuleTransformation
 from recir.sharding_plan import EmbeddingShardingPlan, EmbeddingShardingType
+from torch._subclasses.fake_tensor import FakeTensorMode
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.tensor import DeviceMesh
 from torch.distributed.tensor._dtensor_spec import DTensorSpec
 from torch.distributed.tensor.placement_types import Replicate, Shard
+from torch.fx.graph_module import _get_attr, _has_attr
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.testing._internal.common_distributed import skip_if_lt_x_gpu
 from torch.testing._internal.common_utils import run_tests  # noqa: TCH001
@@ -1072,6 +1074,298 @@ class TestBuildDataParallelStrategies(unittest.TestCase):
         self.assertAlmostEqual(result[3], 3.14)
         self.assertTrue(result[4])
         self.assertEqual(result[5], "metadata")
+
+
+class _NestedTensorConstantModule(nn.Module):
+    """Module whose forward references a tensor literal in a nested submodule.
+
+    The literal is captured by ``make_fx`` and lifted onto the GraphModule via
+    a ``get_attr`` node. Note that ``make_fx`` currently flattens such literals
+    into top-level attributes on the GraphModule (e.g. ``_tensor_constant0``)
+    regardless of which nested submodule they originated in, so the resulting
+    ``get_attr`` target is a flat (dot-free) name. This module exercises the
+    real production code path; the dotted-target robustness path is covered by
+    a separate, manually constructed regression test below.
+    """
+
+    class _Inner(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.lin = nn.Linear(4, 4, bias=False)
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            # Inline tensor literal — make_fx will lift this into a get_attr.
+            bias = torch.tensor([0.5, 0.25, 0.125, 0.0625])
+            return self.lin(x) + bias
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.inner: nn.Module = self._Inner()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.inner(x)
+
+
+class TestLocalCompileTensorConstants(unittest.TestCase):
+    """Unit tests for tensor get_attr handling in ``_local_compile``."""
+
+    def test_local_compile_preserves_get_attr_constants_across_recompile(
+        self,
+    ) -> None:
+        """Tensor get_attr constants must survive ``gm.recompile()``.
+
+        ``make_fx`` lifts inline tensor literals into module attributes
+        referenced via ``get_attr`` nodes. In production today the lifted
+        targets are flat top-level names on the GraphModule (e.g.
+        ``_tensor_constant0``), regardless of which nested submodule the
+        literal originated in. Without re-registering each lifted attribute
+        as ``_AttrKind.CONSTANT`` they are stored as buffers and either
+        disappear or get rewritten by subsequent ``recompile`` calls —
+        breaking any pass that walks the gm to recover the underlying value.
+
+        This test exercises the real production code path. The
+        inner-submodule constant case is covered separately by
+        ``test_local_compile_handles_inner_submodule_constant``.
+        """
+        mod = _NestedTensorConstantModule()
+        opt = torch.optim.SGD(mod.parameters(), lr=0.1, foreach=True)
+        x = torch.randn(2, 4)
+
+        def train_step(
+            mod: nn.Module, opt: torch.optim.Optimizer, x: torch.Tensor
+        ) -> torch.Tensor:
+            out = mod(x)
+            loss = out.sum()
+            loss.backward()
+            opt.step()
+            opt.zero_grad()
+            return loss
+
+        fake_mode = FakeTensorMode(allow_non_fake_inputs=True)
+        result = _local_compile(train_step, None, mod, opt, x, fake_mode=fake_mode)
+        gm = result.gm
+
+        tensor_get_attrs = [
+            node
+            for node in gm.graph.nodes
+            if node.op == "get_attr"
+            and isinstance(_get_attr(gm, node.target), torch.Tensor)
+        ]
+        self.assertGreater(
+            len(tensor_get_attrs),
+            0,
+            "Expected at least one tensor get_attr node from the inline tensor literal",
+        )
+
+        # The inline literal in ``_NestedTensorConstantModule._Inner.forward``
+        # is exactly this tensor, so every lifted constant must equal it.
+        expected_bias = torch.tensor([0.5, 0.25, 0.125, 0.0625])
+
+        # The constants dict on the result must capture every tensor get_attr.
+        for node in tensor_get_attrs:
+            fqn = node.target
+            self.assertIn(
+                fqn,
+                result.constants,
+                f"Expected constant FQN {fqn!r} to be recorded in _LocalCompiledResult.constants",
+            )
+            # And the value should be retrievable via the (flat, in production)
+            # attribute path.
+            self.assertTrue(_has_attr(gm, fqn))
+            value_before = _get_attr(gm, fqn)
+            self.assertIsInstance(value_before, torch.Tensor)
+            torch.testing.assert_close(value_before, expected_bias)
+            # The result.constants entry must point at the same value.
+            torch.testing.assert_close(result.constants[fqn], expected_bias)
+            # Constants must NOT be tracked as buffers (the pre-fix behavior
+            # silently registered them as buffers, which breaks recompile).
+            buffer_fqns = {n for n, _ in gm.named_buffers()}
+            self.assertNotIn(
+                fqn,
+                buffer_fqns,
+                f"Constant {fqn!r} should not be registered as a buffer",
+            )
+
+        # Recompile and re-check: the tensor must still be reachable via the
+        # attribute path AND the cached value identity must be preserved
+        # (i.e. _AttrKind.CONSTANT survived recompile).
+        gm.recompile()
+        for node in tensor_get_attrs:
+            fqn = node.target
+            self.assertTrue(
+                _has_attr(gm, fqn),
+                f"Constant {fqn!r} disappeared after gm.recompile()",
+            )
+            value_after = _get_attr(gm, fqn)
+            self.assertIsInstance(value_after, torch.Tensor)
+            torch.testing.assert_close(value_after, expected_bias)
+            self.assertIs(
+                value_after,
+                result.constants[fqn],
+                f"Constant {fqn!r} value changed across gm.recompile()",
+            )
+
+    def test_local_compile_handles_inner_submodule_constant(self) -> None:
+        """``_local_compile`` must classify a constant lifted from an inner
+        submodule's forward as ``_AttrKind.CONSTANT`` end-to-end.
+
+        ``make_fx`` currently flattens lifted tensor literals into top-level
+        attribute names on the GraphModule even when the literal lives inside
+        a nested submodule's forward, so the dotted-target codepath is not
+        reachable via the public API today. We still want to assert that the
+        retag is correctly applied for an inner-submodule-sourced constant —
+        if a future make_fx change preserves the qualified path, the assertion
+        below would also catch a regression there because the constant's FQN
+        is read from the produced graph.
+        """
+        weight_const = torch.tensor([1.0, 2.0, 3.0])
+
+        class _Inner(nn.Module):
+            def forward(self, x: torch.Tensor) -> torch.Tensor:
+                # Inline tensor literal inside a nested submodule's forward.
+                return x + weight_const
+
+        class _Outer(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.inner = _Inner()
+
+            def forward(self, x: torch.Tensor) -> torch.Tensor:
+                return self.inner(x)
+
+        mod = _Outer()
+        x = torch.randn(3)
+
+        def train_step(mod: nn.Module, x: torch.Tensor) -> torch.Tensor:
+            return mod(x).sum()
+
+        fake_mode = FakeTensorMode(allow_non_fake_inputs=True)
+        result = _local_compile(train_step, None, mod, x, fake_mode=fake_mode)
+        gm = result.gm
+
+        tensor_get_attrs = [
+            node
+            for node in gm.graph.nodes
+            if node.op == "get_attr"
+            and isinstance(_get_attr(gm, node.target), torch.Tensor)
+        ]
+        self.assertGreater(len(tensor_get_attrs), 0)
+
+        gm.recompile()
+
+        # Every retagged constant must (a) be reachable on ``gm`` via its FQN,
+        # (b) match the inner-submodule literal value, and (c) NOT live in
+        # ``named_buffers()``.
+        buffer_fqns = {n for n, _ in gm.named_buffers()}
+        for node in tensor_get_attrs:
+            fqn = node.target
+            self.assertIn(fqn, result.constants)
+            value = _get_attr(gm, fqn)
+            self.assertIsInstance(value, torch.Tensor)
+            torch.testing.assert_close(value, weight_const)
+            self.assertNotIn(fqn, buffer_fqns)
+
+
+class TestBuildStrategiesGetAttrClassification(DTensorTestBase):
+    """Tests for ``build_data_parallel_strategies`` get_attr classification.
+
+    Drives a real 2-rank ``DeviceMesh`` and traces the test fixture via
+    :func:`recir.api._local_compile` so we exercise the same code path the
+    production compile uses.
+    """
+
+    @property
+    def world_size(self) -> int:
+        return 2
+
+    @skip_if_lt_x_gpu(2)
+    @with_comms
+    def test_build_data_parallel_strategies_classifies_tensor_get_attr_as_replicate(
+        self,
+    ) -> None:
+        """A tensor get_attr from ``_local_compile`` must be PARAM + REPLICATE."""
+        mod = _NestedTensorConstantModule()
+        x = torch.randn(2, 4)
+
+        def train_step(mod: nn.Module, x: torch.Tensor) -> torch.Tensor:
+            return mod(x).sum()
+
+        fake_mode = FakeTensorMode(allow_non_fake_inputs=True)
+        result = _local_compile(train_step, None, mod, x, fake_mode=fake_mode)
+        gm = result.gm
+
+        tensor_get_attrs = [n for n in gm.graph.nodes if n.op == "get_attr"]
+        self.assertGreater(
+            len(tensor_get_attrs), 0, "fixture produced no get_attr nodes"
+        )
+
+        mesh = DeviceMesh("cuda", torch.arange(self.world_size))
+        strategy_map = build_data_parallel_strategies(
+            gm,
+            num_params=len(result.params),
+            num_states=len(result.named_states),
+            mesh=mesh,
+            batch_dim=0,
+            parallel_mode=DataParallelStyle.REPLICATE,
+        )
+        for attr_node in tensor_get_attrs:
+            attr_strategy = cast(DataParallelStrategy, strategy_map[attr_node])
+            self.assertEqual(attr_strategy.node_type, NodeType.PARAM)
+            out_specs = attr_strategy.op_spec.output_specs
+            self.assertIsInstance(out_specs, tuple)
+            placements = out_specs[0].placements  # type: ignore[index,union-attr]
+            self.assertTrue(
+                all(isinstance(p, Replicate) for p in placements),
+                f"Expected all-Replicate placements for tensor get_attr {attr_node.target!r}, got {placements}",
+            )
+
+    @skip_if_lt_x_gpu(2)
+    @with_comms
+    def test_build_data_parallel_strategies_classifies_non_tensor_get_attr_as_non_tensor(
+        self,
+    ) -> None:
+        """A non-tensor get_attr (e.g. DeviceMesh metadata) must be NON_TENSOR.
+
+        ``make_fx`` does not naturally emit non-tensor ``get_attr`` nodes, so
+        we trace a real graph via ``_local_compile`` and then graft a single
+        ``get_attr`` node referencing a non-tensor attribute on the gm root —
+        keeping the rest of the graph (and the strategy invocation) production
+        shaped.
+        """
+        mod = _NestedTensorConstantModule()
+        x = torch.randn(2, 4)
+
+        def train_step(mod: nn.Module, x: torch.Tensor) -> torch.Tensor:
+            return mod(x).sum()
+
+        fake_mode = FakeTensorMode(allow_non_fake_inputs=True)
+        result = _local_compile(train_step, None, mod, x, fake_mode=fake_mode)
+        gm = result.gm
+
+        # Attach a non-tensor attribute on the gm root and insert a get_attr
+        # node referencing it. The node is left dangling (it has no consumer);
+        # ``build_data_parallel_strategies`` walks every node in the graph, so
+        # it will still classify it. We deliberately skip ``gm.recompile()``
+        # because the inserted node has no consumer and would be DCE'd from
+        # the regenerated forward; the node is still present in
+        # ``gm.graph.nodes`` for the strategy walk.
+        non_tensor_attr = MagicMock(spec=DeviceMesh)
+        non_tensor_attr.ndim = 1
+        gm.meta_attr = non_tensor_attr  # pyre-ignore[16]
+        with gm.graph.inserting_before(next(iter(gm.graph.nodes))):
+            attr_node = gm.graph.get_attr("meta_attr")
+
+        mesh = DeviceMesh("cuda", torch.arange(self.world_size))
+        strategy_map = build_data_parallel_strategies(
+            gm,
+            num_params=len(result.params),
+            num_states=len(result.named_states),
+            mesh=mesh,
+            batch_dim=0,
+            parallel_mode=DataParallelStyle.REPLICATE,
+        )
+        attr_strategy = cast(DataParallelStrategy, strategy_map[attr_node])
+        self.assertEqual(attr_strategy.node_type, NodeType.NON_TENSOR)
 
 
 class TestCloneParamChains(unittest.TestCase):
