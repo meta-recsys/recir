@@ -50,6 +50,7 @@ from torchrec.distributed.embedding import EmbeddingCollectionSharder
 from torchrec.distributed.embedding_types import EmbeddingComputeKernel
 from torchrec.distributed.model_parallel import DistributedModelParallel
 from torchrec.distributed.planner import EmbeddingShardingPlanner, Topology
+from torchrec.distributed.planner.types import ParameterConstraints
 from torchrec.distributed.types import ShardingEnv, ShardingType
 from torchrec.optim.keyed import KeyedOptimizerWrapper
 from torchrec.optim.optimizers import in_backward_optimizer_filter
@@ -137,15 +138,19 @@ def init_dual_pg() -> Tuple[int, int]:
 
 
 class _ECSharder(EmbeddingCollectionSharder):
-    """Force ROW_WISE sharding with FUSED in-backward optimizer kernel."""
+    """EmbeddingCollection sharder offering ROW_WISE + TABLE_WISE.
+
+    The actual per-table sharding choice is left to the planner via
+    `ParameterConstraints` in `setup_dmp` (small tables -> TABLE_WISE so
+    they aren't sliced too thin for fbgemm's CPU FUSED path; large tables
+    -> ROW_WISE so they scale across ranks). Kernel is always FUSED.
+    """
 
     def __init__(
         self,
-        sharding_type: str,
         kernel_type: str,
         fused_params: Dict[str, Any] | None = None,
     ) -> None:
-        self._sharding_type = sharding_type
         self._kernel_type = kernel_type
         if fused_params is None:
             fused_params = {}
@@ -154,7 +159,10 @@ class _ECSharder(EmbeddingCollectionSharder):
         super().__init__(fused_params=fused_params)
 
     def sharding_types(self, compute_device_type: str) -> List[str]:
-        return [self._sharding_type]
+        return [
+            ShardingType.ROW_WISE.value,
+            ShardingType.TABLE_WISE.value,
+        ]
 
     def compute_kernels(
         self, sharding_type: str, compute_device_type: str
@@ -167,43 +175,64 @@ def setup_dmp(
     cfg: RankFMConfig,
     gloo_world: int,
 ) -> Tuple[nn.Module, torch.optim.Optimizer]:
-    """Shard the ECSparseArch's EmbeddingCollection ROW_WISE on CPU via gloo.
-
-    The xsurface model's embedding tables live at:
-      model.recblock.tokenizer_stack.mot_sparse_arch._sparse_arch._embedding_collection
-    which is a TorchRecEmbeddingCollection. EmbeddingCollectionSharder shards
-    it in place; the surrounding ECSparseArch wrapper remains an
-    ``_ECSparseArch`` instance, so SparseArchOverride's
-    ``isinstance(orig_submodule, ECSparseArch)`` check still matches.
-
-    Returns (model_for_compile, dense_optimizer). The sparse params get the
-    FUSED in-backward optimizer (lr=cfg.embedding_lr); the dense optimizer
-    here covers everything else.
-    """
+    """Shard the EC ROW_WISE on CPU via gloo, mirroring dlrmv3."""
     if not dist.is_initialized():
         logger.info("Single-node: skipping DMP, using model directly")
         dense_opt = torch.optim.SGD(model.parameters(), lr=cfg.dense_lr, foreach=False)
         return model, dense_opt
 
     pg = dist.distributed_c10d._get_default_group()
-
     sharders = [
         _ECSharder(
-            sharding_type=ShardingType.ROW_WISE.value,
             kernel_type=EmbeddingComputeKernel.FUSED.value,
             fused_params={"learning_rate": cfg.embedding_lr},
         )
     ]
 
+    # Per-table sharding constraints. Pure ROW_WISE failed because some
+    # categorical tables in rankfm are tiny (interface_type ~ 10 rows,
+    # device_os ~ 100 rows, etc.); slicing them across 32 ranks gives
+    # <=1 row per rank, which trips an fbgemm CUDA-only fast path even
+    # though we requested CPU FUSED. Pure TABLE_WISE works but doesn't
+    # scale large tables (post_id, viewer_rid). Mix: small tables ->
+    # TABLE_WISE (each lives on one rank), large -> ROW_WISE (sliced
+    # across ranks for memory + compute parallelism).
+    ec = (
+        model.recblock.tokenizer_stack.mot_sparse_arch._sparse_arch._embedding_collection  # pyre-ignore[16]
+    )
+    ROW_WISE_MIN_ROWS_PER_RANK = 100
+    row_wise_min = gloo_world * ROW_WISE_MIN_ROWS_PER_RANK
+    constraints: Dict[str, ParameterConstraints] = {}
+    for table in ec.embedding_configs():
+        if table.num_embeddings >= row_wise_min:
+            sharding = ShardingType.ROW_WISE.value
+        else:
+            sharding = ShardingType.TABLE_WISE.value
+        constraints[table.name] = ParameterConstraints(
+            sharding_types=[sharding],
+        )
+        logger.info(
+            "  constraint: %s (%d rows) -> %s",
+            table.name,
+            table.num_embeddings,
+            sharding,
+        )
+
     planner = EmbeddingShardingPlanner(
         topology=Topology(world_size=gloo_world, compute_device="cpu"),
+        constraints=constraints,
     )
     plan = planner.collective_plan(model, sharders, pg)
-
     logger.info("DMP sharding plan:")
     for module_path, module_plan in plan.plan.items():
         for param_name, param_sharding in module_plan.items():
-            logger.info(f"  {module_path}.{param_name}: {param_sharding.sharding_type}")
+            logger.info(
+                "  %s.%s: sharding_type=%s compute_kernel=%s",
+                module_path,
+                param_name,
+                param_sharding.sharding_type,
+                getattr(param_sharding, "compute_kernel", "?"),
+            )
 
     dmp = DistributedModelParallel(
         model,
@@ -214,16 +243,14 @@ def setup_dmp(
         device=torch.device("cpu"),
         init_data_parallel=False,
     )
-
     dense_opt = KeyedOptimizerWrapper(
         dict(in_backward_optimizer_filter(dmp.named_parameters())),
         lambda params: torch.optim.SGD(params, lr=cfg.dense_lr, foreach=False),
     )
-
-    logger.info("DMP initialized with ROW_WISE embedding sharding on CPU (gloo)")
-    # Return dmp.module so downstream code (override matching, train_step
-    # forward) sees the original model attribute paths. The sharded EC lives
-    # inside _sparse_arch._embedding_collection, transparently.
+    logger.info("DMP initialized: ROW_WISE EC on CPU (gloo_world=%d)", gloo_world)
+    # Return dmp.module so override matching (isinstance(orig_submodule,
+    # ECSparseArch)) still works - DMP shards the EmbeddingCollection in
+    # place inside ECSparseArch but doesn't replace the wrapper.
     return dmp.module, dense_opt
 
 
@@ -292,30 +319,35 @@ def _build_compiled_train_step(
     # Sample input + batch must be built BEFORE DMP because _build_overrides
     # walks the recblock and registers forward hooks; doing this against the
     # post-DMP module is fine but cleanest before sharding.
+    torch.manual_seed(0)
     _, ro_keys, nro_keys = _make_sample_input(
-        model.recblock, device, batch_size=global_bs
+        model.recblock, device, batch_size=cfg.local_batch_size
     )
     batch = _create_random_train_batch(
+        feature_config,
+        device,
+        batch_size=cfg.local_batch_size,
+        ro_kjt_keys=ro_keys,
+        nro_kjt_keys=nro_keys,
+    )
+
+    # Build overrides BEFORE DMP. _build_overrides runs the sparse arch
+    # eagerly and captures its output via a forward hook; that captured
+    # tensor becomes the SparseArchOverride dummy used during XLA tracing.
+    expanded_batch = _create_random_train_batch(
         feature_config,
         device,
         batch_size=global_bs,
         ro_kjt_keys=ro_keys,
         nro_kjt_keys=nro_keys,
     )
-
-    # Apply gloo + DMP for ROW_WISE embedding sharding. After this call,
-    # model.recblock.tokenizer_stack.mot_sparse_arch._sparse_arch is still
-    # an _ECSparseArch (so SparseArchOverride.replacement matches via
-    # isinstance), but the EmbeddingCollection inside is sharded.
-    model, dense_opt = setup_dmp(model, cfg, gloo_world)
-
-    all_labels = batch.all_labels
+    all_labels = expanded_batch.all_labels
     assert all_labels is not None
     batch_sample = _inputs_to_feature_bundle(
-        batch.ro_id_list_features,
+        expanded_batch.ro_id_list_features,
         None,
-        batch.nro_id_list_features,
-        batch.num_candidates,
+        expanded_batch.nro_id_list_features,
+        expanded_batch.num_candidates,
         all_labels,
     )
     recblock = model.recblock
@@ -326,6 +358,12 @@ def _build_compiled_train_step(
         device,
         batch_size=global_bs,
     )
+
+    # Apply gloo + DMP for ROW_WISE embedding sharding. After this call,
+    # model.recblock.tokenizer_stack.mot_sparse_arch._sparse_arch is still
+    # an _ECSparseArch (so SparseArchOverride.replacement matches via
+    # isinstance), but the EmbeddingCollection inside is sharded.
+    model, dense_opt = setup_dmp(model, cfg, gloo_world)
 
     # Capture KJT keys for the runtime reconstruction inside train_step.
     ro_kjt = batch.ro_id_list_features
@@ -528,7 +566,12 @@ def main() -> None:
     torch.manual_seed(0)
     num_tpu_devices = jax.device_count()
     num_ranks = num_tpu_devices if num_tpu_devices > 1 else gloo_world
-    global_bs = cfg.local_batch_size * num_ranks
+    # global_bs = local_batch_size * gloo_world (NOT * num_ranks). num_ranks
+    # (jax.device_count) is the GSPMD mesh size used for grad averaging;
+    # gloo_world is the number of OS processes contributing data. global_bs
+    # must equal local_batch_size * gloo_world for the override's
+    # cached_output (sized at global_bs) to match the expanded trace input.
+    global_bs = cfg.local_batch_size * gloo_world
     train_step, model, opt, batch, _ = _build_compiled_train_step(
         cfg,
         num_ranks=num_ranks,

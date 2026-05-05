@@ -32,9 +32,7 @@ from hammer.v3.modules.mot.preprocessors.mot_preprocessor import MoTPreprocessor
 from hammer.v3.modules.mot.tokenizers.mot_sparse_arch import ECSparseArch
 from hammer.v3.modules.recblock import _inputs_to_feature_bundle, RecBlock
 from minimal_viable_ai.core.dataloader.dataloader import RandomDataPipe
-from minimal_viable_ai.core.dataloader.dataloader_core_configs import (
-    RandomROODataSourceConfig,
-)
+from minimal_viable_ai.core.dataloader.dataloader_configs import RandomDataSourceConfig
 from minimal_viable_ai.core.model_family_api.configs import RecModelFamilyConfig
 from minimal_viable_ai.core.ranking_common.configs import MTMLROOTrainBatch
 from recir.api import Override
@@ -176,57 +174,47 @@ class DummyPreprocessorStack(nn.Module):
         self._num_tensors: int = tensor_idx
         self._num_kjts: int = kjt_idx
 
-    def _mark_inputs(self, features: FeatureBundle) -> List[torch.Tensor]:
+    def forward(self, features: FeatureBundle) -> FeatureBundle:
         oid = self._override_id
+
+        # Mark input tensor leaves with anchor_input. Iterate the actual
+        # features bundle (not the sample-captured lists) so the ordering
+        # matches what the pre-hook captures at trace time. This ensures
+        # the anchor indices align with fwd_fn's reconstruction order.
         input_idx = 0
-        marked_sums: List[torch.Tensor] = []
+        anchored_inputs: List[torch.Tensor] = []
         for desc in features:
             val = features.get(desc)
             if val is None:
                 continue
             if isinstance(val, KeyedJaggedTensor):
-                m_v = anchor_input(val.values(), oid, input_idx)
-                marked_sums.append(m_v.float().sum())
+                anchored_inputs.append(anchor_input(val.values(), oid, input_idx))
                 input_idx += 1
-                m_l = anchor_input(val.lengths(), oid, input_idx)
-                marked_sums.append(m_l.float().sum())
+                anchored_inputs.append(anchor_input(val.lengths(), oid, input_idx))
                 input_idx += 1
             elif isinstance(val, torch.Tensor):
-                m = anchor_input(val, oid, input_idx)
-                marked_sums.append(m.float().sum())
+                anchored_inputs.append(anchor_input(val, oid, input_idx))
                 input_idx += 1
             elif isinstance(val, dict):
                 for key in sorted(val.keys()):
                     if isinstance(val[key], torch.Tensor):
-                        m = anchor_input(val[key], oid, input_idx)
-                        marked_sums.append(m.float().sum())
+                        anchored_inputs.append(anchor_input(val[key], oid, input_idx))
                         input_idx += 1
-        return marked_sums
-
-    def forward(self, features: FeatureBundle) -> FeatureBundle:
-        oid = self._override_id
-        marked_sums = self._mark_inputs(features)
-
-        _batch_sum: torch.Tensor = (
-            torch.stack(marked_sums).sum() if marked_sums else torch.tensor(0.0)
-        )
-        _batch_dep = _batch_sum * 0.0 + self._grad_anchor * 0.0
-        _batch_dep_long = _batch_dep.long()
-
-        # Build output tensors from buffers + batch_dep, wrap with anchor_output.
-        # Use _batch_dep_long for integer tensors to preserve dtype.
         output_tensors: List[torch.Tensor] = []
         for i in range(self._num_tensors):
             buf = getattr(self, f"_tensor_{i}")
-            dep = _batch_dep if buf.is_floating_point() else _batch_dep_long
-            output_tensors.append(buf + dep)
+            output_tensors.append(torch.zeros_like(buf))
         for i in range(self._num_kjts):
             vbuf = getattr(self, f"_kjt_values_{i}")
-            dep_v = _batch_dep if vbuf.is_floating_point() else _batch_dep_long
-            output_tensors.append(vbuf + dep_v)
-            output_tensors.append(getattr(self, f"_kjt_lengths_{i}") + _batch_dep_long)
+            lbuf = getattr(self, f"_kjt_lengths_{i}")
+            output_tensors.append(torch.zeros_like(vbuf))
+            output_tensors.append(lbuf.clone())
 
-        anchored = [anchor_output(t, oid, idx) for idx, t in enumerate(output_tensors)]
+        deps: List[torch.Tensor] = anchored_inputs + [self._grad_anchor]
+        anchored = [
+            anchor_output(t, oid, idx, deps=deps)
+            for idx, t in enumerate(output_tensors)
+        ]
 
         # Reconstruct FeatureBundle from anchored tensors.
         bundle = FeatureBundle()
@@ -281,26 +269,24 @@ class DummySparseArch(nn.Module):
     ) -> Dict[str, JaggedTensor]:
         oid = self._override_id
 
-        # Mark input KJT components with anchor_input.
+        # Anchor the input KJT components so SparseArchOverride.transform can
+        # rediscover them via replace_override_anchors and use them as
+        # dispatch inputs (instead of falling back to all batch placeholders).
         m_v = anchor_input(id_list_features.values(), oid, 0)
         m_l = anchor_input(id_list_features.lengths(), oid, 1)
 
-        _batch_dep = (
-            m_v.float().sum() + m_l.float().sum()
-        ) * 0.0 + self._grad_anchor * 0.0
-        _batch_dep_long = _batch_dep.long()
+        deps: List[torch.Tensor] = [m_v, m_l, self._grad_anchor]
 
-        # Build output tensors from buffers + batch_dep, wrap with anchor_output.
         out_idx = 0
         result: Dict[str, JaggedTensor] = {}
         for i, name in enumerate(self._feature_names):
-            v = anchor_output(
-                getattr(self, f"_jt_values_{i}") + _batch_dep, oid, out_idx
-            )
-            lengths = anchor_output(
-                getattr(self, f"_jt_lengths_{i}") + _batch_dep_long, oid, out_idx + 1
-            )
-            result[name] = JaggedTensor(values=v, lengths=lengths)
+            vbuf = getattr(self, f"_jt_values_{i}")
+            lbuf = getattr(self, f"_jt_lengths_{i}")
+            v_z = torch.zeros_like(vbuf)
+            l_z = lbuf.clone()
+            v = anchor_output(v_z, oid, out_idx, deps=deps)
+            l = anchor_output(l_z, oid, out_idx + 1, deps=deps)
+            result[name] = JaggedTensor(values=v, lengths=l)
             out_idx += 2
         return result
 
@@ -773,12 +759,17 @@ def _create_random_train_batch(
     C = TEST_NUM_CANDIDATES
     B_NRO = B * C
 
-    data_source_config = RandomROODataSourceConfig(
+    # TODO: Enable and test ROO data
+    # data_source_config = RandomROODataSourceConfig(
+    #     batch_size=B,
+    #     num_batches=1,
+    #     num_generate=1,
+    #     num_candidates=C,
+    #     pin_memory=False,
+    # )
+    data_source_config = RandomDataSourceConfig(
         batch_size=B,
-        num_batches=1,
         num_generate=1,
-        num_candidates=C,
-        pin_memory=False,
     )
     data_pipe = RandomDataPipe(
         feature_config=feature_config,
