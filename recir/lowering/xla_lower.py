@@ -53,6 +53,7 @@ class _XLAModule(torch.nn.Module):
         self.xla_hlo_text: Optional[str] = None
         self.keep_jax_output: bool = False
         self.torch_output_indices: Optional[set[int]] = None
+        self.safe_donate_indices: Optional[set[int]] = None
 
     def _postprocess_jax_output(
         self, jax_out: Any, input_device: torch.device
@@ -374,8 +375,26 @@ class _XLAModule(torch.nn.Module):
             sum(is_fsdp_sharded),
             mesh.axis_names,
         )
+        # Donate state inputs (weights, gradients, optimizer state) so XLA can
+        # reuse their HBM buffers for the corresponding outputs (in-place
+        # update). Without this, JAX runtime holds both old (W, G, M) and new
+        # (W', G', M') simultaneously during the train step, doubling
+        # persistent state from ~45 GB to ~90 GB per device on Llama-3-8B
+        # and triggering HBM OOM at LoadProgram.
+        safe_donate = self.safe_donate_indices or set()
+        donate_argnums = tuple(
+            i for i, b in enumerate(is_batch) if not b and i in safe_donate
+        )
+        logger.info(
+            "GSPMD: donating %d/%d input buffers (state) for in-place update",
+            len(donate_argnums),
+            len(placeholders),
+        )
         jitted: Any = jax.jit(
-            jax_fn, in_shardings=in_shardings, out_shardings=out_shardings
+            jax_fn,
+            in_shardings=in_shardings,
+            out_shardings=out_shardings,
+            donate_argnums=donate_argnums,
         )
 
         _hlo_captured: List[bool] = [False]
@@ -510,6 +529,17 @@ def _jax_to_torch(t: Any, device: torch.device) -> Any:
     For batch-sharded arrays (shards differ), concatenates all addressable
     shards to reconstruct the per-process tensor.  For replicated arrays
     (all shards identical), takes a single shard.
+
+    Preserves bf16 dtype: numpy doesn't natively represent bf16 so the
+    transfer round-trips through fp32 in `_jax_to_numpy`; the inverse
+    cast back to bf16 happens here.  Without this cast, JAX outputs from
+    a bf16-compiled program would be returned as fp32 torch tensors,
+    which (when cached in `XLADeviceStateManager.device_state`) would
+    feed fp32 inputs into the NEXT compiled step — triggering a JAX
+    cache miss + re-compile of the same train_step in fp32.  See the
+    "OOM #3" subsection of
+    `mrs/rankevolve/rankagi/post_train/scripts/gpu/benchmark_results.md`
+    (llama3-8b section) for the runtime evidence.
     """
     import numpy as np
 
@@ -519,6 +549,7 @@ def _jax_to_torch(t: Any, device: torch.device) -> Any:
         return [_jax_to_torch(x, device) for x in t]
     if isinstance(t, tuple):
         return tuple(_jax_to_torch(x, device) for x in t)
+    src_is_bf16 = hasattr(t, "dtype") and getattr(t.dtype, "name", "") == "bfloat16"
     if hasattr(t, "addressable_shards") and t.addressable_shards:
         shards = t.addressable_shards
         if len(shards) > 1 and shards[0].data.shape != t.shape:
@@ -532,11 +563,33 @@ def _jax_to_torch(t: Any, device: torch.device) -> Any:
             np_arr = _jax_to_numpy(shards[0].data)
         if np_arr.ndim == 0:
             return torch.tensor(np_arr.item(), device=device)
-        return torch.tensor(np_arr, device=device)
+        out = torch.tensor(np_arr, device=device)
+        if src_is_bf16:
+            out = out.to(torch.bfloat16)
+        return out
     np_arr = _jax_to_numpy(t)
     if np_arr.ndim == 0:
         return torch.tensor(np_arr.item(), device=device)
-    return torch.tensor(np_arr, device=device)
+    out = torch.tensor(np_arr, device=device)
+    if src_is_bf16:
+        out = out.to(torch.bfloat16)
+    return out
+
+
+def _annotate_safe_donate_indices(gm: torch.fx.GraphModule) -> None:
+    for call_node in gm.graph.nodes:
+        if call_node.op != "call_module":
+            continue
+        target = getattr(gm, call_node.target, None)
+        if not isinstance(target, _XLAModule):
+            continue
+        safe: set[int] = set()
+        for i, arg in enumerate(call_node.args):
+            if not isinstance(arg, torch.fx.Node):
+                continue
+            if set(arg.users.keys()) == {call_node}:
+                safe.add(i)
+        target.safe_donate_indices = safe
 
 
 def _strip_profiler_nodes(gm: torch.fx.GraphModule) -> torch.fx.GraphModule:
@@ -578,7 +631,7 @@ def partial_lower_xla(
     # Strip profiler ops before segmentation so their ScriptObject
     # handles never become XLA subgraph inputs.
     gm = _strip_profiler_nodes(gm)
-    return segment_and_lower(
+    lowered = segment_and_lower(
         gm,
         compatibility_fn=_is_xla_compatible,
         module_factory=lambda sub_gm: _XLAModule(sub_gm, backend_type),
@@ -587,3 +640,5 @@ def partial_lower_xla(
         subgraph_predicate=subgraph_predicate,
         dumper=dumper,
     )
+    _annotate_safe_donate_indices(lowered)
+    return lowered
