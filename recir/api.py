@@ -46,7 +46,9 @@ from recir.region_transforms import (
 )
 from torch import fx
 from torch._subclasses.fake_tensor import FakeTensorMode
+from torch.export.unflatten import _assign_attr, _AttrKind
 from torch.fx.graph import _PyTreeCodeGen, _PyTreeInfo, CodeGen
+from torch.fx.graph_module import _del_attr, _get_attr
 from torch.nn.utils import stateless
 from torch.nn.utils._named_member_accessor import NamedMemberAccessor
 
@@ -245,6 +247,12 @@ class _LocalCompiledResult:
     params: Dict[str, nn.Parameter]
     buffers: Dict[str, torch.Tensor]
     named_states: Dict[str, Any]
+    # Tensor constants referenced via ``get_attr`` nodes in ``gm`` (e.g. inline
+    # tensor literals lifted by ``make_fx``). Keyed by fully-qualified attribute
+    # name on ``gm`` so downstream serde / inspection can recover them. These
+    # are stored as gm attributes (not placeholders) and registered via
+    # ``_AttrKind.CONSTANT`` so they survive ``gm.recompile()`` cleanly.
+    constants: Dict[str, torch.Tensor]
 
 
 def _local_compile(
@@ -374,7 +382,47 @@ def _local_compile(
             _allow_non_fake_inputs=False,
         )(params, buffers, named_states, args, kwargs)
 
-    return _LocalCompiledResult(gm, mod, opt, params, buffers, named_states)
+    # Re-register tensor ``get_attr`` constants as ``_AttrKind.CONSTANT``.
+    #
+    # ``make_fx`` lifts inline tensor literals into module attributes referenced
+    # by ``get_attr`` nodes. ``fx.GraphModule.__init__`` silently registers any
+    # tensor attribute that isn't an ``nn.Parameter`` as a *buffer*. Buffers are
+    # rewritten on subsequent ``gm.recompile()`` calls (the codegen treats them
+    # like state) and aren't propagated through later passes that move sub-gms
+    # around. By deregistering each tensor get_attr and reassigning it via
+    # ``_assign_attr(..., _AttrKind.CONSTANT)`` we (a) preserve the value across
+    # ``recompile`` and (b) give downstream passes (e.g. data-parallel strategy
+    # building) a stable tensor attribute they can introspect via the qualified
+    # path.
+    #
+    # In production today, ``make_fx`` emits flat top-level attribute names
+    # (e.g. ``_tensor_constant0``), so qualified paths don't actually appear
+    # here. The qualname-aware helpers from ``torch.fx.graph_module`` are used
+    # for robustness against any FUTURE qualified targets — for example, custom
+    # tracers, downstream passes that move attrs into submodules, or upstream
+    # changes to ``make_fx``. Every ``get_attr`` target produced by ``make_fx``
+    # references an attribute that exists on ``gm``; if ``_get_attr`` ever
+    # raises here it indicates an upstream invariant break, so let the
+    # exception propagate rather than silently skip the node.
+    constants: Dict[str, torch.Tensor] = {}
+    for node in gm.graph.nodes:
+        if node.op != "get_attr":
+            continue
+        fqn = node.target
+        if not isinstance(fqn, str):
+            continue
+        value = _get_attr(gm, fqn)
+        if not isinstance(value, torch.Tensor):
+            continue
+        # Multiple ``get_attr`` nodes can share the same target FQN; only
+        # re-register once per unique attribute name.
+        if fqn in constants:
+            continue
+        _del_attr(gm, fqn)
+        _assign_attr(value, gm, fqn, attr_kind=_AttrKind.CONSTANT)
+        constants[fqn] = value
+
+    return _LocalCompiledResult(gm, mod, opt, params, buffers, named_states, constants)
 
 
 def _make_batch_transform(
