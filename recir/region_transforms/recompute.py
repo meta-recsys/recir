@@ -44,8 +44,11 @@ class RecomputeTransform(RegionTransform):
             if nn_module_stack is None:
                 continue
             # nn_module_stack is an OrderedDict of
-            # {module_fqn: (module_class_fqn, module_type)}
-            for fqn in nn_module_stack:
+            # {tracer_key: (module_fqn, module_class_fqn)} as populated by
+            # torch.fx.experimental.proxy_tensor.PythonKeyTracer.create_node.
+            # The dict keys are opaque tracer identifiers; the FQN to match
+            # against is the first element of the value tuple.
+            for fqn, _ in nn_module_stack.values():
                 if fqn in self.submodule_fqns:
                     fqn_to_nodes.setdefault(fqn, set()).add(node)
         regions: list[set[fx.Node]] = []

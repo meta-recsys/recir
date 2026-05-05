@@ -491,6 +491,11 @@ def _apply_region_transforms(
                     out = out * _grad_scale
                 return out
 
+    # ``record_module_stack=True`` makes make_fx use ``_ModuleStackTracer``
+    # which populates ``node.meta["nn_module_stack"]`` (used by FQN-based
+    # transforms like RecomputeTransform).  ``_ModuleStackTracer`` requires
+    # ``_orig_mod`` on the traced callable to identify the scope root.
+    _stateless_forward._orig_mod = root_mod  # type: ignore[attr-defined]
     with (
         fake_mode,
         _preserve_autograd_function_leaves(_autograd_function_leaves or set()),
@@ -499,6 +504,7 @@ def _apply_region_transforms(
             _stateless_forward,
             tracing_mode="fake",
             _allow_non_fake_inputs=True,
+            record_module_stack=True,
         )({**params, **buffers}, *fake_args)
 
     for transform in transforms:

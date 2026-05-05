@@ -255,7 +255,6 @@ def _local_compile(
     _parametrize_fns: Optional[List[Callable[[torch.Tensor], torch.Tensor]]] = None,
     _exclude_param_fqns: Optional[set[str]] = None,
     _stateless_func_wrapper: Optional[Callable[..., Any]] = None,
-    _input_transform: Optional[Callable[[Any], Any]] = None,
     **kwargs: Any,
 ) -> _LocalCompiledResult:
     """Trace a train_step into a local FX graph.
@@ -273,8 +272,8 @@ def _local_compile(
         module_override: Optional list of Override instances for submodule replacement.
         *args: Arguments to the train_step function (must include nn.Module and Optimizer).
         fake_mode: The FakeTensorMode to use for tracing. Each compile path creates
-            its own mode and passes it here. This mode wraps the make_fx call
-            and is used to convert inputs when no _input_transform is provided.
+            its own mode and passes it here. Callers are responsible for
+            converting inputs to FakeTensors before calling this function.
         _parametrize_fns: Optional list of per-parameter transform functions.
             Each ``fn(param) -> param`` is registered via :func:`parametrize_params`
             on the module during tracing, and deregistered after.  Multiple
@@ -283,9 +282,6 @@ def _local_compile(
             traced function execution (e.g., gradients_tagging for the v1/GSPMD
             DataParallel path).  Receives the ``params`` dict and returns a
             context manager.  If None, no additional wrapping is applied.
-        _input_transform: Optional function to transform input tensors before tracing
-            (e.g., FakeTensor conversion with batch expansion for DataParallel).
-            If None, inputs are converted to FakeTensors using fake_mode.
         **kwargs: Keyword arguments to the train_step function.
     """
     # 1. Extract nn.Module and Optimizer from args and kwargs
@@ -365,18 +361,6 @@ def _local_compile(
             # Return updated state in the same pytree structure used to build
             # flat_state so DeviceStateManager can copy outputs back by index.
             return ret, params, buffers, named_states
-
-    # Convert inputs (default: simple FakeTensor conversion).
-    if _input_transform is not None:
-        args = pytree.tree_map_only(torch.Tensor, _input_transform, args)
-        kwargs = pytree.tree_map_only(torch.Tensor, _input_transform, kwargs)
-    else:
-        args = pytree.tree_map_only(
-            torch.Tensor, lambda t: fake_mode.from_tensor(t), args
-        )
-        kwargs = pytree.tree_map_only(
-            torch.Tensor, lambda t: fake_mode.from_tensor(t), kwargs
-        )
 
     with fake_mode, _enable_compile(), torch.autograd.detect_anomaly(check_nan=False):
         # FIXME(@mrshenli): functionalization does not work for our use
@@ -612,17 +596,19 @@ def _compile_data_parallel(
       8. Apply module overrides
     """
     fake_mode: FakeTensorMode = FakeTensorMode()
+    input_transform = _make_batch_transform(
+        parallel_mode.input_batch_dim,
+        ratio=parallel_mode.num_processes,
+        fake_mode=fake_mode,
+    )
+    args = pytree.tree_map_only(torch.Tensor, input_transform, args)
+    kwargs = pytree.tree_map_only(torch.Tensor, input_transform, kwargs)
     local_result = _local_compile(
         func,
         module_override,
         *args,
         fake_mode=fake_mode,
         _stateless_func_wrapper=gradients_tagging,
-        _input_transform=_make_batch_transform(
-            parallel_mode.input_batch_dim,
-            ratio=parallel_mode.num_processes,
-            fake_mode=fake_mode,
-        ),
         **kwargs,
     )
     gm = local_result.gm
@@ -732,12 +718,25 @@ def _compile_data_parallel_v2(
         transforms.append(RegatherTransform(skip_param_fqns=embedding_param_fqns))
     if region_transforms:
         transforms.extend(region_transforms)
-    discovery = _discover_for_region_transforms(
-        transforms, func, args, kwargs, mod=_mod
-    )
 
     # 5. Set up external fake mode for tracing.
     fake_mode: FakeTensorMode = FakeTensorMode(allow_non_fake_inputs=True)
+
+    # Apply the per-process → per-device batch transform up front, so
+    # discovery, region-transform inner trace, and the outer trace all
+    # see the same (per-device) input shape.  Otherwise the region's
+    # ``gm_fwd`` would bake per-process shapes that conflict with the
+    # outer trace's narrowed inputs.
+    input_transform = _make_batch_transform(
+        parallel_mode.input_batch_dim,
+        ratio=1 / (world_size // parallel_mode.num_processes),
+        fake_mode=fake_mode,
+    )
+    args = pytree.tree_map_only(torch.Tensor, input_transform, args)
+    kwargs = pytree.tree_map_only(torch.Tensor, input_transform, kwargs)
+    discovery = _discover_for_region_transforms(
+        transforms, func, args, kwargs, mod=_mod
+    )
 
     # 6. Shard params on the module and optimizer states.
     #    shard_params mutates both the dict and the module in-place.
@@ -781,11 +780,6 @@ def _compile_data_parallel_v2(
             fake_mode=fake_mode,
             _parametrize_fns=[] if transforms else [collectives_fn],
             _exclude_param_fqns=embedding_param_fqns if not transforms else None,
-            _input_transform=_make_batch_transform(
-                parallel_mode.input_batch_dim,
-                ratio=1 / (world_size // parallel_mode.num_processes),
-                fake_mode=fake_mode,
-            ),
             **kwargs,
         )
 
@@ -833,6 +827,18 @@ def _compile_gspmd(
     """
     fake_mode: FakeTensorMode = FakeTensorMode()
     transforms = region_transforms or []
+    # Apply the per-process → global batch transform up front, so discovery,
+    # region-transform inner trace, and the outer ``_local_compile`` trace
+    # all see the same (global) input shape.  Otherwise the region's
+    # ``gm_fwd`` would bake per-process shapes (e.g. ``aten.view`` target
+    # lists) that conflict with the outer trace's expanded inputs.
+    input_transform = _make_batch_transform(
+        parallel_mode.input_batch_dim,
+        ratio=parallel_mode.num_processes,
+        fake_mode=fake_mode,
+    )
+    args = pytree.tree_map_only(torch.Tensor, input_transform, args)
+    kwargs = pytree.tree_map_only(torch.Tensor, input_transform, kwargs)
     discovery = _discover_for_region_transforms(transforms, func, args, kwargs)
     with ExitStack() as region_stack:
         _enter_region_transform_contexts(region_stack, transforms, discovery, fake_mode)
@@ -842,11 +848,6 @@ def _compile_gspmd(
             *args,
             fake_mode=fake_mode,
             _stateless_func_wrapper=gradients_tagging,
-            _input_transform=_make_batch_transform(
-                parallel_mode.input_batch_dim,
-                ratio=parallel_mode.num_processes,
-                fake_mode=fake_mode,
-            ),
             **kwargs,
         )
     gm = local_result.gm
