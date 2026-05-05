@@ -40,7 +40,7 @@ from torch._subclasses.fake_tensor import FakeTensorMode
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.tensor import DeviceMesh
 from torch.distributed.tensor._dtensor_spec import DTensorSpec
-from torch.distributed.tensor.placement_types import Replicate, Shard
+from torch.distributed.tensor.placement_types import Partial, Replicate, Shard
 from torch.fx.graph_module import _get_attr, _has_attr
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.testing._internal.common_distributed import skip_if_lt_x_gpu
@@ -1074,6 +1074,122 @@ class TestBuildDataParallelStrategies(unittest.TestCase):
         self.assertAlmostEqual(result[3], 3.14)
         self.assertTrue(result[4])
         self.assertEqual(result[5], "metadata")
+
+
+class _SumOverShardAxisModule(nn.Module):
+    """Reduces ``(B, F1, F2, F3)`` over the leading ``B, F1, F2`` dims with
+    ``keepdim=True``.
+
+    The shape is hand-picked so the reduced output ``(1, 1, 1, F3)`` has a
+    trailing dim whose size equals ``B`` (i.e. ``F3 == B``).  This collision
+    is what causes the size-match heuristic in ``BatchDimAnalyzer`` to mis-
+    classify the sum's output as ``Shard(F3_axis)`` when no op-specific rule
+    fires first.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        # Trivial parameter so ``_local_compile`` has something to track.
+        self.scale: nn.Parameter = nn.Parameter(torch.ones(1))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # ``torch.sum`` with a list dim arg lowers to ``aten.sum.dim_IntList``.
+        return (x * self.scale).sum(dim=[0, 1, 2], keepdim=True)
+
+
+class TestSumOverShardedAxisPartial(unittest.TestCase):
+    """Regression test for ``aten.sum.dim_IntList`` reducing the shard axis.
+
+    Background: ``BatchDimAnalyzer.compute_batch_dim`` falls back to a raw
+    output-shape size match when the op is not in ``dim_rule_map``.  For an
+    activation with batch dim 0 and ``batch_dim_size=8`` flowing into
+
+        ``aten.sum.dim_IntList(input, [0, 1, 2], keepdim=True)``
+
+    on a global shape ``(8, 32, 8, 8)``, the keepdim=True output shape is
+    ``(1, 1, 1, 8)`` -- the trailing dim incidentally equals 8 and the
+    size-match heuristic returned ``3``, producing a ``Shard(3)`` placement
+    and silently turning a Partial-producing reduction into a fake shard.
+    Downstream view rewrites then expect the wrong per-rank shape and crash
+    at runtime -- this matches the production DDRO sum-over-sharded-batch
+    chain that exposed the bug.
+
+    Correct semantics: when the input is ``Shard(k)`` and ``k`` is in the
+    sum's reduce-dim list, the output is a partial sum across the shard mesh
+    dim and must carry a ``Partial`` placement so a subsequent allreduce can
+    materialise the global value.
+
+    Scope of this regression: ``aten.sum.dim_IntList`` only.  Other reductions
+    (mean/max/prod) have differing partial-reduction semantics and are out of
+    scope for this fix.
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        if not torch.distributed.is_initialized():
+            torch.distributed.init_process_group("fake", rank=0, world_size=2)
+            cls._owns_pg = True
+        else:
+            cls._owns_pg = False
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        if cls._owns_pg:
+            torch.distributed.destroy_process_group()
+
+    def test_sum_dim_intlist_over_shard_axis_emits_partial(self) -> None:
+        # Trace a real nn.Module via ``_local_compile`` so the test exercises
+        # the same code path the production compile uses (see
+        # ``TestBuildStrategiesGetAttrClassification`` for the analogous
+        # pattern in this file).
+        mod = _SumOverShardAxisModule()
+        x = torch.randn(8, 32, 8, 8)
+        fake_mode = FakeTensorMode(allow_non_fake_inputs=True)
+        result = _local_compile(
+            lambda mod, x: mod(x), None, mod, x, fake_mode=fake_mode
+        )
+        gm = result.gm
+
+        sum_nodes = [
+            n for n in gm.graph.nodes if n.target == torch.ops.aten.sum.dim_IntList
+        ]
+        self.assertEqual(
+            len(sum_nodes),
+            1,
+            f"Expected exactly one aten.sum.dim_IntList node, got {len(sum_nodes)}",
+        )
+        sum_node = sum_nodes[0]
+
+        mesh = DeviceMesh("cpu", torch.arange(2))
+        strategy_map = build_data_parallel_strategies(
+            gm,
+            num_params=len(result.params),
+            num_states=len(result.named_states),
+            mesh=mesh,
+            batch_dim=0,
+            parallel_mode=DataParallelStyle.FULLY_SHARD,
+        )
+
+        sum_strategy = cast(DataParallelStrategy, strategy_map[sum_node])
+        self.assertEqual(sum_strategy.node_type, NodeType.ACT)
+        op_spec = sum_strategy.op_spec
+        assert op_spec is not None
+        out_specs = op_spec.output_specs
+        output_spec = out_specs[0] if isinstance(out_specs, tuple) else out_specs
+        assert isinstance(output_spec, DTensorSpec)
+        self.assertEqual(len(output_spec.placements), 1)
+        placement = output_spec.placements[0]
+        self.assertIsInstance(
+            placement,
+            Partial,
+            (
+                f"Expected Partial placement for aten.sum.dim_IntList that "
+                f"reduces over the shard axis, got {placement!r}"
+            ),
+        )
+        # Default reduce_op for Partial() is "sum"; confirm we did not pick
+        # up an avg/max accidentally.
+        self.assertEqual(cast(Partial, placement).reduce_op, "sum")
 
 
 class _NestedTensorConstantModule(nn.Module):

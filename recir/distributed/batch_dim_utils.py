@@ -5,7 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 # pyre-strict
-from typing import Callable, Dict, List, Set
+from typing import Callable, Dict, List, Optional, Set
 
 import torch
 import torch.fx as fx
@@ -18,6 +18,72 @@ from torch.distributed.tensor.placement_types import Partial as _Partial
 
 
 aten: torch._ops._OpNamespace = torch.ops.aten
+
+# Sentinel batch-dim values used by ``BatchDimAnalyzer``:
+#   REPLICATED: tensor has no batch dim and is fully replicated.
+#   PARTIAL:    tensor is a partial (un-reduced) result across the shard mesh
+#               dim; ``compute_act_spec`` converts this into a ``_Partial()``
+#               placement so a downstream allreduce can materialise the global
+#               value.
+# Non-negative values are real (output) batch-dim indices.
+REPLICATED: int = -1
+PARTIAL: int = -2
+
+
+# Registry of op-specific batch-dim propagation rules consulted *before* the
+# fallback shape-match heuristic in ``BatchDimAnalyzer.compute_batch_dim``.
+#
+# Why a pre-fallback hook is needed: the trailing fallback in
+# ``compute_batch_dim`` would correctly emit ``PARTIAL`` for a reduction whose
+# output drops the batch dim -- *if* it ever ran.  But the intervening shape
+# loop returns the first output dim whose size matches ``batch_dim_size``,
+# preempting the fallback.  Reductions like
+# ``aten.sum.dim_IntList(x, [0, 1, 2], keepdim=True)`` on an input shaped
+# ``(B, ..., F)`` where ``F == B`` produce an output whose trailing dim
+# incidentally equals ``batch_dim_size`` and get mis-classified as
+# ``Shard(F_axis)``.  Ops registered here run first and can short-circuit
+# that mis-classification.
+#
+# A rule is ``Callable[[node, operand_batch_dim, operand], Optional[int]]``;
+# returning ``None`` means "no opinion, continue with the default flow".
+_BatchDimRule = Callable[[fx.Node, int, fx.Node], Optional[int]]
+_BATCH_DIM_PROPAGATION_RULES: Dict[torch._ops.OpOverload, _BatchDimRule] = {}
+
+
+def _register_batch_dim_rule(
+    op: torch._ops.OpOverload,
+) -> Callable[[_BatchDimRule], _BatchDimRule]:
+    def _decorator(fn: _BatchDimRule) -> _BatchDimRule:
+        _BATCH_DIM_PROPAGATION_RULES[op] = fn
+        return fn
+
+    return _decorator
+
+
+@_register_batch_dim_rule(aten.sum.dim_IntList)
+def _propagate_sum_dim_intlist(
+    node: fx.Node, operand_batch_dim: int, operand: fx.Node
+) -> Optional[int]:
+    """Emit ``PARTIAL`` when ``aten.sum.dim_IntList`` reduces the shard axis.
+
+    Scope is intentionally narrow: only ``aten.sum.dim_IntList``;
+    mean/max/prod have differing partial-reduction semantics and are out of
+    scope.
+    """
+    if len(node.args) < 2:
+        return None
+    reduce_dims_arg = node.args[1]
+    if not isinstance(reduce_dims_arg, (list, tuple)):
+        return None
+    operand_ndim = operand.meta["val"].ndim
+    normalised_reduce_dims = {
+        (d + operand_ndim) if d < 0 else d
+        for d in reduce_dims_arg
+        if isinstance(d, int)
+    }
+    if operand_batch_dim in normalised_reduce_dims:
+        return PARTIAL
+    return None
 
 
 class BatchDimAnalyzer:
@@ -125,6 +191,20 @@ class BatchDimAnalyzer:
                 # node_val doesn't have a shape (e.g., _RecordFunction), skip shape analysis
                 shapes = []
 
+        # Op-specific propagation rules run *before* the size-match fallback
+        # below.  See ``_BATCH_DIM_PROPAGATION_RULES`` for the rationale.
+        rule = _BATCH_DIM_PROPAGATION_RULES.get(node.target)
+        if rule is not None:
+            rule_inputs = node.all_input_nodes
+            if rule_inputs and rule_inputs[0] in self.batch_dim_map:
+                operand = rule_inputs[0]
+                operand_batch_dim = self.batch_dim_map[operand]
+                if operand_batch_dim >= 0:
+                    rule_result = rule(node, operand_batch_dim, operand)
+                    if rule_result is not None:
+                        self.set_batch_dim(node, rule_result)
+                        return rule_result
+
         # for reduction op that reduces over the sharded batch dim
         # we don't generate partial, but rather, we generate shard
         # This is because the intention of data parallel is to never
@@ -145,9 +225,8 @@ class BatchDimAnalyzer:
         if not operands:
             # if there's no operands, it must be factory ops and it's a tensor
             # generated for computation and should be marked as replicated
-            self.set_batch_dim(node, -1)
-            # -1 means replicated
-            return -1
+            self.set_batch_dim(node, REPLICATED)
+            return REPLICATED
         else:
             # if there's operand we see the operand have batch dim, if operand
             # have batch dim but output does not, it's either a full reduction,
@@ -166,22 +245,19 @@ class BatchDimAnalyzer:
                 self.set_batch_dim(node, operand_batch_dim)
                 return operand_batch_dim
             else:
-                # if operand have batch dim but output does not, it should
-                # produce partial, we use -2 to indicate partial
-                self.set_batch_dim(node, -2)
-                return -2
+                # if operand has batch dim but output does not, produce
+                # partial.
+                self.set_batch_dim(node, PARTIAL)
+                return PARTIAL
 
     def compute_act_spec(self, node: fx.Node, mesh: DeviceMesh) -> DTensorSpec:
         """Compute the batch dimension for the current node, then generate the sharding spec that shards on the batch dimension."""
         node_batch_dim = self.compute_batch_dim(node)
-        if node_batch_dim == -1:
-            # indicate this activation is replicated
+        if node_batch_dim == REPLICATED:
             act_spec = DTensorSpec(mesh=mesh, placements=(Replicate(),))
-        elif node_batch_dim == -2:
-            # indicate this activation is partial
+        elif node_batch_dim == PARTIAL:
             act_spec = DTensorSpec(mesh=mesh, placements=(_Partial(),))
         else:
-            # indicate this activation is Shard
             act_spec = DTensorSpec(mesh=mesh, placements=(Shard(node_batch_dim),))
 
         return act_spec
