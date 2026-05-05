@@ -410,24 +410,26 @@ class TestRecomputeTransformDetection(unittest.TestCase):
         model = SimpleMLP()
         fake_mode = _make_fake_mode()
 
+        # nn_module_stack is only populated when make_fx runs with
+        # ``record_module_stack=True`` AND the traced callable exposes
+        # ``_orig_mod`` for ``_ModuleStackTracer`` to scope from.  This
+        # matches what ``_apply_region_transforms`` does internally.
+        traced_fn = lambda *args: model(*args)  # noqa: E731
+        traced_fn._orig_mod = model  # type: ignore[attr-defined]
         with fake_mode:
             gm = make_fx(
-                lambda *args: model(*args),
+                traced_fn,
                 tracing_mode="fake",
                 _allow_non_fake_inputs=True,
+                record_module_stack=True,
             )(fake_mode.from_tensor(torch.randn(4, 50)))
 
         transform = RecomputeTransform(submodule_fqns={"net1"})
         called: OrderedDict[str, tuple[nn.Module, tuple[Any, ...]]] = OrderedDict()
         regions = transform.detect_regions(gm, called)
 
-        # nn_module_stack metadata may or may not be populated depending on
-        # make_fx version. If populated, should detect one region for net1.
-        if regions:
-            self.assertEqual(len(regions), 1)
-            self.assertGreater(len(regions[0]), 0)
-        else:
-            self.assertEqual(len(regions), 0)
+        self.assertEqual(len(regions), 1)
+        self.assertGreater(len(regions[0]), 0)
 
     def test_nonexistent_submodule_returns_empty(self) -> None:
         model = SimpleMLP()
