@@ -29,17 +29,27 @@ _OVERRIDE_BWD: Dict[int, Callable] = {}
 _lib: torch.library.Library = torch.library.Library("recir_override", "DEF")  # noqa: TOR901
 
 
-def _fwd_anchor_cpu(x: torch.Tensor, override_id: int, output_idx: int) -> torch.Tensor:
+def _fwd_anchor_cpu(
+    x: torch.Tensor,
+    deps: list[torch.Tensor],  # noqa: ARG001
+    override_id: int,
+    output_idx: int,
+) -> torch.Tensor:
     return x
 
 
-_lib.define("fwd_anchor(Tensor x, int override_id, int output_idx) -> Tensor")
+_lib.define(
+    "fwd_anchor(Tensor x, Tensor[] deps, int override_id, int output_idx) -> Tensor"
+)
 _lib.impl("fwd_anchor", _fwd_anchor_cpu, "CPU")
 
 
 @torch.library.impl_abstract("recir_override::fwd_anchor")
 def _fwd_anchor_fake(
-    x: torch.Tensor, override_id: int, output_idx: int
+    x: torch.Tensor,
+    deps: list[torch.Tensor],  # noqa: ARG001
+    override_id: int,
+    output_idx: int,
 ) -> torch.Tensor:
     return torch.empty_like(x)
 
@@ -181,7 +191,7 @@ def replace_override_anchors(
         for n in gm.graph.nodes
         if n.op == "call_function"
         and n.target is torch.ops.recir_override.fwd_anchor.default
-        and n.args[1] == override_id
+        and n.args[2] == override_id
     ]
     bwd_anchors = [
         n
@@ -234,7 +244,7 @@ def replace_override_anchors(
             )
             fwd_node.meta["xla_graph_break"] = True
         for anchor in fwd_anchors:
-            output_idx = anchor.args[2]
+            output_idx = anchor.args[3]
             with gm.graph.inserting_before(anchor):
                 getitem_node = gm.graph.call_function(
                     operator.getitem,
@@ -274,6 +284,12 @@ class OverrideAnchorFn(torch.autograd.Function):
 
     Both ops have FakeTensor impls (for make_fx tracing) but no Meta kernel,
     so they appear as graph-breaking nodes in the traced graph.
+
+    ``deps`` is an optional list of tensors that the fwd_anchor node carries
+    as positional inputs solely so functionalization / DCE cannot prune them
+    from the FX graph (e.g. ``input_anchor`` outputs that would otherwise be
+    orphaned after a ``* 0.0`` constant-folding chain). ``deps`` does not
+    influence the value of the anchor's output and receives no gradient.
     """
 
     @staticmethod
@@ -282,34 +298,43 @@ class OverrideAnchorFn(torch.autograd.Function):
         x: torch.Tensor,
         override_id: int,
         output_idx: int,
+        *deps: torch.Tensor,
     ) -> torch.Tensor:
         ctx.override_id = override_id  # pyre-ignore[16]
         ctx.output_idx = output_idx  # pyre-ignore[16]
-        return torch.ops.recir_override.fwd_anchor(x, override_id, output_idx)
+        ctx._num_deps = len(deps)  # pyre-ignore[16]
+        return torch.ops.recir_override.fwd_anchor(
+            x, list(deps), override_id, output_idx
+        )
 
     @staticmethod
     def backward(
         ctx: torch.autograd.function.FunctionCtx,
         grad: torch.Tensor,
-    ) -> Tuple[torch.Tensor, None, None]:
+    ) -> Tuple:
         override_id = ctx.override_id  # pyre-ignore[16]
         output_idx = ctx.output_idx  # pyre-ignore[16]
         return (
             torch.ops.recir_override.bwd_anchor(grad, override_id, output_idx),
             None,
             None,
-        )
+        ) + (None,) * ctx._num_deps  # pyre-ignore[16]
 
 
 def anchor_output(
-    tensor: torch.Tensor, override_id: int, output_idx: int
+    tensor: torch.Tensor,
+    override_id: int,
+    output_idx: int,
+    deps: list[torch.Tensor] | None = None,
 ) -> torch.Tensor:
     """Wrap a DummyPreprocess output tensor with OverrideAnchorFn.
 
     This creates identifiable fwd_anchor (forward) and bwd_anchor (backward)
     nodes in the make_fx-traced FX graph.
     """
-    return OverrideAnchorFn.apply(tensor, override_id, output_idx)
+    if deps is None:
+        deps = []
+    return OverrideAnchorFn.apply(tensor, override_id, output_idx, *deps)
 
 
 class InputAnchorFn(torch.autograd.Function):
