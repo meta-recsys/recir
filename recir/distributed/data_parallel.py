@@ -755,10 +755,26 @@ def build_data_parallel_strategies(
         if node.target in no_ops:
             continue
         elif node.op == "get_attr":
-            # get_attr nodes reference module attributes (e.g. buffers, constants
-            # lifted during tracing such as the step counter in capturable Adam).
-            # Treat them as non-tensor constants that don't require sharding.
-            dp_strategy_map[node] = DataParallelStrategy([NodeType.NON_TENSOR], None)
+            # ``get_attr`` nodes reference module attributes which may be
+            # tensors (e.g. inline tensor literals lifted by ``make_fx``, the
+            # step counter in capturable Adam) or arbitrary Python objects
+            # (e.g. ``DeviceMesh``, process-group metadata). Walk the
+            # qualified target name on the GraphModule to recover the value
+            # so we can pick the right strategy. Tensor constants are
+            # identical on every rank and therefore REPLICATE.
+            attr_val: Any = train_step_graph
+            for attr in node.target.split("."):
+                attr_val = getattr(attr_val, attr, None)
+                if attr_val is None:
+                    break
+            if isinstance(attr_val, torch.Tensor):
+                dp_strategy_map[node] = DataParallelStrategy.from_mesh(
+                    [NodeType.PARAM], mesh, DataParallelStyle.REPLICATE
+                )
+            else:
+                dp_strategy_map[node] = DataParallelStrategy(
+                    [NodeType.NON_TENSOR], None
+                )
         elif "val" not in node.meta:
             # NOTE: There're certain cases where the nodes do not have real tensor values:
             # 1. optimizer states can be None sometimes, i.e. SGD with no momentum, optimizer states populate `momentum` state
