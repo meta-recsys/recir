@@ -11,9 +11,13 @@ from __future__ import annotations
 import math
 import unittest
 
+import jax
 import jax.numpy as jnp
 import numpy as np
-from recir.ops.pallas.flash_attention import pallas_flash_attention_varlen
+from recir.ops.pallas.flash_attention import (
+    pallas_flash_attention_batched,
+    pallas_flash_attention_varlen,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -254,3 +258,229 @@ class FlashAttentionTest(unittest.TestCase):
     def test_many_items(self) -> None:
         """Stress test: 32 items, prefix=64, item_len=4."""
         self._run_and_compare([(64, 32, 4)])
+
+
+# ---------------------------------------------------------------------------
+# Reference batched attention with target mask (pure JAX, differentiable)
+# ---------------------------------------------------------------------------
+
+
+def _build_target_attention_mask_jax(
+    seq_len: int,
+    prefix_len: int,
+    tokens_per_item: int,
+) -> jax.Array:
+    """Build [seq_len, seq_len] additive mask (0 or -inf) using pure JAX."""
+    qi = jnp.arange(seq_len)[:, None]
+    ki = jnp.arange(seq_len)[None, :]
+    q_in_prefix = qi < prefix_len
+    k_in_prefix = ki < prefix_len
+    causal = ki <= qi
+    both_prefix = q_in_prefix & k_in_prefix & causal
+    q_item_k_prefix = (~q_in_prefix) & k_in_prefix
+    q_item = (qi - prefix_len) // tokens_per_item
+    k_item = (ki - prefix_len) // tokens_per_item
+    same_item = q_item == k_item
+    both_items = (~q_in_prefix) & (~k_in_prefix) & same_item & causal
+    bool_mask = both_prefix | q_item_k_prefix | both_items
+    return jnp.where(bool_mask, 0.0, -1e30)
+
+
+def _reference_batched_attention(
+    q: jax.Array,
+    k: jax.Array,
+    v: jax.Array,
+    prefix_len: int,
+    tokens_per_item: int,
+    sm_scale: float,
+) -> jax.Array:
+    """Naive einsum-based batched attention with target mask.
+
+    Used as the differentiable reference for gradient tests.
+
+    Args:
+        q: [B, S, H, D]
+        k: [B, S, Hkv, D]
+        v: [B, S, Hkv, D]
+    Returns:
+        [B, S, H, D]
+    """
+    seq_len = q.shape[1]
+    num_heads = q.shape[2]
+    num_kv_heads = k.shape[2]
+    groups = num_heads // num_kv_heads
+
+    # Repeat KV across head groups to match Q.
+    k_full = jnp.repeat(k, groups, axis=2)  # [B, S, H, D]
+    v_full = jnp.repeat(v, groups, axis=2)
+
+    # Build mask once; same for all batches/heads.
+    mask = _build_target_attention_mask_jax(seq_len, prefix_len, tokens_per_item)
+    # [B, H, S_q, S_k]
+    scores = jnp.einsum("bshd,bthd->bhst", q, k_full) * sm_scale
+    scores = scores + mask  # broadcast over (B, H)
+    attn = jax.nn.softmax(scores, axis=-1)
+    # [B, S_q, H, D]
+    out = jnp.einsum("bhst,bthd->bshd", attn, v_full)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Backward pass tests
+# ---------------------------------------------------------------------------
+
+
+class FlashAttentionGradientTest(unittest.TestCase):
+    """Tests for the ``custom_vjp`` backward of the batched Pallas kernel."""
+
+    def _run_grad_test(
+        self,
+        batch_size: int,
+        seq_len: int,
+        num_heads: int,
+        num_kv_heads: int,
+        head_dim: int,
+        prefix_len: int,
+        tokens_per_item: int,
+        block_q: int = 32,
+        block_k: int = 32,
+        atol: float = 5e-2,
+        rtol: float = 5e-2,
+    ) -> None:
+        sm_scale = 1.0 / math.sqrt(head_dim)
+        rng = np.random.RandomState(123)
+        q_np = rng.randn(batch_size, seq_len, num_heads, head_dim).astype(np.float32)
+        k_np = rng.randn(batch_size, seq_len, num_kv_heads, head_dim).astype(np.float32)
+        v_np = rng.randn(batch_size, seq_len, num_kv_heads, head_dim).astype(np.float32)
+        do_np = rng.randn(batch_size, seq_len, num_heads, head_dim).astype(np.float32)
+        # Use float32 throughout so gradient comparison is meaningful.
+        q = jnp.array(q_np)
+        k = jnp.array(k_np)
+        v = jnp.array(v_np)
+        do = jnp.array(do_np)
+
+        def pallas_loss(q, k, v):
+            out = pallas_flash_attention_batched(  # pyre-ignore[29]
+                q,
+                k,
+                v,
+                prefix_len=prefix_len,
+                tokens_per_item=tokens_per_item,
+                sm_scale=sm_scale,
+                block_q=block_q,
+                block_k=block_k,
+                interpret=True,
+            )
+            return jnp.sum(out * do)
+
+        def ref_loss(q, k, v):
+            out = _reference_batched_attention(
+                q,
+                k,
+                v,
+                prefix_len=prefix_len,
+                tokens_per_item=tokens_per_item,
+                sm_scale=sm_scale,
+            )
+            return jnp.sum(out * do)
+
+        # Compute Pallas output to verify forward correctness too.
+        pallas_out = pallas_flash_attention_batched(  # pyre-ignore[29]
+            q,
+            k,
+            v,
+            prefix_len=prefix_len,
+            tokens_per_item=tokens_per_item,
+            sm_scale=sm_scale,
+            block_q=block_q,
+            block_k=block_k,
+            interpret=True,
+        )
+        ref_out = _reference_batched_attention(
+            q,
+            k,
+            v,
+            prefix_len=prefix_len,
+            tokens_per_item=tokens_per_item,
+            sm_scale=sm_scale,
+        )
+        np.testing.assert_allclose(
+            np.array(pallas_out), np.array(ref_out), atol=atol, rtol=rtol
+        )
+
+        dq_p, dk_p, dv_p = jax.grad(pallas_loss, argnums=(0, 1, 2))(q, k, v)
+        dq_r, dk_r, dv_r = jax.grad(ref_loss, argnums=(0, 1, 2))(q, k, v)
+
+        np.testing.assert_allclose(np.array(dq_p), np.array(dq_r), atol=atol, rtol=rtol)
+        np.testing.assert_allclose(np.array(dk_p), np.array(dk_r), atol=atol, rtol=rtol)
+        np.testing.assert_allclose(np.array(dv_p), np.array(dv_r), atol=atol, rtol=rtol)
+
+    def test_grad_basic(self) -> None:
+        """Single batch, no GQA, simple target mask."""
+        self._run_grad_test(
+            batch_size=1,
+            seq_len=64,
+            num_heads=2,
+            num_kv_heads=2,
+            head_dim=32,
+            prefix_len=16,
+            tokens_per_item=4,
+            block_q=32,
+            block_k=32,
+        )
+
+    def test_grad_batched(self) -> None:
+        """Batch=2, no GQA."""
+        self._run_grad_test(
+            batch_size=2,
+            seq_len=64,
+            num_heads=4,
+            num_kv_heads=4,
+            head_dim=32,
+            prefix_len=16,
+            tokens_per_item=4,
+            block_q=32,
+            block_k=32,
+        )
+
+    def test_grad_gqa(self) -> None:
+        """GQA: num_heads=4, num_kv_heads=2 (groups=2)."""
+        self._run_grad_test(
+            batch_size=1,
+            seq_len=64,
+            num_heads=4,
+            num_kv_heads=2,
+            head_dim=32,
+            prefix_len=16,
+            tokens_per_item=4,
+            block_q=32,
+            block_k=32,
+        )
+
+    def test_grad_single_token_items(self) -> None:
+        """Edge case: tokens_per_item=1."""
+        self._run_grad_test(
+            batch_size=1,
+            seq_len=64,
+            num_heads=2,
+            num_kv_heads=2,
+            head_dim=32,
+            prefix_len=16,
+            tokens_per_item=1,
+            block_q=32,
+            block_k=32,
+        )
+
+    def test_grad_padded_seqlen(self) -> None:
+        """seq_len that is not a multiple of block_q triggers padding path."""
+        self._run_grad_test(
+            batch_size=1,
+            seq_len=48,
+            num_heads=2,
+            num_kv_heads=2,
+            head_dim=32,
+            prefix_len=12,
+            tokens_per_item=4,
+            block_q=32,
+            block_k=32,
+        )
