@@ -182,8 +182,15 @@ class _XLAModule(torch.nn.Module):
             ]
             global_shape = list(jax_array.shape)
             global_shape[input_batch_dim] *= num_global // num_local
+            # Build a PartitionSpec naming "torch_dist" on the actual batch
+            # axis (input_batch_dim), with None on every other axis.
+            ndim = len(global_shape)
+            spec_parts: List[Any] = [None] * max(ndim, input_batch_dim + 1)
+            spec_parts[input_batch_dim] = "torch_dist"
             return jax.make_array_from_single_device_arrays(
-                tuple(global_shape), NamedSharding(mesh, P("torch_dist")), local_buffers
+                tuple(global_shape),
+                NamedSharding(mesh, P(*spec_parts)),
+                local_buffers,
             )
         if is_fsdp_weight:
             # FSDP: input is a local shard (after shard_params).
@@ -304,25 +311,31 @@ class _XLAModule(torch.nn.Module):
         devices = jax.devices()
         mesh: Any = Mesh(devices, axis_names=("torch_dist",))
         replicated = NamedSharding(mesh, P())
-        batch_sharded = NamedSharding(mesh, P("torch_dist"))
         placeholders = [n for n in self.gm.graph.nodes if n.op == "placeholder"]
         is_batch: List[bool] = [
             n.meta.get("is_batch_input", False) for n in placeholders
         ]
-        input_batch_dim: int = 0
-        for n in placeholders:
-            if n.meta.get("is_batch_input", False):
-                input_batch_dim = n.meta.get("batch_dim", 0)
-                break
+        # Per-placeholder batch_dim. Without _propagate_batch_input_meta this
+        # would be 0 for everything with the propagation pass, intermediate FX nodes
+        # crossing graph breaks land here with their actual batch axis
+        per_input_batch_dim: List[int] = [
+            n.meta.get("batch_dim", 0) if is_batch[i] else 0
+            for i, n in enumerate(placeholders)
+        ]
         is_fsdp_meta: List[bool] = [
             n.meta.get("is_fsdp_sharded", False) for n in placeholders
         ]
         # Build per-input sharding specs and track which inputs are FSDP-sharded.
         in_shardings = []
         is_fsdp_sharded: List[bool] = []
-        for i, _node in enumerate(placeholders):
+        for i, n in enumerate(placeholders):
             if is_batch[i]:
-                in_shardings.append(batch_sharded)
+                val = n.meta.get("val", None)
+                ndim = val.ndim if hasattr(val, "ndim") else 1
+                bd = per_input_batch_dim[i]
+                spec_parts: List[Any] = [None] * max(ndim, bd + 1)
+                spec_parts[bd] = "torch_dist"
+                in_shardings.append(NamedSharding(mesh, P(*spec_parts)))
                 is_fsdp_sharded.append(False)
             elif is_fsdp_meta[i] and i < len(args) and hasattr(args[i], "ndim"):
                 ndim = args[i].ndim
@@ -332,6 +345,7 @@ class _XLAModule(torch.nn.Module):
             else:
                 in_shardings.append(replicated)
                 is_fsdp_sharded.append(False)
+        batch_sharded = NamedSharding(mesh, P("torch_dist"))
         out_node = next(n for n in self.gm.graph.nodes if n.op == "output")
         torch_indices: set[int] = self.torch_output_indices or set()
         out_leaves, out_treedef = jax.tree.flatten(out_node.args[0])
@@ -405,7 +419,7 @@ class _XLAModule(torch.nn.Module):
                     a,
                     mesh,
                     is_batch[j],
-                    input_batch_dim,
+                    per_input_batch_dim[j],
                     is_fsdp_weight=is_fsdp_sharded[j],
                 )
                 for j, a in enumerate(run_args)
@@ -421,7 +435,11 @@ class _XLAModule(torch.nn.Module):
 
         example_args = tuple(
             self._to_sharded_jax(
-                a, mesh, is_batch[j], input_batch_dim, is_fsdp_weight=is_fsdp_sharded[j]
+                a,
+                mesh,
+                is_batch[j],
+                per_input_batch_dim[j],
+                is_fsdp_weight=is_fsdp_sharded[j],
             )
             for j, a in enumerate(args)
         )
