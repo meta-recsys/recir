@@ -64,6 +64,7 @@ CPU separately).
 
 from __future__ import annotations
 
+import functools
 from typing import Tuple
 
 import jax
@@ -1611,8 +1612,10 @@ def _split_traffic_ringshift_globalpad(
     """
     W = world_size
     # Single-slot recv layout (see naive splitter docstring). Caller must pass
-    # recv_capacity >= traffic_matrix.max() (which is the global max DMA size
-    # across all waves and ranks).
+    # recv_capacity >= max_local_ids + TILE (NO W factor -- single-slot recv
+    # layout means only one peer's payload per wave; per-wave incoming for any
+    # rank is bounded by max_local_ids + TILE - 1, the worst-case all-to-one-
+    # peer skew).
     recv_off_global = jnp.zeros((W,), dtype=jnp.int32)
     padded_offsets = (
         jnp.cumsum(send_counts_padded) - send_counts_padded
@@ -1631,119 +1634,131 @@ def _split_traffic_ringshift_globalpad(
     )
 
 
-def _make_alltc_fused_f32_ringshift_kernel(
+def _make_ringshift_single_wave_kernel(
     *,
     world_size: int,
     recv_capacity: int,
     embedding_dim: int,
     v_local: int,
 ):
-    """Single-call all-TC fused f32 ring-shift kernel.
+    """Single-wave all-TC fused f32 ring-shift kernel.
 
-    Per wave w (Python-unrolled): peer = (my_rank + w) % W. Length-1 inner
-    DMA loop -> sidesteps W=4 hang per v67a litmus PASS.
+    The previous design folded the W-wave loop INSIDE one Pallas call, but
+    that path hit cross-wave barrier-semaphore collisions / runtime hangs
+    once W reached 128 (regardless of fori_loop vs. Python unrolling — see
+    v68p/v68s/v68v/v68y). Codex confirmed the v23 split-pipeline pattern is
+    the right path: hoist the wave loop to a JAX-level Python ``for`` loop
+    over individual ``pl.pallas_call`` invocations, each with a UNIQUE
+    ``compiler_params=CompilerParams(collective_id=w_py)``. With per-call
+    unique collective_id, the implicit device-barrier semaphore for one
+    wave can no longer collide with the previous (or next) wave's
+    semaphore.
+
+    This kernel is the single-wave body: it expects the wave index plus
+    the per-rank scalars for that one wave (p1_cnt, p3_cnt, send_off,
+    recv_off, phase3_remote_off) as scalar (shape ``(1,)``) SMEM inputs.
+    The accumulating ``out`` buffer is aliased through
+    ``input_output_aliases`` so each wave writes a disjoint slice and the
+    accumulator survives across calls.
     """
-    max_waves = world_size  # ring-shift uses W waves
 
     def kernel(
         sorted_row_ref,
         table_ref,
-        p1_cnt_ref,             # [W] int32 SMEM (per-rank Phase 1 actual DMA cnt)
-        p3_cnt_ref,             # [W] int32 SMEM (per-rank Phase 3 actual DMA cnt)
-        send_off_ref,           # [W] int32 SMEM (per-rank Phase 1 send offsets)
-        recv_off_ref,           # [W] int32 SMEM (global Phase 1 recv layout offsets)
-        phase3_remote_off_ref,  # [W] int32 SMEM (per-rank Phase 3 remote dst)
-        out_ref,
+        wave_idx_ref,           # SMEM (1,) int32 — this wave's index w
+        p1_cnt_ref,             # SMEM (1,) int32 — this wave's p1_cnt
+        p3_cnt_ref,             # SMEM (1,) int32 — this wave's p3_cnt
+        send_off_ref,           # SMEM (1,) int32 — this wave's send_off
+        recv_off_ref,           # SMEM (1,) int32 — this wave's recv_off
+        phase3_remote_off_ref,  # SMEM (1,) int32 — this wave's phase3_remote_off
+        out_init_ref,           # input HBM, aliased to out_ref (accumulator)
+        out_ref,                # output HBM, alias of out_init_ref
         recv_row_buf,
         looked_up_buf,
         zero_int_vmem,
         zero_emb_vmem,
         table_vmem,
         idx_smem,
-        barrier_sems,
         send_sem_id,
         recv_sem_id,
         send_sem_emb,
         recv_sem_emb,
     ):
+        del out_init_ref  # aliased to out_ref via input_output_aliases
         my_rank = lax.axis_index("x")
+        wave_idx = wave_idx_ref[0]  # traced scalar int32
         pltpu.sync_copy(table_ref, table_vmem)
         zero_int_vmem[...] = jnp.zeros_like(zero_int_vmem)
         zero_emb_vmem[...] = jnp.zeros_like(zero_emb_vmem)
+        pltpu.sync_copy(zero_int_vmem, recv_row_buf)
 
-        for w in range(max_waves):
-            pltpu.sync_copy(zero_int_vmem, recv_row_buf)
-
-            pre_sem = barrier_sems.at[w, 0]
-            for peer in range(world_size):
-                pl.semaphore_signal(
-                    pre_sem, 1,
-                    device_id=(peer,),
-                    device_id_type=pltpu.DeviceIdType.MESH,
-                )
-            pl.semaphore_wait(pre_sem, world_size)
-
-            p1_cnt = pl.multiple_of(p1_cnt_ref[w], _TILE_INT32)
-            send_start = pl.multiple_of(send_off_ref[w], _TILE_INT32)
-            remote_recv_start = pl.multiple_of(recv_off_ref[w], _TILE_INT32)
-            peer_id_send = (my_rank + w) % world_size
-
-            d = pltpu.make_async_remote_copy(
-                src_ref=sorted_row_ref.at[pl.ds(send_start, p1_cnt)],
-                dst_ref=recv_row_buf.at[
-                    pl.ds(remote_recv_start, p1_cnt)
-                ],
-                send_sem=send_sem_id, recv_sem=recv_sem_id,
-                device_id=(peer_id_send,),
+        # Custom cross-device barrier driven by the per-call unique
+        # ``collective_id`` (set in the wrapper via ``CompilerParams``).
+        # Mosaic rejects ``collective_id`` unless we use the custom-barrier
+        # semaphore (``pltpu.get_barrier_semaphore()``), and v23 uses the
+        # same idiom in ``_make_id_a2a_kernel`` / ``_make_emb_a2a_kernel``.
+        # Inner peer signal loop is Python-unrolled (W ops in HLO body); the
+        # outer wave loop is at JAX level (not inside Mosaic), so this only
+        # adds W entries here, not W*W.
+        sem = pltpu.get_barrier_semaphore()
+        for peer in range(world_size):
+            pl.semaphore_signal(
+                sem, 1,
+                device_id=(peer,),
                 device_id_type=pltpu.DeviceIdType.MESH,
             )
-            d.start()
-            d.wait()
+        pl.semaphore_wait(sem, world_size)
 
-            post_sem = barrier_sems.at[w, 1]
-            for peer in range(world_size):
-                pl.semaphore_signal(
-                    post_sem, 1,
-                    device_id=(peer,),
-                    device_id_type=pltpu.DeviceIdType.MESH,
-                )
-            pl.semaphore_wait(post_sem, world_size)
+        # Phase 1: ID DMA — send my chunk for the (my_rank+wave_idx)-th
+        # peer, receive into recv_row_buf at this wave's recv offset.
+        p1_cnt = pl.multiple_of(p1_cnt_ref[0], _TILE_INT32)
+        send_start = pl.multiple_of(send_off_ref[0], _TILE_INT32)
+        remote_recv_start = pl.multiple_of(recv_off_ref[0], _TILE_INT32)
+        peer_id_send = (my_rank + wave_idx) % world_size
 
-            # Phase 2: local lookup.
-            pltpu.sync_copy(recv_row_buf, idx_smem)
+        d = pltpu.make_async_remote_copy(
+            src_ref=sorted_row_ref.at[pl.ds(send_start, p1_cnt)],
+            dst_ref=recv_row_buf.at[pl.ds(remote_recv_start, p1_cnt)],
+            send_sem=send_sem_id, recv_sem=recv_sem_id,
+            device_id=(peer_id_send,),
+            device_id_type=pltpu.DeviceIdType.MESH,
+        )
+        d.start()
+        d.wait()
+        # NO POST BARRIER — d.wait() syncs both send+recv, providing the
+        # cross-rank ordering Phase 2 needs.
 
-            def gather_body(i, __):
-                row_idx = idx_smem[i]
-                zero_emb_vmem[pl.ds(i, 1), :] = table_vmem[pl.ds(row_idx, 1), :]
-                return None
+        # Phase 2: local lookup.
+        pltpu.sync_copy(recv_row_buf, idx_smem)
 
-            lax.fori_loop(0, recv_capacity, gather_body, None)
-            pltpu.sync_copy(zero_emb_vmem, looked_up_buf)
+        def gather_body(i, __):
+            row_idx = idx_smem[i]
+            zero_emb_vmem[pl.ds(i, 1), :] = table_vmem[pl.ds(row_idx, 1), :]
+            return None
 
-            # Phase 3: emb a2a back to source. p3_cnt is the ACTUAL count of
-            # embeddings I'm responsible for in this wave (= what src DMA'd to
-            # me in Phase 1). Slack slots in the layout window stay as zero
-            # and are NOT included in the DMA, so we never corrupt src's
-            # out_ref past its real chunk for me.
-            peer_emb_send = (my_rank - w + world_size) % world_size
-            phase3_remote_start = pl.multiple_of(
-                phase3_remote_off_ref[w], _TILE_INT32
-            )
-            p3_cnt = pl.multiple_of(p3_cnt_ref[w], _TILE_INT32)
+        lax.fori_loop(0, recv_capacity, gather_body, None)
+        pltpu.sync_copy(zero_emb_vmem, looked_up_buf)
 
-            d = pltpu.make_async_remote_copy(
-                src_ref=looked_up_buf.at[
-                    pl.ds(remote_recv_start, p3_cnt), :
-                ],
-                dst_ref=out_ref.at[
-                    pl.ds(phase3_remote_start, p3_cnt), :
-                ],
-                send_sem=send_sem_emb, recv_sem=recv_sem_emb,
-                device_id=(peer_emb_send,),
-                device_id_type=pltpu.DeviceIdType.MESH,
-            )
-            d.start()
-            d.wait()
+        # Phase 3: emb a2a back to source. p3_cnt is the ACTUAL count of
+        # embeddings I'm responsible for in this wave (= what src DMA'd to
+        # me in Phase 1). Each wave writes to a DISJOINT slice of the
+        # global accumulator (different phase3_remote_start per wave), so
+        # waves don't collide on the aliased ``out_ref`` accumulator.
+        peer_emb_send = (my_rank - wave_idx + world_size) % world_size
+        phase3_remote_start = pl.multiple_of(
+            phase3_remote_off_ref[0], _TILE_INT32
+        )
+        p3_cnt = pl.multiple_of(p3_cnt_ref[0], _TILE_INT32)
+
+        d = pltpu.make_async_remote_copy(
+            src_ref=looked_up_buf.at[pl.ds(remote_recv_start, p3_cnt), :],
+            dst_ref=out_ref.at[pl.ds(phase3_remote_start, p3_cnt), :],
+            send_sem=send_sem_emb, recv_sem=recv_sem_emb,
+            device_id=(peer_emb_send,),
+            device_id_type=pltpu.DeviceIdType.MESH,
+        )
+        d.start()
+        d.wait()
 
     return kernel
 
@@ -1790,8 +1805,13 @@ def _jagged_a2a_embedding_lookup_local_f32_alltc_ringshift(
     else:
         raise ValueError(f"unknown splitter {splitter}")
 
-    # Static upper bound for send buffer: W * (max_local_ids + W * TILE).
-    max_padded = world_size * (max_local_ids + world_size * _TILE_INT32)
+    # Tight upper bound for send buffer (sum of TILE-padded per-peer chunks):
+    # sum_p send_counts_padded[p] <= sum_p send_counts_real[p] + W*(TILE-1)
+    # <= max_local_ids + W*TILE. The earlier `W * (max_local_ids + W*TILE)`
+    # was W× over-allocated — harmless at W=4 (~7 MB at D=128), but at W=128
+    # it ballooned `sorted_emb_padded` to 4M rows × D and blew VMEM during
+    # Pallas compile.
+    max_padded = max_local_ids + world_size * _TILE_INT32
     sorted_row_padded = _pad_per_peer(
         sorted_row_real,
         send_counts_real,
@@ -1804,59 +1824,117 @@ def _jagged_a2a_embedding_lookup_local_f32_alltc_ringshift(
     HBM = pltpu.MemorySpace.HBM
     SMEM = pltpu.MemorySpace.SMEM
 
-    kernel = _make_alltc_fused_f32_ringshift_kernel(
+    single_wave_kernel = _make_ringshift_single_wave_kernel(
         world_size=world_size,
         recv_capacity=recv_capacity,
         embedding_dim=embedding_dim,
         v_local=v_local,
     )
 
-    sorted_emb_padded, _recv_row_dummy, _looked_up_dummy = pl.pallas_call(
-        kernel,
-        out_shape=[
-            jax.ShapeDtypeStruct((max_padded, embedding_dim), dtype),
-            jax.ShapeDtypeStruct((recv_capacity,), jnp.int32),
-            jax.ShapeDtypeStruct((recv_capacity, embedding_dim), dtype),
-        ],
-        grid_spec=pltpu.PrefetchScalarGridSpec(
-            num_scalar_prefetch=0,
-            in_specs=[
-                pl.BlockSpec(memory_space=HBM),   # sorted_row
-                pl.BlockSpec(memory_space=HBM),   # table
-                pl.BlockSpec(memory_space=SMEM),  # p1_cnt
-                pl.BlockSpec(memory_space=SMEM),  # p3_cnt
-                pl.BlockSpec(memory_space=SMEM),  # send_off
-                pl.BlockSpec(memory_space=SMEM),  # recv_off
-                pl.BlockSpec(memory_space=SMEM),  # phase3_remote_off
+    # JAX-level Python wave loop. Each pallas_call gets a UNIQUE
+    # ``collective_id`` so its implicit device-barrier semaphore doesn't
+    # collide with the previous (or next) wave's barrier — same fix as v23
+    # (see ``jagged_a2a_embedding_lookup`` lines around 720/776). Each
+    # call's ``out_init`` aliases to ``out`` so the accumulator survives
+    # across waves; per-wave dst offsets land on disjoint slices.
+    #
+    # CROSS-RANK EPOCH BARRIER (v69c): even with unique collective_ids,
+    # successive semaphore-using epochs can skew across ranks across
+    # repeated invocations of the same jit — wave w on rank A may launch
+    # before wave w-1 has fully drained on rank B, so rank A's barrier
+    # semaphore in epoch w consumes a signal still in flight from epoch
+    # w-1. Stitch the waves together with a psum on a real value derived
+    # from the previous wave's output, then bind that scalar into the
+    # next wave's accumulator via ``optimization_barrier`` (XLA can't
+    # statically simplify it away). This forces every rank to finish wave
+    # w-1 before any rank launches wave w. Matches the pattern in the
+    # existing chunked v_local wrapper.
+    sorted_emb_padded = jnp.zeros((max_padded, embedding_dim), dtype=dtype)
+    sync_dep = jnp.float32(0.0)  # initial — no dep yet
+
+    for w_py in range(max_waves):
+        # Slice this wave's (1,)-shaped scalars from the (W,)-shaped
+        # splitter outputs. SMEM specs expect rank-1 arrays.
+        p1_cnt_w = lax.dynamic_slice(p1_cnt, (w_py,), (1,))
+        p3_cnt_w = lax.dynamic_slice(p3_cnt, (w_py,), (1,))
+        send_off_w = lax.dynamic_slice(send_off, (w_py,), (1,))
+        recv_off_w = lax.dynamic_slice(recv_off, (w_py,), (1,))
+        phase3_remote_off_w = lax.dynamic_slice(
+            phase3_remote_off, (w_py,), (1,)
+        )
+        wave_idx_w = jnp.array([w_py], dtype=jnp.int32)
+
+        # Bind sync_dep into the accumulator input via optimization_barrier.
+        # ``sorted_emb_padded_dep`` is numerically identical to
+        # ``sorted_emb_padded`` but XLA treats it as opaquely depending on
+        # ``sync_dep``. For w_py=0 this is a no-op (sync_dep is constant
+        # 0). For w_py>=1, sync_dep carries the cross-rank psum from the
+        # previous wave — the kernel for wave w cannot launch on any rank
+        # until every rank has finished wave w-1.
+        sorted_emb_padded_dep, _ = jax.lax.optimization_barrier(
+            (sorted_emb_padded, sync_dep)
+        )
+
+        sorted_emb_padded, _recv_row_dummy, _looked_up_dummy = pl.pallas_call(
+            single_wave_kernel,
+            out_shape=[
+                jax.ShapeDtypeStruct((max_padded, embedding_dim), dtype),
+                jax.ShapeDtypeStruct((recv_capacity,), jnp.int32),
+                jax.ShapeDtypeStruct((recv_capacity, embedding_dim), dtype),
             ],
-            out_specs=[
-                pl.BlockSpec(memory_space=HBM),
-                pl.BlockSpec(memory_space=HBM),
-                pl.BlockSpec(memory_space=HBM),
-            ],
-            scratch_shapes=(
-                pltpu.VMEM((recv_capacity,), jnp.int32),
-                pltpu.VMEM((recv_capacity, embedding_dim), dtype),
-                pltpu.VMEM((v_local, embedding_dim), dtype),
-                SMEM((recv_capacity,), jnp.int32),
-                pltpu.SemaphoreType.REGULAR((max_waves, 2)),
-                pltpu.SemaphoreType.DMA,
-                pltpu.SemaphoreType.DMA,
-                pltpu.SemaphoreType.DMA,
-                pltpu.SemaphoreType.DMA,
+            grid_spec=pltpu.PrefetchScalarGridSpec(
+                num_scalar_prefetch=0,
+                in_specs=[
+                    pl.BlockSpec(memory_space=HBM),   # sorted_row
+                    pl.BlockSpec(memory_space=HBM),   # table
+                    pl.BlockSpec(memory_space=SMEM),  # wave_idx
+                    pl.BlockSpec(memory_space=SMEM),  # p1_cnt
+                    pl.BlockSpec(memory_space=SMEM),  # p3_cnt
+                    pl.BlockSpec(memory_space=SMEM),  # send_off
+                    pl.BlockSpec(memory_space=SMEM),  # recv_off
+                    pl.BlockSpec(memory_space=SMEM),  # phase3_remote_off
+                    pl.BlockSpec(memory_space=HBM),   # out_init (alias)
+                ],
+                out_specs=[
+                    pl.BlockSpec(memory_space=HBM),  # out (= aliased out_init)
+                    pl.BlockSpec(memory_space=HBM),  # recv_row_buf (HBM scratch)
+                    pl.BlockSpec(memory_space=HBM),  # looked_up_buf (HBM scratch)
+                ],
+                scratch_shapes=(
+                    pltpu.VMEM((recv_capacity,), jnp.int32),
+                    pltpu.VMEM((recv_capacity, embedding_dim), dtype),
+                    pltpu.VMEM((v_local, embedding_dim), dtype),
+                    SMEM((recv_capacity,), jnp.int32),
+                    # NO REGULAR barrier sem — kernel uses
+                    # ``pltpu.get_barrier_semaphore()`` (custom barrier),
+                    # required by Mosaic when ``collective_id`` is set on
+                    # ``CompilerParams``.
+                    pltpu.SemaphoreType.DMA,
+                    pltpu.SemaphoreType.DMA,
+                    pltpu.SemaphoreType.DMA,
+                    pltpu.SemaphoreType.DMA,
+                ),
             ),
-        ),
-        interpret=interpret,
-    )(
-        sorted_row_padded,
-        local_embedding_table,
-        p1_cnt,
-        p3_cnt,
-        send_off,
-        recv_off,
-        phase3_remote_off,
-    )
-    del _recv_row_dummy, _looked_up_dummy
+            input_output_aliases={8: 0},  # out_init (input idx 8) -> out (output idx 0)
+            compiler_params=pltpu.CompilerParams(collective_id=w_py),
+            interpret=interpret,
+        )(
+            sorted_row_padded,
+            local_embedding_table,
+            wave_idx_w,
+            p1_cnt_w,
+            p3_cnt_w,
+            send_off_w,
+            recv_off_w,
+            phase3_remote_off_w,
+            sorted_emb_padded_dep,
+        )
+        del _recv_row_dummy, _looked_up_dummy
+
+        # Cross-rank epoch barrier: psum a real value derived from this
+        # wave's output (so XLA can't statically simplify). One scalar per
+        # rank; ``axis_name`` is bound here because we're inside shard_map.
+        sync_dep = jax.lax.psum(sorted_emb_padded[0, 0], axis_name)
 
     sorted_emb = _unpad_per_peer(
         sorted_emb_padded,
@@ -1908,3 +1986,364 @@ def jagged_a2a_embedding_lookup_f32_alltc_ringshift(
         check_vma=False,
     )
     return sharded(local_ids, local_id_count, local_embedding_table)
+
+
+# ---------------------------------------------------------------------------
+# v_local-chunking wrapper around the fused ringshift kernel.
+#
+# Motivation: the fused kernel keeps the FULL local table shard in VMEM
+# (`table_vmem` of shape `(v_local, embedding_dim) * f32`). For large
+# `v_local * D` (e.g. 1M * 512 * 4B = 2 GB) this blows the ~64 MB VMEM cap.
+#
+# Approach A (sort + per-chunk dispatch):
+#   1. Per rank, sort IDs by which "table chunk" they target — chunk c covers
+#      the per-rank rows [c*v_local_chunk_size, (c+1)*v_local_chunk_size). All
+#      IDs in chunk c have `(id // W) // v_local_chunk_size == c`. Padding
+#      positions are sent to a sentinel chunk (sorts last).
+#   2. For each chunk c (Python loop), we dynamic-slice
+#      `chunk_max_local_ids` IDs out of the sorted buffer at offset
+#      `chunk_offsets[c]`. The kernel sees `chunk_count_c` valid IDs only
+#      (the rest are over-slice padding the kernel zeros via _unpad_per_peer).
+#   3. We slice the table along v_local: `chunk_table = local_embedding_table
+#      [:, c*v_local_chunk_size:(c+1)*v_local_chunk_size, :]`. The IDs are
+#      remapped via `chunk_ids = chunk_ids - c * v_local_chunk_size * W` so
+#      that `(remapped // W)` indexes the chunk-local slice.
+#   4. Each chunk call returns `(W, chunk_max_local_ids, D)` — first
+#      `chunk_count_c` rows are valid; rest are zero. Scatter-add back into
+#      a `(W, max_local_ids, D)` accumulator at original positions
+#      `perm[chunk_offsets[c]:chunk_offsets[c]+chunk_count_c]`.
+#
+# Each ID falls into exactly one chunk so every output row is written by
+# exactly one chunk; .at[].add() is equivalent to .at[].set() under that
+# invariant.
+# ---------------------------------------------------------------------------
+
+
+def _chunked_per_rank_sort(
+    local_ids: jax.Array,
+    local_id_count: jax.Array,
+    *,
+    world_size: int,
+    v_local_chunk_size: int,
+    num_chunks: int,
+    max_local_ids: int,
+) -> Tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    """Per-rank sort by chunk index.
+
+    Returns:
+        sorted_ids: ``[max_local_ids]`` int32 — IDs sorted by chunk_idx.
+        chunk_counts: ``[num_chunks]`` int32 — count of IDs per chunk
+            (excluding sentinel-padded slots).
+        chunk_offsets: ``[num_chunks]`` int32 — cumsum-prefix offsets into
+            ``sorted_ids``.
+        perm: ``[max_local_ids]`` int32 — sort permutation (so original
+            position is recoverable).
+    """
+    pos = jnp.arange(max_local_ids, dtype=jnp.int32)
+    is_valid = pos < local_id_count
+    # Chunk index = (id // W) // v_local_chunk_size. For invalid (padding)
+    # positions, route to the sentinel chunk (= num_chunks) so they sort to
+    # the very end of sorted_ids and get dropped from chunk_counts.
+    raw_chunk_idx = (local_ids // world_size) // v_local_chunk_size
+    chunk_idx = jnp.where(is_valid, raw_chunk_idx, num_chunks).astype(jnp.int32)
+    perm = jnp.argsort(chunk_idx, stable=True).astype(jnp.int32)
+    sorted_ids = local_ids[perm]
+    bins = jnp.bincount(chunk_idx, length=num_chunks + 1)
+    chunk_counts = bins[:num_chunks].astype(jnp.int32)
+    chunk_offsets = (jnp.cumsum(chunk_counts) - chunk_counts).astype(jnp.int32)
+    return sorted_ids, chunk_counts, chunk_offsets, perm
+
+
+def _make_cross_rank_sync(mesh: jax.sharding.Mesh, axis_name: str):
+    """Build a per-rank -> psum scalar function under shard_map.
+
+    The returned callable takes a ``(W,)`` array sharded along ``axis_name``
+    (so each device sees a ``(1,)`` slice), reduces with ``psum`` across the
+    axis, and returns a replicated scalar. Used in the chunked wrapper to
+    create a cross-rank epoch barrier between per-chunk pallas_call
+    dispatches: chunk c+1's ``chunk_table_c`` is forced (via
+    optimization_barrier) to depend on chunk c's psum scalar, which itself
+    depends on every rank reaching the end of chunk c. Without this, XLA
+    can reorder per-chunk kernels across ranks and the cross-rank
+    semaphore protocol of the inner kernel deadlocks.
+    """
+    P = jax.sharding.PartitionSpec
+
+    @functools.partial(
+        jax.shard_map,
+        mesh=mesh,
+        in_specs=(P(axis_name),),
+        out_specs=P(),
+        check_vma=False,
+    )
+    def _sync(per_rank_scalar):
+        # per_rank_scalar is shape (1,) on each device after sharding split.
+        return jax.lax.psum(per_rank_scalar[0], axis_name)
+
+    return _sync
+
+
+def jagged_a2a_embedding_lookup_f32_alltc_ringshift_chunked(
+    local_ids: jax.Array,
+    local_id_count: jax.Array,
+    local_embedding_table: jax.Array,
+    *,
+    mesh: jax.sharding.Mesh,
+    axis_name: str,
+    v_local_chunk_size: int,
+    chunk_max_local_ids: int,
+    recv_capacity: int,
+    interpret: bool = False,
+    splitter: str = "globalpad",
+    _sync_payload: str = "min",
+) -> jax.Array:
+    """v_local-chunked wrapper around the fused ringshift kernel.
+
+    Splits the per-rank embedding table along the row axis into chunks of
+    ``v_local_chunk_size`` rows each, then dispatches one fused kernel call
+    per chunk. Each call sees only the IDs whose destination row falls in
+    that chunk, and a slice of the table covering that chunk.
+
+    Args:
+        local_ids: ``[W, max_local_ids]`` int32, sharded along ``axis_name``.
+        local_id_count: ``[W]`` int32, sharded along ``axis_name``.
+        local_embedding_table: ``[W, v_local, D]`` f32, sharded along
+            ``axis_name``. ``v_local`` need not divide ``v_local_chunk_size``;
+            the last chunk may be partial.
+        mesh: JAX mesh.
+        axis_name: name of the world-size axis on the mesh.
+        v_local_chunk_size: number of per-rank table rows per chunk.
+        chunk_max_local_ids: static upper bound on per-chunk valid ID count.
+            Should include 2-3x safety factor over (max_local_ids /
+            num_chunks) to absorb skew. Will be rounded up to a TILE multiple.
+        recv_capacity: per-call receive buffer capacity (passed through to
+            the inner kernel).
+        interpret: passed through to ``pallas_call``.
+        splitter: passed through to inner kernel.
+        _sync_payload: shape of the per-chunk psum payload used for the
+            cross-rank epoch barrier between chunks. ``"min"`` reduces a
+            one-element-per-rank scalar (steady-state default; recommended
+            for bench). ``"full"`` reduces the entire chunk_out per rank
+            (max-debuggable dependency; use when investigating multi-chunk
+            hangs).
+
+    Returns:
+        ``[W, max_local_ids, D]`` f32 — same shape and semantics as the
+        un-chunked kernel.
+    """
+    if _sync_payload not in ("min", "full"):
+        raise ValueError(
+            f"_sync_payload must be 'min' or 'full', got {_sync_payload!r}"
+        )
+    assert local_embedding_table.dtype == jnp.float32
+    world_size = mesh.shape[axis_name]
+    max_local_ids = local_ids.shape[1]
+    v_local = local_embedding_table.shape[1]
+    embedding_dim = local_embedding_table.shape[2]
+    num_chunks = (v_local + v_local_chunk_size - 1) // v_local_chunk_size
+    # Round chunk_max_local_ids up to TILE so each kernel call's input fits
+    # the tile-aligned inner API. The kernel only looks at the first
+    # chunk_count_c rows of the chunk_max_local_ids buffer.
+    if chunk_max_local_ids % _TILE_INT32 != 0:
+        chunk_max_local_ids = (
+            (chunk_max_local_ids + _TILE_INT32 - 1) // _TILE_INT32
+        ) * _TILE_INT32
+
+    P = jax.sharding.PartitionSpec
+
+    # Step 1: per-rank sort by chunk index, under shard_map.
+    def _sort_per_device(ids, count):
+        sorted_ids, chunk_counts, chunk_offsets, perm = _chunked_per_rank_sort(
+            ids[0], count[0],
+            world_size=world_size,
+            v_local_chunk_size=v_local_chunk_size,
+            num_chunks=num_chunks,
+            max_local_ids=max_local_ids,
+        )
+        return (
+            sorted_ids[None, :],
+            chunk_counts[None, :],
+            chunk_offsets[None, :],
+            perm[None, :],
+        )
+
+    sort_sharded = jax.shard_map(
+        _sort_per_device, mesh=mesh,
+        in_specs=(P(axis_name), P(axis_name)),
+        out_specs=(P(axis_name), P(axis_name), P(axis_name), P(axis_name)),
+        check_vma=False,
+    )
+    sorted_ids, chunk_counts, chunk_offsets, perm = sort_sharded(
+        local_ids, local_id_count
+    )
+
+    # Allocate the output accumulator (sharded along axis_name).
+    output_total = jnp.zeros(
+        (world_size, max_local_ids, embedding_dim),
+        dtype=local_embedding_table.dtype,
+    )
+    # Make sure the accumulator is sharded the same way as inputs so the
+    # per-chunk shard_map scatter works on local data.
+    output_total = jax.lax.with_sharding_constraint(
+        output_total,
+        jax.sharding.NamedSharding(mesh, P(axis_name)),
+    )
+
+    # Step 2: for each chunk, slice IDs + table, run inner kernel, scatter back.
+    #
+    # CRITICAL: We force a CROSS-RANK epoch barrier between per-chunk
+    # pallas_calls via psum + optimization_barrier on the chunk_table input.
+    #
+    # An optimization_barrier on output_total (this rank's local accumulator)
+    # only orders this rank's kernel sequence — XLA can still emit chunk c+1
+    # on rank A while rank B is still in chunk c, and the inner kernel's
+    # cross-rank semaphores deadlock when ranks are out of phase.
+    #
+    # The fix: between chunk c and chunk c+1, every rank reduces a payload
+    # derived from chunk c's output via psum across `axis_name`. The
+    # resulting replicated scalar `sync_dep` is bound into chunk c+1's
+    # `chunk_table_c` via optimization_barrier, so XLA must emit the psum
+    # (which itself depends on every rank reaching end-of-chunk-c) before
+    # any rank can launch chunk c+1's kernel.
+    cross_rank_sync = _make_cross_rank_sync(mesh, axis_name)
+    sync_dep = jnp.float32(0.0)
+
+    for c in range(num_chunks):
+        # Slice the table along v_local. The last chunk may be partial.
+        v_start = c * v_local_chunk_size
+        v_end = min(v_start + v_local_chunk_size, v_local)
+        actual_chunk_v = v_end - v_start
+        # If the chunk would be smaller than v_local_chunk_size, pad it with
+        # zero rows so all kernel calls share the same v_local. Using a
+        # ones-tail sentinel would shift the row indexing — zeros are safer
+        # because the remap math already places valid IDs in [0, actual_chunk_v).
+        raw_chunk_table = local_embedding_table[:, v_start:v_end, :]
+        if actual_chunk_v < v_local_chunk_size:
+            pad_rows = v_local_chunk_size - actual_chunk_v
+            raw_chunk_table = jnp.concatenate(
+                [
+                    raw_chunk_table,
+                    jnp.zeros(
+                        (world_size, pad_rows, embedding_dim),
+                        dtype=local_embedding_table.dtype,
+                    ),
+                ],
+                axis=1,
+            )
+            raw_chunk_table = jax.lax.with_sharding_constraint(
+                raw_chunk_table,
+                jax.sharding.NamedSharding(mesh, P(axis_name)),
+            )
+
+        # Bind sync_dep into chunk_table via optimization_barrier.
+        # chunk_table_c is numerically identical to raw_chunk_table but XLA
+        # treats it as opaquely depending on sync_dep. For c=0 this is a
+        # no-op (sync_dep is just a constant 0). For c>=1 sync_dep carries
+        # the cross-rank psum from chunk c-1 — the kernel for chunk c
+        # cannot launch on any rank until every rank has finished chunk c-1.
+        chunk_table, _ = lax.optimization_barrier((raw_chunk_table, sync_dep))
+
+        # Per-rank chunk slicing + remap, returning chunk_ids and chunk_count.
+        # Close over Python int `c` so it's a static constant inside shard_map.
+        c_const = c
+        offset_const = c_const * v_local_chunk_size * world_size
+
+        def _slice_per_device(s_ids, c_counts, c_offsets, _c=c_const, _off=offset_const):
+            # s_ids: [1, max_local_ids]; c_counts/c_offsets: [1, num_chunks].
+            offset = c_offsets[0, _c]
+            count = c_counts[0, _c]
+            chunk_ids = lax.dynamic_slice(
+                s_ids[0], (offset,), (chunk_max_local_ids,)
+            )
+            # Remap: subtract the global row offset that this chunk represents.
+            # chunk_idx = (id // W) // v_local_chunk_size, so
+            # (id - c * v_local_chunk_size * W) // W is in [0, v_local_chunk_size).
+            chunk_ids = chunk_ids - jnp.int32(_off)
+            # Clip to a safe non-negative range so the kernel's `(id // W)`
+            # over the over-slice padding does not produce undefined behaviour.
+            # Real IDs in this chunk are guaranteed in [0, v_local_chunk_size * W).
+            chunk_ids = jnp.maximum(chunk_ids, 0).astype(jnp.int32)
+            return chunk_ids[None, :], count[None]
+
+        slice_sharded = jax.shard_map(
+            _slice_per_device,
+            mesh=mesh,
+            in_specs=(P(axis_name), P(axis_name), P(axis_name)),
+            out_specs=(P(axis_name), P(axis_name)),
+            check_vma=False,
+        )
+        chunk_ids_arr, chunk_count_arr = slice_sharded(
+            sorted_ids, chunk_counts, chunk_offsets
+        )
+
+        # Run the inner fused kernel on this chunk.
+        chunk_out = jagged_a2a_embedding_lookup_f32_alltc_ringshift(
+            chunk_ids_arr,
+            chunk_count_arr,
+            chunk_table,
+            mesh=mesh,
+            axis_name=axis_name,
+            recv_capacity=recv_capacity,
+            interpret=interpret,
+            splitter=splitter,
+        )
+        # chunk_out is [W, chunk_max_local_ids, D] — first chunk_count_c rows
+        # are valid; rest are zero (kernel's _unpad_per_peer guarantees this).
+
+        # Step 3: scatter chunk_out back to the global output at original
+        # positions perm[chunk_offsets[c]:chunk_offsets[c]+chunk_count_c].
+        def _scatter_per_device(out_acc, c_out, c_offsets, p, c_counts, _c=c_const):
+            # out_acc: [1, max_local_ids, D]
+            # c_out:   [1, chunk_max_local_ids, D]
+            # c_offsets: [1, num_chunks]; p: [1, max_local_ids]; c_counts: [1, num_chunks]
+            offset = c_offsets[0, _c]
+            count = c_counts[0, _c]
+            # Positions in the original (un-sorted) array.
+            chunk_perm = lax.dynamic_slice(
+                p[0], (offset,), (chunk_max_local_ids,)
+            )
+            # Mask: only the first `count` rows of c_out are valid; the rest
+            # are over-slice and should not be added.
+            row_mask = (
+                jnp.arange(chunk_max_local_ids, dtype=jnp.int32) < count
+            )[:, None]
+            c_out_masked = jnp.where(row_mask, c_out[0], 0)
+            # Mask out positions: clip out-of-range to position 0; we will
+            # also add 0 there so it is harmless. (count_<= max_local_ids
+            # always holds because all valid IDs are in [0, max_local_ids).)
+            safe_perm = jnp.where(
+                row_mask[:, 0],
+                chunk_perm,
+                jnp.int32(0),
+            )
+            new_acc = out_acc[0].at[safe_perm].add(c_out_masked)
+            return new_acc[None, ...]
+
+        scatter_sharded = jax.shard_map(
+            _scatter_per_device, mesh=mesh,
+            in_specs=(
+                P(axis_name), P(axis_name), P(axis_name),
+                P(axis_name), P(axis_name),
+            ),
+            out_specs=P(axis_name),
+            check_vma=False,
+        )
+        output_total = scatter_sharded(
+            output_total, chunk_out, chunk_offsets, perm, chunk_counts
+        )
+
+        # Cross-rank epoch barrier — psum a payload derived from THIS chunk's
+        # kernel output. The resulting replicated scalar is bound into the
+        # next chunk's chunk_table via optimization_barrier (above), so XLA
+        # cannot launch chunk c+1 on any rank until every rank has finished
+        # chunk c (the psum is a true cross-rank join).
+        if _sync_payload == "full":
+            # Max-debuggable dependency: full reduction over chunk_out.
+            local_per_rank = chunk_out.sum(axis=(1, 2))   # shape (W,)
+        else:
+            # Steady-state default: one-element-per-rank payload — creates
+            # the cross-rank join without an extra full-buffer pass.
+            local_per_rank = chunk_out[:, :1, :1].sum(axis=(1, 2))   # shape (W,)
+        sync_dep = cross_rank_sync(local_per_rank)
+
+    return output_total

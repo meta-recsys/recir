@@ -140,9 +140,11 @@ class JaggedA2ABenchmark(unittest.TestCase):
             ))
             # Ring-shift uses single-slot recv layout: recv_capacity must
             # hold ONE wave (worst-case = traffic_matrix.max() <= max_local_ids
-            # + TILE-1 in the all-to-one-peer skew). Round up to TILE.
+            # + TILE-1 in the all-to-one-peer skew). NO W factor — single-slot
+            # recv layout means only one peer's payload per wave. Round up to
+            # TILE.
             TILE = 128
-            rs_recv_capacity = max_local_ids + world_size * TILE
+            rs_recv_capacity = max_local_ids + TILE
             rs_recv_capacity = ((rs_recv_capacity + TILE - 1) // TILE) * TILE
             print(f"  ring-shift recv_capacity={rs_recv_capacity}", flush=True)
             rs_naive_jit = jax.jit(functools.partial(
