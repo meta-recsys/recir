@@ -1743,21 +1743,50 @@ def _make_ringshift_single_wave_kernel(
 
         # Phase 1: ID DMA — send my chunk for the (my_rank+wave_idx)-th
         # peer, receive into recv_row_buf at this wave's recv offset.
+        # Hoist BOTH p1_cnt and p3_cnt early: codex's fix needs p3_cnt
+        # available for the Phase 1 recv-side drain (recv extent = OPPOSITE
+        # side's send count = p3_cnt). Also pre-compute phase3_remote_start
+        # for symmetry though it's only used in Phase 3.
         p1_cnt = pl.multiple_of(p1_cnt_ref[0], _TILE_INT32)
+        p3_cnt = pl.multiple_of(p3_cnt_ref[0], _TILE_INT32)
         send_start = pl.multiple_of(send_off_ref[0], _TILE_INT32)
         remote_recv_start = pl.multiple_of(recv_off_ref[0], _TILE_INT32)
+        phase3_remote_start = pl.multiple_of(
+            phase3_remote_off_ref[0], _TILE_INT32
+        )
+
+        # === v71d: Codex Option B — separate inbound DMA descriptor ===
+        # The wait_recv() extent is determined by the descriptor's slice, not
+        # by the recv_sem signals it drains. So we build TWO descriptors:
+        #   d_send: my outbound (extent p1_cnt) — start() + wait_send()
+        #   d_recv: peer's send to me (extent p3_cnt = OPPOSITE side's
+        #           send count) — wait_recv() ONLY (no start, peer issues it).
+        # The DeviceID on d_recv is my_src (who is sending TO me); src/dst
+        # refs describe the slice on MY side that gets drained when the peer's
+        # signals arrive.
+        d_send = pltpu.make_async_remote_copy(
+            src_ref=sorted_row_ref.at[pl.ds(send_start, p1_cnt)],
+            dst_ref=recv_row_buf.at[pl.ds(remote_recv_start, p1_cnt)],
+            send_sem=send_sem_id, recv_sem=recv_sem_id,
+            device_id=(my_dst,),
+            device_id_type=pltpu.DeviceIdType.MESH,
+        )
+        d_recv = pltpu.make_async_remote_copy(
+            src_ref=sorted_row_ref.at[pl.ds(0, p3_cnt)],
+            dst_ref=recv_row_buf.at[pl.ds(0, p3_cnt)],
+            send_sem=send_sem_id, recv_sem=recv_sem_id,
+            device_id=(my_src,),
+            device_id_type=pltpu.DeviceIdType.MESH,
+        )
 
         @pl.when(p1_cnt > 0)
-        def _do_phase1_dma():
-            d = pltpu.make_async_remote_copy(
-                src_ref=sorted_row_ref.at[pl.ds(send_start, p1_cnt)],
-                dst_ref=recv_row_buf.at[pl.ds(remote_recv_start, p1_cnt)],
-                send_sem=send_sem_id, recv_sem=recv_sem_id,
-                device_id=(my_dst,),
-                device_id_type=pltpu.DeviceIdType.MESH,
-            )
-            d.start()
-            d.wait()
+        def _phase1_send():
+            d_send.start()
+            d_send.wait_send()  # only wait for OUR SEND completion (extent p1_cnt)
+
+        @pl.when(p3_cnt > 0)
+        def _phase1_recv():
+            d_recv.wait_recv()  # drains recv_sem by p3_cnt (peer's send extent)
         pl.debug_print(
             "[K] after_phase1 r={} w={} cnt={}", my_rank, wave_idx, p1_cnt,
         )
@@ -1780,23 +1809,37 @@ def _make_ringshift_single_wave_kernel(
         # global accumulator (different phase3_remote_start per wave), so
         # waves don't collide on the aliased ``out_ref`` accumulator.
         # Phase 3 destination peer = my_src (send back to the rank that
-        # sent us its IDs in Phase 1).
-        phase3_remote_start = pl.multiple_of(
-            phase3_remote_off_ref[0], _TILE_INT32
+        # sent us its IDs in Phase 1). p3_cnt and phase3_remote_start were
+        # hoisted earlier so the codex Phase 1 recv-drain can reference
+        # p3_cnt; reuse them here directly.
+
+        # === v71d: Codex Option B — separate inbound Phase 3 descriptor ===
+        # Phase 3 send: my outbound back to my_src (extent p3_cnt rows × D).
+        # Phase 3 recv: my_dst sends embeddings for the p1_cnt IDs I sent
+        # (extent p1_cnt rows × D = OPPOSITE side's send count).
+        d3_send = pltpu.make_async_remote_copy(
+            src_ref=looked_up_buf.at[pl.ds(remote_recv_start, p3_cnt), :],
+            dst_ref=out_ref.at[pl.ds(phase3_remote_start, p3_cnt), :],
+            send_sem=send_sem_emb, recv_sem=recv_sem_emb,
+            device_id=(my_src,),  # send back to my source
+            device_id_type=pltpu.DeviceIdType.MESH,
         )
-        p3_cnt = pl.multiple_of(p3_cnt_ref[0], _TILE_INT32)
+        d3_recv = pltpu.make_async_remote_copy(
+            src_ref=looked_up_buf.at[pl.ds(0, p1_cnt), :],
+            dst_ref=out_ref.at[pl.ds(0, p1_cnt), :],
+            send_sem=send_sem_emb, recv_sem=recv_sem_emb,
+            device_id=(my_dst,),  # peer who will send TO me
+            device_id_type=pltpu.DeviceIdType.MESH,
+        )
 
         @pl.when(p3_cnt > 0)
-        def _do_phase3_dma():
-            d = pltpu.make_async_remote_copy(
-                src_ref=looked_up_buf.at[pl.ds(remote_recv_start, p3_cnt), :],
-                dst_ref=out_ref.at[pl.ds(phase3_remote_start, p3_cnt), :],
-                send_sem=send_sem_emb, recv_sem=recv_sem_emb,
-                device_id=(my_src,),  # send back to my source
-                device_id_type=pltpu.DeviceIdType.MESH,
-            )
-            d.start()
-            d.wait()
+        def _phase3_send():
+            d3_send.start()
+            d3_send.wait_send()  # only wait for OUR SEND completion (p3_cnt * D)
+
+        @pl.when(p1_cnt > 0)
+        def _phase3_recv():
+            d3_recv.wait_recv()  # drains recv_sem_emb by p1_cnt rows × D
         pl.debug_print(
             "[K] after_phase3 r={} w={} cnt={}", my_rank, wave_idx, p3_cnt,
         )
