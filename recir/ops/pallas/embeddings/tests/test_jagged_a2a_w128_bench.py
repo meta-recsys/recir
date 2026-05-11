@@ -2282,6 +2282,709 @@ class JaggedA2AW128Benchmark(unittest.TestCase):
         log(f"ran in {elapsed_ms:.1f} ms total (dispatch={dispatch_ms:.1f}, block={elapsed_ms-dispatch_ms:.1f})")
         log("RESULT: WORKS")
 
+    def test_w32_smem_varying_litmus(self) -> None:
+        """W=32 wave-dep litmus + per-wave SMEM scalar inputs (VARYING values).
+
+        Identical to test_w32_smem_scalars_litmus (v70q) except the per-wave
+        SMEM scalar arrays carry VALUES THAT VARY ACROSS WAVES (instead of
+        being constant). All values remain TILE-aligned and within in-bounds
+        ranges (input/output buffers enlarged to keep the offsets safe).
+
+        Variation pattern:
+          - p1_cnt[w]            : alternates between FIXED_COUNT and half_count
+          - p3_cnt[w]            : alternates between half_count and FIXED_COUNT
+          - send_off[w]          : cycles 0, TILE, 2*TILE, 3*TILE
+          - recv_off[w]          : 0 (matches v68c single-slot)
+          - phase3_remote_off[w] : cycles 0, TILE, 2*TILE, 3*TILE
+
+        Slice EXTENTS still use compile-time constants (Pallas requires static
+        extents); only the offsets and the multiple_of/markers consume the
+        SMEM-scalar values. This narrowly isolates "does varying SMEM-scalar
+        contents (vs. constant) trigger the W=32 hang?".
+
+        If this works at W=32 PRODSIZE: the hang requires a more specific
+        per-wave SMEM-scalar VALUE pattern (likely the splitter's actual
+        output). If it hangs: smoking gun — varying SMEM scalar values cause
+        the W=32 hang.
+        """
+        from jax.experimental import pallas as pl
+        from jax.experimental.pallas import tpu as pltpu
+        from jax import lax
+        from jax.experimental.multihost_utils import sync_global_devices
+        import sys
+
+        world_size = 32
+        max_waves = world_size
+        P = jax.sharding.PartitionSpec
+
+        all_devices = jax.devices()
+        if len(all_devices) < 256:
+            self.skipTest(f"Need 256 logical devices, have {len(all_devices)}")
+        devices = all_devices[::8]  # symmetric: 1 per host
+        assert len(devices) == world_size
+        mesh = jax.sharding.Mesh(np.array(devices), ("x",))
+
+        def log(msg):
+            if jax.process_index() == 0:
+                print(f"[LITMUS_W32_VARYING] {msg}", file=sys.stderr, flush=True)
+
+        FIXED_COUNT = 128
+        # PRODUCTION sizing.
+        v_local = 8 * 1024            # production scale
+        recv_capacity = 8 * 1024 + 128  # production scale (8K + TILE)
+        D = 128                       # production scale
+        TILE = 128
+
+        # Generous extra room for varying offsets (cycle 0..3*TILE).
+        # send_off in [0, 3*TILE] and Phase 1 slice extent = FIXED_COUNT, so
+        # per-rank sorted_row buffer needs >= 3*TILE + FIXED_COUNT == 4*TILE.
+        # Keep symmetric, sized 2*FIXED_COUNT*MAX_OFF_FACTOR for safety.
+        SORTED_PER_RANK_LEN = 4 * FIXED_COUNT  # 512 (room for 3*TILE offset)
+        # Out buffer: phase3_remote_off in [0, 3*TILE], extent recv_capacity.
+        # So per-rank out_acc needs >= recv_capacity + 3*TILE.
+        OUT_PER_RANK_LEN = recv_capacity + 3 * TILE  # 8K + 4*TILE
+
+        def make_full_chain_kernel(world_size: int):
+            def kernel(sorted_row_ref, table_ref, dummy_in_ref,
+                       wave_idx_ref, p1_cnt_ref, p3_cnt_ref,
+                       send_off_ref, recv_off_ref, phase3_remote_off_ref,
+                       out_init_ref,
+                       out_ref, recv_row_buf, looked_up_buf,
+                       send_sem, recv_sem, send_sem_emb, recv_sem_emb,
+                       table_vmem, zero_emb_vmem, idx_smem):
+                del dummy_in_ref, out_init_ref
+                my_rank = lax.axis_index("x")
+                wave_idx = wave_idx_ref[0]  # traced scalar int32
+
+                # Per-wave SMEM scalars (read but unused for slice extents:
+                # Pallas needs static extents; we still route values through
+                # the kernel to exercise the SMEM scalar input wiring).
+                p1_cnt = pl.multiple_of(p1_cnt_ref[0], TILE)
+                p3_cnt = pl.multiple_of(p3_cnt_ref[0], TILE)
+                send_start = pl.multiple_of(send_off_ref[0], TILE)
+                remote_recv_start = pl.multiple_of(recv_off_ref[0], TILE)
+                phase3_remote_start = pl.multiple_of(
+                    phase3_remote_off_ref[0], TILE
+                )
+                # Use values to keep them live (XLA/MLIR can't DCE these
+                # because they feed into DMA src/dst offsets via lax.add 0s).
+                _ = p1_cnt + p3_cnt  # keep counts referenced
+
+                # Pre-barrier (proven to work in v70i barrier-only litmus).
+                sem = pltpu.get_barrier_semaphore()
+                for peer in range(world_size):
+                    pl.semaphore_signal(sem, 1, device_id=(peer,),
+                                        device_id_type=pltpu.DeviceIdType.MESH)
+                pl.semaphore_wait(sem, world_size)
+
+                # Phase 1 ID DMA: ring-shift to wave-dependent peer
+                # my_dst = (my_rank + wave_idx) % W (matches production).
+                my_dst = (my_rank + wave_idx) % world_size
+                # Use SMEM-scalar offsets in pl.ds starts (extent stays static).
+                d = pltpu.make_async_remote_copy(
+                    src_ref=sorted_row_ref.at[pl.ds(send_start, FIXED_COUNT)],
+                    dst_ref=recv_row_buf.at[pl.ds(remote_recv_start, FIXED_COUNT)],
+                    send_sem=send_sem,
+                    recv_sem=recv_sem,
+                    device_id=(my_dst,),
+                    device_id_type=pltpu.DeviceIdType.MESH,
+                )
+                d.start()
+                d.wait()
+
+                # Phase 2 gather: stage table HBM -> VMEM (matches full kernel).
+                pltpu.sync_copy(table_ref, table_vmem)
+
+                # Initialize gather output buffer to zeros.
+                zero_emb_vmem[...] = jnp.zeros_like(zero_emb_vmem)
+
+                # Stage recv_row_buf HBM -> SMEM (the indices).
+                pltpu.sync_copy(recv_row_buf, idx_smem)
+
+                # Gather loop.
+                def gather_body(i, __):
+                    row_idx = idx_smem[i % FIXED_COUNT]
+                    zero_emb_vmem[pl.ds(i, 1), :] = table_vmem[pl.ds(row_idx, 1), :]
+                    return None
+                lax.fori_loop(0, recv_capacity, gather_body, None)
+
+                # Copy gathered output to HBM.
+                pltpu.sync_copy(zero_emb_vmem, looked_up_buf)
+
+                # Phase 3 DMA: send gathered embeddings back to wave-dependent
+                # source peer my_src = (my_rank - wave_idx + W) % W (matches
+                # production). Use SMEM-scalar phase3_remote_start as dst start.
+                my_src = (my_rank - wave_idx + world_size) % world_size
+                phase3_count = recv_capacity
+                d3 = pltpu.make_async_remote_copy(
+                    src_ref=looked_up_buf.at[pl.ds(0, phase3_count), :],
+                    dst_ref=out_ref.at[pl.ds(phase3_remote_start, phase3_count), :],
+                    send_sem=send_sem_emb,
+                    recv_sem=recv_sem_emb,
+                    device_id=(my_src,),
+                    device_id_type=pltpu.DeviceIdType.MESH,
+                )
+                d3.start()
+                d3.wait()
+            return kernel
+
+        HBM = pltpu.MemorySpace.HBM
+        SMEM = pltpu.MemorySpace.SMEM
+
+        def per_device_run(local_sorted, local_table, local_dummy):
+            out_acc = jnp.zeros((OUT_PER_RANK_LEN, D), dtype=jnp.float32)
+            sync_dep = jnp.float32(0.0)
+            # Per-wave SMEM scalar arrays of shape (W,). VARY across waves
+            # (still TILE-aligned, still in-bounds for the enlarged buffers).
+            half_count = (FIXED_COUNT // 2 // TILE) * TILE
+            half_count = max(half_count, TILE)
+            p1_cnt_arr = jnp.array(
+                [FIXED_COUNT if w % 2 == 0 else half_count for w in range(max_waves)],
+                dtype=jnp.int32,
+            )
+            p3_cnt_arr = jnp.array(
+                [half_count if w % 2 == 0 else FIXED_COUNT for w in range(max_waves)],
+                dtype=jnp.int32,
+            )
+            # send_off cycles 0, TILE, 2*TILE, 3*TILE — TILE-aligned, in-bounds.
+            send_off_arr = jnp.array(
+                [(w % 4) * TILE for w in range(max_waves)],
+                dtype=jnp.int32,
+            )
+            # recv_off stays 0 (matches v68c single-slot).
+            recv_off_arr = jnp.zeros((max_waves,), dtype=jnp.int32)
+            # phase3_remote_off cycles 0, TILE, 2*TILE, 3*TILE.
+            phase3_remote_off_arr = jnp.array(
+                [(w % 4) * TILE for w in range(max_waves)],
+                dtype=jnp.int32,
+            )
+            for w_py in range(max_waves):
+                out_acc_dep, _ = jax.lax.optimization_barrier(
+                    (out_acc, sync_dep)
+                )
+                # SMEM scalar carrying this wave's index w (matches production).
+                wave_idx_w = jnp.array([w_py], dtype=jnp.int32)
+                p1_cnt_w = lax.dynamic_slice(p1_cnt_arr, (w_py,), (1,))
+                p3_cnt_w = lax.dynamic_slice(p3_cnt_arr, (w_py,), (1,))
+                send_off_w = lax.dynamic_slice(send_off_arr, (w_py,), (1,))
+                recv_off_w = lax.dynamic_slice(recv_off_arr, (w_py,), (1,))
+                phase3_remote_off_w = lax.dynamic_slice(
+                    phase3_remote_off_arr, (w_py,), (1,)
+                )
+                kernel = make_full_chain_kernel(world_size)
+                (out_acc, _recv_dummy, _looked_up_dummy) = pl.pallas_call(
+                    kernel,
+                    out_shape=[
+                        jax.ShapeDtypeStruct((OUT_PER_RANK_LEN, D), jnp.float32),
+                        jax.ShapeDtypeStruct((FIXED_COUNT,), jnp.int32),
+                        jax.ShapeDtypeStruct((recv_capacity, D), jnp.float32),
+                    ],
+                    grid_spec=pltpu.PrefetchScalarGridSpec(
+                        num_scalar_prefetch=0,
+                        in_specs=[
+                            pl.BlockSpec(memory_space=HBM),   # sorted_row_ref
+                            pl.BlockSpec(memory_space=HBM),   # table_ref
+                            pl.BlockSpec(memory_space=HBM),   # dummy_in_ref
+                            pl.BlockSpec(memory_space=SMEM),  # wave_idx_ref
+                            pl.BlockSpec(memory_space=SMEM),  # p1_cnt_ref
+                            pl.BlockSpec(memory_space=SMEM),  # p3_cnt_ref
+                            pl.BlockSpec(memory_space=SMEM),  # send_off_ref
+                            pl.BlockSpec(memory_space=SMEM),  # recv_off_ref
+                            pl.BlockSpec(memory_space=SMEM),  # phase3_remote_off_ref
+                            pl.BlockSpec(memory_space=HBM),   # out_init_ref
+                        ],
+                        out_specs=[
+                            pl.BlockSpec(memory_space=HBM),   # out_ref
+                            pl.BlockSpec(memory_space=HBM),   # recv_row_buf
+                            pl.BlockSpec(memory_space=HBM),   # looked_up_buf
+                        ],
+                        scratch_shapes=[
+                            pltpu.SemaphoreType.DMA,  # send_sem (Phase 1)
+                            pltpu.SemaphoreType.DMA,  # recv_sem (Phase 1)
+                            pltpu.SemaphoreType.DMA,  # send_sem_emb (Phase 3)
+                            pltpu.SemaphoreType.DMA,  # recv_sem_emb (Phase 3)
+                            pltpu.VMEM((v_local, D), jnp.float32),
+                            pltpu.VMEM((recv_capacity, D), jnp.float32),
+                            pltpu.SMEM((FIXED_COUNT,), jnp.int32),
+                        ],
+                    ),
+                    input_output_aliases={9: 0},
+                    compiler_params=pltpu.CompilerParams(collective_id=w_py),
+                )(
+                    local_sorted, local_table, local_dummy,
+                    wave_idx_w, p1_cnt_w, p3_cnt_w,
+                    send_off_w, recv_off_w, phase3_remote_off_w,
+                    out_acc_dep,
+                )
+                del _recv_dummy, _looked_up_dummy
+                # Sync_dep keeps waves ordered cross-rank.
+                sync_dep = jax.lax.psum(out_acc[0, 0].astype(jnp.float32), "x")
+            return out_acc
+
+        sharded = jax.shard_map(
+            per_device_run, mesh=mesh,
+            in_specs=(P("x"), P("x"), P("x")),
+            out_specs=P("x"),
+            check_vma=False,
+        )
+
+        # Per-rank sorted_row enlarged to SORTED_PER_RANK_LEN to fit varying
+        # send_off in [0, 3*TILE] + extent FIXED_COUNT.
+        sorted_per_rank = (
+            jnp.arange(world_size * SORTED_PER_RANK_LEN, dtype=jnp.int32) % v_local
+        )
+        assert sorted_per_rank.shape == (world_size * SORTED_PER_RANK_LEN,)
+        sorted_per_rank = jax.device_put(
+            sorted_per_rank,
+            jax.sharding.NamedSharding(mesh, P("x")),
+        )
+        table_per_rank = jnp.zeros((world_size * v_local, D), dtype=jnp.float32)
+        table_per_rank = jax.device_put(
+            table_per_rank,
+            jax.sharding.NamedSharding(mesh, P("x")),
+        )
+        dummy_per_rank = jnp.zeros((world_size, 1), dtype=jnp.int32)
+        dummy_per_rank = jax.device_put(
+            dummy_per_rank,
+            jax.sharding.NamedSharding(mesh, P("x")),
+        )
+        jax.block_until_ready(sorted_per_rank)
+        jax.block_until_ready(table_per_rank)
+        jax.block_until_ready(dummy_per_rank)
+        log("inputs ready")
+
+        bjit = jax.jit(sharded)
+        log("calling kernel...")
+        sync_global_devices("litmus_smem_varying_start")
+        t0 = time.perf_counter()
+        out = bjit(sorted_per_rank, table_per_rank, dummy_per_rank)
+        dispatch_ms = (time.perf_counter() - t0) * 1e3
+        log(f"dispatched (after {dispatch_ms:.1f}ms), blocking...")
+        jax.block_until_ready(out)
+        elapsed_ms = (time.perf_counter() - t0) * 1e3
+        log(f"ran in {elapsed_ms:.1f} ms total (dispatch={dispatch_ms:.1f}, block={elapsed_ms-dispatch_ms:.1f})")
+        log("RESULT: WORKS")
+
+    def test_w32_smem_real_splitter_litmus(self) -> None:
+        """W=32 litmus + REAL per-wave SMEM scalars from production splitter.
+
+        Identical structure to test_w32_smem_varying_litmus (v70r) except the
+        five per-wave SMEM scalar arrays (p1_cnt, p3_cnt, send_off, recv_off,
+        phase3_remote_off) are computed from REAL inputs via
+        ``_bucketize_and_sort`` -> ``_round_up_tile`` ->
+        ``_split_traffic_ringshift_globalpad`` (the production splitter chain
+        from jagged_a2a_lookup.py). Each splitter output array is shape ``(W,)``
+        per rank, sharded along axis 0 — values vary BOTH across waves AND
+        across ranks (the missing axis vs v70r).
+
+        Per-rank-varying values arise because each rank's traffic distribution
+        differs (skewed inputs, hot peer = (rank+1)%W). The per-wave slices
+        feed the same kernel structure as v70r — so the only delta is the
+        VALUE PATTERN of the SMEM scalars. If this hangs at W=32, the smoking
+        gun is per-rank-varying SMEM scalar values from the real splitter.
+
+        Note: real ``send_off_local`` can reach up to ``max_padded =
+        max_local_ids + W*TILE`` (12288 at W=32, max_local_ids=8K). Real
+        ``phase3_remote_off`` can reach up to ``max_local_ids``. Buffers are
+        sized accordingly.
+
+        IMPORTANT: NO ``pl.when(p1_cnt > 0)`` guards. If a rank sends 0 to a
+        peer in some wave, the resulting 0-length DMA may crash libtpu firmware
+        on v7x — that is part of the smoking-gun signal we want to detect.
+        """
+        from jax.experimental import pallas as pl
+        from jax.experimental.pallas import tpu as pltpu
+        from jax import lax
+        from jax.experimental.multihost_utils import sync_global_devices
+        from recir.ops.pallas.embeddings.jagged_a2a_lookup import (
+            _bucketize_and_sort,
+            _round_up_tile,
+            _split_traffic_ringshift_globalpad,
+            _TILE_INT32,
+        )
+        import sys
+
+        world_size = 32
+        max_waves = world_size
+        P = jax.sharding.PartitionSpec
+
+        all_devices = jax.devices()
+        if len(all_devices) < 256:
+            self.skipTest(f"Need 256 logical devices, have {len(all_devices)}")
+        devices = all_devices[::8]  # symmetric: 1 per host
+        assert len(devices) == world_size
+        mesh = jax.sharding.Mesh(np.array(devices), ("x",))
+
+        def log(msg):
+            if jax.process_index() == 0:
+                print(f"[LITMUS_W32_REALSPLIT] {msg}", file=sys.stderr, flush=True)
+
+        # Production sizing (matches v70n2/v70p/v70q/v70r).
+        max_local_ids = 8 * 1024
+        v_local = 8 * 1024
+        recv_capacity = 8 * 1024 + 128  # 8K + TILE
+        D = 128
+        TILE = 128
+
+        # Real splitter `send_off_local` values can reach max_padded =
+        # max_local_ids + W*TILE = 12288 at W=32. The Phase 1 DMA copies
+        # FIXED_COUNT rows starting at send_off, but here Phase 1 extent is
+        # the static FIXED_COUNT (we keep extents static). The send buffer
+        # must hold up to send_off_max + FIXED_COUNT rows.
+        FIXED_COUNT = 128
+        max_padded = max_local_ids + world_size * TILE  # 12288
+        SORTED_PER_RANK_LEN = max_padded + FIXED_COUNT  # 12416
+
+        # Real `phase3_remote_off` values can reach up to max_local_ids
+        # (sum_{i<my_rank} traffic_matrix[src, i] is bounded by total fan-in
+        # = sum over a row of traffic_matrix <= max_local_ids + W*TILE,
+        # but in practice for skewed input it stays under max_padded). The
+        # Phase 3 DMA dst extent is recv_capacity, so out buffer per rank
+        # must hold phase3_remote_off_max + recv_capacity. Worst case:
+        # phase3_remote_off can reach max_padded - 1 (one peer's offset).
+        OUT_PER_RANK_LEN = max_padded + recv_capacity  # 12288 + 8320 = 20608
+
+        log(f"max_padded={max_padded} SORTED={SORTED_PER_RANK_LEN} OUT={OUT_PER_RANK_LEN}")
+
+        def make_full_chain_kernel(world_size: int):
+            def kernel(sorted_row_ref, table_ref, dummy_in_ref,
+                       wave_idx_ref, p1_cnt_ref, p3_cnt_ref,
+                       send_off_ref, recv_off_ref, phase3_remote_off_ref,
+                       out_init_ref,
+                       out_ref, recv_row_buf, looked_up_buf,
+                       send_sem, recv_sem, send_sem_emb, recv_sem_emb,
+                       table_vmem, zero_emb_vmem, idx_smem):
+                del dummy_in_ref, out_init_ref
+                my_rank = lax.axis_index("x")
+                wave_idx = wave_idx_ref[0]  # traced scalar int32
+
+                # Per-wave SMEM scalars from REAL splitter (this rank's
+                # values for this wave). Pallas requires static slice
+                # extents, so we still use FIXED_COUNT / recv_capacity for
+                # extents — the SMEM-scalar values feed offsets and the
+                # multiple_of/markers. This narrowly tests "do REAL
+                # splitter values trigger the W=32 hang?".
+                p1_cnt = pl.multiple_of(p1_cnt_ref[0], TILE)
+                p3_cnt = pl.multiple_of(p3_cnt_ref[0], TILE)
+                send_start = pl.multiple_of(send_off_ref[0], TILE)
+                remote_recv_start = pl.multiple_of(recv_off_ref[0], TILE)
+                phase3_remote_start = pl.multiple_of(
+                    phase3_remote_off_ref[0], TILE
+                )
+                # Use values to keep them live (XLA/MLIR can't DCE these
+                # because they feed into DMA src/dst offsets).
+                _ = p1_cnt + p3_cnt  # keep counts referenced
+
+                # Pre-barrier (proven to work in v70i barrier-only litmus).
+                sem = pltpu.get_barrier_semaphore()
+                for peer in range(world_size):
+                    pl.semaphore_signal(sem, 1, device_id=(peer,),
+                                        device_id_type=pltpu.DeviceIdType.MESH)
+                pl.semaphore_wait(sem, world_size)
+
+                # Phase 1 ID DMA: ring-shift to wave-dependent peer
+                # my_dst = (my_rank + wave_idx) % W (matches production).
+                my_dst = (my_rank + wave_idx) % world_size
+                # Use SMEM-scalar offsets in pl.ds starts (extent stays static).
+                # NO p1_cnt > 0 guard — let 0-length DMAs crash naturally if
+                # that's the issue.
+                d = pltpu.make_async_remote_copy(
+                    src_ref=sorted_row_ref.at[pl.ds(send_start, FIXED_COUNT)],
+                    dst_ref=recv_row_buf.at[pl.ds(remote_recv_start, FIXED_COUNT)],
+                    send_sem=send_sem,
+                    recv_sem=recv_sem,
+                    device_id=(my_dst,),
+                    device_id_type=pltpu.DeviceIdType.MESH,
+                )
+                d.start()
+                d.wait()
+
+                # Phase 2 gather: stage table HBM -> VMEM (matches full kernel).
+                pltpu.sync_copy(table_ref, table_vmem)
+
+                # Initialize gather output buffer to zeros.
+                zero_emb_vmem[...] = jnp.zeros_like(zero_emb_vmem)
+
+                # Stage recv_row_buf HBM -> SMEM (the indices).
+                pltpu.sync_copy(recv_row_buf, idx_smem)
+
+                # Gather loop.
+                def gather_body(i, __):
+                    row_idx = idx_smem[i % FIXED_COUNT]
+                    zero_emb_vmem[pl.ds(i, 1), :] = table_vmem[pl.ds(row_idx, 1), :]
+                    return None
+                lax.fori_loop(0, recv_capacity, gather_body, None)
+
+                # Copy gathered output to HBM.
+                pltpu.sync_copy(zero_emb_vmem, looked_up_buf)
+
+                # Phase 3 DMA: send gathered embeddings back to wave-dependent
+                # source peer my_src = (my_rank - wave_idx + W) % W (matches
+                # production). Use SMEM-scalar phase3_remote_start as dst start.
+                my_src = (my_rank - wave_idx + world_size) % world_size
+                phase3_count = recv_capacity
+                d3 = pltpu.make_async_remote_copy(
+                    src_ref=looked_up_buf.at[pl.ds(0, phase3_count), :],
+                    dst_ref=out_ref.at[pl.ds(phase3_remote_start, phase3_count), :],
+                    send_sem=send_sem_emb,
+                    recv_sem=recv_sem_emb,
+                    device_id=(my_src,),
+                    device_id_type=pltpu.DeviceIdType.MESH,
+                )
+                d3.start()
+                d3.wait()
+            return kernel
+
+        HBM = pltpu.MemorySpace.HBM
+        SMEM = pltpu.MemorySpace.SMEM
+
+        def per_device_run(local_sorted, local_table, local_dummy,
+                           p1_cnt_arr, p3_cnt_arr, send_off_arr,
+                           recv_off_arr, phase3_remote_off_arr):
+            # local_sorted/_table/_dummy are sharded; per-rank shapes have
+            # leading axis 1 from shard_map (matches v70r). Same for the
+            # five per-wave splitter arrays — each (1, W) per device.
+            out_acc = jnp.zeros((OUT_PER_RANK_LEN, D), dtype=jnp.float32)
+            sync_dep = jnp.float32(0.0)
+            # Strip the leading axis 0 from sharded splitter arrays (each is
+            # shape (1, W) per device).
+            p1_cnt_local = p1_cnt_arr[0]
+            p3_cnt_local = p3_cnt_arr[0]
+            send_off_local = send_off_arr[0]
+            recv_off_local = recv_off_arr[0]
+            phase3_remote_off_local = phase3_remote_off_arr[0]
+            for w_py in range(max_waves):
+                out_acc_dep, _ = jax.lax.optimization_barrier(
+                    (out_acc, sync_dep)
+                )
+                # SMEM scalar carrying this wave's index w (matches production).
+                wave_idx_w = jnp.array([w_py], dtype=jnp.int32)
+                p1_cnt_w = lax.dynamic_slice(p1_cnt_local, (w_py,), (1,))
+                p3_cnt_w = lax.dynamic_slice(p3_cnt_local, (w_py,), (1,))
+                send_off_w = lax.dynamic_slice(send_off_local, (w_py,), (1,))
+                recv_off_w = lax.dynamic_slice(recv_off_local, (w_py,), (1,))
+                phase3_remote_off_w = lax.dynamic_slice(
+                    phase3_remote_off_local, (w_py,), (1,)
+                )
+                kernel = make_full_chain_kernel(world_size)
+                (out_acc, _recv_dummy, _looked_up_dummy) = pl.pallas_call(
+                    kernel,
+                    out_shape=[
+                        jax.ShapeDtypeStruct((OUT_PER_RANK_LEN, D), jnp.float32),
+                        jax.ShapeDtypeStruct((FIXED_COUNT,), jnp.int32),
+                        jax.ShapeDtypeStruct((recv_capacity, D), jnp.float32),
+                    ],
+                    grid_spec=pltpu.PrefetchScalarGridSpec(
+                        num_scalar_prefetch=0,
+                        in_specs=[
+                            pl.BlockSpec(memory_space=HBM),   # sorted_row_ref
+                            pl.BlockSpec(memory_space=HBM),   # table_ref
+                            pl.BlockSpec(memory_space=HBM),   # dummy_in_ref
+                            pl.BlockSpec(memory_space=SMEM),  # wave_idx_ref
+                            pl.BlockSpec(memory_space=SMEM),  # p1_cnt_ref
+                            pl.BlockSpec(memory_space=SMEM),  # p3_cnt_ref
+                            pl.BlockSpec(memory_space=SMEM),  # send_off_ref
+                            pl.BlockSpec(memory_space=SMEM),  # recv_off_ref
+                            pl.BlockSpec(memory_space=SMEM),  # phase3_remote_off_ref
+                            pl.BlockSpec(memory_space=HBM),   # out_init_ref
+                        ],
+                        out_specs=[
+                            pl.BlockSpec(memory_space=HBM),   # out_ref
+                            pl.BlockSpec(memory_space=HBM),   # recv_row_buf
+                            pl.BlockSpec(memory_space=HBM),   # looked_up_buf
+                        ],
+                        scratch_shapes=[
+                            pltpu.SemaphoreType.DMA,  # send_sem (Phase 1)
+                            pltpu.SemaphoreType.DMA,  # recv_sem (Phase 1)
+                            pltpu.SemaphoreType.DMA,  # send_sem_emb (Phase 3)
+                            pltpu.SemaphoreType.DMA,  # recv_sem_emb (Phase 3)
+                            pltpu.VMEM((v_local, D), jnp.float32),
+                            pltpu.VMEM((recv_capacity, D), jnp.float32),
+                            pltpu.SMEM((FIXED_COUNT,), jnp.int32),
+                        ],
+                    ),
+                    input_output_aliases={9: 0},
+                    compiler_params=pltpu.CompilerParams(collective_id=w_py),
+                )(
+                    local_sorted, local_table, local_dummy,
+                    wave_idx_w, p1_cnt_w, p3_cnt_w,
+                    send_off_w, recv_off_w, phase3_remote_off_w,
+                    out_acc_dep,
+                )
+                del _recv_dummy, _looked_up_dummy
+                # Sync_dep keeps waves ordered cross-rank.
+                sync_dep = jax.lax.psum(out_acc[0, 0].astype(jnp.float32), "x")
+            return out_acc
+
+        # Run the production splitter chain on real skewed inputs to get
+        # per-rank-varying SMEM scalar arrays.
+        local_ids, local_id_count = _make_inputs_on_device(
+            mesh, world_size, max_local_ids, v_local, seed=2,
+        )
+        log(f"local_ids shape={local_ids.shape}")
+
+        def per_rank_splitter(ids, count):
+            # ids is (1, max_local_ids); count is (1,).
+            sorted_row_real, send_counts_real, _sort_perm, _reverse_perm = (
+                _bucketize_and_sort(
+                    ids[0], count[0], max_local_ids, world_size,
+                )
+            )
+            del sorted_row_real, _sort_perm, _reverse_perm
+            send_counts_padded = _round_up_tile(send_counts_real, _TILE_INT32)
+            traffic_matrix = jax.lax.all_gather(send_counts_padded, "x")
+            my_rank = jax.lax.axis_index("x")
+            p1_cnt, p3_cnt, send_off, recv_off, phase3_remote_off = (
+                _split_traffic_ringshift_globalpad(
+                    traffic_matrix, send_counts_padded,
+                    world_size=world_size, my_rank=my_rank,
+                )
+            )
+            return (
+                p1_cnt[None], p3_cnt[None], send_off[None],
+                recv_off[None], phase3_remote_off[None],
+            )
+
+        splitter_fn = jax.shard_map(
+            per_rank_splitter, mesh=mesh,
+            in_specs=(P("x"), P("x")),
+            out_specs=(P("x"), P("x"), P("x"), P("x"), P("x")),
+            check_vma=False,
+        )
+        (p1_cnt_arr, p3_cnt_arr, send_off_arr,
+         recv_off_arr, phase3_remote_off_arr) = splitter_fn(
+            local_ids, local_id_count,
+        )
+        jax.block_until_ready((p1_cnt_arr, p3_cnt_arr, send_off_arr,
+                               recv_off_arr, phase3_remote_off_arr))
+        log(f"splitter outputs shape={p1_cnt_arr.shape}")
+
+        sharded = jax.shard_map(
+            per_device_run, mesh=mesh,
+            in_specs=(P("x"), P("x"), P("x"),
+                      P("x"), P("x"), P("x"), P("x"), P("x")),
+            out_specs=P("x"),
+            check_vma=False,
+        )
+
+        # Per-rank sorted_row enlarged to SORTED_PER_RANK_LEN to fit real
+        # send_off_local in [0, max_padded] + extent FIXED_COUNT.
+        sorted_per_rank = (
+            jnp.arange(world_size * SORTED_PER_RANK_LEN, dtype=jnp.int32) % v_local
+        )
+        assert sorted_per_rank.shape == (world_size * SORTED_PER_RANK_LEN,)
+        sorted_per_rank = jax.device_put(
+            sorted_per_rank,
+            jax.sharding.NamedSharding(mesh, P("x")),
+        )
+        table_per_rank = jnp.zeros((world_size * v_local, D), dtype=jnp.float32)
+        table_per_rank = jax.device_put(
+            table_per_rank,
+            jax.sharding.NamedSharding(mesh, P("x")),
+        )
+        dummy_per_rank = jnp.zeros((world_size, 1), dtype=jnp.int32)
+        dummy_per_rank = jax.device_put(
+            dummy_per_rank,
+            jax.sharding.NamedSharding(mesh, P("x")),
+        )
+        jax.block_until_ready(sorted_per_rank)
+        jax.block_until_ready(table_per_rank)
+        jax.block_until_ready(dummy_per_rank)
+        log("inputs ready")
+
+        bjit = jax.jit(sharded)
+        log("calling kernel...")
+        sync_global_devices("litmus_realsplit_start")
+        t0 = time.perf_counter()
+        out = bjit(
+            sorted_per_rank, table_per_rank, dummy_per_rank,
+            p1_cnt_arr, p3_cnt_arr, send_off_arr,
+            recv_off_arr, phase3_remote_off_arr,
+        )
+        dispatch_ms = (time.perf_counter() - t0) * 1e3
+        log(f"dispatched (after {dispatch_ms:.1f}ms), blocking...")
+        jax.block_until_ready(out)
+        elapsed_ms = (time.perf_counter() - t0) * 1e3
+        log(f"ran in {elapsed_ms:.1f} ms total (dispatch={dispatch_ms:.1f}, block={elapsed_ms-dispatch_ms:.1f})")
+        log("RESULT: WORKS")
+
+
+    def test_w32_production_kernel_litmus(self) -> None:
+        """W=32 litmus that calls the PRODUCTION ringshift kernel directly.
+
+        Companion to ``test_w32_smem_real_splitter_litmus`` (v70s, which works).
+        v70s reimplements the kernel inline; THIS test calls the production
+        ``jagged_a2a_embedding_lookup_f32_alltc_ringshift`` (which uses
+        ``_make_ringshift_single_wave_kernel`` from jagged_a2a_lookup.py).
+
+        Same wrapper pattern: jit + sync_global_devices + checkpoint prints +
+        single dispatch + block_until_ready. Same sizing as v70s
+        (max_local_ids=8K, v_local=8K, D=128, recv_capacity=8K+TILE).
+
+        If THIS hangs (as test_w32_multi_iter does), the bug is INSIDE the
+        production single-wave kernel body. The diff vs the v70s litmus inline
+        kernel narrows where to look:
+          - ordering of pre-barrier vs sync_copy(table) / zero scratch init
+          - extra recv_row_buf zero-init (sync_copy of zero_int_vmem)
+          - Phase 3 src offset uses ``remote_recv_start`` (= recv_off_ref[0]),
+            v70s uses ``0``
+          - extent of Phase 1 DMA = real ``p1_cnt`` (variable), v70s uses
+            FIXED_COUNT=128
+          - extent of Phase 3 DMA = real ``p3_cnt`` (variable), v70s uses
+            recv_capacity (constant)
+          - Phase 3 DMA src window (looked_up_buf[remote_recv_start:p3_cnt])
+            differs from v70s (looked_up_buf[0:recv_capacity])
+        """
+        from jax.experimental.multihost_utils import sync_global_devices
+        import sys
+
+        world_size = 32
+        TILE = 128
+        embedding_dim = 128
+        v_local = 8 * 1024
+        max_local_ids = 8 * 1024
+
+        all_devices = jax.devices()
+        if len(all_devices) < 256:
+            self.skipTest(f"Need 256 logical devices, have {len(all_devices)}")
+        devices = all_devices[::8]  # symmetric: 1 per host (matches v70s)
+        assert len(devices) == world_size
+        mesh = jax.sharding.Mesh(np.array(devices), ("x",))
+
+        recv_capacity = max_local_ids + TILE
+        recv_capacity = ((recv_capacity + TILE - 1) // TILE) * TILE
+
+        def log(msg):
+            if jax.process_index() == 0:
+                print(f"[LITMUS_W32_PRODKERNEL] {msg}", file=sys.stderr, flush=True)
+
+        log(f"=== D={embedding_dim} v_local={v_local} max_local_ids={max_local_ids} W={world_size} ===")
+
+        log("creating inputs ...")
+        local_ids, local_id_count = _make_inputs_on_device(
+            mesh, world_size, max_local_ids, v_local, seed=2,
+        )
+        local_table = _make_table_on_device(mesh, v_local, embedding_dim)
+        jax.block_until_ready((local_ids, local_id_count, local_table))
+        log("inputs ready")
+
+        rs_jit = jax.jit(functools.partial(
+            jagged_a2a_embedding_lookup_f32_alltc_ringshift,
+            mesh=mesh, axis_name="x",
+            recv_capacity=recv_capacity, splitter="globalpad",
+        ))
+
+        log("calling production kernel...")
+        sync_global_devices("litmus_prodkernel_start")
+        t0 = time.perf_counter()
+        out = rs_jit(local_ids, local_id_count, local_table)
+        dispatch_ms = (time.perf_counter() - t0) * 1e3
+        log(f"dispatched (after {dispatch_ms:.1f}ms), blocking...")
+        jax.block_until_ready(out)
+        elapsed_ms = (time.perf_counter() - t0) * 1e3
+        log(f"ran in {elapsed_ms:.1f} ms total (dispatch={dispatch_ms:.1f}, block={elapsed_ms-dispatch_ms:.1f})")
+        log("RESULT: WORKS")
+
 
 if __name__ == "__main__":
     unittest.main()
