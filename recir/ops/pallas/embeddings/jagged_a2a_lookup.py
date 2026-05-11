@@ -83,6 +83,16 @@ except ImportError:
     plsc = None  # type: ignore[assignment]
 
 
+# Number of distinct ``collective_id`` values cycled across per-wave
+# pallas_call sites in ``_jagged_a2a_embedding_lookup_local_f32_alltc_ringshift``.
+# At W=128, using a unique id per wave triggers 128 distinct compiles
+# (cold-compile > 40 min). Cycling through K ids reduces to K compiles
+# (~minutes); cross-rank sync between waves is provided by the per-wave
+# ``psum + optimization_barrier`` carry, so channel reuse between waves
+# separated by K is safe.
+_COLLECTIVE_ID_CYCLE = 8
+
+
 # ---------------------------------------------------------------------------
 # A. Host-side input preparation (pure JAX, all static shapes)
 # ---------------------------------------------------------------------------
@@ -1641,17 +1651,16 @@ def _make_ringshift_single_wave_kernel(
     embedding_dim: int,
     v_local: int,
 ):
-    """Single-wave all-TC fused f32 ring-shift kernel.
+    """Single-wave all-TC fused f32 ring-shift kernel (v69d-style structure).
 
-    The previous design folded the W-wave loop INSIDE one Pallas call, but
-    that path hit cross-wave barrier-semaphore collisions / runtime hangs
-    once W reached 128 (regardless of fori_loop vs. Python unrolling — see
-    v68p/v68s/v68v/v68y). Codex confirmed the v23 split-pipeline pattern is
-    the right path: hoist the wave loop to a JAX-level Python ``for`` loop
-    over individual ``pl.pallas_call`` invocations, each with a UNIQUE
-    ``compiler_params=CompilerParams(collective_id=w_py)``. With per-call
-    unique collective_id, the implicit device-barrier semaphore for one
-    wave can no longer collide with the previous (or next) wave's
+    The previous design folded the W-wave loop INSIDE one Pallas call as
+    ``lax.fori_loop`` (v69w) but at W=32 multi-iter that hung. Codex's
+    pivot: revert to the v69d-style multi-call structure where the wave
+    loop is hoisted to a JAX-level Python ``for`` loop over individual
+    ``pl.pallas_call`` invocations, each with a UNIQUE
+    ``compiler_params=CompilerParams(collective_id=w_py)``. Per-call
+    unique collective_id ensures the implicit device-barrier semaphore
+    for one wave can't collide with the previous (or next) wave's
     semaphore.
 
     This kernel is the single-wave body: it expects the wave index plus
@@ -1660,6 +1669,13 @@ def _make_ringshift_single_wave_kernel(
     The accumulating ``out`` buffer is aliased through
     ``input_output_aliases`` so each wave writes a disjoint slice and the
     accumulator survives across calls.
+
+    Pair-handshake pre-barrier: 1 signal + 1 wait per wave, with
+    my_src/my_dst computed from the scalar wave_idx — ringshift has
+    exactly ONE sender->me + me->ONE receiver per wave (same peer when
+    wave_idx == 0). Uses ``pltpu.get_barrier_semaphore()`` (custom
+    barrier), required by Mosaic when ``collective_id`` is set on
+    ``CompilerParams``.
     """
 
     def kernel(
@@ -1692,15 +1708,17 @@ def _make_ringshift_single_wave_kernel(
         zero_emb_vmem[...] = jnp.zeros_like(zero_emb_vmem)
         pltpu.sync_copy(zero_int_vmem, recv_row_buf)
 
-        # Custom cross-device barrier driven by the per-call unique
-        # ``collective_id`` (set in the wrapper via ``CompilerParams``).
-        # Mosaic rejects ``collective_id`` unless we use the custom-barrier
-        # semaphore (``pltpu.get_barrier_semaphore()``), and v23 uses the
-        # same idiom in ``_make_id_a2a_kernel`` / ``_make_emb_a2a_kernel``.
-        # Inner peer signal loop is Python-unrolled (W ops in HLO body); the
-        # outer wave loop is at JAX level (not inside Mosaic), so this only
-        # adds W entries here, not W*W.
+        # All-peer broadcast pre-barrier (W signals + 1 wait of W per wave).
+        # Reverted from pair-handshake (which used a TRACED device_id and
+        # may have a multi-host routing bug) back to the original static
+        # Python-loop unrolled signals to all peers. The custom barrier
+        # semaphore (``pltpu.get_barrier_semaphore()``) is required by
+        # Mosaic when ``collective_id`` is set on ``CompilerParams`` (set
+        # by the wrapper, unique per wave). Each call's barrier sem is a
+        # fresh slot so signals can't leak across waves.
         sem = pltpu.get_barrier_semaphore()
+        my_src = (my_rank - wave_idx + world_size) % world_size  # who sends to me
+        my_dst = (my_rank + wave_idx) % world_size               # who I send to
         for peer in range(world_size):
             pl.semaphore_signal(
                 sem, 1,
@@ -1714,19 +1732,16 @@ def _make_ringshift_single_wave_kernel(
         p1_cnt = pl.multiple_of(p1_cnt_ref[0], _TILE_INT32)
         send_start = pl.multiple_of(send_off_ref[0], _TILE_INT32)
         remote_recv_start = pl.multiple_of(recv_off_ref[0], _TILE_INT32)
-        peer_id_send = (my_rank + wave_idx) % world_size
 
         d = pltpu.make_async_remote_copy(
             src_ref=sorted_row_ref.at[pl.ds(send_start, p1_cnt)],
             dst_ref=recv_row_buf.at[pl.ds(remote_recv_start, p1_cnt)],
             send_sem=send_sem_id, recv_sem=recv_sem_id,
-            device_id=(peer_id_send,),
+            device_id=(my_dst,),
             device_id_type=pltpu.DeviceIdType.MESH,
         )
         d.start()
         d.wait()
-        # NO POST BARRIER — d.wait() syncs both send+recv, providing the
-        # cross-rank ordering Phase 2 needs.
 
         # Phase 2: local lookup.
         pltpu.sync_copy(recv_row_buf, idx_smem)
@@ -1744,7 +1759,8 @@ def _make_ringshift_single_wave_kernel(
         # me in Phase 1). Each wave writes to a DISJOINT slice of the
         # global accumulator (different phase3_remote_start per wave), so
         # waves don't collide on the aliased ``out_ref`` accumulator.
-        peer_emb_send = (my_rank - wave_idx + world_size) % world_size
+        # Phase 3 destination peer = my_src (send back to the rank that
+        # sent us its IDs in Phase 1).
         phase3_remote_start = pl.multiple_of(
             phase3_remote_off_ref[0], _TILE_INT32
         )
@@ -1754,7 +1770,7 @@ def _make_ringshift_single_wave_kernel(
             src_ref=looked_up_buf.at[pl.ds(remote_recv_start, p3_cnt), :],
             dst_ref=out_ref.at[pl.ds(phase3_remote_start, p3_cnt), :],
             send_sem=send_sem_emb, recv_sem=recv_sem_emb,
-            device_id=(peer_emb_send,),
+            device_id=(my_src,),  # send back to my source
             device_id_type=pltpu.DeviceIdType.MESH,
         )
         d.start()
@@ -1831,12 +1847,12 @@ def _jagged_a2a_embedding_lookup_local_f32_alltc_ringshift(
         v_local=v_local,
     )
 
-    # JAX-level Python wave loop. Each pallas_call gets a UNIQUE
-    # ``collective_id`` so its implicit device-barrier semaphore doesn't
-    # collide with the previous (or next) wave's barrier — same fix as v23
-    # (see ``jagged_a2a_embedding_lookup`` lines around 720/776). Each
-    # call's ``out_init`` aliases to ``out`` so the accumulator survives
-    # across waves; per-wave dst offsets land on disjoint slices.
+    # JAX-level Python wave loop (v69d-style). Each pallas_call gets a
+    # UNIQUE ``collective_id`` so its implicit device-barrier semaphore
+    # doesn't collide with the previous (or next) wave's barrier (same
+    # fix as v23 lines around 720/776). Each call's ``out_init`` aliases
+    # to ``out`` so the accumulator survives across waves; per-wave dst
+    # offsets land on disjoint slices.
     #
     # CROSS-RANK EPOCH BARRIER (v69c): even with unique collective_ids,
     # successive semaphore-using epochs can skew across ranks across
@@ -1846,9 +1862,8 @@ def _jagged_a2a_embedding_lookup_local_f32_alltc_ringshift(
     # w-1. Stitch the waves together with a psum on a real value derived
     # from the previous wave's output, then bind that scalar into the
     # next wave's accumulator via ``optimization_barrier`` (XLA can't
-    # statically simplify it away). This forces every rank to finish wave
-    # w-1 before any rank launches wave w. Matches the pattern in the
-    # existing chunked v_local wrapper.
+    # statically simplify it away). This forces every rank to finish
+    # wave w-1 before any rank launches wave w.
     sorted_emb_padded = jnp.zeros((max_padded, embedding_dim), dtype=dtype)
     sync_dep = jnp.float32(0.0)  # initial — no dep yet
 
@@ -1907,8 +1922,8 @@ def _jagged_a2a_embedding_lookup_local_f32_alltc_ringshift(
                     SMEM((recv_capacity,), jnp.int32),
                     # NO REGULAR barrier sem — kernel uses
                     # ``pltpu.get_barrier_semaphore()`` (custom barrier),
-                    # required by Mosaic when ``collective_id`` is set on
-                    # ``CompilerParams``.
+                    # required by Mosaic when ``collective_id`` is set
+                    # on ``CompilerParams``.
                     pltpu.SemaphoreType.DMA,
                     pltpu.SemaphoreType.DMA,
                     pltpu.SemaphoreType.DMA,
@@ -1932,8 +1947,9 @@ def _jagged_a2a_embedding_lookup_local_f32_alltc_ringshift(
         del _recv_row_dummy, _looked_up_dummy
 
         # Cross-rank epoch barrier: psum a real value derived from this
-        # wave's output (so XLA can't statically simplify). One scalar per
-        # rank; ``axis_name`` is bound here because we're inside shard_map.
+        # wave's output (so XLA can't statically simplify). One scalar
+        # per rank; ``axis_name`` is bound here because we're inside
+        # shard_map.
         sync_dep = jax.lax.psum(sorted_emb_padded[0, 0], axis_name)
 
     sorted_emb = _unpad_per_peer(
