@@ -1,0 +1,41 @@
+# v63: W4Phase12Litmus — phase-1 + phase-2 isolating litmus.
+# Runs ONLY the new W4Phase12Litmus test class on a 4-chip TPU v7x slice
+# to isolate whether phase 2's nested `lax.fori_loop` inside the outer
+# wave loop is the culprit for v62's hang.
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  generateName: litmus-v63-w4-phase12-
+  namespace: default
+spec:
+  replicatedJobs:
+  - name: worker
+    replicas: 1
+    template:
+      spec:
+        parallelism: 1
+        completions: 1
+        template:
+          spec:
+            containers:
+            - name: litmus
+              image: gcr.io/mrs-tpu-y317h/shenli-runner:v63
+              imagePullPolicy: Always
+              env:
+              - name: PYTHONUNBUFFERED
+                value: "1"
+              command:
+              - sh
+              - -c
+              - >-
+                python3 -u -m unittest -v
+                recir.ops.pallas.embeddings.tests.test_inbound_flush_litmus.W4Phase12Litmus
+              ports:
+              - containerPort: 8471
+              resources:
+                limits:
+                  google.com/tpu: 4
+            nodeSelector:
+              cloud.google.com/gke-tpu-accelerator: tpu7x
+              cloud.google.com/gke-tpu-topology: 2x2x1
+            restartPolicy: Never
