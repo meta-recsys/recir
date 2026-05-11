@@ -19,6 +19,7 @@ import torch.fx as fx
 import torch.nn as nn
 from recir.graph_utils import OP
 from recir.region_transforms.base import RegionTransform
+from recir.region_transforms.core import _extract_subgraph, _replace_region
 
 logger: logging.Logger = logging.getLogger(__name__)
 
@@ -31,11 +32,11 @@ class RecomputeTransform(RegionTransform):
     def __init__(self, submodule_fqns: set[str]) -> None:
         self.submodule_fqns = submodule_fqns
 
-    def detect_regions(
+    def transform_graph(
         self,
         gm: fx.GraphModule,
         called_modules: OrderedDict[str, tuple[nn.Module, tuple[Any, ...]]],
-    ) -> list[set[fx.Node]]:
+    ) -> None:
         fqn_to_nodes: dict[str, set[fx.Node]] = {}
         for node in gm.graph.nodes:
             if node.op not in (OP.CALL_FUNCTION, OP.CALL_METHOD):
@@ -51,22 +52,23 @@ class RecomputeTransform(RegionTransform):
             for fqn, _ in nn_module_stack.values():
                 if fqn in self.submodule_fqns:
                     fqn_to_nodes.setdefault(fqn, set()).add(node)
-        regions: list[set[fx.Node]] = []
+        all_regions: list[set[fx.Node]] = []
         for fqn in self.submodule_fqns:
             nodes = fqn_to_nodes.get(fqn)
             if nodes:
-                regions.append(nodes)
+                all_regions.append(nodes)
             else:
                 logger.warning(
                     "RecomputeTransform: no nodes found for submodule '%s'",
                     fqn,
                 )
-        return regions
+        for region_nodes in all_regions:
+            region_gm = _extract_subgraph(gm, region_nodes)
+            wrapped_fn = self._wrap_checkpoint(region_gm)
+            _replace_region(gm, region_nodes, wrapped_fn)
 
-    def wrap_region(
-        self,
-        region_gm: fx.GraphModule,
-    ) -> Callable[..., Any]:
+    @staticmethod
+    def _wrap_checkpoint(region_gm: fx.GraphModule) -> Callable[..., Any]:
         def _apply(*inputs: torch.Tensor) -> Any:
             return torch.utils.checkpoint.checkpoint(
                 region_gm,
