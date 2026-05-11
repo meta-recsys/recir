@@ -729,6 +729,170 @@ class JaggedA2AW128Benchmark(unittest.TestCase):
         log(f"=== RESULT: ra2a={ra2a_times} fused={fused_times}")
 
 
+    def test_w64_multi_iter(self) -> None:
+        """W=64 multi-iter perf test on v71d (production kernel + split DMA fix).
+
+        Mirrors test_w32_multi_iter but world_size=64, devices[::4] (2 devices per
+        host across all 32 hosts).
+        """
+        from jax.experimental.multihost_utils import sync_global_devices
+        import sys
+
+        world_size = 64
+        TILE = 128
+        embedding_dim = 128
+        v_local = 8 * 1024
+        max_local_ids = 8 * 1024
+
+        all_devices = jax.devices()
+        if len(all_devices) < 256:
+            self.skipTest(f"Need 256 logical devices, have {len(all_devices)}")
+        devices = all_devices[::4]  # 2 devices per host, all 32 hosts
+        assert len(devices) == world_size, f"expected {world_size}, got {len(devices)}"
+        mesh = jax.sharding.Mesh(np.array(devices), ("x",))
+
+        recv_capacity = max_local_ids + TILE
+        recv_capacity = ((recv_capacity + TILE - 1) // TILE) * TILE
+
+        def log(msg):
+            if jax.process_index() == 0:
+                print(f"[W=64] {msg}", file=sys.stderr, flush=True)
+
+        log(f"=== D={embedding_dim} v_local={v_local} max_local_ids={max_local_ids} ===")
+
+        log("creating inputs ...")
+        local_ids, local_id_count = _make_inputs_on_device(mesh, world_size, max_local_ids, v_local, seed=2)
+        local_table = _make_table_on_device(mesh, v_local, embedding_dim)
+        jax.block_until_ready((local_ids, local_id_count, local_table))
+        args = (local_ids, local_id_count, local_table)
+        log("inputs ready")
+
+        rs_gp_jit = jax.jit(functools.partial(
+            jagged_a2a_embedding_lookup_f32_alltc_ringshift,
+            mesh=mesh, axis_name="x",
+            recv_capacity=recv_capacity, splitter="globalpad",
+        ))
+        ra2a_jit = jax.jit(functools.partial(
+            jagged_a2a_embedding_lookup_reference_jax,
+            mesh=mesh, axis_name="x",
+        ))
+
+        log("-- ra2a --")
+        ra2a_times = []
+        for i in range(3):
+            sync_global_devices(f"ra2a_iter_{i}_start")
+            log(f"ra2a iter {i} pre-call")
+            t0 = time.perf_counter()
+            out = ra2a_jit(*args)
+            log(f"ra2a iter {i} dispatched (after {(time.perf_counter()-t0)*1e3:.1f}ms), blocking...")
+            jax.block_until_ready(out)
+            elapsed_ms = (time.perf_counter() - t0) * 1e3
+            ra2a_times.append(elapsed_ms)
+            log(f"ra2a iter {i}: {elapsed_ms:.1f} ms total")
+        sync_global_devices("ra2a_done")
+        log(f"ra2a all iters: {ra2a_times}")
+
+        log("-- fused_rs_globalpad --")
+        fused_times = []
+        for i in range(3):
+            sync_global_devices(f"fused_iter_{i}_start")
+            log(f"fused iter {i} pre-call (before jit_fn dispatch)")
+            t0 = time.perf_counter()
+            out = rs_gp_jit(*args)
+            dispatch_ms = (time.perf_counter() - t0) * 1e3
+            log(f"fused iter {i} dispatched (after {dispatch_ms:.1f}ms), blocking on result...")
+            jax.block_until_ready(out)
+            elapsed_ms = (time.perf_counter() - t0) * 1e3
+            block_ms = elapsed_ms - dispatch_ms
+            fused_times.append(elapsed_ms)
+            log(f"fused iter {i}: {elapsed_ms:.1f} ms total (dispatch={dispatch_ms:.1f}, block={block_ms:.1f})")
+        sync_global_devices("fused_done")
+        log(f"fused all iters: {fused_times}")
+        log(f"=== RESULT: ra2a={ra2a_times} fused={fused_times}")
+
+
+    def test_w128_multi_iter_v71d(self) -> None:
+        """W=128 multi-iter perf test on v71d (production kernel + split DMA fix).
+
+        Mirrors test_w32_multi_iter but world_size=128, devices[::2] (4 devices per
+        host across all 32 hosts).
+        """
+        from jax.experimental.multihost_utils import sync_global_devices
+        import sys
+
+        world_size = 128
+        TILE = 128
+        embedding_dim = 128
+        v_local = 8 * 1024
+        max_local_ids = 8 * 1024
+
+        all_devices = jax.devices()
+        if len(all_devices) < 256:
+            self.skipTest(f"Need 256 logical devices, have {len(all_devices)}")
+        devices = all_devices[::2]  # 4 devices per host, all 32 hosts
+        assert len(devices) == world_size, f"expected {world_size}, got {len(devices)}"
+        mesh = jax.sharding.Mesh(np.array(devices), ("x",))
+
+        recv_capacity = max_local_ids + TILE
+        recv_capacity = ((recv_capacity + TILE - 1) // TILE) * TILE
+
+        def log(msg):
+            if jax.process_index() == 0:
+                print(f"[W=128] {msg}", file=sys.stderr, flush=True)
+
+        log(f"=== D={embedding_dim} v_local={v_local} max_local_ids={max_local_ids} ===")
+
+        log("creating inputs ...")
+        local_ids, local_id_count = _make_inputs_on_device(mesh, world_size, max_local_ids, v_local, seed=2)
+        local_table = _make_table_on_device(mesh, v_local, embedding_dim)
+        jax.block_until_ready((local_ids, local_id_count, local_table))
+        args = (local_ids, local_id_count, local_table)
+        log("inputs ready")
+
+        rs_gp_jit = jax.jit(functools.partial(
+            jagged_a2a_embedding_lookup_f32_alltc_ringshift,
+            mesh=mesh, axis_name="x",
+            recv_capacity=recv_capacity, splitter="globalpad",
+        ))
+        ra2a_jit = jax.jit(functools.partial(
+            jagged_a2a_embedding_lookup_reference_jax,
+            mesh=mesh, axis_name="x",
+        ))
+
+        log("-- ra2a --")
+        ra2a_times = []
+        for i in range(3):
+            sync_global_devices(f"ra2a_iter_{i}_start")
+            log(f"ra2a iter {i} pre-call")
+            t0 = time.perf_counter()
+            out = ra2a_jit(*args)
+            log(f"ra2a iter {i} dispatched (after {(time.perf_counter()-t0)*1e3:.1f}ms), blocking...")
+            jax.block_until_ready(out)
+            elapsed_ms = (time.perf_counter() - t0) * 1e3
+            ra2a_times.append(elapsed_ms)
+            log(f"ra2a iter {i}: {elapsed_ms:.1f} ms total")
+        sync_global_devices("ra2a_done")
+        log(f"ra2a all iters: {ra2a_times}")
+
+        log("-- fused_rs_globalpad --")
+        fused_times = []
+        for i in range(3):
+            sync_global_devices(f"fused_iter_{i}_start")
+            log(f"fused iter {i} pre-call (before jit_fn dispatch)")
+            t0 = time.perf_counter()
+            out = rs_gp_jit(*args)
+            dispatch_ms = (time.perf_counter() - t0) * 1e3
+            log(f"fused iter {i} dispatched (after {dispatch_ms:.1f}ms), blocking on result...")
+            jax.block_until_ready(out)
+            elapsed_ms = (time.perf_counter() - t0) * 1e3
+            block_ms = elapsed_ms - dispatch_ms
+            fused_times.append(elapsed_ms)
+            log(f"fused iter {i}: {elapsed_ms:.1f} ms total (dispatch={dispatch_ms:.1f}, block={block_ms:.1f})")
+        sync_global_devices("fused_done")
+        log(f"fused all iters: {fused_times}")
+        log(f"=== RESULT: ra2a={ra2a_times} fused={fused_times}")
+
+
     def _run_multi_iter_with_devices(self, world_size, devices):
         """Shared helper: 3-iter test of ra2a + fused with checkpoint prints
         between async dispatch and block_until_ready.
