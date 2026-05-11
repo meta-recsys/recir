@@ -2986,5 +2986,843 @@ class JaggedA2AW128Benchmark(unittest.TestCase):
         log("RESULT: WORKS")
 
 
+    # =====================================================================
+    # REVERSE-BISECT W=32 LITMUS METHODS
+    #
+    # Start from v70s (test_w32_smem_real_splitter_litmus, which PASSES at
+    # W=32 in ~27s) and add production-specific elements one at a time,
+    # building toward _make_ringshift_single_wave_kernel. Each addition is
+    # tested at W=32 with the same wrapper/inputs as v70s. The first
+    # addition that breaks the litmus is the smoking gun.
+    #
+    # Production diffs (vs v70s):
+    #   A: ADD pltpu.sync_copy(zero_int_vmem, recv_row_buf) zero-init
+    #   B: ADD extra (recv_capacity,) int VMEM scratch (zero_int_vmem) —
+    #      paired with A (sync_copy needs the scratch to source from)
+    #   C: ORDER: init FIRST, barrier AFTER (v70s: barrier first, init after)
+    #   D: Phase 1 DMA extent = pl.multiple_of(p1_cnt_ref[0], TILE) (runtime)
+    #      [v70s: extent = FIXED_COUNT (compile-time constant)]
+    #   E: Phase 3 DMA extent = pl.multiple_of(p3_cnt_ref[0], TILE) (runtime)
+    #      [v70s: extent = recv_capacity (compile-time constant)]
+    #
+    # Layered methods:
+    #   _plus_A_litmus     : v70s + A (and B, since A requires B's scratch)
+    #   _plus_AB_litmus    : same as _plus_A (A and B are inseparable;
+    #                        kept for naming consistency with the plan)
+    #   _plus_ABC_litmus   : + C (init first, barrier after)
+    #   _plus_ABCDE_litmus : + D, E (runtime Phase 1/3 extents from SMEM)
+    # =====================================================================
+
+    def _run_w32_reverse_bisect(self, *, label: str, kernel_factory) -> None:
+        """Shared driver for the W=32 reverse-bisect litmus suite.
+
+        Uses the same wrapper/inputs as test_w32_smem_real_splitter_litmus
+        (v70s). The kernel body differs per step via ``kernel_factory``.
+        """
+        from jax.experimental import pallas as pl
+        from jax.experimental.pallas import tpu as pltpu
+        from jax import lax
+        from jax.experimental.multihost_utils import sync_global_devices
+        from recir.ops.pallas.embeddings.jagged_a2a_lookup import (
+            _bucketize_and_sort,
+            _round_up_tile,
+            _split_traffic_ringshift_globalpad,
+            _TILE_INT32,
+        )
+        import sys
+
+        world_size = 32
+        max_waves = world_size
+        P = jax.sharding.PartitionSpec
+
+        all_devices = jax.devices()
+        if len(all_devices) < 256:
+            self.skipTest(f"Need 256 logical devices, have {len(all_devices)}")
+        devices = all_devices[::8]
+        assert len(devices) == world_size
+        mesh = jax.sharding.Mesh(np.array(devices), ("x",))
+
+        def log(msg):
+            if jax.process_index() == 0:
+                print(f"[LITMUS_W32_REV_{label}] {msg}", file=sys.stderr, flush=True)
+
+        max_local_ids = 8 * 1024
+        v_local = 8 * 1024
+        recv_capacity = 8 * 1024 + 128
+        D = 128
+        TILE = 128
+        FIXED_COUNT = 128
+        max_padded = max_local_ids + world_size * TILE
+        SORTED_PER_RANK_LEN = max_padded + FIXED_COUNT
+        OUT_PER_RANK_LEN = max_padded + recv_capacity
+
+        log(f"max_padded={max_padded} SORTED={SORTED_PER_RANK_LEN} OUT={OUT_PER_RANK_LEN}")
+
+        HBM = pltpu.MemorySpace.HBM
+        SMEM = pltpu.MemorySpace.SMEM
+
+        kernel = kernel_factory(
+            world_size=world_size,
+            FIXED_COUNT=FIXED_COUNT,
+            recv_capacity=recv_capacity,
+            TILE=TILE,
+        )
+
+        # Each step uses one of two scratch layouts:
+        #   layout "v70s"  — original v70s scratches (no zero_int_vmem)
+        #   layout "withZ" — adds zero_int_vmem just before idx_smem (matches
+        #                    production ordering: ints VMEM, then emb VMEM,
+        #                    then table VMEM, then idx SMEM). To minimize
+        #                    structural diffs vs v70s, we INSERT zero_int_vmem
+        #                    at the start of the VMEM block.
+        #
+        # The kernel_factory tells us which layout it expects via its return
+        # tuple: (kernel_fn, scratch_layout) — but to keep the API simple we
+        # let the kernel_factory return just the fn and assume layout based on
+        # label.
+        if label.startswith("A") or label.startswith("AB") or label.startswith("ABC"):
+            # When diff B is in play, zero_int_vmem is sized (recv_capacity,)
+            # and the sync_copy requires recv_row_buf to also be sized
+            # (recv_capacity,). idx_smem grows accordingly so the
+            # sync_copy(recv_row_buf, idx_smem) shapes match. These size
+            # changes are inseparable from diff B and are NOT a new diff.
+            recv_row_buf_len = recv_capacity
+            idx_smem_len = recv_capacity
+            scratch_shapes = [
+                pltpu.SemaphoreType.DMA,  # send_sem (Phase 1)
+                pltpu.SemaphoreType.DMA,  # recv_sem (Phase 1)
+                pltpu.SemaphoreType.DMA,  # send_sem_emb (Phase 3)
+                pltpu.SemaphoreType.DMA,  # recv_sem_emb (Phase 3)
+                pltpu.VMEM((recv_capacity,), jnp.int32),  # zero_int_vmem (NEW: diff B)
+                pltpu.VMEM((v_local, D), jnp.float32),     # table_vmem
+                pltpu.VMEM((recv_capacity, D), jnp.float32),  # zero_emb_vmem
+                pltpu.SMEM((idx_smem_len,), jnp.int32),     # idx_smem
+            ]
+            has_zero_int = True
+        else:
+            # Should not happen given our 4 step labels, but safe fallback.
+            recv_row_buf_len = FIXED_COUNT
+            idx_smem_len = FIXED_COUNT
+            scratch_shapes = [
+                pltpu.SemaphoreType.DMA,
+                pltpu.SemaphoreType.DMA,
+                pltpu.SemaphoreType.DMA,
+                pltpu.SemaphoreType.DMA,
+                pltpu.VMEM((v_local, D), jnp.float32),
+                pltpu.VMEM((recv_capacity, D), jnp.float32),
+                pltpu.SMEM((FIXED_COUNT,), jnp.int32),
+            ]
+            has_zero_int = False
+
+        def per_device_run(local_sorted, local_table, local_dummy,
+                           p1_cnt_arr, p3_cnt_arr, send_off_arr,
+                           recv_off_arr, phase3_remote_off_arr):
+            out_acc = jnp.zeros((OUT_PER_RANK_LEN, D), dtype=jnp.float32)
+            sync_dep = jnp.float32(0.0)
+            p1_cnt_local = p1_cnt_arr[0]
+            p3_cnt_local = p3_cnt_arr[0]
+            send_off_local = send_off_arr[0]
+            recv_off_local = recv_off_arr[0]
+            phase3_remote_off_local = phase3_remote_off_arr[0]
+            for w_py in range(max_waves):
+                out_acc_dep, _ = jax.lax.optimization_barrier(
+                    (out_acc, sync_dep)
+                )
+                wave_idx_w = jnp.array([w_py], dtype=jnp.int32)
+                p1_cnt_w = lax.dynamic_slice(p1_cnt_local, (w_py,), (1,))
+                p3_cnt_w = lax.dynamic_slice(p3_cnt_local, (w_py,), (1,))
+                send_off_w = lax.dynamic_slice(send_off_local, (w_py,), (1,))
+                recv_off_w = lax.dynamic_slice(recv_off_local, (w_py,), (1,))
+                phase3_remote_off_w = lax.dynamic_slice(
+                    phase3_remote_off_local, (w_py,), (1,)
+                )
+                (out_acc, _recv_dummy, _looked_up_dummy) = pl.pallas_call(
+                    kernel,
+                    out_shape=[
+                        jax.ShapeDtypeStruct((OUT_PER_RANK_LEN, D), jnp.float32),
+                        jax.ShapeDtypeStruct((recv_row_buf_len,), jnp.int32),
+                        jax.ShapeDtypeStruct((recv_capacity, D), jnp.float32),
+                    ],
+                    grid_spec=pltpu.PrefetchScalarGridSpec(
+                        num_scalar_prefetch=0,
+                        in_specs=[
+                            pl.BlockSpec(memory_space=HBM),
+                            pl.BlockSpec(memory_space=HBM),
+                            pl.BlockSpec(memory_space=HBM),
+                            pl.BlockSpec(memory_space=SMEM),
+                            pl.BlockSpec(memory_space=SMEM),
+                            pl.BlockSpec(memory_space=SMEM),
+                            pl.BlockSpec(memory_space=SMEM),
+                            pl.BlockSpec(memory_space=SMEM),
+                            pl.BlockSpec(memory_space=SMEM),
+                            pl.BlockSpec(memory_space=HBM),
+                        ],
+                        out_specs=[
+                            pl.BlockSpec(memory_space=HBM),
+                            pl.BlockSpec(memory_space=HBM),
+                            pl.BlockSpec(memory_space=HBM),
+                        ],
+                        scratch_shapes=scratch_shapes,
+                    ),
+                    input_output_aliases={9: 0},
+                    compiler_params=pltpu.CompilerParams(collective_id=w_py),
+                )(
+                    local_sorted, local_table, local_dummy,
+                    wave_idx_w, p1_cnt_w, p3_cnt_w,
+                    send_off_w, recv_off_w, phase3_remote_off_w,
+                    out_acc_dep,
+                )
+                del _recv_dummy, _looked_up_dummy
+                sync_dep = jax.lax.psum(out_acc[0, 0].astype(jnp.float32), "x")
+            return out_acc
+
+        local_ids, local_id_count = _make_inputs_on_device(
+            mesh, world_size, max_local_ids, v_local, seed=2,
+        )
+        log(f"local_ids shape={local_ids.shape}")
+
+        def per_rank_splitter(ids, count):
+            sorted_row_real, send_counts_real, _sort_perm, _reverse_perm = (
+                _bucketize_and_sort(
+                    ids[0], count[0], max_local_ids, world_size,
+                )
+            )
+            del sorted_row_real, _sort_perm, _reverse_perm
+            send_counts_padded = _round_up_tile(send_counts_real, _TILE_INT32)
+            traffic_matrix = jax.lax.all_gather(send_counts_padded, "x")
+            my_rank = jax.lax.axis_index("x")
+            p1_cnt, p3_cnt, send_off, recv_off, phase3_remote_off = (
+                _split_traffic_ringshift_globalpad(
+                    traffic_matrix, send_counts_padded,
+                    world_size=world_size, my_rank=my_rank,
+                )
+            )
+            return (
+                p1_cnt[None], p3_cnt[None], send_off[None],
+                recv_off[None], phase3_remote_off[None],
+            )
+
+        splitter_fn = jax.shard_map(
+            per_rank_splitter, mesh=mesh,
+            in_specs=(P("x"), P("x")),
+            out_specs=(P("x"), P("x"), P("x"), P("x"), P("x")),
+            check_vma=False,
+        )
+        (p1_cnt_arr, p3_cnt_arr, send_off_arr,
+         recv_off_arr, phase3_remote_off_arr) = splitter_fn(
+            local_ids, local_id_count,
+        )
+        jax.block_until_ready((p1_cnt_arr, p3_cnt_arr, send_off_arr,
+                               recv_off_arr, phase3_remote_off_arr))
+        log(f"splitter outputs shape={p1_cnt_arr.shape}")
+
+        sharded = jax.shard_map(
+            per_device_run, mesh=mesh,
+            in_specs=(P("x"), P("x"), P("x"),
+                      P("x"), P("x"), P("x"), P("x"), P("x")),
+            out_specs=P("x"),
+            check_vma=False,
+        )
+
+        sorted_per_rank = (
+            jnp.arange(world_size * SORTED_PER_RANK_LEN, dtype=jnp.int32) % v_local
+        )
+        sorted_per_rank = jax.device_put(
+            sorted_per_rank,
+            jax.sharding.NamedSharding(mesh, P("x")),
+        )
+        table_per_rank = jnp.zeros((world_size * v_local, D), dtype=jnp.float32)
+        table_per_rank = jax.device_put(
+            table_per_rank,
+            jax.sharding.NamedSharding(mesh, P("x")),
+        )
+        dummy_per_rank = jnp.zeros((world_size, 1), dtype=jnp.int32)
+        dummy_per_rank = jax.device_put(
+            dummy_per_rank,
+            jax.sharding.NamedSharding(mesh, P("x")),
+        )
+        jax.block_until_ready(sorted_per_rank)
+        jax.block_until_ready(table_per_rank)
+        jax.block_until_ready(dummy_per_rank)
+        log(f"inputs ready (has_zero_int_scratch={has_zero_int})")
+
+        bjit = jax.jit(sharded)
+        log("calling kernel...")
+        sync_global_devices(f"litmus_rev_{label}_start")
+        t0 = time.perf_counter()
+        out = bjit(
+            sorted_per_rank, table_per_rank, dummy_per_rank,
+            p1_cnt_arr, p3_cnt_arr, send_off_arr,
+            recv_off_arr, phase3_remote_off_arr,
+        )
+        dispatch_ms = (time.perf_counter() - t0) * 1e3
+        log(f"dispatched (after {dispatch_ms:.1f}ms), blocking...")
+        jax.block_until_ready(out)
+        elapsed_ms = (time.perf_counter() - t0) * 1e3
+        log(f"ran in {elapsed_ms:.1f} ms total (dispatch={dispatch_ms:.1f}, block={elapsed_ms-dispatch_ms:.1f})")
+        log("RESULT: WORKS")
+
+
+    @staticmethod
+    def _make_kernel_plus_A(*, world_size, FIXED_COUNT, recv_capacity, TILE):
+        """v70s kernel + diff A (sync_copy zero into recv_row_buf) and the
+        required diff B (zero_int_vmem scratch)."""
+        from jax.experimental import pallas as pl
+        from jax.experimental.pallas import tpu as pltpu
+        from jax import lax
+
+        def kernel(sorted_row_ref, table_ref, dummy_in_ref,
+                   wave_idx_ref, p1_cnt_ref, p3_cnt_ref,
+                   send_off_ref, recv_off_ref, phase3_remote_off_ref,
+                   out_init_ref,
+                   out_ref, recv_row_buf, looked_up_buf,
+                   send_sem, recv_sem, send_sem_emb, recv_sem_emb,
+                   zero_int_vmem,  # NEW (diff B)
+                   table_vmem, zero_emb_vmem, idx_smem):
+            del dummy_in_ref, out_init_ref
+            my_rank = lax.axis_index("x")
+            wave_idx = wave_idx_ref[0]
+
+            p1_cnt = pl.multiple_of(p1_cnt_ref[0], TILE)
+            p3_cnt = pl.multiple_of(p3_cnt_ref[0], TILE)
+            send_start = pl.multiple_of(send_off_ref[0], TILE)
+            remote_recv_start = pl.multiple_of(recv_off_ref[0], TILE)
+            phase3_remote_start = pl.multiple_of(
+                phase3_remote_off_ref[0], TILE
+            )
+            _ = p1_cnt + p3_cnt
+
+            # v70s order: barrier FIRST, init AFTER (NOT swapped here — that's diff C)
+            sem = pltpu.get_barrier_semaphore()
+            for peer in range(world_size):
+                pl.semaphore_signal(sem, 1, device_id=(peer,),
+                                    device_id_type=pltpu.DeviceIdType.MESH)
+            pl.semaphore_wait(sem, world_size)
+
+            my_dst = (my_rank + wave_idx) % world_size
+            d = pltpu.make_async_remote_copy(
+                src_ref=sorted_row_ref.at[pl.ds(send_start, FIXED_COUNT)],
+                dst_ref=recv_row_buf.at[pl.ds(remote_recv_start, FIXED_COUNT)],
+                send_sem=send_sem, recv_sem=recv_sem,
+                device_id=(my_dst,),
+                device_id_type=pltpu.DeviceIdType.MESH,
+            )
+            d.start()
+            d.wait()
+
+            pltpu.sync_copy(table_ref, table_vmem)
+            zero_emb_vmem[...] = jnp.zeros_like(zero_emb_vmem)
+
+            # === DIFF A: zero recv_row_buf via sync_copy from zero_int_vmem ===
+            zero_int_vmem[...] = jnp.zeros_like(zero_int_vmem)
+            pltpu.sync_copy(zero_int_vmem, recv_row_buf)
+
+            pltpu.sync_copy(recv_row_buf, idx_smem)
+
+            def gather_body(i, __):
+                row_idx = idx_smem[i % FIXED_COUNT]
+                zero_emb_vmem[pl.ds(i, 1), :] = table_vmem[pl.ds(row_idx, 1), :]
+                return None
+            lax.fori_loop(0, recv_capacity, gather_body, None)
+
+            pltpu.sync_copy(zero_emb_vmem, looked_up_buf)
+
+            my_src = (my_rank - wave_idx + world_size) % world_size
+            phase3_count = recv_capacity
+            d3 = pltpu.make_async_remote_copy(
+                src_ref=looked_up_buf.at[pl.ds(0, phase3_count), :],
+                dst_ref=out_ref.at[pl.ds(phase3_remote_start, phase3_count), :],
+                send_sem=send_sem_emb, recv_sem=recv_sem_emb,
+                device_id=(my_src,),
+                device_id_type=pltpu.DeviceIdType.MESH,
+            )
+            d3.start()
+            d3.wait()
+        return kernel
+
+
+    @staticmethod
+    def _make_kernel_plus_ABC(*, world_size, FIXED_COUNT, recv_capacity, TILE):
+        """v70s kernel + diff A (sync_copy zero), B (zero_int_vmem scratch),
+        C (init FIRST, barrier AFTER — production order)."""
+        from jax.experimental import pallas as pl
+        from jax.experimental.pallas import tpu as pltpu
+        from jax import lax
+
+        def kernel(sorted_row_ref, table_ref, dummy_in_ref,
+                   wave_idx_ref, p1_cnt_ref, p3_cnt_ref,
+                   send_off_ref, recv_off_ref, phase3_remote_off_ref,
+                   out_init_ref,
+                   out_ref, recv_row_buf, looked_up_buf,
+                   send_sem, recv_sem, send_sem_emb, recv_sem_emb,
+                   zero_int_vmem,
+                   table_vmem, zero_emb_vmem, idx_smem):
+            del dummy_in_ref, out_init_ref
+            my_rank = lax.axis_index("x")
+            wave_idx = wave_idx_ref[0]
+
+            p1_cnt = pl.multiple_of(p1_cnt_ref[0], TILE)
+            p3_cnt = pl.multiple_of(p3_cnt_ref[0], TILE)
+            send_start = pl.multiple_of(send_off_ref[0], TILE)
+            remote_recv_start = pl.multiple_of(recv_off_ref[0], TILE)
+            phase3_remote_start = pl.multiple_of(
+                phase3_remote_off_ref[0], TILE
+            )
+            _ = p1_cnt + p3_cnt
+
+            # === DIFF C: init FIRST (production order) ===
+            pltpu.sync_copy(table_ref, table_vmem)
+            zero_int_vmem[...] = jnp.zeros_like(zero_int_vmem)
+            zero_emb_vmem[...] = jnp.zeros_like(zero_emb_vmem)
+            pltpu.sync_copy(zero_int_vmem, recv_row_buf)
+
+            # Barrier AFTER init (production order).
+            sem = pltpu.get_barrier_semaphore()
+            for peer in range(world_size):
+                pl.semaphore_signal(sem, 1, device_id=(peer,),
+                                    device_id_type=pltpu.DeviceIdType.MESH)
+            pl.semaphore_wait(sem, world_size)
+
+            my_dst = (my_rank + wave_idx) % world_size
+            d = pltpu.make_async_remote_copy(
+                src_ref=sorted_row_ref.at[pl.ds(send_start, FIXED_COUNT)],
+                dst_ref=recv_row_buf.at[pl.ds(remote_recv_start, FIXED_COUNT)],
+                send_sem=send_sem, recv_sem=recv_sem,
+                device_id=(my_dst,),
+                device_id_type=pltpu.DeviceIdType.MESH,
+            )
+            d.start()
+            d.wait()
+
+            pltpu.sync_copy(recv_row_buf, idx_smem)
+
+            def gather_body(i, __):
+                row_idx = idx_smem[i % FIXED_COUNT]
+                zero_emb_vmem[pl.ds(i, 1), :] = table_vmem[pl.ds(row_idx, 1), :]
+                return None
+            lax.fori_loop(0, recv_capacity, gather_body, None)
+
+            pltpu.sync_copy(zero_emb_vmem, looked_up_buf)
+
+            my_src = (my_rank - wave_idx + world_size) % world_size
+            phase3_count = recv_capacity
+            d3 = pltpu.make_async_remote_copy(
+                src_ref=looked_up_buf.at[pl.ds(0, phase3_count), :],
+                dst_ref=out_ref.at[pl.ds(phase3_remote_start, phase3_count), :],
+                send_sem=send_sem_emb, recv_sem=recv_sem_emb,
+                device_id=(my_src,),
+                device_id_type=pltpu.DeviceIdType.MESH,
+            )
+            d3.start()
+            d3.wait()
+        return kernel
+
+
+    @staticmethod
+    def _make_kernel_plus_ABCDE(*, world_size, FIXED_COUNT, recv_capacity, TILE):
+        """v70s kernel + diffs A, B, C, D, E:
+          D: Phase 1 DMA extent = pl.multiple_of(p1_cnt_ref[0], TILE) (runtime)
+          E: Phase 3 DMA extent = pl.multiple_of(p3_cnt_ref[0], TILE) (runtime)
+        """
+        from jax.experimental import pallas as pl
+        from jax.experimental.pallas import tpu as pltpu
+        from jax import lax
+
+        def kernel(sorted_row_ref, table_ref, dummy_in_ref,
+                   wave_idx_ref, p1_cnt_ref, p3_cnt_ref,
+                   send_off_ref, recv_off_ref, phase3_remote_off_ref,
+                   out_init_ref,
+                   out_ref, recv_row_buf, looked_up_buf,
+                   send_sem, recv_sem, send_sem_emb, recv_sem_emb,
+                   zero_int_vmem,
+                   table_vmem, zero_emb_vmem, idx_smem):
+            del dummy_in_ref, out_init_ref
+            my_rank = lax.axis_index("x")
+            wave_idx = wave_idx_ref[0]
+
+            p1_cnt = pl.multiple_of(p1_cnt_ref[0], TILE)
+            p3_cnt = pl.multiple_of(p3_cnt_ref[0], TILE)
+            send_start = pl.multiple_of(send_off_ref[0], TILE)
+            remote_recv_start = pl.multiple_of(recv_off_ref[0], TILE)
+            phase3_remote_start = pl.multiple_of(
+                phase3_remote_off_ref[0], TILE
+            )
+
+            # Init first (diff C).
+            pltpu.sync_copy(table_ref, table_vmem)
+            zero_int_vmem[...] = jnp.zeros_like(zero_int_vmem)
+            zero_emb_vmem[...] = jnp.zeros_like(zero_emb_vmem)
+            pltpu.sync_copy(zero_int_vmem, recv_row_buf)
+
+            sem = pltpu.get_barrier_semaphore()
+            for peer in range(world_size):
+                pl.semaphore_signal(sem, 1, device_id=(peer,),
+                                    device_id_type=pltpu.DeviceIdType.MESH)
+            pl.semaphore_wait(sem, world_size)
+
+            # === DIFF D: Phase 1 extent = runtime p1_cnt ===
+            # NO pl.when guard (matches v70s; production has @pl.when(p1_cnt>0)
+            # but we keep the v70s no-guard pattern to isolate just the extent
+            # change).
+            my_dst = (my_rank + wave_idx) % world_size
+            d = pltpu.make_async_remote_copy(
+                src_ref=sorted_row_ref.at[pl.ds(send_start, p1_cnt)],
+                dst_ref=recv_row_buf.at[pl.ds(remote_recv_start, p1_cnt)],
+                send_sem=send_sem, recv_sem=recv_sem,
+                device_id=(my_dst,),
+                device_id_type=pltpu.DeviceIdType.MESH,
+            )
+            d.start()
+            d.wait()
+
+            pltpu.sync_copy(recv_row_buf, idx_smem)
+
+            def gather_body(i, __):
+                row_idx = idx_smem[i % FIXED_COUNT]
+                zero_emb_vmem[pl.ds(i, 1), :] = table_vmem[pl.ds(row_idx, 1), :]
+                return None
+            lax.fori_loop(0, recv_capacity, gather_body, None)
+
+            pltpu.sync_copy(zero_emb_vmem, looked_up_buf)
+
+            # === DIFF E: Phase 3 extent = runtime p3_cnt ===
+            # Still using src offset 0 (NOT diff F) and dst offset
+            # phase3_remote_start (already runtime in v70s).
+            my_src = (my_rank - wave_idx + world_size) % world_size
+            d3 = pltpu.make_async_remote_copy(
+                src_ref=looked_up_buf.at[pl.ds(0, p3_cnt), :],
+                dst_ref=out_ref.at[pl.ds(phase3_remote_start, p3_cnt), :],
+                send_sem=send_sem_emb, recv_sem=recv_sem_emb,
+                device_id=(my_src,),
+                device_id_type=pltpu.DeviceIdType.MESH,
+            )
+            d3.start()
+            d3.wait()
+        return kernel
+
+
+    def test_w32_v70s_plus_A_litmus(self) -> None:
+        """v70s + diff A (sync_copy zero into recv_row_buf).
+
+        Note: diff A requires diff B (the zero_int_vmem scratch) to source
+        from. So this method effectively tests A+B together; the next method
+        test_w32_v70s_plus_AB_litmus is identical.
+        """
+        self._run_w32_reverse_bisect(
+            label="A",
+            kernel_factory=self._make_kernel_plus_A,
+        )
+
+
+    def test_w32_v70s_plus_AB_litmus(self) -> None:
+        """v70s + diffs A and B (zero recv_row_buf + extra int VMEM scratch).
+
+        Identical to _plus_A_litmus since A and B are inseparable; this
+        method is kept for naming consistency with the bisect plan.
+        """
+        self._run_w32_reverse_bisect(
+            label="AB",
+            kernel_factory=self._make_kernel_plus_A,
+        )
+
+
+    def test_w32_v70s_plus_ABC_litmus(self) -> None:
+        """v70s + diffs A, B, C (init FIRST, barrier AFTER — production order)."""
+        self._run_w32_reverse_bisect(
+            label="ABC",
+            kernel_factory=self._make_kernel_plus_ABC,
+        )
+
+
+    def test_w32_v70s_plus_ABCDE_litmus(self) -> None:
+        """v70s + diffs A, B, C, D, E (also runtime Phase 1 & 3 DMA extents)."""
+        self._run_w32_reverse_bisect(
+            label="ABCDE",
+            kernel_factory=self._make_kernel_plus_ABCDE,
+        )
+
+
+    @staticmethod
+    def _make_kernel_plus_ABCD(*, world_size, FIXED_COUNT, recv_capacity, TILE):
+        """v70s kernel + diffs A, B, C, D ONLY (Phase 1 runtime extent).
+          D: Phase 1 DMA extent = pl.multiple_of(p1_cnt_ref[0], TILE) (runtime)
+          Phase 3 extent stays at recv_capacity (compile-time const) — no E.
+        Used to isolate whether D alone is sufficient to trigger the W=32 hang.
+        """
+        from jax.experimental import pallas as pl
+        from jax.experimental.pallas import tpu as pltpu
+        from jax import lax
+
+        def kernel(sorted_row_ref, table_ref, dummy_in_ref,
+                   wave_idx_ref, p1_cnt_ref, p3_cnt_ref,
+                   send_off_ref, recv_off_ref, phase3_remote_off_ref,
+                   out_init_ref,
+                   out_ref, recv_row_buf, looked_up_buf,
+                   send_sem, recv_sem, send_sem_emb, recv_sem_emb,
+                   zero_int_vmem,
+                   table_vmem, zero_emb_vmem, idx_smem):
+            del dummy_in_ref, out_init_ref
+            my_rank = lax.axis_index("x")
+            wave_idx = wave_idx_ref[0]
+
+            p1_cnt = pl.multiple_of(p1_cnt_ref[0], TILE)
+            p3_cnt = pl.multiple_of(p3_cnt_ref[0], TILE)
+            send_start = pl.multiple_of(send_off_ref[0], TILE)
+            remote_recv_start = pl.multiple_of(recv_off_ref[0], TILE)
+            phase3_remote_start = pl.multiple_of(
+                phase3_remote_off_ref[0], TILE
+            )
+            _ = p3_cnt  # keep symbol live; not used as DMA extent here.
+
+            # Init first (diff C).
+            pltpu.sync_copy(table_ref, table_vmem)
+            zero_int_vmem[...] = jnp.zeros_like(zero_int_vmem)
+            zero_emb_vmem[...] = jnp.zeros_like(zero_emb_vmem)
+            pltpu.sync_copy(zero_int_vmem, recv_row_buf)
+
+            sem = pltpu.get_barrier_semaphore()
+            for peer in range(world_size):
+                pl.semaphore_signal(sem, 1, device_id=(peer,),
+                                    device_id_type=pltpu.DeviceIdType.MESH)
+            pl.semaphore_wait(sem, world_size)
+
+            # === DIFF D: Phase 1 extent = runtime p1_cnt (no E) ===
+            my_dst = (my_rank + wave_idx) % world_size
+            d = pltpu.make_async_remote_copy(
+                src_ref=sorted_row_ref.at[pl.ds(send_start, p1_cnt)],
+                dst_ref=recv_row_buf.at[pl.ds(remote_recv_start, p1_cnt)],
+                send_sem=send_sem, recv_sem=recv_sem,
+                device_id=(my_dst,),
+                device_id_type=pltpu.DeviceIdType.MESH,
+            )
+            d.start()
+            d.wait()
+
+            pltpu.sync_copy(recv_row_buf, idx_smem)
+
+            def gather_body(i, __):
+                row_idx = idx_smem[i % FIXED_COUNT]
+                zero_emb_vmem[pl.ds(i, 1), :] = table_vmem[pl.ds(row_idx, 1), :]
+                return None
+            lax.fori_loop(0, recv_capacity, gather_body, None)
+
+            pltpu.sync_copy(zero_emb_vmem, looked_up_buf)
+
+            # NO E: Phase 3 extent stays compile-time const (recv_capacity).
+            my_src = (my_rank - wave_idx + world_size) % world_size
+            phase3_count = recv_capacity
+            d3 = pltpu.make_async_remote_copy(
+                src_ref=looked_up_buf.at[pl.ds(0, phase3_count), :],
+                dst_ref=out_ref.at[pl.ds(phase3_remote_start, phase3_count), :],
+                send_sem=send_sem_emb, recv_sem=recv_sem_emb,
+                device_id=(my_src,),
+                device_id_type=pltpu.DeviceIdType.MESH,
+            )
+            d3.start()
+            d3.wait()
+        return kernel
+
+
+    @staticmethod
+    def _make_kernel_plus_ABCE(*, world_size, FIXED_COUNT, recv_capacity, TILE):
+        """v70s kernel + diffs A, B, C, E ONLY (Phase 3 runtime extent).
+          E: Phase 3 DMA extent = pl.multiple_of(p3_cnt_ref[0], TILE) (runtime)
+          Phase 1 extent stays at FIXED_COUNT (compile-time const) — no D.
+        Used to isolate whether E alone is sufficient to trigger the W=32 hang.
+        """
+        from jax.experimental import pallas as pl
+        from jax.experimental.pallas import tpu as pltpu
+        from jax import lax
+
+        def kernel(sorted_row_ref, table_ref, dummy_in_ref,
+                   wave_idx_ref, p1_cnt_ref, p3_cnt_ref,
+                   send_off_ref, recv_off_ref, phase3_remote_off_ref,
+                   out_init_ref,
+                   out_ref, recv_row_buf, looked_up_buf,
+                   send_sem, recv_sem, send_sem_emb, recv_sem_emb,
+                   zero_int_vmem,
+                   table_vmem, zero_emb_vmem, idx_smem):
+            del dummy_in_ref, out_init_ref
+            my_rank = lax.axis_index("x")
+            wave_idx = wave_idx_ref[0]
+
+            p1_cnt = pl.multiple_of(p1_cnt_ref[0], TILE)
+            p3_cnt = pl.multiple_of(p3_cnt_ref[0], TILE)
+            send_start = pl.multiple_of(send_off_ref[0], TILE)
+            remote_recv_start = pl.multiple_of(recv_off_ref[0], TILE)
+            phase3_remote_start = pl.multiple_of(
+                phase3_remote_off_ref[0], TILE
+            )
+            _ = p1_cnt  # keep symbol live; not used as DMA extent here.
+
+            # Init first (diff C).
+            pltpu.sync_copy(table_ref, table_vmem)
+            zero_int_vmem[...] = jnp.zeros_like(zero_int_vmem)
+            zero_emb_vmem[...] = jnp.zeros_like(zero_emb_vmem)
+            pltpu.sync_copy(zero_int_vmem, recv_row_buf)
+
+            sem = pltpu.get_barrier_semaphore()
+            for peer in range(world_size):
+                pl.semaphore_signal(sem, 1, device_id=(peer,),
+                                    device_id_type=pltpu.DeviceIdType.MESH)
+            pl.semaphore_wait(sem, world_size)
+
+            # NO D: Phase 1 extent stays compile-time const (FIXED_COUNT).
+            my_dst = (my_rank + wave_idx) % world_size
+            d = pltpu.make_async_remote_copy(
+                src_ref=sorted_row_ref.at[pl.ds(send_start, FIXED_COUNT)],
+                dst_ref=recv_row_buf.at[pl.ds(remote_recv_start, FIXED_COUNT)],
+                send_sem=send_sem, recv_sem=recv_sem,
+                device_id=(my_dst,),
+                device_id_type=pltpu.DeviceIdType.MESH,
+            )
+            d.start()
+            d.wait()
+
+            pltpu.sync_copy(recv_row_buf, idx_smem)
+
+            def gather_body(i, __):
+                row_idx = idx_smem[i % FIXED_COUNT]
+                zero_emb_vmem[pl.ds(i, 1), :] = table_vmem[pl.ds(row_idx, 1), :]
+                return None
+            lax.fori_loop(0, recv_capacity, gather_body, None)
+
+            pltpu.sync_copy(zero_emb_vmem, looked_up_buf)
+
+            # === DIFF E: Phase 3 extent = runtime p3_cnt (no D) ===
+            my_src = (my_rank - wave_idx + world_size) % world_size
+            d3 = pltpu.make_async_remote_copy(
+                src_ref=looked_up_buf.at[pl.ds(0, p3_cnt), :],
+                dst_ref=out_ref.at[pl.ds(phase3_remote_start, p3_cnt), :],
+                send_sem=send_sem_emb, recv_sem=recv_sem_emb,
+                device_id=(my_src,),
+                device_id_type=pltpu.DeviceIdType.MESH,
+            )
+            d3.start()
+            d3.wait()
+        return kernel
+
+
+    def test_w32_v70s_plus_ABCD_litmus(self) -> None:
+        """v70s + diffs A, B, C, D ONLY (runtime Phase 1 extent; Phase 3
+        stays compile-time const). Bisects D vs E."""
+        self._run_w32_reverse_bisect(
+            label="ABCD",
+            kernel_factory=self._make_kernel_plus_ABCD,
+        )
+
+
+    def test_w32_v70s_plus_ABCE_litmus(self) -> None:
+        """v70s + diffs A, B, C, E ONLY (runtime Phase 3 extent; Phase 1
+        stays compile-time const). Bisects D vs E."""
+        self._run_w32_reverse_bisect(
+            label="ABCE",
+            kernel_factory=self._make_kernel_plus_ABCE,
+        )
+
+
+    @staticmethod
+    def _make_kernel_plus_ABCDE_with_guards(
+        *, world_size, FIXED_COUNT, recv_capacity, TILE,
+    ):
+        """Identical to _make_kernel_plus_ABCDE but wraps Phase 1 and Phase 3
+        DMAs in pl.when(cnt > 0) guards so 0-length DMAs are skipped.
+
+        Hypothesis being tested: the ABCDE hang at W=32 is caused by 0-length
+        DMAs (runtime extent == 0) deadlocking the TPU async copy engine. If
+        this kernel WORKS, the smoking gun is conclusively 0-length DMAs.
+        """
+        from jax.experimental import pallas as pl
+        from jax.experimental.pallas import tpu as pltpu
+        from jax import lax
+
+        def kernel(sorted_row_ref, table_ref, dummy_in_ref,
+                   wave_idx_ref, p1_cnt_ref, p3_cnt_ref,
+                   send_off_ref, recv_off_ref, phase3_remote_off_ref,
+                   out_init_ref,
+                   out_ref, recv_row_buf, looked_up_buf,
+                   send_sem, recv_sem, send_sem_emb, recv_sem_emb,
+                   zero_int_vmem,
+                   table_vmem, zero_emb_vmem, idx_smem):
+            del dummy_in_ref, out_init_ref
+            my_rank = lax.axis_index("x")
+            wave_idx = wave_idx_ref[0]
+
+            p1_cnt = pl.multiple_of(p1_cnt_ref[0], TILE)
+            p3_cnt = pl.multiple_of(p3_cnt_ref[0], TILE)
+            send_start = pl.multiple_of(send_off_ref[0], TILE)
+            remote_recv_start = pl.multiple_of(recv_off_ref[0], TILE)
+            phase3_remote_start = pl.multiple_of(
+                phase3_remote_off_ref[0], TILE
+            )
+
+            # Init first (diff C).
+            pltpu.sync_copy(table_ref, table_vmem)
+            zero_int_vmem[...] = jnp.zeros_like(zero_int_vmem)
+            zero_emb_vmem[...] = jnp.zeros_like(zero_emb_vmem)
+            pltpu.sync_copy(zero_int_vmem, recv_row_buf)
+
+            sem = pltpu.get_barrier_semaphore()
+            for peer in range(world_size):
+                pl.semaphore_signal(sem, 1, device_id=(peer,),
+                                    device_id_type=pltpu.DeviceIdType.MESH)
+            pl.semaphore_wait(sem, world_size)
+
+            # === DIFF D + GUARD: Phase 1 DMA gated by p1_cnt > 0 ===
+            my_dst = (my_rank + wave_idx) % world_size
+
+            @pl.when(p1_cnt > 0)
+            def _do_phase1_dma():
+                d = pltpu.make_async_remote_copy(
+                    src_ref=sorted_row_ref.at[pl.ds(send_start, p1_cnt)],
+                    dst_ref=recv_row_buf.at[pl.ds(remote_recv_start, p1_cnt)],
+                    send_sem=send_sem, recv_sem=recv_sem,
+                    device_id=(my_dst,),
+                    device_id_type=pltpu.DeviceIdType.MESH,
+                )
+                d.start()
+                d.wait()
+
+            pltpu.sync_copy(recv_row_buf, idx_smem)
+
+            def gather_body(i, __):
+                row_idx = idx_smem[i % FIXED_COUNT]
+                zero_emb_vmem[pl.ds(i, 1), :] = table_vmem[pl.ds(row_idx, 1), :]
+                return None
+            lax.fori_loop(0, recv_capacity, gather_body, None)
+
+            pltpu.sync_copy(zero_emb_vmem, looked_up_buf)
+
+            # === DIFF E + GUARD: Phase 3 DMA gated by p3_cnt > 0 ===
+            my_src = (my_rank - wave_idx + world_size) % world_size
+
+            @pl.when(p3_cnt > 0)
+            def _do_phase3_dma():
+                d3 = pltpu.make_async_remote_copy(
+                    src_ref=looked_up_buf.at[pl.ds(0, p3_cnt), :],
+                    dst_ref=out_ref.at[pl.ds(phase3_remote_start, p3_cnt), :],
+                    send_sem=send_sem_emb, recv_sem=recv_sem_emb,
+                    device_id=(my_src,),
+                    device_id_type=pltpu.DeviceIdType.MESH,
+                )
+                d3.start()
+                d3.wait()
+        return kernel
+
+
+    def test_w32_v70s_plus_ABCDE_with_guards_litmus(self) -> None:
+        """v70s + diffs A, B, C, D, E with pl.when(cnt > 0) guards on Phase 1
+        and Phase 3 DMAs.
+
+        Diagnostic: if this WORKS but ABCDE HANGS, the smoking gun is
+        conclusively 0-length DMAs at W=32 (runtime extent == 0 deadlocks the
+        async copy engine).
+        """
+        self._run_w32_reverse_bisect(
+            label="ABCDE_GUARDED",
+            kernel_factory=self._make_kernel_plus_ABCDE_with_guards,
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1703,12 +1703,16 @@ def _make_ringshift_single_wave_kernel(
         del out_init_ref  # aliased to out_ref via input_output_aliases
         my_rank = lax.axis_index("x")
         wave_idx = wave_idx_ref[0]  # traced scalar int32
-        pltpu.sync_copy(table_ref, table_vmem)
-        zero_int_vmem[...] = jnp.zeros_like(zero_int_vmem)
-        zero_emb_vmem[...] = jnp.zeros_like(zero_emb_vmem)
-        pltpu.sync_copy(zero_int_vmem, recv_row_buf)
 
-        # All-peer broadcast pre-barrier (W signals + 1 wait of W per wave).
+        pl.debug_print("[K] START r={} w={}", my_rank, wave_idx)
+
+        # All-peer broadcast pre-barrier FIRST (v70s pattern). Moved before
+        # the in-kernel init operations because issuing init ops (sync_copy
+        # of table, zeroing scratches, sync_copy of zero into recv_row_buf)
+        # BEFORE the cross-rank barrier appears to interfere with the
+        # barrier at large W (W=32 hangs in production order; v70s order
+        # works). Keeping the barrier as the first cross-rank op matches
+        # the working v70s litmus structure.
         # Reverted from pair-handshake (which used a TRACED device_id and
         # may have a multi-host routing bug) back to the original static
         # Python-loop unrolled signals to all peers. The custom barrier
@@ -1726,6 +1730,16 @@ def _make_ringshift_single_wave_kernel(
                 device_id_type=pltpu.DeviceIdType.MESH,
             )
         pl.semaphore_wait(sem, world_size)
+        pl.debug_print("[K] after_barrier r={} w={}", my_rank, wave_idx)
+
+        # THEN initialize scratches (table prefetch, zero scratches, zero
+        # the recv buffer). After the barrier so init can't race with it.
+        pltpu.sync_copy(table_ref, table_vmem)
+        pl.debug_print("[K] after_table_copy r={} w={}", my_rank, wave_idx)
+        zero_int_vmem[...] = jnp.zeros_like(zero_int_vmem)
+        zero_emb_vmem[...] = jnp.zeros_like(zero_emb_vmem)
+        pltpu.sync_copy(zero_int_vmem, recv_row_buf)
+        pl.debug_print("[K] after_init r={} w={}", my_rank, wave_idx)
 
         # Phase 1: ID DMA — send my chunk for the (my_rank+wave_idx)-th
         # peer, receive into recv_row_buf at this wave's recv offset.
@@ -1733,15 +1747,20 @@ def _make_ringshift_single_wave_kernel(
         send_start = pl.multiple_of(send_off_ref[0], _TILE_INT32)
         remote_recv_start = pl.multiple_of(recv_off_ref[0], _TILE_INT32)
 
-        d = pltpu.make_async_remote_copy(
-            src_ref=sorted_row_ref.at[pl.ds(send_start, p1_cnt)],
-            dst_ref=recv_row_buf.at[pl.ds(remote_recv_start, p1_cnt)],
-            send_sem=send_sem_id, recv_sem=recv_sem_id,
-            device_id=(my_dst,),
-            device_id_type=pltpu.DeviceIdType.MESH,
+        @pl.when(p1_cnt > 0)
+        def _do_phase1_dma():
+            d = pltpu.make_async_remote_copy(
+                src_ref=sorted_row_ref.at[pl.ds(send_start, p1_cnt)],
+                dst_ref=recv_row_buf.at[pl.ds(remote_recv_start, p1_cnt)],
+                send_sem=send_sem_id, recv_sem=recv_sem_id,
+                device_id=(my_dst,),
+                device_id_type=pltpu.DeviceIdType.MESH,
+            )
+            d.start()
+            d.wait()
+        pl.debug_print(
+            "[K] after_phase1 r={} w={} cnt={}", my_rank, wave_idx, p1_cnt,
         )
-        d.start()
-        d.wait()
 
         # Phase 2: local lookup.
         pltpu.sync_copy(recv_row_buf, idx_smem)
@@ -1753,6 +1772,7 @@ def _make_ringshift_single_wave_kernel(
 
         lax.fori_loop(0, recv_capacity, gather_body, None)
         pltpu.sync_copy(zero_emb_vmem, looked_up_buf)
+        pl.debug_print("[K] after_gather r={} w={}", my_rank, wave_idx)
 
         # Phase 3: emb a2a back to source. p3_cnt is the ACTUAL count of
         # embeddings I'm responsible for in this wave (= what src DMA'd to
@@ -1766,15 +1786,20 @@ def _make_ringshift_single_wave_kernel(
         )
         p3_cnt = pl.multiple_of(p3_cnt_ref[0], _TILE_INT32)
 
-        d = pltpu.make_async_remote_copy(
-            src_ref=looked_up_buf.at[pl.ds(remote_recv_start, p3_cnt), :],
-            dst_ref=out_ref.at[pl.ds(phase3_remote_start, p3_cnt), :],
-            send_sem=send_sem_emb, recv_sem=recv_sem_emb,
-            device_id=(my_src,),  # send back to my source
-            device_id_type=pltpu.DeviceIdType.MESH,
+        @pl.when(p3_cnt > 0)
+        def _do_phase3_dma():
+            d = pltpu.make_async_remote_copy(
+                src_ref=looked_up_buf.at[pl.ds(remote_recv_start, p3_cnt), :],
+                dst_ref=out_ref.at[pl.ds(phase3_remote_start, p3_cnt), :],
+                send_sem=send_sem_emb, recv_sem=recv_sem_emb,
+                device_id=(my_src,),  # send back to my source
+                device_id_type=pltpu.DeviceIdType.MESH,
+            )
+            d.start()
+            d.wait()
+        pl.debug_print(
+            "[K] after_phase3 r={} w={} cnt={}", my_rank, wave_idx, p3_cnt,
         )
-        d.start()
-        d.wait()
 
     return kernel
 
