@@ -35,7 +35,9 @@ class RecomputeTransform(RegionTransform):
     def transform_graph(
         self,
         gm: fx.GraphModule,
-        called_modules: OrderedDict[str, tuple[nn.Module, tuple[Any, ...]]],
+        called_modules: OrderedDict[
+            str, tuple[nn.Module, tuple[Any, ...], dict[str, Any]]
+        ],
     ) -> None:
         fqn_to_nodes: dict[str, set[fx.Node]] = {}
         for node in gm.graph.nodes:

@@ -256,9 +256,30 @@ class _LocalCompiledResult:
     constants: Dict[str, torch.Tensor]
 
 
+def _apply_module_overrides(
+    mod: nn.Module,
+    module_override: List[Override],
+) -> None:
+    """Swap non-traceable submodules with override replacements in-place."""
+    accessor: NamedMemberAccessor = NamedMemberAccessor(mod)
+
+    def swap(fqn_prefix: str, module: torch.nn.Module) -> None:
+        for override in module_override:
+            for name, child in module.named_children():
+                if len(name) == 0:
+                    continue
+                fqn = fqn_prefix + "." + name if fqn_prefix != "" else name
+                new_child = override.replacement(fqn, child)
+                if id(new_child) == id(child):
+                    swap(fqn, new_child)
+                else:
+                    accessor.swap_submodule(fqn, new_child)
+
+    swap("", mod)
+
+
 def _local_compile(
     func: Callable[..., Any],
-    module_override: Optional[List[Override]],
     *args: Any,
     fake_mode: FakeTensorMode,
     _parametrize_fns: Optional[List[Callable[[torch.Tensor], torch.Tensor]]] = None,
@@ -270,15 +291,13 @@ def _local_compile(
 
     This performs the local tracing portion of _compile:
     1. Extract nn.Module and Optimizer from args
-    2. Apply module overrides
-    3. Trace with make_fx using FakeTensorMode
+    2. Trace with make_fx using FakeTensorMode
 
     Does NOT require dist.init_process_group by default. Does NOT perform
     DataParallel partitioning, collective dedup, or state flattening.
 
     Args:
         func: The train_step function to trace.
-        module_override: Optional list of Override instances for submodule replacement.
         *args: Arguments to the train_step function (must include nn.Module and Optimizer).
         fake_mode: The FakeTensorMode to use for tracing. Each compile path creates
             its own mode and passes it here. Callers are responsible for
@@ -311,25 +330,7 @@ def _local_compile(
     _mod: nn.Module = mod
     _opt: Optional[torch.optim.Optimizer] = opt
 
-    # 2. Override target submodules (e.g., MoE) with dummy replacements
-    if module_override:
-        accessor: NamedMemberAccessor = NamedMemberAccessor(mod)
-
-        def swap(fqn_prefix: str, module: torch.nn.Module) -> None:
-            for override in module_override:  # type: ignore[union-attr]
-                for name, child in module.named_children():
-                    if len(name) == 0:
-                        continue
-                    fqn = fqn_prefix + "." + name if fqn_prefix != "" else name
-                    new_child = override.replacement(fqn, child)
-                    if id(new_child) == id(child):
-                        swap(fqn, new_child)
-                    else:
-                        accessor.swap_submodule(fqn, new_child)
-
-        swap("", mod)
-
-    # 3. Trace stateless version of the train_step
+    # 2. Trace stateless version of the train_step
     params = dict(mod.named_parameters(remove_duplicate=False))
     buffers = dict(mod.named_buffers(remove_duplicate=False))
 
@@ -509,7 +510,7 @@ class _RegionDiscovery:
     by running the train step under FakeTensorMode hooks.
     """
 
-    called_modules: OrderedDict[str, Tuple[nn.Module, Tuple[Any, ...]]]
+    called_modules: OrderedDict[str, Tuple[nn.Module, Tuple[Any, ...], Dict[str, Any]]]
     autograd_function_leaves: set[type]  # pyre-fixme[24]
 
 
@@ -571,7 +572,9 @@ def _enter_region_transform_contexts(
     """
     if discovery is None or not transforms:
         return
-    for _fqn, root_mod, root_fake_args in _find_forward_roots(discovery.called_modules):
+    for _fqn, root_mod, root_fake_args, root_fake_kwargs in _find_forward_roots(
+        discovery.called_modules
+    ):
         cm_factories = (
             [parametrize_cm_factory(root_mod)]
             if parametrize_cm_factory is not None
@@ -586,6 +589,7 @@ def _enter_region_transform_contexts(
                 fake_mode,
                 _parametrize_cm_factories=cm_factories,
                 _autograd_function_leaves=discovery.autograd_function_leaves,
+                fake_kwargs=root_fake_kwargs,
             )
         )
 
@@ -624,6 +628,10 @@ def _compile_and_transform(
         result = _compile_data_parallel(
             func, module_override, cast(DataParallel, parallel_mode), *args, **kwargs
         )
+    if region_transforms:
+        for transform in region_transforms:
+            transform.finalize_compiled_graph(result.gm)
+
     if gm_transformation is not None:
         result.gm = gm_transformation(result.gm)
         result.state_manager = getattr(
@@ -657,9 +665,13 @@ def _compile_data_parallel(
     )
     args = pytree.tree_map_only(torch.Tensor, input_transform, args)
     kwargs = pytree.tree_map_only(torch.Tensor, input_transform, kwargs)
+    if module_override:
+        for arg in pytree.arg_tree_leaves(*args, **kwargs):
+            if isinstance(arg, nn.Module):
+                _apply_module_overrides(arg, module_override)
+                break
     local_result = _local_compile(
         func,
-        module_override,
         *args,
         fake_mode=fake_mode,
         _stateless_func_wrapper=gradients_tagging,
@@ -779,6 +791,12 @@ def _compile_data_parallel_v2(
     if region_transforms:
         transforms.extend(region_transforms)
 
+    # Apply module overrides so that non-traceable submodules are
+    # replaced with dummy placeholders for discovery, region-transform
+    # inner trace, and the outer _local_compile trace.
+    if module_override:
+        _apply_module_overrides(_mod, module_override)
+
     # 5. Set up external fake mode for tracing.
     fake_mode: FakeTensorMode = FakeTensorMode(allow_non_fake_inputs=True)
 
@@ -835,7 +853,6 @@ def _compile_data_parallel_v2(
         #    double-allgather and corrupt gradients.
         local_result = _local_compile(
             func,
-            module_override,
             *args,
             fake_mode=fake_mode,
             _parametrize_fns=[] if transforms else [collectives_fn],
@@ -887,6 +904,14 @@ def _compile_gspmd(
     """
     fake_mode: FakeTensorMode = FakeTensorMode()
     transforms = region_transforms or []
+    # Apply module overrides so that non-traceable submodules (e.g. MoE)
+    # are replaced with dummy placeholders for discovery, region-transform
+    # inner trace, and the outer _local_compile trace.
+    if module_override:
+        for arg in pytree.arg_tree_leaves(*args, **kwargs):
+            if isinstance(arg, nn.Module):
+                _apply_module_overrides(arg, module_override)
+                break
     # Apply the per-process → global batch transform up front, so discovery,
     # region-transform inner trace, and the outer ``_local_compile`` trace
     # all see the same (global) input shape.  Otherwise the region's
@@ -904,7 +929,6 @@ def _compile_gspmd(
         _enter_region_transform_contexts(region_stack, transforms, discovery, fake_mode)
         local_result = _local_compile(
             func,
-            module_override,
             *args,
             fake_mode=fake_mode,
             _stateless_func_wrapper=gradients_tagging,

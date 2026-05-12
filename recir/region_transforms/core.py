@@ -39,12 +39,13 @@ logger: logging.Logger = logging.getLogger(__name__)
 @contextmanager
 def _forward_pre_hooks(
     mod: nn.Module,
-    called: OrderedDict[str, tuple[nn.Module, tuple[Any, ...]]],
+    called: OrderedDict[str, tuple[nn.Module, tuple[Any, ...], dict[str, Any]]],
 ) -> Generator[None, None, None]:
     """Register forward_pre_hooks on every submodule to capture call info.
 
-    Hooks record ``{fqn: (submodule, input_args)}`` into *called*.
-    All hooks are removed when the context exits, even on exception.
+    Hooks record ``{fqn: (submodule, input_args, input_kwargs)}`` into
+    *called*.  All hooks are removed when the context exits, even on
+    exception.
     """
     hooks: list[Any] = []
     for name, submod in mod.named_modules():
@@ -52,11 +53,12 @@ def _forward_pre_hooks(
         def _hook(
             m: nn.Module,
             input_args: tuple[Any, ...],
+            input_kwargs: dict[str, Any],
             name: str = name,
         ) -> None:
-            called.setdefault(name, (m, input_args))
+            called.setdefault(name, (m, input_args, input_kwargs))
 
-        hooks.append(submod.register_forward_pre_hook(_hook))
+        hooks.append(submod.register_forward_pre_hook(_hook, with_kwargs=True))
     try:
         yield
     finally:
@@ -70,12 +72,14 @@ def _discover_called_modules(
     func: Callable[..., Any],
     *args: Any,
     **kwargs: Any,
-) -> OrderedDict[str, tuple[nn.Module, tuple[Any, ...]]]:
+) -> OrderedDict[str, tuple[nn.Module, tuple[Any, ...], dict[str, Any]]]:
     """Run the train_step function under FakeTensorMode + no_grad with hooks.
     Executes ``func(*args, **kwargs)`` (the full train step) so that the
     model receives exactly the arguments the train step passes to it.
     """
-    called: OrderedDict[str, tuple[nn.Module, tuple[Any, ...]]] = OrderedDict()
+    called: OrderedDict[str, tuple[nn.Module, tuple[Any, ...], dict[str, Any]]] = (
+        OrderedDict()
+    )
 
     with (
         _forward_pre_hooks(mod, called),
@@ -250,8 +254,8 @@ def _preserve_autograd_function_leaves(
 
 
 def _find_forward_roots(
-    called_modules: OrderedDict[str, tuple[nn.Module, tuple[Any, ...]]],
-) -> list[tuple[str, nn.Module, tuple[Any, ...]]]:
+    called_modules: OrderedDict[str, tuple[nn.Module, tuple[Any, ...], dict[str, Any]]],
+) -> list[tuple[str, nn.Module, tuple[Any, ...], dict[str, Any]]]:
     """Find forward roots: modules whose forward IS called, but no
     ancestor's forward is called.
 
@@ -266,14 +270,14 @@ def _find_forward_roots(
     root_fqns: set[str] = set()
     for fqn in called_fqns:
         if fqn == "":
-            mod, args = called_modules[""]
-            return [("", mod, args)]
+            mod, args, kwargs = called_modules[""]
+            return [("", mod, args, kwargs)]
         if any(fqn.startswith(r + ".") for r in root_fqns):
             continue
         root_fqns.add(fqn)
     return [
-        (fqn, mod, args)
-        for fqn, (mod, args) in called_modules.items()
+        (fqn, mod, args, kwargs)
+        for fqn, (mod, args, kwargs) in called_modules.items()
         if fqn in root_fqns
     ]
 
@@ -444,12 +448,13 @@ def _replace_region(
 def _apply_region_transforms(
     root_mod: nn.Module,
     fake_args: tuple[Any, ...],
-    called_modules: OrderedDict[str, tuple[nn.Module, tuple[Any, ...]]],
+    called_modules: OrderedDict[str, tuple[nn.Module, tuple[Any, ...], dict[str, Any]]],
     transforms: list[RegionTransform],
     fake_mode: FakeTensorMode,
     _parametrize_cm_factories: list[Callable[[], Any]] | None = None,
     _grad_scale: float | None = None,
     _autograd_function_leaves: set[type] | None = None,  # pyre-fixme[24]
+    fake_kwargs: dict[str, Any] | None = None,
 ) -> Generator[None, None, None]:
     """
     Trace root_mod.forward, detect regions for each transform,
@@ -470,23 +475,73 @@ def _apply_region_transforms(
     behavior in the traced graph.  This replaces the ``_grad_scale``
     workaround for specific cases like DTensor's ``to_local`` with
     ``grad_placements``.
+
+    When *fake_kwargs* is supplied, keyword arguments captured during
+    discovery are flattened into positional args for ``make_fx`` tracing
+    (which only supports positional args) and reconstructed when calling
+    ``root_mod.forward``.
     """
     if not transforms:
         yield
         return
 
+    _fake_kwargs = fake_kwargs or {}
+
+    def _chain_inputs(
+        args: tuple[Any, ...], kwargs: dict[str, Any]
+    ) -> tuple[tuple[Any, ...], dict[str, Any]]:
+        for t in transforms:
+            args, kwargs = t.transform_inputs(args, kwargs)
+        return args, kwargs
+
+    # Only spin up the inner ``make_fx`` trace when at least one transform
+    # actually overrides it.
+    needs_inner_trace = any(
+        type(t).transform_graph is not RegionTransform.transform_graph
+        for t in transforms
+    )
+
+    original_forward = root_mod.forward
+
+    if not needs_inner_trace:
+        # pyre-fixme[53]
+        def _patched_forward_inputs_only(*args: Any, **kw: Any) -> Any:
+            new_args, new_kw = _chain_inputs(args, kw)
+            return original_forward(*new_args, **new_kw)
+
+        root_mod.forward = _patched_forward_inputs_only  # type: ignore[method-assign]
+        try:
+            yield
+        finally:
+            root_mod.forward = original_forward  # type: ignore[method-assign]
+        return
+
+    # Apply input transforms to fake inputs FIRST so the inner trace
+    # and the outer trace will see same shapes
+    with fake_mode:
+        padded_fake_args, padded_fake_kwargs = _chain_inputs(fake_args, _fake_kwargs)
+
     params = dict(root_mod.named_parameters(remove_duplicate=False))
     buffers = dict(root_mod.named_buffers(remove_duplicate=False))
+    _padded_kwarg_leaves, _padded_kwarg_spec = pytree.tree_flatten(padded_fake_kwargs)
+    _n_pos_args: int = len(padded_fake_args)
 
+    # pyre-ignore
     def _stateless_forward(
         params_and_buffers: dict[str, Any],
-        *args: Any,
+        *all_args: Any,
     ) -> Any:
+        pos_args = all_args[:_n_pos_args]
+        kw_dict: dict[str, Any] = (
+            pytree.tree_unflatten(list(all_args[_n_pos_args:]), _padded_kwarg_spec)
+            if _padded_kwarg_leaves
+            else {}
+        )
         with stateless._reparametrize_module(root_mod, params_and_buffers):
             with ExitStack() as pstack:
                 for factory in _parametrize_cm_factories or []:
                     pstack.enter_context(factory())
-                out = root_mod(*args)
+                out = root_mod(*pos_args, **kw_dict)
                 if _grad_scale is not None:
                     out = out * _grad_scale
                 return out
@@ -500,24 +555,30 @@ def _apply_region_transforms(
         fake_mode,
         _preserve_autograd_function_leaves(_autograd_function_leaves or set()),
     ):
+        _kwarg_leaves_refaked = tuple(
+            torch.empty(v.shape, dtype=v.dtype, device=v.device)
+            if isinstance(v, torch.Tensor)
+            else v
+            for v in _padded_kwarg_leaves
+        )
         gm_fwd = make_fx(
             _stateless_forward,
             tracing_mode="fake",
             _allow_non_fake_inputs=True,
             record_module_stack=True,
-        )({**params, **buffers}, *fake_args)
+        )({**params, **buffers}, *padded_fake_args, *_kwarg_leaves_refaked)
 
     for transform in transforms:
         transform.transform_graph(gm_fwd, called_modules)
 
-    original_forward = root_mod.forward
-
     def _patched_forward(*args: Any, **kw: Any) -> Any:  # pyre-fixme[53]
+        new_args, new_kw = _chain_inputs(args, kw)
         params_and_buffers = {
             **dict(root_mod.named_parameters(remove_duplicate=False)),
             **dict(root_mod.named_buffers(remove_duplicate=False)),
         }
-        return gm_fwd(params_and_buffers, *args, **kw)
+        kw_leaves = pytree.tree_leaves(new_kw) if new_kw else []
+        return gm_fwd(params_and_buffers, *new_args, *kw_leaves)
 
     root_mod.forward = _patched_forward  # type: ignore[method-assign]
     try:
