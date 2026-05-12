@@ -6,41 +6,42 @@
 
 # pyre-strict
 
-"""RegionTransform ABC — base class for graph-level region transforms."""
+"""RegionTransform — base class for region transforms."""
 
 from __future__ import annotations
 
-from abc import ABC, abstractmethod
 from collections import OrderedDict
-from typing import Any, Callable
+from typing import Any
 
 import torch.fx as fx
 import torch.nn as nn
 
 
-class RegionTransform(ABC):
-    """Base class for a graph-level region transform.
+class RegionTransform:
+    """Base class for a region transform.
 
-    Subclasses define:
-    - detect_regions: which subgraphs to target
-    - wrap_region: how to wrap each subgraph (the autograd.Function)
+    Subclasses override one or both optional hooks:
+
+    * :meth:`transform_inputs` — Python pre-step that wraps the forward
+      with input-side ops (e.g. padding).
+    * :meth:`transform_graph` — In-place rewrite of the inner-traced
+      ``gm_fwd`` (e.g. recompute, regather).  Implementing it triggers
+      an inner ``make_fx`` trace with the already-transformed inputs.
     """
 
-    @abstractmethod
-    def detect_regions(
+    def transform_inputs(
+        self,
+        args: tuple[Any, ...],
+        kwargs: dict[str, Any],
+    ) -> tuple[tuple[Any, ...], dict[str, Any]]:
+        """Optional input pre-transform.  Default is a no-op."""
+        return args, kwargs
+
+    def transform_graph(
         self,
         gm: fx.GraphModule,
         called_modules: OrderedDict[str, tuple[nn.Module, tuple[Any, ...]]],
-    ) -> list[set[fx.Node]]:
-        """Return a list of node sets, each representing a region to wrap."""
-        ...
-
-    @abstractmethod
-    def wrap_region(
-        self,
-        region_gm: fx.GraphModule,
-    ) -> Callable[..., Any]:
-        """Given a sub-GraphModule for a region, return a callable that
-        replaces it.  Typically wraps region_gm in an autograd.Function
-        with custom save/backward behavior."""
-        ...
+    ) -> None:
+        """Optional inner-graph rewrite.  Default is a no-op; the inner
+        ``make_fx`` trace is skipped when no transform overrides it."""
+        return

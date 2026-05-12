@@ -19,6 +19,7 @@ import torch.nn as nn
 import torch.utils._pytree as pytree
 from recir.graph_utils import OP
 from recir.region_transforms.base import RegionTransform
+from recir.region_transforms.core import _extract_subgraph, _replace_region
 
 
 def _collect_chain_regions(
@@ -103,11 +104,11 @@ class RegatherTransform(RegionTransform):
     def __init__(self, skip_param_fqns: Optional[Set[str]] = None) -> None:
         self.skip_param_fqns: Set[str] = skip_param_fqns or set()
 
-    def detect_regions(
+    def transform_graph(
         self,
         gm: fx.GraphModule,
         called_modules: OrderedDict[str, tuple[nn.Module, tuple[Any, ...]]],
-    ) -> list[set[fx.Node]]:
+    ) -> None:
         root_mod, _root_args = next(iter(called_modules.values()))
         param_fqns = [fqn for fqn, _ in root_mod.named_parameters()]
         skip_indices = {
@@ -115,18 +116,23 @@ class RegatherTransform(RegionTransform):
         }
         placeholders = [n for n in gm.graph.nodes if n.op == OP.PLACEHOLDER]
         param_placeholders = placeholders[: len(param_fqns)]
-        regions: list[set[fx.Node]] = []
+        all_regions: list[set[fx.Node]] = []
+        seen_nodes: set[fx.Node] = set()
         for i, node in enumerate(param_placeholders):
             if i in skip_indices:
                 continue
-            param_regions = _collect_chain_regions(node)
-            regions.extend(param_regions)
-        return regions
+            for region_nodes in _collect_chain_regions(node):
+                unique = region_nodes - seen_nodes
+                if unique:
+                    all_regions.append(unique)
+                    seen_nodes.update(unique)
+        for region_nodes in all_regions:
+            region_gm = _extract_subgraph(gm, region_nodes)
+            wrapped_fn = self._wrap_checkpoint(region_gm)
+            _replace_region(gm, region_nodes, wrapped_fn)
 
-    def wrap_region(
-        self,
-        region_gm: fx.GraphModule,
-    ) -> Callable[..., Any]:
+    @staticmethod
+    def _wrap_checkpoint(region_gm: fx.GraphModule) -> Callable[..., Any]:
         def _apply(*inputs: Any) -> Any:
             return torch.utils.checkpoint.checkpoint(
                 region_gm,
