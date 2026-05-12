@@ -507,7 +507,6 @@ def export_bundle(
     )
     result = _local_compile(
         forward_only,
-        None,
         model,
         *sample_inputs,
         fake_mode=fake_mode,

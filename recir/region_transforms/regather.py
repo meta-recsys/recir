@@ -107,9 +107,11 @@ class RegatherTransform(RegionTransform):
     def transform_graph(
         self,
         gm: fx.GraphModule,
-        called_modules: OrderedDict[str, tuple[nn.Module, tuple[Any, ...]]],
+        called_modules: OrderedDict[
+            str, tuple[nn.Module, tuple[Any, ...], dict[str, Any]]
+        ],
     ) -> None:
-        root_mod, _root_args = next(iter(called_modules.values()))
+        root_mod, _root_args, _root_kwargs = next(iter(called_modules.values()))
         param_fqns = [fqn for fqn, _ in root_mod.named_parameters()]
         skip_indices = {
             i for i, fqn in enumerate(param_fqns) if fqn in self.skip_param_fqns

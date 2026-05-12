@@ -133,7 +133,7 @@ class TestDiscoverCalledModules(unittest.TestCase):
             model, fake_mode, lambda m, inp: m(inp), model, x
         )
 
-        _, root_args = called[""]
+        _, root_args, _root_kwargs = called[""]
         self.assertEqual(len(root_args), 1)
         self.assertEqual(root_args[0].shape, torch.Size([4, 50]))
 
@@ -166,7 +166,7 @@ class TestFindForwardRoots(unittest.TestCase):
         roots = _find_forward_roots(called)
 
         self.assertEqual(len(roots), 1)
-        fqn, mod, _args = roots[0]
+        fqn, mod, _args, _kwargs = roots[0]
         self.assertEqual(fqn, "")
         self.assertIs(mod, model)
 
@@ -180,7 +180,7 @@ class TestFindForwardRoots(unittest.TestCase):
         )
         roots = _find_forward_roots(called)
 
-        root_fqns = {fqn for fqn, _, _ in roots}
+        root_fqns = {fqn for fqn, _, _, _ in roots}
         self.assertNotIn("net1", root_fqns)
         self.assertNotIn("relu", root_fqns)
         self.assertNotIn("net2", root_fqns)
@@ -189,25 +189,29 @@ class TestFindForwardRoots(unittest.TestCase):
         """When encoder and decoder are called directly (not via parent forward),
         both should be forward roots."""
         model = TwoPathModel()
-        called: OrderedDict[str, tuple[nn.Module, tuple[Any, ...]]] = OrderedDict()
-        called["encoder"] = (model.encoder, (torch.randn(4, 16),))
-        called["decoder"] = (model.decoder, (torch.randn(4, 16),))
+        called: OrderedDict[str, tuple[nn.Module, tuple[Any, ...], dict[str, Any]]] = (
+            OrderedDict()
+        )
+        called["encoder"] = (model.encoder, (torch.randn(4, 16),), {})
+        called["decoder"] = (model.decoder, (torch.randn(4, 16),), {})
 
         roots = _find_forward_roots(called)
-        root_fqns = {fqn for fqn, _, _ in roots}
+        root_fqns = {fqn for fqn, _, _, _ in roots}
         self.assertEqual(root_fqns, {"encoder", "decoder"})
 
     def test_nested_modules_not_roots_when_parent_called(self) -> None:
         """If parent IS called, children are NOT roots."""
-        called: OrderedDict[str, tuple[nn.Module, tuple[Any, ...]]] = OrderedDict()
+        called: OrderedDict[str, tuple[nn.Module, tuple[Any, ...], dict[str, Any]]] = (
+            OrderedDict()
+        )
         dummy_mod = nn.Linear(10, 10)
         dummy_args: tuple[Any, ...] = (torch.randn(4, 10),)
-        called[""] = (dummy_mod, dummy_args)
-        called["encoder"] = (dummy_mod, dummy_args)
-        called["encoder.attn"] = (dummy_mod, dummy_args)
+        called[""] = (dummy_mod, dummy_args, {})
+        called["encoder"] = (dummy_mod, dummy_args, {})
+        called["encoder.attn"] = (dummy_mod, dummy_args, {})
 
         roots = _find_forward_roots(called)
-        root_fqns = {fqn for fqn, _, _ in roots}
+        root_fqns = {fqn for fqn, _, _, _ in roots}
         self.assertEqual(root_fqns, {""})
 
     def test_container_module_skipped_in_ancestor_walk(self) -> None:
@@ -222,16 +226,18 @@ class TestFindForwardRoots(unittest.TestCase):
         "stu.layers" is absent from called_modules.  "stu.layers.0"
         must NOT be a root because its grandparent "stu" IS called.
         """
-        called: OrderedDict[str, tuple[nn.Module, tuple[Any, ...]]] = OrderedDict()
+        called: OrderedDict[str, tuple[nn.Module, tuple[Any, ...], dict[str, Any]]] = (
+            OrderedDict()
+        )
         dummy_mod = nn.Linear(10, 10)
         dummy_args: tuple[Any, ...] = (torch.randn(4, 10),)
-        called[""] = (dummy_mod, dummy_args)
-        called["stu"] = (dummy_mod, dummy_args)
+        called[""] = (dummy_mod, dummy_args, {})
+        called["stu"] = (dummy_mod, dummy_args, {})
         # "stu.layers" is NOT in called — ModuleList never calls forward().
-        called["stu.layers.0"] = (dummy_mod, dummy_args)
+        called["stu.layers.0"] = (dummy_mod, dummy_args, {})
 
         roots = _find_forward_roots(called)
-        root_fqns = {fqn for fqn, _, _ in roots}
+        root_fqns = {fqn for fqn, _, _, _ in roots}
         self.assertEqual(root_fqns, {""})
         # "stu.layers.0" should NOT be a root because "stu" is called.
 
@@ -426,7 +432,9 @@ class TestRecomputeTransformDetection(unittest.TestCase):
             )(fake_mode.from_tensor(torch.randn(4, 50)))
 
         transform = RecomputeTransform(submodule_fqns={"net1"})
-        called: OrderedDict[str, tuple[nn.Module, tuple[Any, ...]]] = OrderedDict()
+        called: OrderedDict[str, tuple[nn.Module, tuple[Any, ...], dict[str, Any]]] = (
+            OrderedDict()
+        )
         num_nodes_before = len(list(gm.graph.nodes))
         transform.transform_graph(gm, called)
         num_nodes_after = len(list(gm.graph.nodes))
@@ -455,7 +463,9 @@ class TestRecomputeTransformDetection(unittest.TestCase):
             )(fake_mode.from_tensor(torch.randn(4, 50)))
 
         transform = RecomputeTransform(submodule_fqns={"nonexistent"})
-        called: OrderedDict[str, tuple[nn.Module, tuple[Any, ...]]] = OrderedDict()
+        called: OrderedDict[str, tuple[nn.Module, tuple[Any, ...], dict[str, Any]]] = (
+            OrderedDict()
+        )
         num_nodes_before = len(list(gm.graph.nodes))
         transform.transform_graph(gm, called)
         num_nodes_after = len(list(gm.graph.nodes))
@@ -476,7 +486,9 @@ class TestApplyRegionTransforms(unittest.TestCase):
             def transform_graph(
                 self,
                 gm: fx.GraphModule,
-                called_modules: OrderedDict[str, tuple[nn.Module, tuple[Any, ...]]],
+                called_modules: OrderedDict[
+                    str, tuple[nn.Module, tuple[Any, ...], dict[str, Any]]
+                ],
             ) -> None:
                 for n in list(gm.graph.nodes):
                     if n.op == OP.CALL_FUNCTION:
@@ -498,10 +510,15 @@ class TestApplyRegionTransforms(unittest.TestCase):
         roots = _find_forward_roots(called)
 
         with ExitStack() as stack:
-            for _fqn, root_mod, fake_args in roots:
+            for _fqn, root_mod, fake_args, fake_kwargs in roots:
                 stack.enter_context(
                     _apply_region_transforms(
-                        root_mod, fake_args, called, [IdentityTransform()], fake_mode
+                        root_mod,
+                        fake_args,
+                        called,
+                        [IdentityTransform()],
+                        fake_mode,
+                        fake_kwargs=fake_kwargs,
                     )
                 )
             result = model(x)
@@ -521,7 +538,9 @@ class TestApplyRegionTransforms(unittest.TestCase):
             def transform_graph(
                 self,
                 gm: fx.GraphModule,
-                called_modules: OrderedDict[str, tuple[nn.Module, tuple[Any, ...]]],
+                called_modules: OrderedDict[
+                    str, tuple[nn.Module, tuple[Any, ...], dict[str, Any]]
+                ],
             ) -> None:
                 pass
 
@@ -529,10 +548,15 @@ class TestApplyRegionTransforms(unittest.TestCase):
         original_forward = model.forward
 
         with ExitStack() as stack:
-            for _fqn, root_mod, fake_args in roots:
+            for _fqn, root_mod, fake_args, fake_kwargs in roots:
                 stack.enter_context(
                     _apply_region_transforms(
-                        root_mod, fake_args, called, [DummyTransform()], fake_mode
+                        root_mod,
+                        fake_args,
+                        called,
+                        [DummyTransform()],
+                        fake_mode,
+                        fake_kwargs=fake_kwargs,
                     )
                 )
             self.assertNotEqual(model.forward, original_forward)
@@ -557,9 +581,16 @@ class TestApplyRegionTransforms(unittest.TestCase):
         roots = _find_forward_roots(called)
 
         with ExitStack() as stack:
-            for _fqn, root_mod, fake_args in roots:
+            for _fqn, root_mod, fake_args, fake_kwargs in roots:
                 stack.enter_context(
-                    _apply_region_transforms(root_mod, fake_args, called, [], fake_mode)
+                    _apply_region_transforms(
+                        root_mod,
+                        fake_args,
+                        called,
+                        [],
+                        fake_mode,
+                        fake_kwargs=fake_kwargs,
+                    )
                 )
             self.assertIs(
                 model.forward.__func__,  # pyre-fixme[16]
@@ -662,7 +693,9 @@ class TestTransformOrdering(unittest.TestCase):
             def transform_graph(
                 self,
                 gm: fx.GraphModule,
-                called_modules: OrderedDict[str, tuple[nn.Module, tuple[Any, ...]]],
+                called_modules: OrderedDict[
+                    str, tuple[nn.Module, tuple[Any, ...], dict[str, Any]]
+                ],
             ) -> None:
                 call_order.append("transform_A")
 
@@ -670,7 +703,9 @@ class TestTransformOrdering(unittest.TestCase):
             def transform_graph(
                 self,
                 gm: fx.GraphModule,
-                called_modules: OrderedDict[str, tuple[nn.Module, tuple[Any, ...]]],
+                called_modules: OrderedDict[
+                    str, tuple[nn.Module, tuple[Any, ...], dict[str, Any]]
+                ],
             ) -> None:
                 call_order.append("transform_B")
 
@@ -683,7 +718,7 @@ class TestTransformOrdering(unittest.TestCase):
         roots = _find_forward_roots(called)
 
         with ExitStack() as stack:
-            for _fqn, root_mod, fake_args in roots:
+            for _fqn, root_mod, fake_args, fake_kwargs in roots:
                 stack.enter_context(
                     _apply_region_transforms(
                         root_mod,
@@ -691,6 +726,7 @@ class TestTransformOrdering(unittest.TestCase):
                         called,
                         [TrackingTransformA(), TrackingTransformB()],
                         fake_mode,
+                        fake_kwargs=fake_kwargs,
                     )
                 )
 
@@ -988,12 +1024,14 @@ class TestApplyRegionTransformsWithLeaves(unittest.TestCase):
             def transform_graph(
                 self,
                 gm: fx.GraphModule,
-                called_modules: OrderedDict[str, tuple[nn.Module, tuple[Any, ...]]],
+                called_modules: OrderedDict[
+                    str, tuple[nn.Module, tuple[Any, ...], dict[str, Any]]
+                ],
             ) -> None:
                 pass
 
         with ExitStack() as stack:
-            for _fqn, root_mod, fake_args in roots:
+            for _fqn, root_mod, fake_args, fake_kwargs in roots:
                 stack.enter_context(
                     _apply_region_transforms(
                         root_mod,
@@ -1002,6 +1040,7 @@ class TestApplyRegionTransformsWithLeaves(unittest.TestCase):
                         [IdentityTransform()],
                         fake_mode,
                         _autograd_function_leaves={ScaleAndShiftFunction},
+                        fake_kwargs=fake_kwargs,
                     )
                 )
             # Inside the context, run forward+backward.
