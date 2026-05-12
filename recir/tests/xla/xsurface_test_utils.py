@@ -32,7 +32,9 @@ from hammer.v3.modules.mot.preprocessors.mot_preprocessor import MoTPreprocessor
 from hammer.v3.modules.mot.tokenizers.mot_sparse_arch import ECSparseArch
 from hammer.v3.modules.recblock import _inputs_to_feature_bundle, RecBlock
 from minimal_viable_ai.core.dataloader.dataloader import RandomDataPipe
-from minimal_viable_ai.core.dataloader.dataloader_configs import RandomDataSourceConfig
+from minimal_viable_ai.core.dataloader.dataloader_configs import (
+    RandomROODataSourceConfig,
+)
 from minimal_viable_ai.core.model_family_api.configs import RecModelFamilyConfig
 from minimal_viable_ai.core.ranking_common.configs import MTMLROOTrainBatch
 from recir.api import Override
@@ -489,10 +491,24 @@ class SparseArchOverride(Override):
         state: Dict[str, Any] = {"saved": None}
 
         def fwd_fn(*input_tensors: torch.Tensor) -> Tuple[torch.Tensor, ...]:
+            values = input_tensors[0]
+            lengths = input_tensors[1]
+            # Padding may cause values/lengths mismatch: the preprocessor
+            # output lengths include padded dummy entries whose totals can
+            # exceed the values tensor size.  Pad or narrow values so that
+            # values.shape[0] == sum(lengths).
+            total = int(lengths.sum().item())
+            if values.shape[0] < total:
+                pad_size = total - values.shape[0]
+                values = torch.nn.functional.pad(
+                    values, [0] * (2 * values.ndim - 1) + [pad_size]
+                )
+            elif values.shape[0] > total:
+                values = values.narrow(0, 0, total)
             kjt = KeyedJaggedTensor(
                 keys=input_kjt_keys,
-                values=input_tensors[0],
-                lengths=input_tensors[1],
+                values=values,
+                lengths=lengths,
             )
             with torch.enable_grad():
                 output = real_arch(kjt)
@@ -740,104 +756,197 @@ def _resize_nro_tensor(t: torch.Tensor, target_dim0: int) -> torch.Tensor:
     return out
 
 
+def _tile_dim0(t: torch.Tensor, target: int) -> torch.Tensor:
+    """Cyclically tile *t* along dim 0 to length ``target`` (or trim)."""
+    cur = t.shape[0]
+    if cur == target:
+        return t
+    if cur > target:
+        return t[:target].contiguous()
+    if cur == 0:
+        # Nothing to tile from — fall back to zeros.
+        return torch.zeros(target, *t.shape[1:], dtype=t.dtype, device=t.device)
+    n_full = target // cur
+    n_extra = target - n_full * cur
+    parts = [t] * n_full
+    if n_extra > 0:
+        parts.append(t[:n_extra])
+    return torch.cat(parts, dim=0)
+
+
+def _tile_last_dim(t: torch.Tensor, target: int) -> torch.Tensor:
+    """Cyclically tile *t* along the last dim to length ``target`` (or trim)."""
+    cur = t.shape[-1]
+    if cur == target:
+        return t
+    if cur > target:
+        return t[..., :target].contiguous()
+    if cur == 0:
+        return torch.zeros(*t.shape[:-1], target, dtype=t.dtype, device=t.device)
+    n_full = target // cur
+    n_extra = target - n_full * cur
+    parts = [t] * n_full
+    if n_extra > 0:
+        parts.append(t[..., :n_extra])
+    return torch.cat(parts, dim=-1)
+
+
+def resize_kjt_b(kjt: KeyedJaggedTensor, target_b: int) -> KeyedJaggedTensor:
+    """Resize a per-key-major KJT to have ``target_b`` entries per key.
+
+    Cyclically tiles each key's per-sample lengths and the corresponding
+    per-sample value chunks.  Tiling (rather than zero-padding) keeps the
+    synthesized batch "valid" enough to flow through the preprocessor
+    and tokenizer in :func:`_build_overrides` — zero-padded entries
+    short-circuit those paths and the sparse arch hook never fires.
+    """
+    keys = kjt.keys()
+    K = len(keys)
+    cur_lengths = kjt.lengths()
+    cur_b = cur_lengths.shape[0] // K
+    if cur_b == target_b:
+        return kjt
+    cur_values = kjt.values()
+
+    new_lengths_parts: List[torch.Tensor] = []
+    new_values_parts: List[torch.Tensor] = []
+    cur_offset = 0
+
+    for k in range(K):
+        key_lengths = cur_lengths[k * cur_b : (k + 1) * cur_b]
+        key_total = int(key_lengths.sum().item())
+        key_values = cur_values[cur_offset : cur_offset + key_total]
+        cur_offset += key_total
+
+        if target_b < cur_b:
+            tiled_lengths = key_lengths[:target_b]
+            cum = torch.cat(
+                [
+                    torch.zeros(1, dtype=key_lengths.dtype, device=key_lengths.device),
+                    key_lengths.cumsum(0),
+                ]
+            )
+            tiled_values = key_values[: int(cum[target_b].item())]
+        elif cur_b == 0:
+            # Nothing to tile from — empty key segment.
+            tiled_lengths = torch.zeros(
+                target_b, dtype=key_lengths.dtype, device=key_lengths.device
+            )
+            tiled_values = torch.empty(
+                0, dtype=key_values.dtype, device=key_values.device
+            )
+        else:
+            n_full = target_b // cur_b
+            n_extra = target_b - n_full * cur_b
+            length_parts = [key_lengths] * n_full
+            value_parts = [key_values] * n_full
+            if n_extra > 0:
+                length_parts.append(key_lengths[:n_extra])
+                cum = torch.cat(
+                    [
+                        torch.zeros(
+                            1, dtype=key_lengths.dtype, device=key_lengths.device
+                        ),
+                        key_lengths.cumsum(0),
+                    ]
+                )
+                value_parts.append(key_values[: int(cum[n_extra].item())])
+            tiled_lengths = torch.cat(length_parts)
+            tiled_values = torch.cat(value_parts) if value_parts else key_values
+
+        new_lengths_parts.append(tiled_lengths)
+        new_values_parts.append(tiled_values)
+
+    new_lengths = torch.cat(new_lengths_parts)
+    new_values = (
+        torch.cat(new_values_parts)
+        if new_values_parts
+        else torch.empty(0, dtype=cur_values.dtype, device=cur_values.device)
+    )
+    return KeyedJaggedTensor.from_lengths_sync(
+        keys=keys,
+        values=new_values,
+        lengths=new_lengths,
+    )
+
+
+def resize_batch_inplace(
+    batch: MTMLROOTrainBatch, target_b_ro: int, target_b_nro: int
+) -> None:
+    """Resize *batch* in place to ``(target_b_ro, target_b_nro)``.
+
+    Synthesizes the override-build batch from a small trace-time batch
+    so we don't need a second :class:`RandomDataPipe` call at large
+    sizes (that path can SIGABRT inside the data pipe's C++ allocator).
+
+    Strategy: cyclically tile each tensor / KJT to the target size so
+    the synthesized batch contains real (repeated) samples — never zeros.
+    Zero-padded entries (or a 0 in ``num_candidates``) short-circuit the
+    tokenizer's call to the sparse arch in :func:`_build_overrides`, and
+    the forward hook then never fires, leaving the cached output empty.
+
+    ``num_candidates`` is regenerated as a roughly-uniform distribution
+    of ``target_b_nro`` across ``target_b_ro`` slots so every entry is
+    at least ``floor(target_b_nro / target_b_ro)``.
+    """
+    if batch.ro_float_features.shape[0] != target_b_ro:
+        batch.ro_float_features = _tile_dim0(batch.ro_float_features, target_b_ro)
+        batch.ro_id_list_features = resize_kjt_b(batch.ro_id_list_features, target_b_ro)
+
+    if batch.nro_float_features.shape[0] != target_b_nro:
+        batch.nro_float_features = _tile_dim0(batch.nro_float_features, target_b_nro)
+        batch.nro_id_list_features = resize_kjt_b(
+            batch.nro_id_list_features, target_b_nro
+        )
+        if batch.unary_features is not None:
+            batch.unary_features = resize_kjt_b(batch.unary_features, target_b_nro)
+        batch.supervision_label = _tile_last_dim(batch.supervision_label, target_b_nro)
+        batch.supervision_weight = _tile_last_dim(
+            batch.supervision_weight, target_b_nro
+        )
+        all_labels = batch.all_labels
+        if all_labels is not None:
+            for key in list(all_labels.keys()):
+                all_labels[key] = _tile_dim0(all_labels[key], target_b_nro)
+
+    per_sample = target_b_nro // target_b_ro
+    remainder = target_b_nro - per_sample * target_b_ro
+    nc = torch.full(
+        (target_b_ro,),
+        per_sample,
+        dtype=batch.num_candidates.dtype,
+        device=batch.num_candidates.device,
+    )
+    if remainder > 0:
+        nc[:remainder] = nc[:remainder] + 1
+    batch.num_candidates = nc
+
+
 def _create_random_train_batch(
     feature_config: BlueReelsVDDFeatureConfig,
     device: torch.device,
     batch_size: int = TEST_BATCH_SIZE,
-    ro_kjt_keys: List[str] | None = None,
-    nro_kjt_keys: List[str] | None = None,
 ) -> MTMLROOTrainBatch:
-    """Generate a random MTMLROOTrainBatch with uniform num_candidates.
+    """Generate a random MTMLROOTrainBatch via RandomROODataSourceConfig.
 
-    RandomDataPipe produces jagged num_candidates per sample (via
-    torch.randint), but the DummyPreprocessorStack caches outputs with
-    uniform num_candidates=TEST_NUM_CANDIDATES. To avoid dim0 mismatches
-    between nro_float_features and RecBlock's user_embeddings, we
-    regenerate the batch with uniform candidate counts.
+    All keys, shapes, and per-key lengths come from the feature config
+    (``_RO_HISTORY_FEATURES``, ``_RO_CONTEXTUAL_FEATURES``,
+    ``_NRO_FEATURES``).  ``randgen`` produces jagged num_candidates and
+    variable RO history lengths when given a RecROORandGenContext.
     """
     B = batch_size
     C = TEST_NUM_CANDIDATES
-    B_NRO = B * C
 
-    # TODO: Enable and test ROO data
-    # data_source_config = RandomROODataSourceConfig(
-    #     batch_size=B,
-    #     num_batches=1,
-    #     num_generate=1,
-    #     num_candidates=C,
-    #     pin_memory=False,
-    # )
-    data_source_config = RandomDataSourceConfig(
+    data_source_config = RandomROODataSourceConfig(
         batch_size=B,
+        num_batches=1,
         num_generate=1,
+        num_candidates=C,
+        pin_memory=False,
     )
     data_pipe = RandomDataPipe(
         feature_config=feature_config,
         data_source_config=data_source_config,
     )
     batch = cast(MTMLROOTrainBatch, next(iter(data_pipe)))
-
-    # Fix num_candidates to be uniform (RandomDataPipe generates jagged).
-    batch.num_candidates = torch.full((B,), C, dtype=batch.num_candidates.dtype)
-
-    # Rebuild ro_id_list_features KJT with uniform UIH lengths.
-    ro_kjt = batch.ro_id_list_features
-    ro_keys = ro_kjt_keys if ro_kjt_keys is not None else ro_kjt.keys()
-    num_ro_keys = len(ro_keys)
-    batch.ro_id_list_features = KeyedJaggedTensor(
-        keys=ro_keys,
-        values=torch.randint(
-            0,
-            50,
-            (B * TEST_MAX_UIH_SEQ_LEN * num_ro_keys,),
-            dtype=ro_kjt.values().dtype,
-        ),
-        lengths=torch.full((B * num_ro_keys,), TEST_MAX_UIH_SEQ_LEN, dtype=torch.int64),
-    )
-
-    # Same for NRO KJT — use only the model's expected keys.
-    nro_kjt = batch.nro_id_list_features
-    nro_keys = nro_kjt_keys if nro_kjt_keys is not None else nro_kjt.keys()
-    num_nro_keys = len(nro_keys)
-    batch.nro_id_list_features = KeyedJaggedTensor(
-        keys=nro_keys,
-        values=torch.randint(
-            0, 50, (B * C * num_nro_keys,), dtype=nro_kjt.values().dtype
-        ),
-        lengths=torch.full((B * num_nro_keys,), C, dtype=torch.int64),
-    )
-
-    # Rebuild all_labels to match sample_inputs shapes.
-    UIH = TEST_MAX_UIH_SEQ_LEN
-    all_labels = batch.all_labels
-    assert all_labels is not None
-    for key in list(all_labels.keys()):
-        all_labels[key] = torch.randint(0, 256, (B * UIH,), dtype=all_labels[key].dtype)
-
-    # Resize NRO-side tensors to match B_NRO = B * C.
-    batch.nro_float_features = _resize_nro_tensor(batch.nro_float_features, B_NRO)
-
-    # Rebuild unary_features KJT to B_NRO entries.
-    if batch.unary_features is not None:
-        unary_kjt = batch.unary_features
-        num_keys = len(unary_kjt.keys())
-        total_values = B_NRO * num_keys
-        batch.unary_features = KeyedJaggedTensor(
-            keys=unary_kjt.keys(),
-            values=torch.randint(0, 100, (total_values,)),
-            lengths=torch.ones(total_values, dtype=torch.int64),
-        )
-
-    # supervision_label / supervision_weight are (T, B_NRO): resize the LAST
-    # dim (B_NRO), not dim 0 (T = num_main_tasks). _resize_nro_tensor would
-    # mangle dim 0, producing a (B_NRO, original_B_NRO) tensor and breaking
-    # the [:cls_end] slice in BCE loss.
-    for attr in ("supervision_label", "supervision_weight"):
-        t = getattr(batch, attr)
-        if t.dim() >= 1 and t.shape[-1] != B_NRO:
-            new_t = torch.zeros(*t.shape[:-1], B_NRO, dtype=t.dtype)
-            copy_cols = min(t.shape[-1], B_NRO)
-            new_t[..., :copy_cols] = t[..., :copy_cols]
-            setattr(batch, attr, new_t)
-
     return batch.to(device, non_blocking=False)  # pyre-ignore

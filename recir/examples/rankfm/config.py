@@ -53,6 +53,11 @@ class RankFMConfig:
     # jagged totals (required by the GSPMD shard-divisibility check).
     disable_seq_len_sampling: bool = True
 
+    # Enable PaddingRegionTransform for dynamic-shape batches. When True,
+    # jagged inputs are padded to static budgets at each step, allowing
+    # different batches with varying jagged lengths.
+    enable_padding: bool = True
+
     # Profiling
     profile_start_step: int = -1
     profile_end_step: int = -1
@@ -78,10 +83,16 @@ class RankFMConfig:
             dest="disable_seq_len_sampling",
             action="store_false",
         )
+        p.add_argument(
+            "--enable_padding", action="store_true", default=cfg.enable_padding
+        )
+        p.add_argument("--disable_padding", dest="enable_padding", action="store_false")
         p.add_argument("--profile_start_step", type=int, default=cfg.profile_start_step)
         p.add_argument("--profile_end_step", type=int, default=cfg.profile_end_step)
         p.add_argument("--profile_dir", type=str, default=cfg.profile_dir)
-        p.add_argument("--enable_memory_log", action="store_true")
+        p.add_argument(
+            "--enable_memory_log", action="store_true", default=cfg.enable_memory_log
+        )
 
         p.add_argument(
             "--preset",
@@ -126,6 +137,7 @@ class RankFMConfig:
             dense_lr=args.dense_lr,
             embedding_lr=args.embedding_lr,
             disable_seq_len_sampling=args.disable_seq_len_sampling,
+            enable_padding=args.enable_padding,
             profile_start_step=args.profile_start_step,
             profile_end_step=args.profile_end_step,
             profile_dir=args.profile_dir,
