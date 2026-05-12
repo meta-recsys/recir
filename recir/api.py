@@ -603,6 +603,12 @@ def _compile_and_transform(
     region_transforms: Optional[List[RegionTransform]] = None,
     **kwargs: Any,
 ) -> _CompiledResult:
+    if region_transforms:
+        for transform in region_transforms:
+            bind = getattr(transform, "bind_signature", None)
+            if bind is not None:
+                bind(func)
+
     if isinstance(parallel_mode, GSPMDParallel):
         result = _compile_gspmd(
             func,
