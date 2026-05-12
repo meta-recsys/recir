@@ -508,21 +508,7 @@ def _apply_region_transforms(
         )({**params, **buffers}, *fake_args)
 
     for transform in transforms:
-        regions = transform.detect_regions(gm_fwd, called_modules)
-        for region_nodes in regions:
-            if not region_nodes:
-                continue
-            placeholders = [n for n in region_nodes if n.op == "placeholder"]
-            if placeholders:
-                raise ValueError(
-                    f"Region contains placeholder nodes {placeholders}; "
-                    f"regions must only contain call_function / call_method "
-                    f"nodes. Parameter placeholders should be region inputs, "
-                    f"not members."
-                )
-            region_gm = _extract_subgraph(gm_fwd, region_nodes)
-            wrapped_fn = transform.wrap_region(region_gm)
-            _replace_region(gm_fwd, region_nodes, wrapped_fn)
+        transform.transform_graph(gm_fwd, called_modules)
 
     original_forward = root_mod.forward
 
