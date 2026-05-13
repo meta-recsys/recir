@@ -1,0 +1,51 @@
+# W=64 backward perf bench (v71r-bwd-bench).
+# TC backward custom_vjp vs JAX auto-diff baseline (ra2a+scatter_add+ra2a).
+# Multi-host (32 hosts) on recir-v7-128 cluster; devices[::4] = 2 devices/host.
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  generateName: shenli-w64-bwd-bench-v71r-
+  namespace: default
+spec:
+  replicatedJobs:
+  - name: worker
+    replicas: 1
+    template:
+      spec:
+        parallelism: 32
+        completions: 32
+        backoffLimit: 0
+        activeDeadlineSeconds: 2700
+        template:
+          spec:
+            containers:
+            - name: bench
+              image: gcr.io/mrs-tpu-y317h/shenli-runner:v71r-bwd-bench
+              imagePullPolicy: Always
+              env:
+              - name: PYTHONUNBUFFERED
+                value: "1"
+              - name: JAX_DISTRIBUTED_INITIALIZATION_TIMEOUT
+                value: "900"
+              command:
+              - bash
+              - -c
+              - |
+                set +e
+                echo "Job Start: $(date) host: $(hostname)"
+                cd /app/recir
+                timeout 2600 python3 -u -m unittest -v recir.ops.pallas.embeddings.tests.test_jagged_a2a_w128_bench.JaggedA2AW128Benchmark.test_w64_multi_iter_backward 2>&1
+                EXIT=$?
+                echo ""
+                echo "BENCH_EXIT=$EXIT"
+                echo "Job End: $(date)"
+                exit $EXIT
+              ports:
+              - containerPort: 8471
+              resources:
+                limits:
+                  google.com/tpu: 4
+            nodeSelector:
+              cloud.google.com/gke-tpu-accelerator: tpu7x
+              cloud.google.com/gke-tpu-topology: 4x4x8
+            restartPolicy: Never

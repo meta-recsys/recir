@@ -1146,6 +1146,256 @@ class JaggedA2AW128Benchmark(unittest.TestCase):
         log(f"=== RESULT: ra2a={ra2a_times} fused={fused_times}")
 
 
+    # ------------------------------------------------------------------
+    # Backward (custom_vjp) bench helpers + W=32/64/128 entry points.
+    # ------------------------------------------------------------------
+    #
+    # Compares the just-shipped TC backward kernel (registered on
+    # ``jagged_a2a_embedding_lookup_f32_alltc_ringshift`` via
+    # ``jax.custom_vjp``) against the JAX-auto-diff'd baseline that uses
+    # ``jagged_a2a_embedding_lookup_reference_jax`` (XLA decomposes the
+    # backward into ``ragged_all_to_all`` + ``scatter_add`` +
+    # ``ragged_all_to_all``).
+    #
+    # Loss is ``sum(out * fixed_target)`` so the seed gradient is just
+    # ``target`` (deterministic, independent of forward output) — matches
+    # ``test_jagged_a2a_backward.py``'s loss to keep numerical structure
+    # identical.
+    #
+    # Methodology: 5-iter warmup + 10-iter measurement, sync_global_devices
+    # barriers between iters. Median + p99 reported per (kernel, mode).
+    # Backward-only is estimated as
+    # ``(forward+backward median) - (forward median)`` — a reasonable
+    # decomposition since both jit-compile the same forward path; XLA may
+    # fuse forward into backward but the same compiler treatment applies
+    # to both fused and baseline so the ratio is meaningful.
+
+    def _run_backward_bench_with_devices(self, world_size, devices, *, tag) -> None:
+        from jax.experimental.multihost_utils import sync_global_devices
+        import os
+        import sys
+
+        # Diagnostic prints (also visible on rank>0 hosts, both stdout and
+        # stderr) so we can debug "test ran in 19s with no log output" cases.
+        rank0_log = (jax.process_index() == 0)
+        print(f"[ENTER {tag}] proc_idx={jax.process_index()} "
+              f"n_proc={jax.process_count()} TPU_WORKER_ID={os.environ.get('TPU_WORKER_ID')}",
+              file=sys.stderr, flush=True)
+
+        TILE = 128
+        embedding_dim = 128
+        v_local = 8 * 1024
+        max_local_ids = 8 * 1024
+        n_warmup = 5
+        n_measure = 10
+
+        assert len(devices) == world_size, (
+            f"expected {world_size}, got {len(devices)}"
+        )
+        mesh = jax.sharding.Mesh(np.array(devices), ("x",))
+
+        recv_capacity = max_local_ids + TILE
+        recv_capacity = ((recv_capacity + TILE - 1) // TILE) * TILE
+
+        def log(msg):
+            if rank0_log:
+                print(f"[{tag}] {msg}", file=sys.stderr, flush=True)
+
+        log(f"=== W={world_size} D={embedding_dim} v_local={v_local} "
+            f"max_local_ids={max_local_ids} ===")
+
+        # ---- inputs (skewed IDs + per-rank random fp32 table + target) ----
+        log("creating inputs ...")
+        local_ids, local_id_count = _make_inputs_on_device(
+            mesh, world_size, max_local_ids, v_local, seed=2
+        )
+
+        P = jax.sharding.PartitionSpec
+
+        @functools.partial(
+            jax.shard_map,
+            mesh=mesh,
+            in_specs=(),
+            out_specs=P("x"),
+            check_vma=False,
+        )
+        def make_table_random():
+            rank = jax.lax.axis_index("x")
+            key = jax.random.fold_in(jax.random.PRNGKey(7), rank)
+            return jax.random.normal(
+                key, (1, v_local, embedding_dim), dtype=jnp.float32
+            )
+
+        @functools.partial(
+            jax.shard_map,
+            mesh=mesh,
+            in_specs=(),
+            out_specs=P("x"),
+            check_vma=False,
+        )
+        def make_target_random():
+            rank = jax.lax.axis_index("x")
+            key = jax.random.fold_in(jax.random.PRNGKey(13), rank)
+            return jax.random.normal(
+                key, (1, max_local_ids, embedding_dim), dtype=jnp.float32
+            )
+
+        local_table = make_table_random()
+        target = make_target_random()
+        jax.block_until_ready(
+            (local_ids, local_id_count, local_table, target)
+        )
+        log("inputs ready")
+
+        # ---- loss closures: tracers passed as args (multi-host safety) ----
+        def fused_loss(local_ids, local_id_count, local_table, target):
+            out = jagged_a2a_embedding_lookup_f32_alltc_ringshift(
+                local_ids, local_id_count, local_table,
+                mesh=mesh, axis_name="x",
+                recv_capacity=recv_capacity, splitter="globalpad",
+            )
+            return jnp.sum(out * target)
+
+        def ref_loss(local_ids, local_id_count, local_table, target):
+            out = jagged_a2a_embedding_lookup_reference_jax(
+                local_ids, local_id_count, local_table,
+                mesh=mesh, axis_name="x",
+            )
+            return jnp.sum(out * target)
+
+        # ---- jit-compiled forward and value+grad pairs ----
+        # value_and_grad gives us forward+backward in a single jitted call.
+        # Forward-only = jit(loss). Subtract for backward-only estimate.
+        fwd_fused_jit = jax.jit(fused_loss)
+        fwd_ref_jit = jax.jit(ref_loss)
+        fb_fused_jit = jax.jit(jax.value_and_grad(fused_loss, argnums=2))
+        fb_ref_jit = jax.jit(jax.value_and_grad(ref_loss, argnums=2))
+
+        args = (local_ids, local_id_count, local_table, target)
+
+        def time_jit(label, fn, n_warmup, n_measure):
+            log(f"-- {label} warmup ({n_warmup} iters) --")
+            for i in range(n_warmup):
+                sync_global_devices(f"{label}_warmup_{i}_start")
+                t0 = time.perf_counter()
+                out = fn(*args)
+                jax.block_until_ready(out)
+                elapsed_ms = (time.perf_counter() - t0) * 1e3
+                log(f"{label} warmup {i}: {elapsed_ms:.1f} ms")
+            sync_global_devices(f"{label}_warmup_done")
+
+            log(f"-- {label} measure ({n_measure} iters) --")
+            times_ms = []
+            for i in range(n_measure):
+                sync_global_devices(f"{label}_meas_{i}_start")
+                t0 = time.perf_counter()
+                out = fn(*args)
+                jax.block_until_ready(out)
+                elapsed_ms = (time.perf_counter() - t0) * 1e3
+                times_ms.append(elapsed_ms)
+                log(f"{label} meas {i}: {elapsed_ms:.1f} ms")
+            sync_global_devices(f"{label}_meas_done")
+            return times_ms
+
+        fwd_fused_times = time_jit("fwd_fused", fwd_fused_jit, n_warmup, n_measure)
+        fwd_ref_times = time_jit("fwd_ref", fwd_ref_jit, n_warmup, n_measure)
+        fb_fused_times = time_jit("fb_fused", fb_fused_jit, n_warmup, n_measure)
+        fb_ref_times = time_jit("fb_ref", fb_ref_jit, n_warmup, n_measure)
+
+        def median(xs):
+            return statistics.median(xs)
+
+        def p99(xs):
+            xs_s = sorted(xs)
+            # With n=10 measurements, p99 is the max — stable proxy.
+            idx = max(0, int(round(0.99 * (len(xs_s) - 1))))
+            return xs_s[idx]
+
+        fwd_fused_med = median(fwd_fused_times)
+        fwd_fused_p99 = p99(fwd_fused_times)
+        fwd_ref_med = median(fwd_ref_times)
+        fwd_ref_p99 = p99(fwd_ref_times)
+        fb_fused_med = median(fb_fused_times)
+        fb_fused_p99 = p99(fb_fused_times)
+        fb_ref_med = median(fb_ref_times)
+        fb_ref_p99 = p99(fb_ref_times)
+
+        bwd_fused_est = max(0.0, fb_fused_med - fwd_fused_med)
+        bwd_ref_est = max(0.0, fb_ref_med - fwd_ref_med)
+        speedup = (bwd_ref_est / bwd_fused_est) if bwd_fused_est > 0 else float("inf")
+
+        # Final report — exact format requested.
+        log(
+            f"forward+backward fused: median={fb_fused_med:.1f} ms, "
+            f"p99={fb_fused_p99:.1f} ms"
+        )
+        log(
+            f"forward+backward baseline: median={fb_ref_med:.1f} ms, "
+            f"p99={fb_ref_p99:.1f} ms"
+        )
+        log(
+            f"forward only fused: median={fwd_fused_med:.1f} ms "
+            f"(baseline forward: {fwd_ref_med:.1f} ms)"
+        )
+        log(f"backward only fused estimate: {bwd_fused_est:.1f} ms")
+        log(f"backward only baseline estimate: {bwd_ref_est:.1f} ms")
+        log(f"backward speedup: {speedup:.2f}x")
+        log(
+            f"=== RESULT: fwd_fused={fwd_fused_times} fwd_ref={fwd_ref_times} "
+            f"fb_fused={fb_fused_times} fb_ref={fb_ref_times}"
+        )
+
+    def test_w32_multi_iter_backward(self) -> None:
+        """W=32 backward perf bench: TC custom_vjp vs JAX auto-diff (ra2a+scatter+ra2a).
+
+        Mirrors test_w32_multi_iter (devices[::8] = 1 device per host across 32
+        hosts; D=128, v_local=8K, max_local_ids=8K, recv_capacity=8K+TILE) but
+        times jit(value_and_grad(loss)) for both kernels in addition to the
+        forward-only path. Reports median+p99 for forward-only and
+        forward+backward, plus an estimated backward-only delta and the
+        backward speedup of fused vs baseline.
+        """
+        import os
+        import sys
+        print(
+            f"[BWD_BENCH_W32 ENTER_TEST] TPU_WORKER_ID={os.environ.get('TPU_WORKER_ID')} "
+            f"n_local_devices={len(jax.local_devices())}",
+            file=sys.stderr, flush=True,
+        )
+        all_devices = jax.devices()
+        print(
+            f"[BWD_BENCH_W32 POST_DEVICES] n_devices={len(all_devices)} "
+            f"proc_idx={jax.process_index()} n_proc={jax.process_count()}",
+            file=sys.stderr, flush=True,
+        )
+        if len(all_devices) < 256:
+            self.skipTest(f"Need 256 logical devices, have {len(all_devices)}")
+        devices = all_devices[::8]  # 1 device per host
+        self._run_backward_bench_with_devices(
+            world_size=32, devices=devices, tag="BWD_BENCH_W32"
+        )
+
+    def test_w64_multi_iter_backward(self) -> None:
+        """W=64 backward perf bench (devices[::4] = 2 devices per host)."""
+        all_devices = jax.devices()
+        if len(all_devices) < 256:
+            self.skipTest(f"Need 256 logical devices, have {len(all_devices)}")
+        devices = all_devices[::4]  # 2 devices per host
+        self._run_backward_bench_with_devices(
+            world_size=64, devices=devices, tag="BWD_BENCH_W64"
+        )
+
+    def test_w128_multi_iter_backward(self) -> None:
+        """W=128 backward perf bench (devices[::2] = 4 devices per host)."""
+        all_devices = jax.devices()
+        if len(all_devices) < 256:
+            self.skipTest(f"Need 256 logical devices, have {len(all_devices)}")
+        devices = all_devices[::2]  # 4 devices per host
+        self._run_backward_bench_with_devices(
+            world_size=128, devices=devices, tag="BWD_BENCH_W128"
+        )
+
+
     def _run_multi_iter_with_devices(self, world_size, devices):
         """Shared helper: 3-iter test of ra2a + fused with checkpoint prints
         between async dispatch and block_until_ready.
