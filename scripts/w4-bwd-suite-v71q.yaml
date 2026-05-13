@@ -1,0 +1,51 @@
+# W=4 backward FULL test suite (v71q-tc-bwd) — runs all 6 W=4 backward tests.
+# Single-host (4 chips) on recir-v7-8-1 cluster.
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  generateName: shenli-w4-bwd-suite-v71q-
+  namespace: default
+spec:
+  replicatedJobs:
+  - name: worker
+    replicas: 1
+    template:
+      spec:
+        parallelism: 1
+        completions: 1
+        backoffLimit: 0
+        activeDeadlineSeconds: 1800
+        template:
+          spec:
+            containers:
+            - name: bench
+              image: gcr.io/mrs-tpu-y317h/shenli-runner:v71q-tc-bwd
+              imagePullPolicy: Always
+              env:
+              - name: PYTHONUNBUFFERED
+                value: "1"
+              - name: JAX_DISTRIBUTED_INITIALIZATION_TIMEOUT
+                value: "300"
+              command:
+              - bash
+              - -c
+              - |
+                set +e
+                echo "Job Start: $(date) host: $(hostname)"
+                cd /app/recir
+                # Run the entire W=4 backward suite (6 tests).
+                timeout 1700 python3 -u -m unittest -v recir.ops.pallas.embeddings.tests.test_jagged_a2a_backward.JaggedA2ABackwardW4 2>&1
+                EXIT=$?
+                echo ""
+                echo "BENCH_EXIT=$EXIT"
+                echo "Job End: $(date)"
+                exit $EXIT
+              ports:
+              - containerPort: 8471
+              resources:
+                limits:
+                  google.com/tpu: 4
+            nodeSelector:
+              cloud.google.com/gke-tpu-accelerator: tpu7x
+              cloud.google.com/gke-tpu-topology: 2x2x1
+            restartPolicy: Never

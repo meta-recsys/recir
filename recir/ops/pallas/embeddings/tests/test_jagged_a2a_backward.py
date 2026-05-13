@@ -52,11 +52,17 @@ from recir.ops.pallas.embeddings.tests.test_jagged_a2a_lookup import _has_tpu
 # produces deterministic gradients independent of any RNG.
 
 
-def _fused_loss_for_table(local_ids, local_id_count, target,
-                          mesh, axis_name, recv_capacity, splitter):
-    """Loss = sum(forward(table) * target). Gradient w.r.t. table = grad_out
-    backprop = target → custom_vjp."""
-    def loss(local_table):
+def _fused_loss_for_table(mesh, axis_name, recv_capacity, splitter):
+    """Returns a loss(local_ids, local_id_count, local_table, target).
+
+    Loss = sum(forward(table) * target). Gradient w.r.t. table = grad_out
+    backprop = target → custom_vjp.
+
+    Multi-host safety: all jax.Array inputs are passed as function args
+    (not closed over) so jit can serialize them across host processes
+    instead of trying to inline the per-host shards as MLIR constants.
+    """
+    def loss(local_ids, local_id_count, local_table, target):
         out = jagged_a2a_embedding_lookup_f32_alltc_ringshift(
             local_ids, local_id_count, local_table,
             mesh=mesh, axis_name=axis_name,
@@ -66,8 +72,8 @@ def _fused_loss_for_table(local_ids, local_id_count, target,
     return loss
 
 
-def _ref_loss_for_table(local_ids, local_id_count, target, mesh, axis_name):
-    def loss(local_table):
+def _ref_loss_for_table(mesh, axis_name):
+    def loss(local_ids, local_id_count, local_table, target):
         out = jagged_a2a_embedding_lookup_reference_jax(
             local_ids, local_id_count, local_table,
             mesh=mesh, axis_name=axis_name,
@@ -190,26 +196,30 @@ class JaggedA2ABackwardW4(unittest.TestCase):
     def _check_grad_close(
         self, tag, local_ids, local_id_count, local_table, target,
     ):
-        """Run jit(grad(fused_loss)) and jit(grad(ref_loss)) and compare."""
+        """Run jit(grad(fused_loss)) and jit(grad(ref_loss)) and compare.
+
+        Loss is `sum(forward(table) * target)`. Gradient is taken w.r.t.
+        the table arg only (argnums=2). All other args (ids/count/target)
+        are passed AS arguments to the jit, not closed over — required
+        for multi-host correctness.
+        """
         fused_loss = _fused_loss_for_table(
-            local_ids, local_id_count, target,
             mesh=self.mesh, axis_name="x",
             recv_capacity=self.recv_capacity, splitter="globalpad",
         )
         ref_loss = _ref_loss_for_table(
-            local_ids, local_id_count, target,
             mesh=self.mesh, axis_name="x",
         )
 
-        fused_grad_jit = jax.jit(jax.grad(fused_loss))
-        ref_grad_jit = jax.jit(jax.grad(ref_loss))
+        fused_grad_jit = jax.jit(jax.grad(fused_loss, argnums=2))
+        ref_grad_jit = jax.jit(jax.grad(ref_loss, argnums=2))
 
         self._log(tag, "computing fused grad ...")
-        fused_grad = fused_grad_jit(local_table)
+        fused_grad = fused_grad_jit(local_ids, local_id_count, local_table, target)
         jax.block_until_ready(fused_grad)
 
         self._log(tag, "computing ref grad ...")
-        ref_grad = ref_grad_jit(local_table)
+        ref_grad = ref_grad_jit(local_ids, local_id_count, local_table, target)
         jax.block_until_ready(ref_grad)
 
         # Compare in-graph: replicated scalar.
@@ -447,24 +457,24 @@ class JaggedA2ABackwardW4(unittest.TestCase):
         jax.block_until_ready((local_ids, local_id_count, local_table, target))
 
         fused_loss = _fused_loss_for_table(
-            local_ids, local_id_count, target,
             mesh=self.mesh, axis_name="x",
             recv_capacity=self.recv_capacity, splitter="globalpad",
         )
         ref_loss = _ref_loss_for_table(
-            local_ids, local_id_count, target,
             mesh=self.mesh, axis_name="x",
         )
 
-        fused_vag_jit = jax.jit(jax.value_and_grad(fused_loss))
-        ref_vag_jit = jax.jit(jax.value_and_grad(ref_loss))
+        # Gradient w.r.t. table only (argnums=2). All other args are
+        # passed via the call signature so multi-host jit works.
+        fused_vag_jit = jax.jit(jax.value_and_grad(fused_loss, argnums=2))
+        ref_vag_jit = jax.jit(jax.value_and_grad(ref_loss, argnums=2))
 
         self._log("W4_VAG", "computing fused value_and_grad ...")
-        f_val, f_grad = fused_vag_jit(local_table)
+        f_val, f_grad = fused_vag_jit(local_ids, local_id_count, local_table, target)
         jax.block_until_ready((f_val, f_grad))
 
         self._log("W4_VAG", "computing ref value_and_grad ...")
-        r_val, r_grad = ref_vag_jit(local_table)
+        r_val, r_grad = ref_vag_jit(local_ids, local_id_count, local_table, target)
         jax.block_until_ready((r_val, r_grad))
 
         f_val_v = float(jax.device_get(f_val))
@@ -551,55 +561,64 @@ class JaggedA2ABackwardW32(unittest.TestCase):
         log("inputs ready")
 
         fused_loss = _fused_loss_for_table(
-            local_ids, local_id_count, target,
             mesh=mesh, axis_name="x",
             recv_capacity=recv_capacity, splitter="globalpad",
         )
         ref_loss = _ref_loss_for_table(
-            local_ids, local_id_count, target,
             mesh=mesh, axis_name="x",
         )
 
-        fused_grad_jit = jax.jit(jax.grad(fused_loss))
-        ref_grad_jit = jax.jit(jax.grad(ref_loss))
+        # Gradient w.r.t. table only (argnums=2). All other args passed as
+        # arguments — required to avoid "Closing over jax.Array that
+        # spans non-addressable devices" error in multi-host jit.
+        fused_grad_jit = jax.jit(jax.grad(fused_loss, argnums=2))
+        ref_grad_jit = jax.jit(jax.grad(ref_loss, argnums=2))
 
         log("-- computing reference (ra2a) grad --")
         sync_global_devices("bwd_ref_start")
-        ref_grad = ref_grad_jit(local_table)
+        ref_grad = ref_grad_jit(local_ids, local_id_count, local_table, target)
         jax.block_until_ready(ref_grad)
         log("ref grad ready")
 
         log("-- computing fused (ringshift custom_vjp) grad --")
         sync_global_devices("bwd_fused_start")
-        fused_grad = fused_grad_jit(local_table)
+        fused_grad = fused_grad_jit(local_ids, local_id_count, local_table, target)
         jax.block_until_ready(fused_grad)
         log("fused grad ready")
 
+        # All reductions in-graph: jnp.max produces a replicated scalar,
+        # safe to fetch on every host. Avoid np.asarray() on the full
+        # sharded grad arrays — that would trigger the
+        # "non-addressable devices" runtime error in multi-host.
         diff_max = jnp.max(jnp.abs(fused_grad - ref_grad))
         ref_max = jnp.max(jnp.abs(ref_grad))
+        # Combined atol+rtol per-element bound:  atol + rtol * |ref|.
+        # max(|fused - ref| - (atol + rtol * |ref|)) > 0 means a violation.
+        violation = jnp.max(
+            jnp.abs(fused_grad - ref_grad) - (atol + rtol * jnp.abs(ref_grad))
+        )
         diff_max_v = float(jax.device_get(diff_max))
         ref_max_v = float(jax.device_get(ref_max))
+        violation_v = float(jax.device_get(violation))
         sync_global_devices("bwd_diff_done")
 
         log(f"max_abs_diff = {diff_max_v:.6e}, ref_max = {ref_max_v:.6e}")
         if ref_max_v > 0:
             rel = diff_max_v / max(ref_max_v, 1e-12)
             log(f"relative max_diff = {rel:.6e}")
+        log(f"violation_max (>0 means atol/rtol failure) = {violation_v:.6e}")
 
-        if diff_max_v < atol:
-            log(f"PASS: max_diff {diff_max_v:.6e} < atol {atol:.0e}")
+        if violation_v <= 0:
+            log(f"PASS: all elements within atol={atol:.0e} + rtol={rtol:.0e}*|ref|")
         else:
-            log(f"FAIL: max_diff {diff_max_v:.6e} >= atol {atol:.0e}")
-        log(f"=== RESULT: max_diff={diff_max_v:.6e} ===")
+            log(f"FAIL: max violation {violation_v:.6e} > 0")
+        log(f"=== RESULT: max_diff={diff_max_v:.6e} violation={violation_v:.6e} ===")
 
-        # numpy-compatible per-element tolerance check (also enforces rtol).
-        np.testing.assert_allclose(
-            np.asarray(fused_grad), np.asarray(ref_grad),
-            atol=atol, rtol=rtol,
-            err_msg=(
-                f"[BWD_W32] grad mismatch: max_abs_diff={diff_max_v:.6e}, "
-                f"ref_max={ref_max_v:.6e}"
-            ),
+        # In-graph assertion: the worst per-element violation must be <=0.
+        self.assertLessEqual(
+            violation_v, 0.0,
+            f"[BWD_W32] tolerance violation: max_abs_diff={diff_max_v:.6e}, "
+            f"ref_max={ref_max_v:.6e}, violation={violation_v:.6e}"
         )
 
 
