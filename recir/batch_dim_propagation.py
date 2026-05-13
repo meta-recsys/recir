@@ -221,6 +221,15 @@ def _output_batch_dim_for(
     if target in (aten.index.Tensor, aten.gather.default):
         return input_batch_dim
 
+    if isinstance(target, torch._ops.OpOverload) and target.name() in (
+        "recir_padding::pad_to_static",
+        "recir_padding::pad_count_to_sum",
+        "recir_padding::pad_jagged_lengths",
+        "recir_padding::pad_jagged_values",
+        "recir_padding::unpad_grad",
+        "recir_padding::unpad_jagged_grad",
+    ):
+        return input_batch_dim
     # Unknown op - don't propagate.
     return None
 
@@ -290,6 +299,9 @@ def _output_batch_dim_for_positional(node: fx.Node) -> Optional[int]:
 
 
 def propagate_batch_input_meta(gm: fx.GraphModule) -> None:
+    import logging as _lg
+
+    _logger = _lg.getLogger(__name__)
     aten = torch.ops.aten
     # Ops where the operand position matters for batch tracking. For these
     # we pass per-arg batch_dim to _output_batch_dim_for via node.args
@@ -300,6 +312,7 @@ def propagate_batch_input_meta(gm: fx.GraphModule) -> None:
         aten.bmm.default,
         aten.addmm.default,
     }
+    _missing: dict[str, int] = {}
     for node in gm.graph.nodes:
         if node.op != "call_function":
             continue
@@ -332,6 +345,20 @@ def propagate_batch_input_meta(gm: fx.GraphModule) -> None:
             continue
         new_batch_dim = _output_batch_dim_for(node.target, input_batch_dim, node)
         if new_batch_dim is None:
+            tname = (
+                node.target.name()
+                if isinstance(node.target, torch._ops.OpOverload)
+                else str(node.target)
+            )
+            _missing[tname] = _missing.get(tname, 0) + 1
             continue
         node.meta["is_batch_input"] = True
         node.meta["batch_dim"] = new_batch_dim
+    if _missing:
+        _logger.info(
+            "[propagate_batch_input_meta] %d distinct ops broke propagation "
+            "(input was batched but op not in allowlist):",
+            len(_missing),
+        )
+        for _name, _count in sorted(_missing.items(), key=lambda x: -x[1]):
+            _logger.info("  %s -> %d nodes", _name, _count)
