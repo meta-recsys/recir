@@ -40,8 +40,14 @@ class RegionTransform:
     def transform_graph(
         self,
         gm: fx.GraphModule,
-        called_modules: OrderedDict[str, tuple[nn.Module, tuple[Any, ...]]],
+        called_modules: OrderedDict[
+            str, tuple[nn.Module, tuple[Any, ...], dict[str, Any]]
+        ],
     ) -> None:
         """Optional inner-graph rewrite.  Default is a no-op; the inner
         ``make_fx`` trace is skipped when no transform overrides it."""
         return
+
+    def finalize_compiled_graph(self, gm: fx.GraphModule) -> None:
+        """Optional post-compile hook on the final outer graph (e.g. tag
+        XLA graph-break nodes).  Default is a no-op."""
