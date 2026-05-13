@@ -729,6 +729,143 @@ class JaggedA2AW128Benchmark(unittest.TestCase):
         log(f"=== RESULT: ra2a={ra2a_times} fused={fused_times}")
 
 
+    def test_w32_correctness(self) -> None:
+        """W=32 numerical correctness check: fused vs ra2a reference.
+
+        Uses the same mesh + sizes as test_w32_multi_iter (W=32 via devices[::8],
+        D=128, v_local=8K, max_local_ids=8K, recv_capacity=8K+TILE), but
+        replaces the all-zero table with a per-rank random fp32 table so we can
+        actually compare outputs. Computes max |out - ref| in-graph and asserts
+        it is exactly 0.0 (bitwise-identical to the ra2a reference).
+        """
+        all_devices = jax.devices()
+        if len(all_devices) < 256:
+            self.skipTest(f"Need 256 logical devices, have {len(all_devices)}")
+        devices = all_devices[::8]  # 1 device per host
+        self._run_correctness_with_devices(world_size=32, devices=devices)
+
+
+    def test_w64_correctness(self) -> None:
+        """W=64 numerical correctness check: fused vs ra2a reference.
+
+        Mirrors test_w32_correctness with world_size=64, devices[::4]
+        (2 devices per host across all 32 hosts).
+        """
+        all_devices = jax.devices()
+        if len(all_devices) < 256:
+            self.skipTest(f"Need 256 logical devices, have {len(all_devices)}")
+        devices = all_devices[::4]  # 2 devices per host
+        self._run_correctness_with_devices(world_size=64, devices=devices)
+
+
+    def test_w128_correctness(self) -> None:
+        """W=128 numerical correctness check: fused vs ra2a reference.
+
+        Mirrors test_w32_correctness with world_size=128, devices[::2]
+        (4 devices per host across all 32 hosts).
+        """
+        all_devices = jax.devices()
+        if len(all_devices) < 256:
+            self.skipTest(f"Need 256 logical devices, have {len(all_devices)}")
+        devices = all_devices[::2]  # 4 devices per host
+        self._run_correctness_with_devices(world_size=128, devices=devices)
+
+
+    def _run_correctness_with_devices(self, world_size, devices) -> None:
+        """Shared helper: run fused vs ra2a correctness check at given W.
+
+        D=128, v_local=8K, max_local_ids=8K, recv_capacity=8K+TILE.
+        Per-rank random fp32 table (different rng key per rank).
+        Computes max |out - ref| in-graph; asserts exactly 0.0 (bitwise-identical).
+        Prints `[CORRECTNESS_W{N}] max_diff = ...` and PASS/FAIL on rank 0.
+        """
+        from jax.experimental.multihost_utils import sync_global_devices
+        import sys
+
+        TILE = 128
+        embedding_dim = 128
+        v_local = 8 * 1024
+        max_local_ids = 8 * 1024
+
+        assert len(devices) == world_size, f"expected {world_size}, got {len(devices)}"
+        mesh = jax.sharding.Mesh(np.array(devices), ("x",))
+
+        recv_capacity = max_local_ids + TILE
+        recv_capacity = ((recv_capacity + TILE - 1) // TILE) * TILE
+
+        tag = f"CORRECTNESS_W{world_size}"
+
+        def log(msg):
+            if jax.process_index() == 0:
+                print(f"[{tag}] {msg}", file=sys.stderr, flush=True)
+
+        log(f"=== D={embedding_dim} v_local={v_local} max_local_ids={max_local_ids} ===")
+
+        log("creating inputs ...")
+        local_ids, local_id_count = _make_inputs_on_device(
+            mesh, world_size, max_local_ids, v_local, seed=2
+        )
+
+        # Per-rank RANDOM fp32 table (NOT zero) so out vs ref comparison is
+        # meaningful. Different rng key per rank so neighboring shards differ.
+        P = jax.sharding.PartitionSpec
+
+        @functools.partial(
+            jax.shard_map,
+            mesh=mesh,
+            in_specs=(),
+            out_specs=P("x"),
+            check_vma=False,
+        )
+        def make_table_random():
+            rank = jax.lax.axis_index("x")
+            key = jax.random.fold_in(jax.random.PRNGKey(7), rank)
+            return jax.random.normal(key, (1, v_local, embedding_dim), dtype=jnp.float32)
+
+        local_table = make_table_random()
+        jax.block_until_ready((local_ids, local_id_count, local_table))
+        args = (local_ids, local_id_count, local_table)
+        log("inputs ready (random fp32 table)")
+
+        rs_gp_jit = jax.jit(functools.partial(
+            jagged_a2a_embedding_lookup_f32_alltc_ringshift,
+            mesh=mesh, axis_name="x",
+            recv_capacity=recv_capacity, splitter="globalpad",
+        ))
+        ra2a_jit = jax.jit(functools.partial(
+            jagged_a2a_embedding_lookup_reference_jax,
+            mesh=mesh, axis_name="x",
+        ))
+
+        log("-- computing reference (ra2a) --")
+        sync_global_devices("ref_start")
+        ref = ra2a_jit(*args)
+        jax.block_until_ready(ref)
+        log("ref ready")
+
+        log("-- computing fused (ringshift + globalpad) --")
+        sync_global_devices("fused_start")
+        out = rs_gp_jit(*args)
+        jax.block_until_ready(out)
+        log("fused ready")
+
+        # Compute max diff in-graph; result is fully replicated -> safe to
+        # device_get on every host.
+        log("-- computing max_diff in-graph --")
+        diff_max = jnp.max(jnp.abs(out - ref))
+        diff_max_value = float(jax.device_get(diff_max))
+        sync_global_devices("diff_done")
+
+        log(f"max_diff = {diff_max_value:.6e}")
+        if diff_max_value == 0.0:
+            log(f"PASS: max_diff {diff_max_value:.6e} == 0 (bitwise-identical)")
+        else:
+            log(f"FAIL: max_diff {diff_max_value:.6e} != 0")
+        log(f"=== RESULT: max_diff={diff_max_value:.6e} ===")
+
+        self.assertEqual(diff_max_value, 0.0)
+
+
     def test_w64_multi_iter(self) -> None:
         """W=64 multi-iter perf test on v71d (production kernel + split DMA fix).
 
