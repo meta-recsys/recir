@@ -353,13 +353,12 @@ class TestReplaceRegion(unittest.TestCase):
 
 
 class TestRegatherTransformDetection(unittest.TestCase):
-    def test_detect_chain_regions(self) -> None:
-        """Each parameter's usage chain (param → chain_ops → compute) is a region."""
+    def test_transform_graph_wraps_chains(self) -> None:
+        """transform_graph wraps each parameter chain with checkpoint."""
         model = SimpleMLP()
         fake_mode = _make_fake_mode()
         x = torch.randn(4, 50)
 
-        # Use the same stateless tracing pattern as _apply_region_transforms.
         from torch.nn.utils import stateless
 
         params = dict(model.named_parameters(remove_duplicate=False))
@@ -382,22 +381,24 @@ class TestRegatherTransformDetection(unittest.TestCase):
             model, fake_mode, lambda m, inp: m(inp), model, x
         )
 
+        num_nodes_before = len(list(gm.graph.nodes))
         transform = RegatherTransform()
-        regions = transform.detect_regions(gm, called)
+        transform.transform_graph(gm, called)
+        num_nodes_after = len(list(gm.graph.nodes))
 
-        # SimpleMLP has 4 parameters. Each should produce at least one region.
-        self.assertGreaterEqual(len(regions), 4)
-
-        # Each region should contain more than just a placeholder — it should
-        # include chain ops and/or the compute consumer.
-        for region in regions:
-            self.assertGreaterEqual(len(region), 1)
-            # Regions should NOT contain placeholders (param nodes are region
-            # inputs, not members) — only chain ops and compute consumers.
-            placeholders = [n for n in region if n.op == OP.PLACEHOLDER]
-            self.assertEqual(len(placeholders), 0)
-            non_placeholders = [n for n in region if n.op != OP.PLACEHOLDER]
-            self.assertGreaterEqual(len(non_placeholders), 1)
+        self.assertNotEqual(num_nodes_before, num_nodes_after)
+        # SimpleMLP has two Linear layers. Each layer's weight chain
+        # ({t, addmm}) absorbs its bias chain ({addmm}) via the
+        # seen_nodes dedup in RegatherTransform.transform_graph, so
+        # we expect exactly one wrapper per Linear (target is the
+        # `_apply` closure returned by `RegatherTransform._wrap_checkpoint`).
+        wrapper_nodes = [
+            n
+            for n in gm.graph.nodes
+            if n.op == OP.CALL_FUNCTION
+            and getattr(n.target, "__name__", None) == "_apply"
+        ]
+        self.assertEqual(len(wrapper_nodes), 2)
 
 
 # ---------------------------------------------------------------------------
@@ -406,7 +407,7 @@ class TestRegatherTransformDetection(unittest.TestCase):
 
 
 class TestRecomputeTransformDetection(unittest.TestCase):
-    def test_detect_submodule_regions(self) -> None:
+    def test_transform_graph_wraps_submodule(self) -> None:
         model = SimpleMLP()
         fake_mode = _make_fake_mode()
 
@@ -426,12 +427,23 @@ class TestRecomputeTransformDetection(unittest.TestCase):
 
         transform = RecomputeTransform(submodule_fqns={"net1"})
         called: OrderedDict[str, tuple[nn.Module, tuple[Any, ...]]] = OrderedDict()
-        regions = transform.detect_regions(gm, called)
+        num_nodes_before = len(list(gm.graph.nodes))
+        transform.transform_graph(gm, called)
+        num_nodes_after = len(list(gm.graph.nodes))
 
-        self.assertEqual(len(regions), 1)
-        self.assertGreater(len(regions[0]), 0)
+        # net1's call_function nodes should collapse into a single
+        # checkpoint wrapper call (target is the `_apply` closure
+        # returned by `RecomputeTransform._wrap_checkpoint`).
+        self.assertLess(num_nodes_after, num_nodes_before)
+        wrapper_nodes = [
+            n
+            for n in gm.graph.nodes
+            if n.op == OP.CALL_FUNCTION
+            and getattr(n.target, "__name__", None) == "_apply"
+        ]
+        self.assertEqual(len(wrapper_nodes), 1)
 
-    def test_nonexistent_submodule_returns_empty(self) -> None:
+    def test_nonexistent_submodule_is_noop(self) -> None:
         model = SimpleMLP()
         fake_mode = _make_fake_mode()
 
@@ -444,9 +456,10 @@ class TestRecomputeTransformDetection(unittest.TestCase):
 
         transform = RecomputeTransform(submodule_fqns={"nonexistent"})
         called: OrderedDict[str, tuple[nn.Module, tuple[Any, ...]]] = OrderedDict()
-        regions = transform.detect_regions(gm, called)
-
-        self.assertEqual(len(regions), 0)
+        num_nodes_before = len(list(gm.graph.nodes))
+        transform.transform_graph(gm, called)
+        num_nodes_after = len(list(gm.graph.nodes))
+        self.assertEqual(num_nodes_before, num_nodes_after)
 
 
 # ---------------------------------------------------------------------------
@@ -460,18 +473,19 @@ class TestApplyRegionTransforms(unittest.TestCase):
         produce the same output."""
 
         class IdentityTransform(RegionTransform):
-            def detect_regions(
+            def transform_graph(
                 self,
                 gm: fx.GraphModule,
                 called_modules: OrderedDict[str, tuple[nn.Module, tuple[Any, ...]]],
-            ) -> list[set[fx.Node]]:
-                return [{n} for n in gm.graph.nodes if n.op == OP.CALL_FUNCTION]
+            ) -> None:
+                for n in list(gm.graph.nodes):
+                    if n.op == OP.CALL_FUNCTION:
+                        region_gm = _extract_subgraph(gm, {n})
 
-            def wrap_region(self, region_gm: fx.GraphModule) -> Any:
-                def wrapped(*args: Any) -> Any:
-                    return region_gm(*args)
+                        def wrapped(*args: Any, _gm: Any = region_gm) -> Any:
+                            return _gm(*args)
 
-                return wrapped
+                        _replace_region(gm, {n}, wrapped)
 
         model = SimpleMLP()
         x = torch.randn(4, 50)
@@ -504,20 +518,14 @@ class TestApplyRegionTransforms(unittest.TestCase):
         roots = _find_forward_roots(called)
 
         class DummyTransform(RegionTransform):
-            def detect_regions(
+            def transform_graph(
                 self,
                 gm: fx.GraphModule,
                 called_modules: OrderedDict[str, tuple[nn.Module, tuple[Any, ...]]],
-            ) -> list[set[fx.Node]]:
-                return [{n} for n in gm.graph.nodes if n.op == OP.CALL_FUNCTION]
+            ) -> None:
+                pass
 
-            def wrap_region(self, region_gm: fx.GraphModule) -> Any:
-                def wrapped(*args: Any) -> Any:
-                    return region_gm(*args)
-
-                return wrapped
-
-        # Capture a reference to the original forward before entering context.
+        original_forward_fn = type(model).forward
         original_forward = model.forward
 
         with ExitStack() as stack:
@@ -527,11 +535,14 @@ class TestApplyRegionTransforms(unittest.TestCase):
                         root_mod, fake_args, called, [DummyTransform()], fake_mode
                     )
                 )
-            # Inside the context, forward should be replaced.
             self.assertNotEqual(model.forward, original_forward)
 
-        # After exit, original class forward is accessible again.
-        # Verify the model produces correct output (forward restored).
+        # After exit, the patched forward must be removed and the original
+        # class method must be reachable again.
+        self.assertIs(
+            model.forward.__func__,  # pyre-fixme[16]
+            original_forward_fn,
+        )
         result = model(x)
         self.assertEqual(result.shape, torch.Size([4, 8]))
 
@@ -550,7 +561,6 @@ class TestApplyRegionTransforms(unittest.TestCase):
                 stack.enter_context(
                     _apply_region_transforms(root_mod, fake_args, called, [], fake_mode)
                 )
-            # forward should not be replaced when transforms list is empty.
             self.assertIs(
                 model.forward.__func__,  # pyre-fixme[16]
                 original_forward_fn,
@@ -558,26 +568,25 @@ class TestApplyRegionTransforms(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# Unit tests: RegatherTransform wrap_region
+# Unit tests: RegatherTransform._wrap_checkpoint
 # ---------------------------------------------------------------------------
 
 
-class TestRegatherTransformWrapRegion(unittest.TestCase):
-    def test_wrap_produces_correct_forward(self) -> None:
+class TestRegatherTransformCheckpoint(unittest.TestCase):
+    def test_checkpoint_produces_correct_forward(self) -> None:
         """Checkpoint-wrapped region should produce correct output."""
         g = fx.Graph()
         ph = g.placeholder("x")
         g.output(ph)
         identity_gm = fx.GraphModule(nn.Module(), g)
 
-        transform = RegatherTransform()
-        wrapped_fn = transform.wrap_region(identity_gm)
+        wrapped_fn = RegatherTransform._wrap_checkpoint(identity_gm)
 
         x = torch.randn(4, 8, requires_grad=True)
         result = wrapped_fn(x)
         self.assertEqual(result.shape, x.shape)
 
-    def test_wrap_backward_produces_gradient(self) -> None:
+    def test_checkpoint_backward_produces_gradient(self) -> None:
         """Checkpoint-wrapped region should produce valid gradients in backward."""
         g = fx.Graph()
         ph = g.placeholder("x")
@@ -585,8 +594,7 @@ class TestRegatherTransformWrapRegion(unittest.TestCase):
         g.output(mul_node)
         scale_gm = fx.GraphModule(nn.Module(), g)
 
-        transform = RegatherTransform()
-        wrapped_fn = transform.wrap_region(scale_gm)
+        wrapped_fn = RegatherTransform._wrap_checkpoint(scale_gm)
 
         x = torch.randn(4, 8, requires_grad=True)
         result = wrapped_fn(x)
@@ -598,11 +606,11 @@ class TestRegatherTransformWrapRegion(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# Unit tests: RecomputeTransform wrap_region
+# Unit tests: RecomputeTransform._wrap_checkpoint
 # ---------------------------------------------------------------------------
 
 
-class TestRecomputeTransformWrapRegion(unittest.TestCase):
+class TestRecomputeTransformCheckpoint(unittest.TestCase):
     def test_recompute_forward_correct(self) -> None:
         g = fx.Graph()
         ph = g.placeholder("x")
@@ -610,8 +618,7 @@ class TestRecomputeTransformWrapRegion(unittest.TestCase):
         g.output(relu_node)
         relu_gm = fx.GraphModule(nn.Module(), g)
 
-        transform = RecomputeTransform(submodule_fqns=set())
-        wrapped_fn = transform.wrap_region(relu_gm)
+        wrapped_fn = RecomputeTransform._wrap_checkpoint(relu_gm)
 
         x = torch.randn(4, 8)
         expected = torch.relu(x)
@@ -625,8 +632,7 @@ class TestRecomputeTransformWrapRegion(unittest.TestCase):
         g.output(relu_node)
         relu_gm = fx.GraphModule(nn.Module(), g)
 
-        transform = RecomputeTransform(submodule_fqns=set())
-        wrapped_fn = transform.wrap_region(relu_gm)
+        wrapped_fn = RecomputeTransform._wrap_checkpoint(relu_gm)
 
         x = torch.randn(4, 8, requires_grad=True)
         result = wrapped_fn(x)
@@ -653,44 +659,20 @@ class TestTransformOrdering(unittest.TestCase):
         call_order: list[str] = []
 
         class TrackingTransformA(RegionTransform):
-            def detect_regions(
+            def transform_graph(
                 self,
                 gm: fx.GraphModule,
                 called_modules: OrderedDict[str, tuple[nn.Module, tuple[Any, ...]]],
-            ) -> list[set[fx.Node]]:
-                call_order.append("detect_A")
-                for n in gm.graph.nodes:
-                    if n.op == OP.CALL_FUNCTION:
-                        return [{n}]
-                return []
-
-            def wrap_region(self, region_gm: fx.GraphModule) -> Any:
-                call_order.append("wrap_A")
-
-                def wrapped(*args: Any) -> Any:
-                    return region_gm(*args)
-
-                return wrapped
+            ) -> None:
+                call_order.append("transform_A")
 
         class TrackingTransformB(RegionTransform):
-            def detect_regions(
+            def transform_graph(
                 self,
                 gm: fx.GraphModule,
                 called_modules: OrderedDict[str, tuple[nn.Module, tuple[Any, ...]]],
-            ) -> list[set[fx.Node]]:
-                call_order.append("detect_B")
-                for n in gm.graph.nodes:
-                    if n.op == OP.CALL_FUNCTION:
-                        return [{n}]
-                return []
-
-            def wrap_region(self, region_gm: fx.GraphModule) -> Any:
-                call_order.append("wrap_B")
-
-                def wrapped(*args: Any) -> Any:
-                    return region_gm(*args)
-
-                return wrapped
+            ) -> None:
+                call_order.append("transform_B")
 
         model = SimpleMLP()
         fake_mode = _make_fake_mode()
@@ -712,7 +694,7 @@ class TestTransformOrdering(unittest.TestCase):
                     )
                 )
 
-        self.assertEqual(call_order, ["detect_A", "wrap_A", "detect_B", "wrap_B"])
+        self.assertEqual(call_order, ["transform_A", "transform_B"])
 
 
 # ---------------------------------------------------------------------------
@@ -1003,15 +985,12 @@ class TestApplyRegionTransformsWithLeaves(unittest.TestCase):
         roots = _find_forward_roots(called)
 
         class IdentityTransform(RegionTransform):
-            def detect_regions(
+            def transform_graph(
                 self,
                 gm: fx.GraphModule,
                 called_modules: OrderedDict[str, tuple[nn.Module, tuple[Any, ...]]],
-            ) -> list[set[fx.Node]]:
-                return []
-
-            def wrap_region(self, region_gm: fx.GraphModule) -> Any:
-                return region_gm
+            ) -> None:
+                pass
 
         with ExitStack() as stack:
             for _fqn, root_mod, fake_args in roots:
