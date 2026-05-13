@@ -67,6 +67,33 @@ _PAD_ID_STRIDE: int = 1_000_000
 
 
 # ---------------------------------------------------------------------------
+# Public helper for compile-time consumers (override builders, override-batch
+# resizers) that need the same post-pad sizes that ``_discover`` will pick at
+# trace time.  Centralizing the formula keeps those call sites from drifting.
+# ---------------------------------------------------------------------------
+
+
+def compute_padded_shape(
+    size: int,
+    num_devices: int,
+    *,
+    must_be_strictly_greater: bool = True,
+) -> int:
+    """Round *size* up to a multiple of *num_devices*.
+
+    When ``must_be_strictly_greater`` is True (default), bumps the result by
+    ``num_devices`` if *size* is already aligned, guaranteeing at least one
+    slot of headroom.  ``pad_jagged_lengths`` and ``pad_count_to_sum`` need
+    at least one dummy slot to absorb budget deficits, so the jagged path
+    always requires strict-greater.
+    """
+    padded = int(math.ceil(size / num_devices)) * num_devices
+    if padded == size and must_be_strictly_greater:
+        padded += num_devices
+    return padded
+
+
+# ---------------------------------------------------------------------------
 # Custom ops
 # ---------------------------------------------------------------------------
 
@@ -697,9 +724,9 @@ class PaddingRegionTransform(RegionTransform):
 
         batch_size = tensors[self.batch_size_arg_idx].shape[dim]
         layout.batch_size = batch_size
-        padded_bs = int(math.ceil(batch_size / nd)) * nd
-        if padded_bs == batch_size and self._resolved_pairs:
-            padded_bs += nd
+        padded_bs = compute_padded_shape(
+            batch_size, nd, must_be_strictly_greater=bool(self._resolved_pairs)
+        )
         layout.padded_bs = padded_bs
 
         jagged_indices: set[int] = set()
@@ -716,9 +743,7 @@ class PaddingRegionTransform(RegionTransform):
                 pair_bs = batch_size * max_count
             else:
                 pair_bs = batch_size
-            pair_padded_bs = int(math.ceil(pair_bs / nd)) * nd
-            if pair_padded_bs == pair_bs:
-                pair_padded_bs += nd
+            pair_padded_bs = compute_padded_shape(pair_bs, nd)
             # num_keys is derived from the actual lengths tensor shape at trace time
             actual_pair_bs = (
                 tensors[bs_idx].shape[dim] if bs_idx is not None else batch_size

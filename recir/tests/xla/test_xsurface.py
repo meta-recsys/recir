@@ -22,7 +22,6 @@ if "xla_force_host_platform_device_count" not in _existing_xla_flags:
         _existing_xla_flags + " --xla_force_host_platform_device_count=2"
     ).strip()
 
-import dataclasses
 import unittest
 from typing import Any, Dict, Tuple
 
@@ -38,6 +37,11 @@ from recir.distributed.parallel_mode import GSPMDParallel
 from recir.gm_transformation import GraphModuleTransformation
 from recir.lowering.fbgemm_fallback import _batched_complete_cumsum_impl
 from recir.lowering.xla_lower import _XLAModule
+from recir.region_transforms.padding import (
+    compute_padded_shape,
+    JaggedPairConfig,
+    PaddingRegionTransform,
+)
 from recir.tests.xla.gspmd_test_utils import assert_hlo_has_collective
 from recir.tests.xla.xsurface_test_utils import (
     _build_full_model,
@@ -45,10 +49,12 @@ from recir.tests.xla.xsurface_test_utils import (
     _create_random_train_batch,
     _make_sample_input,
     _verify_traced_graph,
+    resize_batch_inplace,
     TEST_BATCH_SIZE,
+    TEST_MAX_UIH_SEQ_LEN,
+    TEST_NUM_CANDIDATES,
 )
 from torch._subclasses.fake_tensor import FakeTensorMode
-from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
 # Register gr.batched_complete_cumsum decomposition for XLA lowering.
 SPMD_DECOMP_TABLE[torch.ops.gr.batched_complete_cumsum.default] = (
@@ -92,22 +98,13 @@ class XSurfaceFakeTracingCompatTest(unittest.TestCase):
         # Generate a random training batch for the full model inputs.
         batch = _create_random_train_batch(feature_config, device)
 
-        # Decompose KJTs into plain tensors so make_fx does not try to
-        # unflatten PH sentinels through KeyedJaggedTensor.__init__.
+        # Decompose KJTs into plain tensors for _local_compile.
         ro_kjt = batch.ro_id_list_features
-        ro_kjt_keys = ro_kjt.keys()
-        ro_kjt_values = ro_kjt.values()
-        ro_kjt_lengths = ro_kjt.lengths()
-
         nro_kjt = batch.nro_id_list_features
-        nro_kjt_keys = nro_kjt.keys()
-        nro_kjt_values = nro_kjt.values()
-        nro_kjt_lengths = nro_kjt.lengths()
-
         unary_kjt = batch.unary_features
-        unary_kjt_keys = unary_kjt.keys()  # pyre-ignore
-        unary_kjt_values = unary_kjt.values()  # pyre-ignore
-        unary_kjt_lengths = unary_kjt.lengths()  # pyre-ignore
+        assert unary_kjt is not None
+
+        model.set_recir_kjt_keys(ro_kjt.keys(), nro_kjt.keys(), unary_kjt.keys())
 
         # pyre-ignore
         def forward_fn(
@@ -121,39 +118,24 @@ class XSurfaceFakeTracingCompatTest(unittest.TestCase):
             unary_values: torch.Tensor,
             unary_lengths: torch.Tensor,
             num_candidates: torch.Tensor,
+            supervision_label_t: torch.Tensor,
+            supervision_weight_t: torch.Tensor,
             all_labels: Dict[str, torch.Tensor],
-            supervision_weight: torch.Tensor,
         ) -> Tuple[torch.Tensor, torch.Tensor]:
-            ro_id_list_features = KeyedJaggedTensor(
-                keys=ro_kjt_keys,
-                values=ro_id_list_values,
-                lengths=ro_id_list_lengths,
+            logits, named_tensors = mod(
+                ro_float_features,
+                nro_float_features,
+                ro_id_list_values,
+                ro_id_list_lengths,
+                nro_id_list_values,
+                nro_id_list_lengths,
+                unary_values,
+                unary_lengths,
+                num_candidates,
+                supervision_label_t,
+                supervision_weight_t,
+                all_labels,
             )
-            nro_id_list_features = KeyedJaggedTensor(
-                keys=nro_kjt_keys,
-                values=nro_id_list_values,
-                lengths=nro_id_list_lengths,
-            )
-            unary_features = KeyedJaggedTensor(
-                keys=unary_kjt_keys,
-                values=unary_values,
-                lengths=unary_lengths,
-            )
-            # The post-refactor model exposes only forward(batch); rebuild
-            # the batch from dynamic tensors and reuse the captured ``batch``
-            # for the remaining (static) fields like supervision_label.
-            new_batch = dataclasses.replace(
-                batch,
-                ro_float_features=ro_float_features,
-                nro_float_features=nro_float_features,
-                ro_id_list_features=ro_id_list_features,
-                nro_id_list_features=nro_id_list_features,
-                unary_features=unary_features,
-                num_candidates=num_candidates,
-                all_labels=all_labels,
-                supervision_weight=supervision_weight,
-            )
-            logits, named_tensors = mod.forward(new_batch)
             predictions = named_tensors["prediction"]
             return logits, predictions
 
@@ -167,15 +149,16 @@ class XSurfaceFakeTracingCompatTest(unittest.TestCase):
             model,
             batch.ro_float_features,
             batch.nro_float_features,
-            ro_kjt_values,
-            ro_kjt_lengths,
-            nro_kjt_values,
-            nro_kjt_lengths,
-            unary_kjt_values,
-            unary_kjt_lengths,
+            ro_kjt.values(),
+            ro_kjt.lengths(),
+            nro_kjt.values(),
+            nro_kjt.lengths(),
+            unary_kjt.values(),
+            unary_kjt.lengths(),
             batch.num_candidates,
+            batch.supervision_label.t().contiguous(),
+            batch.supervision_weight.t().contiguous(),
             batch.all_labels,
-            batch.supervision_weight,
             fake_mode=fake_mode,
         )
         _verify_traced_graph(self, result.gm)
@@ -194,7 +177,7 @@ class TestXSurfaceXLACompile(unittest.TestCase):
         self.num_ranks: int = len(self.devices)
 
     def _build_compiled_train_step(
-        self, num_steps: int = 1
+        self, num_steps: int = 1, use_padding: bool = False
     ) -> Tuple[Any, BlueReelsVDDTrainV3]:
         """Build the model, compile with XLA GSPMD, and run num_steps."""
         torch.manual_seed(42)
@@ -206,27 +189,52 @@ class TestXSurfaceXLACompile(unittest.TestCase):
             if p.is_floating_point():
                 p.requires_grad_(True)
 
-        _, ro_keys, nro_keys = _make_sample_input(
-            model.recblock, device, batch_size=global_bs
-        )
+        # When padding is enabled, build the override at the post-pad
+        # shapes PaddingRegionTransform feeds into the overridden sparse
+        # arch.  Use the same formulas as ``_discover``: padded_bs is the
+        # post-pad B_RO; pair_padded_bs is the post-pad B_NRO computed
+        # from the trace-time batch's actual jagged B_NRO.  We synthesize
+        # the override batch by resizing a fresh small batch up to those
+        # post-pad sizes, avoiding a second large-batch ``RandomDataPipe``
+        # call that can SIGABRT in its C++ allocator.  Mirrors
+        # ``_build_compiled_train_step`` in
+        # ``recir/examples/rankfm/train.py``.
         batch = _create_random_train_batch(
             feature_config,
             device,
             batch_size=global_bs,
-            ro_kjt_keys=ro_keys,
-            nro_kjt_keys=nro_keys,
         )
-        all_labels = batch.all_labels
-        assert all_labels is not None
+        if use_padding:
+            nd = self.num_ranks
+            padded_bs = compute_padded_shape(global_bs, nd)
+            # Trace-time B_NRO comes from the actual (jagged) batch.
+            trace_pair_bs = batch.nro_float_features.shape[0]
+            pair_padded_bs = compute_padded_shape(trace_pair_bs, nd)
+            override_bs = padded_bs
+            override_batch = _create_random_train_batch(
+                feature_config,
+                device,
+                batch_size=global_bs,
+            )
+            resize_batch_inplace(
+                override_batch,
+                target_b_ro=padded_bs,
+                target_b_nro=pair_padded_bs,
+            )
+        else:
+            override_bs = global_bs
+            override_batch = batch
+        override_all_labels = override_batch.all_labels
+        assert override_all_labels is not None
         batch_sample = _inputs_to_feature_bundle(
-            batch.ro_id_list_features,
+            override_batch.ro_id_list_features,
             None,
-            batch.nro_id_list_features,
-            batch.num_candidates,
-            all_labels,
+            override_batch.nro_id_list_features,
+            override_batch.num_candidates,
+            override_all_labels,
         )
         overrides = _build_overrides(
-            model.recblock, batch_sample, device, batch_size=global_bs
+            model.recblock, batch_sample, device, batch_size=override_bs
         )
 
         ro_kjt = batch.ro_id_list_features
@@ -247,22 +255,64 @@ class TestXSurfaceXLACompile(unittest.TestCase):
 
         opt = torch.optim.SGD(model.parameters(), lr=0.01, foreach=False)
 
-        @compile(
-            module_override=overrides,
-            parallel_mode=GSPMDParallel(
+        base_gm_transform = GraphModuleTransformation(
+            backend=BackendType.XLA_GSPMD,
+            enable_device_state=True,
+        )
+
+        compile_kwargs: dict[str, Any] = {
+            "module_override": overrides,
+            "parallel_mode": GSPMDParallel(
                 "replicate",
                 loss_reduction="sum",
                 num_ranks=self.num_ranks,
                 num_processes=1,
             ),
-            # pyre-ignore[6]
-            gm_transformation=GraphModuleTransformation(
-                backend=BackendType.XLA_GSPMD,
-                enable_device_state=True,
-            ),
-        )
+            "gm_transformation": base_gm_transform,
+        }
+
+        # Store KJT keys so the model's forward can construct KJTs
+        # from the raw tensor inputs.
+        model.set_recir_kjt_keys(ro_kjt_keys, nro_kjt_keys, unary_kjt_keys)
+
+        if use_padding:
+            module_config = model.module_config
+            contextual_budgets = dict(module_config.contextual_feature_to_max_length)
+            history_budget = TEST_MAX_UIH_SEQ_LEN
+
+            ro_per_sample = [
+                contextual_budgets.get(key, history_budget) for key in ro_kjt_keys
+            ]
+
+            padding_transform = PaddingRegionTransform(
+                jagged_pairs={
+                    "ro_id_list_values": JaggedPairConfig(
+                        "ro_id_list_lengths",
+                        per_sample_budgets=ro_per_sample,
+                    ),
+                    "nro_id_list_values": JaggedPairConfig(
+                        "nro_id_list_lengths",
+                        per_sample_budgets=1,
+                        batch_size_arg="nro_float_features",
+                        count_arg="num_candidates",
+                        max_per_sample_count=TEST_NUM_CANDIDATES,
+                    ),
+                    "unary_values": JaggedPairConfig(
+                        "unary_lengths",
+                        per_sample_budgets=1,
+                        batch_size_arg="nro_float_features",
+                        count_arg="num_candidates",
+                        max_per_sample_count=TEST_NUM_CANDIDATES,
+                    ),
+                },
+                batch_size_arg="ro_float_features",
+                num_devices=self.num_ranks,
+                num_processes=1,
+            )
+            compile_kwargs["region_transforms"] = [padding_transform]
+
         # pyre-ignore
-        def train_step(
+        def train_step_fn(
             mod: nn.Module,
             opt: torch.optim.Optimizer,
             ro_float_features: torch.Tensor,
@@ -274,44 +324,29 @@ class TestXSurfaceXLACompile(unittest.TestCase):
             unary_values: torch.Tensor,
             unary_lengths: torch.Tensor,
             num_candidates: torch.Tensor,
-            # supervision_{label,weight} are passed as (B_NRO, T) so dim-0
-            # is the batch dim and divides evenly across num_ranks. The model
-            # expects (T, B_NRO), so we transpose back inside.
             supervision_label_t: torch.Tensor,
             supervision_weight_t: torch.Tensor,
             all_labels: Dict[str, torch.Tensor],
         ) -> None:
-            ro_id_list_features = KeyedJaggedTensor(
-                keys=ro_kjt_keys,
-                values=ro_id_list_values,
-                lengths=ro_id_list_lengths,
+            all_losses, _ = mod(
+                ro_float_features,
+                nro_float_features,
+                ro_id_list_values,
+                ro_id_list_lengths,
+                nro_id_list_values,
+                nro_id_list_lengths,
+                unary_values,
+                unary_lengths,
+                num_candidates,
+                supervision_label_t,
+                supervision_weight_t,
+                all_labels,
             )
-            nro_id_list_features = KeyedJaggedTensor(
-                keys=nro_kjt_keys,
-                values=nro_id_list_values,
-                lengths=nro_id_list_lengths,
-            )
-            unary_features = KeyedJaggedTensor(
-                keys=unary_kjt_keys,
-                values=unary_values,
-                lengths=unary_lengths,
-            )
-            new_batch = dataclasses.replace(
-                batch,
-                ro_float_features=ro_float_features,
-                nro_float_features=nro_float_features,
-                ro_id_list_features=ro_id_list_features,
-                nro_id_list_features=nro_id_list_features,
-                unary_features=unary_features,
-                num_candidates=num_candidates,
-                all_labels=all_labels,
-                supervision_label=supervision_label_t.t().contiguous(),
-                supervision_weight=supervision_weight_t.t().contiguous(),
-            )
-            all_losses, _ = mod.forward(new_batch)  # pyre-ignore[29]
             loss: torch.Tensor = all_losses.sum()
             loss.backward()
             opt.step()
+
+        train_step = compile(**compile_kwargs)(train_step_fn)  # pyre-ignore[6]
 
         for _ in range(num_steps):
             train_step(
@@ -356,6 +391,11 @@ class TestXSurfaceXLACompile(unittest.TestCase):
         """Verify the compiled HLO contains all-reduce for GSPMD."""
         compiled_obj, _ = self._build_compiled_train_step()
         assert_hlo_has_collective(self, compiled_obj, "all-reduce", "XLA_GSPMD")
+
+    def test_xsurface_compiles_with_padding(self) -> None:
+        """Verify XLA GSPMD compilation works with PaddingRegionTransform."""
+        compiled_obj, _ = self._build_compiled_train_step(use_padding=True)
+        self.assertIsNotNone(compiled_obj)
 
     def test_xsurface_params_change_after_training(self) -> None:
         """Verify parameters actually change after training (not frozen)."""

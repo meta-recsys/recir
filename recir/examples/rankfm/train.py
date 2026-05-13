@@ -20,7 +20,7 @@ Usage:
 
 from __future__ import annotations
 
-import dataclasses
+import copy
 import logging
 import os
 import time
@@ -39,11 +39,16 @@ from recir.decompositions import SPMD_DECOMP_TABLE
 from recir.distributed.parallel_mode import GSPMDParallel
 from recir.gm_transformation import GraphModuleTransformation
 from recir.lowering.fbgemm_fallback import _batched_complete_cumsum_impl
+from recir.region_transforms.padding import (
+    compute_padded_shape,
+    JaggedPairConfig,
+    PaddingRegionTransform,
+)
 from recir.tests.xla.xsurface_test_utils import (
     _build_full_model,
     _build_overrides,
     _create_random_train_batch,
-    _make_sample_input,
+    resize_batch_inplace,
     TestConfigProvider,
 )
 from torchrec.distributed.embedding import EmbeddingCollectionSharder
@@ -54,7 +59,6 @@ from torchrec.distributed.planner.types import ParameterConstraints
 from torchrec.distributed.types import ShardingEnv, ShardingType
 from torchrec.optim.keyed import KeyedOptimizerWrapper
 from torchrec.optim.optimizers import in_backward_optimizer_filter
-from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
 from .config import RankFMConfig
 
@@ -298,6 +302,35 @@ def _patch_test_config_provider(cfg: RankFMConfig) -> None:
     TestConfigProvider.create_config = _patched_create_config
 
 
+def _create_uniform_batch(
+    feature_config: Any,
+    device: torch.device,
+    batch_size: int,
+) -> Any:
+    """Create a batch with uniform (non-jagged) shapes.
+
+    Uses RandomDataSourceConfig (non-ROO) so every sample has exactly
+    feature_config.num_candidates_per_request candidates and
+    feature_config.history_len history items.  This ensures B_NRO =
+    batch_size * C, which stays consistent after GSPMD tiling.
+    """
+    from minimal_viable_ai.core.dataloader.dataloader import RandomDataPipe
+    from minimal_viable_ai.core.dataloader.dataloader_configs import (
+        RandomDataSourceConfig,
+    )
+
+    pipe = RandomDataPipe(
+        feature_config=feature_config,
+        data_source_config=RandomDataSourceConfig(
+            batch_size=batch_size,
+            num_batches=1,
+            num_generate=1,
+            pin_memory=False,
+        ),
+    )
+    return next(iter(pipe)).to(device, non_blocking=False)
+
+
 def _build_compiled_train_step(
     cfg: RankFMConfig,
     num_ranks: int,
@@ -307,62 +340,85 @@ def _build_compiled_train_step(
 ) -> Tuple[Any, Any, Any, Any, Any]:
     """Build model, batch, overrides, and the compiled train_step.
 
-    Returns (train_step, model, opt, batch, kjt_keys_tuple).
+    Returns (train_step, model, opt, batch, feature_config).
     """
     device = torch.device("cpu")
     model, feature_config = _build_full_model(device)
+
+    # Sync feature_config with the test constants so randgen produces
+    # shapes that match the padding budgets and override expectations.
+    feature_config.history_len = cfg.max_uih_seq_len
+    feature_config.num_candidates_per_request = cfg.num_candidates
 
     for p in model.parameters():
         if p.is_floating_point():
             p.requires_grad_(True)
 
-    # Sample input + batch must be built BEFORE DMP because _build_overrides
-    # walks the recblock and registers forward hooks; doing this against the
-    # post-DMP module is fine but cleanest before sharding.
+    module_config = model.module_config  # pyre-ignore[16]
+
     torch.manual_seed(0)
-    _, ro_keys, nro_keys = _make_sample_input(
-        model.recblock, device, batch_size=cfg.local_batch_size
-    )
-    batch = _create_random_train_batch(
+    batch = _create_uniform_batch(
         feature_config,
         device,
         batch_size=cfg.local_batch_size,
-        ro_kjt_keys=ro_keys,
-        nro_kjt_keys=nro_keys,
     )
 
-    # Build overrides BEFORE DMP. _build_overrides runs the sparse arch
-    # eagerly and captures its output via a forward hook; that captured
-    # tensor becomes the SparseArchOverride dummy used during XLA tracing.
-    expanded_batch = _create_random_train_batch(
-        feature_config,
-        device,
-        batch_size=global_bs,
-        ro_kjt_keys=ro_keys,
-        nro_kjt_keys=nro_keys,
-    )
-    all_labels = expanded_batch.all_labels
-    assert all_labels is not None
-    batch_sample = _inputs_to_feature_bundle(
-        expanded_batch.ro_id_list_features,
-        None,
-        expanded_batch.nro_id_list_features,
-        expanded_batch.num_candidates,
-        all_labels,
-    )
+    if cfg.enable_padding:
+        # Pre-compute padded_bs and pair_padded_bs using the SAME formula as
+        # PaddingRegionTransform's ``_discover``.  The override-built sample
+        # batch must already be at the post-pad sizes, otherwise the cached
+        # sparse-arch output won't dim-match the runtime-padded forward path
+        # (cat fails downstream in ``_forward_post_hstu``).
+        nd = num_ranks
+        padded_bs = compute_padded_shape(global_bs, nd)
+        # nro pair has its own batch dim (B_NRO != B_RO).  At trace time
+        # B_NRO = global_bs * num_candidates_per_request (uniform)
+        trace_pair_bs = global_bs * cfg.num_candidates
+        pair_padded_bs = compute_padded_shape(trace_pair_bs, nd)
+
+        # Override-build batch must be at the post-pad sizes so the cached
+        # sparse-arch output dim-matches the runtime-padded forward path.
+        # Build it by deep-copying the small runtime batch and resizing in
+        # place; calling ``_create_uniform_batch(batch_size=padded_bs)``
+        # directly can SIGABRT inside ``RandomDataPipe``'s C++ allocator at
+        # large ``batch_size * num_candidates_per_request * history_len``.
+        expanded_batch = copy.deepcopy(batch)
+        resize_batch_inplace(
+            expanded_batch,
+            target_b_ro=padded_bs,
+            target_b_nro=pair_padded_bs,
+        )
+        all_labels = expanded_batch.all_labels
+        assert all_labels is not None
+        override_batch_sample = _inputs_to_feature_bundle(
+            expanded_batch.ro_id_list_features,
+            None,
+            expanded_batch.nro_id_list_features,
+            expanded_batch.num_candidates,
+            all_labels,
+        )
+        override_bs = padded_bs
+    else:
+        all_labels = batch.all_labels
+        assert all_labels is not None
+        override_batch_sample = _inputs_to_feature_bundle(
+            batch.ro_id_list_features,
+            None,
+            batch.nro_id_list_features,
+            batch.num_candidates,
+            all_labels,
+        )
+        override_bs = global_bs
+
     recblock = model.recblock
     assert isinstance(recblock, RecBlock)
     overrides = _build_overrides(
         recblock,
-        batch_sample,
+        override_batch_sample,
         device,
-        batch_size=global_bs,
+        batch_size=override_bs,
     )
-
-    # Apply gloo + DMP for ROW_WISE embedding sharding. After this call,
-    # model.recblock.tokenizer_stack.mot_sparse_arch._sparse_arch is still
-    # an _ECSparseArch (so SparseArchOverride.replacement matches via
-    # isinstance), but the EmbeddingCollection inside is sharded.
+    # Apply gloo + DMP for ROW_WISE embedding sharding.
     model, dense_opt = setup_dmp(model, cfg, gloo_world)
 
     # Capture KJT keys for the runtime reconstruction inside train_step.
@@ -376,20 +432,59 @@ def _build_compiled_train_step(
 
     opt = dense_opt
 
-    @compile(
-        module_override=overrides,
-        parallel_mode=GSPMDParallel(
+    model.set_recir_kjt_keys(  # pyre-ignore[29]
+        ro_kjt_keys, nro_kjt_keys, unary_kjt_keys
+    )
+
+    compile_kwargs: Dict[str, Any] = {
+        "module_override": overrides,
+        "parallel_mode": GSPMDParallel(
             "replicate",
             loss_reduction="sum",
             num_ranks=num_ranks,
             num_processes=num_processes,
         ),
-        # pyre-ignore[6]: GraphModuleTransformation is callable
-        gm_transformation=GraphModuleTransformation(
+        "gm_transformation": GraphModuleTransformation(
             backend=BackendType.XLA_GSPMD,
             enable_device_state=True,
         ),
-    )
+    }
+
+    if cfg.enable_padding:
+        contextual_budgets = dict(module_config.contextual_feature_to_max_length)
+        history_budget = cfg.max_uih_seq_len
+        ro_per_sample = [
+            contextual_budgets.get(key, history_budget) for key in ro_kjt_keys
+        ]
+        compile_kwargs["region_transforms"] = [
+            PaddingRegionTransform(
+                jagged_pairs={
+                    "ro_id_list_values": JaggedPairConfig(
+                        "ro_id_list_lengths",
+                        per_sample_budgets=ro_per_sample,
+                    ),
+                    "nro_id_list_values": JaggedPairConfig(
+                        "nro_id_list_lengths",
+                        per_sample_budgets=1,
+                        batch_size_arg="nro_float_features",
+                        count_arg="num_candidates",
+                        max_per_sample_count=cfg.num_candidates,
+                    ),
+                    "unary_values": JaggedPairConfig(
+                        "unary_lengths",
+                        per_sample_budgets=1,
+                        batch_size_arg="nro_float_features",
+                        count_arg="num_candidates",
+                        max_per_sample_count=cfg.num_candidates,
+                    ),
+                },
+                batch_size_arg="ro_float_features",
+                num_devices=num_ranks,
+                num_processes=num_processes,
+            ),
+        ]
+
+    @compile(**compile_kwargs)  # pyre-ignore[6]
     # pyre-ignore
     def train_step(
         mod: nn.Module,
@@ -403,47 +498,29 @@ def _build_compiled_train_step(
         unary_values: torch.Tensor,
         unary_lengths: torch.Tensor,
         num_candidates: torch.Tensor,
-        # supervision_{label,weight} are passed as (B_NRO, T) so dim-0
-        # is the batch dim and divides evenly across num_ranks. The model
-        # expects (T, B_NRO), so we transpose back inside.
         supervision_label_t: torch.Tensor,
         supervision_weight_t: torch.Tensor,
         all_labels: Dict[str, torch.Tensor],
     ) -> None:
-        ro_id_list_features = KeyedJaggedTensor(
-            keys=ro_kjt_keys,
-            values=ro_id_list_values,
-            lengths=ro_id_list_lengths,
+        all_losses, _ = mod(
+            ro_float_features,
+            nro_float_features,
+            ro_id_list_values,
+            ro_id_list_lengths,
+            nro_id_list_values,
+            nro_id_list_lengths,
+            unary_values,
+            unary_lengths,
+            num_candidates,
+            supervision_label_t,
+            supervision_weight_t,
+            all_labels,
         )
-        nro_id_list_features = KeyedJaggedTensor(
-            keys=nro_kjt_keys,
-            values=nro_id_list_values,
-            lengths=nro_id_list_lengths,
-        )
-        unary_features = KeyedJaggedTensor(
-            keys=unary_kjt_keys,
-            values=unary_values,
-            lengths=unary_lengths,
-        )
-        new_batch = dataclasses.replace(
-            batch,
-            ro_float_features=ro_float_features,
-            nro_float_features=nro_float_features,
-            ro_id_list_features=ro_id_list_features,
-            nro_id_list_features=nro_id_list_features,
-            unary_features=unary_features,
-            num_candidates=num_candidates,
-            all_labels=all_labels,
-            supervision_label=supervision_label_t.t().contiguous(),
-            supervision_weight=supervision_weight_t.t().contiguous(),
-        )
-        all_losses, _ = mod.forward(new_batch)  # pyre-ignore[29]
         loss: torch.Tensor = all_losses.sum()
         loss.backward()
         opt.step()
 
-    kjt_keys_tuple = (ro_kjt_keys, nro_kjt_keys, unary_kjt_keys)
-    return train_step, model, opt, batch, kjt_keys_tuple
+    return train_step, model, opt, batch, feature_config
 
 
 def _is_jax_profiling_enabled(cfg: RankFMConfig) -> bool:
@@ -469,6 +546,70 @@ def _log_hbm_memory() -> None:
             )
 
 
+def _extract_train_step_args(
+    batch: Any,
+) -> Tuple[Any, ...]:
+    """Extract raw tensor args from a batch for the train step."""
+    ro_kjt = batch.ro_id_list_features
+    nro_kjt = batch.nro_id_list_features
+    unary_kjt = batch.unary_features
+    assert unary_kjt is not None
+    return (
+        batch.ro_float_features,
+        batch.nro_float_features,
+        ro_kjt.values(),
+        ro_kjt.lengths(),
+        nro_kjt.values(),
+        nro_kjt.lengths(),
+        unary_kjt.values(),
+        unary_kjt.lengths(),
+        batch.num_candidates,
+        batch.supervision_label.t().contiguous(),
+        batch.supervision_weight.t().contiguous(),
+        batch.all_labels,
+    )
+
+
+def _log_per_key_stats(name: str, kjt: Any, B: int) -> str:
+    """Format per-key length stats for a KJT."""
+    keys = kjt.keys()
+    lengths = kjt.lengths()
+    num_keys = len(keys)
+    per_key = lengths.reshape(num_keys, B)
+    parts: List[str] = []
+    for i, key in enumerate(keys):
+        kl = per_key[i]
+        total = int(kl.sum())
+        mn = int(kl.min())
+        mx = int(kl.max())
+        if mn == mx:
+            parts.append(f"{key}:{mn}x{B}={total}")
+        else:
+            parts.append(f"{key}:[{mn}-{mx}]sum={total}")
+    return f"{name}({num_keys} keys): " + ", ".join(parts)
+
+
+def _log_batch_info(step: int, batch: Any) -> None:
+    """Log per-step batch shapes and per-key length stats."""
+    nc = batch.num_candidates
+    B = batch.ro_float_features.shape[0]
+    logger.info(
+        f"[BATCH step={step}] B={B} "
+        f"ro_float={list(batch.ro_float_features.shape)} "
+        f"nro_float={list(batch.nro_float_features.shape)} "
+        f"num_candidates sum={int(nc.sum())} min={int(nc.min())} max={int(nc.max())}"
+    )
+    logger.info(
+        f"[BATCH step={step}] %s",
+        _log_per_key_stats("RO", batch.ro_id_list_features, B),
+    )
+    B_NRO = int(nc.sum())
+    logger.info(
+        f"[BATCH step={step}] %s",
+        _log_per_key_stats("NRO", batch.nro_id_list_features, B_NRO),
+    )
+
+
 def _run_training_loop(
     cfg: RankFMConfig,
     train_step: Any,
@@ -477,13 +618,15 @@ def _run_training_loop(
     batch: Any,
     is_main: bool,
     global_bs: int,
+    feature_config: Any = None,
 ) -> None:
-    """Execute the compiled training loop with optional JAX profiling."""
-    ro_kjt = batch.ro_id_list_features
-    nro_kjt = batch.nro_id_list_features
-    unary_kjt = batch.unary_features
-    assert unary_kjt is not None
+    """Execute the compiled training loop with optional JAX profiling.
 
+    When ``cfg.enable_padding`` is True and ``feature_config`` is provided,
+    a fresh random batch is generated each step (with varying jagged
+    shapes). The PaddingRegionTransform pads them to static budgets at
+    runtime.
+    """
     jax_profiling = _is_jax_profiling_enabled(cfg)
     profiling_active = False
     if jax_profiling:
@@ -504,24 +647,20 @@ def _run_training_loop(
             profiling_active = True
             logger.info(f"[PROFILE] Started trace at step {step}")
 
+        if cfg.enable_padding and feature_config is not None and step > 1:
+            torch.manual_seed(step)
+            batch = _create_random_train_batch(
+                feature_config,
+                torch.device("cpu"),
+                batch_size=cfg.local_batch_size,
+            )
+
+        if is_main:
+            _log_batch_info(step, batch)
+
         step_start = time.time()
 
-        train_step(
-            model,
-            opt,
-            batch.ro_float_features,
-            batch.nro_float_features,
-            ro_kjt.values(),
-            ro_kjt.lengths(),
-            nro_kjt.values(),
-            nro_kjt.lengths(),
-            unary_kjt.values(),
-            unary_kjt.lengths(),
-            batch.num_candidates,
-            batch.supervision_label.t().contiguous(),
-            batch.supervision_weight.t().contiguous(),
-            batch.all_labels,
-        )
+        train_step(model, opt, *_extract_train_step_args(batch))
         sync_device_state_to_torch(train_step)
 
         step_time = time.time() - step_start
@@ -572,7 +711,7 @@ def main() -> None:
     # must equal local_batch_size * gloo_world for the override's
     # cached_output (sized at global_bs) to match the expanded trace input.
     global_bs = cfg.local_batch_size * gloo_world
-    train_step, model, opt, batch, _ = _build_compiled_train_step(
+    train_step, model, opt, batch, feature_config = _build_compiled_train_step(
         cfg,
         num_ranks=num_ranks,
         num_processes=gloo_world,
@@ -581,7 +720,16 @@ def main() -> None:
     )
 
     # --- 4. Train ---
-    _run_training_loop(cfg, train_step, model, opt, batch, is_main, global_bs)
+    _run_training_loop(
+        cfg,
+        train_step,
+        model,
+        opt,
+        batch,
+        is_main,
+        global_bs,
+        feature_config=feature_config if cfg.enable_padding else None,
+    )
 
     # Cleanup
     if dist.is_initialized():
