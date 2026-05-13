@@ -2438,7 +2438,7 @@ def _jagged_a2a_embedding_lookup_backward_local(
     return grad_table_acc
 
 
-def jagged_a2a_embedding_lookup_f32_alltc_ringshift(
+def _ringshift_forward_impl(
     local_ids: jax.Array,
     local_id_count: jax.Array,
     local_embedding_table: jax.Array,
@@ -2446,13 +2446,14 @@ def jagged_a2a_embedding_lookup_f32_alltc_ringshift(
     mesh: jax.sharding.Mesh,
     axis_name: str,
     recv_capacity: int,
-    interpret: bool = False,
-    splitter: str = "globalpad",
+    interpret: bool,
+    splitter: str,
 ) -> jax.Array:
-    """Ring-shift fused all-TC f32 kernel.
+    """Internal: forward-only impl of the ringshift kernel (no custom_vjp).
 
-    Per-wave per-rank ONE DMA; W waves total. Validated as v67a (naive) and
-    v67b (globalpad) litmus PASS on v7x.
+    Both the public API and the custom_vjp `_fwd` call this so we don't
+    recurse into the custom_vjp wrapper from inside `_fwd`. The body is the
+    original public-API body (shard_map of the per-device fused kernel).
     """
     assert local_embedding_table.dtype == jnp.float32
     world_size = mesh.shape[axis_name]
@@ -2476,6 +2477,146 @@ def jagged_a2a_embedding_lookup_f32_alltc_ringshift(
         check_vma=False,
     )
     return sharded(local_ids, local_id_count, local_embedding_table)
+
+
+def _ringshift_backward_impl(
+    grad_out: jax.Array,
+    local_ids: jax.Array,
+    local_id_count: jax.Array,
+    table_shape: Tuple[int, int],
+    *,
+    mesh: jax.sharding.Mesh,
+    axis_name: str,
+    recv_capacity: int,
+    interpret: bool,
+    splitter: str,
+) -> jax.Array:
+    """Internal: backward impl that wraps `_jagged_a2a_embedding_lookup_backward_local`
+    in a shard_map. Returns ``[world_size, v_local, D]`` (caller-shape).
+
+    Inputs:
+      - grad_out:        [W, max_local_ids, D] f32 sharded along axis_name
+      - local_ids:       [W, max_local_ids]    int32 sharded along axis_name
+      - local_id_count:  [W]                   int32 sharded along axis_name
+      - table_shape:     (v_local, embedding_dim) — Python tuple from the
+                         residual.
+    """
+    world_size = mesh.shape[axis_name]
+    v_local, embedding_dim = table_shape
+    P = jax.sharding.PartitionSpec
+
+    def per_device(g, ids, count):
+        gt = _jagged_a2a_embedding_lookup_backward_local(
+            g[0], ids[0], count[0],
+            axis_name=axis_name,
+            world_size=world_size,
+            recv_capacity=recv_capacity,
+            splitter=splitter,
+            interpret=interpret,
+            v_local=v_local,
+            embedding_dim=embedding_dim,
+        )
+        return gt[None, ...]
+
+    sharded = jax.shard_map(
+        per_device, mesh=mesh,
+        in_specs=(P(axis_name), P(axis_name), P(axis_name)),
+        out_specs=P(axis_name),
+        check_vma=False,
+    )
+    return sharded(grad_out, local_ids, local_id_count)
+
+
+# Inner positional-args function on which `jax.custom_vjp` is registered.
+# `mesh`, `axis_name`, `recv_capacity`, `interpret`, `splitter` are static
+# (non-tracer) and must be positional for ``nondiff_argnums``. The public
+# API below preserves the existing keyword-only signature; this inner
+# function exists only because custom_vjp can't take static kwargs directly.
+@functools.partial(jax.custom_vjp, nondiff_argnums=(3, 4, 5, 6, 7))
+def _ringshift_with_grad(
+    local_ids: jax.Array,
+    local_id_count: jax.Array,
+    local_embedding_table: jax.Array,
+    mesh: jax.sharding.Mesh,
+    axis_name: str,
+    recv_capacity: int,
+    interpret: bool,
+    splitter: str,
+) -> jax.Array:
+    return _ringshift_forward_impl(
+        local_ids, local_id_count, local_embedding_table,
+        mesh=mesh, axis_name=axis_name,
+        recv_capacity=recv_capacity, interpret=interpret, splitter=splitter,
+    )
+
+
+def _ringshift_with_grad_fwd(
+    local_ids, local_id_count, local_embedding_table,
+    mesh, axis_name, recv_capacity, interpret, splitter,
+):
+    """Forward + save residuals for backward.
+
+    Per design v2 §3 + the implementation-task note: save ONLY
+    (local_ids, local_id_count, table_shape) — `_bwd` re-derives everything
+    else from these (sort_perm, splitter outputs, padding) by calling the
+    same host-side helpers. The redundant work is cheap and avoids tracking
+    extra residual tensors.
+    """
+    out = _ringshift_forward_impl(
+        local_ids, local_id_count, local_embedding_table,
+        mesh=mesh, axis_name=axis_name,
+        recv_capacity=recv_capacity, interpret=interpret, splitter=splitter,
+    )
+    # local_embedding_table.shape is a Python tuple — no device storage.
+    residuals = (local_ids, local_id_count, local_embedding_table.shape)
+    return out, residuals
+
+
+def _ringshift_with_grad_bwd(
+    mesh, axis_name, recv_capacity, interpret, splitter,
+    residuals, grad_out,
+):
+    """Backward: compute grad_local_embedding_table.
+
+    Returns gradients matching the differentiable input signature
+    (local_ids, local_id_count, local_embedding_table). The two int32
+    inputs (local_ids, local_id_count) get None gradients.
+    """
+    local_ids, local_id_count, table_shape = residuals
+    grad_table = _ringshift_backward_impl(
+        grad_out, local_ids, local_id_count, table_shape,
+        mesh=mesh, axis_name=axis_name,
+        recv_capacity=recv_capacity, interpret=interpret, splitter=splitter,
+    )
+    return (None, None, grad_table)
+
+
+_ringshift_with_grad.defvjp(_ringshift_with_grad_fwd, _ringshift_with_grad_bwd)
+
+
+def jagged_a2a_embedding_lookup_f32_alltc_ringshift(
+    local_ids: jax.Array,
+    local_id_count: jax.Array,
+    local_embedding_table: jax.Array,
+    *,
+    mesh: jax.sharding.Mesh,
+    axis_name: str,
+    recv_capacity: int,
+    interpret: bool = False,
+    splitter: str = "globalpad",
+) -> jax.Array:
+    """Ring-shift fused all-TC f32 kernel (custom_vjp registered for backward).
+
+    Per-wave per-rank ONE DMA; W waves total. Validated as v67a (naive) and
+    v67b (globalpad) litmus PASS on v7x. The function is a thin wrapper
+    around an internal `jax.custom_vjp`-registered helper so that
+    `jax.grad` / `jax.value_and_grad` / `optax` compose correctly. Public
+    API signature unchanged.
+    """
+    return _ringshift_with_grad(
+        local_ids, local_id_count, local_embedding_table,
+        mesh, axis_name, recv_capacity, interpret, splitter,
+    )
 
 
 # ---------------------------------------------------------------------------
