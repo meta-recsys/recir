@@ -866,6 +866,122 @@ class JaggedA2AW128Benchmark(unittest.TestCase):
         self.assertEqual(diff_max_value, 0.0)
 
 
+    def test_w32_zero_count_wave_correctness(self) -> None:
+        """W=32 correctness test that exercises zero-count waves.
+
+        Codex review of the v71d split-DMA-descriptor stack flagged that the
+        skewed input generator never produces ``p1_cnt == 0`` or ``p3_cnt == 0``
+        at any wave at W=32/64/128, so the independent ``pl.when(p1_cnt > 0)``
+        / ``pl.when(p3_cnt > 0)`` guards introduced by v71d are not exercised
+        by the existing correctness tests.
+
+        This test fixes that with a deterministic construction: even-rank ``k``
+        sends all items to peer ``(k+1)%W``; odd-rank ``k`` sends all items to
+        peer ``(k+2)%W``. The resulting traffic matrix produces all four
+        ``(p1_cnt, p3_cnt)`` cases at different (rank, wave) combinations:
+
+          rank 0, wave 1: ``p1>0, p3=0`` (rank 0 sends to peer 1, but receives
+                          from rank W-1 which is odd and sends to peer 1, not 0)
+          rank 1, wave 1: ``p1=0, p3>0`` (rank 1 sends to peer 3, but receives
+                          from rank 0 which sends to peer 1)
+          rank 1, wave 2: ``p1>0, p3>0`` (rank 1 sends to peer 3 = (1+2)%W)
+          rank 0, wave 2: ``p1=0, p3=0`` (no-op wave)
+
+        Output is compared bitwise against the ra2a reference. Pending cluster
+        validation; included as part of the v71d landing to close the codex
+        coverage finding.
+        """
+        from jax.experimental.multihost_utils import sync_global_devices
+        import sys
+
+        world_size = 32
+        TILE = 128
+        embedding_dim = 128
+        v_local = 8 * 1024
+        max_local_ids = 8 * 1024
+
+        all_devices = jax.devices()
+        if len(all_devices) < 256:
+            self.skipTest(f"Need 256 logical devices, have {len(all_devices)}")
+        devices = all_devices[::8]
+        mesh = jax.sharding.Mesh(np.array(devices), ("x",))
+
+        recv_capacity = max_local_ids + TILE
+        recv_capacity = ((recv_capacity + TILE - 1) // TILE) * TILE
+
+        def log(msg):
+            if jax.process_index() == 0:
+                print(f"[ZERO_COUNT_W{world_size}] {msg}", file=sys.stderr, flush=True)
+
+        log(f"=== D={embedding_dim} v_local={v_local} max_local_ids={max_local_ids} ===")
+
+        P = jax.sharding.PartitionSpec
+
+        @functools.partial(
+            jax.shard_map,
+            mesh=mesh,
+            in_specs=(),
+            out_specs=(P("x"), P("x")),
+            check_vma=False,
+        )
+        def make_zero_count_inputs():
+            rank = jax.lax.axis_index("x")
+            key = jax.random.fold_in(jax.random.PRNGKey(11), rank)
+            even_dst = (rank + 1) % world_size
+            odd_dst = (rank + 2) % world_size
+            owner = jnp.where(rank % 2 == 0, even_dst, odd_dst)
+            owner_arr = jnp.full((max_local_ids,), owner, dtype=jnp.int32)
+            row_in_owner = jax.random.randint(
+                key, (max_local_ids,), 0, v_local, dtype=jnp.int32
+            )
+            ids = (owner_arr + world_size * row_in_owner).astype(jnp.int32)
+            local_id_count = jnp.array(max_local_ids, dtype=jnp.int32)
+            return ids[None, :], local_id_count[None]
+
+        local_ids, local_id_count = make_zero_count_inputs()
+
+        @functools.partial(
+            jax.shard_map,
+            mesh=mesh,
+            in_specs=(),
+            out_specs=P("x"),
+            check_vma=False,
+        )
+        def make_table_random():
+            rank = jax.lax.axis_index("x")
+            key = jax.random.fold_in(jax.random.PRNGKey(13), rank)
+            return jax.random.normal(key, (1, v_local, embedding_dim), dtype=jnp.float32)
+
+        local_table = make_table_random()
+        jax.block_until_ready((local_ids, local_id_count, local_table))
+        args = (local_ids, local_id_count, local_table)
+        log("inputs ready (deterministic single-peer-per-rank)")
+
+        rs_gp_jit = jax.jit(functools.partial(
+            jagged_a2a_embedding_lookup_f32_alltc_ringshift,
+            mesh=mesh, axis_name="x",
+            recv_capacity=recv_capacity, splitter="globalpad",
+        ))
+        ra2a_jit = jax.jit(functools.partial(
+            jagged_a2a_embedding_lookup_reference_jax,
+            mesh=mesh, axis_name="x",
+        ))
+
+        sync_global_devices("zc_ref_start")
+        ref = ra2a_jit(*args)
+        jax.block_until_ready(ref)
+        sync_global_devices("zc_fused_start")
+        out = rs_gp_jit(*args)
+        jax.block_until_ready(out)
+
+        diff_max = jnp.max(jnp.abs(out - ref))
+        diff_max_value = float(jax.device_get(diff_max))
+        sync_global_devices("zc_diff_done")
+
+        log(f"max_diff = {diff_max_value:.6e}")
+        self.assertEqual(diff_max_value, 0.0)
+
+
     def test_w64_multi_iter(self) -> None:
         """W=64 multi-iter perf test on v71d (production kernel + split DMA fix).
 
