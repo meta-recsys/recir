@@ -2557,18 +2557,33 @@ def _ringshift_with_grad_fwd(
     """Forward + save residuals for backward.
 
     Per design v2 §3 + the implementation-task note: save ONLY
-    (local_ids, local_id_count, table_shape) — `_bwd` re-derives everything
-    else from these (sort_perm, splitter outputs, padding) by calling the
-    same host-side helpers. The redundant work is cheap and avoids tracking
-    extra residual tensors.
+    (local_ids, local_id_count, per_device_table_shape) — `_bwd`
+    re-derives everything else from these (sort_perm, splitter outputs,
+    padding) by calling the same host-side helpers. The redundant work
+    is cheap and avoids tracking extra residual tensors.
+
+    `local_embedding_table` here has shape ``[world_size, v_local, D]``
+    (the public-API-level shape, before ``shard_map`` shards out the
+    leading rank axis). We save the per-device shape ``(v_local, D)`` so
+    the backward driver can size its per-rank accumulator without
+    re-deriving from the mesh.
     """
     out = _ringshift_forward_impl(
         local_ids, local_id_count, local_embedding_table,
         mesh=mesh, axis_name=axis_name,
         recv_capacity=recv_capacity, interpret=interpret, splitter=splitter,
     )
-    # local_embedding_table.shape is a Python tuple — no device storage.
-    residuals = (local_ids, local_id_count, local_embedding_table.shape)
+    # local_embedding_table.shape is the user-facing 3-tuple
+    # (world_size, v_local, D); strip the rank axis for the per-device
+    # backward accumulator.
+    full_shape = local_embedding_table.shape
+    if len(full_shape) != 3:
+        raise ValueError(
+            f"_ringshift_with_grad expects local_embedding_table of shape "
+            f"[world_size, v_local, D], got shape {full_shape}"
+        )
+    per_device_shape = (int(full_shape[1]), int(full_shape[2]))
+    residuals = (local_ids, local_id_count, per_device_shape)
     return out, residuals
 
 
