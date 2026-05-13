@@ -1145,9 +1145,7 @@ class TestSumOverShardedAxisPartial(unittest.TestCase):
         mod = _SumOverShardAxisModule()
         x = torch.randn(8, 32, 8, 8)
         fake_mode = FakeTensorMode(allow_non_fake_inputs=True)
-        result = _local_compile(
-            lambda mod, x: mod(x), None, mod, x, fake_mode=fake_mode
-        )
+        result = _local_compile(lambda mod, x: mod(x), mod, x, fake_mode=fake_mode)
         gm = result.gm
 
         sum_nodes = [
@@ -1258,7 +1256,7 @@ class TestLocalCompileTensorConstants(unittest.TestCase):
             return loss
 
         fake_mode = FakeTensorMode(allow_non_fake_inputs=True)
-        result = _local_compile(train_step, None, mod, opt, x, fake_mode=fake_mode)
+        result = _local_compile(train_step, mod, opt, x, fake_mode=fake_mode)
         gm = result.gm
 
         tensor_get_attrs = [
@@ -1356,7 +1354,7 @@ class TestLocalCompileTensorConstants(unittest.TestCase):
             return mod(x).sum()
 
         fake_mode = FakeTensorMode(allow_non_fake_inputs=True)
-        result = _local_compile(train_step, None, mod, x, fake_mode=fake_mode)
+        result = _local_compile(train_step, mod, x, fake_mode=fake_mode)
         gm = result.gm
 
         tensor_get_attrs = [
@@ -1407,7 +1405,7 @@ class TestBuildStrategiesGetAttrClassification(DTensorTestBase):
             return mod(x).sum()
 
         fake_mode = FakeTensorMode(allow_non_fake_inputs=True)
-        result = _local_compile(train_step, None, mod, x, fake_mode=fake_mode)
+        result = _local_compile(train_step, mod, x, fake_mode=fake_mode)
         gm = result.gm
 
         tensor_get_attrs = [n for n in gm.graph.nodes if n.op == "get_attr"]
@@ -1455,7 +1453,7 @@ class TestBuildStrategiesGetAttrClassification(DTensorTestBase):
             return mod(x).sum()
 
         fake_mode = FakeTensorMode(allow_non_fake_inputs=True)
-        result = _local_compile(train_step, None, mod, x, fake_mode=fake_mode)
+        result = _local_compile(train_step, mod, x, fake_mode=fake_mode)
         gm = result.gm
 
         # Attach a non-tensor attribute on the gm root and insert a get_attr

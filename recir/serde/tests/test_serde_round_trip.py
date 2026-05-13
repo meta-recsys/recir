@@ -55,7 +55,7 @@ def _trace(mod: nn.Module, *args: torch.Tensor) -> _LocalCompiledResult:
     def train_step(mod: nn.Module, *args: torch.Tensor) -> torch.Tensor:
         return mod(*args).sum()
 
-    return _local_compile(train_step, None, mod, *args, fake_mode=fake_mode)
+    return _local_compile(train_step, mod, *args, fake_mode=fake_mode)
 
 
 class _ScalarConstModule(nn.Module):
