@@ -8,6 +8,7 @@ ringshift kernel:
   * ``_bucketize_and_sort``       -- per-rank ID -> destination bucketing
   * ``_round_up_tile``            -- TILE alignment helper
   * ``_pad_per_peer``             -- sentinel-padded per-peer slice layout
+  * ``_pad_per_peer_2d``          -- 2D variant for f32 row payloads (grad)
   * ``_unpad_per_peer``           -- inverse of ``_pad_per_peer``
   * ``_derive_offsets``           -- send/recv offset matrices from traffic
   * ``_split_traffic_ringshift_globalpad`` -- ring-shift splitter
@@ -30,6 +31,7 @@ from recir.ops.pallas.embeddings.ringshift import (
     _bucketize_and_sort,
     _derive_offsets,
     _pad_per_peer,
+    _pad_per_peer_2d,
     _ringshift_phase3_remote_offset,
     _round_up_tile,
     _split_traffic_ringshift_globalpad,
@@ -225,6 +227,87 @@ class PadUnpadTest(unittest.TestCase):
             np.array(send_counts_padded),
             np.array([128, 128, 256, 128], dtype=np.int32),
         )
+
+    def test_pad_per_peer_2d_layout_and_zero_fill(self) -> None:
+        """``_pad_per_peer_2d`` must zero-fill slack rows and preserve real rows.
+
+        Mirrors ``test_pad_per_peer_layout`` but with a D-wide row payload
+        (the f32 grad_out variant). Slack rows MUST be exactly zero (a real
+        zero gradient), not sentinel-row replicates -- backward correctness
+        depends on this since the receiver will scatter-add ALL received
+        rows including padded slots.
+        """
+        world_size = 4
+        max_local_ids = 16
+        d = 3
+        # Real per-peer counts: skewed (matches the 1D layout test above).
+        send_counts_real = jnp.array([5, 0, 7, 4], dtype=jnp.int32)
+        send_counts_padded = _round_up_tile(send_counts_real, 4)  # tile=4 here
+        max_padded = max_local_ids + world_size * 4
+        # Build a deterministic [max_local_ids, D] payload where row i has
+        # value ``[i*10 + j for j in range(d)]`` so we can identify which
+        # source row landed where.
+        sorted_rows_2d = jnp.array(
+            [[i * 10 + j for j in range(d)] for i in range(max_local_ids)],
+            dtype=jnp.float32,
+        )
+
+        padded = _pad_per_peer_2d(
+            sorted_rows_2d,
+            send_counts_real,
+            send_counts_padded,
+            max_local_ids,
+            max_padded,
+            world_size,
+        )
+        # Padded layout (slot index -> source row, '0' means zero-row):
+        #   peer 0: padded[0:5)  = rows 0..4
+        #   peer 0: padded[5:8)  = ZERO ZERO ZERO  (3 slack rows)
+        #   peer 1: padded[8:8)  = (empty -- 0 padded count)
+        #   peer 2: padded[8:15) = rows 5..11
+        #   peer 2: padded[15:16) = ZERO          (1 slack row)
+        #   peer 3: padded[16:20) = rows 12..15
+        padded_np = np.array(padded)
+        self.assertEqual(padded_np.shape, (max_padded, d))
+        self.assertEqual(padded_np.dtype, np.float32)
+
+        # Real rows preserved (all D columns).
+        for slot, src_row in enumerate(range(0, 5)):
+            np.testing.assert_array_equal(
+                padded_np[slot], np.array(sorted_rows_2d[src_row])
+            )
+        for slot, src_row in zip(range(8, 15), range(5, 12)):
+            np.testing.assert_array_equal(
+                padded_np[slot], np.array(sorted_rows_2d[src_row])
+            )
+        for slot, src_row in zip(range(16, 20), range(12, 16)):
+            np.testing.assert_array_equal(
+                padded_np[slot], np.array(sorted_rows_2d[src_row])
+            )
+        # Slack rows are exactly zero (the backward-correctness guarantee).
+        for slack_slot in (5, 6, 7, 15):
+            np.testing.assert_array_equal(
+                padded_np[slack_slot], np.zeros(d, dtype=np.float32)
+            )
+
+    def test_pad_per_peer_2d_dtype_preserved(self) -> None:
+        """Output dtype must match ``sorted_rows_2d.dtype`` (f32 in)."""
+        world_size = 2
+        max_local_ids = 4
+        d = 2
+        send_counts_real = jnp.array([2, 2], dtype=jnp.int32)
+        send_counts_padded = _round_up_tile(send_counts_real, 2)
+        max_padded = max_local_ids + world_size * 2
+        sorted_rows_2d = jnp.ones((max_local_ids, d), dtype=jnp.float32)
+        padded = _pad_per_peer_2d(
+            sorted_rows_2d,
+            send_counts_real,
+            send_counts_padded,
+            max_local_ids,
+            max_padded,
+            world_size,
+        )
+        self.assertEqual(padded.dtype, jnp.float32)
 
 
 class RingshiftSplitterTest(unittest.TestCase):

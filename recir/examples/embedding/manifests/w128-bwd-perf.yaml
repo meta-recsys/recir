@@ -1,0 +1,54 @@
+# W=128 multi-iter forward + forward+backward perf bench on a 4x4x8
+# TPU-v7x slice (32 hosts x 4 chips per host). Pod timeout extended
+# (compile + multi-iter takes longer at W=128). Times jit(fwd) and
+# jit(value_and_grad) for both fused ringshift and ra2a baseline; reports
+# median + p99 + estimated backward-only delta + speedup.
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  generateName: ringshift-w128-bwd-perf-
+  namespace: default
+spec:
+  replicatedJobs:
+  - name: worker
+    replicas: 1
+    template:
+      spec:
+        parallelism: 32
+        completions: 32
+        backoffLimit: 0
+        activeDeadlineSeconds: 2400
+        template:
+          spec:
+            containers:
+            - name: bench
+              image: us-central1-docker.pkg.dev/mrs-tpu-y317h/recml/ringshift_tpu:latest
+              imagePullPolicy: Always
+              env:
+              - name: PYTHONUNBUFFERED
+                value: "1"
+              - name: JAX_DISTRIBUTED_INITIALIZATION_TIMEOUT
+                value: "900"
+              command:
+              - bash
+              - -c
+              - |
+                set +e
+                echo "Job Start: $(date) host: $(hostname)"
+                cd /app/recir
+                timeout 2300 python3 -u -m unittest -v \
+                  recir.examples.embedding.ringshift_bwd.RingshiftBwdPerfTest.test_w128_multi_iter_backward 2>&1
+                EXIT=$?
+                echo ""
+                echo "BENCH_EXIT=$EXIT"
+                echo "Job End: $(date)"
+                exit $EXIT
+              ports:
+              - containerPort: 8471
+              resources:
+                limits:
+                  google.com/tpu: 4
+            nodeSelector:
+              cloud.google.com/gke-tpu-accelerator: tpu7x
+              cloud.google.com/gke-tpu-topology: 4x4x8
+            restartPolicy: Never
