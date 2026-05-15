@@ -1,0 +1,52 @@
+# W=32 backward correctness test -- multi-host (32 hosts x 1 chip per host)
+# on a 4x4x8 TPU-v7x slice. Compares jax.grad(fused) vs jax.grad(reference)
+# at atol=rtol=1e-4 (in-graph violation max <= 0).
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  generateName: ringshift-w32-bwd-corr-
+  namespace: default
+spec:
+  replicatedJobs:
+  - name: worker
+    replicas: 1
+    template:
+      spec:
+        parallelism: 32
+        completions: 32
+        backoffLimit: 0
+        activeDeadlineSeconds: 1800
+        template:
+          spec:
+            containers:
+            - name: bench
+              image: us-central1-docker.pkg.dev/mrs-tpu-y317h/recml/ringshift_tpu:latest
+              imagePullPolicy: Always
+              env:
+              - name: PYTHONUNBUFFERED
+                value: "1"
+              - name: JAX_DISTRIBUTED_INITIALIZATION_TIMEOUT
+                value: "900"
+              command:
+              - bash
+              - -c
+              - |
+                set +e
+                echo "Job Start: $(date) host: $(hostname)"
+                cd /app/recir
+                timeout 1700 python3 -u -m unittest -v \
+                  recir.examples.embedding.ringshift_bwd.RingshiftBwdW32Test.test_w32_correctness 2>&1
+                EXIT=$?
+                echo ""
+                echo "BENCH_EXIT=$EXIT"
+                echo "Job End: $(date)"
+                exit $EXIT
+              ports:
+              - containerPort: 8471
+              resources:
+                limits:
+                  google.com/tpu: 4
+            nodeSelector:
+              cloud.google.com/gke-tpu-accelerator: tpu7x
+              cloud.google.com/gke-tpu-topology: 4x4x8
+            restartPolicy: Never

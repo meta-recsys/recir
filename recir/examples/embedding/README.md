@@ -23,8 +23,12 @@ from recir.ops.pallas.embeddings import (
 | `build_image.sh`                            | OSS: build + push image to GCR. Run from the OSS recir checkout (`setup.py` at top). |
 | `build_image_podman.sh`                     | fbcode: stage `recir/github/setup.py` + recir tree, build with podman + Meta corp creds, push to GCR. |
 | `ringshift_fwd.py`                          | unittest test runner: forward correctness + perf (`RingshiftFwdCorrectnessTest`, `RingshiftFwdPerfTest`). |
+| `ringshift_bwd.py`                          | unittest test runner: backward correctness (W=4 + W=32) + fwd+bwd perf (`RingshiftBwdW4Test`, `RingshiftBwdW32Test`, `RingshiftBwdPerfTest`). |
 | `manifests/w{4,32,64,128}-correctness.yaml` | JobSet manifests for forward correctness at each W.           |
 | `manifests/w{32,64,128}-perf.yaml`          | JobSet manifests for forward perf at each W.                  |
+| `manifests/w4-bwd-suite.yaml`               | JobSet manifest for the full W=4 backward unittest suite (6 tests, single host). |
+| `manifests/w32-bwd-correctness.yaml`        | JobSet manifest for backward correctness at W=32 (multi-host). |
+| `manifests/w{32,64,128}-bwd-perf.yaml`      | JobSet manifests for fwd+bwd multi-iter perf at each W (multi-host). |
 
 ## Build the image
 
@@ -54,7 +58,9 @@ Both scripts push
 ## Submit a job
 
 Each manifest invokes one `unittest` test method on a TPU-v7x topology sized
-for that W:
+for that W.
+
+### Forward
 
 | Manifest                  | Topology  | Method                                                        |
 | ------------------------- | --------- | ------------------------------------------------------------- |
@@ -66,10 +72,30 @@ for that W:
 | `w64-perf.yaml`           | `4x4x8`   | `RingshiftFwdPerfTest.test_w64_multi_iter`                    |
 | `w128-perf.yaml`          | `4x4x8`   | `RingshiftFwdPerfTest.test_w128_multi_iter`                   |
 
-To submit:
+### Backward
+
+The backward kernel ships as a `jax.custom_vjp` for `ringshift_embedding_lookup`,
+so `jax.grad` / `jax.value_and_grad` on the fused op routes through the fused
+backward Pallas kernel (mirrors the forward ringshift: barrier-first, split
+DMA descriptors per direction, scatter-add into a per-wave HBM accumulator).
+
+Correctness manifests compare `jax.grad(fused)` against `jax.grad(reference_jax)`
+at `atol=rtol=1e-4`. Perf manifests time `value_and_grad` (fwd+bwd) and report
+median + p99 + the estimated backward-only delta vs the forward-only baseline.
+
+| Manifest                  | Topology  | Method                                                                                  |
+| ------------------------- | --------- | --------------------------------------------------------------------------------------- |
+| `w4-bwd-suite.yaml`       | `2x2x1`   | `RingshiftBwdW4Test` (full suite: 6 tests -- base, repeated hot row, wave0 self-peer, zero count, non-tile-aligned, jit value_and_grad). |
+| `w32-bwd-correctness.yaml`| `4x4x8`   | `RingshiftBwdW32Test.test_w32_correctness`                                              |
+| `w32-bwd-perf.yaml`       | `4x4x8`   | `RingshiftBwdPerfTest.test_w32_multi_iter_backward`                                     |
+| `w64-bwd-perf.yaml`       | `4x4x8`   | `RingshiftBwdPerfTest.test_w64_multi_iter_backward`                                     |
+| `w128-bwd-perf.yaml`      | `4x4x8`   | `RingshiftBwdPerfTest.test_w128_multi_iter_backward`                                    |
+
+To submit (forward or backward, same command):
 
 ```sh
 kubectl create -f recir/examples/embedding/manifests/w32-correctness.yaml
+kubectl create -f recir/examples/embedding/manifests/w32-bwd-correctness.yaml
 ```
 
 ## View results

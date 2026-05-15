@@ -53,6 +53,7 @@ CPU separately).
 
 from __future__ import annotations
 
+import functools
 from typing import Tuple
 
 import jax
@@ -144,6 +145,54 @@ def _pad_per_peer(
     is_real = local_pad_pos < send_counts_real[peer_id]
     src_pos = jnp.clip(real_offsets[peer_id] + local_pad_pos, 0, max_local_ids - 1)
     return jnp.where(is_real, sorted_row[src_pos], 0).astype(jnp.int32)
+
+
+def _pad_per_peer_2d(
+    sorted_rows_2d: jax.Array,
+    send_counts_real: jax.Array,
+    send_counts_padded: jax.Array,
+    max_local_ids: int,
+    max_padded: int,
+    world_size: int,
+) -> jax.Array:
+    """2D variant of :func:`_pad_per_peer` for f32 row payloads (e.g., grad_out).
+
+    Operates per-row instead of per-int32 scalar: each "row" in
+    ``sorted_rows_2d`` is a D-wide embedding gradient. Per-peer padding rows
+    are zero-filled (NOT replicated from a sentinel index, because for
+    embedding gradients there's no "row 0 is harmless" safety -- a zero
+    gradient is the right semantic for slack rows since the receiver scatters
+    them but they contribute nothing to the gradient sum).
+
+    Args:
+        sorted_rows_2d: ``[max_local_ids, D]`` float -- gradient rows already
+            permuted by ``sort_perm`` (so per-peer slices are contiguous).
+        send_counts_real: ``[world_size]`` int32 -- real per-peer count.
+        send_counts_padded: ``[world_size]`` int32 -- TILE-aligned per-peer
+            count.
+        max_local_ids: static -- original (un-padded) total count.
+        max_padded: static -- total padded length (= sum of
+            ``send_counts_padded`` worst case = ``max_local_ids + W * TILE``).
+        world_size: static.
+
+    Returns:
+        ``[max_padded, D]`` float -- per-peer slices with zero-filled tail
+        rows, exactly matching the sentinel layout produced by
+        :func:`_pad_per_peer`.
+    """
+    real_offsets = jnp.cumsum(send_counts_real) - send_counts_real
+    padded_offsets = jnp.cumsum(send_counts_padded) - send_counts_padded
+    pos = jnp.arange(max_padded, dtype=jnp.int32)
+    peer_id = jnp.clip(
+        jnp.searchsorted(padded_offsets, pos, side="right") - 1,
+        0,
+        world_size - 1,
+    )
+    local_pad_pos = pos - padded_offsets[peer_id]
+    is_real = local_pad_pos < send_counts_real[peer_id]
+    src_pos = jnp.clip(real_offsets[peer_id] + local_pad_pos, 0, max_local_ids - 1)
+    gathered = sorted_rows_2d[src_pos]  # [max_padded, D]
+    return jnp.where(is_real[:, None], gathered, 0).astype(sorted_rows_2d.dtype)
 
 
 def _unpad_per_peer(
@@ -918,9 +967,7 @@ def ringshift_embedding_lookup(
         recv_capacity: per-wave receive buffer size. With single-slot recv
             layout, only one peer's payload lands per wave; per-wave incoming
             for any rank is bounded by ``max_local_ids + TILE - 1``. Caller
-            should pass a TILE-aligned value at least that large. Must also
-            be divisible by ``num_subcores * num_lanes`` if the SC path is
-            used (not used in this forward kernel).
+            should pass a TILE-aligned value at least that large.
         interpret: if True, run the Pallas kernel under the JAX interpreter
             (CPU-emulated; for unit tests). NOTE: the kernel uses
             runtime-extent slices ``ref.at[pl.ds(start, runtime_count)]`` that
@@ -931,6 +978,422 @@ def ringshift_embedding_lookup(
 
     Returns:
         ``[world_size, max_local_ids, D]`` f32 embeddings in caller order.
+
+    Differentiability: this function is a thin wrapper around an internal
+    :func:`jax.custom_vjp`-registered helper (:func:`_ringshift_with_grad`)
+    so ``jax.grad`` / ``jax.value_and_grad`` / ``optax`` compose correctly.
+    The backward pass uses the dedicated
+    :func:`_ringshift_embedding_lookup_backward_local` driver. The public
+    API signature is unchanged.
+    """
+    return _ringshift_with_grad(  # pyre-ignore[29]
+        local_ids,
+        local_id_count,
+        local_embedding_table,
+        mesh,
+        axis_name,
+        recv_capacity,
+        interpret,
+        splitter,
+    )
+
+
+# ---------------------------------------------------------------------------
+# F. Backward kernel (TC, single-wave) + driver + custom_vjp wiring
+# ---------------------------------------------------------------------------
+#
+# Backward pass for the ringshift kernel. Structurally mirrors the forward
+# kernel (single-wave Pallas kernel + Python wave loop in a per-device
+# driver, wrapped by shard_map). Differences from forward:
+#
+#   * Phase 1 is split in TWO sub-DMAs (1a + 1b): per-peer ID payload AND
+#     per-peer gradient row payload travel together so the OWNER of each
+#     row receives both the destination index and the gradient value to
+#     scatter-add into its local table-grad accumulator.
+#   * Phase 2 is a local scatter-add (no Phase 3): the OWNER consumes the
+#     received (id, grad) pairs and accumulates into ``grad_table_acc`` —
+#     a per-rank ``[v_local, D]`` buffer aliased across waves via
+#     ``input_output_aliases``.
+#   * The cross-rank epoch barrier between waves uses the same
+#     ``psum + optimization_barrier`` pattern as forward.
+#
+# The backward driver is registered as the VJP of the forward via
+# :func:`jax.custom_vjp` on a thin internal wrapper
+# (:func:`_ringshift_with_grad`). The public API
+# :func:`ringshift_embedding_lookup` retains its original keyword-only
+# signature; it dispatches to ``_ringshift_with_grad`` so that ``jax.grad``
+# / ``jax.value_and_grad`` / ``optax`` compose correctly.
+
+
+def _make_ringshift_backward_single_wave_kernel(
+    *,
+    world_size: int,
+    recv_capacity: int,
+    embedding_dim: int,
+    v_local: int,
+):
+    """Single-wave backward kernel: ID DMA + grad DMA + local scatter-add.
+
+    Mirror of :func:`_make_ringshift_single_wave_kernel` (forward) but for the
+    backward pass. Each wave does THREE steps:
+
+    1. **Phase 1a -- ID DMA** (split-DMA pattern, INT32 row-payload):
+       same peers as forward Phase 1 (my outbound to my_dst, my inbound from
+       my_src), so the OWNER receives the per-peer row indices it needs to
+       scatter into.
+    2. **Phase 1b -- gradient DMA** (split-DMA pattern, F32 row-payload):
+       SAME peers as Phase 1a, just larger payload (D-wide rows). Distinct
+       sems from Phase 1a so the wait_send/wait_recv extents are unambiguous.
+    3. **Phase 2 -- local scatter-add**: load received IDs (HBM -> SMEM) and
+       received grads (HBM -> VMEM); for each received row i, add
+       ``grad_emb_vmem[i, :]`` into ``grad_table_acc_vmem[idx_smem[i], :]``;
+       write the accumulator back to HBM (aliased to the input).
+
+    Accumulator carry across waves: ``grad_table_acc`` is aliased via
+    ``input_output_aliases`` so each wave reads the running accumulator from
+    HBM, performs the local scatter-add into VMEM, and writes the updated
+    accumulator back. Cost is O(v_local * D) HBM<->VMEM bytes per wave --
+    symmetric with forward's per-wave ``table_vmem`` prefetch.
+
+    Sem plumbing: 4 DMA sems per wave (id-send, id-recv, grad-send,
+    grad-recv); ``pltpu.get_barrier_semaphore()`` for the cross-rank
+    pre-barrier (required by Mosaic when ``collective_id`` is set on
+    ``CompilerParams``).
+    """
+
+    def kernel(
+        sorted_row_padded_ref,  # input HBM: [max_padded] int32
+        grad_emb_padded_ref,  # input HBM: [max_padded, D] f32
+        wave_idx_ref,  # SMEM (1,) int32
+        p1_cnt_ref,  # SMEM (1,) int32
+        p3_cnt_ref,  # SMEM (1,) int32
+        send_off_ref,  # SMEM (1,) int32
+        recv_off_ref,  # SMEM (1,) int32
+        grad_table_acc_init_ref,  # input HBM, ALIASED to output
+        grad_table_acc_ref,  # output HBM, alias of init
+        row_recv_buf,  # HBM scratch: [recv_capacity] int32
+        grad_recv_buf,  # HBM scratch: [recv_capacity, D] f32
+        grad_emb_vmem,  # VMEM scratch: [recv_capacity, D] f32
+        grad_table_acc_vmem,  # VMEM scratch: [v_local, D] f32
+        idx_smem,  # SMEM scratch: [recv_capacity] int32
+        zero_int_vmem,  # VMEM scratch: [recv_capacity] int32
+        zero_emb_vmem,  # VMEM scratch: [recv_capacity, D] f32
+        send_sem_id,  # DMA sem for Phase 1a send
+        recv_sem_id,  # DMA sem for Phase 1a recv
+        send_sem_emb,  # DMA sem for Phase 1b send
+        recv_sem_emb,  # DMA sem for Phase 1b recv
+    ):
+        del (
+            grad_table_acc_init_ref
+        )  # aliased to grad_table_acc_ref via input_output_aliases
+        my_rank = lax.axis_index("x")
+        wave_idx = wave_idx_ref[0]
+
+        # All-peer broadcast pre-barrier FIRST. Same ordering as the forward
+        # ringshift kernel: barrier-first preserves the cross-rank sync
+        # robustness validated through W=128 in the forward path.
+        sem = pltpu.get_barrier_semaphore()
+        my_src = (my_rank - wave_idx + world_size) % world_size  # who sends to me
+        my_dst = (my_rank + wave_idx) % world_size  # who I send to
+        for peer in range(world_size):
+            pl.semaphore_signal(
+                sem,
+                1,
+                device_id=(peer,),
+                device_id_type=pltpu.DeviceIdType.MESH,
+            )
+        pl.semaphore_wait(sem, world_size)
+
+        # THEN initialize scratches: load grad_table_acc HBM -> VMEM
+        # (per-wave O(v_local * D) accumulator carry), zero the recv buffers.
+        pltpu.sync_copy(grad_table_acc_ref, grad_table_acc_vmem)
+
+        zero_int_vmem[...] = jnp.zeros_like(zero_int_vmem)
+        zero_emb_vmem[...] = jnp.zeros_like(zero_emb_vmem)
+        pltpu.sync_copy(zero_int_vmem, row_recv_buf)
+        pltpu.sync_copy(zero_emb_vmem, grad_recv_buf)
+
+        # Hoist runtime extents (TILE-aligned because both _round_up_tile and
+        # the splitter ensure all per-wave per-peer counts/offsets are
+        # multiples of _TILE_INT32).
+        p1_cnt = pl.multiple_of(p1_cnt_ref[0], _TILE_INT32)
+        p3_cnt = pl.multiple_of(p3_cnt_ref[0], _TILE_INT32)
+        send_start = pl.multiple_of(send_off_ref[0], _TILE_INT32)
+        remote_recv_start = pl.multiple_of(recv_off_ref[0], _TILE_INT32)
+
+        # ----- Phase 1a: ID DMA (split descriptors per direction) -----
+        # Same split-descriptor pattern as the v71d forward fix: separate send
+        # / recv descriptors with extents matching each side's actual count.
+        d1a_send = pltpu.make_async_remote_copy(
+            src_ref=sorted_row_padded_ref.at[pl.ds(send_start, p1_cnt)],
+            dst_ref=row_recv_buf.at[pl.ds(remote_recv_start, p1_cnt)],
+            send_sem=send_sem_id,
+            recv_sem=recv_sem_id,
+            device_id=(my_dst,),
+            device_id_type=pltpu.DeviceIdType.MESH,
+        )
+        d1a_recv = pltpu.make_async_remote_copy(
+            src_ref=sorted_row_padded_ref.at[pl.ds(0, p3_cnt)],
+            dst_ref=row_recv_buf.at[pl.ds(0, p3_cnt)],
+            send_sem=send_sem_id,
+            recv_sem=recv_sem_id,
+            device_id=(my_src,),
+            device_id_type=pltpu.DeviceIdType.MESH,
+        )
+
+        @pl.when(p1_cnt > 0)
+        def _phase1a_send():
+            d1a_send.start()
+            d1a_send.wait_send()  # extent p1_cnt
+
+        @pl.when(p3_cnt > 0)
+        def _phase1a_recv():
+            d1a_recv.wait_recv()  # extent p3_cnt = OPPOSITE side's send count
+
+        # ----- Phase 1b: gradient DMA (split descriptors per direction) -----
+        # Same peers as Phase 1a, but D-wide row payload and distinct sems.
+        d1b_send = pltpu.make_async_remote_copy(
+            src_ref=grad_emb_padded_ref.at[pl.ds(send_start, p1_cnt), :],
+            dst_ref=grad_recv_buf.at[pl.ds(remote_recv_start, p1_cnt), :],
+            send_sem=send_sem_emb,
+            recv_sem=recv_sem_emb,
+            device_id=(my_dst,),
+            device_id_type=pltpu.DeviceIdType.MESH,
+        )
+        d1b_recv = pltpu.make_async_remote_copy(
+            src_ref=grad_emb_padded_ref.at[pl.ds(0, p3_cnt), :],
+            dst_ref=grad_recv_buf.at[pl.ds(0, p3_cnt), :],
+            send_sem=send_sem_emb,
+            recv_sem=recv_sem_emb,
+            device_id=(my_src,),
+            device_id_type=pltpu.DeviceIdType.MESH,
+        )
+
+        @pl.when(p1_cnt > 0)
+        def _phase1b_send():
+            d1b_send.start()
+            d1b_send.wait_send()  # extent p1_cnt rows x D
+
+        @pl.when(p3_cnt > 0)
+        def _phase1b_recv():
+            d1b_recv.wait_recv()  # extent p3_cnt rows x D
+
+        # ----- Phase 2: local scatter-add into grad_table_acc_vmem -----
+        # Bring received IDs into SMEM (scalar reads) and received grads into
+        # VMEM (row-at-a-time reads). idx_smem is sized for the full
+        # recv_capacity even though only the first p3_cnt entries are
+        # populated (the rest are zero from the pre-DMA zero-fill, which is
+        # fine because the scatter loop only iterates 0..p3_cnt).
+        pltpu.sync_copy(row_recv_buf, idx_smem)
+        pltpu.sync_copy(grad_recv_buf, grad_emb_vmem)
+
+        def scatter_body(i, _):
+            row_idx = idx_smem[i]
+            # Row-at-a-time read-modify-write (mirrors forward's gather; f32
+            # VMEM dim-0 tile is 1, so single-row pl.ds slices are valid).
+            cur = grad_table_acc_vmem[pl.ds(row_idx, 1), :]
+            delta = grad_emb_vmem[pl.ds(i, 1), :]
+            grad_table_acc_vmem[pl.ds(row_idx, 1), :] = cur + delta
+            return None
+
+        lax.fori_loop(0, p3_cnt, scatter_body, None)
+
+        # Write the accumulator back to HBM (aliased to grad_table_acc_ref).
+        pltpu.sync_copy(grad_table_acc_vmem, grad_table_acc_ref)
+
+    return kernel
+
+
+def _ringshift_embedding_lookup_backward_local(
+    grad_out: jax.Array,
+    local_ids: jax.Array,
+    local_id_count: jax.Array,
+    *,
+    axis_name: str,
+    world_size: int,
+    recv_capacity: int,
+    splitter: str,
+    interpret: bool,
+    v_local: int,
+    embedding_dim: int,
+) -> jax.Array:
+    """Per-device backward driver -- wrapped in shard_map by the caller.
+
+    Mirrors :func:`_ringshift_embedding_lookup_local` structurally:
+      * Re-derive bucketize+sort + splitter outputs from ``local_ids`` /
+        ``local_id_count`` (cheap; saves residual storage).
+      * Permute and pad ``grad_out`` per-peer (mirroring forward's row pad).
+      * Python wave loop, per-wave pallas_call with unique
+        ``collective_id = world_size + w_py`` to avoid clashing with the
+        forward kernel's IDs (0..W-1).
+      * Cross-wave epoch barrier via ``psum + optimization_barrier`` on
+        ``grad_table_acc[0, 0]``.
+
+    Returns:
+        ``[v_local, embedding_dim]`` f32 -- gradient w.r.t. the local table
+        shard.
+    """
+    assert grad_out.dtype == jnp.float32
+    max_local_ids = local_ids.shape[0]
+    max_waves = world_size
+    dtype = grad_out.dtype
+
+    # --- Re-derive splitter outputs (cheap; mirrors forward) ---
+    sorted_row_real, send_counts_real, sort_perm, _reverse_perm = _bucketize_and_sort(
+        local_ids, local_id_count, max_local_ids, world_size
+    )
+    send_counts_padded = _round_up_tile(send_counts_real, _TILE_INT32)
+    traffic_matrix = lax.all_gather(send_counts_padded, axis_name)  # [W, W]
+    my_rank = lax.axis_index(axis_name)
+
+    if splitter == "naive":
+        p1_cnt, p3_cnt, send_off, recv_off, _phase3_remote_off = (
+            _split_traffic_ringshift_naive(
+                traffic_matrix,
+                send_counts_padded,
+                world_size=world_size,
+                my_rank=my_rank,
+            )
+        )
+    elif splitter == "globalpad":
+        p1_cnt, p3_cnt, send_off, recv_off, _phase3_remote_off = (
+            _split_traffic_ringshift_globalpad(
+                traffic_matrix,
+                send_counts_padded,
+                world_size=world_size,
+                my_rank=my_rank,
+            )
+        )
+    else:
+        raise ValueError(f"unknown splitter {splitter}")
+
+    # --- Pad sorted_row + grad_out per-peer (sentinel padding to TILE) ---
+    max_padded = max_local_ids + world_size * _TILE_INT32
+    sorted_row_padded = _pad_per_peer(
+        sorted_row_real,
+        send_counts_real,
+        send_counts_padded,
+        max_local_ids,
+        max_padded,
+        world_size,
+    )
+    # Permute grad_out by sort_perm so per-peer slices are contiguous, then
+    # pad with zero rows (zero gradient = no contribution to scatter sum).
+    grad_emb_sorted = grad_out[sort_perm]
+    grad_emb_padded = _pad_per_peer_2d(
+        grad_emb_sorted,
+        send_counts_real,
+        send_counts_padded,
+        max_local_ids,
+        max_padded,
+        world_size,
+    )
+
+    HBM = pltpu.MemorySpace.HBM
+    SMEM = pltpu.MemorySpace.SMEM
+
+    backward_kernel = _make_ringshift_backward_single_wave_kernel(
+        world_size=world_size,
+        recv_capacity=recv_capacity,
+        embedding_dim=embedding_dim,
+        v_local=v_local,
+    )
+
+    # Per the design: backward collective_ids start at world_size to avoid
+    # collision with the forward kernel's IDs (0..W-1) when forward and
+    # backward live in the same jit.
+    COLLECTIVE_ID_OFFSET_BWD = world_size
+
+    grad_table_acc = jnp.zeros((v_local, embedding_dim), dtype=dtype)
+    sync_dep = jnp.float32(0.0)
+
+    for w_py in range(max_waves):
+        p1_cnt_w = lax.dynamic_slice(p1_cnt, (w_py,), (1,))
+        p3_cnt_w = lax.dynamic_slice(p3_cnt, (w_py,), (1,))
+        send_off_w = lax.dynamic_slice(send_off, (w_py,), (1,))
+        recv_off_w = lax.dynamic_slice(recv_off, (w_py,), (1,))
+        wave_idx_w = jnp.array([w_py], dtype=jnp.int32)
+
+        # Cross-rank epoch barrier between waves (same pattern as forward).
+        grad_table_acc_dep, _ = jax.lax.optimization_barrier((grad_table_acc, sync_dep))
+
+        grad_table_acc, _scratch_row, _scratch_grad = pl.pallas_call(
+            backward_kernel,
+            out_shape=[
+                jax.ShapeDtypeStruct((v_local, embedding_dim), dtype),
+                jax.ShapeDtypeStruct((recv_capacity,), jnp.int32),
+                jax.ShapeDtypeStruct((recv_capacity, embedding_dim), dtype),
+            ],
+            grid_spec=pltpu.PrefetchScalarGridSpec(
+                num_scalar_prefetch=0,
+                in_specs=[
+                    pl.BlockSpec(memory_space=HBM),  # sorted_row_padded
+                    pl.BlockSpec(memory_space=HBM),  # grad_emb_padded
+                    pl.BlockSpec(memory_space=SMEM),  # wave_idx
+                    pl.BlockSpec(memory_space=SMEM),  # p1_cnt
+                    pl.BlockSpec(memory_space=SMEM),  # p3_cnt
+                    pl.BlockSpec(memory_space=SMEM),  # send_off
+                    pl.BlockSpec(memory_space=SMEM),  # recv_off
+                    pl.BlockSpec(memory_space=HBM),  # grad_table_acc (alias)
+                ],
+                out_specs=[
+                    pl.BlockSpec(memory_space=HBM),  # grad_table_acc out
+                    pl.BlockSpec(memory_space=HBM),  # row_recv_buf scratch
+                    pl.BlockSpec(memory_space=HBM),  # grad_recv_buf scratch
+                ],
+                scratch_shapes=(
+                    pltpu.VMEM((recv_capacity, embedding_dim), dtype),  # grad_emb_vmem
+                    pltpu.VMEM((v_local, embedding_dim), dtype),  # grad_table_acc_vmem
+                    SMEM((recv_capacity,), jnp.int32),  # idx_smem
+                    pltpu.VMEM((recv_capacity,), jnp.int32),  # zero_int_vmem
+                    pltpu.VMEM((recv_capacity, embedding_dim), dtype),  # zero_emb_vmem
+                    pltpu.SemaphoreType.DMA,  # ID send sem
+                    pltpu.SemaphoreType.DMA,  # ID recv sem
+                    pltpu.SemaphoreType.DMA,  # grad send sem
+                    pltpu.SemaphoreType.DMA,  # grad recv sem
+                ),
+            ),
+            input_output_aliases={7: 0},  # grad_table_acc input -> output
+            compiler_params=pltpu.CompilerParams(
+                collective_id=COLLECTIVE_ID_OFFSET_BWD + w_py,
+            ),
+            interpret=interpret,
+        )(
+            sorted_row_padded,
+            grad_emb_padded,
+            wave_idx_w,
+            p1_cnt_w,
+            p3_cnt_w,
+            send_off_w,
+            recv_off_w,
+            grad_table_acc_dep,
+        )
+        del _scratch_row, _scratch_grad
+
+        # Cross-rank epoch barrier -- psum a real value derived from this
+        # wave's accumulator so XLA can't statically reorder. Same pattern as
+        # forward's `sync_dep = jax.lax.psum(sorted_emb_padded[0, 0], ...)`.
+        sync_dep = jax.lax.psum(grad_table_acc[0, 0], axis_name)
+
+    return grad_table_acc
+
+
+def _ringshift_forward_impl(
+    local_ids: jax.Array,
+    local_id_count: jax.Array,
+    local_embedding_table: jax.Array,
+    *,
+    mesh: jax.sharding.Mesh,
+    axis_name: str,
+    recv_capacity: int,
+    interpret: bool,
+    splitter: str,
+) -> jax.Array:
+    """Internal: forward-only impl of the ringshift kernel (no custom_vjp).
+
+    Both the public API and the custom_vjp `_fwd` call this so we don't
+    recurse into the custom_vjp wrapper from inside `_fwd`. The body is the
+    original public-API body (shard_map of the per-device fused kernel).
     """
     assert local_embedding_table.dtype == jnp.float32
     world_size = mesh.shape[axis_name]
@@ -957,3 +1420,164 @@ def ringshift_embedding_lookup(
         check_vma=False,
     )
     return sharded(local_ids, local_id_count, local_embedding_table)
+
+
+def _ringshift_backward_impl(
+    grad_out: jax.Array,
+    local_ids: jax.Array,
+    local_id_count: jax.Array,
+    table_shape: Tuple[int, int],
+    *,
+    mesh: jax.sharding.Mesh,
+    axis_name: str,
+    recv_capacity: int,
+    interpret: bool,
+    splitter: str,
+) -> jax.Array:
+    """Internal: backward impl that wraps `_ringshift_embedding_lookup_backward_local`
+    in a shard_map. Returns ``[world_size, v_local, D]`` (caller-shape).
+
+    Inputs:
+      - grad_out:        [W, max_local_ids, D] f32 sharded along axis_name
+      - local_ids:       [W, max_local_ids]    int32 sharded along axis_name
+      - local_id_count:  [W]                   int32 sharded along axis_name
+      - table_shape:     (v_local, embedding_dim) -- Python tuple from the
+                         residual.
+    """
+    world_size = mesh.shape[axis_name]
+    v_local, embedding_dim = table_shape
+    P = jax.sharding.PartitionSpec
+
+    def per_device(g, ids, count):
+        gt = _ringshift_embedding_lookup_backward_local(
+            g[0],
+            ids[0],
+            count[0],
+            axis_name=axis_name,
+            world_size=world_size,
+            recv_capacity=recv_capacity,
+            splitter=splitter,
+            interpret=interpret,
+            v_local=v_local,
+            embedding_dim=embedding_dim,
+        )
+        return gt[None, ...]
+
+    sharded = jax.shard_map(
+        per_device,
+        mesh=mesh,
+        in_specs=(P(axis_name), P(axis_name), P(axis_name)),
+        out_specs=P(axis_name),
+        check_vma=False,
+    )
+    return sharded(grad_out, local_ids, local_id_count)
+
+
+# Inner positional-args function on which `jax.custom_vjp` is registered.
+# `mesh`, `axis_name`, `recv_capacity`, `interpret`, `splitter` are static
+# (non-tracer) and must be positional for ``nondiff_argnums``. The public
+# API :func:`ringshift_embedding_lookup` preserves the existing keyword-only
+# signature; this inner function exists only because custom_vjp can't take
+# static kwargs directly.
+@functools.partial(jax.custom_vjp, nondiff_argnums=(3, 4, 5, 6, 7))
+def _ringshift_with_grad(
+    local_ids: jax.Array,
+    local_id_count: jax.Array,
+    local_embedding_table: jax.Array,
+    mesh: jax.sharding.Mesh,
+    axis_name: str,
+    recv_capacity: int,
+    interpret: bool,
+    splitter: str,
+) -> jax.Array:
+    return _ringshift_forward_impl(
+        local_ids,
+        local_id_count,
+        local_embedding_table,
+        mesh=mesh,
+        axis_name=axis_name,
+        recv_capacity=recv_capacity,
+        interpret=interpret,
+        splitter=splitter,
+    )
+
+
+def _ringshift_with_grad_fwd(
+    local_ids,
+    local_id_count,
+    local_embedding_table,
+    mesh,
+    axis_name,
+    recv_capacity,
+    interpret,
+    splitter,
+):
+    """Forward + save residuals for backward.
+
+    Per design v2 section 3 + the implementation-task note: save ONLY
+    (local_ids, local_id_count, per_device_table_shape) -- `_bwd`
+    re-derives everything else from these (sort_perm, splitter outputs,
+    padding) by calling the same host-side helpers. The redundant work
+    is cheap and avoids tracking extra residual tensors.
+
+    `local_embedding_table` here has shape ``[world_size, v_local, D]``
+    (the public-API-level shape, before ``shard_map`` shards out the
+    leading rank axis). We save the per-device shape ``(v_local, D)`` so
+    the backward driver can size its per-rank accumulator without
+    re-deriving from the mesh.
+    """
+    out = _ringshift_forward_impl(
+        local_ids,
+        local_id_count,
+        local_embedding_table,
+        mesh=mesh,
+        axis_name=axis_name,
+        recv_capacity=recv_capacity,
+        interpret=interpret,
+        splitter=splitter,
+    )
+    # local_embedding_table.shape is the user-facing 3-tuple
+    # (world_size, v_local, D); strip the rank axis for the per-device
+    # backward accumulator.
+    full_shape = local_embedding_table.shape
+    if len(full_shape) != 3:
+        raise ValueError(
+            f"_ringshift_with_grad expects local_embedding_table of shape "
+            f"[world_size, v_local, D], got shape {full_shape}"
+        )
+    per_device_shape = (int(full_shape[1]), int(full_shape[2]))
+    residuals = (local_ids, local_id_count, per_device_shape)
+    return out, residuals
+
+
+def _ringshift_with_grad_bwd(
+    mesh,
+    axis_name,
+    recv_capacity,
+    interpret,
+    splitter,
+    residuals,
+    grad_out,
+):
+    """Backward: compute grad_local_embedding_table.
+
+    Returns gradients matching the differentiable input signature
+    (local_ids, local_id_count, local_embedding_table). The two int32
+    inputs (local_ids, local_id_count) get None gradients.
+    """
+    local_ids, local_id_count, table_shape = residuals
+    grad_table = _ringshift_backward_impl(
+        grad_out,
+        local_ids,
+        local_id_count,
+        table_shape,
+        mesh=mesh,
+        axis_name=axis_name,
+        recv_capacity=recv_capacity,
+        interpret=interpret,
+        splitter=splitter,
+    )
+    return (None, None, grad_table)
+
+
+_ringshift_with_grad.defvjp(_ringshift_with_grad_fwd, _ringshift_with_grad_bwd)
