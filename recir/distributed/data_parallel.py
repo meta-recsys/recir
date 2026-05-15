@@ -1329,6 +1329,14 @@ def shard_params_by_plan(
     return sharded_keys
 
 
+# Placeholder dim used for example inputs to ``make_fx(tracing_mode="symbolic")``
+# in the embedding rewrite path.  PyTorch specializes 0 and 1 (treated as
+# constants, not symbols), so we need a value >= 2 to ensure the inlined
+# subgraph uses real symbolic dims.  Picked small but non-power-of-two to
+# avoid any divisibility-based specialization elsewhere.
+_SYMBOLIC_TRACE_PLACEHOLDER_DIM: int = 3
+
+
 def decomposed_row_wise_embedding(
     sharded_weight: torch.Tensor,
     indices: torch.Tensor,
@@ -1352,6 +1360,12 @@ def decomposed_row_wise_embedding(
         group_name: process-group name for collectives.
         world_size: number of ranks in the group.
     """
+    # world_size == 1: skip all_to_all, also avoids a FakeProcessGroup
+    # hazard where the size-exchange collective leaves output uninitialized,
+    # feeding garbage split sizes into the next all_to_all and OOMing.
+    if world_size == 1:
+        return torch.ops.aten.embedding.default(sharded_weight, indices)
+
     # Step 1: Bucketize
     flat_indices = indices.reshape(-1)
     local_rows = num_embeddings // world_size
@@ -1429,6 +1443,11 @@ def decomposed_row_wise_embedding_backward(
         padding_idx: padding index (passed through to local backward).
         scale_grad_by_freq: frequency scaling flag (passed through).
     """
+    if world_size == 1:
+        return torch.ops.aten.embedding_dense_backward.default(
+            grad_output, indices, num_embeddings, padding_idx, scale_grad_by_freq
+        )
+
     local_rows = num_embeddings // world_size
     D = grad_output.shape[-1]
 
@@ -1593,16 +1612,23 @@ def _trace_and_inline_subgraph(
 
 def _rewrite_forward_embeddings(
     gm: fx.GraphModule,
-    embedding_weight_nodes: Set[fx.Node],
+    weight_node_to_tensor: Dict[fx.Node, torch.Tensor],
     num_embeddings_fn: Callable[[int], int],
     group_name: str,
     world_size: int,
-) -> Dict[fx.Node, Tuple[int, int]]:
+) -> Dict[fx.Node, Tuple[int, int, int]]:
     """Rewrite forward ``aten.embedding`` nodes on sharded weights.
 
+    ``weight_node_to_tensor`` maps each embedding-weight placeholder node to
+    its real concrete sharded tensor.  Shapes are read from the concrete
+    tensor (never from ``node.meta["val"]``) because the outer fake_mode's
+    ``ShapeEnv`` symbolicizes placeholder shapes — ``torch.randn`` and
+    ``torch.randint`` reject ``SymIntArrayRef``.
+
     Returns a dict mapping each rewritten node's ``indices`` FX node to
-    ``(local_V, num_embeddings)`` — used by the backward pass to find the
-    corresponding ``aten.embedding_dense_backward`` nodes.
+    ``(local_V, num_embeddings, embedding_dim)`` — used by the backward
+    pass to find the corresponding ``aten.embedding_dense_backward`` nodes
+    and reconstruct concrete grad-output shapes.
     """
     from functools import partial
 
@@ -1611,21 +1637,24 @@ def _rewrite_forward_embeddings(
         for n in gm.graph.nodes
         if n.op == "call_function"
         and n.target == torch.ops.aten.embedding.default
-        and n.args[0] in embedding_weight_nodes
+        and n.args[0] in weight_node_to_tensor
     ]
 
-    forward_indices_meta: Dict[fx.Node, Tuple[int, int]] = {}
+    forward_indices_meta: Dict[fx.Node, Tuple[int, int, int]] = {}
 
     for emb_node in embedding_nodes:
         weight_node = cast(fx.Node, emb_node.args[0])
         indices_node = cast(fx.Node, emb_node.args[1])
 
-        weight_val = weight_node.meta["val"]
-        indices_val = indices_node.meta["val"]
-        local_V = weight_val.shape[0]
+        weight_tensor = weight_node_to_tensor[weight_node]
+        local_V, embedding_dim = (
+            int(weight_tensor.shape[0]),
+            int(weight_tensor.shape[1]),
+        )
         num_embeddings = num_embeddings_fn(local_V)
 
-        forward_indices_meta[indices_node] = (local_V, num_embeddings)
+        indices_ndim = len(indices_node.meta["val"].shape)
+        forward_indices_meta[indices_node] = (local_V, num_embeddings, embedding_dim)
 
         _trace_and_inline_subgraph(
             gm,
@@ -1637,8 +1666,17 @@ def _rewrite_forward_embeddings(
                 world_size=world_size,
             ),
             example_inputs=[
-                torch.randn(weight_val.shape, dtype=weight_val.dtype, device="cpu"),
-                torch.randint(0, num_embeddings, indices_val.shape, device="cpu"),
+                torch.randn(
+                    (local_V, embedding_dim),
+                    dtype=weight_tensor.dtype,
+                    device="cpu",
+                ),
+                torch.randint(
+                    0,
+                    num_embeddings,
+                    (_SYMBOLIC_TRACE_PLACEHOLDER_DIM,) * indices_ndim,
+                    device="cpu",
+                ),
             ],
             input_nodes=[weight_node, indices_node],
         )
@@ -1648,12 +1686,20 @@ def _rewrite_forward_embeddings(
 
 def _rewrite_backward_embeddings(
     gm: fx.GraphModule,
-    forward_indices_meta: Dict[fx.Node, Tuple[int, int]],
+    forward_indices_meta: Dict[fx.Node, Tuple[int, int, int]],
     group_name: str,
     world_size: int,
 ) -> List[fx.Node]:
     """Rewrite ``aten.embedding_dense_backward`` nodes whose ``indices``
     argument matches a previously rewritten forward embedding.
+
+    Reads the concrete embedding dimension ``D`` from the forward pass's
+    metadata (sourced from the real weight tensor).  ``grad_output`` shape
+    is ``(*indices_shape, D)`` — both axes are unbacked SymInts in
+    ``meta["val"]`` (one from ``kjt_split_per_feature``, one from the
+    weight placeholder under ``ShapeEnv``), so we substitute a placeholder
+    indices size and the concrete ``D``.  The symbolic trace re-symbolicizes
+    on its own example inputs.
 
     Returns the list of rewritten backward nodes (for the caller to know
     whether ``graph.lint()`` / ``recompile()`` is needed).
@@ -1674,9 +1720,12 @@ def _rewrite_backward_embeddings(
         padding_idx = bwd_node.args[3] if len(bwd_node.args) > 3 else -1
         scale_grad_by_freq = bwd_node.args[4] if len(bwd_node.args) > 4 else False
 
-        local_V, num_embeddings = forward_indices_meta[indices_node]
+        _local_V, num_embeddings, embedding_dim = forward_indices_meta[indices_node]
         grad_val = grad_output_node.meta["val"]
-        indices_val = indices_node.meta["val"]
+
+        # Match example-input rank to the call site's (see _rewrite_forward_embeddings).
+        # grad_output rank == indices rank + 1 (extra trailing D dim).
+        indices_ndim = len(indices_node.meta["val"].shape)
 
         _trace_and_inline_subgraph(
             gm,
@@ -1690,8 +1739,18 @@ def _rewrite_backward_embeddings(
                 scale_grad_by_freq=scale_grad_by_freq,
             ),
             example_inputs=[
-                torch.randn(grad_val.shape, dtype=grad_val.dtype, device="cpu"),
-                torch.randint(0, num_embeddings, indices_val.shape, device="cpu"),
+                torch.randn(
+                    (_SYMBOLIC_TRACE_PLACEHOLDER_DIM,) * indices_ndim
+                    + (embedding_dim,),
+                    dtype=grad_val.dtype,
+                    device="cpu",
+                ),
+                torch.randint(
+                    0,
+                    num_embeddings,
+                    (_SYMBOLIC_TRACE_PLACEHOLDER_DIM,) * indices_ndim,
+                    device="cpu",
+                ),
             ],
             input_nodes=[grad_output_node, indices_node],
         )
@@ -1702,7 +1761,7 @@ def _rewrite_backward_embeddings(
 def rewrite_sparse_embeddings(
     gm: fx.GraphModule,
     mesh: DeviceMesh,
-    embedding_param_indices: Set[int],
+    embedding_param_tensors: Dict[int, torch.Tensor],
 ) -> None:
     """Replace ``aten.embedding`` and ``aten.embedding_dense_backward`` nodes
     on sharded embedding params with decomposed row-wise AllToAll ops.
@@ -1712,6 +1771,13 @@ def rewrite_sparse_embeddings(
     than the v1 strategy map) and inlines the decomposed sub-graph via
     ``make_fx(tracing_mode="symbolic")`` + ``graph_copy``.
 
+    ``embedding_param_tensors`` maps each embedding-param placeholder
+    index to its concrete sharded local tensor.  Concrete shapes are
+    required because the outer fake_mode's ``ShapeEnv`` symbolicizes
+    every placeholder's ``meta["val"]``, and ``torch.randn`` /
+    ``torch.randint`` (used to build example inputs for the symbolic
+    sub-trace) reject ``SymIntArrayRef``.
+
     Must be called on the compiled graph returned by ``_local_compile``,
     **before** ``_finalize_graph``, so that the inlined AllToAll nodes are
     never re-traced under FakeTensorMode (where ``.tolist()`` would crash).
@@ -1720,15 +1786,15 @@ def rewrite_sparse_embeddings(
     group_name = funcol._resolve_group_name((mesh, 0))
 
     graph_placeholders = [n for n in gm.graph.nodes if n.op == "placeholder"]
-    embedding_weight_nodes: Set[fx.Node] = {
-        graph_placeholders[i]
-        for i in embedding_param_indices
+    weight_node_to_tensor: Dict[fx.Node, torch.Tensor] = {
+        graph_placeholders[i]: tensor
+        for i, tensor in embedding_param_tensors.items()
         if i < len(graph_placeholders)
     }
 
     forward_indices_meta = _rewrite_forward_embeddings(
         gm,
-        embedding_weight_nodes,
+        weight_node_to_tensor,
         lambda local_V: local_V * world_size,
         group_name,
         world_size,
