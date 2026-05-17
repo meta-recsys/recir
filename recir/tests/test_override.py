@@ -4,7 +4,7 @@
 
 """Tests verifying Override forward/backward mechanics.
 
-Tests the core override machinery (anchor ops, transform, dispatch) using
+Tests the core override machinery (anchor ops, patch_graph, dispatch) using
 a simple toy model without XLA, DMP, or multiprocess complexity.
 """
 
@@ -60,8 +60,8 @@ class TestOverride(unittest.TestCase):
         self.assertGreater(len(fwd), 0, "Expected fwd_anchor nodes")
         self.assertGreater(len(bwd), 0, "Expected bwd_anchor nodes")
 
-    def test_transform_replaces_anchors(self):
-        """override.transform() should replace anchor ops with dispatch calls."""
+    def test_patch_graph_replaces_anchors(self):
+        """override.patch_graph() should replace anchor ops with dispatch calls."""
         torch.manual_seed(42)
         preprocess = ToyPreprocess()
         dense = ToyDense()
@@ -73,7 +73,7 @@ class TestOverride(unittest.TestCase):
         x = torch.randint(0, 10, (3,))
 
         gm, flat_state = trace_train_step(wrapper, opt, x)
-        gm = override.transform(gm, flat_state)
+        gm = override.patch_graph(gm, flat_state)
 
         has_graph_break = any(
             n.op == "call_function" and n.meta.get("xla_graph_break")
@@ -106,7 +106,7 @@ class TestOverride(unittest.TestCase):
         x = torch.randint(0, 10, (3,))
 
         gm, flat_state = trace_train_step(wrapper, opt, x)
-        gm = override.transform(gm, flat_state)
+        gm = override.patch_graph(gm, flat_state)
         run_graph(gm, wrapper, opt, x)
 
         self.assertIsNotNone(
@@ -128,7 +128,7 @@ class TestOverride(unittest.TestCase):
         x = torch.randint(0, 10, (3,))
 
         gm, flat_state = trace_train_step(wrapper, opt, x)
-        gm = override.transform(gm, flat_state)
+        gm = override.patch_graph(gm, flat_state)
         run_graph(gm, wrapper, opt, x)
 
         self.assertIsNotNone(
@@ -164,7 +164,7 @@ class TestOverride(unittest.TestCase):
         opt = torch.optim.SGD(wrapper.parameters(), lr=0.01, foreach=False)
 
         gm, flat_state = trace_train_step(wrapper, opt, x)
-        gm = override.transform(gm, flat_state)
+        gm = override.patch_graph(gm, flat_state)
         run_graph(gm, wrapper, opt, x)
 
         self.assertIsNotNone(override_preprocess.embedding.weight.grad)
@@ -189,7 +189,7 @@ class TestOverride(unittest.TestCase):
         x = torch.randint(0, 10, (3,))
 
         gm, flat_state = trace_train_step(wrapper, opt, x)
-        gm = override.transform(gm, flat_state)
+        gm = override.patch_graph(gm, flat_state)
         with torch.no_grad():
             run_graph(gm, wrapper, opt, x)
 
@@ -222,7 +222,7 @@ class TestOverride(unittest.TestCase):
         opt = torch.optim.SGD(wrapper.parameters(), lr=0.01, foreach=False)
 
         gm, flat_state = trace_train_step(wrapper, opt, x)
-        gm = override.transform(gm, flat_state)
+        gm = override.patch_graph(gm, flat_state)
         with torch.no_grad():
             run_graph(gm, wrapper, opt, x)
 

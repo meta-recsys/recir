@@ -65,14 +65,14 @@ class Override(ABC):
     submodule with the return new submodule. The new submodule contains
     operations that users preferred to be traced, which simply be a dummy
     placeholder operator. After tracing, users can implement
-    :meth:`torch.distributed._spmd.Override.transform` to transform the traced
+    :meth:`torch.distributed._spmd.Override.patch_graph` to patch the traced
     graph, where the dummy placeholder operator serves as an anchor to insert
     new sub-graphs.
 
     For overrides that need integrated backward support (i.e., the override's
     backward should fire within the compiled ``train_step`` automatically),
     use :func:`recir.override_ops.replace_override_anchors` inside
-    ``transform()`` to replace anchor ops with runtime dispatch calls.
+    ``patch_graph()`` to replace anchor ops with runtime dispatch calls.
     """
 
     @abstractmethod
@@ -93,27 +93,27 @@ class Override(ABC):
         pass
 
     @abstractmethod
-    def transform(
+    def patch_graph(
         self,
         gm: fx.GraphModule,
         flat_state: List[torch.Tensor],
     ) -> fx.GraphModule:
         r"""
         Given a DTensor-expanded graph and sharding schema for every node,
-        conduct additional transformation for the sub-graph from the :class:`nn.Module`
-        returned by :meth:`torch.distributed._spmd.Override.replacement` if
-        necessary.
+        patch the sub-graph from the :class:`nn.Module` returned by
+        :meth:`torch.distributed._spmd.Override.replacement` if necessary
+        (e.g. to replace override-anchor nodes with runtime dispatch calls).
 
         Args:
             gm (:class:`fx.Graph`): a DTensor-expanded graph.
             flat_state (List[str, :class:`Tensor`]): a reference to the list of
                 flattened state. The elements in ``flat_state`` map to the first
-                ``len(flat_state)`` placeholders in the graph. The transformation
+                ``len(flat_state)`` placeholders in the graph. The patch
                 can add state to or remove state from ``flat_state`` as long as
                 it keeps ``flat_state`` and the placeholders consistent.
 
         Returns:
-            The :class:`fx.Graph` after transformation.
+            The :class:`fx.Graph` after patching.
 
         """
         pass
@@ -492,7 +492,7 @@ def _finalize_graph(
         gm = _dedup_collectives(gm)
     if module_override:
         for override in module_override:
-            gm = override.transform(gm, flat_state)
+            gm = override.patch_graph(gm, flat_state)
     _tag_batch_inputs(gm, len(flat_state), input_batch_dim)
     # Propagate batch-input meta through ops so intermediate FX nodes that
     # become subgraph boundaries (after segment_and_lower) inherit

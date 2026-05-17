@@ -197,7 +197,7 @@ Pod (1 of N)
      `replacement()` time (so the trace sees stable shapes).
   2. Mark inputs with `anchor_input` and outputs with `anchor_output` so
      `replace_override_anchors` can wire up runtime dispatch back to the
-     real modules in `transform()`.
+     real modules in `patch_graph()`.
   3. Inject a `_grad_anchor` parameter and `_batch_dep` term to keep
      autograd connectivity for `make_fx` backward tracing.
 

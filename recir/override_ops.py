@@ -96,14 +96,14 @@ def _input_anchor_fake(
     return torch.empty_like(x)
 
 
-def default_override_transform(
+def default_override_patch_graph(
     gm: fx.GraphModule,
     flat_state: list[torch.Tensor],
     orig_module: torch.nn.Module,
     override_id: int = 0,
     num_ranks: int = 1,
 ) -> fx.GraphModule:
-    """Standard transform: wire up *orig_module* as override forward/backward.
+    """Standard graph patch: wire up *orig_module* as override forward/backward.
 
     Forward: runs *orig_module* under ``enable_grad()``, flattens outputs
     via ``pytree.tree_leaves`` (filtering to tensors), saves
@@ -113,7 +113,7 @@ def default_override_transform(
     ``torch.autograd.backward`` on saved outputs.
 
     Args:
-        gm: the traced graph module to transform.
+        gm: the traced graph module to patch.
         flat_state: flattened model state (params + buffers + optimizer states).
         orig_module: the real module to run at runtime (e.g., the original
             preprocess that was replaced by a dummy during tracing).
@@ -176,7 +176,7 @@ def replace_override_anchors(
 ) -> fx.GraphModule:
     """Replace fwd_anchor/bwd_anchor nodes with dispatch calls to *fwd_fn*/*bwd_fn*.
 
-    This is the helper that Override subclasses call from ``transform()``
+    This is the helper that Override subclasses call from ``patch_graph()``
     to wire up their forward/backward callables into the traced graph.
 
     *fwd_fn* and *bwd_fn* are registered internally so the module-level

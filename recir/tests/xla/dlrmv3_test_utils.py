@@ -26,7 +26,7 @@ from generative_recommenders.modules.dlrm_hstu import (
 )
 from generative_recommenders.ops.jagged_tensors import concat_2D_jagged
 from recir.api import Override
-from recir.override_ops import anchor_output, default_override_transform
+from recir.override_ops import anchor_output, default_override_patch_graph
 from torchrec.modules.embedding_configs import EmbeddingConfig
 from torchrec.modules.embedding_modules import EmbeddingCollection
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
@@ -609,7 +609,7 @@ class DummyPreprocess(nn.Module):
 class DlrmV3SparseOverride(Override):
     """Swaps DlrmV3Preprocess with DummyPreprocess during tracing.
 
-    In ``transform()``, calls ``replace_override_anchors`` to wire up
+    In ``patch_graph()``, calls ``replace_override_anchors`` to wire up
     forward/backward dispatch closures that run the real preprocess at
     runtime.
     """
@@ -625,10 +625,10 @@ class DlrmV3SparseOverride(Override):
             return self._dummy
         return orig_submodule
 
-    def transform(
+    def patch_graph(
         self, gm: torch.fx.GraphModule, flat_state: List[Any]
     ) -> torch.fx.GraphModule:
-        return default_override_transform(
+        return default_override_patch_graph(
             gm,
             flat_state,
             self._orig_preprocess,  # pyre-ignore[6]

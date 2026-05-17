@@ -49,7 +49,7 @@ import torch.distributed as dist
 import torch.fx as fx
 import torch.nn as nn
 from recir.api import Override
-from recir.override_ops import default_override_transform
+from recir.override_ops import default_override_patch_graph
 from recir.tests.xla.dlrmv3_test_utils import (
     DlrmV3Preprocess,
     DlrmV3SparseOverride,
@@ -416,7 +416,7 @@ def _swap_ec(
 class JAXPreprocess:
     """Callable that runs DlrmV3Preprocess with JAX/SparseCore embedding lookup.
 
-    Passed to default_override_transform as the runtime dispatch target.
+    Passed to default_override_patch_graph as the runtime dispatch target.
     Runs as a recir graph break (outside XLA compilation).  Calls
     SparsecoreBackedEC.forward() which triggers the jit'd SparseCore lookup.
     """
@@ -456,7 +456,7 @@ class JAXEmbeddingOverride(Override):
     """Mirrors DlrmV3SparseOverride but dispatches to SparseCore at runtime.
 
     replacement(): swaps DlrmV3Preprocess → DummyPreprocess for tracing.
-    transform():   wires JAXPreprocess (not orig DlrmV3Preprocess) as the
+    patch_graph(): wires JAXPreprocess (not orig DlrmV3Preprocess) as the
                    runtime graph-break dispatch target.
     """
 
@@ -478,16 +478,16 @@ class JAXEmbeddingOverride(Override):
             return self._dummy  # tracing shim with anchor nodes
         return orig_submodule
 
-    def transform(
+    def patch_graph(
         self,
         gm: fx.GraphModule,
         flat_state: list[torch.Tensor],
     ) -> fx.GraphModule:
         assert self._orig_preprocess is not None, (
-            "replacement() must run before transform()"
+            "replacement() must run before patch_graph()"
         )
         self.jax_preprocess = JAXPreprocess(self._orig_preprocess, self._jax_ec)
-        return default_override_transform(
+        return default_override_patch_graph(
             gm,
             flat_state,
             self.jax_preprocess,  # pyre-ignore[6]: JAXPreprocess wraps Module

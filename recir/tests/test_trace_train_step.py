@@ -214,7 +214,7 @@ class TraceTrainStepTest(DTensorTestBase):
             ) -> torch.nn.Module:
                 return orig_submodule
 
-            def transform(
+            def patch_graph(
                 self,
                 gm: fx.GraphModule,
                 flat_state: List[torch.Tensor],
@@ -282,7 +282,7 @@ class TraceTrainStepTest(DTensorTestBase):
                     else orig_submodule
                 )
 
-            def transform(
+            def patch_graph(
                 self,
                 gm: fx.GraphModule,
                 flat_state: List[torch.Tensor],
@@ -345,7 +345,7 @@ class TraceTrainStepTest(DTensorTestBase):
                     else orig_submodule
                 )
 
-            def transform(
+            def patch_graph(
                 self,
                 gm: fx.GraphModule,
                 flat_state: List[torch.Tensor],

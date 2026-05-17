@@ -271,7 +271,7 @@ class DummySparseArch(nn.Module):
     ) -> Dict[str, JaggedTensor]:
         oid = self._override_id
 
-        # Anchor the input KJT components so SparseArchOverride.transform can
+        # Anchor the input KJT components so SparseArchOverride.patch_graph can
         # rediscover them via replace_override_anchors and use them as
         # dispatch inputs (instead of falling back to all batch placeholders).
         m_v = anchor_input(id_list_features.values(), oid, 0)
@@ -302,7 +302,7 @@ class PreprocessorOverride(Override):
     """Override that replaces PreprocessorStack with DummyPreprocessorStack.
 
     replacement() swaps the module before tracing.
-    transform() wires up runtime dispatch to the real PreprocessorStack
+    patch_graph() wires up runtime dispatch to the real PreprocessorStack
     via replace_override_anchors, using input_anchor nodes to identify
     the correct dispatch inputs.
 
@@ -350,7 +350,7 @@ class PreprocessorOverride(Override):
             return self._dummy  # pyre-ignore[7]
         return orig_submodule
 
-    def transform(
+    def patch_graph(
         self,
         gm: torch.fx.GraphModule,
         flat_state: List[torch.Tensor],
@@ -445,7 +445,7 @@ class SparseArchOverride(Override):
     """Override that replaces ECSparseArch with DummySparseArch.
 
     replacement() swaps the module before tracing.
-    transform() wires up runtime dispatch to the real ECSparseArch
+    patch_graph() wires up runtime dispatch to the real ECSparseArch
     via replace_override_anchors, using input_anchor nodes to identify
     the correct dispatch inputs (KJT values and lengths).
     """
@@ -475,7 +475,7 @@ class SparseArchOverride(Override):
             return self._dummy
         return orig_submodule
 
-    def transform(
+    def patch_graph(
         self,
         gm: torch.fx.GraphModule,
         flat_state: List[torch.Tensor],

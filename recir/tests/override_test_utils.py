@@ -8,7 +8,7 @@ import torch.nn as nn
 import torch.utils._pytree as pytree
 from functorch import make_fx
 from recir.api import _enable_compile, _rematerialize_optimizer, Override
-from recir.override_ops import anchor_output, default_override_transform
+from recir.override_ops import anchor_output, default_override_patch_graph
 from torch._subclasses.fake_tensor import FakeTensorMode
 from torch.nn.utils import stateless
 
@@ -104,8 +104,8 @@ class ToyOverride(Override):
             return self._dummy
         return orig_submodule
 
-    def transform(self, gm, flat_state):
-        return default_override_transform(
+    def patch_graph(self, gm, flat_state):
+        return default_override_patch_graph(
             gm,
             flat_state,
             self._orig_preprocess,
