@@ -229,7 +229,7 @@ class GSPMDParallel(ParallelMode):
 
         # Only shard tensors where the local shard can be evenly split
         # across local devices. This ensures _to_sharded_jax and
-        # _jit_gspmd agree on which tensors are FSDP-sharded.
+        # _build_gspmd_executable agree on which tensors are FSDP-sharded.
         def _can_fsdp(_key: str, t: torch.Tensor) -> bool:
             return (
                 t.ndim >= 1

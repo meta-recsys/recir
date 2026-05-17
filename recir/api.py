@@ -989,7 +989,7 @@ def _compile_gspmd(
         input_batch_dim=parallel_mode.input_batch_dim,
         dedup=False,
     )
-    # Set is_fsdp_sharded on placeholder nodes so _jit_gspmd knows
+    # Set is_fsdp_sharded on placeholder nodes so _build_gspmd_executable knows
     # which inputs are local shards.
     if sharded_keys:
         is_sharded: list[bool] = [key in sharded_keys for key in params_and_buffers]

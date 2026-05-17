@@ -12,8 +12,8 @@
 `is_batch_input` / `batch_dim`. After `segment_and_lower` cuts the gm at every
 graph break, intermediate FX nodes that cross subgraph boundaries become NEXT
 subgraph's placeholders. Without `is_batch_input` tags on those intermediate
-nodes, `_jit_gspmd` defaults to `replicated` sharding for them and JAX sees
-per-process shape (instead of global) - producing broadcast-shape mismatches
+nodes, `_build_gspmd_executable` defaults to `replicated` sharding for them and
+JAX sees per-process shape (instead of global) - producing broadcast-shape mismatches
 at downstream elementwise ops that mix per-process and global tensors.
 
 `propagate_batch_input_meta` walks the FX gm in topological order and tags each

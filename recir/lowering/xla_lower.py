@@ -127,11 +127,13 @@ class _XLAModule(torch.nn.Module):
             return torchax.interop.call_torch(gm, *jax_args)
 
         if self.backend_type == BackendType.XLA_GSPMD:
-            lowered, run = self._jit_gspmd(jax_fn, args, input_device)
+            lowered, run = self._build_gspmd_executable(jax_fn, args, input_device)
         elif self._has_collective_ops():
-            lowered, run = self._jit_shard_map(jax_fn, args, input_device)
+            lowered, run = self._build_shard_map_executable(jax_fn, args, input_device)
         else:
-            lowered, run = self._jit_plain(jax_fn, args, input_device, jax_device)
+            lowered, run = self._build_plain_executable(
+                jax_fn, args, input_device, jax_device
+            )
 
         # For shard_map, capture HLO from lowering (includes shard_map ops).
         # For GSPMD, HLO is captured lazily after compilation (run.hlo_text)
@@ -210,7 +212,7 @@ class _XLAModule(torch.nn.Module):
             jax_array.shape, NamedSharding(mesh, P()), local_buffers
         )
 
-    def _jit_shard_map(
+    def _build_shard_map_executable(
         self,
         jax_fn: Callable[..., Any],
         args: Tuple[torch.Tensor, ...],
@@ -259,7 +261,7 @@ class _XLAModule(torch.nn.Module):
             return a
         return jax.device_put(t2j(a), jax_device)
 
-    def _jit_plain(
+    def _build_plain_executable(
         self,
         jax_fn: Callable[..., Any],
         args: Tuple[torch.Tensor, ...],
@@ -301,7 +303,7 @@ class _XLAModule(torch.nn.Module):
                     queue.append(inp)
         return None
 
-    def _jit_gspmd(
+    def _build_gspmd_executable(
         self,
         jax_fn: Callable[..., Any],
         args: Tuple[torch.Tensor, ...],
