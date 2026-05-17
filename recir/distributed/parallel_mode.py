@@ -141,13 +141,14 @@ class ParallelMode(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def transform_and_compile(self, gm: GraphModule) -> GraphModule:
+    def refine_graph(self, gm: GraphModule) -> GraphModule:
         """
-        Transform and compile a distributed graph with a set of graph
-        transformation and optimization passes for each parallel mode.
+        Refine a distributed graph with a set of semantics-preserving
+        passes (comm fusion, comm scheduling, dead-code elimination,
+        weight-free, etc.) for this parallel mode.
 
-        The returned result should be a compiled executable graph in
-        the distributed environment.
+        The returned graph keeps the same meaning as the input — refinement
+        improves execution without changing model behavior.
         """
         # TODO: add more necessary arguments to this interface.
         raise NotImplementedError
@@ -258,9 +259,9 @@ class GSPMDParallel(ParallelMode):
         # No DTensor expansion. Return the graph as-is.
         return gm
 
-    def transform_and_compile(self, gm: GraphModule) -> GraphModule:
+    def refine_graph(self, gm: GraphModule) -> GraphModule:
         raise NotImplementedError(
-            "GSPMDParallel uses gm_transformation, not transform_and_compile"
+            "GSPMDParallel uses gm_transformation, not refine_graph"
         )
 
 
@@ -449,8 +450,8 @@ class DataParallel(ParallelMode):
         )
         return gm
 
-    def transform_and_compile(self, gm: GraphModule) -> GraphModule:
-        """optimize a distributed graph with a set of optimization passes"""
+    def refine_graph(self, gm: GraphModule) -> GraphModule:
+        """Refine a distributed graph with a set of semantics-preserving passes."""
         # TODO: add more necessary arguments to this interface.
         return self._gm_passes(gm)
 
@@ -582,5 +583,5 @@ class HybridParallel(ParallelMode):
 
         return gm
 
-    def transform_and_compile(self, gm: GraphModule) -> GraphModule:
+    def refine_graph(self, gm: GraphModule) -> GraphModule:
         return self._gm_passes(gm)
