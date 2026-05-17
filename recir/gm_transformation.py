@@ -24,8 +24,14 @@ from recir.passes import (
 from torch import fx
 
 
-def lower_gm(gm: fx.GraphModule, backend: Optional[BackendType]) -> fx.GraphModule:
-    """Lower a single graph module for the given backend."""
+def dispatch_gm(gm: fx.GraphModule, backend: Optional[BackendType]) -> fx.GraphModule:
+    """Dispatch a single graph module to the given backend.
+
+    Walks the FX graph, segments contiguous backend-compatible regions, and
+    wraps each region in a backend dispatch module (``_InductorModule`` /
+    ``_XLAModule``). NO backend IR is produced here — that happens lazily
+    on first ``forward`` of each dispatch module.
+    """
     if backend is None:
         return gm
 
@@ -40,18 +46,18 @@ def lower_gm(gm: fx.GraphModule, backend: Optional[BackendType]) -> fx.GraphModu
     return gm
 
 
-def lower_iter_gm(iter_gm: IterGraphModule, backend: Optional[BackendType]) -> None:
-    """Lower all graph modules in an IterGraphModule for the given backend.
+def dispatch_iter_gm(iter_gm: IterGraphModule, backend: Optional[BackendType]) -> None:
+    """Dispatch every sub-GM in an IterGraphModule to the given backend.
 
-    Each graph module (setup, main, cleanup) is lowered independently
+    Each sub-GM (setup, main, cleanup) is dispatched independently
     since they may have diverged after cross-iteration optimizations.
     """
     if backend is None:
         return
 
-    iter_gm.setup_gm = lower_gm(iter_gm.setup_gm, backend)
-    iter_gm.main_gm = lower_gm(iter_gm.main_gm, backend)
-    iter_gm.cleanup_gm = lower_gm(iter_gm.cleanup_gm, backend)
+    iter_gm.setup_gm = dispatch_gm(iter_gm.setup_gm, backend)
+    iter_gm.main_gm = dispatch_gm(iter_gm.main_gm, backend)
+    iter_gm.cleanup_gm = dispatch_gm(iter_gm.cleanup_gm, backend)
 
 
 class GraphPipeline:
@@ -110,8 +116,8 @@ class GraphPipeline:
 
         if not self.enable_iter_graph:
             # Skip IterGraphModule wrapping to avoid 3X compilation overhead
-            # from lowering setup/main/cleanup graphs separately.
-            gm = lower_gm(gm, self.backend)
+            # from dispatching setup/main/cleanup graphs separately.
+            gm = dispatch_gm(gm, self.backend)
 
             if self.dump_graphs:
                 dump_graphs_to_files(
@@ -126,7 +132,7 @@ class GraphPipeline:
             schedule_comm_wait(iter_gm)
             remove_copy_from_optimizer(iter_gm)
         iter_gm.finalize_setup()
-        lower_iter_gm(iter_gm, self.backend)
+        dispatch_iter_gm(iter_gm, self.backend)
 
         if self.dump_graphs:
             dump_graphs_to_files(
