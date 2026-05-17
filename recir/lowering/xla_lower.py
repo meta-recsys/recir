@@ -101,8 +101,10 @@ class _XLAModule(torch.nn.Module):
                     return True
         return False
 
-    def _compile_xla(self, *args: torch.Tensor) -> Callable[..., List[torch.Tensor]]:
-        """Compile the subgraph via torchax/JAX for XLA_SHARD_MAP or XLA_GSPMD.
+    def _build_xla_executable(
+        self, *args: torch.Tensor
+    ) -> Callable[..., List[torch.Tensor]]:
+        """Build the XLA executable for this subgraph (XLA_SHARD_MAP or XLA_GSPMD).
 
         Both backends share the same JAX-traceable function
         (``torchax.interop.call_torch``) since segment_and_lower ensures
@@ -461,7 +463,7 @@ class _XLAModule(torch.nn.Module):
                 BackendType.XLA_SHARD_MAP,
                 BackendType.XLA_GSPMD,
             ):
-                self.compiled = self._compile_xla(*args)
+                self.compiled = self._build_xla_executable(*args)
             else:
                 raise ValueError(f"Unknown XLA backend type: {self.backend_type}")
             logger.info("Completed XLA compilation for subgraph (%s)", tag)
