@@ -70,10 +70,10 @@ class _XLAModule(torch.nn.Module):
             for i, item in enumerate(items)
         ]
 
-    def _compile_dynamo_bridge(
+    def _build_dynamo_bridge_executable(
         self, *args: torch.Tensor
     ) -> Callable[..., List[torch.Tensor]]:
-        """Compile via torch_xla.core.dynamo_bridge.
+        """Build the XLA executable via torch_xla.core.dynamo_bridge.
 
         extract_compiled_graph:
           1. Copies the GraphModule to the lazy/XLA device.
@@ -458,7 +458,7 @@ class _XLAModule(torch.nn.Module):
                 self.backend_type.value,
             )
             if self.backend_type == BackendType.XLA_DYNAMO_BRIDGE:
-                self.compiled = self._compile_dynamo_bridge(*args)
+                self.compiled = self._build_dynamo_bridge_executable(*args)
             elif self.backend_type in (
                 BackendType.XLA_SHARD_MAP,
                 BackendType.XLA_GSPMD,
