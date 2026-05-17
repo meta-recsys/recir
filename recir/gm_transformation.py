@@ -54,7 +54,18 @@ def lower_iter_gm(iter_gm: IterGraphModule, backend: Optional[BackendType]) -> N
     iter_gm.cleanup_gm = lower_gm(iter_gm.cleanup_gm, backend)
 
 
-class GraphModuleTransformation:
+class GraphPipeline:
+    """Runs the per-graph recir pipeline: weight-free → IterGraphModule
+    formation → cross-iteration optimization → backend dispatch.
+
+    Despite the historical name (`GraphModuleTransformation`, kept as a
+    deprecated alias below), this class does NOT do region-semantic
+    transforms. The semantics-changing steps live in `RegionTransform`
+    subclasses; the per-mode optimization passes live in
+    `ParallelMode.refine_graph`. This class is the umbrella that runs the
+    remaining pipeline.
+    """
+
     def __init__(
         self,
         *,
@@ -128,3 +139,8 @@ class GraphModuleTransformation:
             )
 
         return iter_gm
+
+
+# Deprecated alias for the old name. Internal callers should prefer
+# `GraphPipeline`. Kept until OSS users migrate.
+GraphModuleTransformation = GraphPipeline
