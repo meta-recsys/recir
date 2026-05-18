@@ -3281,22 +3281,27 @@ def _aten_log2(x: Any) -> Any:
     return jnp.log2(x)
 
 
-# aten.logical_and
+# aten.logical_and (incl. in-place variant emitted by isposinf/isneginf
+# decompositions under proxy_tensor: `(x == ±inf) & ~isnan(x)` lowers to
+# `aten::logical_and_`).
 @op(torch.ops.aten.logical_and)
+@op(torch.ops.aten.logical_and_)  # pyre-ignore[56]
 @op(torch.ops.aten.__and__)  # pyre-ignore[56]
 def _aten_logical_and(self: Any, other: Any) -> Any:
     return jnp.logical_and(self, other)
 
 
-# aten.logical_or
+# aten.logical_or (incl. in-place variant for symmetry with logical_and_).
 @op(torch.ops.aten.logical_or)
+@op(torch.ops.aten.logical_or_)  # pyre-ignore[56]
 @op(torch.ops.aten.__or__)  # pyre-ignore[56]
 def _aten_logical_or(self: Any, other: Any) -> Any:
     return jnp.logical_or(self, other)
 
 
-# aten.logical_not
+# aten.logical_not (incl. in-place variant for symmetry).
 @op(torch.ops.aten.logical_not)  # pyre-ignore[56]
+@op(torch.ops.aten.logical_not_)  # pyre-ignore[56]
 def _aten_logical_not(self: Any) -> Any:
     return jnp.logical_not(self)
 
