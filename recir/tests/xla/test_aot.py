@@ -23,16 +23,19 @@ used by ``test_xsurface``).
 
 import os
 
-# Spoof multi-device JAX on CPU before any ``import jax``. Two devices is
+# Spoof multi-device JAX on CPU before any ``import jax``. Four devices is
 # enough to exercise SHARD_MAP / GSPMD lowering paths while keeping the
-# test fast.
+# test fast, and lets the AOT-topology test hold a *subset* of devices
+# in a virtual topology while ``jax.local_devices()`` still reports the
+# rest — i.e. the topology really does override device discovery.
 os.environ["JAX_PLATFORMS"] = "cpu"
 _existing_xla_flags: str = os.environ.get("XLA_FLAGS", "")
 if "xla_force_host_platform_device_count" not in _existing_xla_flags:
     os.environ["XLA_FLAGS"] = (
-        _existing_xla_flags + " --xla_force_host_platform_device_count=2"
+        _existing_xla_flags + " --xla_force_host_platform_device_count=4"
     ).strip()
 
+import dataclasses
 import os.path
 import tempfile
 import unittest
@@ -48,11 +51,32 @@ from recir.lowering.aot import (
     _key,
     aot_compile_and_serialize,
     aot_load_into,
+    aot_topology,
     AOTArtifact,
     load_artifacts,
     save_artifacts,
 )
-from recir.lowering.xla_lower import _XLAModule, partial_lower_xla
+from recir.lowering.xla_lower import (
+    _AOT_TOPOLOGY,
+    _get_global_devices,
+    _get_local_devices,
+    _XLAModule,
+    partial_lower_xla,
+)
+
+
+@dataclasses.dataclass
+class _FakeTopology:
+    """Minimal stand-in for ``jax.experimental.topologies.TopologyDescription``.
+
+    The real :class:`TopologyDescription` only exposes a ``.devices``
+    attribute, so any object implementing that contract is sufficient
+    for the AOT-topology code path. Using a fake here keeps the test
+    CPU-only (the real ``get_topology_desc(platform="tpu", ...)`` call
+    would require a TPU runtime that is unavailable on devserver CI).
+    """
+
+    devices: list[object]
 
 
 class _TinyMLP(nn.Module):
@@ -243,6 +267,115 @@ class WarmupCompilePopulatesCacheTest(unittest.TestCase):
         self.assertGreaterEqual(
             len(jax.devices()), 1, "no JAX devices visible — env not initialized"
         )
+
+
+class AOTTopologyContextManagerTest(unittest.TestCase):
+    """``aot_topology`` overrides device discovery for AOT compile.
+
+    These tests pin the contextvar contract: ``_get_global_devices`` and
+    ``_get_local_devices`` must report ``topo.devices`` while the
+    context is active, and revert to ``jax.{,_local}devices()`` once
+    the context exits. The recir AOT compile path on a CPU host depends
+    on this so the resulting binary targets the virtual TPU topology
+    instead of the CPU backend that is actually running the compile.
+    """
+
+    def test_default_no_override(self) -> None:
+        # Outside the context manager, the contextvar is None and the
+        # device-discovery helpers passthrough to JAX directly.
+        self.assertIsNone(_AOT_TOPOLOGY.get())
+        self.assertEqual(_get_global_devices(), jax.devices())
+        self.assertEqual(_get_local_devices(), jax.local_devices())
+
+    def test_topology_overrides_device_lists(self) -> None:
+        # Use a *subset* of the real CPU devices as the virtual topology
+        # so the test asserts override behavior rather than identity.
+        # Pick 2 devices out of the 4 spoofed by XLA_FLAGS.
+        all_devs = jax.devices()
+        self.assertGreaterEqual(
+            len(all_devs),
+            2,
+            "test requires >= 2 spoofed CPU devices; check XLA_FLAGS",
+        )
+        topo = _FakeTopology(devices=all_devs[:2])
+        with aot_topology(topo):
+            self.assertIs(_AOT_TOPOLOGY.get(), topo)
+            # Both helpers report the topology's devices — not just the
+            # local subset — so GSPMD compilation sees the full mesh.
+            self.assertEqual(_get_global_devices(), all_devs[:2])
+            self.assertEqual(_get_local_devices(), all_devs[:2])
+        # Context exit restores the JAX-backed view.
+        self.assertIsNone(_AOT_TOPOLOGY.get())
+        self.assertEqual(_get_global_devices(), all_devs)
+        self.assertEqual(_get_local_devices(), jax.local_devices())
+
+    def test_nested_contexts_stack_correctly(self) -> None:
+        # ``aot_topology`` is implemented with ``contextvars`` so nested
+        # invocations must restore the previous topology on exit, not
+        # reset to None.
+        all_devs = jax.devices()
+        outer_topo = _FakeTopology(devices=all_devs[:2])
+        inner_topo = _FakeTopology(devices=all_devs[:1])
+        with aot_topology(outer_topo):
+            self.assertIs(_AOT_TOPOLOGY.get(), outer_topo)
+            with aot_topology(inner_topo):
+                self.assertIs(_AOT_TOPOLOGY.get(), inner_topo)
+                self.assertEqual(_get_global_devices(), all_devs[:1])
+            # Inner exit restores OUTER, not None.
+            self.assertIs(_AOT_TOPOLOGY.get(), outer_topo)
+            self.assertEqual(_get_global_devices(), all_devs[:2])
+        self.assertIsNone(_AOT_TOPOLOGY.get())
+
+    def test_exception_inside_context_still_restores(self) -> None:
+        # @contextmanager wraps the yield in try/finally so the contextvar
+        # must reset even when the block raises.
+        topo = _FakeTopology(devices=jax.devices()[:1])
+        with self.assertRaises(RuntimeError):
+            with aot_topology(topo):
+                self.assertIs(_AOT_TOPOLOGY.get(), topo)
+                raise RuntimeError("boom")
+        self.assertIsNone(_AOT_TOPOLOGY.get())
+
+    def test_aot_topology_re_exported_from_aot_module(self) -> None:
+        # Public surface contract: callers import ``aot_topology`` from
+        # ``recir.lowering.aot`` (the AOT module) — not from the
+        # internal ``xla_lower`` module. Verify the re-export so we
+        # don't accidentally drop it on a future refactor.
+        from recir.lowering import aot as aot_module, xla_lower
+
+        self.assertIs(aot_module.aot_topology, xla_lower.aot_topology)
+
+
+class AOTTopologyDriveCompileTest(unittest.TestCase):
+    """End-to-end: compile inside ``aot_topology`` produces a usable
+    serialized executable.
+
+    The earlier round-trip test validates serialize/deserialize on its
+    own; this test additionally asserts the topology context manager
+    does not break the AOT pipeline. We use a virtual CPU topology
+    (i.e. devices the local backend already provides) so the compile
+    actually executes — switching to a real TPU topology would require
+    a TPU runtime.
+    """
+
+    def test_compile_inside_aot_topology_produces_artifacts(self) -> None:
+        all_devs = jax.devices()
+        topo = _FakeTopology(devices=all_devs[:2])
+        with aot_topology(topo):
+            lowered = _make_lowered_gm()
+            artifacts = aot_compile_and_serialize(lowered)
+        # Compile produced one artifact per _XLAModule, identical to the
+        # non-topology path (the topology is what the binary targets,
+        # not the count of subgraphs).
+        n_subgraphs = len(_xla_modules(lowered))
+        self.assertGreater(n_subgraphs, 0)
+        self.assertEqual(len(artifacts), n_subgraphs)
+        for key, art in artifacts.items():
+            self.assertGreater(
+                len(art.serialized), 0, f"empty serialized payload for {key}"
+            )
+        # Context-exit happened cleanly.
+        self.assertIsNone(_AOT_TOPOLOGY.get())
 
 
 if __name__ == "__main__":

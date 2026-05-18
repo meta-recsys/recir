@@ -28,9 +28,16 @@ Usage:
 
     # On a CPU host whose default mesh is a virtual TPU topology
     # produced by ``jax.experimental.topologies.get_topology_desc``:
-    artifacts = aot_compile_and_serialize(
-        compiled_obj, example_args_per_gm
+    from jax.experimental.topologies import get_topology_desc
+    from recir.lowering.aot import (
+        aot_compile_and_serialize, aot_topology, save_artifacts,
     )
+
+    topo = get_topology_desc(platform="tpu", topology="2x2x1")
+    with aot_topology(topo):
+        # build / lower / compile the model HERE; the ``_XLAModule``
+        # mesh sees ``topo.devices`` instead of the local CPU.
+        artifacts = aot_compile_and_serialize(compiled_obj)
     save_artifacts(artifacts, "/path/to/aot.bin")
 
     # On every accelerator pod (no virtual topology):
@@ -51,7 +58,7 @@ import torch
 import torch.fx as fx
 from jax.experimental import serialize_executable  # @manual
 from recir.iter_graph_module import IterGraphModule
-from recir.lowering.xla_lower import _XLAModule
+from recir.lowering.xla_lower import _XLAModule, aot_topology  # noqa: F401
 
 
 logger: logging.Logger = logging.getLogger(__name__)

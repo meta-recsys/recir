@@ -5,8 +5,10 @@
 # LICENSE file in the root directory of this source tree.
 
 # pyre-strict
+import contextlib
+import contextvars
 import logging
-from typing import Any, Callable, List, Optional, Tuple
+from typing import Any, Callable, Generator, List, Optional, Tuple
 
 import jax  # @manual
 import jax.numpy as jnp  # @manual
@@ -24,6 +26,61 @@ except ImportError:
     from jax.experimental.shard_map import shard_map
 
 logger: logging.Logger = logging.getLogger(__name__)
+
+
+# Cross-host AOT compile support. When set, the helpers below report the
+# virtual topology's devices instead of the host's local JAX devices, so
+# recir's mesh construction (and the per-input sharded JAX builder)
+# targets the AOT topology rather than the CPU backend that is actually
+# running the compile job. The contextvar default of ``None`` keeps every
+# existing caller on the live ``jax.devices()`` / ``jax.local_devices()``
+# path — the indirection is a true no-op for non-AOT users.
+_AOT_TOPOLOGY: contextvars.ContextVar[Optional[Any]] = contextvars.ContextVar(
+    "aot_topology", default=None
+)
+
+
+@contextlib.contextmanager
+def aot_topology(topology_desc: Any) -> Generator[None, None, None]:
+    """Override device discovery to a virtual topology for AOT compile.
+
+    Use on a CPU host when AOT-compiling for a TPU pod. Inside the
+    context, recir's mesh construction sees ``topology_desc.devices``
+    instead of the local CPU devices, so the produced binary targets
+    the virtual TPU topology and can be serialized via
+    :func:`recir.lowering.aot.aot_compile_and_serialize` for execution
+    on the actual pod (the Pax / MaxText "compile-once-on-CPU,
+    load-everywhere-on-TPU" pattern).
+
+    Args:
+        topology_desc: A ``jax.experimental.topologies.TopologyDescription``
+            (or any object exposing a ``.devices`` attribute that returns
+            a sequence of JAX device handles).
+    """
+    token = _AOT_TOPOLOGY.set(topology_desc)
+    try:
+        yield
+    finally:
+        _AOT_TOPOLOGY.reset(token)
+
+
+def _get_global_devices() -> List[Any]:
+    """Global JAX device list, honoring an active :func:`aot_topology`."""
+    topo = _AOT_TOPOLOGY.get()
+    return list(topo.devices) if topo is not None else jax.devices()
+
+
+def _get_local_devices() -> List[Any]:
+    """Local JAX device list, honoring an active :func:`aot_topology`.
+
+    AOT mode reports ALL virtual devices globally — GSPMD compilation
+    needs the full mesh view, not just one host's slice — so when a
+    topology is set, this returns ``topo.devices`` rather than the local
+    subset. Outside AOT mode it falls back to ``jax.local_devices()``,
+    matching the original behavior.
+    """
+    topo = _AOT_TOPOLOGY.get()
+    return list(topo.devices) if topo is not None else jax.local_devices()
 
 
 class _XLAModule(torch.nn.Module):
@@ -135,8 +192,8 @@ class _XLAModule(torch.nn.Module):
         torchax.default_env()
         gm: torch.fx.GraphModule = self.gm
         input_device: torch.device = args[0].device if args else torch.device("cpu")
-        local_devs = jax.local_devices()
-        jax_device: Any = local_devs[0] if local_devs else jax.devices()[0]
+        local_devs = _get_local_devices()
+        jax_device: Any = local_devs[0] if local_devs else _get_global_devices()[0]
 
         def jax_fn(*jax_args: Any) -> Any:
             return torchax.interop.call_torch(gm, *jax_args)
@@ -187,9 +244,13 @@ class _XLAModule(torch.nn.Module):
         elif tensor.dtype == torch.bfloat16:
             jax_array = jax_array.astype(jnp.bfloat16)
 
-        local_devices = jax.local_devices()
+        local_devices = _get_local_devices()
         num_local = len(local_devices)
-        num_global = jax.device_count()
+        # Honor :func:`aot_topology` here too: when set, the topology's
+        # devices are reported as both local and global, so the host-shard
+        # math collapses to ``num_global // num_local == 1`` (i.e. the
+        # AOT compile sees a single global mesh).
+        num_global = len(_get_global_devices())
         if is_batch_input:
             local_shards = jnp.split(jax_array, num_local, axis=input_batch_dim)
             local_buffers = [
@@ -232,7 +293,7 @@ class _XLAModule(torch.nn.Module):
         input_device: torch.device,
     ) -> Any:
         """jax.jit wrapped in shard_map for collectives."""
-        devices = jax.devices()
+        devices = _get_global_devices()
         mesh: Any = Mesh(devices, axis_names=("torch_dist",))
         placeholders = [n for n in self.gm.graph.nodes if n.op == "placeholder"]
         is_batch: List[bool] = [
@@ -335,7 +396,7 @@ class _XLAModule(torch.nn.Module):
         input_device: torch.device,
     ) -> Any:
         """jax.jit with GSPMD in_shardings/out_shardings."""
-        devices = jax.devices()
+        devices = _get_global_devices()
         mesh: Any = Mesh(devices, axis_names=("torch_dist",))
         replicated = NamedSharding(mesh, P())
         placeholders = [n for n in self.gm.graph.nodes if n.op == "placeholder"]
