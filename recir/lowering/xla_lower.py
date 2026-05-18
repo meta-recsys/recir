@@ -54,6 +54,14 @@ class _XLAModule(torch.nn.Module):
         self.keep_jax_output: bool = False
         self.torch_output_indices: Optional[set[int]] = None
         self.safe_donate_indices: Optional[set[int]] = None
+        # AOT (ahead-of-time) compile state. Populated by ``_compile_xla``
+        # whenever a backend produces a ``jax.stages.Compiled`` so an external
+        # caller (see ``recir.lowering.aot``) can serialize and ship the
+        # compiled executable instead of recompiling on every host. When
+        # ``_aot_loaded`` is True, ``forward`` skips ``_compile_xla`` and
+        # uses ``compiled`` directly.
+        self._jax_compiled: Optional[Any] = None
+        self._aot_loaded: bool = False
 
     def _postprocess_jax_output(
         self, jax_out: Any, input_device: torch.device
@@ -116,6 +124,13 @@ class _XLAModule(torch.nn.Module):
           single device.
         - **XLA_GSPMD**: ``jax.jit`` with explicit ``in_shardings`` /
           ``out_shardings`` read from per-node ``node.meta`` attributes.
+
+        Each ``_jit_*`` helper returns a ``run`` closure that, on first
+        invocation, materializes a ``jax.stages.Compiled`` and stashes
+        it on ``self._jax_compiled``. AOT callers (see
+        ``recir.lowering.aot``) trigger this by issuing a single warmup
+        call to the parent ``_XLAModule`` so the cached executable can
+        be serialized.
         """
         torchax.default_env()
         gm: torch.fx.GraphModule = self.gm
@@ -245,7 +260,14 @@ class _XLAModule(torch.nn.Module):
                 self._to_sharded_jax(a, mesh, is_batch_input=is_batch[j])
                 for j, a in enumerate(run_args)
             )
-            jax_out = jitted(*global_args)
+            # Prefer an AOT-installed or already-compiled executable so we
+            # capture ``jax.stages.Compiled`` exactly once (the JAX cache
+            # otherwise re-invokes lower+compile under the hood). When
+            # nothing is cached yet, fall back to the regular jitted path
+            # which compiles on first invocation.
+            if self._jax_compiled is None:
+                self._jax_compiled = jitted.lower(*global_args).compile()
+            jax_out = self._jax_compiled(*global_args)
             return self._postprocess_jax_output(jax_out, input_device)
 
         return lowered, run
@@ -270,10 +292,15 @@ class _XLAModule(torch.nn.Module):
         example_jax_args = tuple(self._t2j_safe(a, jax_device) for a in args)
         lowered = jax.jit(jax_fn).lower(*example_jax_args)
         compiled: Any = lowered.compile()
+        # Stash on the module so AOT serialization can pick it up.
+        self._jax_compiled = compiled
 
         def run(*run_args: torch.Tensor) -> List[torch.Tensor]:
             jax_args = tuple(self._t2j_safe(a, jax_device) for a in run_args)
-            jax_out = compiled(*jax_args)
+            # Prefer the AOT-installed executable when present; fall back
+            # to the eagerly built ``compiled`` from the enclosing scope.
+            executable = self._jax_compiled or compiled
+            jax_out = executable(*jax_args)
             return self._postprocess_jax_output(jax_out, input_device)
 
         return lowered, run
@@ -424,11 +451,16 @@ class _XLAModule(torch.nn.Module):
                 )
                 for j, a in enumerate(run_args)
             )
+            # First call materializes and stashes the compiled executable
+            # so AOT serializers can pick it up (and so subsequent calls
+            # bypass JAX's internal compile cache lookup, which avoids a
+            # second compile during compile-time HLO capture).
+            if self._jax_compiled is None:
+                self._jax_compiled = jitted.lower(*jax_args).compile()
             if not _hlo_captured[0]:
                 _hlo_captured[0] = True
-                compiled = jitted.lower(*jax_args).compile()
-                run.hlo_text = compiled.as_text()  # pyre-ignore[16]
-            jax_out = jitted(*jax_args)
+                run.hlo_text = self._jax_compiled.as_text()  # pyre-ignore[16]
+            jax_out = self._jax_compiled(*jax_args)
             return self._postprocess_jax_output(jax_out, input_device)
 
         run.hlo_text = None  # pyre-ignore[16]
@@ -459,6 +491,11 @@ class _XLAModule(torch.nn.Module):
                 BackendType.XLA_SHARD_MAP,
                 BackendType.XLA_GSPMD,
             ):
+                # AOT loaders pre-populate ``self._jax_compiled`` and set
+                # ``self._aot_loaded`` so the closures returned by the
+                # ``_jit_*`` helpers can pick the loaded executable up via
+                # ``self._jax_compiled`` instead of triggering a new
+                # compile on the local host.
                 self.compiled = self._compile_xla(*args)
             else:
                 raise ValueError(f"Unknown XLA backend type: {self.backend_type}")
