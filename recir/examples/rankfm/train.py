@@ -48,6 +48,7 @@ from recir.tests.xla.xsurface_test_utils import (
     _build_full_model,
     _build_overrides,
     _create_random_train_batch,
+    _create_uniform_train_batch,
     resize_batch_inplace,
     TestConfigProvider,
 )
@@ -302,35 +303,6 @@ def _patch_test_config_provider(cfg: RankFMConfig) -> None:
     TestConfigProvider.create_config = _patched_create_config
 
 
-def _create_uniform_batch(
-    feature_config: Any,
-    device: torch.device,
-    batch_size: int,
-) -> Any:
-    """Create a batch with uniform (non-jagged) shapes.
-
-    Uses RandomDataSourceConfig (non-ROO) so every sample has exactly
-    feature_config.num_candidates_per_request candidates and
-    feature_config.history_len history items.  This ensures B_NRO =
-    batch_size * C, which stays consistent after GSPMD tiling.
-    """
-    from minimal_viable_ai.core.dataloader.dataloader import RandomDataPipe
-    from minimal_viable_ai.core.dataloader.dataloader_configs import (
-        RandomDataSourceConfig,
-    )
-
-    pipe = RandomDataPipe(
-        feature_config=feature_config,
-        data_source_config=RandomDataSourceConfig(
-            batch_size=batch_size,
-            num_batches=1,
-            num_generate=1,
-            pin_memory=False,
-        ),
-    )
-    return next(iter(pipe)).to(device, non_blocking=False)
-
-
 def _build_compiled_train_step(
     cfg: RankFMConfig,
     num_ranks: int,
@@ -357,7 +329,7 @@ def _build_compiled_train_step(
     module_config = model.module_config  # pyre-ignore[16]
 
     torch.manual_seed(0)
-    batch = _create_uniform_batch(
+    batch = _create_uniform_train_batch(
         feature_config,
         device,
         batch_size=cfg.local_batch_size,
