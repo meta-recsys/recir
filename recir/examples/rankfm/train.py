@@ -297,6 +297,7 @@ def _patch_test_config_provider(cfg: RankFMConfig) -> None:
             ]
         if cfg.disable_seq_len_sampling:
             module_config.hstu_seq_len_sampling_configs = None
+        module_config.hstu_max_seq_len = cfg.max_uih_seq_len
         return config
 
     # pyre-ignore[8]
@@ -335,30 +336,28 @@ def _build_compiled_train_step(
         batch_size=cfg.local_batch_size,
     )
 
-    if cfg.enable_padding:
-        # Pre-compute padded_bs and pair_padded_bs using the SAME formula as
-        # PaddingRegionTransform's ``_discover``.  The override-built sample
-        # batch must already be at the post-pad sizes, otherwise the cached
-        # sparse-arch output won't dim-match the runtime-padded forward path
-        # (cat fails downstream in ``_forward_post_hstu``).
-        nd = num_ranks
-        padded_bs = compute_padded_shape(global_bs, nd)
-        # nro pair has its own batch dim (B_NRO != B_RO).  At trace time
-        # B_NRO = global_bs * num_candidates_per_request (uniform)
-        trace_pair_bs = global_bs * cfg.num_candidates
-        pair_padded_bs = compute_padded_shape(trace_pair_bs, nd)
+    ro_kjt = batch.ro_id_list_features
+    ro_kjt_keys: List[str] = ro_kjt.keys()
+    nro_kjt = batch.nro_id_list_features
+    nro_kjt_keys: List[str] = nro_kjt.keys()
+    unary_kjt = batch.unary_features
+    assert unary_kjt is not None
+    unary_kjt_keys: List[str] = unary_kjt.keys()
 
-        # Override-build batch must be at the post-pad sizes so the cached
-        # sparse-arch output dim-matches the runtime-padded forward path.
-        # Build it by deep-copying the small runtime batch and resizing in
-        # place; calling ``_create_uniform_batch(batch_size=padded_bs)``
-        # directly can SIGABRT inside ``RandomDataPipe``'s C++ allocator at
-        # large ``batch_size * num_candidates_per_request * history_len``.
+    if cfg.enable_padding:
+        # Override-build sample uses GLOBAL sizes (matches PaddingRegionTransform's
+        # pad_to_static fake kernel which also returns global ``target_size``).
+        # That keeps FX trace shapes consistent across override outputs and PRT
+        # pad outputs — both at global.  At runtime, fwd_fn returns PER-HOST
+        # data (cached.shape with dim 0 // num_processes) so _to_sharded_jax
+        # can expand per-host to global, matching PRT pad ops' runtime behavior.
+        padded_ro_bs = compute_padded_shape(global_bs, num_ranks)
+        padded_nro_bs = compute_padded_shape(global_bs * cfg.num_candidates, num_ranks)
         expanded_batch = copy.deepcopy(batch)
         resize_batch_inplace(
             expanded_batch,
-            target_b_ro=padded_bs,
-            target_b_nro=pair_padded_bs,
+            target_b_ro=padded_ro_bs,
+            target_b_nro=padded_nro_bs,
         )
         all_labels = expanded_batch.all_labels
         assert all_labels is not None
@@ -369,7 +368,7 @@ def _build_compiled_train_step(
             expanded_batch.num_candidates,
             all_labels,
         )
-        override_bs = padded_bs
+        override_bs = padded_ro_bs
     else:
         all_labels = batch.all_labels
         assert all_labels is not None
@@ -389,18 +388,19 @@ def _build_compiled_train_step(
         override_batch_sample,
         device,
         batch_size=override_bs,
+        num_processes=num_processes,
     )
+
+    if cfg.enable_padding and feature_config is not None:
+        torch.manual_seed(0)
+        batch = _create_random_train_batch(
+            feature_config,
+            device,
+            batch_size=cfg.local_batch_size,
+        )
+
     # Apply gloo + DMP for ROW_WISE embedding sharding.
     model, dense_opt = setup_dmp(model, cfg, gloo_world)
-
-    # Capture KJT keys for the runtime reconstruction inside train_step.
-    ro_kjt = batch.ro_id_list_features
-    ro_kjt_keys: List[str] = ro_kjt.keys()
-    nro_kjt = batch.nro_id_list_features
-    nro_kjt_keys: List[str] = nro_kjt.keys()
-    unary_kjt = batch.unary_features
-    assert unary_kjt is not None
-    unary_kjt_keys: List[str] = unary_kjt.keys()
 
     opt = dense_opt
 
@@ -423,25 +423,13 @@ def _build_compiled_train_step(
     }
 
     if cfg.enable_padding:
-        contextual_budgets = dict(module_config.contextual_feature_to_max_length)
-        history_budget = cfg.max_uih_seq_len
-        ro_per_sample = [
-            contextual_budgets.get(key, history_budget) for key in ro_kjt_keys
-        ]
         compile_kwargs["region_transforms"] = [
             PaddingRegionTransform(
                 jagged_pairs={
-                    "ro_id_list_values": JaggedPairConfig(
-                        "ro_id_list_lengths",
-                        per_sample_budgets=ro_per_sample,
-                    ),
-                    "nro_id_list_values": JaggedPairConfig(
-                        "nro_id_list_lengths",
-                        per_sample_budgets=1,
-                        batch_size_arg="nro_float_features",
-                        count_arg="num_candidates",
-                        max_per_sample_count=cfg.num_candidates,
-                    ),
+                    # RO/NRO id-list pairs are opted out below — they only
+                    # flow into PreprocessorOverride (a CPU graph break)
+                    # and stay at local stride throughout the preprocessor.
+                    # The override handles the padding.
                     "unary_values": JaggedPairConfig(
                         "unary_lengths",
                         per_sample_budgets=1,
@@ -453,6 +441,12 @@ def _build_compiled_train_step(
                 batch_size_arg="ro_float_features",
                 num_devices=num_ranks,
                 num_processes=num_processes,
+                skip_args={
+                    "ro_id_list_values",
+                    "ro_id_list_lengths",
+                    "nro_id_list_values",
+                    "nro_id_list_lengths",
+                },
             ),
         ]
 

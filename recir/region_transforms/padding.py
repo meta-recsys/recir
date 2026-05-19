@@ -36,7 +36,7 @@ import itertools
 import logging
 import math
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 import torch
 import torch.fx as fx
@@ -634,6 +634,8 @@ class PaddingRegionTransform(RegionTransform):
         num_devices: int = 1,
         num_processes: int = 1,
         batch_dim: int = 0,
+        *,
+        skip_args: Optional[Set[str]] = None,
     ) -> None:
         self._raw_jagged_pairs: Dict[str, JaggedPairConfig] = jagged_pairs
         self._raw_batch_size_arg: str = batch_size_arg
@@ -646,6 +648,10 @@ class PaddingRegionTransform(RegionTransform):
         self.num_processes: int = num_processes
         self.batch_dim: int = batch_dim
         self.batch_size_arg_idx: int = 0
+        # Train-step args opted out of padding here.  Useful when an Override
+        # downstream handles the static-shape conversion for these args.
+        self._skip_args: Set[str] = set(skip_args or set())
+        self._skip_indices: Set[int] = set()  # populated by bind_signature
         self._resolved_pairs: List[
             Tuple[
                 int,
@@ -669,9 +675,12 @@ class PaddingRegionTransform(RegionTransform):
             elif name in ("mod", "opt", "model", "optimizer"):
                 continue
             names.append(name)
+        self._skip_indices = {i for i, n in enumerate(names) if n in self._skip_args}
         self.batch_size_arg_idx = names.index(self._raw_batch_size_arg)
         self._resolved_pairs = []
         for v_name, config in self._raw_jagged_pairs.items():
+            if v_name in self._skip_args:
+                continue
             v_idx = names.index(v_name)
             l_idx = names.index(config.lengths)
             bs_idx = (
@@ -782,6 +791,8 @@ class PaddingRegionTransform(RegionTransform):
             jp.count_idx for jp in layout.jagged_pairs if jp.count_idx is not None
         }
         for i, t in enumerate(tensors):
+            if i in self._skip_indices:
+                continue
             if i in jagged_indices:
                 continue
             if i in count_indices:
@@ -804,6 +815,8 @@ class PaddingRegionTransform(RegionTransform):
                 bs_idx_set.add(jp.bs_idx)  # pyre-ignore
 
         for i, t in enumerate(tensors):
+            if i in self._skip_indices:
+                continue
             if i in jagged_indices or i in bs_idx_set:
                 continue
             if i in layout.batch_indices:
@@ -829,6 +842,7 @@ class PaddingRegionTransform(RegionTransform):
         recognized.update(bs_idx_set)
         recognized.update(layout.derived.keys())
         recognized.update(count_indices)
+        recognized.update(self._skip_indices)
         orphans: List[Tuple[int, List[int]]] = []
         for i, t in enumerate(tensors):
             if i in recognized:
