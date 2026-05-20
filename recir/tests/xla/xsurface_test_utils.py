@@ -33,6 +33,7 @@ from hammer.v3.modules.mot.tokenizers.mot_sparse_arch import ECSparseArch
 from hammer.v3.modules.recblock import _inputs_to_feature_bundle, RecBlock
 from minimal_viable_ai.core.dataloader.dataloader import RandomDataPipe
 from minimal_viable_ai.core.dataloader.dataloader_configs import (
+    RandomDataSourceConfig,
     RandomROODataSourceConfig,
 )
 from minimal_viable_ai.core.model_family_api.configs import RecModelFamilyConfig
@@ -947,6 +948,37 @@ def _create_random_train_batch(
     data_pipe = RandomDataPipe(
         feature_config=feature_config,
         data_source_config=data_source_config,
+    )
+    batch = cast(MTMLROOTrainBatch, next(iter(data_pipe)))
+    return batch.to(device, non_blocking=False)  # pyre-ignore
+
+
+def _create_uniform_train_batch(
+    feature_config: BlueReelsVDDFeatureConfig,
+    device: torch.device,
+    batch_size: int = TEST_BATCH_SIZE,
+) -> MTMLROOTrainBatch:
+    """Generate a uniform MTMLROOTrainBatch via RandomDataSourceConfig.
+
+    Uses the non-ROO data source so every sample has exactly
+    ``feature_config.num_candidates_per_request`` candidates and
+    ``feature_config.history_len`` history items, giving a deterministic
+    ``B_NRO = batch_size * num_candidates_per_request``. Callers that need
+    ``B_NRO`` to divide evenly across ``num_local`` (e.g., when there is no
+    ``PaddingRegionTransform`` to align jagged totals) should use this
+    instead of :func:`_create_random_train_batch`. The caller is responsible
+    for mutating ``feature_config.num_candidates_per_request`` /
+    ``history_len`` first if they need shapes other than the dataloader
+    defaults.
+    """
+    data_pipe = RandomDataPipe(
+        feature_config=feature_config,
+        data_source_config=RandomDataSourceConfig(
+            batch_size=batch_size,
+            num_batches=1,
+            num_generate=1,
+            pin_memory=False,
+        ),
     )
     batch = cast(MTMLROOTrainBatch, next(iter(data_pipe)))
     return batch.to(device, non_blocking=False)  # pyre-ignore

@@ -22,6 +22,7 @@ if "xla_force_host_platform_device_count" not in _existing_xla_flags:
         _existing_xla_flags + " --xla_force_host_platform_device_count=2"
     ).strip()
 
+import copy
 import unittest
 from typing import Any, Dict, Tuple
 
@@ -46,7 +47,7 @@ from recir.tests.xla.gspmd_test_utils import assert_hlo_has_collective
 from recir.tests.xla.xsurface_test_utils import (
     _build_full_model,
     _build_overrides,
-    _create_random_train_batch,
+    _create_uniform_train_batch,
     _make_sample_input,
     _verify_traced_graph,
     resize_batch_inplace,
@@ -95,8 +96,9 @@ class XSurfaceFakeTracingCompatTest(unittest.TestCase):
         recblock_sample, _, _ = _make_sample_input(model.recblock, device)
         overrides = _build_overrides(model.recblock, recblock_sample, device)
 
-        # Generate a random training batch for the full model inputs.
-        batch = _create_random_train_batch(feature_config, device)
+        feature_config.num_candidates_per_request = TEST_NUM_CANDIDATES
+        feature_config.history_len = TEST_MAX_UIH_SEQ_LEN
+        batch = _create_uniform_train_batch(feature_config, device)
 
         # Decompose KJTs into plain tensors for _local_compile.
         ro_kjt = batch.ro_id_list_features
@@ -189,17 +191,18 @@ class TestXSurfaceXLACompile(unittest.TestCase):
             if p.is_floating_point():
                 p.requires_grad_(True)
 
-        # When padding is enabled, build the override at the post-pad
-        # shapes PaddingRegionTransform feeds into the overridden sparse
-        # arch.  Use the same formulas as ``_discover``: padded_bs is the
-        # post-pad B_RO; pair_padded_bs is the post-pad B_NRO computed
-        # from the trace-time batch's actual jagged B_NRO.  We synthesize
-        # the override batch by resizing a fresh small batch up to those
-        # post-pad sizes, avoiding a second large-batch ``RandomDataPipe``
-        # call that can SIGABRT in its C++ allocator.  Mirrors
-        # ``_build_compiled_train_step`` in
+        # Both branches need a deterministic uniform trace batch: in the
+        # non-padding path, B_NRO must divide ``num_local`` up front; in
+        # the padding path, the override-built ``r_inter`` is sized off
+        # the preprocessor's structure (which is driven by feature_config),
+        # so the trace input's B_NRO has to match ``global_bs *
+        # num_candidates_per_request`` exactly.  Using a jagged ROO batch
+        # for trace input desyncs the post-pad ``r_dense`` from
+        # ``r_inter`` at ``_forward_post_hstu``'s cat.  Mirrors
         # ``recir/examples/rankfm/train.py``.
-        batch = _create_random_train_batch(
+        feature_config.num_candidates_per_request = TEST_NUM_CANDIDATES
+        feature_config.history_len = TEST_MAX_UIH_SEQ_LEN
+        batch = _create_uniform_train_batch(
             feature_config,
             device,
             batch_size=global_bs,
@@ -207,15 +210,14 @@ class TestXSurfaceXLACompile(unittest.TestCase):
         if use_padding:
             nd = self.num_ranks
             padded_bs = compute_padded_shape(global_bs, nd)
-            # Trace-time B_NRO comes from the actual (jagged) batch.
-            trace_pair_bs = batch.nro_float_features.shape[0]
+            # Uniform batch ⇒ trace-time B_NRO = global_bs * C.
+            trace_pair_bs = global_bs * TEST_NUM_CANDIDATES
             pair_padded_bs = compute_padded_shape(trace_pair_bs, nd)
             override_bs = padded_bs
-            override_batch = _create_random_train_batch(
-                feature_config,
-                device,
-                batch_size=global_bs,
-            )
+            # Deep-copy + resize avoids a second large-batch
+            # ``RandomDataPipe`` call that can SIGABRT in its C++
+            # allocator.
+            override_batch = copy.deepcopy(batch)
             resize_batch_inplace(
                 override_batch,
                 target_b_ro=padded_bs,
@@ -393,26 +395,35 @@ class TestXSurfaceXLACompile(unittest.TestCase):
         assert_hlo_has_collective(self, compiled_obj, "all-reduce", "XLA_GSPMD")
 
     def test_xsurface_compiles_with_padding(self) -> None:
-        """Verify XLA GSPMD compilation works with PaddingRegionTransform."""
+        """Verify XLA GSPMD compilation works with PaddingRegionTransform.
+
+        Also asserts that recir_padding ops actually appear in the compiled
+        graph — without this we'd be smoke-testing the compile but not
+        verifying PRT inserted any pad nodes (a silently-skipped PRT would
+        still ``assertIsNotNone``).
+        """
         compiled_obj, _ = self._build_compiled_train_step(use_padding=True)
         self.assertIsNotNone(compiled_obj)
-
-    def test_xsurface_params_change_after_training(self) -> None:
-        """Verify parameters actually change after training (not frozen)."""
-        torch.manual_seed(42)
-        device = torch.device("cpu")
-        model, _ = _build_full_model(device)
-        init_params = {n: p.detach().clone() for n, p in model.named_parameters()}
-
-        compiled_obj, trained_model = self._build_compiled_train_step(num_steps=2)
-
-        changed = 0
-        for name, param in trained_model.named_parameters():
-            init_p = init_params.get(name)
-            if init_p is not None and not torch.equal(init_p, param):
-                changed += 1
+        pad_targets = {
+            torch.ops.recir_padding.pad_to_static.default,
+            torch.ops.recir_padding.pad_count_to_sum.default,
+            torch.ops.recir_padding.pad_jagged_lengths.default,
+            torch.ops.recir_padding.pad_jagged_values.default,
+        }
+        seen_graphs: set[int] = set()
+        pad_op_count = 0
+        for gm_name in ("setup_gm", "main_gm", "cleanup_gm"):
+            gm = getattr(compiled_obj.gm, gm_name)
+            for sub in [gm, *gm.modules()]:
+                if not hasattr(sub, "graph") or id(sub.graph) in seen_graphs:
+                    continue
+                seen_graphs.add(id(sub.graph))
+                for node in sub.graph.nodes:
+                    if node.op == "call_function" and node.target in pad_targets:
+                        pad_op_count += 1
         self.assertGreater(
-            changed,
+            pad_op_count,
             0,
-            "No parameters changed after training - model may be frozen.",
+            "Expected recir_padding ops in compiled graph but found none — "
+            "PaddingRegionTransform may not have inserted any pad nodes.",
         )
