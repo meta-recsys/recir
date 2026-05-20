@@ -9,11 +9,13 @@ Contains dummy modules, override classes, model/batch builders, and helper
 functions used by both the fake-tracing-compat test and the XLA compile test.
 """
 
+import contextlib
 import unittest
-from typing import Any, cast, Dict, List, Tuple
+from typing import Any, cast, Dict, Generator, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from hammer.utils import HammerKernel
 from hammer.v3.models.udd_fm_v3.batch_loader import BlueReelsVDDFeatureConfig
 from hammer.v3.models.udd_fm_v3.udd_fm_config import (
@@ -51,6 +53,76 @@ TEST_UC_RID_HASH_SIZE: int = 1_000_000
 TEST_BATCH_SIZE: int = 4
 TEST_MAX_UIH_SEQ_LEN: int = 32
 TEST_NUM_CANDIDATES: int = 8
+
+# Sequential RO key used as the basis for deriving SEQ_LENGTHS at the
+# override boundary: SEQ_LENGTHS[i] = HSTU_ID_LIST[i][SEQ_LENGTHS_BASIS_KEY].lengths
+# + num_candidates.
+SEQ_LENGTHS_BASIS_KEY: str = "datafm_fb_trait_post_id"
+
+
+@contextlib.contextmanager
+def _disable_sampling(real_stack: PreprocessorStack) -> Generator[None, None, None]:
+    """Temporarily null out ``_uih_sampling_module`` on every
+    ``FeaturePreprocessor`` under ``real_stack.mot_preprocessor`` so the
+    cached output build is deterministic and represents the upper bound.
+    """
+    # pyre-ignore[16]: dynamic attr from PreprocessorStack setattr
+    preprocessors = list(real_stack.mot_preprocessor._hstu_preprocessor_list)
+    saved: List[Any] = []
+    for hp in preprocessors:
+        fp = hp._feature_preprocessor
+        saved.append(fp._uih_sampling_module)
+        fp._uih_sampling_module = None
+    try:
+        yield
+    finally:
+        for hp, s in zip(preprocessors, saved):
+            hp._feature_preprocessor._uih_sampling_module = s
+
+
+def _fit_to_shape(
+    t: torch.Tensor, target_shape: torch.Size | Tuple[int, ...]
+) -> torch.Tensor:
+    """End-pad with zeros (or narrow) each dim of *t* to ``target_shape``."""
+    target = tuple(int(s) for s in target_shape)
+    if tuple(t.shape) == target:
+        return t
+    pad_widths: List[int] = []
+    for actual, tgt in zip(reversed(t.shape), reversed(target)):
+        pad_widths += [0, max(0, int(tgt) - int(actual))]
+    out = F.pad(t, pad_widths) if any(p > 0 for p in pad_widths) else t
+    for d, (actual, tgt) in enumerate(zip(out.shape, target)):
+        if int(actual) > int(tgt):
+            out = out.narrow(d, 0, int(tgt))
+    return out
+
+
+def _pad_kjt_to_cached(
+    current_values: torch.Tensor,
+    current_lengths: torch.Tensor,
+    num_keys: int,
+    cached_lengths_buf: torch.Tensor,
+    num_processes: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Pad an output KJT to the per-host cached shape."""
+
+    global_stride = int(cached_lengths_buf.shape[0] // num_keys)  # global batch_size
+    per_host_stride = global_stride // num_processes  # local batch_size
+    cached_per_key_global = (
+        cached_lengths_buf.view(num_keys, global_stride).sum(dim=1).tolist()
+    )  # global cached length sum for each key
+    per_host_per_key_budgets = [int(b // num_processes) for b in cached_per_key_global]
+    # Values first — uses current_lengths to slide current per-key segments.
+    new_values = torch.ops.recir_padding.pad_jagged_values(
+        current_values, current_lengths, per_host_per_key_budgets, 0, -1, 1
+    )
+    # Lengths next — extends stride; deficit dummies absorb the growth from
+    # current per-key sums to per-host cached budgets so sum(new_lengths)
+    # == sum(per_host_per_key_budgets) == len(new_values).
+    new_lengths = torch.ops.recir_padding.pad_jagged_lengths(
+        current_lengths, per_host_per_key_budgets, per_host_stride, 1
+    )
+    return new_values, new_lengths
 
 
 # ---------------------------------------------------------------------------
@@ -129,7 +201,9 @@ class DummyPreprocessorStack(nn.Module):
         if precomputed_output is not None:
             cached_output = precomputed_output
         else:
-            cached_output: FeatureBundle = real_stack(input_features)
+            # Sampling off — see _disable_sampling doc-string for why.
+            with _disable_sampling(real_stack):
+                cached_output: FeatureBundle = real_stack(input_features)
 
         # Capture INPUT structure for fwd_fn reconstruction at runtime.
         entries: List[Tuple[FeatureDescriptor, str, Any]] = []
@@ -323,6 +397,7 @@ class PreprocessorOverride(Override):
         num_ranks: int = 1,
         sample_feature_bundle: FeatureBundle | None = None,
         precomputed_output: FeatureBundle | None = None,
+        num_processes: int = 1,
     ) -> None:
         self._device = device
         self._batch_size = batch_size
@@ -334,6 +409,11 @@ class PreprocessorOverride(Override):
         self._dummy: DummyPreprocessorStack | None = None
         self._sample_feature_bundle = sample_feature_bundle
         self._precomputed_output = precomputed_output
+        # Per-host fitting: cached buffers are at GLOBAL stride (override-
+        # build sample is global), runtime outputs are per-host
+        # (= cached.shape with dim 0 // num_processes) so _to_sharded_jax
+        # can expand back to global at the XLA boundary.
+        self._num_processes: int = num_processes
 
     def replacement(self, fqn: str, orig_submodule: nn.Module) -> nn.Module:
         if isinstance(orig_submodule, PreprocessorStack):
@@ -362,6 +442,7 @@ class PreprocessorOverride(Override):
         real_stack: nn.Module = self._orig_stack  # pyre-ignore[8]
         dummy: DummyPreprocessorStack = self._dummy  # pyre-ignore[8]
         num_ranks: int = self._num_ranks
+        num_processes_fit: int = self._num_processes
 
         # Input structure captured at construction time from sample_feature_bundle.
         entries: List[Tuple[FeatureDescriptor, str, Any]] = dummy._input_entries
@@ -399,25 +480,97 @@ class PreprocessorOverride(Override):
             with torch.enable_grad():
                 output = real_stack(bundle)
 
-            flat: List[torch.Tensor] = []
-            tensor_i = 0
-            for desc in output_tensor_descs:
-                val = output.get(desc)
-                if val is not None and isinstance(val, torch.Tensor):
-                    flat.append(val)
-                else:
-                    flat.append(getattr(dummy, f"_tensor_{tensor_i}"))
-                tensor_i += 1
+            # Fit each runtime output to the PER-HOST shape (cached shape
+            # with dim 0 // num_processes).  Cached buffers are at global
+            # (override-build sample is at global) but real_stack at runtime
+            # processes per-host data and produces per-host outputs.  We
+            # return per-host so _to_sharded_jax can expand to global —
+            # matching the per-host behavior of PRT pad ops at runtime.
+            def _per_host_target(cached_shape: torch.Size) -> Tuple[int, ...]:
+                out = list(int(s) for s in cached_shape)
+                if len(out) > 0:
+                    out[0] = out[0] // num_processes_fit
+                return tuple(out)
+
+            num_nro_candidates_padded: Optional[torch.Tensor] = output.get_tensor(
+                InputFeatures.NUM_CANDIDATES
+            )
+            seq_basis_lengths: Optional[torch.Tensor] = None
+            flat_kjts: List[torch.Tensor] = []
             kjt_i = 0
             for desc in output_kjt_descs:
+                cached_v = getattr(dummy, f"_kjt_values_{kjt_i}")
+                cached_l = getattr(dummy, f"_kjt_lengths_{kjt_i}")
+                target_v = _per_host_target(cached_v.shape)
+                target_l = _per_host_target(cached_l.shape)
+                num_keys = len(dummy._kjt_keys[kjt_i])
                 val = output.get(desc)
                 if val is not None and isinstance(val, KeyedJaggedTensor):
-                    flat.append(val.values())
-                    flat.append(val.lengths())
+                    fitted_v, fitted_l = _pad_kjt_to_cached(
+                        val.values(),
+                        val.lengths(),
+                        num_keys,
+                        cached_l,
+                        num_processes_fit,
+                    )
+                    if (
+                        desc.name == "merged"
+                        and SEQ_LENGTHS_BASIS_KEY in dummy._kjt_keys[kjt_i]
+                    ):
+                        basis_key_idx = dummy._kjt_keys[kjt_i].index(
+                            SEQ_LENGTHS_BASIS_KEY
+                        )
+                        per_host_stride = fitted_l.shape[0] // num_keys
+                        seq_basis_lengths = fitted_l.view(num_keys, per_host_stride)[
+                            basis_key_idx
+                        ]
+                    flat_kjts.append(fitted_v)
+                    flat_kjts.append(fitted_l)
                 else:
-                    flat.append(getattr(dummy, f"_kjt_values_{kjt_i}"))
-                    flat.append(getattr(dummy, f"_kjt_lengths_{kjt_i}"))
+                    flat_kjts.append(
+                        torch.zeros(
+                            target_v, dtype=cached_v.dtype, device=cached_v.device
+                        )
+                    )
+                    flat_kjts.append(
+                        torch.zeros(
+                            target_l, dtype=cached_l.dtype, device=cached_l.device
+                        )
+                    )
                 kjt_i += 1
+
+            # Now process tensor outputs; SEQ_LENGTHS gets derived inline
+            # as first_key_lengths(HSTU_ID_LIST[i]) + num_candidates.
+            flat_tensors: List[torch.Tensor] = []
+            tensor_i = 0
+            for desc in output_tensor_descs:
+                cached_t = getattr(dummy, f"_tensor_{tensor_i}")
+                target_shape = _per_host_target(cached_t.shape)
+                val = output.get(desc)
+                if val is not None and isinstance(val, torch.Tensor):
+                    if (
+                        desc.name.endswith("/seq_lengths")
+                        and seq_basis_lengths is not None
+                        and num_nro_candidates_padded is not None
+                    ):
+                        fitted = (seq_basis_lengths + num_nro_candidates_padded).to(
+                            cached_t.dtype
+                        )
+                    else:
+                        fitted = _fit_to_shape(val, target_shape)
+                    flat_tensors.append(fitted)
+                else:
+                    flat_tensors.append(
+                        torch.zeros(
+                            target_shape,
+                            dtype=cached_t.dtype,
+                            device=cached_t.device,
+                        )
+                    )
+                tensor_i += 1
+
+            # FX trace order: all tensors first, then KJT (values, lengths) pairs.
+            flat: List[torch.Tensor] = flat_tensors + flat_kjts
 
             state["saved"] = [t for t in flat if t.requires_grad]
             return tuple(t.detach() for t in flat)
@@ -603,6 +756,7 @@ def _build_overrides(
     sample_input: FeatureBundle,
     device: torch.device,
     batch_size: int = TEST_BATCH_SIZE,
+    num_processes: int = 1,
 ) -> List[Override]:
     """Build Override instances for tracing, capturing sparse arch I/O via hooks.
 
@@ -630,7 +784,7 @@ def _build_overrides(
 
     pre_handle = sparse_arch.register_forward_pre_hook(pre_hook)
     handle = sparse_arch.register_forward_hook(hook)
-    with torch.no_grad():
+    with torch.no_grad(), _disable_sampling(recblock.preprocessor_stack):
         preproc_output = recblock.preprocessor_stack(sample_input)
         try:
             recblock.tokenizer_stack(preproc_output)
@@ -657,6 +811,7 @@ def _build_overrides(
             batch_size=batch_size,
             sample_feature_bundle=sample_input,
             precomputed_output=preproc_output,
+            num_processes=num_processes,
         ),
         SparseArchOverride(
             cached_output=captured["output"],
@@ -679,15 +834,6 @@ def _build_full_model(
     config = config_provider.create_config()
     module_config = cast(BlueReelsVDDModuleConfig, config.module_config)
     feature_config = cast(BlueReelsVDDFeatureConfig, config.feature_config)
-
-    # Disable UIH sequence-length sampling. The config field is
-    # ``hstu_seq_len_sampling_configs`` (with the hstu_ prefix); setting
-    # ``seq_len_sampling_configs`` would silently create a new attribute
-    # and leave the real one at its TS_WEIGHTED default, which randomly
-    # drops tokens at preprocess time and produces non-deterministic
-    # post-preprocessor jagged totals (breaks the GSPMD shard-divisibility
-    # check on override outputs in the XLA compile path).
-    module_config.hstu_seq_len_sampling_configs = None
     # Trim each STU stack to a single layer to keep the test cheap.
     # Also disable ``use_cuda_attention`` on every attn config so the kernel
     # selection in ``hstu_cross_mha`` falls back to the pure-PyTorch path.

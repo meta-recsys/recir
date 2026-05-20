@@ -49,9 +49,7 @@ class RankFMConfig:
     dense_lr: float = 0.01
     embedding_lr: float = 0.1
 
-    # Disable sequence-length sampling for deterministic post-preprocessor
-    # jagged totals (required by the GSPMD shard-divisibility check).
-    disable_seq_len_sampling: bool = True
+    disable_seq_len_sampling: bool = False
 
     # Enable PaddingRegionTransform for dynamic-shape batches. When True,
     # jagged inputs are padded to static budgets at each step, allowing
@@ -82,6 +80,7 @@ class RankFMConfig:
             "--keep_seq_len_sampling",
             dest="disable_seq_len_sampling",
             action="store_false",
+            default=cfg.disable_seq_len_sampling,
         )
         p.add_argument(
             "--enable_padding", action="store_true", default=cfg.enable_padding
