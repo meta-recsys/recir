@@ -48,6 +48,7 @@ from recir.region_transforms import (
 from torch import fx
 from torch._subclasses.fake_tensor import FakeTensorMode
 from torch.export.unflatten import _assign_attr, _AttrKind
+from torch.fx.experimental.symbolic_shapes import ShapeEnv
 from torch.fx.graph import _PyTreeCodeGen, _PyTreeInfo, CodeGen
 from torch.fx.graph_module import _del_attr, _get_attr
 from torch.nn.utils import stateless
@@ -768,29 +769,15 @@ def _compile_data_parallel_v2(
     assert mod is not None
     _mod: nn.Module = mod
 
-    # 2. Extract params_and_buffers (used for embedding index computation
-    #    and shard_params).
-    params_and_buffers: Dict[str, Any] = {
-        **dict(_mod.named_parameters(remove_duplicate=False)),
-        **dict(_mod.named_buffers(remove_duplicate=False)),
-    }
-
-    # 3. Compute embedding-related values (HybridParallel only).
-    #    Must happen before sharding, which may change parameter objects
-    #    but not FQN order.
+    # 2. Resolve embedding param FQNs from the plan (HybridParallel only).
     embedding_param_fqns: Optional[set[str]] = None
-    embedding_param_indices: Optional[set[int]] = None
     if isinstance(parallel_mode, HybridParallel):
         fqns = parallel_mode.embedding_plan.param_fqns
         embedding_param_fqns = fqns if fqns else None
-        embedding_param_indices = parallel_mode._compute_embedding_param_indices(
-            params_and_buffers
-        )
 
-    # 4. Discover called modules and user autograd functions BEFORE sharding.
-    #    Discovery runs the train step under FakeTensorMode with hooks;
-    #    it must see unsharded parameters to avoid shape mismatches when
-    #    a parameter is reused multiple times in forward (shared weights).
+    # 3. Build transforms list (RegatherTransform for FULLY_SHARD + caller
+    #    region_transforms).  Embedding params are excluded from the regather
+    #    so that step 9's row-wise rewrite owns them.
     transforms: list[RegionTransform] = []
     if dp_style == DataParallelStyle.FULLY_SHARD:
         transforms.append(RegatherTransform(skip_param_fqns=embedding_param_fqns))
@@ -803,8 +790,31 @@ def _compile_data_parallel_v2(
     if module_override:
         _apply_module_overrides(_mod, module_override)
 
+    # 4. Extract params_and_buffers AFTER overrides so the dict matches the
+    #    (post-override) module that _local_compile will trace.  Critical
+    #    for correctness: shard_params mutates _mod by FQN, and embedding
+    #    indices into this dict must map to placeholder positions in the
+    #    traced graph (which uses the post-override params ordering).
+    params_and_buffers: Dict[str, Any] = {
+        **dict(_mod.named_parameters(remove_duplicate=False)),
+        **dict(_mod.named_buffers(remove_duplicate=False)),
+    }
+    embedding_param_indices: Optional[set[int]] = None
+    if isinstance(parallel_mode, HybridParallel):
+        embedding_param_indices = parallel_mode._compute_embedding_param_indices(
+            params_and_buffers
+        )
+
     # 5. Set up external fake mode for tracing.
-    fake_mode: FakeTensorMode = FakeTensorMode(allow_non_fake_inputs=True)
+    #    HybridParallel only: a ShapeEnv is attached so custom ops with
+    #    data-dependent output shapes (``recir_torchrec::kjt_split_per_feature``,
+    #    ``recir_preproc::mot_preprocessor_forward``) can mint fresh SymInts via
+    #    ``torch.library.get_ctx().new_dynamic_size()`` from their fake kernels.
+    #    Without a ShapeEnv those calls raise ``DynamicOutputShapeException``.
+    fake_mode: FakeTensorMode = FakeTensorMode(
+        allow_non_fake_inputs=True,
+        shape_env=ShapeEnv() if isinstance(parallel_mode, HybridParallel) else None,
+    )
 
     # Apply the per-process → per-device batch transform up front, so
     # discovery, region-transform inner trace, and the outer trace all
@@ -869,11 +879,22 @@ def _compile_data_parallel_v2(
     # 9. Embedding rewrite on the compiled graph (HybridParallel only).
     #    Pattern-match aten.embedding nodes on sharded embedding params
     #    and replace with decomposed AllToAll ops via secondary symbolic trace.
+    #
+    #    The rewrite needs concrete tensor shapes to build example inputs
+    #    for the symbolic sub-trace.  Reading shapes from ``placeholder.meta["val"]``
+    #    does not work here: the outer ``fake_mode`` carries a ``ShapeEnv`` which
+    #    symbolicizes every placeholder shape.
     if embedding_param_indices:
+        flat_params_buffers = list(local_result.params.values()) + list(
+            local_result.buffers.values()
+        )
+        embedding_param_tensors: Dict[int, torch.Tensor] = {
+            i: flat_params_buffers[i] for i in embedding_param_indices
+        }
         rewrite_sparse_embeddings(
             local_result.gm,
             mesh,
-            embedding_param_indices,
+            embedding_param_tensors,
         )
 
     # 10. Finalize.
