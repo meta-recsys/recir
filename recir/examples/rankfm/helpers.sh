@@ -15,18 +15,23 @@
 #   rankfm_kill              delete the current $JS
 #   rankfm_iterate [yaml]    build_image_podman.sh -> submit -> tail rank 0
 #
-# Override CTX in your environment to point at a different cluster:
+# Override CTX in your environment to point at a different cluster, or NS to
+# target a different team namespace:
 #     export CTX=gke_<project>_<region>_<cluster>
+#     export NS=ns-<your-team>
 #
-# Defaults assume the recir-v7-128 cluster documented in the README.
+# Defaults assume the prod training cluster documented in
+# fbcode/mrs/public_cloud/tpu/users/README.md and the Enablement MRS
+# Foundation namespace.
 
 _RANKFM_HELPERS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 _RANKFM_FBCODE_ROOT="$(cd "${_RANKFM_HELPERS_DIR}/../../.." && pwd)"
 _RANKFM_DEFAULT_YAML="${_RANKFM_HELPERS_DIR}/rankfm-128chip.yaml"
 _RANKFM_BUILD_SCRIPT="${_RANKFM_HELPERS_DIR}/build_image_podman.sh"
 
-: "${CTX:=gke_mrs-tpu-y317h_us-central1_recir-v7-128}"
-export CTX
+: "${CTX:=gke_mrs-tpu-y317h_us-central1_tpu-prod-training-cluster}"
+: "${NS:=ns-enablement-mrs-foundation}"
+export CTX NS
 
 # Meta devservers need the corp proxy for kubectl / gcloud / podman push.
 # These are no-ops if you've already exported them elsewhere.
@@ -42,28 +47,28 @@ rankfm_submit() {
         return 1
     fi
     local js_name
-    js_name=$(kubectl create -f "$yaml" --context="$CTX" \
+    js_name=$(kubectl create -f "$yaml" --context="$CTX" -n "$NS" \
         -o jsonpath='{.metadata.name}')
     export JS="$js_name"
-    echo "Submitted: $JS"
+    echo "Submitted: $JS (namespace: $NS)"
 }
 
 rankfm_status() {
     [ -z "$JS" ] && { echo "JS not set; run rankfm_submit first" >&2; return 1; }
-    kubectl get pods --context="$CTX" \
+    kubectl get pods --context="$CTX" -n "$NS" \
         -l "jobset.sigs.k8s.io/jobset-name=$JS" -o wide
 }
 
 rankfm_watch() {
     [ -z "$JS" ] && { echo "JS not set" >&2; return 1; }
-    kubectl get pods --context="$CTX" \
+    kubectl get pods --context="$CTX" -n "$NS" \
         -l "jobset.sigs.k8s.io/jobset-name=$JS" -w
 }
 
 rankfm_logs() {
     [ -z "$JS" ] && { echo "JS not set" >&2; return 1; }
     local rank0
-    rank0=$(kubectl get pods --context="$CTX" \
+    rank0=$(kubectl get pods --context="$CTX" -n "$NS" \
         -l "jobset.sigs.k8s.io/jobset-name=$JS" \
         -o name | grep 'worker-0-0-' | head -1 | sed 's|pod/||')
     if [ -z "$rank0" ]; then
@@ -71,23 +76,23 @@ rankfm_logs() {
         return 1
     fi
     echo "Tailing: $rank0"
-    kubectl logs -f "$rank0" --context="$CTX"
+    kubectl logs -f "$rank0" --context="$CTX" -n "$NS"
 }
 
 rankfm_logs_all() {
     [ -z "$JS" ] && { echo "JS not set" >&2; return 1; }
     kubectl logs -l "jobset.sigs.k8s.io/jobset-name=$JS" \
-        --context="$CTX" --max-log-requests=64 --prefix --tail=200 -f
+        --context="$CTX" -n "$NS" --max-log-requests=64 --prefix --tail=200 -f
 }
 
 rankfm_dump_logs() {
     [ -z "$JS" ] && { echo "JS not set" >&2; return 1; }
     mkdir -p /tmp/ranklogs
     rm -f /tmp/ranklogs/*.log
-    for pod in $(kubectl get pods --context="$CTX" \
+    for pod in $(kubectl get pods --context="$CTX" -n "$NS" \
         -l "jobset.sigs.k8s.io/jobset-name=$JS" -o name); do
         local name=${pod#pod/}
-        kubectl logs "$name" --context="$CTX" > "/tmp/ranklogs/${name}.log" 2>&1 &
+        kubectl logs "$name" --context="$CTX" -n "$NS" > "/tmp/ranklogs/${name}.log" 2>&1 &
     done
     wait
     echo "Dumped $(find /tmp/ranklogs/ -maxdepth 1 -name '*.log' | wc -l) logs to /tmp/ranklogs/"
@@ -122,7 +127,7 @@ rankfm_traceback() {
 
 rankfm_kill() {
     [ -z "$JS" ] && { echo "JS not set" >&2; return 1; }
-    kubectl delete "jobset/$JS" --context="$CTX"
+    kubectl delete "jobset/$JS" --context="$CTX" -n "$NS"
     unset JS
 }
 
@@ -131,7 +136,7 @@ rankfm_iterate() {
     ( cd "$_RANKFM_FBCODE_ROOT" && "$_RANKFM_BUILD_SCRIPT" ) || return 1
     rankfm_submit "$yaml" || return 1
     echo "Waiting for rank 0 to be Running before tailing..."
-    until kubectl get pods --context="$CTX" \
+    until kubectl get pods --context="$CTX" -n "$NS" \
         -l "jobset.sigs.k8s.io/jobset-name=$JS" \
         -o jsonpath='{.items[*].status.phase}' 2>/dev/null \
         | grep -q Running; do
