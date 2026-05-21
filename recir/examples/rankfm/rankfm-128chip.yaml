@@ -1,19 +1,30 @@
 # RankFM (xsurface V3) full-scale training on 128-chip unified TPU slice (32 nodes, 4x4x8)
-# Requires recir-v7-128 cluster with workload policy.
+# Uses dynamic auto-slice scheduling (tpuxpack) — ICI is wired at runtime via Slice CR.
 apiVersion: jobset.x-k8s.io/v1alpha2
 kind: JobSet
 metadata:
   generateName: rankfm-128chip-
-  namespace: default
+  namespace: ns-enablement-mrs-foundation
+  labels:
+    kueue.x-k8s.io/queue-name: lq-training
+    x.tpu.cloud.google.com/slice-autoprovisioning: "async"
 spec:
   replicatedJobs:
   - name: worker
     replicas: 1
     template:
+      metadata:
+        labels:
+          x.tpu.google.com/inject-slice-selector: "true"
       spec:
         parallelism: 32
         completions: 32
+        completionMode: Indexed
+        backoffLimit: 0
         template:
+          metadata:
+            annotations:
+              cloud.google.com/gke-tpu-slice-topology: "4x4x8"
           spec:
             containers:
             - name: rankfm
@@ -48,5 +59,9 @@ spec:
                   google.com/tpu: 4
             nodeSelector:
               cloud.google.com/gke-tpu-accelerator: tpu7x
-              cloud.google.com/gke-tpu-topology: 4x4x8
+              cloud.google.com/gke-tpu-topology: "4x4x8"
+            tolerations:
+            - key: "google.com/tpu"
+              operator: "Exists"
+              effect: "NoSchedule"
             restartPolicy: Never
