@@ -486,45 +486,37 @@ class STUDTensorTest(DTensorTestBase):
         set_dev_mode(True)
 
         for data_parallel_mode in ["replicate", "fully_shard"]:
-            for use_parametrization in [False, True]:
 
-                @compile(
-                    parallel_mode=DataParallel(
-                        data_parallel_mode,
-                        use_parametrization=use_parametrization,
-                    )
-                )
-                def train_step(
-                    mod: torch.nn.Module,
-                    opt: torch.optim.Optimizer,
-                    x: torch.Tensor,
-                    x_lengths: torch.Tensor,
-                    x_offsets: torch.Tensor,
-                    max_seq_len: int,
-                    num_targets: torch.Tensor,
-                ) -> None:
-                    mod(
-                        x, x_lengths, x_offsets, max_seq_len, num_targets
-                    ).sum().backward()
-                    opt.step()
+            @compile(parallel_mode=DataParallel(data_parallel_mode))
+            def train_step(
+                mod: torch.nn.Module,
+                opt: torch.optim.Optimizer,
+                x: torch.Tensor,
+                x_lengths: torch.Tensor,
+                x_offsets: torch.Tensor,
+                max_seq_len: int,
+                num_targets: torch.Tensor,
+            ) -> None:
+                mod(x, x_lengths, x_offsets, max_seq_len, num_targets).sum().backward()
+                opt.step()
 
-                mod = Model().cuda(self.rank)
-                torch.manual_seed(seed)
-                x, x_lengths, x_offsets, max_seq_len, num_targets = build_inputs()
-                x = x.cuda(self.rank)
-                x_lengths = x_lengths.cuda(self.rank)
-                x_offsets = x_offsets.cuda(self.rank)
-                num_targets = num_targets.cuda(self.rank)
-                self._test_train_step(
-                    train_step,
-                    mod,
-                    x,
-                    x_lengths,
-                    x_offsets,
-                    max_seq_len,
-                    num_targets,
-                    data_parallel_mode,
-                )
+            mod = Model().cuda(self.rank)
+            torch.manual_seed(seed)
+            x, x_lengths, x_offsets, max_seq_len, num_targets = build_inputs()
+            x = x.cuda(self.rank)
+            x_lengths = x_lengths.cuda(self.rank)
+            x_offsets = x_offsets.cuda(self.rank)
+            num_targets = num_targets.cuda(self.rank)
+            self._test_train_step(
+                train_step,
+                mod,
+                x,
+                x_lengths,
+                x_offsets,
+                max_seq_len,
+                num_targets,
+                data_parallel_mode,
+            )
 
 
 # ---------------------------------------------------------------------------

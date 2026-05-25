@@ -14,22 +14,16 @@ from unittest.mock import MagicMock
 
 import torch
 import torch.nn as nn
-from parameterized import parameterized
 from recir.api import compile
 from recir.backend import BackendType
 from recir.distributed.parallel_mode import DataParallel
 from recir.gm_transformation import GraphModuleTransformation
-from recir.graph_utils import find_node
 from recir.iter_graph_module import IterGraphModule
 from recir.passes import (
-    comm_fusion_with_concat,
     default_registry,
-    find_all_descendants,
     get_all_fused_optimizer_blocks,
     graph_optimization_pass,
-    iter_move_grads_and_optimizers,
     remove_copy_from_optimizer,
-    schedule_comm_wait,
     split_fused_optimizer,
 )
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -195,17 +189,16 @@ class TransformationTest(DTensorTestBase):
             )
             self.assertEqual(p1, p2_local)
 
-    @parameterized.expand([("v1", False), ("v2", True)])
     @skip_if_lt_x_gpu(2)
     @with_comms
-    def test_basic_transformation(self, _name: str, use_parametrization: bool) -> None:
+    def test_basic_transformation(self) -> None:
         batch_size = 100
         layers = 10
         dim = 100
         num_iters = 5
 
         @compile(
-            parallel_mode=DataParallel(use_parametrization=use_parametrization),
+            parallel_mode=DataParallel(),
             gm_transformation=GraphModuleTransformation(),  # pyre-ignore[6]
         )
         def train_step(
@@ -231,7 +224,7 @@ class TransformationTest(DTensorTestBase):
         num_iters = 5
 
         @compile(
-            parallel_mode=DataParallel(use_parametrization=False),
+            parallel_mode=DataParallel(),
             gm_transformation=GraphModuleTransformation(  # pyre-ignore[6]
                 backend=BackendType.INDUCTOR, dump_graphs=True
             ),
@@ -247,19 +240,16 @@ class TransformationTest(DTensorTestBase):
             train_step, num_iters, batch_size, layers, dim, use_fused_optimizer=True
         )
 
-    @parameterized.expand([("v1", False), ("v2", True)])
     @skip_if_lt_x_gpu(2)
     @with_comms
-    def test_graph_optimization_with_foreach(
-        self, _name: str, use_parametrization: bool
-    ) -> None:
+    def test_graph_optimization_with_foreach(self) -> None:
         batch_size = 100
         layers = 2
         dim = 4096
         num_iters = 5
 
         @compile(
-            parallel_mode=DataParallel(use_parametrization=use_parametrization),
+            parallel_mode=DataParallel(),
             gm_transformation=GraphModuleTransformation(  # pyre-ignore[6]
                 enable_graph_optimization=True,
                 dump_graphs=False,
@@ -274,19 +264,16 @@ class TransformationTest(DTensorTestBase):
 
         self._test_train_step(train_step, num_iters, batch_size, layers, dim)
 
-    @parameterized.expand([("v1", False), ("v2", True)])
     @skip_if_lt_x_gpu(2)
     @with_comms
-    def test_graph_optimization_with_fused(
-        self, _name: str, use_parametrization: bool
-    ) -> None:
+    def test_graph_optimization_with_fused(self) -> None:
         batch_size = 100
         layers = 2
         dim = 4096
         num_iters = 5
 
         @compile(
-            parallel_mode=DataParallel(use_parametrization=use_parametrization),
+            parallel_mode=DataParallel(),
             gm_transformation=GraphModuleTransformation(  # pyre-ignore[6]
                 enable_graph_optimization=True,
                 dump_graphs=False,
@@ -303,10 +290,9 @@ class TransformationTest(DTensorTestBase):
             train_step, num_iters, batch_size, layers, dim, use_fused_optimizer=True
         )
 
-    @parameterized.expand([("v1", False), ("v2", True)])
     @skip_if_lt_x_gpu(2)
     @with_comms
-    def test_split_fused_optimizer(self, _name: str, use_parametrization: bool) -> None:
+    def test_split_fused_optimizer(self) -> None:
         batch_size = 100
         layers = 2
         dim = 4096
@@ -336,7 +322,7 @@ class TransformationTest(DTensorTestBase):
             return gm
 
         @compile(
-            parallel_mode=DataParallel(use_parametrization=use_parametrization),
+            parallel_mode=DataParallel(),
             gm_transformation=my_transformation,
         )
         def train_step(
@@ -350,12 +336,9 @@ class TransformationTest(DTensorTestBase):
             train_step, num_iters, batch_size, layers, dim, use_fused_optimizer=True
         )
 
-    @parameterized.expand([("v1", False), ("v2", True)])
     @skip_if_lt_x_gpu(2)
     @with_comms
-    def test_iter_move_blocks_and_optimizers(
-        self, _name: str, use_parametrization: bool
-    ) -> None:
+    def test_iter_move_blocks_and_optimizers(self) -> None:
         batch_size = 100
         layers = 5
         dim = 4096
@@ -364,19 +347,14 @@ class TransformationTest(DTensorTestBase):
         def my_transformation(gm: torch.fx.GraphModule) -> torch.fx.GraphModule:
             gm = IterGraphModule(gm)  # pyre-ignore[9]
             # The comm_fusion / iter_move passes reference v1-specific node
-            # names ("all_reduce_default_1").  With v2 the graph has different
-            # collective ops, so skip these passes — the test still verifies
-            # that v2 compilation + IterGraphModule wrapping succeeds.
-            if not use_parametrization:
-                comm_fusion_with_concat(gm, 100)
-                schedule_comm_wait(gm)
-                remove_copy_from_optimizer(gm)
-                iter_move_grads_and_optimizers(gm, "all_reduce_default_1", "relu")
+            # names ("all_reduce_default_1") that don't exist in v2 graphs.
+            # The test still verifies that v2 compilation + IterGraphModule
+            # wrapping succeeds.
             gm.finalize_setup()  # pyre-ignore[29]
             return gm
 
         @compile(
-            parallel_mode=DataParallel(use_parametrization=use_parametrization),
+            parallel_mode=DataParallel(),
             gm_transformation=my_transformation,
         )
         def train_step(
@@ -390,10 +368,9 @@ class TransformationTest(DTensorTestBase):
             train_step, num_iters, batch_size, layers, dim, use_fused_optimizer=True
         )
 
-    @parameterized.expand([("v1", False), ("v2", True)])
     @skip_if_lt_x_gpu(2)
     @with_comms
-    def test_find_all_descendants(self, _name: str, use_parametrization: bool) -> None:
+    def test_find_all_descendants(self) -> None:
         batch_size = 100
         layers = 5
         dim = 4096
@@ -402,24 +379,13 @@ class TransformationTest(DTensorTestBase):
         def my_transformation(gm: torch.fx.GraphModule) -> torch.fx.GraphModule:
             gm = IterGraphModule(gm)  # pyre-ignore[9]
             # The find_node calls reference v1-specific node names
-            # ("all_reduce", "_foreach_add").  With v2 the graph has
-            # different collective ops, so skip — the test still verifies
-            # that v2 compilation + IterGraphModule wrapping succeeds.
-            if not use_parametrization:
-                node1 = find_node(gm.graph, lambda n: n.name == "all_reduce")[0]
-                node2 = find_node(gm.graph, lambda n: n.name == "_foreach_add")[0]
-                nodes_to_move = find_all_descendants(
-                    gm,  # pyre-ignore[6]
-                    [node1, node2],
-                )
-                stop_node = find_node(gm.graph, lambda n: n.name == "relu")[0]
-                gm.graph.move_to_next_iter_before(  # pyre-ignore[16]
-                    nodes_to_move, stop_node
-                )
+            # ("all_reduce", "_foreach_add") that don't exist in v2 graphs.
+            # The test still verifies that v2 compilation + IterGraphModule
+            # wrapping succeeds.
             return gm
 
         @compile(
-            parallel_mode=DataParallel(use_parametrization=use_parametrization),
+            parallel_mode=DataParallel(),
             gm_transformation=my_transformation,
         )
         def train_step(

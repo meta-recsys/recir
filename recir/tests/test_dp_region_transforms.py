@@ -116,7 +116,6 @@ class TestDPRegionTransform(DTensorTestBase):
             parallel_mode=DataParallel(
                 "replicate",
                 loss_reduction=loss_reduction,
-                use_parametrization=True,
             ),
             region_transforms=[RecomputeTransform(submodule_fqns={"relu"})],
         )(train_step)
@@ -148,7 +147,6 @@ class TestDPRegionTransform(DTensorTestBase):
             parallel_mode=DataParallel(
                 "fully_shard",
                 loss_reduction=loss_reduction,
-                use_parametrization=True,
             ),
             region_transforms=[RecomputeTransform(submodule_fqns={"relu"})],
         )(train_step)
@@ -187,7 +185,6 @@ class TestDPStructural(DTensorTestBase):
                 parallel_mode=DataParallel(
                     "replicate",
                     loss_reduction="sum",
-                    use_parametrization=True,
                 ),
                 region_transforms=region_transforms,
             )(train_step)
@@ -237,7 +234,6 @@ class TestDPStructural(DTensorTestBase):
                 parallel_mode=DataParallel(
                     "replicate",
                     loss_reduction="sum",
-                    use_parametrization=True,
                 ),
                 region_transforms=region_transforms,
             )(train_step)

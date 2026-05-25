@@ -10,7 +10,19 @@ import operator
 from contextlib import contextmanager
 from enum import Enum
 from functools import cached_property
-from typing import Any, Callable, cast, Dict, List, Optional, Set, Tuple, Type, Union
+from typing import (
+    Any,
+    Callable,
+    cast,
+    Dict,
+    FrozenSet,
+    List,
+    Optional,
+    Set,
+    Tuple,
+    Type,
+    Union,
+)
 
 import torch
 import torch.distributed._functional_collectives as funcol
@@ -235,7 +247,15 @@ def gradients_tagging(params: Dict[str, torch.Tensor]) -> Any:
             h.remove()
 
 
-_PARAMETRIZATION_CLASS_CACHE: Dict[Type[nn.Module], Type[nn.Module]] = {}
+# Cache key is (base_class, frozenset(param_names)) — two ``nn.Linear``
+# instances with different parameter sets (e.g. ``bias=True`` vs
+# ``bias=False``) need different parametrized subclasses because each
+# subclass installs ``property`` getters for exactly the params present.
+# Sharing a single subclass across all Linears would make later instances
+# inherit a property they have no entry for in ``_parametrizations``.
+_PARAMETRIZATION_CLASS_CACHE: Dict[
+    Tuple[Type[nn.Module], FrozenSet[str]], Type[nn.Module]
+] = {}
 
 
 def _register_parametrization(
@@ -280,7 +300,8 @@ def _register_parametrization(
             for pn in all_param_names:
                 submod._parametrizations[pn] = []  # type: ignore[index]
 
-            if base_class not in _PARAMETRIZATION_CLASS_CACHE:
+            cache_key = (base_class, frozenset(all_param_names))
+            if cache_key not in _PARAMETRIZATION_CLASS_CACHE:
                 properties: Dict[str, Any] = {}
 
                 def _make_getter(param_name: str) -> property:
@@ -301,9 +322,9 @@ def _register_parametrization(
                     properties,
                 )
                 new_cls._recir_parametrized_base = base_class  # type: ignore[attr-defined]
-                _PARAMETRIZATION_CLASS_CACHE[base_class] = new_cls
+                _PARAMETRIZATION_CLASS_CACHE[cache_key] = new_cls
 
-            submod.__class__ = _PARAMETRIZATION_CLASS_CACHE[base_class]
+            submod.__class__ = _PARAMETRIZATION_CLASS_CACHE[cache_key]
 
         for pn in param_names:
             submod._parametrizations[pn].append(parametrize_fn)  # type: ignore[index]

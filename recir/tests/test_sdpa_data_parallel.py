@@ -4,12 +4,12 @@
 
 from __future__ import annotations
 
-"""Multi-GPU DataParallel v2 tests for models using scaled_dot_product_attention.
+"""Multi-GPU DataParallel tests for models using scaled_dot_product_attention.
 
-Tests that recir's @compile() with DataParallel v2 (use_parametrization=True)
-correctly handles SDPA models on multiple GPUs. v2 uses collectives_insertion
-(parametrization-based) so activations flow as plain local tensors and SDPA's
-multi-output placement issue does not arise.
+Tests that recir's @compile() with DataParallel correctly handles SDPA models
+on multiple GPUs. recir uses collectives_insertion (parametrization-based) so
+activations flow as plain local tensors and SDPA's multi-output placement
+issue does not arise.
 
 Run:
   buck2 test @fbcode//mode/opt -c 'fbcode.enable_gpu_sections=true' \\
@@ -96,11 +96,11 @@ def _create_data(rank: int = 0):
 
 
 class TestSdpaDataParallelV2(DTensorTestBase):
-    """Test recir @compile() + DataParallel v2 with SDPA models on 2 GPUs.
+    """Test recir @compile() + DataParallel with SDPA models on 2 GPUs.
 
-    v2 (use_parametrization=True) inserts collectives via parametrization.
-    Activations flow as plain local tensors, so SDPA's multi-output ops
-    (philox seed/offset) are never assigned DTensor placements.
+    DataParallel inserts collectives via parametrization.  Activations flow
+    as plain local tensors, so SDPA's multi-output ops (philox seed/offset)
+    are never assigned DTensor placements.
     """
 
     @property
@@ -133,7 +133,7 @@ class TestSdpaDataParallelV2(DTensorTestBase):
         ddp_opt.step()
         ddp_opt.zero_grad()
 
-        @compile(parallel_mode=DataParallel("replicate", use_parametrization=True))
+        @compile(parallel_mode=DataParallel("replicate"))
         def train_step(mod, opt, input_ids, labels):
             loss = mod(input_ids, labels)
             loss.backward()

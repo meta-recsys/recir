@@ -205,7 +205,6 @@ class TestXSurfaceHybridParallelCompile(unittest.TestCase):
         parallel_mode = HybridParallel(
             dense_style="replicate",
             embedding_plan=embedding_plan,
-            use_parametrization=True,
         )
         parallel_mode._mesh = _build_default_pg_mesh("cuda", WORLD_SIZE)
 
@@ -528,7 +527,6 @@ class TestXSurfaceCompileMatchesEager(unittest.TestCase):
         parallel_mode = HybridParallel(
             dense_style="replicate",
             embedding_plan=embedding_plan,
-            use_parametrization=True,
         )
         parallel_mode._mesh = _build_default_pg_mesh("cuda", self._LOCAL_WORLD_SIZE)
 
