@@ -19,6 +19,10 @@ from parameterized import parameterized
 from recir.distributed.parallel_mode import GSPMDParallel
 from recir.lowering.xla_lower import _XLAModule
 
+# IMPORTANT: must run BEFORE any `import jax` so the cuda plugin path patch
+# is in effect when jax.devices() / jax.* first triggers plugin discovery.
+from recir.tests.xla import _jax_cuda_plugin_fix  # noqa: F401, I001
+
 
 class TestGSPMDShardParams(unittest.TestCase):
     def _make_model_and_opt(self, dim: int = 256) -> Tuple[nn.Linear, torch.optim.SGD]:

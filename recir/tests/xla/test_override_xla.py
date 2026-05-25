@@ -26,6 +26,10 @@ from recir.tests.override_test_utils import (
     ToyWrapper as SimpleWrapper,
 )
 
+# IMPORTANT: must run BEFORE any `import jax` so the cuda plugin path patch
+# is in effect when jax.devices() / jax.* first triggers plugin discovery.
+from recir.tests.xla import _jax_cuda_plugin_fix  # noqa: F401, I001
+
 
 # ---------------------------------------------------------------------------
 # Tests
