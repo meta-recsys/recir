@@ -49,7 +49,7 @@ from torch.testing._internal.distributed._tensor.common_dtensor import (
 # Port offsets per (test, reduction) to avoid JAX coordinator collisions
 # between parameterized variants running in separate subprocesses.
 _GSPMD_PORT_OFFSETS = {"sum": 3000, "mean": 3100}
-_SHARD_MAP_PORT_OFFSETS = {"sum": 4000, "mean": 4100, "sum_v1": 4200, "mean_v1": 4300}
+_SHARD_MAP_PORT_OFFSETS = {"sum": 4000, "mean": 4100}
 
 
 class TestMultiProcessMultiDevice(DestroyPGMixin, DTensorTestBase):
@@ -147,19 +147,10 @@ class TestMultiProcessMultiDevice(DestroyPGMixin, DTensorTestBase):
         finally:
             jax.distributed.shutdown()
 
-    @parameterized.expand(
-        [
-            ("sum", True),
-            ("sum", False),
-            ("mean", True),
-            ("mean", False),
-        ]
-    )
+    @parameterized.expand([("sum",), ("mean",)])
     @skip_if_lt_x_gpu(4)
     @with_comms
-    def test_shard_map_multi_device_per_process(
-        self, loss_reduction, use_parametrization
-    ):
+    def test_shard_map_multi_device_per_process(self, loss_reduction):
         """DataParallel + XLA_SHARD_MAP with num_ranks=4, num_processes=2."""
         import jax  # @manual
 
@@ -194,8 +185,7 @@ class TestMultiProcessMultiDevice(DestroyPGMixin, DTensorTestBase):
 
         master_addr = os.environ.get("MASTER_ADDR", "localhost")
         master_port = int(os.environ.get("MASTER_PORT", "29500"))
-        port_key = loss_reduction if use_parametrization else f"{loss_reduction}_v1"
-        port_offset = _SHARD_MAP_PORT_OFFSETS[port_key]
+        port_offset = _SHARD_MAP_PORT_OFFSETS[loss_reduction]
         jax.distributed.initialize(
             coordinator_address=f"{master_addr}:{master_port + port_offset}",
             num_processes=self.world_size,
@@ -214,7 +204,6 @@ class TestMultiProcessMultiDevice(DestroyPGMixin, DTensorTestBase):
                     num_ranks=num_ranks,
                     num_processes=self.world_size,
                     backend=BackendType.XLA_SHARD_MAP,
-                    use_parametrization=use_parametrization,
                 ),
                 gm_transformation=GraphModuleTransformation(
                     backend=BackendType.XLA_SHARD_MAP

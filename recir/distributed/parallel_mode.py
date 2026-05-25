@@ -295,7 +295,6 @@ class DataParallel(ParallelMode):
     """
 
     parallel_style: DataParallelStyle
-    _use_parametrization: bool
 
     def __init__(
         self,
@@ -308,7 +307,6 @@ class DataParallel(ParallelMode):
         device_type: str = "cuda",
         backend: Optional[BackendType] = None,
         custom_passes: Optional[Callable[[GraphModule], GraphModule]] = None,
-        use_parametrization: bool = False,
     ) -> None:
         if parallel_style == "replicate":
             self.parallel_style = DataParallelStyle.REPLICATE
@@ -340,7 +338,6 @@ class DataParallel(ParallelMode):
 
         self._process_mesh: Optional[DeviceMesh] = None
         self._device_mesh: Optional[DeviceMesh] = None
-        self._use_parametrization = use_parametrization
 
     @property
     def num_ranks(self) -> int:
@@ -488,7 +485,6 @@ class HybridParallel(ParallelMode):
         embedding_plan: Optional[EmbeddingShardingPlan] = None,
         input_batch_dim: int = 0,
         custom_passes: Optional[Callable[[GraphModule], GraphModule]] = None,
-        use_parametrization: bool = False,
     ) -> None:
         self.dense_style: DataParallelStyle
         if dense_style == "replicate":
@@ -511,7 +507,6 @@ class HybridParallel(ParallelMode):
             self._gm_passes = lambda gm: gm
 
         self._mesh: Optional[DeviceMesh] = None
-        self._use_parametrization = use_parametrization
 
     @property
     def num_ranks(self) -> int:

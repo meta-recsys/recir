@@ -14,6 +14,7 @@ import logging
 from typing import Callable, List, Optional, Tuple
 
 import torch
+import torch.utils._pytree as pytree
 from functorch import make_fx
 from recir.lowering.lowering_utils import segment_and_lower
 from torch._inductor.compile_fx import compile_fx_inner
@@ -32,22 +33,38 @@ class _InductorModule(torch.nn.Module):
         )
 
     def forward(self, *args: torch.Tensor, tag: str) -> List[torch.Tensor]:
+        # ``make_fx`` pytree-flattens ``*args`` to build ``decomp_gm``'s
+        # placeholders, so the inductor call must receive the flat leaves
+        # (not the raw ``args`` tuple) to keep the placeholder/input
+        # bijection.  ``list(args)`` mis-aligns when any arg is a non-tensor
+        # container (e.g. an empty list from ``_fused_adam[4]`` with
+        # ``amsgrad=False``).
+        flat_tensor_args: List[torch.Tensor] = [
+            x for x in pytree.tree_leaves(args) if isinstance(x, torch.Tensor)
+        ]
         if self.compiled is None:
             inductor_decompositions = select_decomp_table()
             # TODO: figure out why turning on cudagraphs cause exceptions.
             decomp_gm = make_fx(self.gm, decomposition_table=inductor_decompositions)(
                 *args
             )
+            # Reset codegen: ``make_fx`` attaches ``_PyTreeCodeGen`` when
+            # ``args`` has any pytree structure, but inductor's
+            # ``GraphLowering.output`` returns ``None``, so the inherited
+            # ``out_spec`` makes ``process_outputs(None)`` blow up in
+            # ``tree_unflatten``.  Inductor manages its own output handling.
+            decomp_gm._graph._codegen = torch.fx.graph.CodeGen()  # pyre-ignore[16, 9]
+            decomp_gm.recompile()
             logger.info("Lowering subgraph (%s) to Inductor...", tag)
             self.compiled = compile_fx_inner(
                 decomp_gm,
-                list(args),
+                flat_tensor_args,
                 cudagraphs=False,  # pyre-ignore
             )
             logger.info("Completed lowering subgraph (%s) to Inductor", tag)
         with torch.profiler.record_function(tag):
             assert self.compiled is not None
-            return self.compiled(list(args))
+            return self.compiled(flat_tensor_args)
 
 
 def _is_inductor_compatible(node: torch.fx.Node) -> Tuple[bool, str]:

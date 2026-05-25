@@ -12,7 +12,7 @@ from contextlib import contextmanager, ExitStack, nullcontext
 from copy import copy
 from dataclasses import dataclass
 from functools import partial, wraps
-from typing import Any, Callable, cast, Dict, Generator, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, Generator, List, Optional, Tuple, Union
 
 import torch
 
@@ -308,7 +308,7 @@ def _local_compile(
             on the module during tracing, and deregistered after.  Multiple
             functions are stacked in order (first fn applied first).
         _stateless_func_wrapper: Optional context manager factory to wrap the
-            traced function execution (e.g., gradients_tagging for the v1/GSPMD
+            traced function execution (e.g., gradients_tagging for the GSPMD
             DataParallel path).  Receives the ``params`` dict and returns a
             context manager.  If None, no additional wrapping is applied.
         **kwargs: Keyword arguments to the train_step function.
@@ -435,7 +435,7 @@ def _make_batch_transform(
 ) -> Callable[[torch.Tensor], torch.Tensor]:
     """Create an input transform that expands or shrinks mini-batch tensors.
 
-    For ratio > 1 (e.g., v1 path: local → global batch), ``repeat`` expands.
+    For ratio > 1 (e.g., GSPMD: local → global batch), ``repeat`` expands.
     For ratio < 1 (e.g., v2 XLA path: multi-device local → per-device batch),
     ``narrow`` shrinks.  For ratio == 1 the tensor is unchanged.
     """
@@ -619,10 +619,7 @@ def _compile_and_transform(
             region_transforms=region_transforms,
             **kwargs,
         )
-    elif (
-        isinstance(parallel_mode, (DataParallel, HybridParallel))
-        and parallel_mode._use_parametrization
-    ):
+    elif isinstance(parallel_mode, (DataParallel, HybridParallel)):
         result = _compile_data_parallel_v2(
             func,
             module_override,
@@ -632,8 +629,8 @@ def _compile_and_transform(
             **kwargs,
         )
     else:
-        result = _compile_data_parallel(
-            func, module_override, cast(DataParallel, parallel_mode), *args, **kwargs
+        raise TypeError(
+            f"Unsupported parallel_mode type: {type(parallel_mode).__name__}"
         )
     if region_transforms:
         for transform in region_transforms:
@@ -645,88 +642,6 @@ def _compile_and_transform(
             gm_transformation, "device_state_manager", DeviceStateManager()
         )
     return result
-
-
-def _compile_data_parallel(
-    func: Callable[..., Any],
-    module_override: Optional[List[Override]],
-    parallel_mode: DataParallel,
-    *args: Any,
-    **kwargs: Any,
-) -> _CompiledResult:
-    """Compile a train step with DTensor-based data parallelism (DDP/FSDP).
-
-    Steps:
-      1-3. Trace with global batch shapes via _local_compile
-      4. Shard params/states with DTensor
-      5. Expand graph with DTensor collectives (partition)
-      6. Flatten args for the caller
-      7. Deduplicate collective ops
-      8. Apply module overrides
-    """
-    fake_mode: FakeTensorMode = FakeTensorMode()
-    input_transform = _make_batch_transform(
-        parallel_mode.input_batch_dim,
-        ratio=parallel_mode.num_processes,
-        fake_mode=fake_mode,
-    )
-    args = pytree.tree_map_only(torch.Tensor, input_transform, args)
-    kwargs = pytree.tree_map_only(torch.Tensor, input_transform, kwargs)
-    if module_override:
-        for arg in pytree.arg_tree_leaves(*args, **kwargs):
-            if isinstance(arg, nn.Module):
-                _apply_module_overrides(arg, module_override)
-                break
-    local_result = _local_compile(
-        func,
-        *args,
-        fake_mode=fake_mode,
-        _stateless_func_wrapper=gradients_tagging,
-        **kwargs,
-    )
-    gm = local_result.gm
-    mod = local_result.mod
-    opt = local_result.opt
-    params = local_result.params
-    buffers = local_result.buffers
-    params_and_buffers: Dict[str, Union[torch.Tensor, nn.Parameter]] = {
-        **params,
-        **buffers,
-    }
-    # 4. Shard parameters and optimizer states before partitioning
-    parallel_mode.shard_params(mod, params_and_buffers, opt)
-    # Re-extract named_states from opt.state (now has correct sharded
-    # states keyed by the new parameter objects).
-    named_states: Dict[str, Any] = {}
-    if opt is not None:
-        for n, p in mod.named_parameters(remove_duplicate=False):
-            if p in opt.state:
-                named_states[n] = opt.state[p]  # type: ignore[index]
-    # 5. parallel mode to expand a single device graph to a distributed graph
-    # Re-split params/buffers from the (possibly re-keyed) module after
-    # shard_params, since shard_params may have replaced parameter objects.
-    sharded_params: Dict[str, nn.Parameter] = {}
-    sharded_buffers: Dict[str, torch.Tensor] = {}
-    for fqn, val in params_and_buffers.items():
-        if isinstance(val, nn.Parameter):
-            sharded_params[fqn] = val
-        else:
-            sharded_buffers[fqn] = val
-    gm = parallel_mode.partition(
-        gm,
-        params=sharded_params,
-        buffers=sharded_buffers,
-        named_states=named_states,
-    )
-    return _finalize_graph(
-        gm,
-        mod,
-        opt,
-        params_and_buffers,
-        named_states,
-        module_override,
-        parallel_mode.input_batch_dim,
-    )
 
 
 def _compile_data_parallel_v2(

@@ -212,17 +212,10 @@ class TestDataParallel(DTensorTestBase):
             for full_p1, p2 in zip(full_p1_list, ref_mod.parameters(), strict=True):
                 self.assertEqual(full_p1, p2)
 
-    @parameterized.expand(
-        [
-            ("sum", False),
-            ("sum", True),
-            ("mean", False),
-            ("mean", True),
-        ]
-    )
+    @parameterized.expand([("sum",), ("mean",)])
     @skip_if_lt_x_gpu(2)
     @with_comms
-    def test_replicate_sgd(self, reduction: str, use_parametrization: bool) -> None:
+    def test_replicate_sgd(self, reduction: str) -> None:
         sgd_configs: list[dict[str, Any]] = [
             {"lr": 0.1},
             {"lr": 0.1, "momentum": 0.9},
@@ -248,23 +241,13 @@ class TestDataParallel(DTensorTestBase):
                 ref_opt,
                 train_batch,
                 make_train_step(reduction),
-                data_parallel_options={"use_parametrization": use_parametrization},
                 reduction=reduction,
             )
 
-    @parameterized.expand(
-        [
-            ("sum", False),
-            ("sum", True),
-            ("mean", False),
-            ("mean", True),
-        ]
-    )
+    @parameterized.expand([("sum",), ("mean",)])
     @skip_if_lt_x_gpu(2)
     @with_comms
-    def test_replicate_adam_fused(
-        self, reduction: str, use_parametrization: bool
-    ) -> None:
+    def test_replicate_adam_fused(self, reduction: str) -> None:
         ddp_mod = SimpleMLP().cuda(self.rank)
         ddp_opt = torch.optim.Adam(ddp_mod.parameters(), lr=0.1, fused=True)
 
@@ -283,21 +266,13 @@ class TestDataParallel(DTensorTestBase):
             ref_opt,
             train_batch,
             make_train_step(reduction),
-            data_parallel_options={"use_parametrization": use_parametrization},
             reduction=reduction,
         )
 
-    @parameterized.expand(
-        [
-            ("sum", False),
-            ("sum", True),
-            ("mean", False),
-            ("mean", True),
-        ]
-    )
+    @parameterized.expand([("sum",), ("mean",)])
     @skip_if_lt_x_gpu(2)
     @with_comms
-    def test_fully_shard_sgd(self, reduction: str, use_parametrization: bool) -> None:
+    def test_fully_shard_sgd(self, reduction: str) -> None:
         sgd_configs: list[dict[str, Any]] = [
             {"lr": 0.1},
             {"lr": 0.1, "momentum": 0.9},
@@ -322,23 +297,13 @@ class TestDataParallel(DTensorTestBase):
                 ref_opt,
                 train_batch,
                 make_train_step(reduction),
-                data_parallel_options={"use_parametrization": use_parametrization},
                 reduction=reduction,
             )
 
-    @parameterized.expand(
-        [
-            ("sum", False),
-            ("sum", True),
-            ("mean", False),
-            ("mean", True),
-        ]
-    )
+    @parameterized.expand([("sum",), ("mean",)])
     @skip_if_lt_x_gpu(2)
     @with_comms
-    def test_fully_shard_adam_fused(
-        self, reduction: str, use_parametrization: bool
-    ) -> None:
+    def test_fully_shard_adam_fused(self, reduction: str) -> None:
         fsdp_mod = SimpleMLP().cuda(self.rank)
         fsdp_opt = torch.optim.Adam(fsdp_mod.parameters(), lr=0.1, fused=True)
 
@@ -357,23 +322,13 @@ class TestDataParallel(DTensorTestBase):
             ref_opt,
             train_batch,
             make_train_step(reduction),
-            data_parallel_options={"use_parametrization": use_parametrization},
             reduction=reduction,
         )
 
-    @parameterized.expand(
-        [
-            ("sum", False),
-            ("sum", True),
-            ("mean", False),
-            ("mean", True),
-        ]
-    )
+    @parameterized.expand([("sum",), ("mean",)])
     @skip_if_lt_x_gpu(2)
     @with_comms
-    def test_data_parallel_batch_dim_analysis(
-        self, reduction: str, use_parametrization: bool
-    ) -> None:
+    def test_data_parallel_batch_dim_analysis(self, reduction: str) -> None:
         # test batch dim analysis by adding a few ops that changes
         # the batch dim in non-trival ways
 
@@ -428,23 +383,13 @@ class TestDataParallel(DTensorTestBase):
                 ref_opt,
                 train_batch,
                 step,
-                data_parallel_options={"use_parametrization": use_parametrization},
                 reduction=reduction,
             )
 
-    @parameterized.expand(
-        [
-            ("sum", False),
-            ("sum", True),
-            ("mean", False),
-            ("mean", True),
-        ]
-    )
+    @parameterized.expand([("sum",), ("mean",)])
     @skip_if_lt_x_gpu(2)
     @with_comms
-    def test_fully_shard_non_0_batch_dim(
-        self, reduction: str, use_parametrization: bool
-    ) -> None:
+    def test_fully_shard_non_0_batch_dim(self, reduction: str) -> None:
         class WrapperModule(nn.Module):
             def __init__(self) -> None:
                 super().__init__()
@@ -472,7 +417,7 @@ class TestDataParallel(DTensorTestBase):
             ref_opt,
             train_batch,
             make_train_step(reduction),
-            {"input_batch_dim": 1, "use_parametrization": use_parametrization},
+            {"input_batch_dim": 1},
             reduction=reduction,
         )
 
@@ -484,12 +429,9 @@ class TestPerOpFSDP(DTensorTestBase):
     def world_size(self) -> int:
         return 2
 
-    @parameterized.expand([("v1", False), ("v2", True)])
     @skip_if_lt_x_gpu(2)
     @with_comms
-    def test_fully_shard_separate_allgathers(
-        self, _name: str, use_parametrization: bool
-    ) -> None:
+    def test_fully_shard_separate_allgathers(self) -> None:
         """Verify FSDP inserts allgathers for each parameter."""
         mod = SimpleMLP().cuda(self.rank)
         opt = torch.optim.SGD(mod.parameters(), lr=0.1)
@@ -499,11 +441,7 @@ class TestPerOpFSDP(DTensorTestBase):
             torch.randn((128, 8), device=torch.device(self.rank)),
         )
 
-        compiled_fn = compile(
-            parallel_mode=DataParallel(
-                "fully_shard", use_parametrization=use_parametrization
-            )
-        )(train_step)
+        compiled_fn = compile(parallel_mode=DataParallel("fully_shard"))(train_step)
         compiled_fn(mod, opt, train_batch)
 
         from recir.api import COMPILED_OBJECT_KEY
@@ -528,22 +466,13 @@ class TestPerOpFSDP(DTensorTestBase):
         # checkpoint recomputes ALL regions in backward (both weight and
         # bias chains), adding 4 backward allgathers.
         # Total: 4 forward + 4 backward = 8.
-        # v1 inserts allgathers per strategy mismatch at each use site,
-        # plus additional backward allgathers via chain cloning.
-        if use_parametrization:
-            expected = 8  # 4 forward + 4 backward (reentrant checkpoint)
-            self.assertEqual(
-                allgather_count,
-                expected,
-                f"Expected {expected} allgathers (4 forward + 4 backward "
-                f"reentrant checkpoint recompute), got {allgather_count}",
-            )
-        else:
-            self.assertGreaterEqual(
-                allgather_count,
-                4,
-                f"Expected at least 4 allgathers, got {allgather_count}",
-            )
+        expected = 8  # 4 forward + 4 backward (reentrant checkpoint)
+        self.assertEqual(
+            allgather_count,
+            expected,
+            f"Expected {expected} allgathers (4 forward + 4 backward "
+            f"reentrant checkpoint recompute), got {allgather_count}",
+        )
 
         self.assertGreater(
             reduce_scatter_count,
@@ -551,12 +480,9 @@ class TestPerOpFSDP(DTensorTestBase):
             "Expected at least one reduce_scatter for per-layer gradient reduction",
         )
 
-    @parameterized.expand([("v1", False), ("v2", True)])
     @skip_if_lt_x_gpu(2)
     @with_comms
-    def test_fully_shard_shared_weight_allgathers(
-        self, _name: str, use_parametrization: bool
-    ) -> None:
+    def test_fully_shard_shared_weight_allgathers(self) -> None:
         """Verify allgather counts when a parameter is reused multiple times in forward."""
         mod = SharedWeightMLP().cuda(self.rank)
         opt = torch.optim.SGD(mod.parameters(), lr=0.1)
@@ -566,11 +492,7 @@ class TestPerOpFSDP(DTensorTestBase):
             torch.randn((64, 32), device=torch.device(self.rank)),
         )
 
-        compiled_fn = compile(
-            parallel_mode=DataParallel(
-                "fully_shard", use_parametrization=use_parametrization
-            )
-        )(train_step)
+        compiled_fn = compile(parallel_mode=DataParallel("fully_shard"))(train_step)
         compiled_fn(mod, opt, train_batch)
 
         from recir.api import COMPILED_OBJECT_KEY
@@ -585,8 +507,7 @@ class TestPerOpFSDP(DTensorTestBase):
                     allgather_count += 1
 
         # SharedWeightMLP has 1 unique param (linear.weight) accessed 3 times.
-        # Both v1 and v2 insert at least 3 forward allgathers (one per access).
-        # v1 may insert additional backward allgathers via chain cloning.
+        # v2 inserts at least 3 forward allgathers (one per access).
         self.assertGreaterEqual(
             allgather_count,
             3,
@@ -594,17 +515,10 @@ class TestPerOpFSDP(DTensorTestBase):
             f"got {allgather_count}",
         )
 
-    @parameterized.expand([("v1", False), ("v2", True)])
     @skip_if_lt_x_gpu(2)
     @with_comms
-    def test_fully_shard_allgather_before_compute_not_before_non_compute(
-        self, _name: str, use_parametrization: bool
-    ) -> None:
+    def test_fully_shard_allgather_before_compute_not_before_non_compute(self) -> None:
         """Verify allgather is inserted right before compute ops, not before non-compute ops.
-
-        With shard strategy propagation (v1), non-compute ops like t() should
-        operate on the local shard.  The allgather should only appear right
-        before the compute op (e.g., addmm, mm) that needs the full weight.
 
         For v2, allgathers are inserted via DTensor parametrization during
         tracing, so wait_tensor nodes don't carry NodeType.PARAM metadata.
@@ -618,11 +532,7 @@ class TestPerOpFSDP(DTensorTestBase):
             torch.randn((128, 8), device=torch.device(self.rank)),
         )
 
-        compiled_fn = compile(
-            parallel_mode=DataParallel(
-                "fully_shard", use_parametrization=use_parametrization
-            )
-        )(train_step)
+        compiled_fn = compile(parallel_mode=DataParallel("fully_shard"))(train_step)
         compiled_fn(mod, opt, train_batch)
 
         from recir.api import COMPILED_OBJECT_KEY
@@ -652,12 +562,9 @@ class TestPerOpFSDP(DTensorTestBase):
                         f"deferred to right before the compute op instead.",
                     )
 
-    @parameterized.expand([("v1", False), ("v2", True)])
     @skip_if_lt_x_gpu(2)
     @with_comms
-    def test_fully_shard_numerical_correctness_with_per_op(
-        self, _name: str, use_parametrization: bool
-    ) -> None:
+    def test_fully_shard_numerical_correctness_with_per_op(self) -> None:
         """Verify per-op FSDP still produces numerically correct results."""
         fsdp_mod = SimpleMLP().cuda(self.rank)
         fsdp_opt = torch.optim.SGD(fsdp_mod.parameters(), lr=0.1)
@@ -683,11 +590,7 @@ class TestPerOpFSDP(DTensorTestBase):
         ref_opt.step()
 
         # Compile with fully_shard
-        compiled_fn = compile(
-            parallel_mode=DataParallel(
-                "fully_shard", use_parametrization=use_parametrization
-            )
-        )(train_step)
+        compiled_fn = compile(parallel_mode=DataParallel("fully_shard"))(train_step)
         compiled_fn(fsdp_mod, fsdp_opt, train_batch)
 
         # Reconstruct full params and compare
@@ -701,12 +604,9 @@ class TestPerOpFSDP(DTensorTestBase):
             for full_p1, p2 in zip(full_p1_list, ref_mod.parameters(), strict=True):
                 self.assertEqual(full_p1, p2)
 
-    @parameterized.expand([("v1", False), ("v2", True)])
     @skip_if_lt_x_gpu(2)
     @with_comms
-    def test_fully_shard_weight_free_nodes(
-        self, _name: str, use_parametrization: bool
-    ) -> None:
+    def test_fully_shard_weight_free_nodes(self) -> None:
         """Verify FSDP graph structure and weight_free transformation with fully_shard."""
         mod = SimpleMLP().cuda(self.rank)
         opt = torch.optim.SGD(mod.parameters(), lr=0.1)
@@ -717,9 +617,7 @@ class TestPerOpFSDP(DTensorTestBase):
         )
 
         compiled_fn = compile(
-            parallel_mode=DataParallel(
-                "fully_shard", use_parametrization=use_parametrization
-            ),
+            parallel_mode=DataParallel("fully_shard"),
             gm_transformation=GraphModuleTransformation(  # pyre-ignore[6]
                 enable_weight_free=True
             ),
@@ -741,20 +639,12 @@ class TestPerOpFSDP(DTensorTestBase):
         # Region transforms checkpoint-wrap each per-param chain using
         # use_reentrant=True; all regions recompute in backward, adding
         # 4 more allgathers.  Total: 4 forward + 4 backward = 8.
-        # v1 may produce more due to chain cloning.
-        if use_parametrization:
-            self.assertEqual(
-                allgather_count,
-                8,
-                f"Expected 8 allgathers (4 forward + 4 backward "
-                f"reentrant checkpoint recompute), got {allgather_count}",
-            )
-        else:
-            self.assertGreaterEqual(
-                allgather_count,
-                4,
-                f"Expected at least 4 allgathers, got {allgather_count}",
-            )
+        self.assertEqual(
+            allgather_count,
+            8,
+            f"Expected 8 allgathers (4 forward + 4 backward "
+            f"reentrant checkpoint recompute), got {allgather_count}",
+        )
 
         # Verify free_storage ordering when present.
         for node in gm.graph.nodes:
@@ -776,22 +666,18 @@ class TestPerOpFSDP(DTensorTestBase):
                             f"consumer at position {node_order[user]}",
                         )
 
-    @parameterized.expand([("v1", False), ("v2", True)])
     @skip_if_lt_x_gpu(2)
     @with_comms
-    def test_fully_shard_auto_free_without_free_storage(
-        self, _name: str, use_parametrization: bool
-    ) -> None:
+    def test_fully_shard_auto_free_without_free_storage(self) -> None:
         """Verify peak memory is reasonable with and without free_storage nodes.
 
         When free_storage nodes are present (e.g. after per-op allgather
         cloning), removing them should not significantly increase peak memory
         because the FX recompiler inserts ``= None`` after last use.
 
-        When the v2 compile path is used (upfront allgathers without
-        NodeType.PARAM metadata), insert_weight_free_nodes may not insert
-        free_storage nodes.  In that case both runs are identical and peak
-        memory should be equal.
+        With v2 (upfront allgathers without NodeType.PARAM metadata),
+        insert_weight_free_nodes may not insert free_storage nodes.  In
+        that case both runs are identical and peak memory should be equal.
         """
         device = torch.device(self.rank)
 
@@ -808,9 +694,7 @@ class TestPerOpFSDP(DTensorTestBase):
 
         # --- Run WITH free_storage (compilation with weight_free optimization) ---
         compiled_with = compile(
-            parallel_mode=DataParallel(
-                "fully_shard", use_parametrization=use_parametrization
-            ),
+            parallel_mode=DataParallel("fully_shard"),
             gm_transformation=GraphModuleTransformation(  # pyre-ignore[6]
                 enable_weight_free=True
             ),
@@ -825,9 +709,7 @@ class TestPerOpFSDP(DTensorTestBase):
 
         # --- Run WITHOUT free_storage ---
         compiled_without = compile(
-            parallel_mode=DataParallel(
-                "fully_shard", use_parametrization=use_parametrization
-            ),
+            parallel_mode=DataParallel("fully_shard"),
             gm_transformation=GraphModuleTransformation(  # pyre-ignore[6]
                 enable_weight_free=True
             ),
@@ -2609,275 +2491,6 @@ class TestShardStateDict(unittest.TestCase):
         self.assertIsNone(None)  # verify no exception was raised
 
 
-class TestHybridParallelE2E(DTensorTestBase):
-    """End-to-end tests for HybridParallel with recir.compile."""
-
-    @property
-    def world_size(self) -> int:
-        return 2
-
-    @skip_if_lt_x_gpu(2)
-    @with_comms
-    def test_compile_and_run(self) -> None:
-        """HybridParallel compiles and runs one train step without error."""
-        model = EmbeddingMLP().cuda(self.rank)
-        opt = torch.optim.SGD(model.parameters(), lr=0.1)
-        device = f"cuda:{self.rank}"
-        train_batch = (
-            torch.randint(0, 16, (8, 3), device=device),
-            torch.randn(8, 4, device=device),
-        )
-
-        plan = EmbeddingShardingPlan(
-            sharding_map={"emb.weight": EmbeddingShardingType.ROW_WISE}
-        )
-        compiled_fn = compile(
-            parallel_mode=HybridParallel(
-                dense_style="fully_shard",
-                embedding_plan=plan,
-            )
-        )(embedding_train_step)
-        # Should not raise
-        loss = compiled_fn(model, opt, train_batch)
-        self.assertIsNotNone(loss)
-
-    @skip_if_lt_x_gpu(2)
-    @with_comms
-    def test_graph_has_decomposed_embedding(self) -> None:
-        """Compiled graph contains decomposed AllToAll ops for row-wise embedding."""
-        model = EmbeddingMLP().cuda(self.rank)
-        opt = torch.optim.SGD(model.parameters(), lr=0.1)
-        device = f"cuda:{self.rank}"
-        train_batch = (
-            torch.randint(0, 16, (8, 3), device=device),
-            torch.randn(8, 4, device=device),
-        )
-
-        plan = EmbeddingShardingPlan(
-            sharding_map={"emb.weight": EmbeddingShardingType.ROW_WISE}
-        )
-        compiled_fn = compile(
-            parallel_mode=HybridParallel(
-                dense_style="fully_shard",
-                embedding_plan=plan,
-            )
-        )(embedding_train_step)
-        compiled_fn(model, opt, train_batch)
-
-        from recir.api import COMPILED_OBJECT_KEY
-
-        compiled_obj = compiled_fn.__dict__[COMPILED_OBJECT_KEY]
-        gm = compiled_obj.gm
-
-        # Decomposed row-wise embedding should produce all_to_all_single nodes
-        a2a_nodes = [
-            n
-            for n in gm.graph.nodes
-            if n.op == "call_function"
-            and n.target == torch.ops._c10d_functional.all_to_all_single.default
-        ]
-        self.assertGreaterEqual(
-            len(a2a_nodes),
-            3,
-            "Expected at least 3 all_to_all_single nodes from decomposed embedding",
-        )
-
-    @skip_if_lt_x_gpu(2)
-    @with_comms
-    def test_no_allgather_on_embedding_params(self) -> None:
-        """Embedding params should not have allgather (they use row-wise sharding, not FSDP)."""
-        model = EmbeddingMLP().cuda(self.rank)
-        opt = torch.optim.SGD(model.parameters(), lr=0.1)
-        device = f"cuda:{self.rank}"
-        train_batch = (
-            torch.randint(0, 16, (8, 3), device=device),
-            torch.randn(8, 4, device=device),
-        )
-
-        plan = EmbeddingShardingPlan(
-            sharding_map={"emb.weight": EmbeddingShardingType.ROW_WISE}
-        )
-        compiled_fn = compile(
-            parallel_mode=HybridParallel(
-                dense_style="fully_shard",
-                embedding_plan=plan,
-            )
-        )(embedding_train_step)
-        compiled_fn(model, opt, train_batch)
-
-        from recir.api import COMPILED_OBJECT_KEY
-
-        compiled_obj = compiled_fn.__dict__[COMPILED_OBJECT_KEY]
-        gm = compiled_obj.gm
-
-        # Find the decomposed aten.embedding node's weight input.
-        # There should be no allgather between the placeholder and this node.
-        for node in gm.graph.nodes:
-            if (
-                node.op == "call_function"
-                and node.target == torch.ops.aten.embedding.default
-            ):
-                weight_node = node.args[0]
-                # Walk the chain from weight_node back to the placeholder.
-                # None of the intermediate nodes should be allgather.
-                current = weight_node
-                while current.op != "placeholder":
-                    target_str = str(getattr(current, "target", ""))
-                    self.assertNotIn(
-                        "all_gather_into_tensor",
-                        target_str,
-                        "Embedding param should not be allgathered",
-                    )
-                    if current.args:
-                        current = current.args[0]
-                    else:
-                        break
-
-
-class TestHybridParallelNumericalCorrectness(DTensorTestBase):
-    """Numerical correctness E2E tests for HybridParallel."""
-
-    @property
-    def world_size(self) -> int:
-        return 2
-
-    @skip_if_lt_x_gpu(2)
-    @with_comms
-    @unittest.expectedFailure
-    def test_hybrid_parallel_numerical_correctness(self) -> None:
-        """Compare HybridParallel output against single-GPU reference.
-
-        TODO: The decomposed row-wise embedding backward accumulates partial
-        gradients differently from the single-device reference, causing
-        numerical mismatches after the optimizer step.  Marked as expected
-        failure until the backward path is validated.
-        """
-        torch.manual_seed(42)
-        device = f"cuda:{self.rank}"
-
-        # Reference model on single device (no sharding)
-        ref_model = EmbeddingMLP(num_embeddings=16, embedding_dim=8).cuda(self.rank)
-        # Test model (will be sharded)
-        test_model = deepcopy(ref_model)
-
-        ref_opt = torch.optim.SGD(ref_model.parameters(), lr=0.1)
-        test_opt = torch.optim.SGD(test_model.parameters(), lr=0.1)
-
-        torch.manual_seed(self.rank + 100)
-        train_batch = (
-            torch.randint(0, 16, (8, 3), device=device),
-            torch.randn(8, 4, device=device),
-        )
-        ref_batch = deepcopy(train_batch)
-
-        # Run reference (single-device, no compilation)
-        embedding_train_step(ref_model, ref_opt, ref_batch)
-
-        # Run HybridParallel compiled version
-        plan = EmbeddingShardingPlan(
-            sharding_map={"emb.weight": EmbeddingShardingType.ROW_WISE}
-        )
-        compiled_fn = compile(
-            parallel_mode=HybridParallel(
-                dense_style="fully_shard",
-                embedding_plan=plan,
-            )
-        )(embedding_train_step)
-        compiled_fn(test_model, test_opt, train_batch)
-
-        # Allgather sharded embedding params to compare
-        # Embedding weight: sharded on dim 0
-        emb_shards = [
-            torch.empty_like(test_model.emb.weight) for _ in range(self.world_size)
-        ]
-        torch.distributed.all_gather(emb_shards, test_model.emb.weight)
-        full_emb_weight = torch.cat(emb_shards, dim=0)
-
-        torch.testing.assert_close(
-            full_emb_weight,
-            ref_model.emb.weight,
-            atol=1e-5,
-            rtol=1e-5,
-        )
-
-        # Dense params: sharded in FULLY_SHARD mode, allgather to compare
-        for name in ["linear.weight", "linear.bias"]:
-            ref_param = dict(ref_model.named_parameters())[name]
-            test_param = dict(test_model.named_parameters())[name]
-            shards = [torch.empty_like(test_param) for _ in range(self.world_size)]
-            torch.distributed.all_gather(shards, test_param)
-            full_param = torch.cat(shards, dim=0)
-            torch.testing.assert_close(
-                full_param,
-                ref_param,
-                atol=1e-5,
-                rtol=1e-5,
-            )
-
-    @skip_if_lt_x_gpu(2)
-    @with_comms
-    @unittest.expectedFailure
-    def test_hybrid_parallel_replicate_dense_style(self) -> None:
-        """HybridParallel with dense_style='replicate': dense params replicated, embeddings row-wise.
-
-        TODO: Same backward mismatch as test_hybrid_parallel_numerical_correctness.
-        """
-        torch.manual_seed(42)
-        device = f"cuda:{self.rank}"
-
-        ref_model = EmbeddingMLP(num_embeddings=16, embedding_dim=8).cuda(self.rank)
-        test_model = deepcopy(ref_model)
-
-        ref_opt = torch.optim.SGD(ref_model.parameters(), lr=0.1)
-        test_opt = torch.optim.SGD(test_model.parameters(), lr=0.1)
-
-        torch.manual_seed(self.rank + 100)
-        train_batch = (
-            torch.randint(0, 16, (8, 3), device=device),
-            torch.randn(8, 4, device=device),
-        )
-        ref_batch = deepcopy(train_batch)
-
-        # Run reference (single-device)
-        embedding_train_step(ref_model, ref_opt, ref_batch)
-
-        # Run HybridParallel with replicate dense style
-        plan = EmbeddingShardingPlan(
-            sharding_map={"emb.weight": EmbeddingShardingType.ROW_WISE}
-        )
-        compiled_fn = compile(
-            parallel_mode=HybridParallel(
-                dense_style="replicate",
-                embedding_plan=plan,
-            )
-        )(embedding_train_step)
-        compiled_fn(test_model, test_opt, train_batch)
-
-        # Embedding weight: sharded, allgather to compare
-        emb_shards = [
-            torch.empty_like(test_model.emb.weight) for _ in range(self.world_size)
-        ]
-        torch.distributed.all_gather(emb_shards, test_model.emb.weight)
-        full_emb_weight = torch.cat(emb_shards, dim=0)
-        torch.testing.assert_close(
-            full_emb_weight,
-            ref_model.emb.weight,
-            atol=1e-5,
-            rtol=1e-5,
-        )
-
-        # Dense params: replicated, so they should match directly (no allgather needed)
-        for name in ["linear.weight", "linear.bias"]:
-            ref_param = dict(ref_model.named_parameters())[name]
-            test_param = dict(test_model.named_parameters())[name]
-            torch.testing.assert_close(
-                test_param,
-                ref_param,
-                atol=1e-5,
-                rtol=1e-5,
-            )
-
-
 class TestMultipleEmbeddingTables(DTensorTestBase):
     """E2E test for models with multiple embedding tables."""
 
@@ -2952,7 +2565,7 @@ class TestMultipleEmbeddingTables(DTensorTestBase):
 
 
 class TestHybridParallelV2E2E(DTensorTestBase):
-    """End-to-end tests for HybridParallel with use_parametrization=True (v2)."""
+    """End-to-end tests for HybridParallel with recir.compile (v2)."""
 
     @property
     def world_size(self) -> int:
@@ -2977,7 +2590,6 @@ class TestHybridParallelV2E2E(DTensorTestBase):
             parallel_mode=HybridParallel(
                 dense_style="fully_shard",
                 embedding_plan=plan,
-                use_parametrization=True,
             )
         )(embedding_train_step)
         loss = compiled_fn(model, opt, train_batch)
@@ -3002,7 +2614,6 @@ class TestHybridParallelV2E2E(DTensorTestBase):
             parallel_mode=HybridParallel(
                 dense_style="fully_shard",
                 embedding_plan=plan,
-                use_parametrization=True,
             )
         )(embedding_train_step)
         compiled_fn(model, opt, train_batch)
@@ -3043,7 +2654,6 @@ class TestHybridParallelV2E2E(DTensorTestBase):
             parallel_mode=HybridParallel(
                 dense_style="fully_shard",
                 embedding_plan=plan,
-                use_parametrization=True,
             )
         )(embedding_train_step)
         compiled_fn(model, opt, train_batch)
@@ -3098,7 +2708,6 @@ class TestHybridParallelV2E2E(DTensorTestBase):
             parallel_mode=HybridParallel(
                 dense_style="fully_shard",
                 embedding_plan=plan,
-                use_parametrization=True,
             )
         )(multi_embedding_train_step)
         compiled_fn(model, opt, train_batch)
@@ -3143,7 +2752,6 @@ class TestHybridParallelV2GraphStructure(DTensorTestBase):
             parallel_mode=HybridParallel(
                 dense_style="fully_shard",
                 embedding_plan=plan,
-                use_parametrization=True,
             )
         )(train_step_fn)
         compiled_fn(model, opt, train_batch)
@@ -3300,7 +2908,6 @@ class TestHybridParallelV2Backward(DTensorTestBase):
             parallel_mode=HybridParallel(
                 dense_style="fully_shard",
                 embedding_plan=plan,
-                use_parametrization=True,
             )
         )(train_step_fn)
         compiled_fn(model, opt, train_batch)
@@ -3482,7 +3089,6 @@ class TestHybridParallelV2Backward(DTensorTestBase):
             parallel_mode=HybridParallel(
                 dense_style="fully_shard",
                 embedding_plan=plan,
-                use_parametrization=True,
             )
         )(embedding_train_step)
         compiled_fn(model, opt, train_batch)
@@ -3544,7 +3150,6 @@ class TestHybridParallelV2NumericalCorrectness(DTensorTestBase):
             parallel_mode=HybridParallel(
                 dense_style="fully_shard",
                 embedding_plan=plan,
-                use_parametrization=True,
             )
         )(embedding_train_step)
         compiled_loss = compiled_fn(model, opt, train_batch)
@@ -3589,7 +3194,6 @@ class TestHybridParallelV2NumericalCorrectness(DTensorTestBase):
             parallel_mode=HybridParallel(
                 dense_style="fully_shard",
                 embedding_plan=plan,
-                use_parametrization=True,
             )
         )(multi_embedding_train_step)
         compiled_loss = compiled_fn(model, opt, train_batch)
