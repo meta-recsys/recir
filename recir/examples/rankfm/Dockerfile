@@ -37,6 +37,9 @@ RUN pip install gin-config matplotlib pybind11
 # Extra deps for hammer/v3 and minimal_viable_ai
 RUN pip install pyre-extensions iopath
 
+# zstandard: decompress .pt.zst dataporter batches in BatchReplayPipe
+RUN pip install zstandard
+
 # Copy and install recir with XLA + rec extras
 COPY recir /app/recir
 COPY setup.py /app/setup.py
