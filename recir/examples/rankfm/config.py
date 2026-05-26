@@ -49,6 +49,11 @@ class RankFMConfig:
     dense_lr: float = 0.01
     embedding_lr: float = 0.1
 
+    # Real data replay (synthetic data is used when gcs_data_path is empty)
+    gcs_data_path: str = ""
+    data_file_template: str = ""
+    data_replicate_across_ranks: bool = False
+
     disable_seq_len_sampling: bool = False
 
     # Enable PaddingRegionTransform for dynamic-shape batches. When True,
@@ -76,6 +81,13 @@ class RankFMConfig:
         p.add_argument("--max_steps", type=int, default=cfg.max_steps)
         p.add_argument("--dense_lr", type=float, default=cfg.dense_lr)
         p.add_argument("--embedding_lr", type=float, default=cfg.embedding_lr)
+        p.add_argument("--gcs_data_path", type=str, default=cfg.gcs_data_path)
+        p.add_argument("--data_file_template", type=str, default=cfg.data_file_template)
+        p.add_argument(
+            "--data_replicate_across_ranks",
+            action="store_true",
+            default=cfg.data_replicate_across_ranks,
+        )
         p.add_argument(
             "--keep_seq_len_sampling",
             dest="disable_seq_len_sampling",
@@ -135,6 +147,9 @@ class RankFMConfig:
             max_steps=args.max_steps,
             dense_lr=args.dense_lr,
             embedding_lr=args.embedding_lr,
+            gcs_data_path=args.gcs_data_path,
+            data_file_template=args.data_file_template,
+            data_replicate_across_ranks=args.data_replicate_across_ranks,
             disable_seq_len_sampling=args.disable_seq_len_sampling,
             enable_padding=args.enable_padding,
             profile_start_step=args.profile_start_step,

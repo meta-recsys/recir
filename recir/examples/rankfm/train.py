@@ -24,7 +24,7 @@ import copy
 import logging
 import os
 import time
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 import fbgemm_gpu  # noqa: F401 -- force C++ op registration before fallback
 import jax
@@ -62,6 +62,7 @@ from torchrec.optim.keyed import KeyedOptimizerWrapper
 from torchrec.optim.optimizers import in_backward_optimizer_filter
 
 from .config import RankFMConfig
+from .data_pipe import BatchReplayPipe, compute_kjt_key_to_size, replay_batch_iter
 
 # Bootstrap gr::batched_complete_cumsum if the C++ library failed to load
 # (e.g. OSS Docker container where hammer/oss/generative_recommenders/ops/cpp
@@ -297,7 +298,6 @@ def _patch_test_config_provider(cfg: RankFMConfig) -> None:
             ]
         if cfg.disable_seq_len_sampling:
             module_config.hstu_seq_len_sampling_configs = None
-        module_config.hstu_max_seq_len = cfg.max_uih_seq_len
         return config
 
     # pyre-ignore[8]
@@ -310,10 +310,14 @@ def _build_compiled_train_step(
     num_processes: int,
     gloo_world: int,
     global_bs: int,
-) -> Tuple[Any, Any, Any, Any, Any]:
+) -> Tuple[Any, Any, Any, Any, Any, Dict[str, int]]:
     """Build model, batch, overrides, and the compiled train_step.
 
-    Returns (train_step, model, opt, batch, feature_config).
+    Returns (train_step, model, opt, batch, feature_config, key_to_size).
+    ``key_to_size`` is the model's KJT-feature -> num_embeddings map computed
+    pre-DMP (post-DMP the EC is wrapped in a ``ShardedEmbeddingCollection``
+    that doesn't expose ``embedding_configs()``); use it to clamp loaded IDs
+    into the model's hash space at every runtime step.
     """
     device = torch.device("cpu")
     model, feature_config = _build_full_model(device)
@@ -336,28 +340,30 @@ def _build_compiled_train_step(
         batch_size=cfg.local_batch_size,
     )
 
-    ro_kjt = batch.ro_id_list_features
-    ro_kjt_keys: List[str] = ro_kjt.keys()
-    nro_kjt = batch.nro_id_list_features
-    nro_kjt_keys: List[str] = nro_kjt.keys()
-    unary_kjt = batch.unary_features
-    assert unary_kjt is not None
-    unary_kjt_keys: List[str] = unary_kjt.keys()
-
     if cfg.enable_padding:
-        # Override-build sample uses GLOBAL sizes (matches PaddingRegionTransform's
-        # pad_to_static fake kernel which also returns global ``target_size``).
-        # That keeps FX trace shapes consistent across override outputs and PRT
-        # pad outputs — both at global.  At runtime, fwd_fn returns PER-HOST
-        # data (cached.shape with dim 0 // num_processes) so _to_sharded_jax
-        # can expand per-host to global, matching PRT pad ops' runtime behavior.
-        padded_ro_bs = compute_padded_shape(global_bs, num_ranks)
-        padded_nro_bs = compute_padded_shape(global_bs * cfg.num_candidates, num_ranks)
+        # Pre-compute padded_bs and pair_padded_bs using the SAME formula as
+        # PaddingRegionTransform's ``_discover``.  The override-built sample
+        # batch must already be at the post-pad sizes, otherwise the cached
+        # sparse-arch output won't dim-match the runtime-padded forward path
+        # (cat fails downstream in ``_forward_post_hstu``).
+        nd = num_ranks
+        padded_bs = compute_padded_shape(global_bs, nd)
+        # nro pair has its own batch dim (B_NRO != B_RO).  At trace time
+        # B_NRO = global_bs * num_candidates_per_request (uniform)
+        trace_pair_bs = global_bs * cfg.num_candidates
+        pair_padded_bs = compute_padded_shape(trace_pair_bs, nd)
+
+        # Override-build batch must be at the post-pad sizes so the cached
+        # sparse-arch output dim-matches the runtime-padded forward path.
+        # Build it by deep-copying the small runtime batch and resizing in
+        # place; calling ``_create_uniform_train_batch(batch_size=padded_bs)``
+        # directly can SIGABRT inside ``RandomDataPipe``'s C++ allocator at
+        # large ``batch_size * num_candidates_per_request * history_len``.
         expanded_batch = copy.deepcopy(batch)
         resize_batch_inplace(
             expanded_batch,
-            target_b_ro=padded_ro_bs,
-            target_b_nro=padded_nro_bs,
+            target_b_ro=padded_bs,
+            target_b_nro=pair_padded_bs,
         )
         all_labels = expanded_batch.all_labels
         assert all_labels is not None
@@ -368,7 +374,7 @@ def _build_compiled_train_step(
             expanded_batch.num_candidates,
             all_labels,
         )
-        override_bs = padded_ro_bs
+        override_bs = padded_bs
     else:
         all_labels = batch.all_labels
         assert all_labels is not None
@@ -391,16 +397,21 @@ def _build_compiled_train_step(
         num_processes=num_processes,
     )
 
-    if cfg.enable_padding and feature_config is not None:
-        torch.manual_seed(0)
-        batch = _create_random_train_batch(
-            feature_config,
-            device,
-            batch_size=cfg.local_batch_size,
-        )
+    # Compute KJT key -> num_embeddings map BEFORE DMP, while the EC still
+    # exposes embedding_configs() (the sharded post-DMP wrapper does not).
+    key_to_size: Dict[str, int] = compute_kjt_key_to_size(model)
 
     # Apply gloo + DMP for ROW_WISE embedding sharding.
     model, dense_opt = setup_dmp(model, cfg, gloo_world)
+
+    # Capture KJT keys for the runtime reconstruction inside train_step.
+    ro_kjt = batch.ro_id_list_features
+    ro_kjt_keys: List[str] = ro_kjt.keys()
+    nro_kjt = batch.nro_id_list_features
+    nro_kjt_keys: List[str] = nro_kjt.keys()
+    unary_kjt = batch.unary_features
+    assert unary_kjt is not None
+    unary_kjt_keys: List[str] = unary_kjt.keys()
 
     opt = dense_opt
 
@@ -423,13 +434,25 @@ def _build_compiled_train_step(
     }
 
     if cfg.enable_padding:
+        contextual_budgets = dict(module_config.contextual_feature_to_max_length)
+        history_budget = cfg.max_uih_seq_len
+        ro_per_sample = [
+            contextual_budgets.get(key, history_budget) for key in ro_kjt_keys
+        ]
         compile_kwargs["region_transforms"] = [
             PaddingRegionTransform(
                 jagged_pairs={
-                    # RO/NRO id-list pairs are opted out below — they only
-                    # flow into PreprocessorOverride (a CPU graph break)
-                    # and stay at local stride throughout the preprocessor.
-                    # The override handles the padding.
+                    "ro_id_list_values": JaggedPairConfig(
+                        "ro_id_list_lengths",
+                        per_sample_budgets=ro_per_sample,
+                    ),
+                    "nro_id_list_values": JaggedPairConfig(
+                        "nro_id_list_lengths",
+                        per_sample_budgets=1,
+                        batch_size_arg="nro_float_features",
+                        count_arg="num_candidates",
+                        max_per_sample_count=cfg.num_candidates,
+                    ),
                     "unary_values": JaggedPairConfig(
                         "unary_lengths",
                         per_sample_budgets=1,
@@ -441,12 +464,6 @@ def _build_compiled_train_step(
                 batch_size_arg="ro_float_features",
                 num_devices=num_ranks,
                 num_processes=num_processes,
-                skip_args={
-                    "ro_id_list_values",
-                    "ro_id_list_lengths",
-                    "nro_id_list_values",
-                    "nro_id_list_lengths",
-                },
             ),
         ]
 
@@ -486,7 +503,7 @@ def _build_compiled_train_step(
         loss.backward()
         opt.step()
 
-    return train_step, model, opt, batch, feature_config
+    return train_step, model, opt, batch, feature_config, key_to_size
 
 
 def _is_jax_profiling_enabled(cfg: RankFMConfig) -> bool:
@@ -576,6 +593,58 @@ def _log_batch_info(step: int, batch: Any) -> None:
     )
 
 
+def _next_training_batch(
+    step: int,
+    cfg: RankFMConfig,
+    batch: Any,
+    replay_iter: Optional[Iterator[Any]],
+    feature_config: Any,
+) -> Optional[Any]:
+    """Resolve the batch for ``step``. Returns None if the replay pipe is exhausted."""
+    if replay_iter is not None:
+        try:
+            return next(replay_iter)
+        except StopIteration:
+            return None
+    if cfg.enable_padding and feature_config is not None and step > 1:
+        torch.manual_seed(step)
+        return _create_random_train_batch(
+            feature_config,
+            torch.device("cpu"),
+            batch_size=cfg.local_batch_size,
+        )
+    return batch
+
+
+def _build_replay_iter(
+    cfg: RankFMConfig,
+    data_pipe: Optional[BatchReplayPipe],
+    key_to_size: Optional[Dict[str, int]],
+    ro_target_keys: Optional[List[str]] = None,
+    nro_target_keys: Optional[List[str]] = None,
+    unary_target_keys: Optional[List[str]] = None,
+    ro_per_key_budgets: Optional[List[int]] = None,
+) -> Optional[Iterator[Any]]:
+    if data_pipe is None:
+        return None
+    if key_to_size is None:
+        logger.warning(
+            "Replay mode but key_to_size is None; loaded IDs will not be "
+            "clamped against model table sizes (may IndexError)."
+        )
+    return replay_batch_iter(
+        data_pipe,
+        key_to_size or {},
+        max_steps=cfg.max_steps,
+        local_batch_size=cfg.local_batch_size,
+        num_candidates=cfg.num_candidates,
+        ro_target_keys=ro_target_keys,
+        nro_target_keys=nro_target_keys,
+        unary_target_keys=unary_target_keys,
+        ro_per_key_budgets=ro_per_key_budgets,
+    )
+
+
 def _run_training_loop(
     cfg: RankFMConfig,
     train_step: Any,
@@ -585,13 +654,19 @@ def _run_training_loop(
     is_main: bool,
     global_bs: int,
     feature_config: Any = None,
+    data_pipe: Optional[BatchReplayPipe] = None,
+    key_to_size: Optional[Dict[str, int]] = None,
+    ro_per_key_budgets: Optional[List[int]] = None,
 ) -> None:
     """Execute the compiled training loop with optional JAX profiling.
 
-    When ``cfg.enable_padding`` is True and ``feature_config`` is provided,
-    a fresh random batch is generated each step (with varying jagged
-    shapes). The PaddingRegionTransform pads them to static budgets at
-    runtime.
+    Three batch-source modes:
+      1. ``data_pipe`` is set => iterate over real batches loaded from GCS
+         (or local mirror). KJT IDs are clamped via ``key_to_size``.
+         PaddingRegionTransform pads each loaded batch to static budgets.
+      2. ``cfg.enable_padding`` + ``feature_config`` => fresh random
+         (jagged) batch per step; padded at trace time.
+      3. otherwise => reuse the closure-captured uniform batch every step.
     """
     jax_profiling = _is_jax_profiling_enabled(cfg)
     profiling_active = False
@@ -602,8 +677,31 @@ def _run_training_loop(
         )
 
     model.train(True)
-    logger.info(f"Starting training: {cfg.max_steps} steps, global_bs={global_bs}")
+    mode = "replay" if data_pipe is not None else "synthetic"
+    logger.info(
+        f"Starting training ({mode}): {cfg.max_steps} steps, global_bs={global_bs}"
+    )
     start_time = time.time()
+    # The override was traced with the synthetic batch's key order. At
+    # runtime, the override reconstructs the KJT with hardcoded keys (in
+    # trace-time order) but applies them to whatever values our data_pipe
+    # produces. If our KJT has keys in a different order than the trace-time
+    # batch, values get silently misaligned per key.
+    # Force our data_pipe output to match the synthetic batch's key order.
+    ro_target_keys: List[str] = list(batch.ro_id_list_features.keys())
+    nro_target_keys: List[str] = list(batch.nro_id_list_features.keys())
+    unary_target_keys: Optional[List[str]] = (
+        list(batch.unary_features.keys()) if batch.unary_features is not None else None
+    )
+    replay_iter = _build_replay_iter(
+        cfg,
+        data_pipe,
+        key_to_size,
+        ro_target_keys=ro_target_keys,
+        nro_target_keys=nro_target_keys,
+        unary_target_keys=unary_target_keys,
+        ro_per_key_budgets=ro_per_key_budgets,
+    )
 
     for step in range(1, cfg.max_steps + 1):
         if jax_profiling and step == cfg.profile_start_step:
@@ -613,22 +711,18 @@ def _run_training_loop(
             profiling_active = True
             logger.info(f"[PROFILE] Started trace at step {step}")
 
-        if cfg.enable_padding and feature_config is not None and step > 1:
-            torch.manual_seed(step)
-            batch = _create_random_train_batch(
-                feature_config,
-                torch.device("cpu"),
-                batch_size=cfg.local_batch_size,
-            )
+        next_batch = _next_training_batch(step, cfg, batch, replay_iter, feature_config)
+        if next_batch is None:
+            logger.info(f"Replay pipe exhausted at step {step}; ending training.")
+            break
+        batch = next_batch
 
         if is_main:
             _log_batch_info(step, batch)
 
         step_start = time.time()
-
         train_step(model, opt, *_extract_train_step_args(batch))
         sync_device_state_to_torch(train_step)
-
         step_time = time.time() - step_start
 
         if jax_profiling and step == cfg.profile_end_step and profiling_active:
@@ -638,7 +732,6 @@ def _run_training_loop(
 
         if is_main:
             logger.info(f"Step {step}/{cfg.max_steps} | time={step_time:.2f}s")
-
         if jax_profiling and cfg.enable_memory_log and is_main:
             _log_hbm_memory()
 
@@ -677,15 +770,60 @@ def main() -> None:
     # must equal local_batch_size * gloo_world for the override's
     # cached_output (sized at global_bs) to match the expanded trace input.
     global_bs = cfg.local_batch_size * gloo_world
-    train_step, model, opt, batch, feature_config = _build_compiled_train_step(
-        cfg,
-        num_ranks=num_ranks,
-        num_processes=gloo_world,
-        gloo_world=gloo_world,
-        global_bs=global_bs,
+    train_step, model, opt, batch, feature_config, key_to_size = (
+        _build_compiled_train_step(
+            cfg,
+            num_ranks=num_ranks,
+            num_processes=gloo_world,
+            gloo_world=gloo_world,
+            global_bs=global_bs,
+        )
     )
 
-    # --- 4. Train ---
+    # --- 4. Optional GCS data pipe. When set, _run_training_loop iterates
+    # real batches from disk (one batch per file per epoch) and clamps KJT
+    # IDs into the model's hash space via key_to_size. PaddingRegionTransform
+    # handles the dynamic-shape padding at runtime.
+    data_pipe: Optional[BatchReplayPipe] = None
+    if cfg.gcs_data_path:
+        # When --data_file_template is set, generate filenames programmatically
+        # and skip directory enumeration (avoids the 58-min ls /mnt/barnfs
+        # tax). One file per epoch — the rotating window in
+        # replay_batch_iter provides per-step diversity within that file.
+        explicit_files: Optional[List[str]] = None
+        if cfg.data_file_template:
+            explicit_files = [cfg.data_file_template.format(i=1)]
+            logger.info(
+                f"Direct-read mode: file_list={explicit_files} (template "
+                f"'{cfg.data_file_template}')"
+            )
+        data_pipe = BatchReplayPipe(
+            path=cfg.gcs_data_path,
+            rank=gloo_rank,
+            world_size=gloo_world,
+            replicate_across_ranks=cfg.data_replicate_across_ranks,
+            file_list=explicit_files,
+        )
+        logger.info(
+            f"Replay pipe: {len(data_pipe)} batches for rank {gloo_rank} "
+            f"(replicate={cfg.data_replicate_across_ranks})"
+        )
+    else:
+        logger.info("Using synthetic data (no --gcs_data_path)")
+
+    # Per-key RO budgets for eager pad in data_pipe (matches PRT's per-key
+    # padding for ro_id_list_features). nro/unary use a single global formula
+    # (B * num_candidates) inside data_pipe; ro is per-key so we compute it
+    # here from the same module_config that PRT reads.
+    _module_config = model.module_config  # pyre-ignore[16]
+    ro_kjt_keys_for_pad = list(batch.ro_id_list_features.keys())
+    contextual_budgets_for_pad = dict(_module_config.contextual_feature_to_max_length)
+    ro_per_key_budgets: List[int] = [
+        cfg.local_batch_size * contextual_budgets_for_pad.get(k, cfg.max_uih_seq_len)
+        for k in ro_kjt_keys_for_pad
+    ]
+
+    # --- 5. Train ---
     _run_training_loop(
         cfg,
         train_step,
@@ -695,11 +833,23 @@ def main() -> None:
         is_main,
         global_bs,
         feature_config=feature_config if cfg.enable_padding else None,
+        data_pipe=data_pipe,
+        key_to_size=key_to_size,
+        ro_per_key_budgets=ro_per_key_budgets,
     )
 
-    # Cleanup
+    # Cleanup. JAX's PJRT runtime + libtpu workers + the gloo collective
+    # thread keep the process alive after main() returns, so the JobSet pod
+    # never reaches Completed. Politely shut down both, then force-exit to
+    # bypass any remaining background threads (atexit handlers / GC).
     if dist.is_initialized():
         dist.destroy_process_group()
+    try:
+        jax.distributed.shutdown()
+    except Exception as e:  # noqa: BLE001 -- best-effort cleanup
+        logger.warning(f"jax.distributed.shutdown() raised (non-fatal): {e}")
+    logger.info("Cleanup complete; exiting.")
+    os._exit(0)
 
 
 if __name__ == "__main__":
