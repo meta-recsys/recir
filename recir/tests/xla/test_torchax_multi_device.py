@@ -23,6 +23,10 @@ import recir.torchax as torchax
 import torch
 import torch.nn as nn
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
+
+# IMPORTANT: must run BEFORE any `import jax` so the cuda plugin path patch
+# is in effect when jax.devices() / jax.* first triggers plugin discovery.
+from recir.tests.xla import _jax_cuda_plugin_fix  # noqa: F401, I001
 from recir.tests.xla.xla_test_mixin import jax_distributed
 from torch.testing._internal.common_distributed import skip_if_lt_x_gpu
 from torch.testing._internal.common_utils import run_tests

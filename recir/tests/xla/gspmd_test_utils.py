@@ -18,6 +18,10 @@ test_gspmd_single_process.py, and test_gspmd_multi_device.py.
 import torch
 import torch.nn as nn
 from recir.lowering.xla_lower import _is_xla_compatible, _XLAModule
+
+# IMPORTANT: must run BEFORE any `import jax` so the cuda plugin path patch
+# is in effect when jax.devices() / jax.* first triggers plugin discovery.
+from recir.tests.xla import _jax_cuda_plugin_fix  # noqa: F401
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 

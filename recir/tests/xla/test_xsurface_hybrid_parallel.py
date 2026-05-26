@@ -20,6 +20,10 @@ from recir.distributed.parallel_mode import HybridParallel
 from recir.ops.fake.kjt import patch_ec_for_tracing
 from recir.ops.fake.mot_preprocessor import patch_mot_preprocessor_for_tracing
 from recir.sharding_plan import EmbeddingShardingPlan, EmbeddingShardingType
+
+# IMPORTANT: must run BEFORE any `import jax` so the cuda plugin path patch
+# is in effect when jax.devices() / jax.* first triggers plugin discovery.
+from recir.tests.xla import _jax_cuda_plugin_fix  # noqa: F401, I001
 from recir.tests.xla.xsurface_test_utils import (
     _build_full_model,
     _create_random_train_batch,
