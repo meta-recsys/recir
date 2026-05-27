@@ -5,6 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 # pyre-strict
+import inspect
 import logging
 from abc import ABC, abstractmethod
 from collections import OrderedDict
@@ -12,7 +13,22 @@ from contextlib import contextmanager, ExitStack, nullcontext
 from copy import copy
 from dataclasses import dataclass
 from functools import partial, wraps
-from typing import Any, Callable, Dict, Generator, List, Optional, Tuple, Union
+from typing import (
+    Any,
+    Callable,
+    cast,
+    Dict,
+    Generator,
+    List,
+    Optional,
+    Sequence,
+    Tuple,
+    TYPE_CHECKING,
+    Union,
+)
+
+if TYPE_CHECKING:
+    from recir.backends.base import Backend
 
 import torch
 
@@ -455,6 +471,43 @@ def _make_batch_transform(
     return _get_full_batch_arg
 
 
+def _resolve_trace_batch_ratio(
+    parallel_mode: Optional[ParallelMode],
+) -> Optional[float]:
+    """Determine the per-host -> trace batch ratio for ``parallel_mode``.
+
+    Returns ``None`` when ``parallel_mode`` doesn't request a pre-trace
+    batch transform (e.g., ``DataParallel`` v1 with a DTensor partition
+    that re-runs the transform internally, or unrecognized modes).
+
+    For GSPMD-style modes (the partition is a no-op; XLA inflates
+    placeholder shardings at compile time), the trace should see global
+    batch shapes so HuggingFace's modeling code bakes the correct
+    Python-int literals into ``expand``/``view`` calls.  The ratio is
+    ``num_processes`` (per-host -> per-process global; for single-host
+    runs ``num_processes == 1`` and the transform is a no-op).
+    """
+    if parallel_mode is None:
+        return None
+    # Use isinstance only when the parallel-mode classes are import-safe.
+    # Avoid a hard import at module load to keep recir importable in
+    # environments where the XLA/distributed deps are missing.
+    if isinstance(parallel_mode, GSPMDParallel):
+        # GSPMD: partition is a no-op; XLA lowering inflates placeholders
+        # to the global batch via _to_sharded_jax + _jit_gspmd shardings.
+        # Tracing with the global batch makes baked Python-int literals
+        # (HF Gemma3 / Llama / Qwen modeling code) consistent with the
+        # GSPMD runtime shape.
+        return float(parallel_mode.num_processes)
+    # DataParallel / HybridParallel: the v2 parametrization-based trace path
+    # (in :func:`trace`) applies its own per-process -> per-device batch
+    # transform via ``1/(world_size // num_processes)``.  Returning ``None``
+    # here keeps the GSPMD-only contract of this helper explicit and
+    # preserves the original behavior for plain
+    # ``recir.compile(parallel_mode=DataParallel(), ...)``.
+    return None
+
+
 def _tag_batch_inputs(
     gm: fx.GraphModule, num_model_tensors: int, input_batch_dim: int
 ) -> None:
@@ -642,6 +695,731 @@ def _compile_and_transform(
             gm_transformation, "device_state_manager", DeviceStateManager()
         )
     return result
+
+
+# ---------------------------------------------------------------------------
+# v7.1 public lower-level API: trace + compile_from_gm
+# ---------------------------------------------------------------------------
+#
+# These two functions split the legacy ``_compile_and_transform`` pipeline at
+# the partition boundary so surgical orchestrators (e.g.
+# ``mivilm.surgeon.compile``) can splice graph-level edits between the local
+# trace (stage 2) and partition (stage 5).
+#
+# ``trace()`` runs stages 0 + 2 (eager pre-trace context + ``make_fx``) and
+# returns ``(gm, flat_state)``.  The bundle of (mod, opt, params, buffers,
+# named_states) is stashed on the gm as ``gm._recir_trace_ctx`` so
+# ``compile_from_gm`` can recover it without forcing the user to pass it
+# through.
+#
+# ``compile_from_gm()`` runs stages 4-10 (region_transforms.finalize,
+# partition, optimize_passes, IterGraph wrap, dispatch) using the trace
+# context recovered from the gm, the explicit ``parallel_mode``, and the
+# explicit ``backend``.
+
+
+# Marker attribute used to stash trace context on a graph module.
+_TRACE_CTX_ATTR = "_recir_trace_ctx"
+
+
+@dataclass
+class _TraceContext:
+    """Per-trace bundle stashed on ``gm._recir_trace_ctx``.
+
+    Holds the references that :func:`compile_from_gm` needs to drive the
+    post-trace stages: the original module, optimizer, parameter / buffer /
+    optimizer-state dicts, and any embedding-specific data computed during
+    the v2 trace (used by :func:`rewrite_sparse_embeddings`).
+    """
+
+    mod: nn.Module
+    opt: Optional[torch.optim.Optimizer]
+    params: Dict[str, nn.Parameter]
+    buffers: Dict[str, torch.Tensor]
+    named_states: Dict[str, Any]
+    input_batch_dim: int
+    embedding_param_indices: Optional[set[int]] = None
+
+
+def _set_trace_ctx(gm: fx.GraphModule, ctx: _TraceContext) -> None:
+    """Attach ``ctx`` to ``gm`` so :func:`compile_from_gm` can recover it.
+
+    Stored as a Python attribute (not a buffer), so it survives
+    ``gm.recompile()`` but is not serialized by ``torch.save``.
+    """
+    setattr(gm, _TRACE_CTX_ATTR, ctx)
+
+
+def _get_trace_ctx(gm: fx.GraphModule) -> _TraceContext:
+    """Recover the trace context stashed by :func:`trace`."""
+    ctx = getattr(gm, _TRACE_CTX_ATTR, None)
+    if ctx is None:
+        raise RuntimeError(
+            "recir.compile_from_gm requires a gm produced by recir.trace "
+            "(missing trace context attribute). If you mutated the gm via "
+            "extract/replace_region, the stash is preserved automatically; "
+            "if you built the gm from scratch you must call recir.trace first."
+        )
+    return cast(_TraceContext, ctx)
+
+
+def trace(  # noqa: C901 — orchestration: dispatches on parallel_mode flavor (DP/HybridParallel vs GSPMD vs None); splitting the branches into helpers would obscure the shared post-trace tagging.
+    callable_: Callable[..., Any],
+    *args: Any,
+    region_transforms: Sequence[RegionTransform] = (),
+    input_batch_dim: int = 0,
+    parallel_mode: Optional[ParallelMode] = None,
+    **kwargs: Any,
+) -> Tuple[fx.GraphModule, List[torch.Tensor]]:
+    """Stage 2 standalone: trace ``callable_`` into an FX graph module.
+
+    Wraps :func:`_local_compile` plus the ``region_transforms`` bind +
+    discovery + per-root context setup that the legacy paths perform
+    pre-trace.  Returns ``(gm, flat_state)`` where ``flat_state`` is 1:1 with
+    the first ``len(flat_state)`` placeholders of the gm.
+
+    The returned gm has an internal ``_recir_trace_ctx`` attribute holding the
+    references (``mod``, ``opt``, ``params``, ``buffers``, ``named_states``)
+    that :func:`compile_from_gm` uses to drive the post-trace stages.
+
+    After tracing this also runs :func:`_tag_batch_inputs` +
+    :func:`propagate_batch_input_meta` so every placeholder carries
+    ``is_batch_input`` / ``is_weight`` / ``batch_dim`` metadata.  This makes
+    the meta-driven branch in mivilm's ``_semantic_input_map`` work without
+    falling back to the (broken) ordinal heuristic that misidentifies
+    optimizer-state placeholders (e.g. Adam's 0-dim ``step`` scalar) as
+    user inputs.
+
+    Args:
+        callable_: the function to trace (typically a ``train_step``).
+        *args: positional arguments to ``callable_``.  Must include an
+            :class:`nn.Module` (and optionally a :class:`torch.optim.Optimizer`).
+        region_transforms: optional :class:`RegionTransform` sequence applied
+            to scope-rewrite sub-regions of the forward graph during tracing.
+            Their ``bind_signature(callable_)`` is called once before the
+            outer trace and their ``_apply_region_transforms`` ExitStack
+            wrappers are entered around the trace itself.
+        input_batch_dim: the batch dimension on user-input tensors.  Stored on
+            each user-input placeholder as ``meta["batch_dim"]`` by
+            :func:`_tag_batch_inputs`.  Defaults to ``0`` (matches
+            :class:`DataParallel` and most :class:`GSPMDParallel` setups).
+        parallel_mode: optional :class:`ParallelMode` driving the pre-trace
+            setup.  Three flavors are recognized:
+
+              * :class:`DataParallel` / :class:`HybridParallel`: trace via
+                autograd-emitted parametrization (``parametrize_params`` +
+                ``collectives_insertion``) so the resulting gm has the
+                allgather / reduce-scatter ops baked in.  Inputs are shrunk
+                from per-process to per-device shape via the
+                ``1/(world_size // num_processes)`` batch transform.
+                ``shard_params`` runs BEFORE tracing so the gm captures
+                sharded parameter shapes.  For :class:`HybridParallel`, the
+                embedding parameters are excluded from collectives at trace
+                time and rewritten post-trace by
+                :func:`compile_from_gm` via :func:`rewrite_sparse_embeddings`.
+              * :class:`GSPMDParallel`: expand per-process batch tensors to
+                the global batch (HuggingFace-style modeling code bakes
+                ``inputs_embeds.shape[0]`` as a Python int; without this
+                pre-trace expansion the literal becomes stale once GSPMD
+                lowering inflates placeholders to global shape).  Trace
+                under :func:`gradients_tagging` so the gm carries
+                ``_spmd::tag_grad`` markers consumed by
+                :func:`compile_from_gm`'s GSPMD branch.
+              * ``None``: trace as-is (legacy behavior for callers that
+                don't request a parallelism strategy).
+        **kwargs: keyword arguments to ``callable_``.
+
+    Returns:
+        ``(gm, flat_state)``.
+    """
+    region_transforms_list = list(region_transforms)
+
+    # Stage 2 prep: bind signatures so region transforms can resolve
+    # signature-dependent inputs (e.g. RecomputeTransform's selector).
+    for transform in region_transforms_list:
+        bind = getattr(transform, "bind_signature", None)
+        if bind is not None:
+            bind(callable_)
+
+    # Pre-extract mod (and opt for the DP/HybridParallel branch's pre-trace
+    # ``shard_params`` call); ``_local_compile`` re-extracts both itself.
+    mod: Optional[nn.Module] = None
+    opt: Optional[torch.optim.Optimizer] = None
+    for arg in pytree.arg_tree_leaves(*args, **kwargs):
+        if isinstance(arg, nn.Module) and mod is None:
+            mod = arg
+        if isinstance(arg, torch.optim.Optimizer) and opt is None:
+            opt = arg
+    assert mod is not None, "recir.trace requires an nn.Module in the arguments"
+    _mod: nn.Module = mod
+
+    # Dispatch on parallel_mode flavor for the trace setup.
+    embedding_param_indices: Optional[set[int]] = None
+    if isinstance(parallel_mode, (DataParallel, HybridParallel)):
+        # DataParallel / HybridParallel v2: parametrization-based collective
+        # insertion (no DTensor partitioner downstream).  Mirrors the body
+        # of the legacy-path ``_compile_data_parallel_v2`` helper,
+        # restructured so the post-trace tagging / context-stash steps are
+        # shared with the GSPMD branch below.
+
+        # Extract mesh and DP style from the parallel mode.
+        if isinstance(parallel_mode, HybridParallel):
+            mesh = parallel_mode.mesh
+            dp_style = parallel_mode.dense_style
+        else:
+            mesh = parallel_mode.device_mesh
+            dp_style = parallel_mode.parallel_style
+        world_size: int = parallel_mode.num_ranks
+
+        # Resolve embedding param FQNs from the plan (HybridParallel only).
+        embedding_param_fqns: Optional[set[str]] = None
+        if isinstance(parallel_mode, HybridParallel):
+            fqns = parallel_mode.embedding_plan.param_fqns
+            embedding_param_fqns = fqns if fqns else None
+
+        # Build transforms list (RegatherTransform for FULLY_SHARD + caller
+        # region_transforms).  Embedding params are excluded from the
+        # regather so that the post-trace row-wise embedding rewrite owns
+        # them.
+        dp_transforms: list[RegionTransform] = []
+        if dp_style == DataParallelStyle.FULLY_SHARD:
+            dp_transforms.append(
+                RegatherTransform(skip_param_fqns=embedding_param_fqns)
+            )
+        if region_transforms_list:
+            dp_transforms.extend(region_transforms_list)
+
+        # Extract params_and_buffers BEFORE shard_params so the FQN order
+        # matches the placeholder ordering ``_local_compile`` will emit.
+        # Embedding indices computed from this snapshot map to placeholder
+        # positions in the traced graph.
+        params_and_buffers: Dict[str, Any] = {
+            **dict(_mod.named_parameters(remove_duplicate=False)),
+            **dict(_mod.named_buffers(remove_duplicate=False)),
+        }
+        if isinstance(parallel_mode, HybridParallel):
+            embedding_param_indices = parallel_mode._compute_embedding_param_indices(
+                params_and_buffers
+            )
+
+        # HybridParallel-only ShapeEnv: custom ops with data-dependent output
+        # shapes (``recir_torchrec::kjt_split_per_feature``,
+        # ``recir_preproc::mot_preprocessor_forward``) mint fresh SymInts via
+        # ``torch.library.get_ctx().new_dynamic_size()`` from their fake
+        # kernels; without a ShapeEnv those calls raise
+        # ``DynamicOutputShapeException``.
+        fake_mode: FakeTensorMode = FakeTensorMode(
+            allow_non_fake_inputs=True,
+            shape_env=ShapeEnv() if isinstance(parallel_mode, HybridParallel) else None,
+        )
+
+        # Apply the per-process -> per-device batch transform up front, so
+        # discovery, region-transform inner trace, and the outer trace all
+        # see the same (per-device) input shape.  Otherwise the region's
+        # ``gm_fwd`` would bake per-process shapes that conflict with the
+        # outer trace's narrowed inputs.
+        input_transform = _make_batch_transform(
+            parallel_mode.input_batch_dim,
+            ratio=1 / (world_size // parallel_mode.num_processes),
+            fake_mode=fake_mode,
+        )
+        args = pytree.tree_map_only(torch.Tensor, input_transform, args)
+        kwargs = pytree.tree_map_only(torch.Tensor, input_transform, kwargs)
+        discovery = _discover_for_region_transforms(
+            dp_transforms, callable_, args, kwargs, mod=_mod
+        )
+
+        # Shard params on the module and optimizer states.  Mutates the dict
+        # and the module in-place; also updates ``opt.state`` so that
+        # parameter -> state mappings remain valid post-shard.
+        parallel_mode.shard_params(_mod, params_and_buffers, opt)
+
+        # Apply region transforms AFTER sharding, with parametrization.  The
+        # traced forward includes allgather ops from ``collectives_insertion``
+        # so each per-parameter region encompasses allgather + chain +
+        # compute.  Embedding params (if any) are excluded from collectives
+        # — they use AllToAll inserted post-trace, not allgather.
+        collectives_fn = collectives_insertion(dp_style, mesh)
+        parametrize_kwargs: Dict[str, Any] = {}
+        if embedding_param_fqns:
+            parametrize_kwargs["exclude_param_fqns"] = embedding_param_fqns
+        with ExitStack() as region_stack:
+            _enter_region_transform_contexts(
+                region_stack,
+                dp_transforms,
+                discovery,
+                fake_mode,
+                parametrize_cm_factory=lambda root_mod: partial(
+                    parametrize_params,
+                    root_mod,
+                    collectives_fn,
+                    **parametrize_kwargs,
+                ),
+            )
+            # When region transforms are active, gm_fwd already contains the
+            # allgather ops (baked in during the parametrized trace), so we
+            # must NOT also pass ``collectives_fn`` to ``_local_compile`` —
+            # that would double-allgather and corrupt gradients.
+            local_result = _local_compile(
+                callable_,
+                *args,
+                fake_mode=fake_mode,
+                _parametrize_fns=[] if dp_transforms else [collectives_fn],
+                _exclude_param_fqns=embedding_param_fqns if not dp_transforms else None,
+                **kwargs,
+            )
+    else:
+        # GSPMDParallel or no parallel_mode: legacy trace path.  Expand
+        # per-process batch tensors to the global batch BEFORE tracing so
+        # ``inputs_embeds.shape[0]`` resolves to the global batch and
+        # HuggingFace's modeling code bakes the correct literal into
+        # ``expand`` / ``view`` / ``reshape`` calls.  Otherwise GSPMD lowering
+        # inflates placeholders to global shape post-trace but consumer
+        # literals still reference the per-host shape -> JAX broadcast
+        # mismatch.  Mirrors the pre-trace transform in :func:`_compile_gspmd`.
+        fake_mode = FakeTensorMode(allow_non_fake_inputs=True)
+        trace_batch_ratio = _resolve_trace_batch_ratio(parallel_mode)
+        if trace_batch_ratio is not None and trace_batch_ratio != 1:
+            input_transform = _make_batch_transform(
+                input_batch_dim,
+                ratio=trace_batch_ratio,
+                fake_mode=fake_mode,
+            )
+            args = pytree.tree_map_only(torch.Tensor, input_transform, args)
+            kwargs = pytree.tree_map_only(torch.Tensor, input_transform, kwargs)
+
+        discovery = _discover_for_region_transforms(
+            region_transforms_list, callable_, args, kwargs, mod=_mod
+        )
+        with ExitStack() as region_stack:
+            _enter_region_transform_contexts(
+                region_stack,
+                region_transforms_list,
+                discovery,
+                fake_mode,
+            )
+            # Apply ``gradients_tagging`` during the inner trace so the
+            # resulting gm carries ``_spmd::tag_grad`` markers on every
+            # parameter gradient.  ``_compile_gspmd`` historically always
+            # passed this wrapper; without it ``compile_from_gm``'s GSPMD
+            # branch would have no grad markers to scale / erase.  Mirrors
+            # ``_local_compile(..., _stateless_func_wrapper=gradients_tagging)``
+            # in the legacy GSPMD entry point.
+            local_result = _local_compile(
+                callable_,
+                *args,
+                fake_mode=fake_mode,
+                _stateless_func_wrapper=gradients_tagging,
+                **kwargs,
+            )
+
+    flat_state = pytree.tree_leaves(
+        [
+            {**local_result.params, **local_result.buffers},
+            local_result.named_states,
+        ]
+    )
+    # Tag placeholders with is_batch_input / is_weight / batch_dim so the
+    # meta-driven branch in downstream consumers (e.g. mivilm.surgeon's
+    # ``_semantic_input_map``) can identify user-input placeholders without
+    # relying on the broken ordinal heuristic that misses opt named_states.
+    # The first ``len(flat_state)`` placeholders are params + buffers + opt
+    # named_states; anything past that is a user input.
+    _tag_batch_inputs(local_result.gm, len(flat_state), input_batch_dim)
+    # Propagate batch-input meta through ops so intermediate FX nodes that
+    # become subgraph boundaries (after later partition/lower) inherit
+    # is_batch_input / batch_dim — mirrors the legacy ``_finalize_graph`` flow.
+    propagate_batch_input_meta(local_result.gm)
+    ctx = _TraceContext(
+        mod=local_result.mod,
+        opt=local_result.opt,
+        params=local_result.params,
+        buffers=local_result.buffers,
+        named_states=local_result.named_states,
+        input_batch_dim=input_batch_dim,
+        embedding_param_indices=embedding_param_indices,
+    )
+    _set_trace_ctx(local_result.gm, ctx)
+    return local_result.gm, flat_state
+
+
+def compile_from_gm(  # noqa: C901 — orchestration: stages 4-8 of the pipeline are intentionally laid out inline so the # Stage N comments stay readable; refactor would split the pipeline across helpers.
+    gm: fx.GraphModule,
+    flat_state: List[torch.Tensor],
+    *,
+    parallel_mode: ParallelMode,
+    backend: "Backend",
+    region_transforms: Sequence[RegionTransform] = (),
+) -> _CompiledResult:
+    """Stages 4-10: continue the pipeline from a pre-traced gm.
+
+    The full recir compile pipeline is split into ten stages, of which
+    :func:`trace` runs stages 0-3 and this function runs stages 4-10:
+
+    Pipeline stages (consult the inline ``# Stage N:`` comments below for
+    the source-level boundaries):
+
+    * **Stage 0** -- ``eager_preproc`` hooks (handled by :func:`trace`).
+      User-supplied callbacks mutate the original ``nn.Module`` *before*
+      tracing (e.g. attach hooks, register buffers).  Not run by this
+      function.
+    * **Stage 1** -- ``module_override`` rewrites (handled by :func:`trace`).
+      Apply structural Override surgery on the module pre-trace.  Not run
+      here.
+    * **Stage 2** -- ``make_fx`` trace (handled by :func:`trace`). Produce
+      the initial ``fx.GraphModule`` plus its placeholder ↔ flat_state
+      binding via ``_local_compile``.  Not run here.
+    * **Stage 3** -- post-trace meta tagging (handled by :func:`trace`).
+      Run ``_tag_batch_inputs`` + ``propagate_batch_input_meta`` so every
+      placeholder carries ``is_batch_input`` / ``is_weight`` / ``batch_dim``
+      metadata.  Not run here.
+    * **Stage 4** -- ``region_transforms[*].finalize_compiled_graph(gm)``.
+      Each :class:`RegionTransform` gets a chance to finalize after the
+      graph is partitioned (note: stage-4 runs *after* stage-5 in the code
+      below to match the legacy ``_compile_and_transform`` ordering).
+    * **Stage 5** -- ``parallel_mode.shard_params`` + ``partition``.
+      ``shard_params`` updates ``opt.state`` and may re-key parameters
+      in-place; we then re-extract ``named_states`` by walking the
+      now-sharded module and call ``partition_from_module`` to rewrite the
+      graph for the chosen parallelism strategy (DP/FSDP/GSPMD/etc.).
+      Also re-flattens the graph via ``_to_caller_flattened_graph_module``
+      so the caller can invoke ``gm(*flat_state, *user_inputs)`` directly,
+      and rebuilds ``flat_state`` from the post-shard params/buffers/states.
+    * **Stage 6** -- ``backend.optimize_passes`` applied to
+      ``(gm, flat_state)``.  Each pass may rewrite the graph and/or update
+      flat_state.  Passes are dispatched by ``inspect.signature`` arity:
+      two-argument passes get ``(gm, flat_state)``; single-argument passes
+      get ``(gm,)``.
+    * **Stage 7** -- ``IterGraphModule(gm)`` wrap if
+      ``backend.uses_iter_graph``.  Wraps the graph in an
+      :class:`IterGraphModule` so cross-iteration passes (e.g. comm-fusion,
+      lazy-lowering hooks) can operate.
+    * **Stage 8** -- ``backend.dispatch(gm)``.  Backend-owned final
+      rewrite.  For ``XLA*Backend`` this performs ``partial_lower_xla`` to
+      splice ``_XLAModule`` call_modules into the graph; for
+      ``InductorBackend`` this is a no-op pass-through.
+    * **Stage 9** -- legacy ``_finalize_graph`` (handled by the
+      :func:`compile` wrapper for the data-parallel/GSPMD paths, not by
+      this function).
+    * **Stage 10** -- runtime-time wrapping (handled by :func:`compile` /
+      :func:`sync_device_state_to_torch`, not by this function).
+
+    Args:
+        gm: a graph module produced by :func:`trace` (must carry the
+            internal trace context attribute populated by ``trace`` via
+            ``_set_trace_ctx``).
+        flat_state: the flat state list mirroring the leading placeholders of
+            ``gm``.  Reused by the returned ``_CompiledResult``.
+        parallel_mode: how to partition the graph across ranks.  Validated
+            against ``backend`` via ``backend.validate_with(parallel_mode)``
+            before stage 5 runs.
+        backend: owns stages 6-8 (optimize passes, IterGraph wrap, dispatch).
+        region_transforms: same sequence passed to :func:`trace`.  Each
+            transform's ``finalize_compiled_graph(gm)`` is invoked after
+            partition (stage 4 in code-order, but conceptually stage 4 of
+            the pipeline).
+
+    Returns:
+        A :class:`_CompiledResult` ready for runtime use via
+        :func:`recir.compile`'s wrapper invocation path.
+    """
+    # Validate backend ↔ parallel_mode compatibility early.
+    backend.validate_with(parallel_mode)
+
+    ctx = _get_trace_ctx(gm)
+    region_transforms_list = list(region_transforms)
+
+    # Stage 5: per-mode post-trace assembly.
+    #
+    # The trace context already contains the (post-shard, for DP/HybridParallel)
+    # ``params`` / ``buffers`` / ``named_states`` snapshot captured inside
+    # :func:`trace`.  Branch shape:
+    #
+    #   * :class:`DataParallel` / :class:`HybridParallel`: ``shard_params`` ran
+    #     inside :func:`trace` so the autograd-emitted parametrization could
+    #     bake the per-parameter collectives into ``gm`` at trace time.  Here
+    #     we just consume the ctx snapshot — no further partition pass is
+    #     required (the DTensor partitioner is skipped entirely on this
+    #     path).  For :class:`HybridParallel`, the embedding parameters were
+    #     excluded from collectives at trace time; rewrite them now into
+    #     decomposed AllToAll ops via :func:`rewrite_sparse_embeddings`.
+    #   * :class:`GSPMDParallel`: ``shard_params`` is deferred to this stage
+    #     because the GSPMD lowering inflates placeholders to the global
+    #     batch post-trace; sharding before the trace would leave the gm
+    #     with per-shard literals that conflict with the inflated
+    #     placeholders.  After sharding we still call
+    #     ``partition_from_module`` (a no-op for the GSPMD partition path,
+    #     kept for symmetry with the abstract :class:`ParallelMode` contract)
+    #     and then scale + erase the autograd-emitted ``_spmd::tag_grad``
+    #     markers so XLA lowering can proceed.
+    sharded_keys: set[str] = set()
+    if isinstance(parallel_mode, (DataParallel, HybridParallel)):
+        # Trace already sharded; reuse ctx snapshot.
+        params_and_buffers: Dict[str, Any] = {**ctx.params, **ctx.buffers}
+        named_states: Dict[str, Any] = ctx.named_states
+
+        # HybridParallel: pattern-match aten.embedding nodes on sharded
+        # embedding params and replace with decomposed AllToAll ops via
+        # secondary symbolic trace.  ``embedding_param_indices`` was
+        # populated by :func:`trace` against the pre-shard params dict; the
+        # ordering is stable across shard_params (which mutates values in
+        # place without re-keying the dict), so the indices still map to
+        # placeholder positions in the traced graph.
+        embedding_param_indices = ctx.embedding_param_indices
+        if isinstance(parallel_mode, HybridParallel) and embedding_param_indices:
+            flat_params_buffers = list(ctx.params.values()) + list(ctx.buffers.values())
+            embedding_param_tensors: Dict[int, torch.Tensor] = {
+                i: flat_params_buffers[i] for i in embedding_param_indices
+            }
+            rewrite_sparse_embeddings(
+                gm,
+                parallel_mode.mesh,
+                embedding_param_tensors,
+            )
+    else:
+        # GSPMDParallel (or future modes that still require a DTensor partition
+        # pass).  Mirror the legacy ``_compile_gspmd`` ordering: shard_params
+        # first (updates ``opt.state`` and may re-key parameters), then
+        # re-extract named_states by walking the now-sharded module, then
+        # ``partition_from_module``.
+        params_and_buffers = {**ctx.params, **ctx.buffers}
+        sharded_keys = parallel_mode.shard_params(ctx.mod, params_and_buffers, ctx.opt)
+        named_states = {}
+        _opt = ctx.opt
+        if _opt is not None and len(_opt.state) > 0:
+            # ``shard_params`` may have re-keyed ``opt.state`` to the new
+            # (post-shard) Parameter identities; walk the live module to pick
+            # up the current binding.
+            for n, p in ctx.mod.named_parameters(remove_duplicate=False):
+                if p in _opt.state:
+                    named_states[n] = _opt.state[p]  # type: ignore[index]
+            # Coverage check: ``shard_params`` may re-key params off the
+            # module so the walk above misses entries that ``trace`` captured
+            # in ``ctx.named_states``. Warn (rather than silently drop) so
+            # downstream optimizer-state restoration does not lose entries.
+            dropped = set(ctx.named_states.keys()) - set(named_states.keys())
+            if dropped:
+                logger.warning(
+                    "GSPMD named_states rebuild dropped %d entries that were "
+                    "present in the pre-shard ctx snapshot: %s",
+                    len(dropped),
+                    sorted(dropped),
+                )
+        else:
+            # Either no optimizer was supplied, or ``_opt.state`` is empty
+            # (optimizer not stepped yet, or a partial-lower path that
+            # never populated state).  In both cases ``ctx.named_states``
+            # — captured by ``trace`` — is the authoritative snapshot;
+            # fall through so we do not silently discard it.
+            named_states = ctx.named_states
+        gm = parallel_mode.partition_from_module(
+            gm, ctx.mod, ctx.opt, params_and_buffers, named_states
+        )
+
+        # GSPMD-specific tag_grad fixup.  ``partition_from_module`` is a no-op
+        # for GSPMD, so the autograd-emitted ``_spmd::tag_grad`` markers
+        # survive into the lowered graph; they must be scaled (for
+        # ``grad_reduction == "avg"``) and erased here.  Mirrors the
+        # post-trace block in the legacy ``_compile_gspmd``:
+        #   * scale: GSPMD lowers the autograd-emitted grad accumulation
+        #     through an all-reduce SUM.  For sum-loss + "avg" grad
+        #     reduction (DDP semantics), divide each tag_grad's output by
+        #     ``num_ranks``.  For mean-loss (grad_reduction="sum"), the
+        #     traced backward already normalises by global numel so the SUM
+        #     alone is correct.
+        #   * erase: tag_grad has no XLA lowering, so leaving the markers
+        #     in the graph triggers ``_is_xla_compatible`` failures at
+        #     ``segment_and_lower`` time (the symptom that surfaces as
+        #     ``test_no_graph_breaks_gspmd`` failing).
+        if isinstance(parallel_mode, GSPMDParallel):
+            num_ranks = parallel_mode.num_ranks
+            if num_ranks > 1 and parallel_mode.grad_reduction == "avg":
+                for node in list(gm.graph.nodes):
+                    if (
+                        node.op == "call_function"
+                        and node.target is torch.ops._spmd.tag_grad.default
+                    ):
+                        with gm.graph.inserting_after(node):
+                            div_node = gm.graph.call_function(
+                                torch.ops.aten.div.Scalar, args=(node, num_ranks)
+                            )
+                            div_node.meta = node.meta.copy() if node.meta else {}
+                            # Filter out div_node itself so the rewrite skips
+                            # the freshly-created (node, num_ranks) edge --
+                            # otherwise div_node would self-reference and we
+                            # would need to restore div_node.args post-hoc.
+                            # Default-arg ``dn=div_node`` pins the current
+                            # iteration's div_node (avoids B023 late binding).
+                            node.replace_all_uses_with(
+                                div_node, lambda u, dn=div_node: u is not dn
+                            )
+            for node in list(gm.graph.nodes):
+                if (
+                    node.op == "call_function"
+                    and node.target is torch.ops._spmd.tag_grad.default
+                ):
+                    node.replace_all_uses_with(node.args[0])
+                    gm.graph.erase_node(node)
+            gm.recompile()
+
+    # Move the pytree-flattening responsibility from the gm to the caller so
+    # the recir wrapper can invoke ``gm(*flat_inps)`` directly.  Mirrors the
+    # legacy ``_finalize_graph`` step; without this, the gm's codegen still
+    # expects the original nested-pytree (model, opt, *args, **kwargs)
+    # structure and runtime invocation explodes.
+    gm = _to_caller_flattened_graph_module(gm)
+
+    # Rebuild flat_state from the post-shard params/buffers/named_states.
+    # ``shard_params`` may have substituted parameter objects, so the
+    # original ``flat_state`` references can be stale.  Tail entries beyond
+    # the model state (added via ``recir.add_state``) are preserved.
+    rebuilt_state = pytree.tree_leaves([params_and_buffers, named_states])
+    if len(flat_state) > len(rebuilt_state):
+        rebuilt_state.extend(flat_state[len(rebuilt_state) :])
+    flat_state = rebuilt_state
+
+    # GSPMD/FSDP: mirror legacy ``_compile_gspmd`` by setting
+    # ``is_fsdp_sharded`` on placeholders that correspond to FSDP-sharded
+    # params/states.  ``_jit_gspmd`` inspects this meta to decide which
+    # inputs are local shards (vs replicated tensors).  Without the tag,
+    # the GSPMD lowering would treat sharded inputs as replicated and the
+    # cross-process gather/all-reduce shape contract breaks.  Only populated
+    # for the GSPMD branch above — the DP/HybridParallel branch consumes
+    # the parametrized gm directly and does not need placeholder-level
+    # FSDP tagging.
+    if sharded_keys:
+        is_sharded: list[bool] = [key in sharded_keys for key in params_and_buffers]
+        for fqn, state in named_states.items():
+            is_sharded.extend([fqn in sharded_keys] * len(state))
+        tensor_idx = 0
+        for node in gm.graph.nodes:
+            if node.op != "placeholder":
+                continue
+            val = node.meta.get("val", None)
+            if isinstance(val, torch.Tensor):
+                node.meta["is_fsdp_sharded"] = (
+                    is_sharded[tensor_idx] if tensor_idx < len(is_sharded) else False
+                )
+                tensor_idx += 1
+
+    # Stage 4 (post-partition is the legacy ordering used by
+    # ``_compile_and_transform``): region transforms get a chance to finalize
+    # after the graph has been partitioned.
+    for transform in region_transforms_list:
+        transform.finalize_compiled_graph(gm)
+
+    # Stage 6: backend-configured optimize passes.  Each pass may rewrite the
+    # graph and/or update flat_state.  Some passes accept (gm,) and others
+    # accept (gm, flat_state) — dispatch via signature inspection so a
+    # ``TypeError`` raised from inside ``opt_pass`` is not silently swapped
+    # for the single-arg form.
+    #
+    # Only count *positional* params toward the arity check.  Otherwise a
+    # signature like ``def my_pass(gm, *, mode="x")`` (1 positional + 1
+    # kw-only) would falsely set ``wants_state=True`` and we'd call
+    # ``opt_pass(gm, flat_state)`` → ``TypeError`` at runtime.
+    _POSITIONAL_KINDS = (
+        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        inspect.Parameter.POSITIONAL_ONLY,
+    )
+    for opt_pass in backend.optimize_passes:
+        try:
+            sig_params = inspect.signature(opt_pass).parameters.values()
+            positional_params = [p for p in sig_params if p.kind in _POSITIONAL_KINDS]
+            wants_state = len(positional_params) >= 2
+        except (TypeError, ValueError):
+            # ``inspect.signature`` raises ``ValueError`` on builtins /
+            # C-extensions and ``TypeError`` on non-callables; in either
+            # case fall back to the legacy single-arg form.
+            wants_state = False
+        if wants_state:
+            result = opt_pass(gm, flat_state)
+        else:
+            result = opt_pass(gm)
+        if isinstance(result, tuple) and len(result) == 2:
+            gm, flat_state = result  # pyre-ignore[9]
+        elif isinstance(result, fx.GraphModule):
+            gm = result
+
+    # Stage 7: optionally wrap in IterGraphModule for cross-iteration passes
+    # and lazy-lowering hooks.
+    if backend.uses_iter_graph:
+        # Local import to avoid pulling IterGraphModule into the
+        # module-import path for callers that don't use this path.
+        from recir.iter_graph_module import IterGraphModule
+
+        gm = cast(fx.GraphModule, IterGraphModule(gm))
+
+    # Stage 8: dispatch (backend.dispatch returns an nn.Module — typically
+    # the same gm rewritten as a partial-lowered module, but the contract
+    # only requires it be a callable nn.Module compatible with the flat-state
+    # invocation convention).
+    dispatched = backend.dispatch(gm)
+    # Preserve the gm reference (the dispatched module is typically the gm
+    # itself, rewritten in place).  ``_CompiledResult.gm`` is callable, so
+    # we use the dispatched module here.
+    final_gm = cast(fx.GraphModule, dispatched)
+
+    return _CompiledResult(
+        gm=final_gm,
+        mod=ctx.mod,
+        opt=ctx.opt,
+        flat_state=flat_state,
+        state_manager=backend.device_state_manager(),
+    )
+
+
+def _compile_via_backend(
+    func: Callable[..., Any],
+    parallel_mode: ParallelMode,
+    backend: "Backend",
+    *,
+    eager_preproc: Sequence[Callable[[nn.Module], None]],
+    region_transforms: Optional[List[RegionTransform]],
+    args: Tuple[Any, ...],
+    kwargs: Dict[str, Any],
+) -> _CompiledResult:
+    """Internal: drive the new v7.1 trace + compile_from_gm pipeline.
+
+    Centralises the eager_preproc → trace → compile_from_gm call sequence so
+    :func:`compile` doesn't have to duplicate it.  Used only when the user
+    passes ``backend=`` to :func:`compile`.
+    """
+    rt = list(region_transforms or ())
+
+    # Stage 0: apply eager pre-trace hooks to every nn.Module argument.
+    # Multi-module signatures (e.g. model + loss module, teacher/student)
+    # all need preprocessing -- not just the first one encountered.
+    if eager_preproc:
+        for arg in pytree.arg_tree_leaves(*args, **kwargs):
+            if isinstance(arg, nn.Module):
+                for hook in eager_preproc:
+                    hook(arg)
+
+    # Stage 2: trace.  Propagate the parallel mode's batch dim so placeholder
+    # meta tagging matches what stages 4-10 will later assume.  Also pass the
+    # parallel mode itself so the trace can expand per-process tensors to the
+    # global batch when the mode is GSPMD-like -- avoids the HF Gemma3 /
+    # Llama / Qwen ``shape[0]``-baked-as-int problem that surfaces post-GSPMD
+    # at JAX broadcast time.  Mirrors the per-host -> global transform that
+    # ``_compile_gspmd`` performs on the legacy partition-only path.
+    gm, flat_state = trace(
+        func,
+        *args,
+        region_transforms=rt,
+        input_batch_dim=parallel_mode.input_batch_dim,
+        parallel_mode=parallel_mode,
+        **kwargs,
+    )
+
+    # Stages 4-10.
+    return compile_from_gm(
+        gm,
+        flat_state,
+        parallel_mode=parallel_mode,
+        backend=backend,
+        region_transforms=rt,
+    )
 
 
 def _compile_data_parallel_v2(
@@ -896,8 +1674,15 @@ def _compile_gspmd(
                         torch.ops.aten.div.Scalar, args=(node, num_ranks)
                     )
                     div_node.meta = node.meta.copy() if node.meta else {}
-                    node.replace_all_uses_with(div_node)
-                    div_node.args = (node, num_ranks)
+                    # Filter out div_node itself so the rewrite skips the
+                    # freshly-created (node, num_ranks) edge -- otherwise
+                    # div_node would self-reference and we would need to
+                    # restore div_node.args post-hoc.
+                    # Default-arg ``dn=div_node`` pins the current iteration's
+                    # div_node (avoids B023 late binding).
+                    node.replace_all_uses_with(
+                        div_node, lambda u, dn=div_node: u is not dn
+                    )
     for node in list(gm.graph.nodes):
         if (
             node.op == "call_function"
@@ -959,11 +1744,14 @@ def _compile_gspmd(
 COMPILED_OBJECT_KEY = "_compiled_obj"
 
 
-def compile(
+def compile(  # noqa: C901 — orchestration: stages 0-10 + legacy DP/GSPMD wiring intentionally kept inline; refactor would obscure the pipeline.
     module_override: Optional[List[Override]] = None,
     gm_transformation: Optional[Callable[[fx.GraphModule], fx.GraphModule]] = None,
     parallel_mode: Optional[ParallelMode] = None,
     region_transforms: Optional[List[RegionTransform]] = None,
+    *,
+    backend: Optional["Backend"] = None,
+    eager_preproc: Sequence[Callable[[nn.Module], None]] = (),
 ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
     r"""Compile and optimize a callable, which can be a train step within a training loop.
 
@@ -976,10 +1764,18 @@ def compile(
             that will be applied to the module in order. The :class:`Override`
             objects provide :class:`nn.Module` replacements during tracing and a
             graph transformation function after tracing. (Default: ``None``)
+
+            .. deprecated:: v7.1
+                Mutually exclusive with ``eager_preproc``.  Use ``eager_preproc``
+                for the new path; ``module_override`` will be deleted in C6.
         gm_transformation (Optional[Callable[fx.GraphModule, fx.GraphModule]]):
             a callback that will be called after the original callable is
             compiled and distributed (usually after the first iteration) to
             transform the compiled GraphModule into a new optimized one.
+
+            .. deprecated:: v7.1
+                Mutually exclusive with ``backend``.  Use ``backend`` for the new
+                path; ``gm_transformation`` will be deleted in C6.
         parallel_mode (Optional[ParallelMode]): a :class:`ParallelMode` object
             that specifies how to parallelize the callable. Each ParallelMode
             would have its own strategy to partition the model and the captured
@@ -988,8 +1784,21 @@ def compile(
             :class:`RegionTransform` instances applied during tracing to rewrite
             sub-regions of the forward graph (e.g. activation checkpointing via
             :class:`RecomputeTransform`). (Default: ``None``)
+        backend (Optional[Backend]): a :class:`recir.backends.Backend` instance
+            that owns stages 6-10 (optimize_passes, IterGraph wrapping,
+            dispatch, build, serialize).  When provided, ``recir.compile``
+            routes through the new :func:`trace` + :func:`compile_from_gm`
+            pipeline.  Mutually exclusive with ``gm_transformation``.
+            (Default: ``None``)
+        eager_preproc (Sequence[Callable[[nn.Module], None]]): a sequence of
+            in-place pre-trace hooks that run against the model (stage 0).
+            Mutually exclusive with ``module_override``.  (Default: ``()``)
 
     """
+    if module_override and eager_preproc:
+        raise ValueError("module_override and eager_preproc are mutually exclusive")
+    if gm_transformation is not None and backend is not None:
+        raise ValueError("gm_transformation and backend are mutually exclusive")
 
     def inner(func: Callable[..., Any]) -> Callable[..., Any]:
         @wraps(func)
@@ -1002,15 +1811,38 @@ def compile(
                 mode: ParallelMode = (
                     DataParallel() if parallel_mode is None else parallel_mode
                 )
-                compiled_obj = _compile_and_transform(
-                    func,
-                    module_override,
-                    mode,
-                    gm_transformation,
-                    *args,
-                    region_transforms=region_transforms,
-                    **kwargs,
-                )
+                if backend is not None:
+                    # New v7.1 path: trace + compile_from_gm.
+                    compiled_obj = _compile_via_backend(
+                        func,
+                        mode,
+                        backend,
+                        eager_preproc=eager_preproc,
+                        region_transforms=region_transforms,
+                        args=args,
+                        kwargs=kwargs,
+                    )
+                else:
+                    # Legacy path: module_override + gm_transformation.
+                    # eager_preproc still applies in pre-trace; runs against
+                    # every nn.Module argument before _compile_and_transform
+                    # sees it (multi-module signatures all need it).  This
+                    # keeps the new kwarg useful even on the old path while
+                    # consumers migrate.
+                    if eager_preproc:
+                        for arg in pytree.arg_tree_leaves(*args, **kwargs):
+                            if isinstance(arg, nn.Module):
+                                for hook in eager_preproc:
+                                    hook(arg)
+                    compiled_obj = _compile_and_transform(
+                        func,
+                        module_override,
+                        mode,
+                        gm_transformation,
+                        *args,
+                        region_transforms=region_transforms,
+                        **kwargs,
+                    )
                 wrapper.__dict__[COMPILED_OBJECT_KEY] = compiled_obj
 
             user_inps = pytree.arg_tree_leaves(*args, **kwargs)

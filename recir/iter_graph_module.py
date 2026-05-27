@@ -433,12 +433,28 @@ class IterGraph(fx.Graph):
         if self._freeze_cross_iter_movement:
             return super().erase_node(to_erase)
 
+        # Nodes added directly to the main graph (e.g. via ``super().call_function``
+        # while ``_freeze_cross_iter_movement`` was toggled) have no mirror
+        # entry in ``_setup_mapping`` / ``_cleanup_mapping``. Treat a missing
+        # mirror as a no-op rather than asserting -- the main-graph erase
+        # below is still meaningful, and there is nothing to clean up in the
+        # sub-graphs.
         setup_node = self._lookup_node(to_erase, self.setup_graph)
-        assert setup_node is not None, "setup_node is None"
-        self.setup_graph.erase_node(setup_node)
+        if setup_node is not None:
+            # Mirror nodes (setup / cleanup) often still feed ``output`` in
+            # their respective sub-graphs even when the main node has been
+            # replaced.  Substitute ``None`` so the mirror erase succeeds;
+            # downstream passes that consume the mirror parent must tolerate
+            # the ``None`` replacement (or recompile around it).
+            if setup_node.users:
+                setup_node.replace_all_uses_with(None)  # pyre-ignore[6]
+            self.setup_graph.erase_node(setup_node)
         super().erase_node(to_erase)
         cleanup_node = self._lookup_node(to_erase, self.cleanup_graph)
-        self.cleanup_graph.erase_node(cleanup_node)  # pyre-ignore[6]
+        if cleanup_node is not None:
+            if cleanup_node.users:
+                cleanup_node.replace_all_uses_with(None)  # pyre-ignore[6]
+            self.cleanup_graph.erase_node(cleanup_node)
 
     def placeholder(
         self,
@@ -770,3 +786,33 @@ class IterGraphModule(nn.Module):
         logger.info("%s", self.main_gm.print_readable(False))
         logger.info("3. Cleanup fx.GraphModule:")
         logger.info("%s", self.cleanup_gm.print_readable(False))
+
+    def add_subgraph_module(self, name: str, module: nn.Module) -> None:
+        """Register ``module`` as a submodule on all three sub-GraphModules.
+
+        ``lower_subgraph_nodes`` (and other graph-surgery callers) splice a
+        ``call_module(target=name)`` node into the main IterGraph. The
+        post-surgery ``fx.Graph.lint`` walks the call site's
+        ``owning_module`` (the ``main_gm``) and raises::
+
+            RuntimeError: Node <name> target <name> references nonexistent
+            attribute <name>
+
+        whenever the submodule attribute is only installed on the outer
+        ``IterGraphModule`` (a plain ``setattr(iter_gm, name, module)``
+        registers it on the ``nn.Module`` parent but *not* on the inner
+        ``fx.GraphModule`` whose ``owning_module`` lint actually walks).
+
+        We propagate to all three sub-GMs (main / setup / cleanup) so the
+        attribute is reachable regardless of which graph the runtime
+        ``forward`` dispatches into for a given iteration. The
+        ``call_module`` node itself currently only exists in the main
+        IterGraph (``IterGraph.create_node`` is not overridden to mirror
+        into setup/cleanup), but registering on all three keeps the
+        sub-GM submodule registries consistent and future-proof.
+        """
+        for gm_name in ("setup_gm", "main_gm", "cleanup_gm"):
+            sub_gm = getattr(self, gm_name, None)
+            if sub_gm is None:
+                continue
+            setattr(sub_gm, name, module)

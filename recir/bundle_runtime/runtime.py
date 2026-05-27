@@ -11,7 +11,7 @@
 Public entry point: :func:`wrap_and_lower`.
 
 The runtime is the consumer-side analogue of
-``recir.api._compile_data_parallel``: it takes the FQN-keyed dicts the
+``recir.api._compile_data_parallel_v2``: it takes the FQN-keyed dicts the
 loader assembled, threads them through the kwargs-only
 :meth:`recir.distributed.parallel_mode.ParallelMode.partition`
 signature, and runs
