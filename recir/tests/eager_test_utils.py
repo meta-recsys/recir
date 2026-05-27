@@ -1,16 +1,19 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # pyre-ignore-all-errors
 
-"""Shared toy model components for override tests."""
+"""Shared toy model components for orchestrator-style override tests."""
 
 import torch
 import torch.nn as nn
 import torch.utils._pytree as pytree
 from functorch import make_fx
-from recir.api import _enable_compile, _rematerialize_optimizer, Override
-from recir.override_ops import anchor_output, default_override_transform
+from recir.api import _enable_compile, _rematerialize_optimizer
+from recir.eager_dispatch import install_graph_break_dispatch, mark_output_with_bwd
 from torch._subclasses.fake_tensor import FakeTensorMode
 from torch.nn.utils import stateless
+
+
+_TOY_MARKER_PREFIX = "recir.tests.toy"
 
 
 class ToyPreprocess(nn.Module):
@@ -53,22 +56,32 @@ class ToyFusedPreprocess(nn.Module):
 
 
 class ToyDummyPreprocess(nn.Module):
-    def __init__(
-        self, batch_size: int = 3, embedding_dim: int = 4, override_id: int = 0
-    ):
+    """Tracing-time stand-in for ToyPreprocess/ToyFusedPreprocess.
+
+    Plants a forward/backward marker pair via ``mark_output_with_bwd`` so the
+    post-trace orchestrator can find both halves and install a graph-break
+    dispatch back to the original preprocess.
+    """
+
+    def __init__(self, batch_size: int = 3, embedding_dim: int = 4, marker_id: int = 0):
         super().__init__()
         self.batch_size = batch_size
         self.embedding_dim = embedding_dim
-        self.override_id = override_id
-        # Requires_grad anchor so OverrideAnchorFn.backward fires during tracing.
+        self.marker_id = marker_id
+        # Requires_grad anchor so the autograd Function backward fires during
+        # tracing — produces a findable backward marker in the bwd subgraph.
         self._grad_anchor = nn.Parameter(torch.zeros(1))
+
+    @property
+    def _marker_prefix(self) -> str:
+        return f"{_TOY_MARKER_PREFIX}::{self.marker_id}"
 
     def forward(self, indices: torch.Tensor) -> torch.Tensor:
         batch_size = indices.shape[0]
         dep = indices.float().sum() * 0.0 + self._grad_anchor * 0.0
-        return anchor_output(
+        return mark_output_with_bwd(
             torch.zeros(batch_size, self.embedding_dim) + dep,
-            self.override_id,
+            self._marker_prefix,
             0,
         )
 
@@ -92,25 +105,40 @@ class ToyWrapper(nn.Module):
         return self.dense(self.preprocess(indices))
 
 
-class ToyOverride(Override):
-    def __init__(self, dummy: ToyDummyPreprocess, num_ranks: int = 1):
+class ToyDispatcher:
+    """Orchestrator-style replacement for the legacy ``ToyOverride``.
+
+    ``install_eager`` swaps the original (Fused)Preprocess submodule for a
+    ``ToyDummyPreprocess`` so tracing sees a stable, fake-tensor-friendly
+    shape.  ``install_graph`` finds the marker pair planted by the dummy and
+    installs a graph-break dispatch back to the captured original module.
+    """
+
+    def __init__(self, dummy: ToyDummyPreprocess, num_ranks: int = 1) -> None:
         self._dummy = dummy
-        self._orig_preprocess = None
+        self._orig_preprocess: nn.Module | None = None
         self._num_ranks = num_ranks
 
-    def replacement(self, fqn, orig_submodule):
-        if isinstance(orig_submodule, (ToyPreprocess, ToyFusedPreprocess)):
-            self._orig_preprocess = orig_submodule
-            return self._dummy
-        return orig_submodule
+    def install_eager(self, model: nn.Module) -> None:
+        for fqn, mod in list(model.named_modules()):
+            if isinstance(mod, (ToyPreprocess, ToyFusedPreprocess)):
+                self._orig_preprocess = mod
+                parent_fqn, leaf = fqn.rsplit(".", 1) if "." in fqn else ("", fqn)
+                parent = model.get_submodule(parent_fqn) if parent_fqn else model
+                setattr(parent, leaf, self._dummy)
 
-    def transform(self, gm, flat_state):
-        return default_override_transform(
+    def install_graph(self, gm, flat_state):
+        assert self._orig_preprocess is not None, (
+            "install_eager() must run before install_graph()"
+        )
+        install_graph_break_dispatch(
             gm,
-            flat_state,
-            self._orig_preprocess,
+            self._dummy._marker_prefix,
+            self._orig_preprocess,  # type: ignore[arg-type]
+            num_state_tensors=len(flat_state),
             num_ranks=self._num_ranks,
         )
+        return gm, flat_state
 
 
 def trace_train_step(wrapper, opt, x):

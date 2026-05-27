@@ -141,9 +141,8 @@ class XSurfaceFakeTracingCompatTest(unittest.TestCase):
             predictions = named_tensors["prediction"]
             return logits, predictions
 
-        from recir.api import _apply_module_overrides
-
-        _apply_module_overrides(model, overrides)
+        for dispatcher in overrides:
+            dispatcher.install_eager(model)
 
         fake_mode = FakeTensorMode(allow_non_fake_inputs=True)
         result = _local_compile(

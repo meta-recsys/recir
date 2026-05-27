@@ -9,7 +9,7 @@
 """
 RankFM (xsurface V3) E2E training on GKE TPU v7x with:
 - recir @compile XLA GSPMD dense path on TPU (JAX PJRT)
-- PreprocessorOverride + SparseArchOverride from xsurface_test_utils
+- PreprocessorDispatcher + SparseArchDispatcher from xsurface_test_utils
   (these wrap the heavy preprocessor and ECSparseArch with dummy modules
   during tracing, and dispatch to the real modules at runtime)
 
@@ -28,16 +28,16 @@ from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 import fbgemm_gpu  # noqa: F401 -- force C++ op registration before fallback
 import jax
+import recir
 import recir.lowering.fbgemm_fallback  # noqa: F401 -- registers SPMD_DECOMP_TABLE entries
 import torch
 import torch.distributed as dist
 import torch.nn as nn
 from hammer.v3.modules.recblock import _inputs_to_feature_bundle, RecBlock
-from recir.api import compile, sync_device_state_to_torch
-from recir.backend import BackendType
+from recir.api import sync_device_state_to_torch
+from recir.backends import XLAGSPMDBackend
 from recir.decompositions import SPMD_DECOMP_TABLE
 from recir.distributed.parallel_mode import GSPMDParallel
-from recir.gm_transformation import GraphModuleTransformation
 from recir.lowering.fbgemm_fallback import _batched_complete_cumsum_impl
 from recir.region_transforms.padding import (
     compute_padded_shape,
@@ -331,8 +331,6 @@ def _build_compiled_train_step(
         if p.is_floating_point():
             p.requires_grad_(True)
 
-    module_config = model.module_config  # pyre-ignore[16]
-
     torch.manual_seed(0)
     batch = _create_uniform_train_batch(
         feature_config,
@@ -419,40 +417,15 @@ def _build_compiled_train_step(
         ro_kjt_keys, nro_kjt_keys, unary_kjt_keys
     )
 
-    compile_kwargs: Dict[str, Any] = {
-        "module_override": overrides,
-        "parallel_mode": GSPMDParallel(
-            "replicate",
-            loss_reduction="sum",
-            num_ranks=num_ranks,
-            num_processes=num_processes,
-        ),
-        "gm_transformation": GraphModuleTransformation(
-            backend=BackendType.XLA_GSPMD,
-            enable_device_state=True,
-        ),
-    }
-
+    region_transforms: List[Any] = []
     if cfg.enable_padding:
-        contextual_budgets = dict(module_config.contextual_feature_to_max_length)
-        history_budget = cfg.max_uih_seq_len
-        ro_per_sample = [
-            contextual_budgets.get(key, history_budget) for key in ro_kjt_keys
-        ]
-        compile_kwargs["region_transforms"] = [
+        region_transforms = [
             PaddingRegionTransform(
                 jagged_pairs={
-                    "ro_id_list_values": JaggedPairConfig(
-                        "ro_id_list_lengths",
-                        per_sample_budgets=ro_per_sample,
-                    ),
-                    "nro_id_list_values": JaggedPairConfig(
-                        "nro_id_list_lengths",
-                        per_sample_budgets=1,
-                        batch_size_arg="nro_float_features",
-                        count_arg="num_candidates",
-                        max_per_sample_count=cfg.num_candidates,
-                    ),
+                    # RO/NRO id-list pairs are opted out below — they only
+                    # flow into PreprocessorDispatcher (a CPU graph break)
+                    # and stay at local stride throughout the preprocessor.
+                    # The dispatcher handles the padding.
                     "unary_values": JaggedPairConfig(
                         "unary_lengths",
                         per_sample_budgets=1,
@@ -467,9 +440,15 @@ def _build_compiled_train_step(
             ),
         ]
 
-    @compile(**compile_kwargs)  # pyre-ignore[6]
+    parallel_mode = GSPMDParallel(
+        "replicate",
+        loss_reduction="sum",
+        num_ranks=num_ranks,
+        num_processes=num_processes,
+    )
+
     # pyre-ignore
-    def train_step(
+    def train_step_fn(
         mod: nn.Module,
         opt: torch.optim.Optimizer,
         ro_float_features: torch.Tensor,
@@ -503,7 +482,67 @@ def _build_compiled_train_step(
         loss.backward()
         opt.step()
 
+    train_step = _compile_with_xsurface_dispatchers(
+        model,
+        opt,
+        batch,
+        overrides,
+        train_step_fn,
+        parallel_mode=parallel_mode,
+        backend=XLAGSPMDBackend(),
+        region_transforms=region_transforms,
+    )
+
     return train_step, model, opt, batch, feature_config, key_to_size
+
+
+def _compile_with_xsurface_dispatchers(
+    model: nn.Module,
+    opt: torch.optim.Optimizer,
+    batch: Any,
+    dispatchers: List[Any],
+    callable_: Any,
+    *,
+    parallel_mode: GSPMDParallel,
+    backend: XLAGSPMDBackend,
+    region_transforms: List[Any],
+) -> Any:
+    """Drive ``recir.trace`` / ``recir.compile_from_gm`` with the rankfm
+    PreprocessorDispatcher + SparseArchDispatcher pair.
+    """
+    from recir.api import make_compiled_runner
+
+    # Stage 0
+    model_to_train = (
+        model.module if isinstance(model, DistributedModelParallel) else model
+    )
+    for dispatcher in dispatchers:
+        dispatcher.install_eager(model_to_train)
+
+    # Stage 2
+    gm, flat_state = recir.trace(
+        callable_,
+        model_to_train,
+        opt,
+        *_extract_train_step_args(batch),
+        parallel_mode=parallel_mode,
+        region_transforms=region_transforms,
+    )
+
+    # Stage 3
+    for dispatcher in dispatchers:
+        gm, flat_state = dispatcher.install_graph(gm, flat_state)
+
+    # Stages 4-10
+    compiled_obj: Any = recir.compile_from_gm(
+        gm,
+        flat_state,
+        parallel_mode=parallel_mode,
+        backend=backend,
+        region_transforms=region_transforms,
+    )
+
+    return make_compiled_runner(compiled_obj)
 
 
 def _is_jax_profiling_enabled(cfg: RankFMConfig) -> bool:

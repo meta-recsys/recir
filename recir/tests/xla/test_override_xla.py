@@ -11,24 +11,46 @@ Requires GPU.
 
 import unittest
 from copy import deepcopy
+from typing import Any
 
+import recir
 import recir.lowering.fbgemm_fallback  # noqa: F401
 import torch
-from recir.api import compile, sync_device_state_to_torch
-from recir.backend import BackendType
+from recir.api import make_compiled_runner, sync_device_state_to_torch
+from recir.backends import XLAGSPMDBackend
 from recir.distributed.parallel_mode import GSPMDParallel
-from recir.gm_transformation import GraphModuleTransformation
-from recir.tests.override_test_utils import (
+from recir.tests.eager_test_utils import (
     ToyDense as SimpleDense,
+    ToyDispatcher as SimpleDispatcher,
     ToyDummyPreprocess as DummyPreprocess,
     ToyFusedPreprocess as FusedPreprocess,
-    ToyOverride as SimpleOverride,
     ToyWrapper as SimpleWrapper,
 )
 
 # IMPORTANT: must run BEFORE any `import jax` so the cuda plugin path patch
 # is in effect when jax.devices() / jax.* first triggers plugin discovery.
 from recir.tests.xla import _jax_cuda_plugin_fix  # noqa: F401, I001
+
+
+def _compile_with_toy_dispatcher(
+    model: torch.nn.Module,
+    callable_: Any,
+    *args: Any,
+    dispatcher: SimpleDispatcher,
+    parallel_mode: GSPMDParallel,
+    backend: XLAGSPMDBackend,
+) -> Any:
+    """Compile a toy override-based train step via the v7.1 trace + compile_from_gm pipeline."""
+    dispatcher.install_eager(model)
+    gm, flat_state = recir.trace(callable_, *args)
+    gm, flat_state = dispatcher.install_graph(gm, flat_state)
+    compiled_obj = recir.compile_from_gm(
+        gm,
+        flat_state,
+        parallel_mode=parallel_mode,
+        backend=backend,
+    )
+    return make_compiled_runner(compiled_obj)
 
 
 # ---------------------------------------------------------------------------
@@ -54,30 +76,32 @@ class TestOverrideXLAGSPMD(unittest.TestCase):
         preprocess = FusedPreprocess(num_embeddings=10, embedding_dim=4, lr=0.1)
         dense = SimpleDense(embedding_dim=4, output_dim=2)
         dummy = DummyPreprocess(embedding_dim=4)
-        wrapper = SimpleWrapper(dummy, dense)
-        override = SimpleOverride(dummy, num_ranks=self.num_ranks)
-        override._orig_preprocess = preprocess
+        wrapper = SimpleWrapper(preprocess, dense)
+        dispatcher = SimpleDispatcher(dummy, num_ranks=self.num_ranks)
 
         opt = torch.optim.SGD(wrapper.parameters(), lr=0.01, foreach=False)
         indices = torch.randint(0, 10, (global_bs,))
 
-        @compile(
-            module_override=[override],
+        def train_step_fn(mod, opt, indices):
+            loss = mod(indices)
+            loss.backward()
+            opt.step()
+
+        train_step = _compile_with_toy_dispatcher(
+            wrapper,
+            train_step_fn,
+            wrapper,
+            opt,
+            indices,
+            dispatcher=dispatcher,
             parallel_mode=GSPMDParallel(
                 "replicate",
                 loss_reduction="sum",
                 num_ranks=self.num_ranks,
                 num_processes=1,
             ),
-            gm_transformation=GraphModuleTransformation(
-                backend=BackendType.XLA_GSPMD,
-                enable_device_state=True,
-            ),
+            backend=XLAGSPMDBackend(),
         )
-        def train_step(mod, opt, indices):
-            loss = mod(indices)
-            loss.backward()
-            opt.step()
 
         train_step(wrapper, opt, indices)
         sync_device_state_to_torch(train_step)
@@ -109,26 +133,33 @@ class TestOverrideXLAGSPMD(unittest.TestCase):
         }
         return baseline_emb_weights, baseline_dense_weights
 
-    def _compile_train_step(self, override: SimpleOverride):
-        @compile(
-            module_override=[override],
+    def _compile_train_step(
+        self,
+        wrapper: SimpleWrapper,
+        dispatcher: SimpleDispatcher,
+        opt: torch.optim.Optimizer,
+        indices: torch.Tensor,
+    ):
+        def train_step_fn(mod, opt, indices):
+            loss = mod(indices)
+            loss.backward()
+            opt.step()
+
+        return _compile_with_toy_dispatcher(
+            wrapper,
+            train_step_fn,
+            wrapper,
+            opt,
+            indices,
+            dispatcher=dispatcher,
             parallel_mode=GSPMDParallel(
                 "replicate",
                 loss_reduction="sum",
                 num_ranks=self.num_ranks,
                 num_processes=1,
             ),
-            gm_transformation=GraphModuleTransformation(
-                backend=BackendType.XLA_GSPMD,
-                enable_device_state=True,
-            ),
+            backend=XLAGSPMDBackend(),
         )
-        def train_step(mod, opt, indices):
-            loss = mod(indices)
-            loss.backward()
-            opt.step()
-
-        return train_step
 
     def _count_graph_break_nodes(self, compiled_obj) -> int:
         bwd_fn_count = 0
@@ -164,12 +195,14 @@ class TestOverrideXLAGSPMD(unittest.TestCase):
         override_preprocess = deepcopy(preprocess)
         override_dense = deepcopy(dense)
         dummy = DummyPreprocess(embedding_dim=4)
-        wrapper = SimpleWrapper(dummy, override_dense)
-        override = SimpleOverride(dummy, num_ranks=self.num_ranks)
-        override._orig_preprocess = override_preprocess
+        # Wrap the *real* preprocess; the dispatcher.install_eager call swaps
+        # it for the dummy during stage 0 (and captures the original module
+        # for the runtime dispatch).
+        wrapper = SimpleWrapper(override_preprocess, override_dense)
+        dispatcher = SimpleDispatcher(dummy, num_ranks=self.num_ranks)
         opt = torch.optim.SGD(wrapper.parameters(), lr=0.01, foreach=False)
 
-        train_step = self._compile_train_step(override)
+        train_step = self._compile_train_step(wrapper, dispatcher, opt, indices)
 
         for _ in range(num_iters):
             train_step(wrapper, opt, indices)

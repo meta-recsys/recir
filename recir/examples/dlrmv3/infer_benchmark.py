@@ -2,7 +2,7 @@
 
 Measures latency and throughput of the dense (HSTU) forward pass on TPU
 via RecIR's @compile with XLA GSPMD backend. Embeddings stay on CPU
-(via DlrmV3SparseOverride), matching the production inference architecture.
+(via DlrmV3SparseDispatcher), matching the production inference architecture.
 
 Usage:
     python3 -u -m recir.examples.dlrmv3.infer_benchmark \
@@ -21,15 +21,14 @@ from typing import Any, Dict, List, Tuple
 import jax
 import torch
 import torch.nn as nn
-from recir.api import compile
-from recir.backend import BackendType
+from recir.backends import XLAGSPMDBackend
 from recir.distributed.parallel_mode import GSPMDParallel
 from recir.examples.dlrmv3.config import DLRMv3Config
-from recir.gm_transformation import GraphModuleTransformation
+from recir.examples.dlrmv3.jax_embedding import compile_with_jax_embedding
 from recir.tests.xla.dlrmv3_test_utils import (
     create_dlrmv3_wrapper,
     create_static_batch,
-    DlrmV3SparseOverride,
+    DlrmV3SparseDispatcher,
     DummyPreprocess,
     get_hstu_config,
 )
@@ -136,27 +135,13 @@ def run_benchmark(
         item_emb_feature_names=hstu_config.item_embedding_feature_names,
         hstu_configs=hstu_config,
     )
-    sparse_override = DlrmV3SparseOverride(dummy)
-    sparse_override._num_ranks = 1
+    sparse_dispatcher = DlrmV3SparseDispatcher(dummy)
+    sparse_dispatcher._num_ranks = 1
 
     num_tpu_devices = jax.device_count()
     num_ranks = num_tpu_devices if num_tpu_devices > 1 else 1
 
-    @compile(
-        module_override=[sparse_override],
-        parallel_mode=GSPMDParallel(
-            "replicate",
-            loss_reduction="sum",
-            num_ranks=num_ranks,
-            num_processes=1,
-        ),
-        # pyre-ignore[6]: GraphModuleTransformation is callable
-        gm_transformation=GraphModuleTransformation(
-            backend=BackendType.XLA_GSPMD,
-            enable_device_state=True,
-        ),
-    )
-    def inference_step(
+    def inference_step_fn(
         mod: nn.Module,
         uih_values: torch.Tensor,
         uih_lengths: torch.Tensor,
@@ -167,6 +152,23 @@ def run_benchmark(
         mod(uih_values, uih_lengths, cand_values, cand_lengths)
 
     uih_values, uih_lengths, cand_values, cand_lengths = batch
+    inference_step = compile_with_jax_embedding(
+        wrapper,
+        inference_step_fn,
+        wrapper,
+        uih_values,
+        uih_lengths,
+        cand_values,
+        cand_lengths,
+        dispatcher=sparse_dispatcher,
+        parallel_mode=GSPMDParallel(
+            "replicate",
+            loss_reduction="sum",
+            num_ranks=num_ranks,
+            num_processes=1,
+        ),
+        backend=XLAGSPMDBackend(),
+    )
 
     # Warmup (includes XLA compilation)
     logger.info(f"  Warmup: {num_warmup} steps (includes XLA compile)...")

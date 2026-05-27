@@ -88,8 +88,13 @@ class Override(ABC):
 
     For overrides that need integrated backward support (i.e., the override's
     backward should fire within the compiled ``train_step`` automatically),
-    use :func:`recir.override_ops.replace_override_anchors` inside
-    ``transform()`` to replace anchor ops with runtime dispatch calls.
+    use :func:`recir.eager_dispatch.install_graph_break_dispatch` inside
+    ``transform()`` to replace marker pairs with runtime dispatch calls.
+
+    .. deprecated:: v7.1
+        :class:`Override` is being replaced by orchestrator-style classes
+        with ``install_eager`` + ``install_graph`` bound methods.  Stays
+        present until C6 of the v7.1 stack.
     """
 
     @abstractmethod
@@ -273,7 +278,7 @@ class _LocalCompiledResult:
     constants: Dict[str, torch.Tensor]
 
 
-def _apply_module_overrides(
+def _apply_eager_passes(
     mod: nn.Module,
     module_override: List[Override],
 ) -> None:
@@ -477,8 +482,8 @@ def _resolve_trace_batch_ratio(
     """Determine the per-host -> trace batch ratio for ``parallel_mode``.
 
     Returns ``None`` when ``parallel_mode`` doesn't request a pre-trace
-    batch transform (e.g., ``DataParallel`` v1 with a DTensor partition
-    that re-runs the transform internally, or unrecognized modes).
+    batch transform (e.g., when ``parallel_mode`` is ``None`` or an
+    unrecognized mode).
 
     For GSPMD-style modes (the partition is a no-op; XLA inflates
     placeholder shardings at compile time), the trace should see global
@@ -486,6 +491,16 @@ def _resolve_trace_batch_ratio(
     Python-int literals into ``expand``/``view`` calls.  The ratio is
     ``num_processes`` (per-host -> per-process global; for single-host
     runs ``num_processes == 1`` and the transform is a no-op).
+
+    For ``DataParallel`` / ``HybridParallel`` driven through the new
+    ``trace`` + ``compile_from_gm`` pipeline, the DTensor partition step
+    re-shards user-input placeholders back to per-process shapes, so the
+    trace must start from the global batch for the runtime per-process
+    inputs to match.  This mirrors the per-host -> global transform that
+    the legacy :func:`_compile_data_parallel` applies inline on its own
+    path; without it, ``partition_data_parallel`` narrows the placeholder
+    to ``per_host_batch // num_processes`` and runtime invocation hits an
+    ``aten.mm`` shape mismatch (e.g. ``(N, 10) @ (10/num_processes, K)``).
     """
     if parallel_mode is None:
         return None
@@ -1481,7 +1496,7 @@ def _compile_data_parallel_v2(
     # replaced with dummy placeholders for discovery, region-transform
     # inner trace, and the outer _local_compile trace.
     if module_override:
-        _apply_module_overrides(_mod, module_override)
+        _apply_eager_passes(_mod, module_override)
 
     # 4. Extract params_and_buffers AFTER overrides so the dict matches the
     #    (post-override) module that _local_compile will trace.  Critical
@@ -1630,7 +1645,7 @@ def _compile_gspmd(
     if module_override:
         for arg in pytree.arg_tree_leaves(*args, **kwargs):
             if isinstance(arg, nn.Module):
-                _apply_module_overrides(arg, module_override)
+                _apply_eager_passes(arg, module_override)
                 break
     # Apply the per-process → global batch transform up front, so discovery,
     # region-transform inner trace, and the outer ``_local_compile`` trace
@@ -1742,6 +1757,81 @@ def _compile_gspmd(
 # Note that the Python convention of __dict__ requires the key to be str.
 # TODO: ensure the key is unique.
 COMPILED_OBJECT_KEY = "_compiled_obj"
+
+
+def make_compiled_runner(compiled_obj: Any) -> Callable[..., Any]:
+    """Wrap a ``_CompiledResult`` into a user-facing callable.
+
+    Builds the standard "prepare_inputs -> gm(*flat_inps) -> process_outputs"
+    runtime adapter that every recir orchestrator (``recir.compile``,
+    :func:`recir.examples.dlrmv3.jax_embedding.compile_with_jax_embedding`,
+    the rankfm trainer, custom dispatchers in tests) emits after stage 10.
+    The wrapper:
+
+    * pops ``last_train_step`` from ``kwargs`` (default ``False``);
+    * routes user args through :meth:`compiled_obj.state_manager.prepare_inputs`
+      to flatten and dedup against ``compiled_obj.flat_state``;
+    * invokes ``compiled_obj.gm(*flat_inps)``, falling back to a plain call
+      when the GM doesn't accept the ``last_iter`` kwarg (i.e. when no
+      :class:`IterGraphModule` wrap was applied);
+    * post-processes via :meth:`compiled_obj.state_manager.process_outputs`
+      to map updated state tensors back into the user-visible return value;
+    * stashes ``compiled_obj`` on the wrapper's ``__dict__`` under
+      :data:`COMPILED_OBJECT_KEY` so :func:`sync_device_state_to_torch` can
+      find it.
+
+    Args:
+        compiled_obj: a :class:`_CompiledResult` returned by
+            :func:`compile_from_gm` (or the legacy
+            :func:`_compile_and_transform`).
+
+    Returns:
+        A callable with the same signature as the original train step.
+        Pass ``last_train_step=True`` on the final call so IterGraph-wrapped
+        modules can flush their state.
+    """
+
+    # Introspect once per wrapper: determine whether the underlying GM's
+    # ``forward`` accepts a ``last_iter`` parameter (i.e. it's an
+    # IterGraphModule wrap). Avoids relying on TypeError substring matching,
+    # which is fragile across Python/torch versions. Explicit ``bool``
+    # annotation is required because the value is captured by the ``runner``
+    # closure below and pyre [53] flags unannotated captured locals.
+    accepts_last_iter: bool
+    try:
+        gm_sig = inspect.signature(compiled_obj.gm)
+        accepts_last_iter = "last_iter" in gm_sig.parameters
+    except (TypeError, ValueError):
+        accepts_last_iter = False
+
+    def runner(*call_args: Any, **call_kwargs: Any) -> Any:
+        last_train_step = (
+            call_kwargs.pop("last_train_step", False) if call_kwargs else False
+        )
+        user_inps = pytree.arg_tree_leaves(*call_args, **call_kwargs)
+        flat_inps = compiled_obj.state_manager.prepare_inputs(
+            compiled_obj.gm,
+            compiled_obj.flat_state,
+            user_inps,
+            last_train_step,
+        )
+        with torch.no_grad():
+            if last_train_step and accepts_last_iter:
+                # Final iter: pass ``last_iter`` so IterGraphModule can flush.
+                output_all = compiled_obj.gm(*flat_inps, last_iter=last_train_step)
+            else:
+                output_all = compiled_obj.gm(*flat_inps)
+            output = output_all[0]
+            updated_flat = pytree.tree_leaves(output_all[1:])
+            return compiled_obj.state_manager.process_outputs(
+                compiled_obj.flat_state,
+                output,
+                updated_flat,
+                last_train_step,
+            )
+
+    runner.__dict__[COMPILED_OBJECT_KEY] = compiled_obj
+    return runner
 
 
 def compile(  # noqa: C901 — orchestration: stages 0-10 + legacy DP/GSPMD wiring intentionally kept inline; refactor would obscure the pipeline.

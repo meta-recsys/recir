@@ -508,7 +508,7 @@ def _is_xla_compatible(node: torch.fx.Node) -> Tuple[bool, str]:
         if not target.has_kernel_for_dispatch_key(torch._C.DispatchKey.Meta):
             return False, f"{target} doesn't have a meta kernel registered"
 
-    # Override dispatch functions inserted by replace_override_anchors
+    # Override dispatch functions inserted by install_graph_break_dispatch
     # are marked with xla_graph_break metadata — they must not be absorbed.
     if node.meta.get("xla_graph_break", False):
         return False, "graph break (override dispatch)"
