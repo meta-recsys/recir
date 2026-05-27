@@ -6,7 +6,7 @@
 
 import os
 
-from setuptools import setup
+from setuptools import find_packages, setup
 
 _readme = os.path.join(os.path.dirname(os.path.abspath(__file__)), "README.md")
 long_description = open(_readme).read() if os.path.exists(_readme) else ""
@@ -19,22 +19,21 @@ setup(
     long_description_content_type="text/markdown",
     license="BSD-3-Clause",
     url="https://github.com/meta-recsys/recir",
-    packages=[
-        "recir",
-        "recir.distributed",
-        "recir.examples",
-        "recir.examples.dlrmv3",
-        "recir.examples.embedding",
-        "recir.lowering",
-        "recir.ops",
-        "recir.ops.fake",
-        "recir.ops.pallas",
-        "recir.ops.pallas.embeddings",
-        "recir.passes",
-        "recir.region_transforms",
-        "recir.torchax",
-        "recir.torchax.ops",
-    ],
+    packages=find_packages(
+        include=["recir", "recir.*"],
+        exclude=[
+            "*.tests",
+            "*.tests.*",
+            "tests",
+            "tests.*",
+            "*.test",
+            "*.test.*",
+            "test",
+            "test.*",
+            "*.benchmarks",
+            "*.benchmarks.*",
+        ],
+    ),
     python_requires=">=3.10",
     install_requires=[
         "torch>=2.4",
