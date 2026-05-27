@@ -144,13 +144,35 @@ def assert_jax_multi_device(test_case, total_gpus, devices_per_process, num_proc
     )
 
 
+def _iter_subgraphs(compiled_gm):
+    """Yield ``(name, sub_gm)`` for the inner gm(s) of ``compiled_gm``.
+
+    Post-NC12 (XLABackend default ``uses_iter_graph=False``), an XLA-backed
+    ``compiled_obj.gm`` is a plain ``fx.GraphModule`` rather than an
+    ``IterGraphModule`` wrapper -- the ``setup_gm`` / ``main_gm`` /
+    ``cleanup_gm`` attributes only exist on the wrapper.  Detect both
+    shapes so a single helper works across the IterGraph and bypass
+    paths.
+    """
+    has_iter = all(
+        hasattr(compiled_gm, attr) for attr in ("setup_gm", "main_gm", "cleanup_gm")
+    )
+    if has_iter:
+        for gm_name in ("setup_gm", "main_gm", "cleanup_gm"):
+            yield gm_name, getattr(compiled_gm, gm_name)
+    else:
+        yield "gm", compiled_gm
+
+
 def assert_no_graph_breaks(test_case, compiled_obj):
     """Verify exactly 1 _XLAModule per subgraph and that collectives are present.
 
-    Checks setup_gm, main_gm, and cleanup_gm for graph structure integrity.
+    Iterates the inner sub-GraphModules (setup/main/cleanup when the gm is
+    wrapped in IterGraphModule; just the gm itself when it is bypassed --
+    e.g. XLAGSPMDBackend / XLAShardMapBackend default to
+    ``uses_iter_graph=False`` after NC12).
     """
-    for gm_name in ("setup_gm", "main_gm", "cleanup_gm"):
-        gm = getattr(compiled_obj.gm, gm_name)
+    for gm_name, gm in _iter_subgraphs(compiled_obj.gm):
         xla_modules = [m for m in gm.modules() if isinstance(m, _XLAModule)]
         incompatible = []
         for node in gm.graph.nodes:

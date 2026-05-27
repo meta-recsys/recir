@@ -30,6 +30,7 @@ from recir.tests.eager_test_utils import (
 # IMPORTANT: must run BEFORE any `import jax` so the cuda plugin path patch
 # is in effect when jax.devices() / jax.* first triggers plugin discovery.
 from recir.tests.xla import _jax_cuda_plugin_fix  # noqa: F401, I001
+from recir.tests.xla.gspmd_test_utils import _iter_subgraphs
 
 
 def _compile_with_toy_dispatcher(
@@ -162,9 +163,11 @@ class TestOverrideXLAGSPMD(unittest.TestCase):
         )
 
     def _count_graph_break_nodes(self, compiled_obj) -> int:
+        # Post-NC12 (uses_iter_graph=False default), the gm is a plain
+        # fx.GraphModule rather than an IterGraphModule wrapper.  Use the
+        # shared helper to iterate either shape.
         bwd_fn_count = 0
-        for gm_name in ("setup_gm", "main_gm", "cleanup_gm"):
-            gm = getattr(compiled_obj.gm, gm_name)
+        for _gm_name, gm in _iter_subgraphs(compiled_obj.gm):
             for n in gm.graph.nodes:
                 if n.op == "call_function" and n.meta.get("xla_graph_break"):
                     bwd_fn_count += 1
