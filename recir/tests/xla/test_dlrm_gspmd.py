@@ -29,6 +29,7 @@ from recir.distributed.parallel_mode import DataParallel, GSPMDParallel
 from recir.lowering.xla_lower import _is_xla_compatible, _XLAModule
 from recir.tests.xla.gspmd_test_utils import (
     _generate_dlrm_inputs,
+    _iter_subgraphs,
     _run_dlrm_baseline,
     assert_hlo_has_collective,
     assert_no_graph_breaks,
@@ -178,8 +179,12 @@ class TestDLRMSingleProcess(unittest.TestCase):
 
         train_step(model, opt, dense, sparse_indices, labels)
         compiled_obj = train_step.__dict__["_compiled_obj"]
-        for gm_name in ("setup_gm", "main_gm", "cleanup_gm"):
-            gm = getattr(compiled_obj.gm, gm_name)
+        # Post-NC12 (uses_iter_graph=False default for XLA*Backend), the
+        # compiled gm is a plain fx.GraphModule rather than an
+        # IterGraphModule wrapper -- ``setup_gm`` / ``main_gm`` /
+        # ``cleanup_gm`` only exist on the wrapper.  Use the shared
+        # helper so the assertion works for both shapes.
+        for gm_name, gm in _iter_subgraphs(compiled_obj.gm):
             xla_modules = [m for m in gm.modules() if isinstance(m, _XLAModule)]
             incompatible = []
             for node in gm.graph.nodes:

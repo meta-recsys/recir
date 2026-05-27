@@ -38,7 +38,7 @@ from recir.tests.xla.dlrmv3_test_utils import (
     STATIC_NUM_CANDIDATES,
     STATIC_UIH_LEN,
 )
-from recir.tests.xla.gspmd_test_utils import DestroyPGMixin
+from recir.tests.xla.gspmd_test_utils import _iter_subgraphs, DestroyPGMixin
 from torch.testing._internal.common_distributed import skip_if_lt_x_gpu
 from torch.testing._internal.common_utils import run_tests
 from torch.testing._internal.distributed._tensor.common_dtensor import (
@@ -295,8 +295,10 @@ class TestDLRMv3ECRWTest(DestroyPGMixin, DTensorTestBase):
             compiled_obj = train_step.__dict__["_compiled_obj"]
             self.assertIsNotNone(compiled_obj, f"Rank {rank}: XLA compilation failed")
             # --- Assert expected graph structure ---
-            for gm_name in ("setup_gm", "main_gm", "cleanup_gm"):
-                gm = getattr(compiled_obj.gm, gm_name)
+            # Post-NC12 (uses_iter_graph=False default), the gm is a plain
+            # fx.GraphModule rather than an IterGraphModule wrapper.  Use
+            # the shared helper to iterate either shape.
+            for gm_name, gm in _iter_subgraphs(compiled_obj.gm):
                 xla_modules = [m for m in gm.modules() if isinstance(m, _XLAModule)]
                 self.assertGreaterEqual(
                     len(xla_modules),

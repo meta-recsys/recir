@@ -36,7 +36,7 @@ from recir.tests.xla.dlrmv3_test_utils import (
     STATIC_NUM_CANDIDATES,
     STATIC_UIH_LEN,
 )
-from recir.tests.xla.gspmd_test_utils import assert_hlo_has_collective
+from recir.tests.xla.gspmd_test_utils import _iter_subgraphs, assert_hlo_has_collective
 
 
 class TestDLRMv3XLA(unittest.TestCase):
@@ -104,9 +104,11 @@ class TestDLRMv3XLA(unittest.TestCase):
         self.assertIsNotNone(compiled_obj)
 
     def test_dlrmv3_has_xla_subgraphs(self) -> None:
+        # Post-NC12 (uses_iter_graph=False default), the gm is a plain
+        # fx.GraphModule rather than an IterGraphModule wrapper. Use the
+        # shared helper to iterate either shape.
         compiled_obj, _ = self._build_compiled_train_step()
-        for gm_name in ("setup_gm", "main_gm", "cleanup_gm"):
-            gm = getattr(compiled_obj.gm, gm_name)
+        for gm_name, gm in _iter_subgraphs(compiled_obj.gm):
             xla_modules = [m for m in gm.modules() if isinstance(m, _XLAModule)]
             self.assertGreaterEqual(
                 len(xla_modules),

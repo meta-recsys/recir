@@ -39,7 +39,7 @@ class _XLABackendBase(Backend):
 
     @property
     def uses_iter_graph(self) -> bool:
-        return True
+        return False
 
     def dispatch(self, gm: fx.GraphModule) -> nn.Module:
         return partial_lower_xla(gm, backend_type=self._backend_type)
@@ -65,6 +65,15 @@ class XLAGSPMDBackend(_XLABackendBase):
             raise ValueError(
                 f"XLAGSPMDBackend requires GSPMDParallel, got "
                 f"{type(parallel_mode).__name__}"
+            )
+        if self.uses_iter_graph:
+            raise ValueError(
+                "uses_iter_graph=True is incompatible with GSPMD parallel mode. "
+                "GSPMD inflates input shapes by num_processes before tracing, "
+                "baking global literals into the FX graph that IterGraphModule's "
+                "unlowered setup_gm/cleanup_gm cannot handle at per-host runtime. "
+                "Set uses_iter_graph=False (the new default after D106027480) or "
+                "use a non-GSPMD parallel mode."
             )
 
 
