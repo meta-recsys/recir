@@ -135,7 +135,7 @@ import hammer.v3; print('hammer.v3: OK')
 import minimal_viable_ai; print('minimal_viable_ai: OK')
 from generative_recommenders.common import HammerKernel; print('generative_recommenders: OK')
 from recir.examples.rankfm.config import RankFMConfig; print('rankfm example: OK')
-from recir.tests.xla.xsurface_test_utils import PreprocessorOverride, SparseArchOverride; print('recir.tests.xla: OK')
+from recir.tests.xla.xsurface_test_utils import PreprocessorDispatcher, SparseArchDispatcher; print('recir.tests.xla: OK')
 print()
 print('All imports OK!')
 "

@@ -562,6 +562,17 @@ def _propagate_call_function_strategy(
                 NodeType.EMBEDDING_PARAM,
                 NodeType.GRAD,
                 NodeType.ACT,
+                # STATE flows through non-compute ops (view / reshape /
+                # _to_copy / clone) on the new ``compile_from_gm`` path
+                # whenever an optimizer (e.g. Adam) keeps per-param state
+                # tensors and a kernel rewrites their layout before the
+                # optimizer step.  STATE is always replicated, so we just
+                # inherit the input strategy unchanged.
+                NodeType.STATE,
+                # NON_TENSOR can reach here when a constant / scalar wrapped
+                # as a 0-d tensor flows through a no-op view; propagate it
+                # unchanged.
+                NodeType.NON_TENSOR,
             ]
             if arg_node_type in (NodeType.PARAM, NodeType.EMBEDDING_PARAM):
                 dp_strategy_map[node] = _propagate_param_non_compute_strategy(
@@ -571,6 +582,10 @@ def _propagate_call_function_strategy(
                 dp_strategy_map[node] = DataParallelStrategy(
                     [NodeType.GRAD], _gen_partial_strategy(mesh, grad_reduction)
                 )
+            elif arg_node_type in (NodeType.STATE, NodeType.NON_TENSOR):
+                # STATE / NON_TENSOR: inherit input's (replicated) strategy.
+                # No batch-dim tracking required.
+                dp_strategy_map[node] = arg_strategy
             else:  # ACT: propagate batch-dim sharding
                 arg_node_spec = batch_dim_analyzer.compute_act_spec(
                     input_nodes[0], mesh

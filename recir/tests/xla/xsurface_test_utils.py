@@ -40,9 +40,24 @@ from minimal_viable_ai.core.dataloader.dataloader_configs import (
 )
 from minimal_viable_ai.core.model_family_api.configs import RecModelFamilyConfig
 from minimal_viable_ai.core.ranking_common.configs import MTMLROOTrainBatch
-from recir.api import Override
-from recir.override_ops import anchor_input, anchor_output, replace_override_anchors
+from recir.eager_dispatch import (
+    install_graph_break_dispatch,
+    mark_input,
+    mark_output_with_bwd,
+)
 from torchrec import JaggedTensor, KeyedJaggedTensor
+
+
+XSURFACE_PREPROCESSOR_MARKER_PREFIX = "recir.examples.rankfm.preprocessor"
+XSURFACE_SPARSE_MARKER_PREFIX = "recir.examples.rankfm.sparse_arch"
+
+
+def _xsurface_preprocessor_prefix(override_id: int) -> str:
+    return f"{XSURFACE_PREPROCESSOR_MARKER_PREFIX}::{override_id}"
+
+
+def _xsurface_sparse_prefix(override_id: int) -> str:
+    return f"{XSURFACE_SPARSE_MARKER_PREFIX}::{override_id}"
 
 
 # ---------------------------------------------------------------------------
@@ -154,9 +169,10 @@ class DummyPreprocessorStack(nn.Module):
     """Replacement for PreprocessorStack that returns fixed-shape outputs.
 
     Runs the real preprocessor eagerly at construction time to capture
-    input/output shapes. Uses anchor_input on inputs and anchor_output on
-    outputs so replace_override_anchors can wire up runtime dispatch to
-    the real PreprocessorStack.
+    input/output shapes.  Wraps inputs/outputs in
+    :func:`recir.eager_dispatch.mark_input` / ``mark_output_with_bwd`` so the
+    post-trace orchestrator can find the markers and wire runtime dispatch to
+    the real :class:`PreprocessorStack`.
 
     A _grad_anchor parameter maintains autograd graph connectivity through
     the dummy so that make_fx traces backward correctly. A _batch_dep term
@@ -253,11 +269,12 @@ class DummyPreprocessorStack(nn.Module):
 
     def forward(self, features: FeatureBundle) -> FeatureBundle:
         oid = self._override_id
+        prefix = _xsurface_preprocessor_prefix(oid)
 
-        # Mark input tensor leaves with anchor_input. Iterate the actual
+        # Mark input tensor leaves with input markers.  Iterate the actual
         # features bundle (not the sample-captured lists) so the ordering
-        # matches what the pre-hook captures at trace time. This ensures
-        # the anchor indices align with fwd_fn's reconstruction order.
+        # matches what the pre-hook captures at trace time.  This ensures
+        # the marker indices align with fwd_fn's reconstruction order.
         input_idx = 0
         anchored_inputs: List[torch.Tensor] = []
         for desc in features:
@@ -265,17 +282,17 @@ class DummyPreprocessorStack(nn.Module):
             if val is None:
                 continue
             if isinstance(val, KeyedJaggedTensor):
-                anchored_inputs.append(anchor_input(val.values(), oid, input_idx))
+                anchored_inputs.append(mark_input(val.values(), prefix, input_idx))
                 input_idx += 1
-                anchored_inputs.append(anchor_input(val.lengths(), oid, input_idx))
+                anchored_inputs.append(mark_input(val.lengths(), prefix, input_idx))
                 input_idx += 1
             elif isinstance(val, torch.Tensor):
-                anchored_inputs.append(anchor_input(val, oid, input_idx))
+                anchored_inputs.append(mark_input(val, prefix, input_idx))
                 input_idx += 1
             elif isinstance(val, dict):
                 for key in sorted(val.keys()):
                     if isinstance(val[key], torch.Tensor):
-                        anchored_inputs.append(anchor_input(val[key], oid, input_idx))
+                        anchored_inputs.append(mark_input(val[key], prefix, input_idx))
                         input_idx += 1
         output_tensors: List[torch.Tensor] = []
         for i in range(self._num_tensors):
@@ -289,7 +306,7 @@ class DummyPreprocessorStack(nn.Module):
 
         deps: List[torch.Tensor] = anchored_inputs + [self._grad_anchor]
         anchored = [
-            anchor_output(t, oid, idx, deps=deps)
+            mark_output_with_bwd(t, prefix, idx, deps=deps)
             for idx, t in enumerate(output_tensors)
         ]
 
@@ -315,9 +332,10 @@ class DummyPreprocessorStack(nn.Module):
 class DummySparseArch(nn.Module):
     """Replacement for ECSparseArch that returns cached embeddings.
 
-    Uses anchor_input on the input KJT components and anchor_output on
-    outputs so replace_override_anchors can wire up runtime dispatch to
-    the real ECSparseArch.
+    Wraps input KJT components in :func:`recir.eager_dispatch.mark_input` and
+    outputs in :func:`mark_output_with_bwd` so the post-trace orchestrator can
+    find the markers and wire runtime dispatch to the real
+    :class:`ECSparseArch`.
 
     A _grad_anchor parameter maintains autograd graph connectivity through
     the dummy so that make_fx traces backward correctly. A _batch_dep term
@@ -345,12 +363,13 @@ class DummySparseArch(nn.Module):
         id_list_features: KeyedJaggedTensor,
     ) -> Dict[str, JaggedTensor]:
         oid = self._override_id
+        prefix = _xsurface_sparse_prefix(oid)
 
-        # Anchor the input KJT components so SparseArchOverride.transform can
-        # rediscover them via replace_override_anchors and use them as
-        # dispatch inputs (instead of falling back to all batch placeholders).
-        m_v = anchor_input(id_list_features.values(), oid, 0)
-        m_l = anchor_input(id_list_features.lengths(), oid, 1)
+        # Mark the input KJT components so SparseArchDispatcher.install_graph
+        # can rediscover them via the marker prefix and use them as dispatch
+        # inputs (instead of falling back to all batch placeholders).
+        m_v = mark_input(id_list_features.values(), prefix, 0)
+        m_l = mark_input(id_list_features.lengths(), prefix, 1)
 
         deps: List[torch.Tensor] = [m_v, m_l, self._grad_anchor]
 
@@ -361,30 +380,31 @@ class DummySparseArch(nn.Module):
             lbuf = getattr(self, f"_jt_lengths_{i}")
             v_z = torch.zeros_like(vbuf)
             l_z = lbuf.clone()
-            v = anchor_output(v_z, oid, out_idx, deps=deps)
-            l = anchor_output(l_z, oid, out_idx + 1, deps=deps)
-            result[name] = JaggedTensor(values=v, lengths=l)
+            v = mark_output_with_bwd(v_z, prefix, out_idx, deps=deps)
+            lengths = mark_output_with_bwd(l_z, prefix, out_idx + 1, deps=deps)
+            result[name] = JaggedTensor(values=v, lengths=lengths)
             out_idx += 2
         return result
 
 
 # ---------------------------------------------------------------------------
-# Override classes
+# Dispatcher classes (orchestrator-style overrides)
 # ---------------------------------------------------------------------------
 
 
-class PreprocessorOverride(Override):
-    """Override that replaces PreprocessorStack with DummyPreprocessorStack.
+class PreprocessorDispatcher:
+    """Orchestrator-style replacement for the legacy ``PreprocessorOverride``.
 
-    replacement() swaps the module before tracing.
-    transform() wires up runtime dispatch to the real PreprocessorStack
-    via replace_override_anchors, using input_anchor nodes to identify
-    the correct dispatch inputs.
+    ``install_eager`` swaps :class:`PreprocessorStack` for
+    :class:`DummyPreprocessorStack` so tracing sees stable shapes (the dummy
+    plants input + forward/backward markers).  ``install_graph`` finds those
+    markers and installs a graph-break dispatch back to the captured real
+    :class:`PreprocessorStack`.
 
-    The input FeatureBundle structure is captured at trace time via a
-    forward_pre_hook on the dummy, ensuring the captured structure matches
-    what RecBlock actually passes (including supervision_weight and the
-    correct KJT keys from the batch, not the sample).
+    The input FeatureBundle structure is captured at trace time via the
+    dummy's stored ``_input_entries``, ensuring the captured structure
+    matches what RecBlock actually passes (including supervision_weight and
+    the correct KJT keys from the batch, not the sample).
     """
 
     def __init__(
@@ -415,29 +435,31 @@ class PreprocessorOverride(Override):
         # can expand back to global at the XLA boundary.
         self._num_processes: int = num_processes
 
-    def replacement(self, fqn: str, orig_submodule: nn.Module) -> nn.Module:
-        if isinstance(orig_submodule, PreprocessorStack):
-            self._orig_stack = orig_submodule
-            self._dummy = DummyPreprocessorStack(
-                real_stack=orig_submodule,
-                device=self._device,
-                batch_size=self._batch_size,
-                max_uih_seq_len=self._max_uih_seq_len,
-                num_candidates=self._num_candidates,
-                override_id=self._override_id,
-                sample_feature_bundle=self._sample_feature_bundle,
-                precomputed_output=self._precomputed_output,
-            )
-            return self._dummy  # pyre-ignore[7]
-        return orig_submodule
+    def install_eager(self, model: nn.Module) -> None:
+        for fqn, mod in list(model.named_modules()):
+            if isinstance(mod, PreprocessorStack):
+                self._orig_stack = mod
+                self._dummy = DummyPreprocessorStack(
+                    real_stack=mod,
+                    device=self._device,
+                    batch_size=self._batch_size,
+                    max_uih_seq_len=self._max_uih_seq_len,
+                    num_candidates=self._num_candidates,
+                    override_id=self._override_id,
+                    sample_feature_bundle=self._sample_feature_bundle,
+                    precomputed_output=self._precomputed_output,
+                )
+                parent_fqn, leaf = fqn.rsplit(".", 1) if "." in fqn else ("", fqn)
+                parent = model.get_submodule(parent_fqn) if parent_fqn else model
+                setattr(parent, leaf, self._dummy)
 
-    def transform(
+    def install_graph(
         self,
         gm: torch.fx.GraphModule,
         flat_state: List[torch.Tensor],
-    ) -> torch.fx.GraphModule:
+    ) -> Tuple[torch.fx.GraphModule, List[torch.Tensor]]:
         if self._orig_stack is None or self._dummy is None:
-            return gm
+            return gm, flat_state
 
         real_stack: nn.Module = self._orig_stack  # pyre-ignore[8]
         dummy: DummyPreprocessorStack = self._dummy  # pyre-ignore[8]
@@ -450,8 +472,6 @@ class PreprocessorOverride(Override):
 
         output_tensor_descs: List[FeatureDescriptor] = dummy._tensor_descs
         output_kjt_descs: List[FeatureDescriptor] = dummy._kjt_descs
-
-        state: Dict[str, Any] = {"saved": None}
 
         def fwd_fn(*input_tensors: torch.Tensor) -> Tuple[torch.Tensor, ...]:
             bundle = FeatureBundle()
@@ -571,37 +591,27 @@ class PreprocessorOverride(Override):
 
             # FX trace order: all tensors first, then KJT (values, lengths) pairs.
             flat: List[torch.Tensor] = flat_tensors + flat_kjts
+            # Return raw (grad-preserving) tensors; the install helper wraps
+            # this callable with save-for-backward + detach.
+            return tuple(flat)
 
-            state["saved"] = [t for t in flat if t.requires_grad]
-            return tuple(t.detach() for t in flat)
-
-        def bwd_fn(grad: torch.Tensor, grad_idx: int = 0) -> None:
-            saved = state["saved"]
-            if saved is not None and grad_idx < len(saved):
-                s = saved[grad_idx]
-                is_last = grad_idx == len(saved) - 1
-                torch.autograd.backward(
-                    [s], [grad / num_ranks], retain_graph=not is_last
-                )
-                if is_last:
-                    state["saved"] = None
-
-        return replace_override_anchors(
+        install_graph_break_dispatch(
             gm,
-            override_id=self._override_id,
-            fwd_fn=fwd_fn,
-            bwd_fn=bwd_fn,
+            _xsurface_preprocessor_prefix(self._override_id),
+            fwd_fn,
             num_state_tensors=len(flat_state),
+            num_ranks=num_ranks,
         )
+        return gm, flat_state
 
 
-class SparseArchOverride(Override):
-    """Override that replaces ECSparseArch with DummySparseArch.
+class SparseArchDispatcher:
+    """Orchestrator-style replacement for the legacy ``SparseArchOverride``.
 
-    replacement() swaps the module before tracing.
-    transform() wires up runtime dispatch to the real ECSparseArch
-    via replace_override_anchors, using input_anchor nodes to identify
-    the correct dispatch inputs (KJT values and lengths).
+    ``install_eager`` swaps :class:`ECSparseArch` for :class:`DummySparseArch`
+    so tracing sees stable shapes (the dummy plants input + forward/backward
+    markers).  ``install_graph`` finds those markers and installs a graph-
+    break dispatch back to the captured real :class:`ECSparseArch`.
     """
 
     def __init__(
@@ -618,31 +628,31 @@ class SparseArchOverride(Override):
         self._orig_sparse_arch: nn.Module | None = None
         self._dummy: DummySparseArch | None = None
 
-    def replacement(self, fqn: str, orig_submodule: nn.Module) -> nn.Module:
-        if isinstance(orig_submodule, ECSparseArch):
-            self._orig_sparse_arch = orig_submodule
-            self._dummy = DummySparseArch(
-                self._cached_output,
-                input_kjt_keys=self._input_kjt_keys,
-                override_id=self._override_id,
-            )
-            return self._dummy
-        return orig_submodule
+    def install_eager(self, model: nn.Module) -> None:
+        for fqn, mod in list(model.named_modules()):
+            if isinstance(mod, ECSparseArch):
+                self._orig_sparse_arch = mod
+                self._dummy = DummySparseArch(
+                    self._cached_output,
+                    input_kjt_keys=self._input_kjt_keys,
+                    override_id=self._override_id,
+                )
+                parent_fqn, leaf = fqn.rsplit(".", 1) if "." in fqn else ("", fqn)
+                parent = model.get_submodule(parent_fqn) if parent_fqn else model
+                setattr(parent, leaf, self._dummy)
 
-    def transform(
+    def install_graph(
         self,
         gm: torch.fx.GraphModule,
         flat_state: List[torch.Tensor],
-    ) -> torch.fx.GraphModule:
+    ) -> Tuple[torch.fx.GraphModule, List[torch.Tensor]]:
         if self._orig_sparse_arch is None or self._dummy is None:
-            return gm
+            return gm, flat_state
 
         real_arch: nn.Module = self._orig_sparse_arch
         input_kjt_keys: List[str] = self._input_kjt_keys
         feature_names: List[str] = self._dummy._feature_names
         num_ranks: int = self._num_ranks
-
-        state: Dict[str, Any] = {"saved": None}
 
         def fwd_fn(*input_tensors: torch.Tensor) -> Tuple[torch.Tensor, ...]:
             values = input_tensors[0]
@@ -672,28 +682,18 @@ class SparseArchOverride(Override):
                 jt = output[name]
                 flat.append(jt.values())
                 flat.append(jt.lengths())
+            # Return raw (grad-preserving) tensors; the install helper wraps
+            # this callable with save-for-backward + detach.
+            return tuple(flat)
 
-            state["saved"] = [t for t in flat if t.requires_grad]
-            return tuple(t.detach() for t in flat)
-
-        def bwd_fn(grad: torch.Tensor, grad_idx: int = 0) -> None:
-            saved = state["saved"]
-            if saved is not None and grad_idx < len(saved):
-                s = saved[grad_idx]
-                is_last = grad_idx == len(saved) - 1
-                torch.autograd.backward(
-                    [s], [grad / num_ranks], retain_graph=not is_last
-                )
-                if is_last:
-                    state["saved"] = None
-
-        return replace_override_anchors(
+        install_graph_break_dispatch(
             gm,
-            override_id=self._override_id,
-            fwd_fn=fwd_fn,
-            bwd_fn=bwd_fn,
+            _xsurface_sparse_prefix(self._override_id),
+            fwd_fn,
             num_state_tensors=len(flat_state),
+            num_ranks=num_ranks,
         )
+        return gm, flat_state
 
 
 # ---------------------------------------------------------------------------
@@ -757,12 +757,14 @@ def _build_overrides(
     device: torch.device,
     batch_size: int = TEST_BATCH_SIZE,
     num_processes: int = 1,
-) -> List[Override]:
-    """Build Override instances for tracing, capturing sparse arch I/O via hooks.
+) -> List[Any]:
+    """Build dispatcher instances for tracing, capturing sparse arch I/O via hooks.
 
     Runs the preprocessor + tokenizer eagerly once to capture the ECSparseArch
     input (via forward pre-hook) and output (via forward hook), then returns
-    overrides for both the preprocessor and the sparse arch.
+    dispatcher instances (PreprocessorDispatcher + SparseArchDispatcher) for
+    both the preprocessor and the sparse arch.  Each dispatcher exposes
+    ``install_eager(model)`` and ``install_graph(gm, flat_state)``.
     """
     # pyre-ignore[16]: dynamic attr from setattr in TokenizerStack
     sparse_arch = recblock.tokenizer_stack.mot_sparse_arch._sparse_arch
@@ -805,7 +807,7 @@ def _build_overrides(
     # Running the preprocessor twice can produce different outputs due to
     # module state mutation (e.g., running stats).
     return [
-        PreprocessorOverride(
+        PreprocessorDispatcher(
             device,
             override_id=0,
             batch_size=batch_size,
@@ -813,7 +815,7 @@ def _build_overrides(
             precomputed_output=preproc_output,
             num_processes=num_processes,
         ),
-        SparseArchOverride(
+        SparseArchDispatcher(
             cached_output=captured["output"],
             input_kjt_keys=input_kjt_keys,
             override_id=1,

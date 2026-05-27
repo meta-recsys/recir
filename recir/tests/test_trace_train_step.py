@@ -8,13 +8,16 @@
 
 from copy import deepcopy
 from functools import wraps
-from typing import Any, Callable, List
+from typing import Any, Callable, List, Tuple
 
+import recir
 import torch
 import torch.distributed as dist
 import torch.fx as fx
 import torch.nn as nn
-from recir.api import compile, COMPILED_OBJECT_KEY, Override
+from recir.api import compile, COMPILED_OBJECT_KEY, make_compiled_runner
+from recir.backends.base import Backend
+from recir.distributed.parallel_mode import DataParallel, ParallelMode
 from torch.distributed.tensor._dtensor_spec import DTensorSpec
 from torch.distributed.tensor._op_schema import OpSchema, OutputSharding
 from torch.distributed.tensor._ops.utils import register_prop_rule
@@ -25,6 +28,69 @@ from torch.testing._internal.distributed._tensor.common_dtensor import (
     DTensorTestBase,
     with_comms as base_with_comms,
 )
+
+
+class _PassThroughBackend(Backend):
+    """Trivial Backend that dispatches gm unchanged (test-only)."""
+
+    def dispatch(self, gm: fx.GraphModule) -> nn.Module:
+        return gm
+
+
+def _compile_with_inline_orchestrator(
+    callable_: Callable[..., Any],
+    *args: Any,
+    eager_passes: Tuple[Callable[[nn.Module], None], ...] = (),
+    graph_patches: Tuple[
+        Callable[
+            [fx.GraphModule, List[torch.Tensor]],
+            Tuple[fx.GraphModule, List[torch.Tensor]],
+        ],
+        ...,
+    ] = (),
+    parallel_mode: ParallelMode | None = None,
+    backend: Backend | None = None,
+) -> Callable[..., Any]:
+    """Stage 0 -> stage 2 -> stage 3 (graph patches) -> stages 4-10 orchestrator.
+
+    Used by the test_trace_train_step tests to exercise the v7.1 trace +
+    compile_from_gm split with bare eager passes + graph patches (the
+    equivalent of the legacy ``module_override`` + the ``transform()``
+    side of Override).
+    """
+    import torch.utils._pytree as pytree
+
+    if parallel_mode is None:
+        parallel_mode = DataParallel()
+    if backend is None:
+        backend = _PassThroughBackend()
+
+    mod: nn.Module | None = None
+    for arg in pytree.arg_tree_leaves(*args):
+        if isinstance(arg, nn.Module):
+            mod = arg
+            break
+    assert mod is not None
+    for hook in eager_passes:
+        hook(mod)
+    # Pass ``parallel_mode`` through so ``recir.trace`` applies the
+    # per-process -> global batch transform that mirrors the legacy
+    # ``_compile_data_parallel`` inline inflation.  Without it,
+    # ``compile_from_gm``'s ``partition_data_parallel`` shards the
+    # batch-dim placeholder to ``per_host_batch // num_processes`` while
+    # the runtime still passes the per-host shape -- an ``aten.mm``
+    # shape mismatch surfaces on the first compiled call (e.g.
+    # ``(2, 10) @ (10/num_processes, 10)`` for the Adam train_step test).
+    gm, flat_state = recir.trace(callable_, *args, parallel_mode=parallel_mode)
+    for patch in graph_patches:
+        gm, flat_state = patch(gm, flat_state)
+    compiled_obj: recir.api._CompiledResult = recir.compile_from_gm(
+        gm,
+        flat_state,
+        parallel_mode=parallel_mode,
+        backend=backend,
+    )
+    return make_compiled_runner(compiled_obj)
 
 
 def with_comms(func: Callable[..., Any]) -> Callable[..., Any]:
@@ -205,35 +271,37 @@ class TraceTrainStepTest(DTensorTestBase):
         self._test_optimizer(mod, ddp_mod, opt, ddp_opt, inp, train_step)
 
     def _test_adam(self, *, foreach: bool, fused: bool) -> None:
-        class AssertOverride(Override):
-            def __init__(self, outer: Any) -> None:
-                self.outer = outer
+        outer: "TraceTrainStepTest" = self
 
-            def replacement(
-                self, fqn: str, orig_submodule: torch.nn.Module
-            ) -> torch.nn.Module:
-                return orig_submodule
-
-            def transform(
-                self,
-                gm: fx.GraphModule,
-                flat_state: List[torch.Tensor],
-            ) -> fx.Graph:
-                # check dedup is successful, where there should only be 1 allreduce
-                all_reduce_nodes = [
-                    n
-                    for n in gm.graph.nodes
-                    if n.target == torch.ops._c10d_functional.all_reduce.default
-                ]
-                self.outer.assertEqual(
-                    len(all_reduce_nodes),
-                    1,
+        def assert_dedup(
+            gm: fx.GraphModule,
+            flat_state: List[torch.Tensor],
+        ) -> Tuple[fx.GraphModule, List[torch.Tensor]]:
+            # Inline orchestrator runs graph_patches AFTER recir.trace but
+            # BEFORE recir.compile_from_gm.  At that point the traced gm
+            # carries one ``_spmd::tag_grad.default`` per parameter gradient
+            # (inserted by ``_local_compile(..., _stateless_func_wrapper=
+            # gradients_tagging)``) and no ``_c10d_functional.all_reduce``
+            # nodes yet -- the latter are inserted by
+            # ``partition_data_parallel`` during ``compile_from_gm``'s
+            # partition step.  Accept either form so the assertion stays
+            # valid across both the legacy (post-partition + dedup) and
+            # the new (pre-partition) graph patch insertion points.
+            collective_nodes = [
+                n
+                for n in gm.graph.nodes
+                if n.target
+                in (
+                    torch.ops._c10d_functional.all_reduce.default,
+                    torch.ops._spmd.tag_grad.default,
                 )
+            ]
+            # Adam-foreach has 1 parameter (bias=False) -> exactly 1
+            # collective marker on the only grad.
+            outer.assertEqual(len(collective_nodes), 1)
+            return gm, flat_state
 
-                return gm
-
-        @compile(module_override=[AssertOverride(self)])
-        def train_step(
+        def train_step_fn(
             mod: nn.Module, opt: torch.optim.Optimizer, inp: torch.Tensor
         ) -> None:
             mod(inp).sum().backward()
@@ -257,6 +325,9 @@ class TraceTrainStepTest(DTensorTestBase):
         ddp_opt = torch.optim.Adam(
             ddp_mod.parameters(), lr=0.01, foreach=foreach, fused=fused
         )
+        train_step = _compile_with_inline_orchestrator(
+            train_step_fn, mod, opt, inp, graph_patches=(assert_dedup,)
+        )
         self._test_optimizer(mod, ddp_mod, opt, ddp_opt, inp, train_step)
 
     @skip_if_lt_x_gpu(2)
@@ -272,42 +343,53 @@ class TraceTrainStepTest(DTensorTestBase):
     def _test_train_step_override(self) -> None:
         transform_targets: list[Any] = []
 
-        class DDMOverride(Override):
-            def replacement(
-                self, fqn: str, orig_submodule: torch.nn.Module
-            ) -> torch.nn.Module:
-                return (
-                    DummyDDM()
-                    if isinstance(orig_submodule, DataDependentModule)
-                    else orig_submodule
-                )
+        def swap_ddm_modules(mod: nn.Module) -> None:
+            for name, child in list(mod.named_modules()):
+                if isinstance(child, DataDependentModule):
+                    parent_fqn, leaf = (
+                        name.rsplit(".", 1) if "." in name else ("", name)
+                    )
+                    parent = mod.get_submodule(parent_fqn) if parent_fqn else mod
+                    setattr(parent, leaf, DummyDDM())
 
-            def transform(
-                self,
-                gm: fx.GraphModule,
-                flat_state: List[torch.Tensor],
-            ) -> fx.Graph:
-                nonlocal transform_targets
-                for node in gm.graph.nodes:
-                    if node.target in [
-                        torch.ops.dummy.ddm.default,
-                        torch.ops.dummy.ddm_backward.default,
-                    ]:
-                        transform_targets.append(node.target)
-                        # N.B.: this is not a complete subgraph representing
-                        # original logic, as we are testing the ability to
-                        # modify graph after DTensor expansion.
-                        with gm.graph.inserting_before(node):
-                            new_node = gm.graph.call_function(torch.add, args=node.args)
-                        node.replace_all_uses_with(new_node)
+        def rewrite_ddm_ops(
+            gm: fx.GraphModule,
+            flat_state: List[torch.Tensor],
+        ) -> Tuple[fx.GraphModule, List[torch.Tensor]]:
+            for node in gm.graph.nodes:
+                if node.target in [
+                    torch.ops.dummy.ddm.default,
+                    torch.ops.dummy.ddm_backward.default,
+                ]:
+                    transform_targets.append(node.target)
+                    # N.B.: this is not a complete subgraph representing
+                    # original logic, as we are testing the ability to
+                    # modify graph after DTensor expansion.  The dummy.ddm
+                    # op takes one Tensor; replace with ``torch.add(x, x)``
+                    # so the rewritten graph stays callable after
+                    # ``gm.recompile()`` (the legacy path skipped recompile
+                    # and ran the original ddm ops, masking the arity
+                    # mismatch).
+                    arg = node.args[0]
+                    with gm.graph.inserting_before(node):
+                        new_node = gm.graph.call_function(torch.add, args=(arg, arg))
+                    # Propagate the original node's meta (in particular
+                    # ``meta["val"]`` carrying the FakeTensor shape) so the
+                    # post-trace ``partition_data_parallel`` strategy builder
+                    # treats ``new_node`` as a tensor-valued ACT node rather
+                    # than NON_TENSOR.  Without this, downstream ``view``
+                    # literals (e.g. the global-batch ``[8, 10]`` baked by
+                    # ``recir.trace``) never get rewritten to per-process
+                    # shapes by the partitioner.
+                    new_node.meta = node.meta.copy()
+                    node.replace_all_uses_with(new_node)
 
-                gm.graph.lint()
-                gm.graph.eliminate_dead_code()
+            gm.graph.lint()
+            gm.graph.eliminate_dead_code()
+            gm.recompile()
+            return gm, flat_state
 
-                return gm
-
-        @compile(module_override=[DDMOverride()])
-        def train_step(
+        def train_step_fn(
             mod: nn.Module, opt: torch.optim.Optimizer, inp: torch.Tensor
         ) -> None:
             mod(inp).sum().backward()
@@ -317,6 +399,14 @@ class TraceTrainStepTest(DTensorTestBase):
         opt = torch.optim.SGD(mod.parameters(), lr=0.01, foreach=False)
         # FIXME: symbolic tracing treats bs=1 as constant, have to use bs > 1.
         inp = torch.randn(4, 10).cuda(self.rank)
+        train_step = _compile_with_inline_orchestrator(
+            train_step_fn,
+            mod,
+            opt,
+            inp,
+            eager_passes=(swap_ddm_modules,),
+            graph_patches=(rewrite_ddm_ops,),
+        )
         train_step(mod, opt, inp)
 
         # checking transforms are indeed invoked.
@@ -335,38 +425,45 @@ class TraceTrainStepTest(DTensorTestBase):
     def test_module_multi_fqn_override(self) -> None:
         transform_targets: list[Any] = []
 
-        class DDMOverride(Override):
-            def replacement(
-                self, fqn: str, orig_submodule: torch.nn.Module
-            ) -> torch.nn.Module:
-                return (
-                    DummyDDM()
-                    if isinstance(orig_submodule, DataDependentModule)
-                    else orig_submodule
-                )
+        def swap_ddm_modules(mod: nn.Module) -> None:
+            for name, child in list(mod.named_modules()):
+                if isinstance(child, DataDependentModule):
+                    parent_fqn, leaf = (
+                        name.rsplit(".", 1) if "." in name else ("", name)
+                    )
+                    parent = mod.get_submodule(parent_fqn) if parent_fqn else mod
+                    setattr(parent, leaf, DummyDDM())
 
-            def transform(
-                self,
-                gm: fx.GraphModule,
-                flat_state: List[torch.Tensor],
-            ) -> fx.Graph:
-                nonlocal transform_targets
-                for node in gm.graph.nodes:
-                    if node.target in [
-                        torch.ops.dummy.ddm.default,
-                        torch.ops.dummy.ddm_backward.default,
-                    ]:
-                        transform_targets.append(node.target)
-                        # N.B.: this is not a complete subgraph representing
-                        # original logic, as we are testing the ability to
-                        # modify graph after DTensor expansion.
-                        with gm.graph.inserting_before(node):
-                            new_node = gm.graph.call_function(torch.add, args=node.args)
-                        node.replace_all_uses_with(new_node)
+        def rewrite_ddm_ops(
+            gm: fx.GraphModule,
+            flat_state: List[torch.Tensor],
+        ) -> Tuple[fx.GraphModule, List[torch.Tensor]]:
+            for node in gm.graph.nodes:
+                if node.target in [
+                    torch.ops.dummy.ddm.default,
+                    torch.ops.dummy.ddm_backward.default,
+                ]:
+                    transform_targets.append(node.target)
+                    # N.B.: see _test_train_step_override for the rationale
+                    # behind the ``torch.add(arg, arg)`` substitute (dummy.ddm
+                    # is a one-arg op and ``torch.add`` requires two; the
+                    # legacy path skipped ``gm.recompile()`` so the arity
+                    # mismatch never reached the runtime).
+                    arg = node.args[0]
+                    with gm.graph.inserting_before(node):
+                        new_node = gm.graph.call_function(torch.add, args=(arg, arg))
+                    # Propagate the original node's meta (see
+                    # _test_train_step_override for the same fix); without
+                    # ``meta["val"]`` the post-trace
+                    # ``partition_data_parallel`` strategy builder marks
+                    # ``new_node`` as NON_TENSOR and never rewrites the
+                    # global-batch ``view`` literal baked by ``recir.trace``.
+                    new_node.meta = node.meta.copy()
+                    node.replace_all_uses_with(new_node)
 
-                gm.graph.eliminate_dead_code()
-
-                return gm
+            gm.graph.eliminate_dead_code()
+            gm.recompile()
+            return gm, flat_state
 
         class MultiDDM(nn.Module):
             def __init__(self, world_size: int) -> None:
@@ -382,8 +479,7 @@ class TraceTrainStepTest(DTensorTestBase):
 
                 return self.relu(self.ddm2(self.l2(self.ddm1(self.l1(x)))))
 
-        @compile(module_override=[DDMOverride()])
-        def train_step(
+        def train_step_fn(
             mod: nn.Module, opt: torch.optim.Optimizer, inp: torch.Tensor
         ) -> None:
             mod(inp).sum().backward()
@@ -392,6 +488,14 @@ class TraceTrainStepTest(DTensorTestBase):
         mod = MultiDDM(self.world_size).cuda(self.rank)
         opt = torch.optim.SGD(mod.parameters(), lr=0.01, foreach=False)
         inp = torch.randn(4, 10).cuda(self.rank)
+        train_step = _compile_with_inline_orchestrator(
+            train_step_fn,
+            mod,
+            opt,
+            inp,
+            eager_passes=(swap_ddm_modules,),
+            graph_patches=(rewrite_ddm_ops,),
+        )
         train_step(mod, opt, inp)
 
         # checking transforms are indeed invoked.

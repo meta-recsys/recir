@@ -20,16 +20,16 @@ import jax  # @manual
 import recir.lowering.fbgemm_fallback  # noqa: F401 -- registers fbgemm decompositions
 import torch
 import torch.nn as nn
-from recir.api import compile, sync_device_state_to_torch
-from recir.backend import BackendType
+from recir.api import sync_device_state_to_torch
+from recir.backends import XLAGSPMDBackend
 from recir.distributed.parallel_mode import GSPMDParallel
-from recir.gm_transformation import GraphModuleTransformation
+from recir.examples.dlrmv3.jax_embedding import compile_with_jax_embedding
 from recir.lowering.xla_lower import _XLAModule
 from recir.tests.xla.dlrmv3_test_utils import (
     create_dlrmv3_wrapper,
     create_static_batch,
     create_tiny_dlrmv3,
-    DlrmV3SparseOverride,
+    DlrmV3SparseDispatcher,
     DummyPreprocess,
     LOCAL_BS,
     SMALL_EMBEDDING_DIM,
@@ -57,21 +57,7 @@ class TestDLRMv3XLA(unittest.TestCase):
             hstu_config, global_bs
         )
 
-        @compile(
-            module_override=[DlrmV3SparseOverride(dummy)],
-            parallel_mode=GSPMDParallel(
-                "replicate",
-                loss_reduction="sum",
-                num_ranks=self.num_ranks,
-                num_processes=1,
-            ),
-            # pyre-ignore[6]: GraphModuleTransformation is callable at runtime.
-            gm_transformation=GraphModuleTransformation(
-                backend=BackendType.XLA_GSPMD,
-                enable_device_state=True,
-            ),
-        )
-        def train_step(
+        def train_step_fn(
             mod: nn.Module,
             opt: torch.optim.Optimizer,
             uih_values: torch.Tensor,
@@ -85,6 +71,25 @@ class TestDLRMv3XLA(unittest.TestCase):
             loss: torch.Tensor = torch.stack(list(aux_losses.values())).sum()
             loss.backward()
             opt.step()
+
+        train_step = compile_with_jax_embedding(
+            wrapper,
+            train_step_fn,
+            wrapper,
+            opt,
+            uih_values,
+            uih_lengths,
+            cand_values,
+            cand_lengths,
+            dispatcher=DlrmV3SparseDispatcher(dummy),
+            parallel_mode=GSPMDParallel(
+                "replicate",
+                loss_reduction="sum",
+                num_ranks=self.num_ranks,
+                num_processes=1,
+            ),
+            backend=XLAGSPMDBackend(),
+        )
 
         for _ in range(num_steps):
             train_step(wrapper, opt, uih_values, uih_lengths, cand_values, cand_lengths)
@@ -144,21 +149,7 @@ class TestDLRMv3XLA(unittest.TestCase):
         # ── XLA GSPMD path (uses the original wrapper) ──
         opt = torch.optim.SGD(wrapper.parameters(), lr=0.01, foreach=False)
 
-        @compile(
-            module_override=[DlrmV3SparseOverride(dummy)],
-            parallel_mode=GSPMDParallel(
-                "replicate",
-                loss_reduction="sum",
-                num_ranks=self.num_ranks,
-                num_processes=1,
-            ),
-            # pyre-ignore[6]: GraphModuleTransformation is callable at runtime.
-            gm_transformation=GraphModuleTransformation(
-                backend=BackendType.XLA_GSPMD,
-                enable_device_state=True,
-            ),
-        )
-        def train_step(
+        def train_step_fn(
             mod: nn.Module,
             opt: torch.optim.Optimizer,
             uih_values: torch.Tensor,
@@ -172,6 +163,25 @@ class TestDLRMv3XLA(unittest.TestCase):
             loss: torch.Tensor = torch.stack(list(aux_losses.values())).sum()
             loss.backward()
             opt.step()
+
+        train_step = compile_with_jax_embedding(
+            wrapper,
+            train_step_fn,
+            wrapper,
+            opt,
+            uih_values,
+            uih_lengths,
+            cand_values,
+            cand_lengths,
+            dispatcher=DlrmV3SparseDispatcher(dummy),
+            parallel_mode=GSPMDParallel(
+                "replicate",
+                loss_reduction="sum",
+                num_ranks=self.num_ranks,
+                num_processes=1,
+            ),
+            backend=XLAGSPMDBackend(),
+        )
 
         for _ in range(num_iters):
             train_step(wrapper, opt, uih_values, uih_lengths, cand_values, cand_lengths)
