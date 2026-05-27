@@ -5,8 +5,10 @@
 # LICENSE file in the root directory of this source tree.
 
 # pyre-strict
+import contextlib
+import contextvars
 import logging
-from typing import Any, Callable, List, Optional, Tuple
+from typing import Any, Callable, Generator, List, Optional, Tuple
 
 import jax  # @manual
 import jax.numpy as jnp  # @manual
@@ -24,6 +26,71 @@ except ImportError:
     from jax.experimental.shard_map import shard_map
 
 logger: logging.Logger = logging.getLogger(__name__)
+
+
+# Cross-host AOT compile support. When set, the device-discovery helpers
+# below report the virtual topology's devices instead of the host's local
+# JAX devices, so recir's mesh construction (and the per-input sharded
+# JAX builder) targets the AOT topology rather than the CPU backend that
+# is actually running the build job. The contextvar default of ``None``
+# keeps every existing caller on the live ``jax.devices()`` /
+# ``jax.local_devices()`` path — the indirection is a true no-op for
+# non-AOT users.
+_AOT_TOPOLOGY: contextvars.ContextVar[Optional[Any]] = contextvars.ContextVar(
+    "aot_topology", default=None
+)
+
+
+@contextlib.contextmanager
+def aot_topology(topology_desc: Any) -> Generator[None, None, None]:
+    """Override device discovery to a virtual topology for AOT prebuild.
+
+    Use on a CPU host when AOT-prebuilding for an accelerator pod.
+    Inside the context, recir's mesh construction sees
+    ``topology_desc.devices`` instead of the local CPU devices, so the
+    produced binary targets the virtual TPU topology and can be
+    serialized via :func:`recir.lowering.aot.aot_prebuild_and_serialize`
+    for execution on the actual pod (the Pax / MaxText
+    "build-once-on-CPU, load-everywhere-on-TPU" pattern).
+
+    Args:
+        topology_desc: A ``jax.experimental.topologies.TopologyDescription``
+            (or any object exposing a ``.devices`` attribute that returns
+            a sequence of JAX device handles).
+    """
+    token = _AOT_TOPOLOGY.set(topology_desc)
+    try:
+        yield
+    finally:
+        _AOT_TOPOLOGY.reset(token)
+
+
+def _get_global_devices() -> List[Any]:
+    """Global JAX device list, honoring an active :func:`aot_topology`."""
+    topo = _AOT_TOPOLOGY.get()
+    return list(topo.devices) if topo is not None else jax.devices()
+
+
+def _get_local_devices() -> List[Any]:
+    """Local JAX device list, honoring an active :func:`aot_topology`.
+
+    AOT mode: returns the per-process slice of ``topo.devices`` (matching
+    the runtime semantics of ``jax.local_devices()`` on each pod).
+    Without this, ``num_local == num_global`` collapses the host-shard
+    math in ``_to_sharded_jax`` to a no-op and the build sees per-host
+    (not per-mesh) batch shapes — the resulting executable then fails
+    sharding-divisibility checks at load time (e.g. axis 0 sized 8
+    cannot be partitioned 256 ways on a 32-host v7-128 pod).
+
+    Outside AOT mode it falls back to ``jax.local_devices()``, matching
+    the original behavior.
+    """
+    topo = _AOT_TOPOLOGY.get()
+    if topo is None:
+        return jax.local_devices()
+    devs = list(topo.devices)
+    p0 = [d for d in devs if getattr(d, "process_index", 0) == 0]
+    return p0 if p0 else devs
 
 
 class _XLAModule(torch.nn.Module):
@@ -54,12 +121,13 @@ class _XLAModule(torch.nn.Module):
         self.keep_jax_output: bool = False
         self.torch_output_indices: Optional[set[int]] = None
         self.safe_donate_indices: Optional[set[int]] = None
-        # AOT (ahead-of-time) cache slot: ``aot_load_prebuilt_into`` stashes
-        # a deserialized ``jax.stages.Compiled`` here so the next forward
-        # call skips the lazy-build path. ``aot_prebuild_and_serialize``
-        # reads from this slot after running a warmup forward. Initialized
-        # to ``None`` so tests can ``assertIsNone`` pre-warmup; the
-        # build/run paths in commit 6 populate it during normal execution.
+        # AOT (ahead-of-time) build state. Populated by ``_build_xla_executable``
+        # whenever a backend produces a ``jax.stages.Compiled``, so an external
+        # caller (see ``recir.lowering.aot``) can serialize and ship the
+        # executable instead of rebuilding on every host. Also set directly by
+        # ``aot_load_prebuilt_into`` on the load side; the run closures
+        # returned by ``_build_*_executable`` prefer this attribute over a
+        # fresh JAX cache lookup.
         self._jax_compiled: Optional[Any] = None
 
     def _postprocess_jax_output(
@@ -123,12 +191,19 @@ class _XLAModule(torch.nn.Module):
           single device.
         - **XLA_GSPMD**: ``jax.jit`` with explicit ``in_shardings`` /
           ``out_shardings`` read from per-node ``node.meta`` attributes.
+
+        Each ``_build_*_executable`` helper returns a ``run`` closure that, on
+        first invocation, materializes a ``jax.stages.Compiled`` and stashes
+        it on ``self._jax_compiled``. AOT callers
+        (:func:`recir.lowering.aot.aot_prebuild_and_serialize`) trigger this
+        by issuing a single warmup call to the parent ``_XLAModule`` so the
+        cached executable can be serialized.
         """
         torchax.default_env()
         gm: torch.fx.GraphModule = self.gm
         input_device: torch.device = args[0].device if args else torch.device("cpu")
-        local_devs = jax.local_devices()
-        jax_device: Any = local_devs[0] if local_devs else jax.devices()[0]
+        local_devs = _get_local_devices()
+        jax_device: Any = local_devs[0] if local_devs else _get_global_devices()[0]
 
         def jax_fn(*jax_args: Any) -> Any:
             return torchax.interop.call_torch(gm, *jax_args)
@@ -179,42 +254,87 @@ class _XLAModule(torch.nn.Module):
         elif tensor.dtype == torch.bfloat16:
             jax_array = jax_array.astype(jnp.bfloat16)
 
-        local_devices = jax.local_devices()
+        local_devices = _get_local_devices()
         num_local = len(local_devices)
-        num_global = jax.device_count()
+        # Honor :func:`aot_topology` here too: when set, the topology's
+        # devices are reported globally, but ``_get_local_devices`` returns
+        # the per-process slice so ``num_global // num_local`` still
+        # encodes the host count.
+        num_global = len(_get_global_devices())
+        # AOT mode: the compile-only client returned by
+        # ``get_topology_desc`` raises ``MakeArraysFromHostBufferShards
+        # not available with compile-only client`` from
+        # ``jax.device_put`` / ``make_array_from_single_device_arrays``.
+        # Lowering only needs abstract input shapes/dtypes/shardings, so
+        # return ``jax.ShapeDtypeStruct`` instead. The corresponding
+        # ``run`` closures (see ``_build_*_executable``) short-circuit
+        # before invoking the executable so these abstract values are
+        # never executed.
+        aot_active = _AOT_TOPOLOGY.get() is not None
+        # Local→global multiplier. Use the topology-aware ratio
+        # (num_global // num_local) so prebuild and runtime agree on the
+        # global batch shape:
+        #   * Real TPU runtime: jax.local_devices() / jax.devices() gives
+        #     num_local=8, num_global=256 → multiplier=32 (=
+        #     jax.process_count()).
+        #   * aot_topology prebuild on a CPU host targeting a 4x4x8
+        #     virtual topology: _get_local_devices filters topo.devices
+        #     by process_index=0 (=8), _get_global_devices=256 →
+        #     multiplier=32. Matches runtime. jax.process_count() on the
+        #     CPU host is 1, so using THAT would compile for a different
+        #     global shape than the runtime executes against and the
+        #     AOT-loaded executable would TypeError on the first call.
+        # `_make_batch_transform` in recir.api._compile_gspmd must use
+        # the same multiplier (see GSPMDParallel.num_processes for the
+        # matching property).
+        host_count = num_global // num_local
         if is_batch_input:
+            global_shape = list(jax_array.shape)
+            global_shape[input_batch_dim] *= host_count
+            ndim = len(global_shape)
+            spec_parts: List[Any] = [None] * max(ndim, input_batch_dim + 1)
+            spec_parts[input_batch_dim] = "torch_dist"
+            sharding = NamedSharding(mesh, P(*spec_parts))
+            if aot_active:
+                return jax.ShapeDtypeStruct(
+                    tuple(global_shape), jax_array.dtype, sharding=sharding
+                )
             local_shards = jnp.split(jax_array, num_local, axis=input_batch_dim)
             local_buffers = [
                 jax.device_put(s, d) for s, d in zip(local_shards, local_devices)
             ]
-            global_shape = list(jax_array.shape)
-            global_shape[input_batch_dim] *= num_global // num_local
-            # Build a PartitionSpec naming "torch_dist" on the actual batch
-            # axis (input_batch_dim), with None on every other axis.
-            ndim = len(global_shape)
-            spec_parts: List[Any] = [None] * max(ndim, input_batch_dim + 1)
-            spec_parts[input_batch_dim] = "torch_dist"
             return jax.make_array_from_single_device_arrays(
-                tuple(global_shape),
-                NamedSharding(mesh, P(*spec_parts)),
-                local_buffers,
+                tuple(global_shape), sharding, local_buffers
             )
         if is_fsdp_weight:
-            # FSDP: input is a local shard (after shard_params).
+            # FSDP: input is a local shard (after shard_params). Same
+            # rationale as the is_batch_input branch above -- the
+            # local→global multiplier here must match the gm's baked
+            # global shape (via _make_batch_transform's host_count).
+            global_shape = list(jax_array.shape)
+            global_shape[0] *= host_count
+            ndim = len(global_shape)
+            spec = P("torch_dist", *([None] * (ndim - 1)))
+            sharding = NamedSharding(mesh, spec)
+            if aot_active:
+                return jax.ShapeDtypeStruct(
+                    tuple(global_shape), jax_array.dtype, sharding=sharding
+                )
             local_shards = jnp.split(jax_array, num_local, axis=0)
             local_buffers = [
                 jax.device_put(s, d) for s, d in zip(local_shards, local_devices)
             ]
-            global_shape = list(jax_array.shape)
-            global_shape[0] *= num_global // num_local
-            ndim = len(global_shape)
-            spec = P("torch_dist", *([None] * (ndim - 1)))
             return jax.make_array_from_single_device_arrays(
-                tuple(global_shape), NamedSharding(mesh, spec), local_buffers
+                tuple(global_shape), sharding, local_buffers
+            )
+        sharding = NamedSharding(mesh, P())
+        if aot_active:
+            return jax.ShapeDtypeStruct(
+                tuple(jax_array.shape), jax_array.dtype, sharding=sharding
             )
         local_buffers = [jax.device_put(jax_array, d) for d in local_devices]
         return jax.make_array_from_single_device_arrays(
-            jax_array.shape, NamedSharding(mesh, P()), local_buffers
+            jax_array.shape, sharding, local_buffers
         )
 
     def _jit_shard_map(
@@ -224,7 +344,21 @@ class _XLAModule(torch.nn.Module):
         input_device: torch.device,
     ) -> Any:
         """jax.jit wrapped in shard_map for collectives."""
-        devices = jax.devices()
+        # NOTE: unlike ``_jit_gspmd`` (which rebuilds ``runtime_mesh``
+        # inside its ``run`` closure to defend against the AOT-prebuild
+        # virtual-mesh pitfall), here ``mesh`` is captured at build time
+        # and reused inside ``run``. This is intentional: ``shard_map``
+        # binds the mesh into the JIT'd computation itself (see the
+        # ``shard_map(jax_fn, mesh=mesh, ...)`` call below), and the
+        # resulting ``lowered`` / ``jitted`` artifacts would not see a
+        # rebuilt mesh anyway — swapping ``mesh`` inside ``run`` is
+        # either a no-op (lowering is frozen) or forces a recompile.
+        # The legacy shard_map path is only taken when
+        # ``backend_type != XLA_GSPMD``; the AOT-prebuild workflow
+        # exclusively uses the GSPMD path, so this build-time capture
+        # is not exercised under a virtual-devices ``aot_topology``
+        # context in practice.
+        devices = _get_global_devices()
         mesh: Any = Mesh(devices, axis_names=("torch_dist",))
         placeholders = [n for n in self.gm.graph.nodes if n.op == "placeholder"]
         is_batch: List[bool] = [
@@ -245,25 +379,51 @@ class _XLAModule(torch.nn.Module):
             self._to_sharded_jax(a, mesh, is_batch_input=is_batch[j])
             for j, a in enumerate(args)
         )
-        lowered = jitted.lower(*example_global_args)
+        # Annotate to silence pyre [53] on the ``lowered`` capture below;
+        # ``jitted.lower`` returns ``jax.stages.Lowered`` whose stubs are
+        # ``Any`` so the inferred type is ``Any`` already.
+        lowered: Any = jitted.lower(*example_global_args)
 
         def run(*run_args: torch.Tensor) -> List[torch.Tensor]:
+            # AOT prebuild mode: lower+compile against the closure-
+            # captured abstract args; never execute on a compile-only
+            # topology. ``_to_sharded_jax`` would raise here too.
+            if _AOT_TOPOLOGY.get() is not None:
+                if self._jax_compiled is None:
+                    self._jax_compiled = lowered.compile()
+                return []
             global_args = tuple(
                 self._to_sharded_jax(a, mesh, is_batch_input=is_batch[j])
                 for j, a in enumerate(run_args)
             )
-            jax_out = jitted(*global_args)
+            # Prefer an AOT-installed or already-built executable so we
+            # capture ``jax.stages.Compiled`` exactly once (the JAX
+            # cache otherwise re-invokes lower+compile under the hood).
+            # When nothing is cached, build on first invocation.
+            if self._jax_compiled is None:
+                self._jax_compiled = jitted.lower(*global_args).compile()
+            jax_out = self._jax_compiled(*global_args)
             return self._postprocess_jax_output(jax_out, input_device)
 
         return lowered, run
 
     @staticmethod
     def _t2j_safe(a: Any, jax_device: Any) -> Any:
-        """Convert a torch.Tensor to a JAX array, passing through None."""
+        """Convert a torch.Tensor to a JAX array, passing through None.
+
+        AOT prebuild mode: the compile-only client cannot host real
+        buffers, so return a ``jax.ShapeDtypeStruct`` instead. The
+        ``_build_plain_executable`` ``run`` closure short-circuits
+        before invoking the executable so the abstract value is only
+        used by lowering.
+        """
         if a is None:
             return None
         if not isinstance(a, torch.Tensor):
             return a
+        if _AOT_TOPOLOGY.get() is not None:
+            jx = t2j(a)
+            return jax.ShapeDtypeStruct(tuple(jx.shape), jx.dtype)
         return jax.device_put(t2j(a), jax_device)
 
     def _jit_plain(
@@ -277,10 +437,26 @@ class _XLAModule(torch.nn.Module):
         example_jax_args = tuple(self._t2j_safe(a, jax_device) for a in args)
         lowered = jax.jit(jax_fn).lower(*example_jax_args)
         compiled: Any = lowered.compile()
+        # Stash on the module so AOT serialization can pick it up — but
+        # only when nothing was AOT-loaded already.  Mirrors the guard in
+        # ``_jit_gspmd`` / ``_jit_shard_map``: an unconditional
+        # assignment here would clobber an AOT-deserialized executable
+        # installed by ``aot_load_prebuilt_into`` and force a recompile
+        # on the next forward pass.
+        if self._jax_compiled is None:
+            self._jax_compiled = compiled
 
         def run(*run_args: torch.Tensor) -> List[torch.Tensor]:
+            # AOT prebuild mode: skip execution; ``compiled`` is already
+            # captured on ``self._jax_compiled`` above.
+            if _AOT_TOPOLOGY.get() is not None:
+                return []
             jax_args = tuple(self._t2j_safe(a, jax_device) for a in run_args)
-            jax_out = compiled(*jax_args)
+            # Prefer the AOT-installed executable when present; fall
+            # back to the eagerly built ``compiled`` from the enclosing
+            # scope.
+            executable = self._jax_compiled or compiled
+            jax_out = executable(*jax_args)
             return self._postprocess_jax_output(jax_out, input_device)
 
         return lowered, run
@@ -308,14 +484,14 @@ class _XLAModule(torch.nn.Module):
                     queue.append(inp)
         return None
 
-    def _jit_gspmd(
+    def _jit_gspmd(  # noqa: C901 — orchestration: builds the GSPMD mesh + per-input/per-output sharding spec + (host, device) routing in one place so the AOT compile + execute paths share a single source of truth.
         self,
         jax_fn: Callable[..., Any],
         args: Tuple[torch.Tensor, ...],
         input_device: torch.device,
     ) -> Any:
         """jax.jit with GSPMD in_shardings/out_shardings."""
-        devices = jax.devices()
+        devices = _get_global_devices()
         mesh: Any = Mesh(devices, axis_names=("torch_dist",))
         replicated = NamedSharding(mesh, P())
         placeholders = [n for n in self.gm.graph.nodes if n.op == "placeholder"]
@@ -421,21 +597,49 @@ class _XLAModule(torch.nn.Module):
         _hlo_captured: List[bool] = [False]
 
         def run(*run_args: torch.Tensor) -> List[torch.Tensor]:
+            # AOT prebuild mode: lower+compile against the closure-
+            # captured abstract args (see ``lowered`` below). Skip
+            # execution — the caller (``aot_prebuild_and_serialize``)
+            # only reads ``self._jax_compiled``.
+            if _AOT_TOPOLOGY.get() is not None:
+                if self._jax_compiled is None:
+                    self._jax_compiled = lowered.compile()
+                if not _hlo_captured[0]:
+                    _hlo_captured[0] = True
+                    run.hlo_text = self._jax_compiled.as_text()  # pyre-ignore[16]
+                return []
+            # IMPORTANT: rebuild the mesh from live JAX devices at call
+            # time rather than reusing the closure-captured `mesh`. When
+            # this _XLAModule was first instantiated under an
+            # `aot_topology(virtual_topo)` context (the canary's warmup
+            # #2 pattern), the captured `mesh` holds the VIRTUAL
+            # devices. Subsequent real-runtime calls happen OUTSIDE
+            # `aot_topology` and must use the real
+            # `jax.devices()`-backed mesh, otherwise `_to_sharded_jax`
+            # builds NamedShardings against virtual devices that don't
+            # correspond to any addressable real device, and JAX SIGSEGVs
+            # silently on first call.
+            runtime_mesh = Mesh(_get_global_devices(), axis_names=("torch_dist",))
             jax_args = tuple(
                 self._to_sharded_jax(
                     a,
-                    mesh,
+                    runtime_mesh,
                     is_batch[j],
                     per_input_batch_dim[j],
                     is_fsdp_weight=is_fsdp_sharded[j],
                 )
                 for j, a in enumerate(run_args)
             )
+            # First call materializes and stashes the compiled
+            # executable so AOT serializers can pick it up (and so
+            # subsequent calls bypass JAX's internal compile cache
+            # lookup, which avoids a second compile during HLO capture).
+            if self._jax_compiled is None:
+                self._jax_compiled = jitted.lower(*jax_args).compile()
             if not _hlo_captured[0]:
                 _hlo_captured[0] = True
-                compiled = jitted.lower(*jax_args).compile()
-                run.hlo_text = compiled.as_text()  # pyre-ignore[16]
-            jax_out = jitted(*jax_args)
+                run.hlo_text = self._jax_compiled.as_text()  # pyre-ignore[16]
+            jax_out = self._jax_compiled(*jax_args)
             return self._postprocess_jax_output(jax_out, input_device)
 
         run.hlo_text = None  # pyre-ignore[16]
@@ -450,7 +654,10 @@ class _XLAModule(torch.nn.Module):
             )
             for j, a in enumerate(args)
         )
-        lowered = jitted.lower(*example_args)
+        # Annotate to silence pyre [53] on the ``lowered`` capture in the
+        # ``run`` closure above (late binding); ``jitted.lower`` returns
+        # ``jax.stages.Lowered`` whose stubs are ``Any``.
+        lowered: Any = jitted.lower(*example_args)
         return lowered, run
 
     def forward(self, *args: torch.Tensor, tag: str = "") -> List[torch.Tensor]:
