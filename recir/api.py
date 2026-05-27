@@ -1064,3 +1064,93 @@ def sync_device_state_to_torch(compiled_fn: Callable[..., Any]) -> None:
     if compiled_obj.state_manager.device_state is None:
         return
     compiled_obj.state_manager.sync_to_torch(compiled_obj.flat_state)
+
+
+# Pull through the ``GraphPatch`` type alias so consumers don't need to import
+# from ``recir.backends`` if they only want the type.
+from recir.backends.base import GraphPatch  # noqa: E402, F401
+# ---------------------------------------------------------------------------
+# v7.1 public surface: graph manipulation primitives
+# ---------------------------------------------------------------------------
+
+
+# Re-exports so callers can write ``from recir.api import ...`` or
+# ``recir.find_markers`` interchangeably.
+from recir.ops.marker import find_markers  # noqa: E402, F401
+from recir.region_transforms import extract_subgraph, replace_region  # noqa: E402, F401
+
+
+def add_state(
+    gm: fx.GraphModule,
+    flat_state: List[torch.Tensor],
+    name: str,
+    tensor: torch.Tensor,
+) -> int:
+    """Atomically add a new state tensor + matching placeholder to ``gm``.
+
+    The new placeholder is inserted immediately after the existing trailing
+    placeholder so it stays grouped with the rest of the flat state.  The
+    tensor is appended to ``flat_state`` and the index of the appended entry
+    in ``flat_state`` is returned (callers use this when wiring downstream
+    uses against the flat-state list).
+
+    Args:
+        gm: the host graph module.  Its graph is mutated in place and
+            recompiled.
+        flat_state: the flat state list mirroring the leading placeholders of
+            ``gm``.  Mutated in place: ``tensor`` is appended.
+        name: the placeholder name (suffixed with a counter if it collides
+            with an existing node name).
+        tensor: the tensor whose value will be passed at runtime.
+
+    Returns:
+        The index of the newly-appended entry in ``flat_state`` (i.e.,
+        ``len(flat_state) - 1`` after append).  This equals the new
+        placeholder's positional index among ``gm``'s placeholders only when
+        no non-flat-state placeholders precede it in ``gm``.
+    """
+    # Locate the insertion point: after the last existing placeholder.  This
+    # keeps the placeholder block contiguous so the caller's existing
+    # flat_state-to-placeholder pairing stays positional.
+    placeholders = [n for n in gm.graph.nodes if n.op == "placeholder"]
+    if placeholders:
+        anchor = placeholders[-1]
+        insert_ctx = gm.graph.inserting_after(anchor)
+    else:
+        # Empty graph (no existing inputs).  Insert at the very front.
+        first_node = next(iter(gm.graph.nodes), None)
+        insert_ctx = (
+            gm.graph.inserting_before(first_node)
+            if first_node is not None
+            else gm.graph.inserting_after()
+        )
+
+    with insert_ctx:
+        new_placeholder = gm.graph.placeholder(name)
+
+    # Attach a fake-tensor val to the new placeholder so downstream passes
+    # that inspect ``node.meta["val"]`` (e.g. batch-dim propagation, region
+    # transforms) see a concrete shape.  Reuse the FakeTensorMode already
+    # attached to ``gm`` (via existing placeholders' meta) when possible so
+    # the new fake-tensor shares the same mode identity as the rest of the
+    # graph — constructing a fresh mode per call would create fake-tensors
+    # tied to a different mode object and break downstream invariants that
+    # rely on a single mode per graph.
+    fake_mode = torch._guards.detect_fake_mode(
+        [n.meta["val"] for n in placeholders if "val" in n.meta]
+    )
+    if fake_mode is None:
+        fake_mode = FakeTensorMode(allow_non_fake_inputs=True)
+    with fake_mode:
+        new_placeholder.meta["val"] = fake_mode.from_tensor(tensor)
+    new_placeholder.meta.setdefault("is_batch_input", False)
+    new_placeholder.meta.setdefault("is_weight", False)
+
+    flat_state.append(tensor)
+
+    gm.graph.lint()
+    gm.recompile()
+
+    # The new placeholder is now the last placeholder; its positional index
+    # among placeholders equals len(flat_state) - 1.
+    return len(flat_state) - 1

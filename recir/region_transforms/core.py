@@ -15,7 +15,7 @@ import logging
 import operator
 from collections import OrderedDict
 from contextlib import contextmanager, ExitStack
-from typing import Any, Callable, Generator
+from typing import Any, Callable, Generator, Iterable
 
 import torch
 import torch.fx as fx
@@ -442,6 +442,47 @@ def _replace_region(
 
     gm.graph.lint()
     gm.recompile()
+
+
+def extract_subgraph(
+    gm: fx.GraphModule,
+    nodes: Iterable[fx.Node],
+) -> fx.GraphModule:
+    """Extract ``nodes`` from ``gm`` into a standalone sub-GraphModule.
+
+    Public wrapper around the internal :func:`_extract_subgraph`.  Accepts any
+    iterable of ``fx.Node`` (list, set, tuple, generator) and converts it to
+    the node-set shape that the internal helper expects.
+
+    Args:
+        gm: the host graph module.
+        nodes: the nodes to lift into a new sub-GraphModule.
+
+    Returns:
+        A new ``fx.GraphModule`` whose graph contains exactly ``nodes`` plus
+        the placeholders / output node required to make it self-contained.
+    """
+    return _extract_subgraph(gm, set(nodes))
+
+
+def replace_region(
+    gm: fx.GraphModule,
+    nodes: Iterable[fx.Node],
+    replacement: Callable[..., Any],
+) -> None:
+    """Replace ``nodes`` in ``gm`` with a single call to ``replacement``.
+
+    Public wrapper around the internal :func:`_replace_region`.  Accepts any
+    iterable of ``fx.Node`` and a callable that will be invoked with the
+    region inputs as positional arguments.
+
+    Args:
+        gm: the host graph module (mutated in place).
+        nodes: the nodes to replace.
+        replacement: callable invoked with the region inputs.  Its outputs
+            replace any external uses of the region's outputs.
+    """
+    _replace_region(gm, set(nodes), replacement)
 
 
 @contextmanager
