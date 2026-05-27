@@ -92,7 +92,7 @@ class XLAGSPMDBackendTest(unittest.TestCase):
 
     def test_uses_iter_graph(self) -> None:
         backend = XLAGSPMDBackend()
-        self.assertTrue(backend.uses_iter_graph)
+        self.assertFalse(backend.uses_iter_graph)
 
     def test_device_state_manager_is_xla(self) -> None:
         backend = XLAGSPMDBackend()
@@ -113,6 +113,24 @@ class XLAGSPMDBackendTest(unittest.TestCase):
             backend.validate_with(mode)
         self.assertIn("GSPMDParallel", str(ctx.exception))
 
+    def test_xla_gspmd_rejects_iter_graph_true(self) -> None:
+        """validate_with raises when uses_iter_graph=True is paired with
+        GSPMD — IterGraphModule's setup/cleanup mirrors cannot handle the
+        global literals GSPMD bakes into the FX graph at trace time.
+        Subclass and override the @property to force True (the base default
+        is False)."""
+
+        class _IterGraphXLAGSPMD(XLAGSPMDBackend):
+            @property
+            def uses_iter_graph(self) -> bool:
+                return True
+
+        backend = _IterGraphXLAGSPMD()
+        mode = GSPMDParallel("replicate", num_ranks=1, num_processes=1)
+        with self.assertRaises(ValueError) as ctx:
+            backend.validate_with(mode)
+        self.assertIn("uses_iter_graph", str(ctx.exception))
+
 
 class XLAShardMapBackendTest(unittest.TestCase):
     """XLAShardMapBackend validates against DataParallel/HybridParallel."""
@@ -121,7 +139,7 @@ class XLAShardMapBackendTest(unittest.TestCase):
         self.assertEqual(tuple(XLAShardMapBackend.default_optimize_passes()), ())
 
     def test_uses_iter_graph(self) -> None:
-        self.assertTrue(XLAShardMapBackend().uses_iter_graph)
+        self.assertFalse(XLAShardMapBackend().uses_iter_graph)
 
     def test_validate_with_data_parallel_passes(self) -> None:
         """DataParallel is accepted."""
