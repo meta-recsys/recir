@@ -4091,6 +4091,55 @@ def _aten_uniform(
 # func: randint.low_generator(SymInt low, SymInt high, SymInt[] size, *, Generator? generator, ScalarType? dtype=long, Layout? layout=None, Device? device=None, bool? pin_memory=None) -> Tensor
 
 
+_INT32_MAX = 2**31 - 1
+_INT32_MIN = -(2**31)
+
+
+def _randint_via_bits(key: Any, size: Any, low: int, high: int) -> Any:
+    """jax.random.randint replacement that supports `high` slightly > int32_max.
+
+    `jax.random.randint(key, shape, minval, maxval)` restricts minval and
+    maxval to fit in int32. Engram's `NgramHashMapping` uses `high=2**31`,
+    which is one over the limit. Use `jax.random.bits` to generate raw
+    uint32 and reduce into `[0, range_size)` via uint32 modulo (stays in
+    uint32 throughout to avoid the int32 overflow that arithmetic on
+    `int(2**31)` triggers). Then cast back to int32 (values fit since
+    range_size <= 2**31 means max output is 2**31 - 1) and add `low`.
+
+    Bias is bounded by `range_size / 2**32`; for engram's case
+    (range=2**31, bits=32) bias is 0.5 -- acceptable for hash init.
+
+    Supports range up to 2**31 (one slot beyond stock `jax.random.randint`).
+    For range > 2**31, uint64 + x64 would be needed; raise instead.
+    """
+    range_size = int(high) - int(low)
+    if range_size <= 0:
+        raise ValueError(f"_aten_randint: empty range [{low}, {high})")
+    # Algorithm correctness: we cast the modulo result back to int32, so
+    # ``res_uint`` must fit in [0, 2**31 - 1]. That bounds ``range_size``
+    # by 2**31 (one slot beyond stock ``jax.random.randint``). Larger
+    # ranges would silently wrap to negative int32 values; raise instead
+    # so the caller routes through a uint64 / x64 path.
+    if range_size > 2**31:
+        raise NotImplementedError(
+            f"_aten_randint range {range_size} > 2**31 needs JAX_ENABLE_X64; "
+            "not supported by this fallback"
+        )
+    # Matching bound on the endpoints: ``low`` must be >= int32_min (so
+    # the final ``+ low`` cast stays in int32) and ``high`` must be
+    # <= 2**31 (so ``range_size`` stays in the supported regime above).
+    if int(low) < -(2**31) or int(high) > 2**31:
+        raise NotImplementedError(
+            f"_aten_randint low={low} high={high} outside [int32_min, 2**31]"
+        )
+    uints = jax.random.bits(key, size, dtype=jnp.uint32)
+    mod_arr = jnp.uint32(range_size)
+    res_uint = uints % mod_arr
+    # Cast back to int32 -- safe because range_size <= 2**31 means
+    # values fit in [0, 2**31 - 1].
+    return res_uint.astype(jnp.int32) + jnp.int32(int(low))
+
+
 @op(torch.ops.aten.randint, needs_env=True)  # pyre-ignore[56]
 @op_base.convert_dtype(use_default_dtype=False)
 def _aten_randint(
@@ -4112,7 +4161,10 @@ def _aten_randint(
         )
 
     key = env.get_and_rotate_prng_key(generator)
-    res = jax.random.randint(key, size, low, high)
+    if int(low) < _INT32_MIN or int(high) > _INT32_MAX:
+        res = _randint_via_bits(key, size, low, high)
+    else:
+        res = jax.random.randint(key, size, low, high)
     if dtype is not None:
         res = res.astype(dtype)
     return res
@@ -4145,7 +4197,10 @@ def _aten_randint_like(
     shape = input.shape
     dtype = dtype or input.dtype
     key = env.get_and_rotate_prng_key(generator)
-    res = jax.random.randint(key, shape, low, high)
+    if int(low) < _INT32_MIN or int(high) > _INT32_MAX:
+        res = _randint_via_bits(key, shape, low, high)
+    else:
+        res = jax.random.randint(key, shape, low, high)
     if dtype is not None:
         res = res.astype(dtype)
     return res
