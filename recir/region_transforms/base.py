@@ -27,6 +27,12 @@ class RegionTransform:
     * :meth:`transform_graph` — In-place rewrite of the inner-traced
       ``gm_fwd`` (e.g. recompute, regather).  Implementing it triggers
       an inner ``make_fx`` trace with the already-transformed inputs.
+    * :meth:`finalize_compiled_graph` — Post-compile pass on the final
+      outer graph returned by the compile pipeline (after
+      ``_finalize_graph``).  Override when the transform needs to inline
+      fine-grained FX nodes that cannot be produced safely during the
+      inner trace (e.g. decompositions involving ``Tensor.tolist()`` /
+      ``_local_scalar_dense`` which crash under fake-mode dispatch).
     """
 
     def transform_inputs(
@@ -50,4 +56,6 @@ class RegionTransform:
 
     def finalize_compiled_graph(self, gm: fx.GraphModule) -> None:
         """Optional post-compile hook on the final outer graph (e.g. tag
-        XLA graph-break nodes).  Default is a no-op."""
+        XLA graph-break nodes, inline post-AOT decompositions).  Default
+        is a no-op."""
+        return

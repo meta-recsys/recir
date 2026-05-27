@@ -28,7 +28,6 @@ from recir.distributed.data_parallel import (
     build_data_parallel_strategies,
     DataParallelStrategy,
     DataParallelStyle,
-    decomposed_row_wise_embedding,
     mark_data_parallel_shardings,
     NodeType,
     partition_value,
@@ -37,6 +36,7 @@ from recir.distributed.data_parallel import (
 from recir.distributed.parallel_mode import DataParallel, HybridParallel
 from recir.passes import insert_weight_free_nodes
 from recir.region_transforms import RegatherTransform
+from recir.region_transforms.sparse_embedding import decomposed_row_wise_embedding
 from recir.sharding_plan import EmbeddingShardingPlan, EmbeddingShardingType
 from torch._subclasses.fake_tensor import FakeTensorMode
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP

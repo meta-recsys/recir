@@ -25,11 +25,13 @@ from recir.region_transforms.core import (
 )
 from recir.region_transforms.recompute import RecomputeTransform
 from recir.region_transforms.regather import RegatherTransform
+from recir.region_transforms.sparse_embedding import SparseEmbeddingTransform
 
 __all__ = [
     "RegionTransform",
     "RegatherTransform",
     "RecomputeTransform",
+    "SparseEmbeddingTransform",
     "_apply_region_transforms",
     "_compute_region_io",
     "_discover_autograd_functions",
