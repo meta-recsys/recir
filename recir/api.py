@@ -11,7 +11,7 @@ import os
 from collections import OrderedDict
 from contextlib import contextmanager, ExitStack, nullcontext
 from copy import copy
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import partial, wraps
 from typing import (
     Any,
@@ -44,7 +44,6 @@ from recir.distributed.data_parallel import (
     DataParallelStyle,
     gradients_tagging,
     parametrize_params,
-    rewrite_sparse_embeddings,
 )
 from recir.distributed.parallel_mode import (
     DataParallel,
@@ -60,6 +59,7 @@ from recir.region_transforms import (
     _find_forward_roots,
     RegatherTransform,
     RegionTransform,
+    SparseEmbeddingTransform,
 )
 from torch import fx
 from torch._subclasses.fake_tensor import FakeTensorMode
@@ -191,6 +191,11 @@ class _CompiledResult:
     opt: Optional[torch.optim.Optimizer]
     flat_state: List[torch.Tensor]
     state_manager: DeviceStateManager
+    # Transforms added by the sub-path (e.g. ``_compile_data_parallel_v2``
+    # adds ``SparseEmbeddingTransform``).  Their ``finalize_compiled_graph``
+    # is invoked by ``_compile_and_transform`` alongside the caller-supplied
+    # ``region_transforms``, in a single consolidated loop.
+    internal_transforms: List["RegionTransform"] = field(default_factory=list)
 
 
 @dataclass
@@ -364,6 +369,23 @@ def _local_compile(
         _del_attr(gm, fqn)
         _assign_attr(value, gm, fqn, attr_kind=_AttrKind.CONSTANT)
         constants[fqn] = value
+
+    # Tag placeholders for params and buffers with their FQN so any
+    # post-compile pass can identify them by name rather than positional
+    # index.  Positional indexing is brittle: Override.transform passes
+    # that run inside _finalize_graph may add or remove leading
+    # placeholders, shifting the params/buffers prefix.  FQN-tagged meta
+    # survives recompile, _to_caller_flattened_graph_module, and
+    # _dedup_collectives because those passes do not mutate placeholder
+    # nodes.
+    params_buffers_fqns = list(params.keys()) + list(buffers.keys())
+    placeholder_idx = 0
+    for node in gm.graph.nodes:
+        if node.op != "placeholder":
+            continue
+        if placeholder_idx < len(params_buffers_fqns):
+            node.meta["fqn"] = params_buffers_fqns[placeholder_idx]
+        placeholder_idx += 1
 
     return _LocalCompiledResult(gm, mod, opt, params, buffers, named_states, constants)
 
@@ -611,6 +633,8 @@ def _compile_and_transform(
         raise TypeError(
             f"Unsupported parallel_mode type: {type(parallel_mode).__name__}"
         )
+    for transform in result.internal_transforms:
+        transform.finalize_compiled_graph(result.gm)
     if region_transforms:
         for transform in region_transforms:
             transform.finalize_compiled_graph(result.gm)
@@ -1060,7 +1084,7 @@ def compile_from_gm(  # noqa: C901 — orchestration: stages 4-8 of the pipeline
     #     required (the DTensor partitioner is skipped entirely on this
     #     path).  For :class:`HybridParallel`, the embedding parameters were
     #     excluded from collectives at trace time; rewrite them now into
-    #     decomposed AllToAll ops via :func:`rewrite_sparse_embeddings`.
+    #     decomposed AllToAll ops via :class:`SparseEmbeddingTransform`.
     #   * :class:`GSPMDParallel`: ``shard_params`` is deferred to this stage
     #     because the GSPMD lowering inflates placeholders to the global
     #     batch post-trace; sharding before the trace would leave the gm
@@ -1078,22 +1102,19 @@ def compile_from_gm(  # noqa: C901 — orchestration: stages 4-8 of the pipeline
 
         # HybridParallel: pattern-match aten.embedding nodes on sharded
         # embedding params and replace with decomposed AllToAll ops via
-        # secondary symbolic trace.  ``embedding_param_indices`` was
-        # populated by :func:`trace` against the pre-shard params dict; the
-        # ordering is stable across shard_params (which mutates values in
-        # place without re-keying the dict), so the indices still map to
-        # placeholder positions in the traced graph.
-        embedding_param_indices = ctx.embedding_param_indices
-        if isinstance(parallel_mode, HybridParallel) and embedding_param_indices:
-            flat_params_buffers = list(ctx.params.values()) + list(ctx.buffers.values())
-            embedding_param_tensors: Dict[int, torch.Tensor] = {
-                i: flat_params_buffers[i] for i in embedding_param_indices
-            }
-            rewrite_sparse_embeddings(
-                gm,
-                parallel_mode.mesh,
-                embedding_param_tensors,
-            )
+        # secondary symbolic trace.  Identifies sharded weight
+        # placeholders by ``node.meta["fqn"]`` (set in
+        # ``_local_compile``) so the lookup is robust to leading-
+        # placeholder shifts introduced by ``Override.transform`` passes
+        # inside ``_finalize_graph``.
+        if isinstance(parallel_mode, HybridParallel):
+            fqns = parallel_mode.embedding_plan.param_fqns
+            if fqns:
+                SparseEmbeddingTransform(
+                    embedding_param_fqns=fqns,
+                    mesh=parallel_mode.mesh,
+                    mod=ctx.mod,
+                ).finalize_compiled_graph(gm)
     else:
         # GSPMDParallel (or future modes that still require a DTensor partition
         # pass).  Mirror the legacy ``_compile_gspmd`` ordering: shard_params
@@ -1350,14 +1371,13 @@ def _compile_data_parallel_v2(
     """Compile with autograd-based collective insertion (no DTensor partition).
 
     Handles both ``DataParallel`` (dense-only) and ``HybridParallel``
-    (dense + embedding sharding) v2 paths.  For ``HybridParallel``,
-    embedding parameters are excluded from collective insertion and
-    instead rewritten post-trace into decomposed AllToAll ops.
+    (dense + embedding sharding) v2 paths.
 
     Caller-supplied ``region_transforms`` (e.g. activation checkpointing via
     :class:`RecomputeTransform`) are appended to the path-internal transforms
-    (``RegatherTransform`` for FULLY_SHARD).  All transforms share a single
-    discovery + ``_apply_region_transforms`` pass.
+    (``RegatherTransform`` for FULLY_SHARD, ``SparseEmbeddingTransform`` for
+    HybridParallel).  All transforms share a single discovery +
+    ``_apply_region_transforms`` pass.
     """
     # Extract mesh and DP style from the parallel mode.
     if isinstance(parallel_mode, HybridParallel):
@@ -1387,10 +1407,30 @@ def _compile_data_parallel_v2(
 
     # 3. Build transforms list (RegatherTransform for FULLY_SHARD + caller
     #    region_transforms).  Embedding params are excluded from the regather
-    #    so that step 9's row-wise rewrite owns them.
+    #    so that the post-compile sparse-embedding rewrite owns them.
     transforms: list[RegionTransform] = []
     if dp_style == DataParallelStyle.FULLY_SHARD:
         transforms.append(RegatherTransform(skip_param_fqns=embedding_param_fqns))
+    sparse_emb_transform: Optional[SparseEmbeddingTransform] = None
+    if embedding_param_fqns:
+        # Pass ``_mod`` so the transform can resolve concrete sharded
+        # tensors at finalize time (it reads ``mod.named_parameters`` /
+        # ``mod.named_buffers``, which return sharded views after
+        # ``shard_params`` mutates ``_mod`` in place below).  Concrete
+        # shapes are required for the inner ``make_fx`` trace under
+        # HybridParallel's ``ShapeEnv`` (symbolic ``meta["val"]`` shapes
+        # would otherwise be rejected by ``torch.randn`` /
+        # ``torch.randint``).
+        sparse_emb_transform = SparseEmbeddingTransform(
+            embedding_param_fqns=embedding_param_fqns,
+            mesh=mesh,
+            mod=_mod,
+        )
+        transforms.append(sparse_emb_transform)
+    # Internal transforms whose ``finalize_compiled_graph`` must be invoked
+    # by this path (the caller-supplied ``region_transforms`` are finalized
+    # by ``_compile_and_transform``).
+    internal_transforms: list[RegionTransform] = list(transforms)
     if region_transforms:
         transforms.extend(region_transforms)
 
@@ -1402,11 +1442,6 @@ def _compile_data_parallel_v2(
         **dict(_mod.named_parameters(remove_duplicate=False)),
         **dict(_mod.named_buffers(remove_duplicate=False)),
     }
-    embedding_param_indices: Optional[set[int]] = None
-    if isinstance(parallel_mode, HybridParallel):
-        embedding_param_indices = parallel_mode._compute_embedding_param_indices(
-            params_and_buffers
-        )
 
     # 5. Set up external fake mode for tracing.
     #    HybridParallel only: a ShapeEnv is attached so custom ops with
@@ -1479,29 +1514,8 @@ def _compile_data_parallel_v2(
             **kwargs,
         )
 
-    # 9. Embedding rewrite on the compiled graph (HybridParallel only).
-    #    Pattern-match aten.embedding nodes on sharded embedding params
-    #    and replace with decomposed AllToAll ops via secondary symbolic trace.
-    #
-    #    The rewrite needs concrete tensor shapes to build example inputs
-    #    for the symbolic sub-trace.  Reading shapes from ``placeholder.meta["val"]``
-    #    does not work here: the outer ``fake_mode`` carries a ``ShapeEnv`` which
-    #    symbolicizes every placeholder shape.
-    if embedding_param_indices:
-        flat_params_buffers = list(local_result.params.values()) + list(
-            local_result.buffers.values()
-        )
-        embedding_param_tensors: Dict[int, torch.Tensor] = {
-            i: flat_params_buffers[i] for i in embedding_param_indices
-        }
-        rewrite_sparse_embeddings(
-            local_result.gm,
-            mesh,
-            embedding_param_tensors,
-        )
-
-    # 10. Finalize.
-    return _finalize_graph(
+    # 9. Finalize.
+    result = _finalize_graph(
         local_result.gm,
         local_result.mod,
         local_result.opt,
@@ -1509,6 +1523,8 @@ def _compile_data_parallel_v2(
         local_result.named_states,
         parallel_mode.input_batch_dim,
     )
+    result.internal_transforms = internal_transforms
+    return result
 
 
 def _compile_gspmd(
