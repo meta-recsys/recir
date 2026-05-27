@@ -20,6 +20,8 @@ from recir.region_transforms.core import (
     _preserve_autograd_function_leaves,
     _replace_region,
     _topo_sort_nodes,
+    extract_subgraph,
+    replace_region,
 )
 from recir.region_transforms.recompute import RecomputeTransform
 from recir.region_transforms.regather import RegatherTransform
@@ -38,4 +40,6 @@ __all__ = [
     "_preserve_autograd_function_leaves",
     "_replace_region",
     "_topo_sort_nodes",
+    "extract_subgraph",
+    "replace_region",
 ]

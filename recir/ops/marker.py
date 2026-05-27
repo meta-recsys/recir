@@ -20,6 +20,7 @@ from dataclasses import dataclass
 from typing import List, Optional, Sequence
 
 import torch
+from torch import fx
 
 
 # ---------------------------------------------------------------------------
@@ -198,3 +199,30 @@ def remove_markers(handles: Sequence) -> None:
     """Remove all hooks previously returned by :func:`attach_markers`."""
     for handle in handles:
         handle.remove()
+
+
+# ---------------------------------------------------------------------------
+# Marker discovery (graph-level)
+# ---------------------------------------------------------------------------
+
+
+def find_markers(gm: fx.GraphModule) -> List[fx.Node]:
+    """Locate all ``recir::mark_boundary`` nodes in ``gm``.
+
+    Returns the nodes in graph-iteration order.  Duplicate marker names are
+    preserved (each occurrence is returned separately); callers that want a
+    name-to-node mapping should build it themselves.
+
+    Args:
+        gm: a traced graph module.
+
+    Returns:
+        A list of ``fx.Node`` objects whose ``target`` is
+        ``torch.ops.recir.mark_boundary.default``.
+    """
+    return [
+        node
+        for node in gm.graph.nodes
+        if node.op == "call_function"
+        and node.target is torch.ops.recir.mark_boundary.default
+    ]
