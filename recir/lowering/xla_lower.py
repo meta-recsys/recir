@@ -11,7 +11,8 @@ import logging
 from typing import Any, Callable, Generator, List, Optional, Tuple
 
 import jax  # @manual
-import jax.numpy as jnp  # @manual
+import ml_dtypes
+import numpy as np
 import recir.torchax as torchax
 import torch
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
@@ -228,6 +229,40 @@ class _XLAModule(torch.nn.Module):
         return run
 
     @staticmethod
+    def _torch_to_numpy_for_jax(tensor: torch.Tensor) -> Any:
+        """Convert a torch tensor to a numpy array with the matching JAX dtype.
+
+        Returns a plain ``numpy.ndarray`` (with ``ml_dtypes`` dtypes where
+        numpy lacks native support, e.g. ``bfloat16``). The caller passes
+        the array directly to ``jax.device_put`` / ``np.split`` — no JAX
+        entry happens here, so this path never emits a tracer-level
+        ``jit(convert_element_type)``.
+
+        Why this matters: the previous implementation routed bf16 through
+        ``bf16 torch -> fp32 torch -> numpy fp32 -> jnp.asarray ->
+        astype(jnp.bfloat16)``. That ``astype(jnp.bfloat16)`` is a JAX
+        primitive bind, which under multi-host TPU with
+        ``JAX_SHARE_BINARY_BETWEEN_HOSTS=true`` triggers a per-weight
+        ``jit(stage)+jit(convert_element_type)`` pair whose cross-host
+        rendezvous deadlocks at ``_convert_element_type_bind_with_trace``
+        once the bf16 weight count crosses ~50. Reinterpreting the bits
+        through ``view(int16) -> view(ml_dtypes.bfloat16)`` is pure CPU,
+        zero JAX entry, and bit-identical.
+        """
+        t = tensor.detach().cpu().contiguous()
+        if t.dtype == torch.bool:
+            return t.numpy().astype(np.bool_)
+        if t.dtype == torch.bfloat16:
+            # ``torch.Tensor.view(dtype)`` requires contiguous memory and
+            # reinterprets the underlying bits without copy. The numpy
+            # int16 view shares the same bits, and ``ndarray.view`` to
+            # the ``ml_dtypes.bfloat16`` dtype is also a zero-copy
+            # reinterpretation.
+            # pyre-ignore[16]: ml_dtypes.bfloat16 is dynamically defined in the C extension.
+            return t.view(torch.int16).numpy().view(ml_dtypes.bfloat16)
+        return t.numpy()
+
+    @staticmethod
     def _to_sharded_jax(
         tensor: Any,
         mesh: Any,
@@ -235,7 +270,16 @@ class _XLAModule(torch.nn.Module):
         input_batch_dim: int = 0,
         is_fsdp_weight: bool = False,
     ) -> Any:
-        """Convert a PyTorch tensor to a properly sharded JAX array."""
+        """Convert a PyTorch tensor to a properly sharded JAX array.
+
+        Routes torch tensors through a pure-numpy intermediate (via
+        :meth:`_torch_to_numpy_for_jax`) and shards with :func:`np.split`
+        — JAX is only entered at the final :func:`jax.device_put`. This
+        avoids the per-weight ``jit(stage)+jit(convert_element_type)``
+        micro-compile pair that the previous bf16 round-trip
+        (``fp32 torch -> numpy fp32 -> astype(jnp.bfloat16)``) emitted
+        and that deadlocked multi-host TPU runs above ~50 bf16 weights.
+        """
         if tensor is None:
             return None
         if not isinstance(tensor, torch.Tensor):
@@ -243,17 +287,7 @@ class _XLAModule(torch.nn.Module):
                 f"Expected torch.Tensor or jax.Array, got {type(tensor)}"
             )
             return tensor
-        t = tensor.detach()
-        if t.dtype == torch.bool:
-            t = t.to(torch.int8)
-        elif t.dtype == torch.bfloat16:
-            t = t.to(torch.float32)
-        nparray = t.cpu().numpy()
-        jax_array = jnp.asarray(nparray)
-        if tensor.dtype == torch.bool:
-            jax_array = jax_array.astype(jnp.bool_)
-        elif tensor.dtype == torch.bfloat16:
-            jax_array = jax_array.astype(jnp.bfloat16)
+        nparray = _XLAModule._torch_to_numpy_for_jax(tensor)
 
         local_devices = _get_local_devices()
         num_local = len(local_devices)
@@ -290,7 +324,7 @@ class _XLAModule(torch.nn.Module):
         # matching property).
         host_count = num_global // num_local
         if is_batch_input:
-            global_shape = list(jax_array.shape)
+            global_shape = list(nparray.shape)
             global_shape[input_batch_dim] *= host_count
             ndim = len(global_shape)
             spec_parts: List[Any] = [None] * max(ndim, input_batch_dim + 1)
@@ -298,9 +332,9 @@ class _XLAModule(torch.nn.Module):
             sharding = NamedSharding(mesh, P(*spec_parts))
             if aot_active:
                 return jax.ShapeDtypeStruct(
-                    tuple(global_shape), jax_array.dtype, sharding=sharding
+                    tuple(global_shape), nparray.dtype, sharding=sharding
                 )
-            local_shards = jnp.split(jax_array, num_local, axis=input_batch_dim)
+            local_shards = np.split(nparray, num_local, axis=input_batch_dim)
             local_buffers = [
                 jax.device_put(s, d) for s, d in zip(local_shards, local_devices)
             ]
@@ -312,16 +346,16 @@ class _XLAModule(torch.nn.Module):
             # rationale as the is_batch_input branch above -- the
             # local→global multiplier here must match the gm's baked
             # global shape (via _make_batch_transform's host_count).
-            global_shape = list(jax_array.shape)
+            global_shape = list(nparray.shape)
             global_shape[0] *= host_count
             ndim = len(global_shape)
             spec = P("torch_dist", *([None] * (ndim - 1)))
             sharding = NamedSharding(mesh, spec)
             if aot_active:
                 return jax.ShapeDtypeStruct(
-                    tuple(global_shape), jax_array.dtype, sharding=sharding
+                    tuple(global_shape), nparray.dtype, sharding=sharding
                 )
-            local_shards = jnp.split(jax_array, num_local, axis=0)
+            local_shards = np.split(nparray, num_local, axis=0)
             local_buffers = [
                 jax.device_put(s, d) for s, d in zip(local_shards, local_devices)
             ]
@@ -331,11 +365,11 @@ class _XLAModule(torch.nn.Module):
         sharding = NamedSharding(mesh, P())
         if aot_active:
             return jax.ShapeDtypeStruct(
-                tuple(jax_array.shape), jax_array.dtype, sharding=sharding
+                tuple(nparray.shape), nparray.dtype, sharding=sharding
             )
-        local_buffers = [jax.device_put(jax_array, d) for d in local_devices]
+        local_buffers = [jax.device_put(nparray, d) for d in local_devices]
         return jax.make_array_from_single_device_arrays(
-            jax_array.shape, sharding, local_buffers
+            nparray.shape, sharding, local_buffers
         )
 
     def _jit_shard_map(

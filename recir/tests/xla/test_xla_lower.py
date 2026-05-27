@@ -84,8 +84,10 @@ class TestPartialLowerXLA(unittest.TestCase):
     def test_to_sharded_jax_bfloat16(self) -> None:
         """Verify _to_sharded_jax handles bfloat16 tensors.
 
-        NumPy does not support bfloat16, so the conversion must cast to
-        float32 for the numpy() call and then back to jnp.bfloat16.
+        Numpy lacks a native bfloat16 dtype, so the conversion goes
+        through ``ml_dtypes.bfloat16`` (zero-copy
+        ``view(int16) -> view(bfloat16)``). This test asserts bit-
+        identical roundtrip in float32 space.
         """
         import jax
         import jax.numpy as jnp
@@ -104,6 +106,89 @@ class TestPartialLowerXLA(unittest.TestCase):
             torch.tensor(expected),
             atol=0,
             rtol=0,
+        )
+
+    def test_to_sharded_jax_bfloat16_bit_identical(self) -> None:
+        """Verify _to_sharded_jax preserves bf16 bits exactly.
+
+        The ``ml_dtypes.bfloat16`` numpy view path is a pure bit
+        reinterpretation. Reading the JAX array back as ``int16`` (same
+        16-bit storage) must yield the same uint16 pattern as the
+        original torch tensor's ``view(torch.int16)``.
+        """
+        import jax
+        import jax.numpy as jnp
+        from jax.sharding import Mesh
+
+        devices = jax.local_devices()
+        mesh = Mesh(devices, axis_names=("torch_dist",))
+        bf16_tensor = torch.randn(4, 8).to(torch.bfloat16)
+        jax_array = _XLAModule._to_sharded_jax(bf16_tensor, mesh)
+        self.assertEqual(jax_array.dtype, jnp.bfloat16)
+
+        # Bit-identical roundtrip: bf16 -> int16 view both sides.
+        original_bits = bf16_tensor.contiguous().view(torch.int16).cpu().numpy()
+        roundtrip_bits = jnp.asarray(jax_array).view(jnp.int16).__array__()
+        self.assertEqual(original_bits.tobytes(), roundtrip_bits.tobytes())
+
+    def test_to_sharded_jax_bfloat16_no_convert_element_type(self) -> None:
+        """Regression: bf16 inputs must NOT trigger jit(convert_element_type).
+
+        Prior to this fix, ``_to_sharded_jax`` cast bf16 weights through
+        ``bf16 torch -> fp32 torch -> numpy fp32 -> astype(jnp.bfloat16)``.
+        The trailing ``astype(jnp.bfloat16)`` is a JAX primitive bind
+        that emits a ``jit(convert_element_type)`` event under
+        ``JAX_LOG_COMPILES=1``. Under multi-host TPU with
+        ``JAX_SHARE_BINARY_BETWEEN_HOSTS=true`` the per-weight rendezvous
+        deadlocked once the bf16 weight count crossed ~50.
+
+        The post-fix path uses ``ml_dtypes.bfloat16`` + ``np.split``
+        (pure CPU, zero JAX entry) before ``jax.device_put``, so no
+        ``convert_element_type`` event reaches the JAX logger.
+        """
+        import io
+        import logging
+
+        import jax
+        from jax.sharding import Mesh
+
+        devices = jax.local_devices()
+        mesh = Mesh(devices, axis_names=("torch_dist",))
+
+        # Capture JAX compile log via a buffered handler on the 'jax'
+        # logger (the destination JAX_LOG_COMPILES routes through).
+        # JAX_LOG_COMPILES=1 lowers the level to INFO so the messages
+        # are emitted.
+        prev_log_compiles = jax.config.jax_log_compiles
+        jax.config.update("jax_log_compiles", True)
+        buf = io.StringIO()
+        handler = logging.StreamHandler(buf)
+        handler.setLevel(logging.INFO)
+        jax_logger = logging.getLogger("jax")
+        prev_level = jax_logger.level
+        jax_logger.setLevel(logging.INFO)
+        jax_logger.addHandler(handler)
+        try:
+            # 8 bf16 weights is well below the ~50 deadlock threshold
+            # but still proves the principle: zero compile events should
+            # be emitted by the bf16 conversion path itself.
+            for _ in range(8):
+                bf16_tensor = torch.randn(4, 8).to(torch.bfloat16)
+                _ = _XLAModule._to_sharded_jax(bf16_tensor, mesh)
+            handler.flush()
+            log_text = buf.getvalue()
+        finally:
+            jax_logger.removeHandler(handler)
+            jax_logger.setLevel(prev_level)
+            jax.config.update("jax_log_compiles", prev_log_compiles)
+
+        # The forbidden primitive — old fp32-round-trip path emitted
+        # one of these per bf16 weight at trace time.
+        self.assertNotIn(
+            "convert_element_type",
+            log_text,
+            f"bf16 conversion must not emit convert_element_type compiles; "
+            f"captured jax log:\n{log_text}",
         )
 
     def test_to_sharded_jax_bool(self) -> None:
