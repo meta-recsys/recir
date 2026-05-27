@@ -32,6 +32,7 @@ if "xla_force_host_platform_device_count" not in _existing_xla_flags:
         _existing_xla_flags + " --xla_force_host_platform_device_count=2"
     ).strip()
 
+import pickle
 import unittest
 
 import jax  # @manual
@@ -86,31 +87,38 @@ class KeyNamespacingTest(unittest.TestCase):
 
 
 class AOTPrebuildAndSerializeTest(unittest.TestCase):
-    """``aot_prebuild_and_serialize`` walks the gm and would serialize each
-    ``_XLAModule``; at this commit the warmup forward does not yet populate
-    ``mod._jax_compiled`` (that lands in the next commit), so the call
-    raises ``RuntimeError`` after the walk visits the first subgraph. We
-    pin the walk + the error contract here; the end-to-end happy path
-    test lives in the commit that adds the populate logic."""
+    """``aot_prebuild_and_serialize`` walks the gm, drives a warmup forward
+    on every ``_XLAModule`` so the lazy-build path populates
+    ``mod._jax_compiled``, then serializes each compiled binary via
+    ``jax.experimental.serialize_executable.serialize``. Pin the walk + the
+    happy-path artifact-dict contract here."""
 
     def test_serializes_every_xla_module_in_plain_gm(self) -> None:
         lowered = _make_lowered_gm()
         n_subgraphs = len(_xla_modules(lowered))
         self.assertGreater(n_subgraphs, 0, "test fixture produced 0 subgraphs")
 
-        # Walk + warmup is wired, but ``_build_*_executable`` does not yet
-        # populate ``_jax_compiled`` — pin the explicit error surface so a
-        # future regression that silently no-ops the warmup is caught.
-        with self.assertRaisesRegex(
-            RuntimeError, "AOT warmup did not populate _jax_compiled"
-        ):
-            aot_prebuild_and_serialize(lowered)
+        # Walk + warmup populate is wired and ``_build_*_executable`` now
+        # populates ``_jax_compiled``, so serialize returns an artifact
+        # for every subgraph the walker visited.
+        artifacts = aot_prebuild_and_serialize(lowered)
+        self.assertEqual(len(artifacts), n_subgraphs)
+        # Plain GraphModule path uses empty gm_name; keys are bare sub_paths.
+        for key, (bin_, in_tree, out_tree) in artifacts.items():
+            self.assertNotIn("::", key)
+            self.assertIsInstance(bin_, bytes)
+            self.assertGreater(len(bin_), 0)
+            self.assertIsNotNone(in_tree)
+            self.assertIsNotNone(out_tree)
+        # Every _XLAModule that produced an artifact also has its AOT
+        # cache slot populated.
+        for mod in _xla_modules(lowered):
+            self.assertIsNotNone(mod._jax_compiled)
 
     def test_iter_graph_module_namespacing(self) -> None:
-        # The IterGraphModule walk path is exercised; at this commit the
-        # warmup still raises before any artifact is built. Confirm the
-        # walker reaches an _XLAModule (otherwise the error wouldn't fire)
-        # without depending on the populate-and-serialize tail.
+        # The IterGraphModule walk path namespaces each artifact key with
+        # the owning gm_name ("setup_gm" / "main_gm" / "cleanup_gm") via
+        # the ``gm_name::sub_path`` ``_key`` format.
         lowered = _make_lowered_gm()
         iter_gm = IterGraphModule(lowered)
         # Sanity: at least one xla module is reachable via the iter-gm walk.
@@ -119,10 +127,14 @@ class AOTPrebuildAndSerializeTest(unittest.TestCase):
             gm_names.issubset({"setup_gm", "main_gm", "cleanup_gm"}),
             f"unexpected gm prefix in iter_gm walk: {gm_names}",
         )
-        with self.assertRaisesRegex(
-            RuntimeError, "AOT warmup did not populate _jax_compiled"
-        ):
-            aot_prebuild_and_serialize(iter_gm)
+        artifacts = aot_prebuild_and_serialize(iter_gm)
+        # Every key must carry the ``gm_name::sub_path`` namespace prefix
+        # so the load side can route artifacts back to the right gm.
+        self.assertGreater(len(artifacts), 0)
+        for key in artifacts:
+            self.assertIn("::", key)
+            prefix = key.split("::", 1)[0]
+            self.assertIn(prefix, {"setup_gm", "main_gm", "cleanup_gm"})
 
     def test_rejects_unknown_gm_type(self) -> None:
         with self.assertRaises(TypeError):
@@ -139,18 +151,32 @@ class AOTRoundTripTest(unittest.TestCase):
         return dict(model.named_parameters()), x
 
     def test_serialize_then_pickle_load_matches_eager_output(self) -> None:
-        # End-to-end serialize -> pickle -> load -> run requires
-        # ``_build_*_executable`` to populate ``_jax_compiled`` during
-        # the warmup forward. That populate logic lands in the next
-        # commit. Here we pin the precondition: the warmup call still
-        # raises today, so the test verifies the error surface and
-        # leaves the round-trip parity check to the commit that adds
-        # the populate path.
+        # End-to-end serialize -> pickle -> load: ``_build_*_executable``
+        # populates ``_jax_compiled`` during the warmup forward, so
+        # serialize returns a non-empty artifact dict, pickle round-trips
+        # it as opaque bytes, and ``aot_load_prebuilt_into`` installs
+        # each compiled executable on a fresh target gm.
         aot_src = _make_lowered_gm()
-        with self.assertRaisesRegex(
-            RuntimeError, "AOT warmup did not populate _jax_compiled"
-        ):
-            aot_prebuild_and_serialize(aot_src)
+        artifacts = aot_prebuild_and_serialize(aot_src)
+        self.assertGreater(len(artifacts), 0)
+        # Pickle round-trip — the artifact dict must survive
+        # serialization for shipment across hosts.
+        blob = pickle.dumps(artifacts)
+        artifacts_roundtrip = pickle.loads(blob)
+        self.assertEqual(set(artifacts_roundtrip.keys()), set(artifacts.keys()))
+
+        # Build a fresh target gm; pre-load, no ``_XLAModule`` has its
+        # AOT slot populated.
+        target = _make_lowered_gm()
+        for mod in _xla_modules(target):
+            self.assertIsNone(mod._jax_compiled)
+
+        n_loaded = aot_load_prebuilt_into(target, artifacts_roundtrip)
+        self.assertEqual(n_loaded, len(artifacts_roundtrip))
+        # Post-load: every ``_XLAModule`` on the target has the
+        # deserialized executable installed.
+        for mod in _xla_modules(target):
+            self.assertIsNotNone(mod._jax_compiled)
 
 
 class AOTStrictModeTest(unittest.TestCase):
@@ -177,13 +203,12 @@ class AOTStrictModeTest(unittest.TestCase):
 
 
 class WarmupBuildPopulatesCacheTest(unittest.TestCase):
-    """Pin the partial wiring at this commit: the AOT slot
+    """Pin the populate contract at this commit: the AOT slot
     ``_jax_compiled`` is initialized to ``None`` on every fresh
-    ``_XLAModule``, the warmup forward inside
-    ``aot_prebuild_and_serialize`` runs, and the surrounding code
-    explicitly errors out when the populate path is missing. The next
-    commit fills the populate hook in ``_build_*_executable`` and the
-    end-to-end happy path test moves with it."""
+    ``_XLAModule``, and the warmup forward inside
+    ``aot_prebuild_and_serialize`` (driven through
+    ``_build_*_executable``) materializes a ``jax.stages.Compiled``
+    and stashes it on every visited subgraph."""
 
     def test_warmup_populates_jax_compiled(self) -> None:
         lowered = _make_lowered_gm()
@@ -193,15 +218,14 @@ class WarmupBuildPopulatesCacheTest(unittest.TestCase):
         for mod in modules:
             self.assertIsNone(mod._jax_compiled)
 
-        # Today, the warmup forward does NOT populate _jax_compiled, so
-        # aot_prebuild_and_serialize raises with a descriptive message.
-        # The next commit fills in the populate path and a sibling test
-        # in that commit replaces this with the positive happy-path
-        # assertion.
-        with self.assertRaisesRegex(
-            RuntimeError, "AOT warmup did not populate _jax_compiled"
-        ):
-            aot_prebuild_and_serialize(lowered)
+        # The warmup forward populates ``_jax_compiled`` on every
+        # subgraph, so serialize returns one artifact per subgraph and
+        # leaves every ``_jax_compiled`` slot set to a non-None
+        # ``jax.stages.Compiled``.
+        artifacts = aot_prebuild_and_serialize(lowered)
+        self.assertEqual(len(artifacts), len(modules))
+        for mod in modules:
+            self.assertIsNotNone(mod._jax_compiled)
 
     def test_jax_devices_present_for_test(self) -> None:
         # Sanity check that XLA_FLAGS spoofed multi-device CPU. Without

@@ -19,6 +19,11 @@ from recir.distributed.data_parallel import (
     shard_params_and_states,
     shard_params_by_plan,
 )
+from recir.lowering.xla_lower import (
+    _AOT_TOPOLOGY,
+    _get_global_devices,
+    _get_local_devices,
+)
 from recir.sharding_plan import EmbeddingShardingPlan
 from torch.distributed.tensor import DeviceMesh
 from torch.fx import GraphModule
@@ -201,6 +206,16 @@ class GSPMDParallel(ParallelMode):
     def num_processes(self) -> int:
         if self._num_processes is not None:
             return self._num_processes
+        # Honor :func:`recir.lowering.xla_lower.aot_topology`: when a
+        # virtual multi-host topology is installed (e.g., a CPU prebuild
+        # targeting a TPU pod), `jax.process_count()` still reports the
+        # host's process count (=1 on the prebuild box) while the
+        # topology models the deployment with N processes. The trace-
+        # time `_make_batch_transform` (which uses this property) must
+        # match the runtime `_to_sharded_jax` local→global multiplier,
+        # so use the topology-aware ratio when one is active.
+        if _AOT_TOPOLOGY.get() is not None:
+            return len(_get_global_devices()) // max(1, len(_get_local_devices()))
         import jax  # @manual  # pyre-ignore[21]
 
         return jax.process_count()
