@@ -429,32 +429,146 @@ class IterGraph(fx.Graph):
         self._cleanup_mapping[main_node] = cleanup_node
         return main_node
 
-    def erase_node(self, to_erase: fx.Node) -> None:
+    def erase_node(
+        self,
+        to_erase: fx.Node,
+        *,
+        cascade_to_mirrors: bool = True,
+        unsafe_drop_users: bool = False,
+    ) -> None:
+        """Erase ``to_erase`` from the main graph and (optionally) its mirrors.
+
+        Args:
+            to_erase: The node to erase from the main graph.
+            cascade_to_mirrors: When ``True`` (default), also erase the
+                setup/cleanup mirror nodes -- the legacy three-graph
+                "stay in sync" behavior. When ``False``, only the main
+                graph is mutated; the mirror parents keep running their
+                original computation (the right choice when the caller
+                is rewriting only the main graph, e.g.
+                ``lower_subgraph_nodes`` splicing a ``call_module``
+                replacement into main but leaving setup/cleanup to
+                execute the original unlowered ops on CPU).
+            unsafe_drop_users: Only relevant when
+                ``cascade_to_mirrors=True``. Allows the cascade to call
+                ``replace_all_uses_with(None)`` on a mirror that still
+                has live users. Safe only when those user-mirrors are
+                themselves about to be erased in the same sweep
+                (profiler ``enter``/``exit`` markers, dead-output
+                nodes). Outside those cases the substituted ``None``
+                survives into the recompiled mirror forward and
+                crashes downstream consumers -- the runtime regression
+                that motivated commit 18 (see
+                ``recir/lowering/xla_device_state.py:_sync_flat_state``).
+
+        Background:
+            Commit 16 generalized commit 15's profiler-marker fix by
+            always doing ``replace_all_uses_with(None)`` before mirror
+            erase. This worked for marker-style ops but corrupted
+            mirror parents whose output depended on the erased node
+            (e.g. Adam's ``addcdiv_`` flowing to ``output``). Commit
+            18 splits the policy: ``unsafe_drop_users`` is the
+            explicit opt-in for the marker case, and
+            ``cascade_to_mirrors=False`` is the opt-out for callers
+            that should leave the mirror parents intact.
+        """
         if self._freeze_cross_iter_movement:
             return super().erase_node(to_erase)
 
-        # Nodes added directly to the main graph (e.g. via ``super().call_function``
-        # while ``_freeze_cross_iter_movement`` was toggled) have no mirror
-        # entry in ``_setup_mapping`` / ``_cleanup_mapping``. Treat a missing
-        # mirror as a no-op rather than asserting -- the main-graph erase
-        # below is still meaningful, and there is nothing to clean up in the
-        # sub-graphs.
+        if not cascade_to_mirrors:
+            super().erase_node(to_erase)
+            return
+
+        # Nodes added directly to the main graph (e.g. via
+        # ``super().call_function`` while ``_freeze_cross_iter_movement`` was
+        # toggled) have no mirror entry in ``_setup_mapping`` /
+        # ``_cleanup_mapping``. Treat a missing mirror as a no-op rather than
+        # asserting -- the main-graph erase below is still meaningful, and
+        # there is nothing to clean up in the sub-graphs.
         setup_node = self._lookup_node(to_erase, self.setup_graph)
-        if setup_node is not None:
-            # Mirror nodes (setup / cleanup) often still feed ``output`` in
-            # their respective sub-graphs even when the main node has been
-            # replaced.  Substitute ``None`` so the mirror erase succeeds;
-            # downstream passes that consume the mirror parent must tolerate
-            # the ``None`` replacement (or recompile around it).
-            if setup_node.users:
-                setup_node.replace_all_uses_with(None)  # pyre-ignore[6]
-            self.setup_graph.erase_node(setup_node)
-        super().erase_node(to_erase)
         cleanup_node = self._lookup_node(to_erase, self.cleanup_graph)
+        if setup_node is not None:
+            self._erase_mirror_node(
+                setup_node,
+                self.setup_graph,
+                "setup",
+                unsafe_drop_users=unsafe_drop_users,
+            )
+        super().erase_node(to_erase)
         if cleanup_node is not None:
-            if cleanup_node.users:
-                cleanup_node.replace_all_uses_with(None)  # pyre-ignore[6]
-            self.cleanup_graph.erase_node(cleanup_node)
+            self._erase_mirror_node(
+                cleanup_node,
+                self.cleanup_graph,
+                "cleanup",
+                unsafe_drop_users=unsafe_drop_users,
+            )
+
+    def _erase_mirror_node(
+        self,
+        mirror_node: fx.Node,
+        mirror_graph: fx.Graph,
+        graph_label: str,
+        *,
+        unsafe_drop_users: bool,
+    ) -> None:
+        """Erase ``mirror_node`` from ``mirror_graph`` after handling its users.
+
+        See ``IterGraph.erase_node`` for the motivating bug. The split
+        keeps the policy (raise vs drop) in one place and avoids
+        duplicating it between the setup and cleanup branches.
+        """
+        if mirror_node.users:
+            if unsafe_drop_users:
+                # Caller asserts the dropped users are about to be
+                # erased themselves (profiler-marker pattern) or
+                # otherwise tolerate ``None`` substitution.
+                #
+                # Correctness verification of ``replace_all_uses_with(None)``:
+                # the FX implementation
+                # (caffe2/torch/fx/node.py:replace_all_uses_with) calls
+                # ``use_node._replace_input_with(self, replace_with)`` for
+                # each user, which simply rewrites the user's
+                # ``args``/``kwargs`` tuple to substitute the replacement.
+                # ``None`` is a valid leaf value in FX arg trees (op
+                # signatures accept ``Optional[Tensor]`` and pytree leaves
+                # may include ``None``), so the rewrite itself is safe;
+                # ``None`` only becomes a problem when the user op runs
+                # and the op cannot tolerate ``None``.  The type signature
+                # claims ``Node`` so the ``pyre-ignore[6]`` is required.
+                #
+                # Callers that pass ``unsafe_drop_users=True`` are
+                # responsible for either
+                # (a) erasing the now-``None``-fed users in the same sweep
+                # (profiler enter/exit, dead-output trees), or
+                # (b) confirming the user op tolerates a ``None`` argument
+                # at runtime (matches the original commit 15/16 fix path
+                # for marker ops whose forward is a no-op).
+                # Outside those cases the substituted ``None`` survives
+                # into the recompiled mirror forward; the assertion in the
+                # docstring above is enforced at call sites, not here.
+                mirror_node.replace_all_uses_with(None)  # pyre-ignore[6]
+            else:
+                user_names = [u.name for u in mirror_node.users]
+                raise RuntimeError(
+                    f"IterGraph.erase_node: {graph_label}-graph mirror of "
+                    f"{mirror_node.name} still has users {user_names}. "
+                    "Erasing without rewriting these users would substitute "
+                    "None in the mirror parent's recompiled forward, which "
+                    "crashes at runtime when the consumer is the ``output`` "
+                    "node or otherwise expects a Tensor. "
+                    "Options: "
+                    "(a) pass ``cascade_to_mirrors=False`` to leave the "
+                    "mirror nodes intact -- correct when the caller is "
+                    "only rewriting the main graph (e.g. "
+                    "``lower_subgraph_nodes``); "
+                    "(b) perform the output/user rewrite cascade in the "
+                    f"{graph_label}_graph parent BEFORE calling erase_node; "
+                    "(c) pass ``unsafe_drop_users=True`` if the user-mirror "
+                    "is also about to be erased in the same sweep and "
+                    "``None`` substitution is safe (e.g. profiler "
+                    "enter/exit markers)."
+                )
+        mirror_graph.erase_node(mirror_node)
 
     def placeholder(
         self,

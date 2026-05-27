@@ -7,7 +7,7 @@
 # pyre-strict
 import logging
 import operator
-from typing import Callable, List, Set, Tuple
+from typing import Any, Callable, List, Set, Tuple
 
 import torch
 
@@ -165,7 +165,7 @@ def lower_subgraph_nodes(
     # See ``IterGraphModule.add_subgraph_module`` for the helper that
     # propagates the registration to all three sub-GMs so the call_module
     # node we splice in below resolves under any of them.
-    from recir.iter_graph_module import IterGraphModule
+    from recir.iter_graph_module import IterGraph, IterGraphModule
 
     if isinstance(gm, IterGraphModule):
         gm.add_subgraph_module(subgraph_name, module)
@@ -175,6 +175,30 @@ def lower_subgraph_nodes(
     insertion_point = subgraph_nodes[-1].next
     for node in prologue:
         insertion_point.prepend(node)
+
+    # When the parent is an ``IterGraphModule``, the main IterGraph
+    # mirrors every mutation into ``setup_gm.graph`` /
+    # ``cleanup_gm.graph`` by default. That mirroring is the WRONG
+    # semantics here: ``segment_and_lower`` only splices the lowered
+    # ``call_module`` into the MAIN IterGraph, so cascading the body
+    # erase into setup/cleanup would strip the original ops from
+    # mirror parents while leaving them with no replacement -- the
+    # mirror parents are supposed to keep running the original
+    # unlowered ops on CPU. We therefore pass
+    # ``cascade_to_mirrors=False`` so each erase only touches the
+    # main IterGraph and leaves the setup/cleanup mirror parents
+    # functionally intact.
+    #
+    # This is the architecturally clean replacement for commit 16's
+    # silent ``replace_all_uses_with(None)`` cascade, which papered
+    # over the original ``RuntimeError`` by substituting ``None``
+    # into the mirror parents' output -- corrupting the recompiled
+    # forward and crashing downstream consumers at runtime (see
+    # commit 18 / canaries).
+    is_iter_graph = isinstance(gm.graph, IterGraph)
+    erase_kwargs: dict[str, Any] = (
+        {"cascade_to_mirrors": False} if is_iter_graph else {}
+    )
 
     with gm.graph.inserting_before(insertion_point):
         subgraph_call = gm.graph.create_node(
@@ -194,7 +218,7 @@ def lower_subgraph_nodes(
 
     for node in reversed(body + outputs):
         if len(node.users) == 0:
-            gm.graph.erase_node(node)
+            gm.graph.erase_node(node, **erase_kwargs)
 
 
 def segment_and_lower(

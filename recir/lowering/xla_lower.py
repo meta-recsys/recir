@@ -611,8 +611,8 @@ class _XLAModule(torch.nn.Module):
             # IMPORTANT: rebuild the mesh from live JAX devices at call
             # time rather than reusing the closure-captured `mesh`. When
             # this _XLAModule was first instantiated under an
-            # `aot_topology(virtual_topo)` context (the canary's warmup
-            # #2 pattern), the captured `mesh` holds the VIRTUAL
+            # `aot_topology(virtual_topo)` context (the AOT-prebuild
+            # warmup pattern), the captured `mesh` holds the VIRTUAL
             # devices. Subsequent real-runtime calls happen OUTSIDE
             # `aot_topology` and must use the real
             # `jax.devices()`-backed mesh, otherwise `_to_sharded_jax`
@@ -839,14 +839,29 @@ def _strip_profiler_nodes(gm: torch.fx.GraphModule) -> torch.fx.GraphModule:
     where ``_record_function_exit`` consumes the handle returned by
     ``_record_function_enter_new``. We iterate in REVERSE topological
     order so each ``_record_function_exit`` is erased before its
-    matching ``_record_function_enter_new``. This matters for
-    ``IterGraphModule``: its overridden ``erase_node`` cascades the
-    erase into the mirrored setup/cleanup graphs without first
-    calling ``replace_all_uses_with(None)`` on the mirror node, so
-    erasing the enter first while its exit mirror still references
-    it raises ``RuntimeError: Tried to erase Node ... but it still
-    had 1 users in the graph``.
+    matching ``_record_function_enter_new``. For ``IterGraphModule``
+    this ensures both the main and the setup/cleanup mirror users are
+    cleared before their producer is erased.
+
+    A ``replace_all_uses_with(None)`` is still issued before
+    ``erase_node`` so that the main graph itself does not raise
+    ``RuntimeError: Tried to erase Node ... but it still had 1 users``
+    on the rare paths where DCE has not yet removed the consumer in
+    forward order. For the ``IterGraphModule`` cascade, the explicit
+    ``unsafe_drop_users=True`` opt-in tells the overridden
+    ``erase_node`` that ``None`` substitution on the mirror is safe
+    here: each user-mirror is itself about to be erased in the same
+    sweep (the reverse-topo order guarantees it), so the substituted
+    ``None`` never reaches the recompiled setup/cleanup forward.
     """
+    # Lazy import to avoid a build-time circular BUCK dep cycle with
+    # ``recir/lowering:lowering_utils`` -> ``recir:iter_graph_module``
+    # -> (lazy) ``recir/lowering:xla_lower``. Marked ``# @manual`` so
+    # autodeps2 does not introduce the dep that would re-form the
+    # cycle. See ``IterGraphModule.named_xla_modules`` for the mirror
+    # pattern.
+    from recir.iter_graph_module import IterGraph  # @manual  # pyre-ignore[21]
+
     changed = False
     for node in reversed(list(gm.graph.nodes)):
         if node.op == "call_function" and isinstance(
@@ -854,7 +869,10 @@ def _strip_profiler_nodes(gm: torch.fx.GraphModule) -> torch.fx.GraphModule:
         ):
             if node.target.name().startswith("profiler::"):
                 node.replace_all_uses_with(None)  # type: ignore[arg-type]
-                gm.graph.erase_node(node)
+                if isinstance(gm.graph, IterGraph):
+                    gm.graph.erase_node(node, unsafe_drop_users=True)
+                else:
+                    gm.graph.erase_node(node)
                 changed = True
     if changed:
         gm.graph.eliminate_dead_code()
