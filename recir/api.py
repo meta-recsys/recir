@@ -8,7 +8,6 @@
 import inspect
 import logging
 import os
-from abc import ABC, abstractmethod
 from collections import OrderedDict
 from contextlib import contextmanager, ExitStack, nullcontext
 from copy import copy
@@ -69,77 +68,8 @@ from torch.fx.experimental.symbolic_shapes import ShapeEnv
 from torch.fx.graph import _PyTreeCodeGen, _PyTreeInfo, CodeGen
 from torch.fx.graph_module import _del_attr, _get_attr
 from torch.nn.utils import stateless
-from torch.nn.utils._named_member_accessor import NamedMemberAccessor
 
 logger: logging.Logger = logging.getLogger(__name__)
-
-
-class Override(ABC):
-    r"""Override the tracing and transformation behavior of :meth:`~torch.distributed._spmd.compile`.
-
-    This is useful when any part of the model is not traceable or if you prefer
-    to not trace it due to any reason. More specifically, users can implement
-    :meth:`torch.distributed._spmd.Override.replacement` to replace an original
-    submodule with the return new submodule. The new submodule contains
-    operations that users preferred to be traced, which simply be a dummy
-    placeholder operator. After tracing, users can implement
-    :meth:`torch.distributed._spmd.Override.transform` to transform the traced
-    graph, where the dummy placeholder operator serves as an anchor to insert
-    new sub-graphs.
-
-    For overrides that need integrated backward support (i.e., the override's
-    backward should fire within the compiled ``train_step`` automatically),
-    use :func:`recir.eager_dispatch.install_graph_break_dispatch` inside
-    ``transform()`` to replace marker pairs with runtime dispatch calls.
-
-    .. deprecated:: v7.1
-        :class:`Override` is being replaced by orchestrator-style classes
-        with ``install_eager`` + ``install_graph`` bound methods.  Stays
-        present until C6 of the v7.1 stack.
-    """
-
-    @abstractmethod
-    def replacement(self, fqn: str, orig_submodule: torch.nn.Module) -> torch.nn.Module:
-        r"""Implement this method to return a new :class:`nn.Module` instance to replace the ``orig_submodule``
-        argument in the model.
-
-        This helps if ``orig_submodule`` is not traceable or should not be traced.
-
-        Args:
-            fqn (str): fully quantified name of the submodule.
-            orig_submodule (class:`nn.Module`): original submodule instance to replace.
-
-        Returns:
-            A new :class:`nn.Module` instance to replace the original one.
-
-        """
-        pass
-
-    @abstractmethod
-    def transform(
-        self,
-        gm: fx.GraphModule,
-        flat_state: List[torch.Tensor],
-    ) -> fx.GraphModule:
-        r"""
-        Given a DTensor-expanded graph and sharding schema for every node,
-        conduct additional transformation for the sub-graph from the :class:`nn.Module`
-        returned by :meth:`torch.distributed._spmd.Override.replacement` if
-        necessary.
-
-        Args:
-            gm (:class:`fx.Graph`): a DTensor-expanded graph.
-            flat_state (List[str, :class:`Tensor`]): a reference to the list of
-                flattened state. The elements in ``flat_state`` map to the first
-                ``len(flat_state)`` placeholders in the graph. The transformation
-                can add state to or remove state from ``flat_state`` as long as
-                it keeps ``flat_state`` and the placeholders consistent.
-
-        Returns:
-            The :class:`fx.Graph` after transformation.
-
-        """
-        pass
 
 
 class _PyTreeCodeGenOutputsOnly(_PyTreeCodeGen):
@@ -277,28 +207,6 @@ class _LocalCompiledResult:
     # are stored as gm attributes (not placeholders) and registered via
     # ``_AttrKind.CONSTANT`` so they survive ``gm.recompile()`` cleanly.
     constants: Dict[str, torch.Tensor]
-
-
-def _apply_eager_passes(
-    mod: nn.Module,
-    module_override: List[Override],
-) -> None:
-    """Swap non-traceable submodules with override replacements in-place."""
-    accessor: NamedMemberAccessor = NamedMemberAccessor(mod)
-
-    def swap(fqn_prefix: str, module: torch.nn.Module) -> None:
-        for override in module_override:
-            for name, child in module.named_children():
-                if len(name) == 0:
-                    continue
-                fqn = fqn_prefix + "." + name if fqn_prefix != "" else name
-                new_child = override.replacement(fqn, child)
-                if id(new_child) == id(child):
-                    swap(fqn, new_child)
-                else:
-                    accessor.swap_submodule(fqn, new_child)
-
-    swap("", mod)
 
 
 def _local_compile(
@@ -560,19 +468,15 @@ def _finalize_graph(
     opt: Optional[torch.optim.Optimizer],
     params_and_buffers: Dict[str, Any],
     named_states: Dict[str, Any],
-    module_override: Optional[List[Override]],
     input_batch_dim: int,
     *,
     dedup: bool = True,
 ) -> _CompiledResult:
-    """Flatten state, dedup collectives, apply overrides, and tag batch inputs."""
+    """Flatten state, dedup collectives, and tag batch inputs."""
     flat_state = pytree.tree_leaves([params_and_buffers, named_states])
     gm = _to_caller_flattened_graph_module(gm)
     if dedup:
         gm = _dedup_collectives(gm)
-    if module_override:
-        for override in module_override:
-            gm = override.transform(gm, flat_state)
     _tag_batch_inputs(gm, len(flat_state), input_batch_dim)
     # Propagate batch-input meta through ops so intermediate FX nodes that
     # become subgraph boundaries (after segment_and_lower) inherit
@@ -676,9 +580,7 @@ def _enter_region_transform_contexts(
 
 def _compile_and_transform(
     func: Callable[..., Any],
-    module_override: Optional[List[Override]],
     parallel_mode: ParallelMode,
-    gm_transformation: Optional[Callable[[fx.GraphModule], fx.GraphModule]],
     *args: Any,
     region_transforms: Optional[List[RegionTransform]] = None,
     **kwargs: Any,
@@ -692,7 +594,6 @@ def _compile_and_transform(
     if isinstance(parallel_mode, GSPMDParallel):
         result = _compile_gspmd(
             func,
-            module_override,
             parallel_mode,
             *args,
             region_transforms=region_transforms,
@@ -701,7 +602,6 @@ def _compile_and_transform(
     elif isinstance(parallel_mode, (DataParallel, HybridParallel)):
         result = _compile_data_parallel_v2(
             func,
-            module_override,
             parallel_mode,
             *args,
             region_transforms=region_transforms,
@@ -715,11 +615,6 @@ def _compile_and_transform(
         for transform in region_transforms:
             transform.finalize_compiled_graph(result.gm)
 
-    if gm_transformation is not None:
-        result.gm = gm_transformation(result.gm)
-        result.state_manager = getattr(
-            gm_transformation, "device_state_manager", DeviceStateManager()
-        )
     return result
 
 
@@ -1087,11 +982,8 @@ def compile_from_gm(  # noqa: C901 — orchestration: stages 4-8 of the pipeline
 
     * **Stage 0** -- ``eager_preproc`` hooks (handled by :func:`trace`).
       User-supplied callbacks mutate the original ``nn.Module`` *before*
-      tracing (e.g. attach hooks, register buffers).  Not run by this
-      function.
-    * **Stage 1** -- ``module_override`` rewrites (handled by :func:`trace`).
-      Apply structural Override surgery on the module pre-trace.  Not run
-      here.
+      tracing (e.g. attach hooks, register buffers, swap non-traceable
+      submodules).  Not run by this function.
     * **Stage 2** -- ``make_fx`` trace (handled by :func:`trace`). Produce
       the initial ``fx.GraphModule`` plus its placeholder ↔ flat_state
       binding via ``_local_compile``.  Not run here.
@@ -1450,7 +1342,6 @@ def _compile_via_backend(
 
 def _compile_data_parallel_v2(
     func: Callable[..., Any],
-    module_override: Optional[List[Override]],
     parallel_mode: Union[DataParallel, HybridParallel],
     *args: Any,
     region_transforms: Optional[List[RegionTransform]] = None,
@@ -1503,17 +1394,10 @@ def _compile_data_parallel_v2(
     if region_transforms:
         transforms.extend(region_transforms)
 
-    # Apply module overrides so that non-traceable submodules are
-    # replaced with dummy placeholders for discovery, region-transform
-    # inner trace, and the outer _local_compile trace.
-    if module_override:
-        _apply_eager_passes(_mod, module_override)
-
-    # 4. Extract params_and_buffers AFTER overrides so the dict matches the
-    #    (post-override) module that _local_compile will trace.  Critical
-    #    for correctness: shard_params mutates _mod by FQN, and embedding
-    #    indices into this dict must map to placeholder positions in the
-    #    traced graph (which uses the post-override params ordering).
+    # 4. Extract params_and_buffers.  Critical for correctness: shard_params
+    #    mutates _mod by FQN, and embedding indices into this dict must map
+    #    to placeholder positions in the traced graph (which uses the
+    #    post-shard params ordering).
     params_and_buffers: Dict[str, Any] = {
         **dict(_mod.named_parameters(remove_duplicate=False)),
         **dict(_mod.named_buffers(remove_duplicate=False)),
@@ -1623,14 +1507,12 @@ def _compile_data_parallel_v2(
         local_result.opt,
         {**local_result.params, **local_result.buffers},
         local_result.named_states,
-        module_override,
         parallel_mode.input_batch_dim,
     )
 
 
 def _compile_gspmd(
     func: Callable[..., Any],
-    module_override: Optional[List[Override]],
     parallel_mode: GSPMDParallel,
     *args: Any,
     region_transforms: Optional[List[RegionTransform]] = None,
@@ -1650,14 +1532,6 @@ def _compile_gspmd(
     """
     fake_mode: FakeTensorMode = FakeTensorMode()
     transforms = region_transforms or []
-    # Apply module overrides so that non-traceable submodules (e.g. MoE)
-    # are replaced with dummy placeholders for discovery, region-transform
-    # inner trace, and the outer _local_compile trace.
-    if module_override:
-        for arg in pytree.arg_tree_leaves(*args, **kwargs):
-            if isinstance(arg, nn.Module):
-                _apply_eager_passes(arg, module_override)
-                break
     # Apply the per-process → global batch transform up front, so discovery,
     # region-transform inner trace, and the outer ``_local_compile`` trace
     # all see the same (global) input shape.  Otherwise the region's
@@ -1732,7 +1606,6 @@ def _compile_gspmd(
         local_result.opt,
         params_and_buffers,
         local_result.named_states,
-        module_override=module_override,
         input_batch_dim=parallel_mode.input_batch_dim,
         dedup=False,
     )
@@ -1846,8 +1719,6 @@ def make_compiled_runner(compiled_obj: Any) -> Callable[..., Any]:
 
 
 def compile(  # noqa: C901 — orchestration: stages 0-9 + legacy DP/GSPMD wiring intentionally kept inline; refactor would obscure the pipeline.
-    module_override: Optional[List[Override]] = None,
-    gm_transformation: Optional[Callable[[fx.GraphModule], fx.GraphModule]] = None,
     parallel_mode: Optional[ParallelMode] = None,
     region_transforms: Optional[List[RegionTransform]] = None,
     *,
@@ -1875,9 +1746,9 @@ def compile(  # noqa: C901 — orchestration: stages 0-9 + legacy DP/GSPMD wirin
       ``Sequence[Callable[[nn.Module], None]]`` hooks that mutate the eager
       module *before* tracing — attach hooks, register buffers, swap
       non-traceable submodules.  Pre-FX; no graph artifact yet.  Driven by
-      :func:`_compile_via_backend` on the new path (legacy path also runs
-      ``eager_preproc`` so consumers can migrate the kwarg ahead of dropping
-      ``module_override=``).
+      :func:`_compile_via_backend` on the new path; the legacy path (no
+      ``backend=``) also runs ``eager_preproc`` so it remains useful with
+      raw :class:`ParallelMode` callers.
     * **Stage 1 -- trace.** :func:`functorch.make_fx` capture (Python -> FX)
       via :func:`trace` and its inner :func:`_local_compile`.  Produces the
       initial :class:`fx.GraphModule` plus a ``flat_state`` list whose
@@ -1979,23 +1850,6 @@ def compile(  # noqa: C901 — orchestration: stages 0-9 + legacy DP/GSPMD wirin
     ``compile``.
 
     Args:
-        module_override (Optional[List[Override]]): a list of Override
-            instances applied to the module in order.  Each :class:`Override`
-            provides an :class:`nn.Module` replacement during tracing and a
-            graph transformation function after tracing.  (Default: ``None``)
-
-            .. deprecated:: v7.1
-                Mutually exclusive with ``eager_preproc``.  Use
-                ``eager_preproc`` for the new path; ``module_override`` will
-                be deleted in C6.
-        gm_transformation (Optional[Callable[fx.GraphModule, fx.GraphModule]]):
-            a callback invoked on the compiled GraphModule after partition
-            to wrap / lower / optimize it (e.g. legacy
-            :class:`GraphModuleTransformation`).  (Default: ``None``)
-
-            .. deprecated:: v7.1
-                Mutually exclusive with ``backend``.  Use ``backend`` for
-                the new path; ``gm_transformation`` will be deleted in C6.
         parallel_mode (Optional[ParallelMode]): a :class:`ParallelMode`
             instance specifying how to parallelize the callable.  Each
             ``ParallelMode`` owns stage 4 (its
@@ -2015,14 +1869,15 @@ def compile(  # noqa: C901 — orchestration: stages 0-9 + legacy DP/GSPMD wirin
             ``uses_iter_graph`` IterGraph wrap, ``dispatch``, lazy
             ``build``).  When provided, ``recir.compile`` routes through
             the new :func:`trace` + :func:`compile_from_gm` pipeline.
-            Mutually exclusive with ``gm_transformation``.
+            When ``None``, the legacy partition-only path is used (no
+            stage-5+ rewrites; useful for raw DP / FSDP / GSPMD captures
+            that downstream code consumes directly).
             (Default: ``None``)
         eager_preproc (Sequence[Callable[[nn.Module], None]]): a sequence
             of in-place pre-trace hooks that run against the model
             argument (stage 0).  Each hook is invoked once on the first
             :class:`nn.Module` discovered in the decorated callable's
-            arguments, before :func:`trace` runs.  Mutually exclusive with
-            ``module_override``.  (Default: ``()``)
+            arguments, before :func:`trace` runs.  (Default: ``()``)
 
     Returns:
         A decorator that, when applied to a callable, returns a wrapped
@@ -2042,10 +1897,6 @@ def compile(  # noqa: C901 — orchestration: stages 0-9 + legacy DP/GSPMD wirin
             subclasses (Inductor, XLA Dynamo-bridge, XLA GSPMD, XLA
             ShardMap) that own stages 5-8.
     """
-    if module_override and eager_preproc:
-        raise ValueError("module_override and eager_preproc are mutually exclusive")
-    if gm_transformation is not None and backend is not None:
-        raise ValueError("gm_transformation and backend are mutually exclusive")
 
     def inner(func: Callable[..., Any]) -> Callable[..., Any]:
         @wraps(func)
@@ -2070,12 +1921,11 @@ def compile(  # noqa: C901 — orchestration: stages 0-9 + legacy DP/GSPMD wirin
                         kwargs=kwargs,
                     )
                 else:
-                    # Legacy path: module_override + gm_transformation.
-                    # eager_preproc still applies in pre-trace; runs against
-                    # every nn.Module argument before _compile_and_transform
-                    # sees it (multi-module signatures all need it).  This
-                    # keeps the new kwarg useful even on the old path while
-                    # consumers migrate.
+                    # Legacy partition-only path (no Backend supplied):
+                    # eager_preproc still applies pre-trace (against every
+                    # nn.Module argument so multi-module signatures all
+                    # benefit), then the gm is partitioned but skips backend
+                    # stages 6-10.
                     if eager_preproc:
                         for arg in pytree.arg_tree_leaves(*args, **kwargs):
                             if isinstance(arg, nn.Module):
@@ -2083,9 +1933,7 @@ def compile(  # noqa: C901 — orchestration: stages 0-9 + legacy DP/GSPMD wirin
                                     hook(arg)
                     compiled_obj = _compile_and_transform(
                         func,
-                        module_override,
                         mode,
-                        gm_transformation,
                         *args,
                         region_transforms=region_transforms,
                         **kwargs,
