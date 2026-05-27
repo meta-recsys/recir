@@ -16,6 +16,7 @@ import recir.torchax as torchax
 import torch
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from recir.backend import BackendType
+from recir.batch_dim_propagation import propagate_batch_input_meta
 from recir.lowering.lowering_utils import segment_and_lower
 from recir.lowering.op_swap import OpSwapRegistry, swap_ops
 from recir.torchax.ops.mappings import t2j
@@ -893,6 +894,24 @@ def partial_lower_xla(
     # Strip profiler ops before segmentation so their ScriptObject
     # handles never become XLA subgraph inputs.
     gm = _strip_profiler_nodes(gm)
+    # Re-propagate is_batch_input/batch_dim. The first pass runs at trace
+    # time in ``recir.api._finalize_graph`` / ``recir.trace`` before any
+    # post-trace mutation (e.g. mivilm surgery splicing new subgraphs in).
+    # Surgery-inserted nodes inherit only the component's traced meta -- no
+    # ``is_batch_input`` tag -- so without re-propagation they become
+    # replicated subgraph placeholders after ``segment_and_lower`` and
+    # ``_jit_gspmd`` builds per-process shardings for them while the rest
+    # of the graph carries global shapes -> JAX broadcast-shape mismatch
+    # (e.g. ``[4096,1,128]`` vs ``[128,1,128]``).
+    #
+    # As of v7.1, ``mivilm.core.surgeon.surgery`` re-tags after every
+    # splice (see ``_retag_after_splice`` there), so the GPU/Inductor path
+    # is also covered without needing a parallel hook here.  This call is
+    # kept as belt-and-suspenders for any non-mivilm caller that mutates
+    # the gm before reaching ``partial_lower_xla``;
+    # ``propagate_batch_input_meta`` is idempotent (skips already-tagged
+    # nodes) so re-running is free for the surgery-tagged callers.
+    propagate_batch_input_meta(gm)
     lowered = segment_and_lower(
         gm,
         compatibility_fn=_is_xla_compatible,
