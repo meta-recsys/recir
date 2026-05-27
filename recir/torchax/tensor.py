@@ -28,7 +28,7 @@ import logging
 import sys
 import threading
 from collections.abc import Iterator
-from typing import Any
+from typing import Any, Tuple
 
 import jax
 import jax.numpy as jnp
@@ -42,6 +42,73 @@ import torch.utils._pytree as torch_pytree
 from recir.torchax import amp, config
 from recir.torchax.ops import mappings, ops_registry
 from recir.torchax.view import View
+from torch.utils._python_dispatch import _get_current_dispatch_mode_stack
+
+
+def _resolve_trace_mode_types() -> Tuple[type, ...]:
+    """Lazily collect the TorchDispatchMode subclasses that count as
+    "trace context".  Some PyTorch versions don't ship every mode, so each
+    import is wrapped in try/except.
+
+    Module-level memoization: we call this once at import time below and
+    stash the tuple in ``_TRACE_MODE_TYPES`` so the per-dispatch
+    ``_torchax_in_trace_context()`` hot path doesn't re-run the imports.
+    """
+    trace_mode_types: list[type] = []
+    try:
+        from torch._subclasses.fake_tensor import FakeTensorMode
+
+        trace_mode_types.append(FakeTensorMode)
+    except ImportError:
+        pass
+    try:
+        from torch.fx.experimental.proxy_tensor import ProxyTorchDispatchMode
+
+        trace_mode_types.append(ProxyTorchDispatchMode)
+    except ImportError:
+        pass
+    try:
+        from torch._subclasses.functional_tensor import FunctionalTensorMode
+
+        trace_mode_types.append(FunctionalTensorMode)
+    except ImportError:
+        pass
+    return tuple(trace_mode_types)
+
+
+# Cache the trace-mode types tuple at import time.  This function is invoked
+# from every dispatch escape hatch (3 call-sites in this file), so the
+# per-call cost must stay minimal — see _torchax_in_trace_context.
+_TRACE_MODE_TYPES: Tuple[type, ...] = _resolve_trace_mode_types()
+
+
+def _torchax_in_trace_context() -> bool:
+    """True if any TRACE/COMPILE-related TorchDispatchMode is currently active.
+
+    Specifically checks for FakeTensorMode, ProxyTorchDispatchMode,
+    and FunctionalTensorMode.
+    Excludes torchax's own Environment (which is pushed as a
+    TorchDispatchMode by `TORCHAX_ENABLE_GLOBALLY=1` and would
+    otherwise make every eager call look like a trace call).
+
+    Used by the dispatch escape hatches to decide whether
+    `mode_utils.no_dispatch()` is safe:
+      * Trace context  -> drop no_dispatch (let trace mode record the op)
+      * Eager context  -> keep no_dispatch (pass through to raw torch)
+
+    Performance: this is on the per-op dispatch escape hatch path. The
+    trace-mode type tuple is resolved once at module import time (see
+    ``_TRACE_MODE_TYPES``); per-call cost is now a stack walk + tuple-isinstance.
+
+    See P2341454293 for the bug history that motivated this check.
+    """
+    if not _TRACE_MODE_TYPES:
+        return False
+    stack = _get_current_dispatch_mode_stack()
+    if not stack:
+        return False
+    return any(isinstance(m, _TRACE_MODE_TYPES) for m in stack)
+
 
 logger: logging.Logger = logging.getLogger(__name__)
 
@@ -562,8 +629,11 @@ class Environment(contextlib.ContextDecorator):
         if not self._is_same_device(the_tensor, new_device):
             if isinstance(the_tensor, Tensor):
                 torch_tensor = self.j2t_copy(the_tensor._elem)
-                with mode_utils.no_dispatch(), torch._C.DisableTorchFunction():
-                    return torch_tensor.to(device=new_device, dtype=new_dtype)
+                with torch._C.DisableTorchFunction():
+                    if _torchax_in_trace_context():
+                        return torch_tensor.to(device=new_device, dtype=new_dtype)
+                    with mode_utils.no_dispatch():
+                        return torch_tensor.to(device=new_device, dtype=new_dtype)
             else:
                 arr = self.t2j_copy(the_tensor)
                 res = Tensor(arr, self, the_tensor.requires_grad)
@@ -572,8 +642,11 @@ class Environment(contextlib.ContextDecorator):
             if isinstance(res, Tensor):
                 res = res.apply_jax(jnp.astype, mappings.t2j_dtype(new_dtype))
             else:
-                with mode_utils.no_dispatch(), torch._C.DisableTorchFunction():
-                    return res.to(device=new_device, dtype=new_dtype)
+                with torch._C.DisableTorchFunction():
+                    if _torchax_in_trace_context():
+                        return res.to(device=new_device, dtype=new_dtype)
+                    with mode_utils.no_dispatch():
+                        return res.to(device=new_device, dtype=new_dtype)
         return res
 
     def get_and_rotate_prng_key(self, generator: torch.Generator | None = None) -> Any:
@@ -596,8 +669,11 @@ class Environment(contextlib.ContextDecorator):
                 res = Tensor(res, self, requires_grad)
             return res
         else:
-            with mode_utils.no_dispatch(), torch._C.DisableTorchFunction():
-                return func(*args, **kwargs)
+            with torch._C.DisableTorchFunction():
+                if _torchax_in_trace_context():
+                    return func(*args, **kwargs)
+                with mode_utils.no_dispatch():
+                    return func(*args, **kwargs)
 
     def _torch_Tensor_to(self, args: Any, kwargs: Any) -> Any:
         the_tensor = args[0]
