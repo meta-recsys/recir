@@ -12,7 +12,6 @@ from recir.api import (  # noqa: F401
     extract_subgraph,
     find_markers,
     GraphPatch,
-    Override,
     replace_region,
     trace,
 )
