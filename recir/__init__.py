@@ -8,11 +8,13 @@
 from recir.api import (  # noqa: F401
     add_state,
     compile,
+    compile_from_gm,
     extract_subgraph,
     find_markers,
     GraphPatch,
     Override,
     replace_region,
+    trace,
 )
 from recir.backend import BackendType  # noqa: F401
 from recir.backends import (  # noqa: F401
@@ -27,6 +29,7 @@ from recir.distributed.parallel_mode import (  # noqa: F401
     HybridParallel,
     ParallelMode,
 )
+from recir.ops.marker import attach_markers, mark_boundary  # noqa: F401
 from recir.sharding_plan import (  # noqa: F401
     EmbeddingShardingPlan,
     EmbeddingShardingType,

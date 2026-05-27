@@ -147,7 +147,30 @@ def lower_subgraph_nodes(
     module = module_factory(subgraph_module)
     if torch_output_indices:
         module.torch_output_indices = torch_output_indices  # pyre-ignore[16]
-    setattr(gm, subgraph_name, module)
+    # Register the lowered subgraph as a submodule attribute.
+    #
+    # For a plain ``fx.GraphModule`` a bare ``setattr`` is sufficient: the
+    # call_module node we insert below targets the parent gm directly so
+    # ``getattr(gm, subgraph_name)`` resolves and ``gm.graph.lint`` passes.
+    #
+    # For an ``IterGraphModule`` the parent is an ``nn.Module`` wrapper
+    # around three ``fx.GraphModule`` sub-graphs (setup / main / cleanup).
+    # ``setattr(iter_gm, subgraph_name, module)`` installs on the wrapper
+    # only, but ``IterGraph.lint`` walks the *main* IterGraph whose
+    # ``owning_module`` is ``iter_gm.main_gm`` (a sub-GM) -- producing::
+    #
+    #     RuntimeError: Node <subgraph_name> target <subgraph_name>
+    #     references nonexistent attribute <subgraph_name>
+    #
+    # See ``IterGraphModule.add_subgraph_module`` for the helper that
+    # propagates the registration to all three sub-GMs so the call_module
+    # node we splice in below resolves under any of them.
+    from recir.iter_graph_module import IterGraphModule
+
+    if isinstance(gm, IterGraphModule):
+        gm.add_subgraph_module(subgraph_name, module)
+    else:
+        setattr(gm, subgraph_name, module)
 
     insertion_point = subgraph_nodes[-1].next
     for node in prologue:

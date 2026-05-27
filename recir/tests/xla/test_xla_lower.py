@@ -397,6 +397,81 @@ class TestPartialLowerXLA(unittest.TestCase):
         node_count_after = len(list(stripped.graph.nodes))
         self.assertEqual(node_count_before, node_count_after)
 
+    def test_strip_profiler_nodes_iter_graph_module(self) -> None:
+        """Regression: _strip_profiler_nodes must work on IterGraphModule.
 
-if __name__ == "__main__":
-    unittest.main()
+        v7.1's XLABackend sets ``default_uses_iter_graph=True`` so
+        ``partial_lower_xla`` now receives an ``IterGraphModule``.
+        ``IterGraphModule.erase_node`` cascades the erase to the
+        mirrored setup/cleanup graphs without first calling
+        ``replace_all_uses_with(None)`` on the mirror node. If
+        ``_strip_profiler_nodes`` erases ``_record_function_enter_new``
+        while its paired ``_record_function_exit`` mirror still
+        references it, torch.fx raises:
+
+            RuntimeError: Tried to erase Node
+            _record_function_enter_new but it still had 1 users in
+            the graph: {_record_function_exit: None}!
+
+        The fix is to iterate in reverse topological order so the
+        ``_record_function_exit`` mirror is erased before the
+        ``_record_function_enter_new`` mirror in all three graphs.
+        """
+        from recir.iter_graph_module import IterGraphModule
+        from recir.lowering.xla_lower import _strip_profiler_nodes
+
+        # Build a tiny graph with a paired enter/exit profiler block
+        # wrapping an aten op (mirrors what the trace emits when user
+        # code calls ``with record_function(...)``).
+        graph = torch.fx.Graph()
+        x = graph.placeholder("x")
+        record_fn = graph.call_function(
+            torch.ops.profiler._record_function_enter_new.default,
+            args=("## test_block ##",),
+        )
+        relu = graph.call_function(torch.ops.aten.relu.default, args=(x,))
+        graph.call_function(
+            torch.ops.profiler._record_function_exit.default,
+            args=(record_fn,),
+        )
+        graph.output(relu)
+        gm = torch.fx.GraphModule(root={}, graph=graph)
+
+        # Wrap in IterGraphModule. This duplicates the main graph into
+        # setup_gm + cleanup_gm and installs the mirror mappings that
+        # IterGraphModule.erase_node depends on.
+        iter_gm = IterGraphModule(gm)
+
+        # Before the fix this raised RuntimeError due to the cascade
+        # erasing the setup-graph mirror of _record_function_enter_new
+        # while its _record_function_exit mirror still referenced it.
+        stripped = _strip_profiler_nodes(iter_gm)
+
+        # All three sub-graphs (main + setup + cleanup) should have
+        # their profiler nodes removed.
+        for sub_gm_name in ("main_gm", "setup_gm", "cleanup_gm"):
+            sub_gm = getattr(stripped, sub_gm_name)
+            profiler_nodes = [
+                n
+                for n in sub_gm.graph.nodes
+                if n.op == "call_function"
+                and isinstance(n.target, torch._ops.OpOverload)
+                and n.target.name().startswith("profiler::")
+            ]
+            self.assertEqual(
+                len(profiler_nodes),
+                0,
+                f"profiler nodes still present in {sub_gm_name}: "
+                f"{[n.name for n in profiler_nodes]}",
+            )
+            # The aten relu should still be present in each sub-graph.
+            relu_nodes = [
+                n
+                for n in sub_gm.graph.nodes
+                if n.op == "call_function" and n.target == torch.ops.aten.relu.default
+            ]
+            self.assertEqual(
+                len(relu_nodes),
+                1,
+                f"relu missing from {sub_gm_name}",
+            )

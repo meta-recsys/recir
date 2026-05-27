@@ -620,9 +620,21 @@ def _strip_profiler_nodes(gm: torch.fx.GraphModule) -> torch.fx.GraphModule:
 
     Must run on the parent graph *before* segmentation so that the
     ScriptObject handles never become XLA subgraph inputs.
+
+    Implementation note: profiler nodes form ``enter -> exit`` pairs,
+    where ``_record_function_exit`` consumes the handle returned by
+    ``_record_function_enter_new``. We iterate in REVERSE topological
+    order so each ``_record_function_exit`` is erased before its
+    matching ``_record_function_enter_new``. This matters for
+    ``IterGraphModule``: its overridden ``erase_node`` cascades the
+    erase into the mirrored setup/cleanup graphs without first
+    calling ``replace_all_uses_with(None)`` on the mirror node, so
+    erasing the enter first while its exit mirror still references
+    it raises ``RuntimeError: Tried to erase Node ... but it still
+    had 1 users in the graph``.
     """
     changed = False
-    for node in list(gm.graph.nodes):
+    for node in reversed(list(gm.graph.nodes)):
         if node.op == "call_function" and isinstance(
             node.target, torch._ops.OpOverload
         ):
