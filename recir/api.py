@@ -7,6 +7,7 @@
 # pyre-strict
 import inspect
 import logging
+import os
 from abc import ABC, abstractmethod
 from collections import OrderedDict
 from contextlib import contextmanager, ExitStack, nullcontext
@@ -394,7 +395,17 @@ def _local_compile(
             # flat_state so DeviceStateManager can copy outputs back by index.
             return ret, params, buffers, named_states
 
-    with fake_mode, _enable_compile(), torch.autograd.detect_anomaly(check_nan=False):
+    # ``torch.autograd.detect_anomaly`` was historically wrapped around the
+    # ``make_fx`` call to catch nan/inf in the trace, but it segfaults under
+    # TPU multi-host runtime (the autograd anomaly hook allocates Python
+    # wrappers around FakeTensors during the trace). Default to OFF; set
+    # ``RECIR_DETECT_ANOMALY=1`` to re-enable for local debugging.
+    _detect_anomaly_ctx = (
+        torch.autograd.detect_anomaly(check_nan=False)
+        if os.environ.get("RECIR_DETECT_ANOMALY", "0") == "1"
+        else nullcontext()
+    )
+    with fake_mode, _enable_compile(), _detect_anomaly_ctx:
         # FIXME(@mrshenli): functionalization does not work for our use
         # case yet. Use explicit decompositions for foreach ops.
         # Remove this when the following issue is addressed.
