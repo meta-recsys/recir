@@ -121,6 +121,8 @@ def _output_batch_dim_for(
         aten.div.Tensor,
         aten.div.Scalar,
         aten.div.Tensor_mode,
+        aten.remainder.Tensor,
+        aten.remainder.Scalar,
         aten.neg.default,
         aten.abs.default,
         aten.exp.default,
@@ -190,6 +192,57 @@ def _output_batch_dim_for(
         # masking / fill (preserve shape)
         aten.masked_fill.Scalar,
         aten.masked_fill.Tensor,
+        # activation / softmax backwards: same shape as the corresponding
+        # forward, batch dim preserved.
+        aten.gelu_backward.default,
+        aten._softmax_backward_data.default,
+        aten._log_softmax_backward_data.default,
+        # nll_loss_backward(grad_output, self, target, weight, reduction,
+        # ignore_index, total_weight) -> Tensor with shape == self.shape.
+        # The batched ``self`` arg (the predictions tensor, [N, C]) and
+        # batched ``target`` arg ([N,]) both carry batch_dim=0; the
+        # consolidator picks 0 and the output preserves it.
+        aten.nll_loss_backward.default,
+        # slice_backward(grad, input_sizes, dim, start, end, step):
+        # scatters grad into a zero-filled tensor of shape ``input_sizes``.
+        # As long as the slice was NOT along the batch axis (typical engram
+        # / Gemma3 pattern: slicing seq or head dims), batch_dim is
+        # preserved. Reductions over the batch axis are extremely rare in
+        # the canary so this passthrough is safe in practice.
+        aten.slice_backward.default,
+        # Pure-view alias (``aten::alias(Tensor(a) self) -> Tensor(a)``):
+        # returns a view of the same storage with the same shape. Inserted
+        # by autograd on detach-style paths; batch_dim is unchanged.
+        aten.alias.default,
+        # Pure elementwise unary ops emitted by engram's RoPE / sign /
+        # ngram-hash paths. None of these change shape, so the batch_dim
+        # carries through unchanged. Without these handlers each call
+        # drops is_batch_input across a graph-break boundary and the
+        # downstream subgraph sees REPLICATED -> JAX broadcast mismatch.
+        aten.sign.default,
+        aten.cos.default,
+        aten.sin.default,
+        # In-place ops (``Tensor(a!) self ... -> Tensor(a!)``): self is
+        # arg 0, the output IS self, batch_dim is preserved. Functional
+        # behavior is identical to the corresponding out-of-place op for
+        # propagation purposes (the consolidator walks all_input_nodes
+        # and picks self's batch_dim; any other tensor args -- like
+        # lerp_'s `end` or addcmul_'s `tensor1`/`tensor2` -- are usually
+        # unbatched accumulators, but if batched they must agree with
+        # self on batch_dim or the consolidator bails). These are the
+        # 12 add_.Scalar + 1 lerp_.Scalar + 1 addcmul_ (+ addcdiv_ from
+        # the optimizer step) nodes that broke propagation on engram.
+        aten.add_.Scalar,
+        aten.add_.Tensor,
+        aten.sub_.Scalar,
+        aten.sub_.Tensor,
+        aten.mul_.Scalar,
+        aten.mul_.Tensor,
+        aten.div_.Scalar,
+        aten.div_.Tensor,
+        aten.lerp_.Scalar,
+        aten.addcmul_.default,
+        aten.addcdiv_.default,
     }
     if target in axis_preserving:
         return input_batch_dim
@@ -206,9 +259,37 @@ def _output_batch_dim_for(
     if target == aten.embedding.default:
         return input_batch_dim
 
+    # convolution(input, weight, ...): input is [N, C, *spatial]; the conv
+    # walks the spatial dims and emits [N, C_out, *spatial_out]. As long as
+    # input_batch_dim points at the N axis (the typical case), the output
+    # batch axis is unchanged. Used by ShortConv inside engram (depthwise
+    # conv1d along the seq dim with batch on axis 0).
+    if target in (aten.convolution.default, aten._convolution.default):
+        return input_batch_dim
+
+    # embedding_dense_backward(grad_output, indices, num_weights, padding_idx,
+    # scale_grad_by_freq) -> (num_weights, embed_dim). The op reduces over
+    # the leading batch axis of grad_output, so the output tensor is *not*
+    # shape-sharded along the batch axis any more. But surgery downstream
+    # still needs to know this grad came from a batched embedding so that
+    # the AllToAll-based v2 row-wise rewrite can reason about it; we
+    # propagate `is_batch_input` from the grad_output (arg 0) so the tag
+    # survives across the boundary. batch_dim stays the same as the
+    # gradient input's batch_dim.
+    if target == aten.embedding_dense_backward.default:
+        return input_batch_dim
+
     # cumsum(input, dim): preserves shape. Always propagate batch_dim.
     if target == aten.cumsum.default:
         return input_batch_dim
+
+    # sum.dim_IntList(input, dim, keepdim=False) / mean.dim(input, dim,
+    # keepdim=False): reductions. The batch axis survives iff none of the
+    # reduce dims target it. With keepdim=True the surviving axes keep
+    # their positions; with keepdim=False each reduced dim left of the
+    # batch axis shifts batch_dim down by 1.
+    if target in (aten.sum.dim_IntList, aten.mean.dim):
+        return _reduce_passthrough(node, input_batch_dim)
 
     # constant_pad_nd(input, pad): pads the LAST few dims (length of pad / 2);
     # earlier dims (including batch) are untouched.
@@ -221,6 +302,37 @@ def _output_batch_dim_for(
     if target in (aten.index.Tensor, aten.gather.default):
         return input_batch_dim
 
+    # view / reshape / _unsafe_view(input, sizes): default-passthrough.
+    # The leading-axis batch dim is preserved by ALL common view patterns
+    # used in engram / Gemma3 / FlatMM:
+    #   * [B, S, D] -> [B*S, D]              (flatten batch+seq)
+    #   * [B, S, H, D] -> [B, S, H*D]        (flatten heads)
+    #   * [B, S, D] -> [-1, D]               (negative-one collapse)
+    #   * [B, 1, D] -> [B, D]                (squeeze-like)
+    # In each, axis 0 still carries the batch sharding even if its size
+    # changes. Position-changing views (e.g. [B, S, D] -> [D, S, B]) are
+    # rare in practice; we accept the small risk of over-propagating
+    # because the alternative (returning None) caused 182 view nodes per
+    # engram step to drop is_batch_input, which surgery-downstream
+    # consumes as REPLICATED -> JAX broadcast mismatch at lower time.
+    # The only case we still bail on is "batch_dim is out of bounds for
+    # the new shape" (e.g. a view that drops dims below batch_dim).
+    if target in (
+        aten.view.default,
+        aten.reshape.default,
+        aten._unsafe_view.default,
+        getattr(aten.view_copy, "default", None),
+    ):
+        return _passthrough_if_rank_ok(node, input_batch_dim)
+
+    # expand(input, sizes): only changes size-1 dims; non-1 dims must match
+    # input. So a batch_dim with size > 1 will pass through unchanged; a
+    # batch_dim with size 1 being broadcast to size N is treated as a new
+    # axis-0 batch and we propagate (the broadcast happens per-process so
+    # the sharding is still axis 0 = batch).
+    if target in (aten.expand.default, aten.expand_copy.default):
+        return _passthrough_if_rank_ok(node, input_batch_dim)
+
     if isinstance(target, torch._ops.OpOverload) and target.name() in (
         "recir_padding::pad_to_static",
         "recir_padding::pad_count_to_sum",
@@ -230,8 +342,80 @@ def _output_batch_dim_for(
         "recir_padding::unpad_jagged_grad",
     ):
         return input_batch_dim
+
+    # recir::mark_boundary(x, name): pure identity (clone). Preserve
+    # batch_dim. Without this handler, every marker insertion would drop
+    # is_batch_input across a graph-break boundary.
+    if isinstance(target, torch._ops.OpOverload) and target.name() == (
+        "recir::mark_boundary"
+    ):
+        return input_batch_dim
     # Unknown op - don't propagate.
     return None
+
+
+def _passthrough_if_rank_ok(node: fx.Node, input_batch_dim: int) -> Optional[int]:
+    """Return input_batch_dim iff the new shape has a valid batch_dim slot.
+
+    For view / reshape / _unsafe_view / expand, default-passthrough rule:
+      * The new shape must have rank > input_batch_dim (so the batch slot
+        still exists in the output).
+
+    This intentionally does NOT require sizes[batch_dim] == input size —
+    flatten-batch-into-leading-axis views (e.g. [B, S, D] -> [B*S, D]) are
+    common and still preserve "axis 0 = batch", just with a different
+    per-process size. Over-propagating here is far less harmful than
+    under-propagating (which silently produces JAX broadcast mismatches).
+    """
+    if len(node.args) < 2:
+        return None
+    sizes = node.args[1]
+    if not isinstance(sizes, (list, tuple)):
+        return None
+    if input_batch_dim >= len(sizes):
+        return None
+    return input_batch_dim
+
+
+def _reduce_passthrough(node: fx.Node, input_batch_dim: int) -> Optional[int]:
+    """Compute the output batch_dim for ``sum.dim_IntList`` / ``mean.dim``.
+
+    Returns None when:
+      * the reduce dims include batch_dim (batch axis is collapsed), or
+      * we cannot determine the input's ndim or normalise the dims.
+
+    Otherwise returns the new batch axis position, accounting for the
+    keepdim flag: with keepdim=False any reduced dims to the left of the
+    batch axis shift it down by 1 each.
+    """
+    if len(node.args) < 2:
+        return None
+    dims_arg = node.args[1]
+    if not isinstance(dims_arg, (list, tuple)):
+        return None
+    # Locate the input tensor (first positional arg) and use its ndim to
+    # normalise negative reduce dims.
+    inputs = [a for a in node.args if isinstance(a, fx.Node)]
+    if not inputs:
+        return None
+    val = inputs[0].meta.get("val")
+    if not hasattr(val, "ndim"):
+        return None
+    ndim = val.ndim
+    norm_dims = {(d + ndim) if d < 0 else d for d in dims_arg if isinstance(d, int)}
+    if input_batch_dim in norm_dims:
+        return None
+    # keepdim is positional arg 2 in both signatures; default False.
+    keepdim = False
+    if len(node.args) > 2 and isinstance(node.args[2], bool):
+        keepdim = node.args[2]
+    elif "keepdim" in node.kwargs:
+        keepdim = bool(node.kwargs["keepdim"])
+    if keepdim:
+        return input_batch_dim
+    # No keepdim: each reduced dim left of batch_dim shrinks the batch axis.
+    shift = sum(1 for d in norm_dims if d < input_batch_dim)
+    return input_batch_dim - shift
 
 
 def _output_batch_dim_for_positional(node: fx.Node) -> Optional[int]:
