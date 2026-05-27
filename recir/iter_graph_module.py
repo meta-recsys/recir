@@ -8,7 +8,7 @@
 import copy
 import inspect
 import logging
-from typing import Any, Callable, cast, Dict, List, Optional, Set, Tuple, Type
+from typing import Any, Callable, cast, Dict, Iterator, List, Optional, Set, Tuple, Type
 
 import torch.nn as nn
 from recir.graph_utils import clone_subgraph, get_output, is_leaf_subgraph
@@ -816,3 +816,30 @@ class IterGraphModule(nn.Module):
             if sub_gm is None:
                 continue
             setattr(sub_gm, name, module)
+
+    def named_xla_modules(self) -> Iterator[Tuple[str, str, Any]]:
+        """Yield ``(gm_name, sub_path, _XLAModule)`` for every ``_XLAModule``
+        reachable across all three sub-graphs.
+
+        ``gm_name`` is one of ``"setup_gm"`` / ``"main_gm"`` / ``"cleanup_gm"``;
+        ``sub_path`` is the dotted attribute path returned by
+        ``named_modules()``. Callers (e.g. ``recir.lowering.aot``) use the
+        ``(gm_name, sub_path)`` tuple as a stable artifact key.
+
+        The ``_XLAModule`` class is imported lazily to avoid a circular
+        import — ``recir.lowering.xla_lower`` imports ``IterGraphModule``.
+        Pyre cannot follow that lazy import without a BUCK dep that would
+        recreate the cycle, so the import and the resulting ``isinstance``
+        check are suppressed locally.
+        """
+        # pyre-ignore[21]: Lazy import to break a build-time circular dep
+        # with recir.lowering.xla_lower; see docstring.
+        from recir.lowering.xla_lower import _XLAModule
+
+        for gm_name in ("setup_gm", "main_gm", "cleanup_gm"):
+            sub_gm = getattr(self, gm_name, None)
+            if sub_gm is None:
+                continue
+            for sub_path, mod in sub_gm.named_modules():
+                if isinstance(mod, _XLAModule):  # pyre-ignore[16]
+                    yield gm_name, sub_path, mod

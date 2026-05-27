@@ -54,6 +54,13 @@ class _XLAModule(torch.nn.Module):
         self.keep_jax_output: bool = False
         self.torch_output_indices: Optional[set[int]] = None
         self.safe_donate_indices: Optional[set[int]] = None
+        # AOT (ahead-of-time) cache slot: ``aot_load_prebuilt_into`` stashes
+        # a deserialized ``jax.stages.Compiled`` here so the next forward
+        # call skips the lazy-build path. ``aot_prebuild_and_serialize``
+        # reads from this slot after running a warmup forward. Initialized
+        # to ``None`` so tests can ``assertIsNone`` pre-warmup; the
+        # build/run paths in commit 6 populate it during normal execution.
+        self._jax_compiled: Optional[Any] = None
 
     def _postprocess_jax_output(
         self, jax_out: Any, input_device: torch.device
