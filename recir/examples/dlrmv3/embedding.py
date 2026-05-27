@@ -46,13 +46,10 @@ import jax.numpy as jnp
 import numpy as np
 import torch
 import torch.distributed as dist
-import torch.fx as fx
 import torch.nn as nn
-from recir.api import Override
-from recir.override_ops import default_override_transform
 from recir.tests.xla.dlrmv3_test_utils import (
     DlrmV3Preprocess,
-    DlrmV3SparseOverride,
+    DlrmV3SparseDispatcher,
     DummyPreprocess,
 )
 from torchrec.distributed.embedding import EmbeddingCollectionSharder
@@ -394,7 +391,7 @@ class SparsecoreBackedEC(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# JAXPreprocess: runtime dispatch target for JAXEmbeddingOverride
+# JAXPreprocess: runtime dispatch target for JAXEmbeddingDispatcher
 # ---------------------------------------------------------------------------
 
 
@@ -416,7 +413,9 @@ def _swap_ec(
 class JAXPreprocess:
     """Callable that runs DlrmV3Preprocess with JAX/SparseCore embedding lookup.
 
-    Passed to default_override_transform as the runtime dispatch target.
+    Passed to :func:`recir.eager_dispatch.install_graph_break_dispatch` as
+    the runtime dispatch target by
+    :class:`recir.examples.dlrmv3.jax_embedding.JAXEmbeddingDispatcher`.
     Runs as a recir graph break (outside XLA compilation).  Calls
     SparsecoreBackedEC.forward() which triggers the jit'd SparseCore lookup.
     """
@@ -448,54 +447,6 @@ class JAXPreprocess:
 
 
 # ---------------------------------------------------------------------------
-# JAXEmbeddingOverride: recir Override using JAX/SparseCore lookup
-# ---------------------------------------------------------------------------
-
-
-class JAXEmbeddingOverride(Override):
-    """Mirrors DlrmV3SparseOverride but dispatches to SparseCore at runtime.
-
-    replacement(): swaps DlrmV3Preprocess → DummyPreprocess for tracing.
-    transform():   wires JAXPreprocess (not orig DlrmV3Preprocess) as the
-                   runtime graph-break dispatch target.
-    """
-
-    def __init__(
-        self,
-        dummy: DummyPreprocess,
-        jax_ec: nn.Module,
-        num_ranks: int,
-    ) -> None:
-        self._dummy: DummyPreprocess = dummy
-        self._jax_ec: nn.Module = jax_ec
-        self._num_ranks: int = num_ranks
-        self._orig_preprocess: DlrmV3Preprocess | None = None
-        self.jax_preprocess: JAXPreprocess | None = None
-
-    def replacement(self, fqn: str, orig_submodule: nn.Module) -> nn.Module:
-        if isinstance(orig_submodule, DlrmV3Preprocess):
-            self._orig_preprocess = orig_submodule
-            return self._dummy  # tracing shim with anchor nodes
-        return orig_submodule
-
-    def transform(
-        self,
-        gm: fx.GraphModule,
-        flat_state: list[torch.Tensor],
-    ) -> fx.GraphModule:
-        assert self._orig_preprocess is not None, (
-            "replacement() must run before transform()"
-        )
-        self.jax_preprocess = JAXPreprocess(self._orig_preprocess, self._jax_ec)
-        return default_override_transform(
-            gm,
-            flat_state,
-            self.jax_preprocess,  # pyre-ignore[6]: JAXPreprocess wraps Module
-            num_ranks=self._num_ranks,
-        )
-
-
-# ---------------------------------------------------------------------------
 # EmbeddingBackend ABC
 # ---------------------------------------------------------------------------
 
@@ -521,8 +472,13 @@ class EmbeddingBackend(ABC):
         ...
 
     @abstractmethod
-    def get_override(self, dummy: DummyPreprocess, num_ranks: int) -> Override:
-        """Return the recir Override to pass to @compile."""
+    def get_dispatcher(self, dummy: DummyPreprocess, num_ranks: int) -> Any:
+        """Return the dispatcher (with ``install_eager`` + ``install_graph``).
+
+        For CPU/torchrec embeddings the dispatcher runs the original
+        :class:`DlrmV3Preprocess`; for JAX/SparseCore embeddings it routes
+        through :class:`recir.examples.dlrmv3.jax_embedding.JAXEmbeddingDispatcher`.
+        """
         ...
 
 
@@ -641,10 +597,10 @@ class CPUTorchRecBackend(EmbeddingBackend):
         logger.info("CPUTorchRecBackend: DMP ROW_WISE initialized on CPU")
         return dmp, dense_opt
 
-    def get_override(self, dummy: DummyPreprocess, num_ranks: int) -> Override:
-        sparse_override = DlrmV3SparseOverride(dummy)
-        sparse_override._num_ranks = num_ranks
-        return sparse_override
+    def get_dispatcher(self, dummy: DummyPreprocess, num_ranks: int) -> Any:
+        dispatcher = DlrmV3SparseDispatcher(dummy)
+        dispatcher._num_ranks = num_ranks
+        return dispatcher
 
 
 # ---------------------------------------------------------------------------
@@ -837,12 +793,17 @@ class JAXTPUBackend(EmbeddingBackend):
         logger.info("JAXTPUBackend: SparsecoreBackedEC initialized")
         return wrapper, opt
 
-    def get_override(
-        self, dummy: DummyPreprocess, num_ranks: int
-    ) -> JAXEmbeddingOverride:
+    def get_dispatcher(self, dummy: DummyPreprocess, num_ranks: int) -> Any:
         if self._jax_ec is None:
-            raise RuntimeError("call setup() before get_override()")
-        return JAXEmbeddingOverride(dummy, self._jax_ec, num_ranks)
+            raise RuntimeError("call setup() before get_dispatcher()")
+        # Local import — jax_embedding imports DummyPreprocess from here, so
+        # we import lazily to break the cycle at module-load time.
+        # pyre-ignore[21]: jax_embedding lives in a sibling buck target; the
+        # lazy import is intentional and resolved at runtime.
+        from recir.examples.dlrmv3.jax_embedding import JAXEmbeddingDispatcher
+
+        # pyre-ignore[16]: see comment on import above.
+        return JAXEmbeddingDispatcher(dummy, self._jax_ec, num_ranks)
 
 
 # ---------------------------------------------------------------------------

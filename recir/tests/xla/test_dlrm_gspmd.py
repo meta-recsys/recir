@@ -24,8 +24,8 @@ import torch
 from parameterized import parameterized
 from recir.api import compile, sync_device_state_to_torch
 from recir.backend import BackendType
+from recir.backends import XLAGSPMDBackend, XLAShardMapBackend
 from recir.distributed.parallel_mode import DataParallel, GSPMDParallel
-from recir.gm_transformation import GraphModuleTransformation
 from recir.lowering.xla_lower import _is_xla_compatible, _XLAModule
 from recir.tests.xla.gspmd_test_utils import (
     _generate_dlrm_inputs,
@@ -73,10 +73,7 @@ class TestDLRMSingleProcess(unittest.TestCase):
                 num_ranks=self.num_ranks,
                 num_processes=1,
             ),
-            gm_transformation=GraphModuleTransformation(
-                backend=BackendType.XLA_GSPMD,
-                enable_device_state=True,
-            ),
+            backend=XLAGSPMDBackend(),
         )
         def train_step(mod, opt, dense, sparse_indices, labels):
             logits = mod(dense, sparse_indices)
@@ -129,10 +126,7 @@ class TestDLRMSingleProcess(unittest.TestCase):
                 device_type="cpu",
                 backend=BackendType.XLA_SHARD_MAP,
             ),
-            gm_transformation=GraphModuleTransformation(
-                backend=BackendType.XLA_SHARD_MAP,
-                enable_device_state=True,
-            ),
+            backend=XLAShardMapBackend(),
         )
         def train_step(mod, opt, dense, sparse_indices, labels):
             logits = mod(dense, sparse_indices)
@@ -174,10 +168,7 @@ class TestDLRMSingleProcess(unittest.TestCase):
                 num_ranks=self.num_ranks,
                 num_processes=1,
             ),
-            gm_transformation=GraphModuleTransformation(
-                backend=BackendType.XLA_GSPMD,
-                enable_device_state=True,
-            ),
+            backend=XLAGSPMDBackend(),
         )
         def train_step(mod, opt, dense, sparse_indices, labels):
             logits = mod(dense, sparse_indices)

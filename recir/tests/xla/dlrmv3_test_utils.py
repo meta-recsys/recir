@@ -25,11 +25,18 @@ from generative_recommenders.modules.dlrm_hstu import (
     SequenceEmbedding,
 )
 from generative_recommenders.ops.jagged_tensors import concat_2D_jagged
-from recir.api import Override
-from recir.override_ops import anchor_output, default_override_transform
+from recir.eager_dispatch import install_graph_break_dispatch, mark_output_with_bwd
 from torchrec.modules.embedding_configs import EmbeddingConfig
 from torchrec.modules.embedding_modules import EmbeddingCollection
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
+
+
+DLRMV3_PREPROCESS_MARKER_PREFIX = "recir.examples.dlrmv3.preprocess"
+
+
+def _dlrmv3_marker_prefix(override_id: int) -> str:
+    return f"{DLRMV3_PREPROCESS_MARKER_PREFIX}::{override_id}"
+
 
 # ── Tiny model constants (mirrors debug.gin structure with reduced dims) ──
 SMALL_HASH_SIZE = 100
@@ -458,10 +465,12 @@ class DummyPreprocess(nn.Module):
     EmbeddingCollection. The shapes are derived from the static batch
     dimensions and model config.
 
-    Uses ``anchor_output()`` from ``recir.override_ops`` to wrap each output
-    tensor, creating identifiable ``fwd_anchor`` (forward) and ``bwd_anchor``
-    (backward) nodes in the make_fx-traced FX graph. Both anchor ops have
-    FakeTensor impls (for tracing) but no Meta kernel → graph break.
+    Wraps each output tensor with :func:`recir.eager_dispatch.mark_output_with_bwd`
+    which plants a forward/backward marker pair into the make_fx-traced FX
+    graph.  The post-trace orchestrator (:class:`DlrmV3SparseDispatcher` or
+    :class:`recir.examples.dlrmv3.jax_embedding.JAXEmbeddingDispatcher`) then
+    replaces those markers with a graph-break dispatch back to the real
+    preprocess (or a JAX SparseCore variant).
     """
 
     def __init__(
@@ -487,8 +496,9 @@ class DummyPreprocess(nn.Module):
         self.hstu_configs: DlrmHSTUConfig = hstu_configs
         self.override_id = override_id
         # Dummy parameter that requires_grad so that _batch_dep requires_grad.
-        # This makes OverrideAnchorFn.backward fire during make_fx tracing,
-        # producing findable bwd_anchor nodes in the backward graph.
+        # This makes the marker autograd Function backward fire during make_fx
+        # tracing, producing findable ``::bwd::`` marker nodes in the backward
+        # graph for ``install_graph_break_dispatch`` to replace.
         self._grad_anchor = nn.Parameter(torch.zeros(1))
 
     def _feature_total_len(self, key: str, batch_size: int) -> int:
@@ -591,27 +601,30 @@ class DummyPreprocess(nn.Module):
             batch_size * self.static_num_candidates,
             batch_size * self.static_uih_len,
         )
-        # Pytree-flatten, anchor each tensor leaf, unflatten back.
-        # This ensures DummyPreprocess and fwd_fn (via pytree.tree_leaves)
-        # produce tensors in the same order.
+        # Pytree-flatten, plant a marker pair on each tensor leaf, unflatten
+        # back.  This ensures DummyPreprocess and the dispatch fwd_fn (via
+        # pytree.tree_leaves) produce tensors in the same order.
+        prefix = _dlrmv3_marker_prefix(oid)
         flat, treedef = pytree.tree_flatten(raw_output)
         idx = 0
         anchored = []
         for leaf in flat:
             if isinstance(leaf, torch.Tensor):
-                anchored.append(anchor_output(leaf, oid, idx))
+                anchored.append(mark_output_with_bwd(leaf, prefix, idx))
                 idx += 1
             else:
                 anchored.append(leaf)
         return treedef.unflatten(anchored)
 
 
-class DlrmV3SparseOverride(Override):
-    """Swaps DlrmV3Preprocess with DummyPreprocess during tracing.
+class DlrmV3SparseDispatcher:
+    """Orchestrator-style replacement for the legacy ``DlrmV3SparseOverride``.
 
-    In ``transform()``, calls ``replace_override_anchors`` to wire up
-    forward/backward dispatch closures that run the real preprocess at
-    runtime.
+    ``install_eager`` swaps :class:`DlrmV3Preprocess` for the
+    :class:`DummyPreprocess` so tracing sees stable, fake-tensor-friendly
+    shapes (the dummy plants forward/backward marker pairs).
+    ``install_graph`` finds those markers and installs a graph-break dispatch
+    back to the captured original preprocess.
     """
 
     def __init__(self, dummy_preprocess: DummyPreprocess) -> None:
@@ -619,21 +632,30 @@ class DlrmV3SparseOverride(Override):
         self._orig_preprocess: nn.Module | None = None
         self._num_ranks: int = 1  # Set by compile() or test for loss scaling
 
-    def replacement(self, fqn: str, orig_submodule: nn.Module) -> nn.Module:
-        if isinstance(orig_submodule, DlrmV3Preprocess):
-            self._orig_preprocess = orig_submodule
-            return self._dummy
-        return orig_submodule
+    def install_eager(self, model: nn.Module) -> None:
+        for fqn, mod in list(model.named_modules()):
+            if isinstance(mod, DlrmV3Preprocess):
+                self._orig_preprocess = mod
+                parent_fqn, leaf = fqn.rsplit(".", 1) if "." in fqn else ("", fqn)
+                parent = model.get_submodule(parent_fqn) if parent_fqn else model
+                setattr(parent, leaf, self._dummy)
 
-    def transform(
-        self, gm: torch.fx.GraphModule, flat_state: List[Any]
-    ) -> torch.fx.GraphModule:
-        return default_override_transform(
+    def install_graph(
+        self,
+        gm: torch.fx.GraphModule,
+        flat_state: List[Any],
+    ) -> Tuple[torch.fx.GraphModule, List[Any]]:
+        assert self._orig_preprocess is not None, (
+            "install_eager() must run before install_graph()"
+        )
+        install_graph_break_dispatch(
             gm,
-            flat_state,
-            self._orig_preprocess,  # pyre-ignore[6]
+            _dlrmv3_marker_prefix(self._dummy.override_id),
+            self._orig_preprocess,  # type: ignore[arg-type]
+            num_state_tensors=len(flat_state),
             num_ranks=self._num_ranks,
         )
+        return gm, flat_state
 
 
 def create_tiny_dlrmv3(

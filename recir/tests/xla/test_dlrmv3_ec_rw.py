@@ -23,15 +23,15 @@ import recir.lowering.fbgemm_fallback  # noqa: F401 -- registers fbgemm decompos
 import torch
 import torch.distributed as dist
 import torch.nn as nn
-from recir.api import compile, sync_device_state_to_torch
-from recir.backend import BackendType
+from recir.api import sync_device_state_to_torch
+from recir.backends import XLAGSPMDBackend
 from recir.distributed.parallel_mode import GSPMDParallel
-from recir.gm_transformation import GraphModuleTransformation
+from recir.examples.dlrmv3.jax_embedding import compile_with_jax_embedding
 from recir.lowering.xla_lower import _XLAModule
 from recir.tests.xla.dlrmv3_test_utils import (
     create_dlrmv3_wrapper,
     create_static_batch,
-    DlrmV3SparseOverride,
+    DlrmV3SparseDispatcher,
     DummyPreprocess,
     LOCAL_BS,
     SMALL_EMBEDDING_DIM,
@@ -255,24 +255,10 @@ class TestDLRMv3ECRWTest(DestroyPGMixin, DTensorTestBase):
                 item_emb_feature_names=hstu_config.item_embedding_feature_names,
                 hstu_configs=hstu_config,
             )
-            sparse_override = DlrmV3SparseOverride(dummy)
-            sparse_override._num_ranks = num_ranks
+            sparse_dispatcher = DlrmV3SparseDispatcher(dummy)
+            sparse_dispatcher._num_ranks = num_ranks
 
-            @compile(
-                module_override=[sparse_override],
-                parallel_mode=GSPMDParallel(
-                    "replicate",
-                    loss_reduction="sum",
-                    num_ranks=num_ranks,
-                    num_processes=world_size,
-                ),
-                # pyre-ignore[6]: GraphModuleTransformation is callable at runtime.
-                gm_transformation=GraphModuleTransformation(
-                    backend=BackendType.XLA_GSPMD,
-                    enable_device_state=True,
-                ),
-            )
-            def train_step(
+            def train_step_fn(
                 mod: nn.Module,
                 opt: torch.optim.Optimizer,
                 uih_values: torch.Tensor,
@@ -286,6 +272,22 @@ class TestDLRMv3ECRWTest(DestroyPGMixin, DTensorTestBase):
                 loss: torch.Tensor = torch.stack(list(aux_losses.values())).sum()
                 loss.backward()
                 opt.step()
+
+            train_step = compile_with_jax_embedding(
+                test_dmp.module,
+                train_step_fn,
+                test_dmp.module,
+                test_dense_opt,
+                *local_batch,
+                dispatcher=sparse_dispatcher,
+                parallel_mode=GSPMDParallel(
+                    "replicate",
+                    loss_reduction="sum",
+                    num_ranks=num_ranks,
+                    num_processes=world_size,
+                ),
+                backend=XLAGSPMDBackend(),
+            )
 
             for _ in range(num_iters):
                 train_step(test_dmp.module, test_dense_opt, *local_batch)

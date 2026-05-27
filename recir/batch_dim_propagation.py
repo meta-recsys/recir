@@ -317,7 +317,7 @@ def propagate_batch_input_meta(gm: fx.GraphModule) -> None:
         if node.op != "call_function":
             continue
         # Skip ops that already have explicit tagging (e.g., dispatch_fwd
-        # outputs stamped by replace_override_anchors).
+        # outputs stamped by install_graph_break_dispatch).
         if node.meta.get("is_batch_input"):
             continue
         # For positional ops (matmul-family), look up batch_dim per-arg

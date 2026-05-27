@@ -2,9 +2,9 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # pyre-ignore-all-errors
 
-"""Tests verifying Override forward/backward mechanics.
+"""Tests verifying orchestrator-style override forward/backward mechanics.
 
-Tests the core override machinery (anchor ops, transform, dispatch) using
+Tests the marker-based override machinery (mark_boundary + dispatcher) using
 a simple toy model without XLA, DMP, or multiprocess complexity.
 """
 
@@ -13,12 +13,12 @@ from copy import deepcopy
 
 import torch
 from functorch import make_fx
-from recir.tests.override_test_utils import (
+from recir.tests.eager_test_utils import (
     run_graph,
     ToyDense,
+    ToyDispatcher,
     ToyDummyPreprocess,
     ToyFusedPreprocess,
-    ToyOverride,
     ToyPreprocess,
     ToyWrapper,
     trace_train_step,
@@ -27,9 +27,22 @@ from torch._subclasses.fake_tensor import FakeTensorMode
 from torch.nn.utils import stateless
 
 
+def _has_marker(gm, suffix: str) -> bool:
+    for n in gm.graph.nodes:
+        if (
+            n.op == "call_function"
+            and n.target is torch.ops.recir.mark_boundary.default
+            and len(n.args) >= 2
+            and isinstance(n.args[1], str)
+            and suffix in n.args[1]
+        ):
+            return True
+    return False
+
+
 class TestOverride(unittest.TestCase):
-    def test_anchor_ops_appear_in_traced_graph(self):
-        """make_fx should produce fwd_anchor and bwd_anchor nodes."""
+    def test_marker_pairs_appear_in_traced_graph(self):
+        """make_fx should produce forward + backward mark_boundary nodes."""
         mod = ToyDummyPreprocess(batch_size=3, embedding_dim=4)
         fake_mode = FakeTensorMode()
         params = dict(mod.named_parameters())
@@ -46,52 +59,37 @@ class TestOverride(unittest.TestCase):
             gm = make_fx(trace_fn, tracing_mode="fake", _allow_non_fake_inputs=False)(
                 params, fake_x
             )
+        self.assertTrue(_has_marker(gm, "::output::"), "Expected output marker node")
+        self.assertTrue(_has_marker(gm, "::bwd::"), "Expected backward marker node")
 
-        fwd = [
-            n
-            for n in gm.graph.nodes
-            if n.op == "call_function" and "fwd_anchor" in str(n.target)
-        ]
-        bwd = [
-            n
-            for n in gm.graph.nodes
-            if n.op == "call_function" and "bwd_anchor" in str(n.target)
-        ]
-        self.assertGreater(len(fwd), 0, "Expected fwd_anchor nodes")
-        self.assertGreater(len(bwd), 0, "Expected bwd_anchor nodes")
-
-    def test_transform_replaces_anchors(self):
-        """override.transform() should replace anchor ops with dispatch calls."""
+    def test_install_graph_replaces_markers(self):
+        """install_graph should replace markers with graph-break dispatch calls."""
         torch.manual_seed(42)
         preprocess = ToyPreprocess()
         dense = ToyDense()
         dummy = ToyDummyPreprocess(batch_size=3, embedding_dim=4)
         wrapper = ToyWrapper(dummy, dense)
-        override = ToyOverride(dummy)
-        override._orig_preprocess = preprocess
+        dispatcher = ToyDispatcher(dummy)
+        # Caller wired install_eager separately when building the wrapper;
+        # rebuild parity here so install_graph can fire on its own.
+        dispatcher._orig_preprocess = preprocess
         opt = torch.optim.SGD(wrapper.parameters(), lr=0.01, foreach=False)
         x = torch.randint(0, 10, (3,))
 
         gm, flat_state = trace_train_step(wrapper, opt, x)
-        gm = override.transform(gm, flat_state)
+        gm, _ = dispatcher.install_graph(gm, flat_state)
 
         has_graph_break = any(
             n.op == "call_function" and n.meta.get("xla_graph_break")
             for n in gm.graph.nodes
         )
         self.assertTrue(has_graph_break, "Expected xla_graph_break dispatch node")
-        has_fwd_anchor = any(
-            "fwd_anchor" in str(n.target)
-            for n in gm.graph.nodes
-            if n.op == "call_function"
+        self.assertFalse(
+            _has_marker(gm, "::output::"), "Output marker should be removed"
         )
-        has_bwd_anchor = any(
-            "bwd_anchor" in str(n.target)
-            for n in gm.graph.nodes
-            if n.op == "call_function"
+        self.assertFalse(
+            _has_marker(gm, "::bwd::"), "Backward marker should be removed"
         )
-        self.assertFalse(has_fwd_anchor, "fwd_anchor should be removed")
-        self.assertFalse(has_bwd_anchor, "bwd_anchor should be removed")
 
     def test_override_backward_produces_gradients(self):
         """override backward should produce embedding gradients."""
@@ -100,13 +98,13 @@ class TestOverride(unittest.TestCase):
         dense = ToyDense()
         dummy = ToyDummyPreprocess(batch_size=3, embedding_dim=4)
         wrapper = ToyWrapper(dummy, dense)
-        override = ToyOverride(dummy)
-        override._orig_preprocess = preprocess
+        dispatcher = ToyDispatcher(dummy)
+        dispatcher._orig_preprocess = preprocess
         opt = torch.optim.SGD(wrapper.parameters(), lr=0.01, foreach=False)
         x = torch.randint(0, 10, (3,))
 
         gm, flat_state = trace_train_step(wrapper, opt, x)
-        gm = override.transform(gm, flat_state)
+        gm, _ = dispatcher.install_graph(gm, flat_state)
         run_graph(gm, wrapper, opt, x)
 
         self.assertIsNotNone(
@@ -121,14 +119,14 @@ class TestOverride(unittest.TestCase):
         dense = ToyDense(embedding_dim=4, output_dim=2)
         dummy = ToyDummyPreprocess(batch_size=3, embedding_dim=4)
         wrapper = ToyWrapper(dummy, dense)
-        override = ToyOverride(dummy)
-        override._orig_preprocess = preprocess
+        dispatcher = ToyDispatcher(dummy)
+        dispatcher._orig_preprocess = preprocess
         self.assertIsNone(preprocess.embedding.weight.grad)
         opt = torch.optim.SGD(wrapper.parameters(), lr=0.01, foreach=False)
         x = torch.randint(0, 10, (3,))
 
         gm, flat_state = trace_train_step(wrapper, opt, x)
-        gm = override.transform(gm, flat_state)
+        gm, _ = dispatcher.install_graph(gm, flat_state)
         run_graph(gm, wrapper, opt, x)
 
         self.assertIsNotNone(
@@ -159,12 +157,12 @@ class TestOverride(unittest.TestCase):
         override_dense = deepcopy(dense)
         dummy = ToyDummyPreprocess(batch_size=3, embedding_dim=4)
         wrapper = ToyWrapper(dummy, override_dense)
-        override = ToyOverride(dummy)
-        override._orig_preprocess = override_preprocess
+        dispatcher = ToyDispatcher(dummy)
+        dispatcher._orig_preprocess = override_preprocess
         opt = torch.optim.SGD(wrapper.parameters(), lr=0.01, foreach=False)
 
         gm, flat_state = trace_train_step(wrapper, opt, x)
-        gm = override.transform(gm, flat_state)
+        gm, _ = dispatcher.install_graph(gm, flat_state)
         run_graph(gm, wrapper, opt, x)
 
         self.assertIsNotNone(override_preprocess.embedding.weight.grad)
@@ -183,13 +181,13 @@ class TestOverride(unittest.TestCase):
         dense = ToyDense(embedding_dim=4, output_dim=2)
         dummy = ToyDummyPreprocess(batch_size=3, embedding_dim=4)
         wrapper = ToyWrapper(dummy, dense)
-        override = ToyOverride(dummy)
-        override._orig_preprocess = preprocess
+        dispatcher = ToyDispatcher(dummy)
+        dispatcher._orig_preprocess = preprocess
         opt = torch.optim.SGD(wrapper.parameters(), lr=0.01, foreach=False)
         x = torch.randint(0, 10, (3,))
 
         gm, flat_state = trace_train_step(wrapper, opt, x)
-        gm = override.transform(gm, flat_state)
+        gm, _ = dispatcher.install_graph(gm, flat_state)
         with torch.no_grad():
             run_graph(gm, wrapper, opt, x)
 
@@ -217,12 +215,12 @@ class TestOverride(unittest.TestCase):
         override_dense = deepcopy(dense)
         dummy = ToyDummyPreprocess(batch_size=3, embedding_dim=4)
         wrapper = ToyWrapper(dummy, override_dense)
-        override = ToyOverride(dummy)
-        override._orig_preprocess = override_preprocess
+        dispatcher = ToyDispatcher(dummy)
+        dispatcher._orig_preprocess = override_preprocess
         opt = torch.optim.SGD(wrapper.parameters(), lr=0.01, foreach=False)
 
         gm, flat_state = trace_train_step(wrapper, opt, x)
-        gm = override.transform(gm, flat_state)
+        gm, _ = dispatcher.install_graph(gm, flat_state)
         with torch.no_grad():
             run_graph(gm, wrapper, opt, x)
 

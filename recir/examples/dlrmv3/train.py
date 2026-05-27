@@ -35,10 +35,10 @@ import recir.lowering.fbgemm_fallback  # noqa: F401 -- registers SPMD_DECOMP_TAB
 import torch
 import torch.distributed as dist
 import torch.nn as nn
-from recir.api import compile, sync_device_state_to_torch
-from recir.backend import BackendType
+from recir.api import sync_device_state_to_torch
+from recir.backends import XLAGSPMDBackend
 from recir.distributed.parallel_mode import GSPMDParallel
-from recir.gm_transformation import GraphModuleTransformation
+from recir.examples.dlrmv3.jax_embedding import compile_with_jax_embedding
 from recir.tests.xla.dlrmv3_test_utils import (
     create_dlrmv3_wrapper,
     create_static_batch,
@@ -148,7 +148,10 @@ def _run_training_loop(
     global_bs: int,
 ) -> None:
     """Execute the compiled training loop with optional JAX profiling."""
-    # Create sparse override for @compile
+    # Create the dispatcher (orchestrator-style override) for the embedding
+    # backend.  Both CPU and JAX backends expose ``install_eager`` +
+    # ``install_graph`` (the dispatcher pattern), so the same compile
+    # orchestrator (`compile_with_jax_embedding`) works for both.
     dummy = DummyPreprocess(
         emb_keys=emb_keys,
         batch_size=cfg.local_batch_size,
@@ -159,28 +162,14 @@ def _run_training_loop(
         item_emb_feature_names=hstu_config.item_embedding_feature_names,
         hstu_configs=hstu_config,
     )
-    module_override = backend.get_override(dummy, num_ranks=num_ranks)
+    dispatcher = backend.get_dispatcher(dummy, num_ranks=num_ranks)
 
     # compile_ranks: use all JAX devices when on TPU (device_count > 1 on TPU,
     # = 1 on CPU-only machines where we fall back to the gloo world size).
     num_tpu_devices = jax.device_count()
     compile_ranks = num_tpu_devices if num_tpu_devices > 1 else num_ranks
 
-    @compile(
-        module_override=[module_override],
-        parallel_mode=GSPMDParallel(
-            "replicate",
-            loss_reduction="sum",
-            num_ranks=compile_ranks,
-            num_processes=num_ranks,
-        ),
-        # pyre-ignore[6]: GraphModuleTransformation is callable
-        gm_transformation=GraphModuleTransformation(
-            backend=BackendType.XLA_GSPMD,
-            enable_device_state=True,
-        ),
-    )
-    def train_step(
+    def train_step_fn(
         mod: nn.Module,
         opt: torch.optim.Optimizer,
         uih_values: torch.Tensor,
@@ -194,6 +183,25 @@ def _run_training_loop(
         loss: torch.Tensor = torch.stack(list(aux_losses.values())).sum()
         loss.backward()
         opt.step()
+
+    model_to_train_for_compile = (
+        model.module if isinstance(model, DistributedModelParallel) else model
+    )
+    train_step = compile_with_jax_embedding(
+        model_to_train_for_compile,
+        train_step_fn,
+        model_to_train_for_compile,
+        dense_opt,
+        *local_batch,
+        dispatcher=dispatcher,
+        parallel_mode=GSPMDParallel(
+            "replicate",
+            loss_reduction="sum",
+            num_ranks=compile_ranks,
+            num_processes=num_ranks,
+        ),
+        backend=XLAGSPMDBackend(),
+    )
 
     # JAX profiler setup — enabled when on TPU and profile_start_step > 0
     profiling_active = False
