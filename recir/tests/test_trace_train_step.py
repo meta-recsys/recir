@@ -512,17 +512,36 @@ class TraceTrainStepTest(DTensorTestBase):
     @skip_if_lt_x_gpu(2)
     @with_comms
     def test_gm_cache_and_transformation(self) -> None:
-        class GraphOptimization:
-            def __init__(self) -> None:
-                self.call_count = 0
+        """Verify the compiled-object cache: a custom stage-6 pass runs once
+        across repeated calls and the cached ``gm`` reference is reused.
 
-            def __call__(self, gm: fx.GraphModule) -> fx.GraphModule:
-                self.call_count += 1
+        Refactored off the legacy ``gm_transformation=`` API to the v7.1
+        ``backend=`` path: the per-compile callback that used to be
+        ``gm_transformation`` is now ``backend.optimize_passes`` (which
+        :func:`compile_from_gm` invokes exactly once per compile).  The
+        :class:`compile` decorator still caches the resulting
+        ``_CompiledResult`` in ``wrapper.__dict__[COMPILED_OBJECT_KEY]`` so
+        subsequent ``train_step(...)`` calls reuse the same ``gm``.
+        """
+
+        class _CountingBackend(Backend):
+            """Counts how often the stage-6 pass fires (== how often
+            :func:`compile_from_gm` runs)."""
+
+            def __init__(self) -> None:
+                self.call_count: int = 0
+
+                def _record_pass(gm: fx.GraphModule) -> None:
+                    self.call_count += 1
+
+                super().__init__(optimize_passes=[_record_pass])
+
+            def dispatch(self, gm: fx.GraphModule) -> nn.Module:
                 return gm
 
-        graph_optimization = GraphOptimization()
+        backend = _CountingBackend()
 
-        @compile(gm_transformation=graph_optimization)
+        @compile(parallel_mode=DataParallel(), backend=backend)
         def train_step(
             mod: nn.Module, opt: torch.optim.Optimizer, inp: torch.Tensor
         ) -> None:
@@ -543,11 +562,11 @@ class TraceTrainStepTest(DTensorTestBase):
         opt.zero_grad()
 
         train_step(mod, opt, inp)
-        self.assertEqual(graph_optimization.call_count, 1)
+        self.assertEqual(backend.call_count, 1)
         gm = train_step.__dict__[COMPILED_OBJECT_KEY].gm
         train_step(mod, opt, inp)
         self.assertEqual(id(gm), id(train_step.__dict__[COMPILED_OBJECT_KEY].gm))
-        self.assertEqual(graph_optimization.call_count, 1)
+        self.assertEqual(backend.call_count, 1)
 
     @skip_if_lt_x_gpu(2)
     @with_comms

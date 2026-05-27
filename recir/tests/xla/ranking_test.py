@@ -20,8 +20,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from recir.api import compile
-from recir.backend import BackendType
-from recir.gm_transformation import GraphModuleTransformation
+from recir.backends import XLAGSPMDBackend
 from recir.lowering.xla_lower import _XLAModule
 from recir.tests.xla.gspmd_test_utils import assert_hlo_has_collective
 from transformers import Qwen2Config, Qwen2ForCausalLM  # @manual
@@ -229,10 +228,7 @@ class TestRankingCompile(unittest.TestCase):
                 num_ranks=self.num_ranks,
                 num_processes=1,
             ),
-            gm_transformation=GraphModuleTransformation(
-                backend=BackendType.XLA_GSPMD,
-                enable_device_state=True,
-            ),
+            backend=XLAGSPMDBackend(),
         )
         def train_step(mod, opt, input_ids, attention_mask, labels, weights):
             loss = mod(input_ids, attention_mask, labels, weights)
@@ -299,9 +295,7 @@ class TestRankingCompile(unittest.TestCase):
                 num_ranks=self.num_ranks,
                 num_processes=1,
             ),
-            gm_transformation=GraphModuleTransformation(
-                backend=BackendType.XLA_GSPMD,
-            ),
+            backend=XLAGSPMDBackend(),
         )
         def train_step(mod, opt, input_ids, attention_mask, labels, weights):
             loss = mod(input_ids, attention_mask, labels, weights)
