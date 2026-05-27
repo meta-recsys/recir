@@ -27,8 +27,8 @@ import torch
 from parameterized import parameterized
 from recir.api import compile
 from recir.backend import BackendType
+from recir.backends import XLAGSPMDBackend, XLAShardMapBackend
 from recir.distributed.parallel_mode import DataParallel, GSPMDParallel
-from recir.gm_transformation import GraphModuleTransformation
 from recir.tests.xla.gspmd_test_utils import (
     _run_single_rank_baseline,
     assert_hlo_has_collective,
@@ -74,7 +74,7 @@ class TestSingleProcessMultiDevice(unittest.TestCase):
                 num_ranks=self.num_ranks,
                 num_processes=1,
             ),
-            gm_transformation=GraphModuleTransformation(backend=BackendType.XLA_GSPMD),
+            backend=XLAGSPMDBackend(),
         )
         def train_step(mod, opt, x):
             reduce_fn(mod(x)).backward()
@@ -115,9 +115,7 @@ class TestSingleProcessMultiDevice(unittest.TestCase):
                 device_type="cpu",
                 backend=BackendType.XLA_SHARD_MAP,
             ),
-            gm_transformation=GraphModuleTransformation(
-                backend=BackendType.XLA_SHARD_MAP
-            ),
+            backend=XLAShardMapBackend(),
         )
         def train_step(mod, opt, x):
             reduce_fn(mod(x)).backward()

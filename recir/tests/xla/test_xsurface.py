@@ -32,10 +32,9 @@ import torch.nn as nn
 from hammer.v3.models.udd_fm_v3.udd_fm_train_v3 import BlueReelsVDDTrainV3
 from hammer.v3.modules.recblock import _inputs_to_feature_bundle
 from recir.api import _local_compile, compile, sync_device_state_to_torch
-from recir.backend import BackendType
+from recir.backends import XLAGSPMDBackend
 from recir.decompositions import SPMD_DECOMP_TABLE
 from recir.distributed.parallel_mode import GSPMDParallel
-from recir.gm_transformation import GraphModuleTransformation
 from recir.lowering.fbgemm_fallback import _batched_complete_cumsum_impl
 from recir.lowering.xla_lower import _XLAModule
 from recir.region_transforms.padding import (
@@ -256,20 +255,18 @@ class TestXSurfaceXLACompile(unittest.TestCase):
 
         opt = torch.optim.SGD(model.parameters(), lr=0.01, foreach=False)
 
-        base_gm_transform = GraphModuleTransformation(
-            backend=BackendType.XLA_GSPMD,
-            enable_device_state=True,
-        )
-
+        # Adapt orchestrator-style dispatchers into ``eager_preproc=`` callables:
+        # each dispatcher's ``install_eager(model)`` matches the
+        # ``Callable[[nn.Module], None]`` shape expected by ``eager_preproc=``.
         compile_kwargs: dict[str, Any] = {
-            "module_override": overrides,
+            "eager_preproc": [dispatcher.install_eager for dispatcher in overrides],
             "parallel_mode": GSPMDParallel(
                 "replicate",
                 loss_reduction="sum",
                 num_ranks=self.num_ranks,
                 num_processes=1,
             ),
-            "gm_transformation": base_gm_transform,
+            "backend": XLAGSPMDBackend(),
         }
 
         # Store KJT keys so the model's forward can construct KJTs

@@ -15,9 +15,8 @@ import os
 
 import torch
 from recir.api import compile
-from recir.backend import BackendType
+from recir.backends import XLAGSPMDBackend
 from recir.distributed.parallel_mode import GSPMDParallel
-from recir.gm_transformation import GraphModuleTransformation
 from recir.lowering.xla_lower import _XLAModule
 from recir.tests.xla.gspmd_test_utils import (
     assert_jax_multi_device,
@@ -88,9 +87,7 @@ class TestMultiProcessFSDP(DestroyPGMixin, DTensorTestBase):
                     num_ranks=num_ranks,
                     num_processes=self.world_size,
                 ),
-                gm_transformation=GraphModuleTransformation(
-                    backend=BackendType.XLA_GSPMD,
-                ),
+                backend=XLAGSPMDBackend(),
             )
             def train_step(mod, opt, x):
                 torch.sum(mod(x)).backward()
@@ -142,10 +139,7 @@ class TestMultiProcessFSDP(DestroyPGMixin, DTensorTestBase):
                     num_ranks=num_ranks,
                     num_processes=self.world_size,
                 ),
-                gm_transformation=GraphModuleTransformation(
-                    backend=BackendType.XLA_GSPMD,
-                    enable_device_state=True,
-                ),
+                backend=XLAGSPMDBackend(),
             )
             def train_step_ds(mod, opt, x):
                 torch.sum(mod(x)).backward()

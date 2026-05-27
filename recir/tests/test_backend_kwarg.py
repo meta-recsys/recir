@@ -6,14 +6,11 @@
 
 # pyre-strict
 
-"""Tests for the new ``backend=`` and ``eager_preproc=`` kwargs on recir.compile.
+"""Tests for the ``backend=`` and ``eager_preproc=`` kwargs on recir.compile.
 
 Verifies:
-- backend= and gm_transformation= are mutually exclusive.
-- module_override= and eager_preproc= are mutually exclusive.
-- compile(backend=...) drives the new pipeline via trace + compile_from_gm.
-- compile(gm_transformation=..., module_override=...) (legacy) still works.
-- eager_preproc hooks are invoked on the model argument before tracing.
+- ``compile(backend=...)`` drives the pipeline via ``trace`` + ``compile_from_gm``.
+- ``eager_preproc`` hooks are invoked on the model argument before tracing.
 """
 
 import unittest
@@ -22,11 +19,7 @@ from typing import List
 import recir
 import torch
 import torch.nn as nn
-from recir.tests.test_utils import (
-    _DoNothingOverride,
-    _NoopBackend,
-    _PassthroughParallel,
-)
+from recir.tests.test_utils import _NoopBackend, _PassthroughParallel
 from torch import fx
 
 
@@ -46,38 +39,6 @@ def _toy_train_step(
     loss = model(x)
     loss.backward()
     opt.step()
-
-
-class MutualExclusivityTest(unittest.TestCase):
-    """The new kwargs must reject conflicting legacy kwargs at decoration time."""
-
-    def test_backend_and_gm_transformation_raise(self) -> None:
-        """backend= + gm_transformation= raises ValueError."""
-
-        def _bogus_gm_transformation(gm: fx.GraphModule) -> fx.GraphModule:
-            return gm
-
-        with self.assertRaises(ValueError) as ctx:
-            recir.compile(
-                gm_transformation=_bogus_gm_transformation,
-                backend=_NoopBackend(),
-                parallel_mode=_PassthroughParallel(),
-            )
-        self.assertIn("mutually exclusive", str(ctx.exception))
-
-    def test_module_override_and_eager_preproc_raise(self) -> None:
-        """module_override= + eager_preproc= raises ValueError."""
-
-        def _hook(m: nn.Module) -> None:
-            return None
-
-        with self.assertRaises(ValueError) as ctx:
-            recir.compile(
-                module_override=[_DoNothingOverride()],
-                eager_preproc=[_hook],
-                parallel_mode=_PassthroughParallel(),
-            )
-        self.assertIn("mutually exclusive", str(ctx.exception))
 
 
 class NewBackendPathTest(unittest.TestCase):
@@ -127,42 +88,3 @@ class NewBackendPathTest(unittest.TestCase):
         self.assertEqual(len(hook_calls), 2)
         for called_model in hook_calls:
             self.assertIs(called_model, model)
-
-
-class LegacyPathStillWorksTest(unittest.TestCase):
-    """Legacy module_override / gm_transformation paths remain functional.
-
-    These tests live next to the new-kwarg tests so we catch regressions if
-    someone accidentally breaks the legacy code paths while iterating on C2.
-    The legacy path requires dist init for the real DataParallel/GSPMD modes,
-    so we exercise it through a no-op gm_transformation that just verifies it
-    is invoked.  Partition + tracing still run end-to-end via the existing
-    ``_compile_data_parallel_v2`` helper, which uses a CPU DeviceMesh by
-    default.
-    """
-
-    def test_gm_transformation_invoked(self) -> None:
-        """A user-provided gm_transformation callable is invoked on the gm."""
-        # Use a single-process FakeProcessGroup-style mode by leaning on the
-        # NoopBackend approach: bypass _compile_and_transform's partition by
-        # checking that the kwarg path is accepted at decoration time.
-        # The actual call would require dist init; we cover that in
-        # test_transformation.py.
-
-        def _gm_transform(gm: fx.GraphModule) -> fx.GraphModule:
-            return gm
-
-        # Should not raise at decoration time.
-        decorator = recir.compile(
-            gm_transformation=_gm_transform,
-            parallel_mode=_PassthroughParallel(),
-        )
-        self.assertTrue(callable(decorator))
-
-    def test_module_override_accepted_at_decoration(self) -> None:
-        """A legacy module_override= still decorates cleanly."""
-        decorator = recir.compile(
-            module_override=[_DoNothingOverride()],
-            parallel_mode=_PassthroughParallel(),
-        )
-        self.assertTrue(callable(decorator))

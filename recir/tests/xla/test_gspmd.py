@@ -19,8 +19,8 @@ import torch
 from parameterized import parameterized
 from recir.api import compile
 from recir.backend import BackendType
+from recir.backends import XLAGSPMDBackend, XLAShardMapBackend
 from recir.distributed.parallel_mode import DataParallel, GSPMDParallel
-from recir.gm_transformation import GraphModuleTransformation
 from recir.tests.xla.gspmd_test_utils import (
     _create_model_and_warmup,
     _generate_inputs,
@@ -76,9 +76,7 @@ class TestGSPMDMultiDevice(DestroyPGMixin, DTensorTestBase):
                     loss_reduction=loss_reduction,
                     backend=BackendType.XLA_SHARD_MAP,
                 ),
-                gm_transformation=GraphModuleTransformation(
-                    backend=BackendType.XLA_SHARD_MAP
-                ),
+                backend=XLAShardMapBackend(),
             )
             def train_step_shard_map(mod, opt, x):
                 reduce_fn(mod(x)).backward()
@@ -119,9 +117,7 @@ class TestGSPMDMultiDevice(DestroyPGMixin, DTensorTestBase):
 
             @compile(
                 parallel_mode=GSPMDParallel("replicate", loss_reduction=loss_reduction),
-                gm_transformation=GraphModuleTransformation(
-                    backend=BackendType.XLA_GSPMD
-                ),
+                backend=XLAGSPMDBackend(),
             )
             def train_step_gspmd(mod, opt, x):
                 reduce_fn(mod(x)).backward()
