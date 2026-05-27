@@ -22,9 +22,8 @@ import torch
 import torch.nn as nn
 from parameterized import parameterized
 from recir.api import compile
-from recir.backend import BackendType
+from recir.backends import XLAGSPMDBackend
 from recir.distributed.parallel_mode import GSPMDParallel
-from recir.gm_transformation import GraphModuleTransformation
 from recir.lowering.xla_lower import _XLAModule
 from recir.region_transforms import RecomputeTransform
 from recir.tests.xla.gspmd_test_utils import (
@@ -46,7 +45,7 @@ def _make_train_step(num_ranks, loss_reduction, region_transforms):
             num_ranks=num_ranks,
             num_processes=1,
         ),
-        gm_transformation=GraphModuleTransformation(backend=BackendType.XLA_GSPMD),
+        backend=XLAGSPMDBackend(),
         region_transforms=region_transforms,
     )
     def train_step(mod, opt, x):
@@ -197,7 +196,6 @@ class TestGSPMDRecompute(unittest.TestCase):
                 num_ranks=2,
                 num_processes=2,
             ),
-            gm_transformation=None,
             region_transforms=[RecomputeTransform(submodule_fqns={"fc1"})],
         )
         def train_step(mod, opt, x):

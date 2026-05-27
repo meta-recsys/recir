@@ -32,9 +32,8 @@ from functorch import make_fx
 from generative_recommenders.common import HammerKernel, set_dev_mode
 from generative_recommenders.modules.stu import STU, STULayer, STULayerConfig, STUStack
 from recir.api import compile, COMPILED_OBJECT_KEY
-from recir.backend import BackendType
+from recir.backends import XLAGSPMDBackend
 from recir.distributed.parallel_mode import DataParallel, GSPMDParallel
-from recir.gm_transformation import GraphModuleTransformation
 
 
 def _has_gpu() -> bool:
@@ -574,10 +573,7 @@ class STUXLATest(unittest.TestCase):
                 num_ranks=num_devices,
                 num_processes=1,
             ),
-            # pyre-ignore[6]: GraphModuleTransformation is callable
-            gm_transformation=GraphModuleTransformation(
-                backend=BackendType.XLA_GSPMD,
-            ),
+            backend=XLAGSPMDBackend(),
         )
         def train_step(
             mod: torch.nn.Module,

@@ -16,11 +16,10 @@ implementations here removes the previous triplicate copies and makes future
 contract tweaks land in one place.
 """
 
-from typing import Any, Dict, List, Set
+from typing import Any, Dict, Set
 
 import torch
 import torch.nn as nn
-from recir.api import Override
 from recir.backends.base import Backend
 from recir.distributed.parallel_mode import ParallelMode
 from torch import fx
@@ -81,19 +80,4 @@ class _NoopBackend(Backend):
         return False
 
     def dispatch(self, gm: fx.GraphModule) -> nn.Module:
-        return gm
-
-
-class _DoNothingOverride(Override):
-    """Override that swaps nothing and applies no graph transform.
-
-    Used purely to exercise the legacy ``module_override=`` kwarg.
-    """
-
-    def replacement(self, fqn: str, orig_submodule: nn.Module) -> nn.Module:
-        return orig_submodule
-
-    def transform(
-        self, gm: fx.GraphModule, flat_state: List[torch.Tensor]
-    ) -> fx.GraphModule:
         return gm

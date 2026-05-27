@@ -239,8 +239,7 @@ class TestGSPMDFSDPSingleProcess(unittest.TestCase):
     def test_gspmd_fully_shard_compiles(self) -> None:
         """GSPMDParallel('fully_shard') should compile and set FSDP metadata."""
         from recir.api import compile
-        from recir.backend import BackendType
-        from recir.gm_transformation import GraphModuleTransformation
+        from recir.backends import XLAGSPMDBackend
         from recir.tests.xla.gspmd_test_utils import DIM, SimpleMLP
 
         torch.manual_seed(42)
@@ -258,9 +257,7 @@ class TestGSPMDFSDPSingleProcess(unittest.TestCase):
                 num_ranks=self.num_ranks,
                 num_processes=1,
             ),
-            gm_transformation=GraphModuleTransformation(  # pyre-ignore[6]
-                backend=BackendType.XLA_GSPMD,
-            ),
+            backend=XLAGSPMDBackend(),
         )
         def train_step(mod: Any, opt: Any, x: Any) -> None:
             torch.sum(mod(x)).backward()
@@ -281,10 +278,9 @@ class TestGSPMDFSDPSingleProcess(unittest.TestCase):
 
     @parameterized.expand([("sum",), ("mean",)])
     def test_gspmd_fsdp_device_state_numerics(self, loss_reduction: str) -> None:
-        """FSDP + GSPMD + enable_device_state=True matches CPU baseline."""
+        """FSDP + GSPMD + XLA device-state manager matches CPU baseline."""
         from recir.api import compile, sync_device_state_to_torch
-        from recir.backend import BackendType
-        from recir.gm_transformation import GraphModuleTransformation
+        from recir.backends import XLAGSPMDBackend
         from recir.tests.xla.gspmd_test_utils import (
             _run_single_rank_baseline,
             DIM,
@@ -314,10 +310,7 @@ class TestGSPMDFSDPSingleProcess(unittest.TestCase):
                 num_ranks=self.num_ranks,
                 num_processes=1,
             ),
-            gm_transformation=GraphModuleTransformation(  # pyre-ignore[6]
-                backend=BackendType.XLA_GSPMD,
-                enable_device_state=True,
-            ),
+            backend=XLAGSPMDBackend(),
         )
         def train_step(mod: Any, opt: Any, x: Any) -> None:
             reduce_fn(mod(x)).backward()
