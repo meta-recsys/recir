@@ -1845,7 +1845,7 @@ def make_compiled_runner(compiled_obj: Any) -> Callable[..., Any]:
     return runner
 
 
-def compile(  # noqa: C901 — orchestration: stages 0-10 + legacy DP/GSPMD wiring intentionally kept inline; refactor would obscure the pipeline.
+def compile(  # noqa: C901 — orchestration: stages 0-9 + legacy DP/GSPMD wiring intentionally kept inline; refactor would obscure the pipeline.
     module_override: Optional[List[Override]] = None,
     gm_transformation: Optional[Callable[[fx.GraphModule], fx.GraphModule]] = None,
     parallel_mode: Optional[ParallelMode] = None,
@@ -1856,45 +1856,191 @@ def compile(  # noqa: C901 — orchestration: stages 0-10 + legacy DP/GSPMD wiri
 ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
     r"""Compile and optimize a callable, which can be a train step within a training loop.
 
-    This method will extract :class:`nn.Module` and :class:`torch.optim.Optimizer`
-    instances from the input arguments and trace operations applied to their
-    parameters and states.
+    This is the public top-level entry point for the recir compile pipeline.
+    Extracts the :class:`nn.Module` + :class:`torch.optim.Optimizer` from the
+    decorated callable's arguments, traces them via :func:`trace`, runs
+    stages 3-9 via :func:`compile_from_gm`, then wraps the result in a
+    runtime callable that manages device state, flattens user args, threads
+    ``flat_state`` through every invocation, and routes ``last_iter=True``
+    for IterGraph cleanup on the final step.
+
+    Pipeline stages (the canonical recir vocabulary; consult the inline
+    ``# Stage N:`` comments in :func:`compile_from_gm` and the per-mode
+    helpers for the source-level boundaries).  **Stages 5-8 (optimize,
+    stage, dispatch, build) are owned by the configured**
+    :class:`~recir.backends.base.Backend`; the rest are owned by the
+    orchestrator.
+
+    * **Stage 0 -- eager_preproc.** User-supplied
+      ``Sequence[Callable[[nn.Module], None]]`` hooks that mutate the eager
+      module *before* tracing — attach hooks, register buffers, swap
+      non-traceable submodules.  Pre-FX; no graph artifact yet.  Driven by
+      :func:`_compile_via_backend` on the new path (legacy path also runs
+      ``eager_preproc`` so consumers can migrate the kwarg ahead of dropping
+      ``module_override=``).
+    * **Stage 1 -- trace.** :func:`functorch.make_fx` capture (Python -> FX)
+      via :func:`trace` and its inner :func:`_local_compile`.  Produces the
+      initial :class:`fx.GraphModule` plus a ``flat_state`` list whose
+      entries map 1:1 to the leading placeholders.  Multi-process modes
+      (DP / HybridParallel / GSPMD) inflate the input batch dim from
+      per-host to global before tracing via ``_make_batch_transform``.
+    * **Stage 2 -- post-trace meta tagging.** :func:`_tag_batch_inputs` plus
+      :func:`propagate_batch_input_meta` walk the gm and tag every
+      placeholder with ``is_batch_input`` / ``is_weight`` / ``batch_dim``
+      meta keys.  Drives downstream correctness for surgical orchestrators
+      that need to identify user-input placeholders semantically.
+    * **Stage 3 -- transform.**
+      ``region_transforms[*].finalize_compiled_graph(gm)``.  Each
+      :class:`RegionTransform` (recompute / regather / padding) finalizes
+      its rewrite after partition.  Code-order is *after* stage 4 to match
+      the legacy ``_compile_and_transform`` ordering; the verb "transform"
+      is reserved for these semantic rewrites.
+    * **Stage 4 -- partition.** Multi-device graph split:
+      ``parallel_mode.shard_params(...)`` followed by
+      ``parallel_mode.partition_from_module(...)``.  Inserts collectives,
+      rewrites the graph for DP / FSDP / GSPMD / Hybrid, then re-flattens
+      via :func:`_to_caller_flattened_graph_module` and rebuilds
+      ``flat_state``.  The verb "partition" is reserved for this distributed
+      graph split.
+    * **Stage 5 -- optimize** *(Backend)*.  ``backend.optimize_passes``
+      rewrites the gm without changing meaning: comm fusion, dead-code
+      elimination, scheduling, sparse-embedding decomposition.
+      Two-argument passes get ``(gm, flat_state)``; single-argument passes
+      get ``(gm,)``.  Owned by :attr:`Backend.optimize_passes`.
+    * **Stage 6 -- stage** *(Backend)*.  Wrap the gm in
+      :class:`IterGraphModule` when ``backend.uses_iter_graph`` is ``True``.
+      Splits one logical step into setup / main / cleanup sub-graphs so
+      cross-iteration passes can operate.  Gated by
+      :attr:`Backend.uses_iter_graph` and applied by
+      :func:`compile_from_gm`.
+    * **Stage 7 -- dispatch** *(Backend)*.  Backend-owned final rewrite.
+      XLA backends call ``partial_lower_xla`` to splice ``_XLAModule``
+      ``call_module`` nodes into the graph; :class:`InductorBackend` is a
+      no-op pass-through.  No backend IR yet — just subgraph carving +
+      routing.  The verb "lower" is banned here (it collides with JAX's
+      ``.lower()``); see :meth:`Backend.dispatch`.
+    * **Stage 8 -- build** *(Backend)*.  First point real backend artifacts
+      exist.  XLA: ``_XLAModule._compile_xla`` runs
+      ``jax.jit(...).lower(...).compile(...)``.  Inductor:
+      ``torch._inductor.compile_fx``.  Lazy — runs on the first forward of
+      the dispatched ``call_module``, not at decoration time.  The verb
+      "compile" is banned here (it's reserved for ``recir.compile``).
+    * **Stage 9 -- prebuild.** Stage 8 run ahead of time on the build host,
+      serialized to disk, reloaded on a production host.  Used for TPU
+      canaries to avoid paying compile cost in the training pod.  See
+      ``recir.lowering.aot.aot_compile_and_serialize``.
+
+    **Runtime wrap (post-stage 9).** :func:`compile` wraps the compiled
+    gm in a callable that manages device state via
+    :class:`~recir.lowering.device_state.DeviceStateManager` (e.g. for XLA
+    so state stays on TPU between steps), pytree-flattens user args,
+    threads ``flat_state`` through every invocation, and routes
+    ``last_iter=True`` for :class:`IterGraphModule` cleanup on the final
+    step.  This wrapping is what :func:`compile` adds on top of the lower-
+    level :func:`trace` + :func:`compile_from_gm` pair.
+
+    **Pipeline dataflow** (``[B]`` = owned by :class:`Backend`)::
+
+        nn.Module + args
+           |
+           v   Stage 0    eager_preproc (user callbacks)
+           |
+           v   Stage 1    trace (make_fx)              -- (gm, flat_state)
+           |
+           v   Stage 2    post-trace meta tagging
+           |
+           v   Stage 4    partition (shard + collectives)
+           |
+           v   Stage 3    transform (region finalize; code-order is AFTER stage 4)
+           |
+           v   Stage 5    optimize          [B]  Backend.optimize_passes
+           |
+           v   Stage 6    stage             [B]  IterGraphModule wrap if Backend.uses_iter_graph
+           |
+           v   Stage 7    dispatch          [B]  Backend.dispatch -- subgraph carving
+           |
+           v   Stage 8    build             [B]  JAX .lower-then-compile / Inductor -- lazy on first forward
+           |
+           v   Stage 9    prebuild               (optional AOT path -- serialize + load on target host)
+           |
+           v   runtime wrap (DeviceStateManager, input flattening, last_iter routing)
+
+    **Naming discipline.**  In recir, name by the artifact you produce.
+    If you emit FX, it is ``trace``.  If you make targeted edits to a
+    graph, it is ``patch``.  If you intentionally change model semantics
+    by rewriting a region, it is ``transform``.  If you split work across
+    devices, it is ``partition``.  If you improve scheduling / fusion /
+    elimination without semantic change, it is ``optimize``.  If you split
+    into setup / main / cleanup, it is ``stage``.  If you carve
+    backend-compatible islands and wrap them, it is ``dispatch`` — never
+    ``lower``.  If you produce backend IR or an executable, it is
+    ``build``.  If you do that ahead of runtime and persist the result,
+    it is ``prebuild``.  Only :func:`recir.compile` may use the verb
+    ``compile``.
 
     Args:
-        module_override (Optional[List[Override]]): a list of Override instances
-            that will be applied to the module in order. The :class:`Override`
-            objects provide :class:`nn.Module` replacements during tracing and a
-            graph transformation function after tracing. (Default: ``None``)
+        module_override (Optional[List[Override]]): a list of Override
+            instances applied to the module in order.  Each :class:`Override`
+            provides an :class:`nn.Module` replacement during tracing and a
+            graph transformation function after tracing.  (Default: ``None``)
 
             .. deprecated:: v7.1
-                Mutually exclusive with ``eager_preproc``.  Use ``eager_preproc``
-                for the new path; ``module_override`` will be deleted in C6.
+                Mutually exclusive with ``eager_preproc``.  Use
+                ``eager_preproc`` for the new path; ``module_override`` will
+                be deleted in C6.
         gm_transformation (Optional[Callable[fx.GraphModule, fx.GraphModule]]):
-            a callback that will be called after the original callable is
-            compiled and distributed (usually after the first iteration) to
-            transform the compiled GraphModule into a new optimized one.
+            a callback invoked on the compiled GraphModule after partition
+            to wrap / lower / optimize it (e.g. legacy
+            :class:`GraphModuleTransformation`).  (Default: ``None``)
 
             .. deprecated:: v7.1
-                Mutually exclusive with ``backend``.  Use ``backend`` for the new
-                path; ``gm_transformation`` will be deleted in C6.
-        parallel_mode (Optional[ParallelMode]): a :class:`ParallelMode` object
-            that specifies how to parallelize the callable. Each ParallelMode
-            would have its own strategy to partition the model and the captured
-            graph (Default: ``None``)
-        region_transforms (Optional[List[RegionTransform]]): a list of
-            :class:`RegionTransform` instances applied during tracing to rewrite
-            sub-regions of the forward graph (e.g. activation checkpointing via
-            :class:`RecomputeTransform`). (Default: ``None``)
-        backend (Optional[Backend]): a :class:`recir.backends.Backend` instance
-            that owns stages 6-10 (optimize_passes, IterGraph wrapping,
-            dispatch, build, serialize).  When provided, ``recir.compile``
-            routes through the new :func:`trace` + :func:`compile_from_gm`
-            pipeline.  Mutually exclusive with ``gm_transformation``.
+                Mutually exclusive with ``backend``.  Use ``backend`` for
+                the new path; ``gm_transformation`` will be deleted in C6.
+        parallel_mode (Optional[ParallelMode]): a :class:`ParallelMode`
+            instance specifying how to parallelize the callable.  Each
+            ``ParallelMode`` owns stage 4 (its
+            :meth:`~ParallelMode.partition_from_module` rewrites the
+            graph for the chosen DP / FSDP / GSPMD / Hybrid strategy).
+            ``DataParallel()`` is used when ``None`` is passed.
             (Default: ``None``)
-        eager_preproc (Sequence[Callable[[nn.Module], None]]): a sequence of
-            in-place pre-trace hooks that run against the model (stage 0).
-            Mutually exclusive with ``module_override``.  (Default: ``()``)
+        region_transforms (Optional[List[RegionTransform]]): a list of
+            :class:`RegionTransform` instances applied at stage 3 to
+            rewrite sub-regions of the forward graph (e.g. activation
+            checkpointing via :class:`RecomputeTransform`, jagged padding
+            via :class:`PaddingRegionTransform`).  Stage 3 is code-order
+            *after* stage 4 partition so the region rewrites see the
+            post-partition graph.  (Default: ``None``)
+        backend (Optional[Backend]): a :class:`recir.backends.Backend`
+            instance that owns stages 5-8 (``optimize_passes``,
+            ``uses_iter_graph`` IterGraph wrap, ``dispatch``, lazy
+            ``build``).  When provided, ``recir.compile`` routes through
+            the new :func:`trace` + :func:`compile_from_gm` pipeline.
+            Mutually exclusive with ``gm_transformation``.
+            (Default: ``None``)
+        eager_preproc (Sequence[Callable[[nn.Module], None]]): a sequence
+            of in-place pre-trace hooks that run against the model
+            argument (stage 0).  Each hook is invoked once on the first
+            :class:`nn.Module` discovered in the decorated callable's
+            arguments, before :func:`trace` runs.  Mutually exclusive with
+            ``module_override``.  (Default: ``()``)
 
+    Returns:
+        A decorator that, when applied to a callable, returns a wrapped
+        callable.  On the first invocation the wrapped callable runs the
+        full pipeline (stages 0-9) and caches the compiled object on
+        ``wrapper.__dict__[COMPILED_OBJECT_KEY]``; subsequent invocations
+        reuse the cached object and pay only the runtime cost (device
+        state sync + flat-state threading + gm forward).
+
+    See Also:
+        :func:`trace`: stages 0-2 alone, exposed so surgical orchestrators
+            (e.g. ``mivilm.surgeon.compile``) can splice graph-level edits
+            between the local trace and partition.
+        :func:`compile_from_gm`: stages 3-9 alone, takes a pre-traced gm
+            from :func:`trace` and drives partition / optimize / dispatch.
+        :mod:`recir.backends`: the :class:`Backend` ABC and concrete
+            subclasses (Inductor, XLA Dynamo-bridge, XLA GSPMD, XLA
+            ShardMap) that own stages 5-8.
     """
     if module_override and eager_preproc:
         raise ValueError("module_override and eager_preproc are mutually exclusive")
