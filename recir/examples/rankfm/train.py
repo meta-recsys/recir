@@ -7,21 +7,28 @@
 # pyre-strict
 
 """
-RankFM (xsurface V3) E2E training on GKE TPU v7x with:
-- recir @compile XLA GSPMD dense path on TPU (JAX PJRT)
-- PreprocessorDispatcher + SparseArchDispatcher from xsurface_test_utils
-  (these wrap the heavy preprocessor and ECSparseArch with dummy modules
-  during tracing, and dispatch to the real modules at runtime)
+RankFM (xsurface V3) E2E training on GKE TPU v7x.
+
+Dense HSTU path always runs on TPU via recir @compile + XLA GSPMD (JAX PJRT),
+using PreprocessorDispatcher + SparseArchDispatcher from xsurface_test_utils
+(these wrap the heavy preprocessor and ECSparseArch with dummy modules during
+tracing, and dispatch to the real modules at runtime).
+
+Supports two embedding backends (--embedding_backend):
+  cpu   torchrec DMP ROW_WISE/TABLE_WISE on CPU + gloo PG
+  tpu   JAX/SparseCore: tpu_sparse_dense_matmul + on-chip Adagrad
 
 Usage:
     python -u -m recir.examples.rankfm.train --preset small --max_steps 10
-    python -u -m recir.examples.rankfm.train --max_steps 20 --profile_start_step 5 --profile_end_step 10
+    python -u -m recir.examples.rankfm.train --preset small --max_steps 5 \\
+        --embedding_backend tpu
 """
 
 from __future__ import annotations
 
 import copy
 import logging
+import math
 import os
 import time
 from typing import Any, Dict, Iterator, List, Optional, Tuple
@@ -33,7 +40,7 @@ import recir.lowering.fbgemm_fallback  # noqa: F401 -- registers SPMD_DECOMP_TAB
 import torch
 import torch.distributed as dist
 import torch.nn as nn
-from hammer.v3.modules.recblock import _inputs_to_feature_bundle, RecBlock
+from hammer.v3.modules.recblock import _inputs_to_feature_bundle
 from recir.api import sync_device_state_to_torch
 from recir.backends import XLAGSPMDBackend
 from recir.decompositions import SPMD_DECOMP_TABLE
@@ -46,23 +53,15 @@ from recir.region_transforms.padding import (
 )
 from recir.tests.xla.xsurface_test_utils import (
     _build_full_model,
-    _build_overrides,
     _create_random_train_batch,
     _create_uniform_train_batch,
     resize_batch_inplace,
     TestConfigProvider,
 )
-from torchrec.distributed.embedding import EmbeddingCollectionSharder
-from torchrec.distributed.embedding_types import EmbeddingComputeKernel
-from torchrec.distributed.model_parallel import DistributedModelParallel
-from torchrec.distributed.planner import EmbeddingShardingPlanner, Topology
-from torchrec.distributed.planner.types import ParameterConstraints
-from torchrec.distributed.types import ShardingEnv, ShardingType
-from torchrec.optim.keyed import KeyedOptimizerWrapper
-from torchrec.optim.optimizers import in_backward_optimizer_filter
 
 from .config import RankFMConfig
 from .data_pipe import BatchReplayPipe, compute_kjt_key_to_size, replay_batch_iter
+from .embedding import build_embedding_backend
 
 # Bootstrap gr::batched_complete_cumsum if the C++ library failed to load
 # (e.g. OSS Docker container where hammer/oss/generative_recommenders/ops/cpp
@@ -97,167 +96,6 @@ def _setup_logging() -> None:
         datefmt="%m%d %H:%M:%S",
         force=True,
     )
-
-
-def init_dual_pg() -> Tuple[int, int]:
-    """Initialize gloo PG alongside JAX PJRT on GKE TPU.
-
-    JAX is auto-initialized by GKE env vars.
-    Gloo uses TPU_PROCESS_ADDRESSES for discovery and JOB_COMPLETION_INDEX for rank.
-
-    Returns (gloo_rank, gloo_world_size).
-    """
-    jax_rank = jax.process_index()
-    jax_world = jax.process_count()
-    logger.info(
-        f"JAX: process_index={jax_rank}, process_count={jax_world}, "
-        f"devices={len(jax.devices())}, platform={jax.devices()[0].platform}"
-    )
-
-    tpu_addrs = os.environ.get("TPU_PROCESS_ADDRESSES", "")
-    addr_list = [a.strip() for a in tpu_addrs.split(",") if a.strip()]
-
-    if not addr_list or len(addr_list) <= 1:
-        logger.info("Single-node mode: skipping gloo PG init")
-        return 0, 1
-
-    coordinator = addr_list[0].split(":")[0]
-    gloo_rank = int(os.environ.get("JOB_COMPLETION_INDEX", "0"))
-    gloo_world = len(addr_list)
-    gloo_port = int(os.environ.get("MASTER_PORT", "29500"))
-
-    logger.info(
-        f"Gloo init: rank={gloo_rank}, world={gloo_world}, "
-        f"coordinator={coordinator}:{gloo_port}"
-    )
-    dist.init_process_group(
-        backend="gloo",
-        init_method=f"tcp://{coordinator}:{gloo_port}",
-        world_size=gloo_world,
-        rank=gloo_rank,
-        timeout=torch.distributed.distributed_c10d.timedelta(seconds=300),
-    )
-    logger.info(
-        f"Gloo PG initialized: rank={dist.get_rank()}, world={dist.get_world_size()}"
-    )
-    return gloo_rank, gloo_world
-
-
-class _ECSharder(EmbeddingCollectionSharder):
-    """EmbeddingCollection sharder offering ROW_WISE + TABLE_WISE.
-
-    The actual per-table sharding choice is left to the planner via
-    `ParameterConstraints` in `setup_dmp` (small tables -> TABLE_WISE so
-    they aren't sliced too thin for fbgemm's CPU FUSED path; large tables
-    -> ROW_WISE so they scale across ranks). Kernel is always FUSED.
-    """
-
-    def __init__(
-        self,
-        kernel_type: str,
-        fused_params: Dict[str, Any] | None = None,
-    ) -> None:
-        self._kernel_type = kernel_type
-        if fused_params is None:
-            fused_params = {}
-        if "learning_rate" not in fused_params:
-            fused_params["learning_rate"] = 0.1
-        super().__init__(fused_params=fused_params)
-
-    def sharding_types(self, compute_device_type: str) -> List[str]:
-        return [
-            ShardingType.ROW_WISE.value,
-            ShardingType.TABLE_WISE.value,
-        ]
-
-    def compute_kernels(
-        self, sharding_type: str, compute_device_type: str
-    ) -> List[str]:
-        return [self._kernel_type]
-
-
-def setup_dmp(
-    model: nn.Module,
-    cfg: RankFMConfig,
-    gloo_world: int,
-) -> Tuple[nn.Module, torch.optim.Optimizer]:
-    """Shard the EC ROW_WISE on CPU via gloo, mirroring dlrmv3."""
-    if not dist.is_initialized():
-        logger.info("Single-node: skipping DMP, using model directly")
-        dense_opt = torch.optim.SGD(model.parameters(), lr=cfg.dense_lr, foreach=False)
-        return model, dense_opt
-
-    pg = dist.distributed_c10d._get_default_group()
-    sharders = [
-        _ECSharder(
-            kernel_type=EmbeddingComputeKernel.FUSED.value,
-            fused_params={"learning_rate": cfg.embedding_lr},
-        )
-    ]
-
-    # Per-table sharding constraints. Pure ROW_WISE failed because some
-    # categorical tables in rankfm are tiny (interface_type ~ 10 rows,
-    # device_os ~ 100 rows, etc.); slicing them across 32 ranks gives
-    # <=1 row per rank, which trips an fbgemm CUDA-only fast path even
-    # though we requested CPU FUSED. Pure TABLE_WISE works but doesn't
-    # scale large tables (post_id, viewer_rid). Mix: small tables ->
-    # TABLE_WISE (each lives on one rank), large -> ROW_WISE (sliced
-    # across ranks for memory + compute parallelism).
-    ec = (
-        model.recblock.tokenizer_stack.mot_sparse_arch._sparse_arch._embedding_collection  # pyre-ignore[16]
-    )
-    ROW_WISE_MIN_ROWS_PER_RANK = 100
-    row_wise_min = gloo_world * ROW_WISE_MIN_ROWS_PER_RANK
-    constraints: Dict[str, ParameterConstraints] = {}
-    for table in ec.embedding_configs():
-        if table.num_embeddings >= row_wise_min:
-            sharding = ShardingType.ROW_WISE.value
-        else:
-            sharding = ShardingType.TABLE_WISE.value
-        constraints[table.name] = ParameterConstraints(
-            sharding_types=[sharding],
-        )
-        logger.info(
-            "  constraint: %s (%d rows) -> %s",
-            table.name,
-            table.num_embeddings,
-            sharding,
-        )
-
-    planner = EmbeddingShardingPlanner(
-        topology=Topology(world_size=gloo_world, compute_device="cpu"),
-        constraints=constraints,
-    )
-    plan = planner.collective_plan(model, sharders, pg)
-    logger.info("DMP sharding plan:")
-    for module_path, module_plan in plan.plan.items():
-        for param_name, param_sharding in module_plan.items():
-            logger.info(
-                "  %s.%s: sharding_type=%s compute_kernel=%s",
-                module_path,
-                param_name,
-                param_sharding.sharding_type,
-                getattr(param_sharding, "compute_kernel", "?"),
-            )
-
-    dmp = DistributedModelParallel(
-        model,
-        env=ShardingEnv.from_process_group(pg),
-        plan=plan,
-        # pyre-ignore[6]: _ECSharder is a valid ModuleSharder subclass
-        sharders=sharders,
-        device=torch.device("cpu"),
-        init_data_parallel=False,
-    )
-    dense_opt = KeyedOptimizerWrapper(
-        dict(in_backward_optimizer_filter(dmp.named_parameters())),
-        lambda params: torch.optim.SGD(params, lr=cfg.dense_lr, foreach=False),
-    )
-    logger.info("DMP initialized: ROW_WISE EC on CPU (gloo_world=%d)", gloo_world)
-    # Return dmp.module so override matching (isinstance(orig_submodule,
-    # ECSparseArch)) still works - DMP shards the EmbeddingCollection in
-    # place inside ECSparseArch but doesn't replace the wrapper.
-    return dmp.module, dense_opt
 
 
 def _patch_test_config_provider(cfg: RankFMConfig) -> None:
@@ -306,9 +144,9 @@ def _patch_test_config_provider(cfg: RankFMConfig) -> None:
 
 def _build_compiled_train_step(
     cfg: RankFMConfig,
+    backend: Any,
     num_ranks: int,
     num_processes: int,
-    gloo_world: int,
     global_bs: int,
     data_pipe: Optional[BatchReplayPipe] = None,
 ) -> Tuple[Any, Any, Any, Any, Any, Dict[str, int], List[int]]:
@@ -316,9 +154,10 @@ def _build_compiled_train_step(
 
     Returns ``(train_step, model, opt, batch, feature_config, key_to_size,
     ro_per_key_budgets)``.  ``key_to_size`` is the model's KJT-feature ->
-    num_embeddings map computed pre-DMP (post-DMP the EC is wrapped in a
+    num_embeddings map computed pre-DMP/backend.setup (post-DMP the EC is wrapped in a
     ``ShardedEmbeddingCollection`` that doesn't expose
-    ``embedding_configs()``); use it to clamp loaded IDs into the model's
+    ``embedding_configs()``);
+    use it to clamp loaded IDs into the model's
     hash space at every runtime step.  ``ro_per_key_budgets`` is the per-
     key RO eager-pad budget (returned so the caller's training-loop replay
     iter can reuse the same numbers we used at trace time).
@@ -331,8 +170,8 @@ def _build_compiled_train_step(
     device = torch.device("cpu")
     model, feature_config = _build_full_model(device)
 
-    # Sync feature_config with the test constants so randgen produces
-    # shapes that match the padding budgets and override expectations.
+    # Sync feature_config with the test constants so randgen produces shapes
+    # that match the padding budgets and override expectations.
     feature_config.history_len = cfg.max_uih_seq_len
     feature_config.num_candidates_per_request = cfg.num_candidates
 
@@ -340,6 +179,12 @@ def _build_compiled_train_step(
         if p.is_floating_point():
             p.requires_grad_(True)
 
+    # Per-rank batch (NOT global). Each pod feeds its own local mini-batch to
+    # train_step at runtime; recir's _make_batch_transform expands the trace-
+    # time inputs by num_processes (=gloo_world) to produce a global view for
+    # GSPMD.  Use uniform (non-ROO) batches so B_NRO = local_bs * num_candidates
+    # is deterministic across ranks - required by the GSPMD shard-divisibility
+    # check on jagged tensor totals.
     torch.manual_seed(0)
     batch = _create_uniform_train_batch(
         feature_config,
@@ -348,65 +193,56 @@ def _build_compiled_train_step(
     )
 
     if cfg.enable_padding:
-        # Pre-compute padded_bs and pair_padded_bs using the SAME formula as
-        # PaddingRegionTransform's ``_discover``.  The override-built sample
-        # batch must already be at the post-pad sizes, otherwise the cached
-        # sparse-arch output won't dim-match the runtime-padded forward path
-        # (cat fails downstream in ``_forward_post_hstu``).
-        nd = num_ranks
-        padded_bs = compute_padded_shape(global_bs, nd)
-        # nro pair has its own batch dim (B_NRO != B_RO).  At trace time
-        # B_NRO = global_bs * num_candidates_per_request (uniform)
-        trace_pair_bs = global_bs * cfg.num_candidates
-        pair_padded_bs = compute_padded_shape(trace_pair_bs, nd)
-
-        # Override-build batch must be at the post-pad sizes so the cached
-        # sparse-arch output dim-matches the runtime-padded forward path.
-        # Build it by deep-copying the small runtime batch and resizing in
-        # place; calling ``_create_uniform_train_batch(batch_size=padded_bs)``
-        # directly can SIGABRT inside ``RandomDataPipe``'s C++ allocator at
-        # large ``batch_size * num_candidates_per_request * history_len``.
+        # Override-build sample uses GLOBAL sizes (matches PaddingRegionTransform's
+        # pad_to_static fake kernel which also returns global target_size).  Keeps
+        # FX trace shapes consistent across override outputs and PRT pad outputs
+        # (both at global).  At runtime, fwd_fn returns PER-HOST data so
+        # _to_sharded_jax can expand per-host to global, matching PRT runtime.
+        # Effective sharding modulus = lcm(GSPMD device count, total SC count).
+        # For JAX: lcm(jax.device_count()=256, sc_modulus(=16) × num_processes(=32) = 512) = 512.
+        # For CPU: lcm(num_ranks, 1 × num_processes) = num_ranks (no change).
+        # Padded shape thus divides both GSPMD shard width and SC CSR width
+        # (per-host SC × num_hosts).
+        padded_num_devices = math.lcm(num_ranks, backend.sc_modulus() * num_processes)
+        padded_ro_bs = compute_padded_shape(global_bs, padded_num_devices)
+        padded_nro_bs = compute_padded_shape(
+            global_bs * cfg.num_candidates, padded_num_devices
+        )
         expanded_batch = copy.deepcopy(batch)
         resize_batch_inplace(
             expanded_batch,
-            target_b_ro=padded_bs,
-            target_b_nro=pair_padded_bs,
+            target_b_ro=padded_ro_bs,
+            target_b_nro=padded_nro_bs,
         )
-        all_labels = expanded_batch.all_labels
-        assert all_labels is not None
-        override_batch_sample = _inputs_to_feature_bundle(
-            expanded_batch.ro_id_list_features,
-            None,
-            expanded_batch.nro_id_list_features,
-            expanded_batch.num_candidates,
-            all_labels,
-        )
-        override_bs = padded_bs
+        override_bs = padded_ro_bs
     else:
-        all_labels = batch.all_labels
-        assert all_labels is not None
-        override_batch_sample = _inputs_to_feature_bundle(
-            batch.ro_id_list_features,
-            None,
-            batch.nro_id_list_features,
-            batch.num_candidates,
-            all_labels,
+        expanded_batch = copy.deepcopy(batch)
+        resize_batch_inplace(
+            expanded_batch,
+            target_b_ro=global_bs,
+            target_b_nro=global_bs * cfg.num_candidates,
         )
         override_bs = global_bs
 
-    recblock = model.recblock
-    assert isinstance(recblock, RecBlock)
-    overrides = _build_overrides(
-        recblock,
-        override_batch_sample,
-        device,
-        batch_size=override_bs,
-        num_processes=num_processes,
+    all_labels = expanded_batch.all_labels
+    assert all_labels is not None
+    batch_sample = _inputs_to_feature_bundle(
+        expanded_batch.ro_id_list_features,
+        None,
+        expanded_batch.nro_id_list_features,
+        expanded_batch.num_candidates,
+        all_labels,
     )
 
-    # Compute KJT key -> num_embeddings map BEFORE DMP, while the EC still
-    # exposes embedding_configs() (the sharded post-DMP wrapper does not).
+    # Compute KJT key -> num_embeddings map BEFORE DMP/backend.setup, while the
+    # EC still exposes embedding_configs() (the sharded post-DMP wrapper does not).
     key_to_size: Dict[str, int] = compute_kjt_key_to_size(model)
+
+    # Capture KJT keys for the runtime reconstruction inside train_step.
+    # Computed against the uniform batch here so they're available BEFORE
+    # we (optionally) swap ``batch`` to the first replay batch below, and
+    # BEFORE backend.setup() runs (the JAX backend needs them to size
+    # per-feature seq_lens in init_sc_embedding_variables).
     ro_kjt_keys: List[str] = list(batch.ro_id_list_features.keys())
     nro_kjt_keys: List[str] = list(batch.nro_id_list_features.keys())
     _unary = batch.unary_features
@@ -450,8 +286,23 @@ def _build_compiled_train_step(
             )
             logger.info("[TRACE] using synthetic random batch for trace")
 
-    # Apply gloo + DMP for ROW_WISE embedding sharding.
-    model, dense_opt = setup_dmp(model, cfg, gloo_world)
+    # Extract table configs from the EC (before backend.setup() mutates anything).
+    # pyre-ignore[16]: dynamic submodule traversal through hammer v3 nn.Module
+    #   union; the runtime path exists on BlueReelsVDDTrainV3.
+    ec = model.recblock.tokenizer_stack.mot_sparse_arch._sparse_arch._embedding_collection
+    table_configs = ec.embedding_configs()
+
+    # Build overrides BEFORE backend.setup(). _build_overrides runs the sparse
+    # arch eagerly and captures its output via a forward hook; doing this against
+    # the original unmodified model is cleanest.
+    overrides = backend.get_override(
+        model.recblock, batch_sample, device, override_bs, num_ranks, num_processes
+    )
+
+    # Set up embedding storage (DMP for CPU, SparseCore for TPU).
+    model, dense_opt = backend.setup(
+        model, table_configs, cfg.embedding_lr, cfg.dense_lr, num_processes
+    )
 
     opt = dense_opt
 
@@ -477,7 +328,10 @@ def _build_compiled_train_step(
                     ),
                 },
                 batch_size_arg="ro_float_features",
-                num_devices=num_ranks,
+                # Align to lcm(GSPMD devices, total SC count) so PRT's
+                # runtime delivery matches the override-build sample's
+                # padded shape (which uses the same modulus above).
+                num_devices=math.lcm(num_ranks, backend.sc_modulus() * num_processes),
                 num_processes=num_processes,
             ),
         ]
@@ -561,6 +415,7 @@ def _compile_with_xsurface_dispatchers(
     PreprocessorDispatcher + SparseArchDispatcher pair.
     """
     from recir.api import make_compiled_runner
+    from torchrec.distributed.model_parallel import DistributedModelParallel
 
     # Stage 0
     model_to_train = (
@@ -817,7 +672,9 @@ def _run_training_loop(
         if jax_profiling and step == cfg.profile_end_step and profiling_active:
             jax.profiler.stop_trace()
             profiling_active = False
-            logger.info(f"[PROFILE] Stopped trace at step {step}")
+            logger.info(
+                f"[PROFILE] Stopped trace at step {step} — saved to {cfg.profile_dir}"
+            )
 
         if is_main:
             logger.info(f"Step {step}/{cfg.max_steps} | time={step_time:.2f}s")
@@ -826,9 +683,11 @@ def _run_training_loop(
 
     total_time = time.time() - start_time
 
-    if profiling_active:
+    if profiling_active and jax_profiling:
         jax.profiler.stop_trace()
-        logger.info("[PROFILE] Stopped trace (training ended)")
+        logger.info(
+            f"[PROFILE] Stopped trace (training ended) — saved to {cfg.profile_dir}"
+        )
 
     if is_main:
         logger.info(
@@ -838,12 +697,25 @@ def _run_training_loop(
 
 
 def main() -> None:
+    # Must be called before any JAX operation. On GKE TPU the PJRT plugin reads
+    # coordinator address and process index from TPU runtime metadata automatically.
+    # Without this, each pod runs as jax.process_count()=1 and the SparseCore
+    # hardware collective (which spans all 128 chips) deadlocks.
+    jax.distributed.initialize()
     _setup_logging()
+    logger.info(
+        f"[DIST] jax.distributed.initialize() done: "
+        f"process_count={jax.process_count()}, "
+        f"device_count={jax.device_count()}, "
+        f"local_device_count={jax.local_device_count()}, "
+        f"process_index={jax.process_index()}"
+    )
     cfg = RankFMConfig.from_args()
     logger.info(f"Config: {cfg}")
 
-    # --- 1. Dual PG init ---
-    gloo_rank, gloo_world = init_dual_pg()
+    # --- 1. Build embedding backend and init PG ---
+    backend = build_embedding_backend(cfg.embedding_backend)
+    gloo_rank, gloo_world = backend.init_pg()
     is_main = gloo_rank == 0
 
     # --- 2. Apply CLI knobs to xsurface_test_utils' TestConfigProvider ---
@@ -898,9 +770,9 @@ def main() -> None:
         ro_per_key_budgets,
     ) = _build_compiled_train_step(
         cfg,
+        backend=backend,
         num_ranks=num_ranks,
         num_processes=gloo_world,
-        gloo_world=gloo_world,
         global_bs=global_bs,
         data_pipe=data_pipe,
     )

@@ -122,6 +122,7 @@ spec:
                 --hash_size_cap 1000000
                 --l1_num_layers 3
                 --l2_num_layers 11
+                --embedding_backend cpu
                 --gcs_data_path /mnt/barnfs
                 --data_file_template "rank_${RANK}_batch_{i}.pt.zst"
                 --data_replicate_across_ranks

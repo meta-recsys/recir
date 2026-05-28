@@ -54,6 +54,9 @@ class RankFMConfig:
     data_file_template: str = ""
     data_replicate_across_ranks: bool = False
 
+    # Embedding backend: "cpu" (torchrec DMP) | "tpu" (JAX/SparseCore)
+    embedding_backend: str = "cpu"
+
     disable_seq_len_sampling: bool = False
 
     # Enable PaddingRegionTransform for dynamic-shape batches. When True,
@@ -104,6 +107,13 @@ class RankFMConfig:
         p.add_argument(
             "--enable_memory_log", action="store_true", default=cfg.enable_memory_log
         )
+        p.add_argument(
+            "--embedding_backend",
+            type=str,
+            default=cfg.embedding_backend,
+            choices=["cpu", "tpu"],
+            help="'cpu': torchrec DMP on CPU; 'tpu': JAX/SparseCore",
+        )
 
         p.add_argument(
             "--preset",
@@ -150,6 +160,7 @@ class RankFMConfig:
             gcs_data_path=args.gcs_data_path,
             data_file_template=args.data_file_template,
             data_replicate_across_ranks=args.data_replicate_across_ranks,
+            embedding_backend=args.embedding_backend,
             disable_seq_len_sampling=args.disable_seq_len_sampling,
             enable_padding=args.enable_padding,
             profile_start_step=args.profile_start_step,

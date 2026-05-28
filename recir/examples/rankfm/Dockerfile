@@ -19,6 +19,9 @@ RUN pip install torch --index-url https://download.pytorch.org/whl/cpu
 # JAX with TPU support
 RUN pip install "jax[tpu]"
 
+# JAX TPU embedding for SparseCore embedding lookup
+RUN pip install jax-tpu-embedding
+
 # torchrec + fbgemm (CPU variant for TPU machines)
 RUN pip install torchrec && \
     pip install fbgemm-gpu-cpu --force-reinstall || true
