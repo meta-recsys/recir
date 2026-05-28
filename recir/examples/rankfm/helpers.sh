@@ -24,7 +24,7 @@
 # fbcode/mrs/public_cloud/tpu/users/README.md and the Enablement MRS
 # Foundation namespace.
 
-_RANKFM_HELPERS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+_RANKFM_HELPERS_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]:-$0}")")" && pwd)"
 _RANKFM_FBCODE_ROOT="$(cd "${_RANKFM_HELPERS_DIR}/../../.." && pwd)"
 _RANKFM_DEFAULT_YAML="${_RANKFM_HELPERS_DIR}/rankfm-128chip.yaml"
 _RANKFM_BUILD_SCRIPT="${_RANKFM_HELPERS_DIR}/build_image_podman.sh"
