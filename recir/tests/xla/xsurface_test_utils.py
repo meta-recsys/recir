@@ -371,6 +371,14 @@ class DummySparseArch(nn.Module):
         m_v = mark_input(id_list_features.values(), prefix, 0)
         m_l = mark_input(id_list_features.lengths(), prefix, 1)
 
+        # Zero-valued anchor wired into every output's computation so FX
+        # trace DCE keeps the m_v / m_l input markers alive end-to-end.
+        # The deps=[m_v, m_l] hint to mark_output_with_bwd alone is not
+        # enough; without a real torch-op dependency the markers get pruned
+        # and install_graph_break_dispatch falls back to passing all
+        # train_step placeholders to fwd_fn.
+        anchor = (m_v.to(torch.int64).sum() * 0) + (m_l.to(torch.int64).sum() * 0)
+
         deps: List[torch.Tensor] = [m_v, m_l, self._grad_anchor]
 
         out_idx = 0
@@ -378,8 +386,8 @@ class DummySparseArch(nn.Module):
         for i, name in enumerate(self._feature_names):
             vbuf = getattr(self, f"_jt_values_{i}")
             lbuf = getattr(self, f"_jt_lengths_{i}")
-            v_z = torch.zeros_like(vbuf)
-            l_z = lbuf.clone()
+            v_z = torch.zeros_like(vbuf) + anchor.to(vbuf.dtype)
+            l_z = lbuf.clone() + anchor.to(lbuf.dtype)
             v = mark_output_with_bwd(v_z, prefix, out_idx, deps=deps)
             lengths = mark_output_with_bwd(l_z, prefix, out_idx + 1, deps=deps)
             result[name] = JaggedTensor(values=v, lengths=lengths)
@@ -655,12 +663,11 @@ class SparseArchDispatcher:
         num_ranks: int = self._num_ranks
 
         def fwd_fn(*input_tensors: torch.Tensor) -> Tuple[torch.Tensor, ...]:
+            # input_tensors == (values, lengths) thanks to mark_input markers
+            # in DummySparseArch.forward (kept alive through trace by the
+            # zero-valued anchor that depends on them).
             values = input_tensors[0]
             lengths = input_tensors[1]
-            # Padding may cause values/lengths mismatch: the preprocessor
-            # output lengths include padded dummy entries whose totals can
-            # exceed the values tensor size.  Pad or narrow values so that
-            # values.shape[0] == sum(lengths).
             total = int(lengths.sum().item())
             if values.shape[0] < total:
                 pad_size = total - values.shape[0]
