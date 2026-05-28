@@ -310,14 +310,23 @@ def _build_compiled_train_step(
     num_processes: int,
     gloo_world: int,
     global_bs: int,
-) -> Tuple[Any, Any, Any, Any, Any, Dict[str, int]]:
+    data_pipe: Optional[BatchReplayPipe] = None,
+) -> Tuple[Any, Any, Any, Any, Any, Dict[str, int], List[int]]:
     """Build model, batch, overrides, and the compiled train_step.
 
-    Returns (train_step, model, opt, batch, feature_config, key_to_size).
-    ``key_to_size`` is the model's KJT-feature -> num_embeddings map computed
-    pre-DMP (post-DMP the EC is wrapped in a ``ShardedEmbeddingCollection``
-    that doesn't expose ``embedding_configs()``); use it to clamp loaded IDs
-    into the model's hash space at every runtime step.
+    Returns ``(train_step, model, opt, batch, feature_config, key_to_size,
+    ro_per_key_budgets)``.  ``key_to_size`` is the model's KJT-feature ->
+    num_embeddings map computed pre-DMP (post-DMP the EC is wrapped in a
+    ``ShardedEmbeddingCollection`` that doesn't expose
+    ``embedding_configs()``); use it to clamp loaded IDs into the model's
+    hash space at every runtime step.  ``ro_per_key_budgets`` is the per-
+    key RO eager-pad budget (returned so the caller's training-loop replay
+    iter can reuse the same numbers we used at trace time).
+
+    When ``data_pipe`` is set, the *first* batch read from it is used as
+    the trace batch -- guarantees the trace's pytree schema (especially
+    ``all_labels`` keys, KJT key order) matches every subsequent runtime
+    batch from the same pipe.
     """
     device = torch.device("cpu")
     model, feature_config = _build_full_model(device)
@@ -398,18 +407,51 @@ def _build_compiled_train_step(
     # Compute KJT key -> num_embeddings map BEFORE DMP, while the EC still
     # exposes embedding_configs() (the sharded post-DMP wrapper does not).
     key_to_size: Dict[str, int] = compute_kjt_key_to_size(model)
+    ro_kjt_keys: List[str] = list(batch.ro_id_list_features.keys())
+    nro_kjt_keys: List[str] = list(batch.nro_id_list_features.keys())
+    _unary = batch.unary_features
+    assert _unary is not None
+    unary_kjt_keys: List[str] = list(_unary.keys())
+
+    _module_config = model.module_config  # pyre-ignore[16]
+    contextual_budgets_for_pad = dict(_module_config.contextual_feature_to_max_length)
+    ro_per_key_budgets: List[int] = [
+        cfg.local_batch_size * contextual_budgets_for_pad.get(k, cfg.max_uih_seq_len)
+        for k in ro_kjt_keys
+    ]
+
+    # Pick the trace batch: prefer the first real-data batch so trace and
+    # runtime see the same pytree schema; fall back to a synthetic random
+    # batch only when no data_pipe is configured.
+    if cfg.enable_padding and feature_config is not None:
+        if data_pipe is not None:
+            trace_iter = replay_batch_iter(
+                data_pipe,
+                key_to_size,
+                max_steps=1,
+                local_batch_size=cfg.local_batch_size,
+                num_candidates=cfg.num_candidates,
+                ro_target_keys=ro_kjt_keys,
+                nro_target_keys=nro_kjt_keys,
+                unary_target_keys=unary_kjt_keys,
+                ro_per_key_budgets=ro_per_key_budgets,
+            )
+            batch = next(trace_iter)
+            logger.info(
+                "[TRACE] using first replay batch (real data) for trace; "
+                "training loop will re-iterate data_pipe from the start"
+            )
+        else:
+            torch.manual_seed(0)
+            batch = _create_random_train_batch(
+                feature_config,
+                device,
+                batch_size=cfg.local_batch_size,
+            )
+            logger.info("[TRACE] using synthetic random batch for trace")
 
     # Apply gloo + DMP for ROW_WISE embedding sharding.
     model, dense_opt = setup_dmp(model, cfg, gloo_world)
-
-    # Capture KJT keys for the runtime reconstruction inside train_step.
-    ro_kjt = batch.ro_id_list_features
-    ro_kjt_keys: List[str] = ro_kjt.keys()
-    nro_kjt = batch.nro_id_list_features
-    nro_kjt_keys: List[str] = nro_kjt.keys()
-    unary_kjt = batch.unary_features
-    assert unary_kjt is not None
-    unary_kjt_keys: List[str] = unary_kjt.keys()
 
     opt = dense_opt
 
@@ -493,7 +535,15 @@ def _build_compiled_train_step(
         region_transforms=region_transforms,
     )
 
-    return train_step, model, opt, batch, feature_config, key_to_size
+    return (
+        train_step,
+        model,
+        opt,
+        batch,
+        feature_config,
+        key_to_size,
+        ro_per_key_budgets,
+    )
 
 
 def _compile_with_xsurface_dispatchers(
@@ -799,30 +849,8 @@ def main() -> None:
     # --- 2. Apply CLI knobs to xsurface_test_utils' TestConfigProvider ---
     _patch_test_config_provider(cfg)
 
-    # --- 3. Build model + overrides + compiled train_step ---
-    torch.manual_seed(0)
-    num_tpu_devices = jax.device_count()
-    num_ranks = num_tpu_devices if num_tpu_devices > 1 else gloo_world
-    # global_bs = local_batch_size * gloo_world (NOT * num_ranks). num_ranks
-    # (jax.device_count) is the GSPMD mesh size used for grad averaging;
-    # gloo_world is the number of OS processes contributing data. global_bs
-    # must equal local_batch_size * gloo_world for the override's
-    # cached_output (sized at global_bs) to match the expanded trace input.
-    global_bs = cfg.local_batch_size * gloo_world
-    train_step, model, opt, batch, feature_config, key_to_size = (
-        _build_compiled_train_step(
-            cfg,
-            num_ranks=num_ranks,
-            num_processes=gloo_world,
-            gloo_world=gloo_world,
-            global_bs=global_bs,
-        )
-    )
-
-    # --- 4. Optional GCS data pipe. When set, _run_training_loop iterates
-    # real batches from disk (one batch per file per epoch) and clamps KJT
-    # IDs into the model's hash space via key_to_size. PaddingRegionTransform
-    # handles the dynamic-shape padding at runtime.
+    # --- 3. Build data_pipe (BEFORE compile, so the trace batch can be
+    # pulled from it and the trace schema matches every runtime batch). ---
     data_pipe: Optional[BatchReplayPipe] = None
     if cfg.gcs_data_path:
         # When --data_file_template is set, generate filenames programmatically
@@ -850,17 +878,32 @@ def main() -> None:
     else:
         logger.info("Using synthetic data (no --gcs_data_path)")
 
-    # Per-key RO budgets for eager pad in data_pipe (matches PRT's per-key
-    # padding for ro_id_list_features). nro/unary use a single global formula
-    # (B * num_candidates) inside data_pipe; ro is per-key so we compute it
-    # here from the same module_config that PRT reads.
-    _module_config = model.module_config  # pyre-ignore[16]
-    ro_kjt_keys_for_pad = list(batch.ro_id_list_features.keys())
-    contextual_budgets_for_pad = dict(_module_config.contextual_feature_to_max_length)
-    ro_per_key_budgets: List[int] = [
-        cfg.local_batch_size * contextual_budgets_for_pad.get(k, cfg.max_uih_seq_len)
-        for k in ro_kjt_keys_for_pad
-    ]
+    # --- 4. Build model + overrides + compiled train_step.
+    # _build_compiled_train_step pulls the FIRST batch from ``data_pipe``
+    # (when set) and uses it as the trace batch, so the gm's input pytree
+    # schema matches every subsequent runtime batch from the same pipe.
+    # ``ro_per_key_budgets`` is returned here for the training loop's
+    # replay iter to reuse the same per-key budgets we used at trace time.
+    torch.manual_seed(0)
+    num_tpu_devices = jax.device_count()
+    num_ranks = num_tpu_devices if num_tpu_devices > 1 else gloo_world
+    global_bs = cfg.local_batch_size * gloo_world
+    (
+        train_step,
+        model,
+        opt,
+        batch,
+        feature_config,
+        key_to_size,
+        ro_per_key_budgets,
+    ) = _build_compiled_train_step(
+        cfg,
+        num_ranks=num_ranks,
+        num_processes=gloo_world,
+        gloo_world=gloo_world,
+        global_bs=global_bs,
+        data_pipe=data_pipe,
+    )
 
     # --- 5. Train ---
     _run_training_loop(
