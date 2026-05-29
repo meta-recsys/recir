@@ -19,8 +19,8 @@ Supports two embedding backends (--embedding_backend):
   tpu   JAX/SparseCore: tpu_sparse_dense_matmul + on-chip Adagrad
 
 Usage:
-    python -u -m recir.examples.rankfm.train --preset small --max_steps 10
-    python -u -m recir.examples.rankfm.train --preset small --max_steps 5 \\
+    python -u -m recir.examples.rankfm.train --max_steps 10
+    python -u -m recir.examples.rankfm.train --max_steps 5 \\
         --embedding_backend tpu
 """
 
@@ -40,6 +40,8 @@ import recir.lowering.fbgemm_fallback  # noqa: F401 -- registers SPMD_DECOMP_TAB
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+from hammer.v3.models.udd_fm_v3.batch_loader import BlueReelsVDDFeatureConfig
+from hammer.v3.models.udd_fm_v3.udd_fm_config import BlueReelsVDDModuleConfig
 from hammer.v3.modules.recblock import _inputs_to_feature_bundle
 from recir.api import sync_device_state_to_torch
 from recir.backends import XLAGSPMDBackend
@@ -52,14 +54,13 @@ from recir.region_transforms.padding import (
     PaddingRegionTransform,
 )
 from recir.tests.xla.xsurface_test_utils import (
-    _build_full_model,
     _create_random_train_batch,
     _create_uniform_train_batch,
+    build_model_from_config,
     resize_batch_inplace,
-    TestConfigProvider,
 )
 
-from .config import RankFMConfig
+from .config import build_module_config, parse_cli, RankFMTrainerConfig
 from .data_pipe import BatchReplayPipe, compute_kjt_key_to_size, replay_batch_iter
 from .embedding import build_embedding_backend
 
@@ -98,52 +99,10 @@ def _setup_logging() -> None:
     )
 
 
-def _patch_test_config_provider(cfg: RankFMConfig) -> None:
-    """Wire CLI knobs into TestConfigProvider so _build_full_model picks them up.
-
-    _build_full_model() in xsurface_test_utils.py calls TestConfigProvider()
-    directly and applies hardcoded overrides (TEST_UC_RID_HASH_SIZE = 1M,
-    L1/L2 stacks trimmed to 1 layer). To honor the CLI knobs without forking
-    _build_full_model, we monkey-patch the module constants and inject a
-    custom create_config that respects cfg.
-    """
-    import recir.tests.xla.xsurface_test_utils as xtu
-
-    xtu.TEST_UC_RID_HASH_SIZE = cfg.hash_size_cap
-    xtu.TEST_BATCH_SIZE = cfg.local_batch_size
-    xtu.TEST_MAX_UIH_SEQ_LEN = cfg.max_uih_seq_len
-    xtu.TEST_NUM_CANDIDATES = cfg.num_candidates
-
-    # Override stack trimming inside _build_full_model. _build_full_model
-    # always slices stack.stu_configs[:1]; we want [:l1_num_layers] and
-    # [:l2_num_layers]. Monkey-patch by wrapping create_config.
-    _orig_create: Any = TestConfigProvider.create_config
-
-    def _patched_create_config(self: TestConfigProvider) -> Any:
-        config = _orig_create(self)
-        module_config = config.module_config
-        if len(module_config.stu_stack_configs) >= 1:
-            module_config.stu_stack_configs[
-                0
-            ].stu_configs = module_config.stu_stack_configs[0].stu_configs[
-                : cfg.l1_num_layers
-            ]
-        if len(module_config.stu_stack_configs) >= 2:
-            module_config.stu_stack_configs[
-                1
-            ].stu_configs = module_config.stu_stack_configs[1].stu_configs[
-                : cfg.l2_num_layers
-            ]
-        if cfg.disable_seq_len_sampling:
-            module_config.hstu_seq_len_sampling_configs = None
-        return config
-
-    # pyre-ignore[8]
-    TestConfigProvider.create_config = _patched_create_config
-
-
 def _build_compiled_train_step(
-    cfg: RankFMConfig,
+    trainer_cfg: RankFMTrainerConfig,
+    module_config: BlueReelsVDDModuleConfig,
+    feature_config: BlueReelsVDDFeatureConfig,
     backend: Any,
     num_ranks: int,
     num_processes: int,
@@ -154,10 +113,9 @@ def _build_compiled_train_step(
 
     Returns ``(train_step, model, opt, batch, feature_config, key_to_size,
     ro_per_key_budgets)``.  ``key_to_size`` is the model's KJT-feature ->
-    num_embeddings map computed pre-DMP/backend.setup (post-DMP the EC is wrapped in a
-    ``ShardedEmbeddingCollection`` that doesn't expose
-    ``embedding_configs()``);
-    use it to clamp loaded IDs into the model's
+    num_embeddings map computed pre-backend.setup (post-DMP the EC is wrapped
+    in a ``ShardedEmbeddingCollection`` that doesn't expose
+    ``embedding_configs()``); use it to clamp loaded IDs into the model's
     hash space at every runtime step.  ``ro_per_key_budgets`` is the per-
     key RO eager-pad budget (returned so the caller's training-loop replay
     iter can reuse the same numbers we used at trace time).
@@ -168,16 +126,20 @@ def _build_compiled_train_step(
     batch from the same pipe.
     """
     device = torch.device("cpu")
-    model, feature_config = _build_full_model(device)
-
-    # Sync feature_config with the test constants so randgen produces shapes
-    # that match the padding budgets and override expectations.
-    feature_config.history_len = cfg.max_uih_seq_len
-    feature_config.num_candidates_per_request = cfg.num_candidates
+    model = build_model_from_config(module_config, device)
 
     for p in model.parameters():
         if p.is_floating_point():
             p.requires_grad_(True)
+
+    num_candidates_per_sample: int = int(module_config.hstu_max_output_len)
+
+    # Effective sharding modulus = lcm(GSPMD device count, total SC count).
+    # For JAX: lcm(jax.device_count()=256, sc_modulus(=16) × num_processes(=32)
+    # = 512) = 512.  For CPU: lcm(num_ranks, 1 × num_processes) = num_ranks
+    # (no change).  Padded shape thus divides both GSPMD shard width and SC
+    # CSR width (per-host SC × num_hosts).
+    padded_num_devices: int = math.lcm(num_ranks, backend.sc_modulus() * num_processes)
 
     # Per-rank batch (NOT global). Each pod feeds its own local mini-batch to
     # train_step at runtime; recir's _make_batch_transform expands the trace-
@@ -189,24 +151,18 @@ def _build_compiled_train_step(
     batch = _create_uniform_train_batch(
         feature_config,
         device,
-        batch_size=cfg.local_batch_size,
+        batch_size=trainer_cfg.local_batch_size,
     )
 
-    if cfg.enable_padding:
-        # Override-build sample uses GLOBAL sizes (matches PaddingRegionTransform's
-        # pad_to_static fake kernel which also returns global target_size).  Keeps
-        # FX trace shapes consistent across override outputs and PRT pad outputs
-        # (both at global).  At runtime, fwd_fn returns PER-HOST data so
+    if trainer_cfg.enable_padding:
+        # Override-build sample uses GLOBAL sizes (matches PRT's pad_to_static
+        # fake kernel which also returns global ``target_size``). Keeps FX
+        # trace shapes consistent across override outputs and PRT pad outputs
+        # (both at global). At runtime, fwd_fn returns PER-HOST data so
         # _to_sharded_jax can expand per-host to global, matching PRT runtime.
-        # Effective sharding modulus = lcm(GSPMD device count, total SC count).
-        # For JAX: lcm(jax.device_count()=256, sc_modulus(=16) × num_processes(=32) = 512) = 512.
-        # For CPU: lcm(num_ranks, 1 × num_processes) = num_ranks (no change).
-        # Padded shape thus divides both GSPMD shard width and SC CSR width
-        # (per-host SC × num_hosts).
-        padded_num_devices = math.lcm(num_ranks, backend.sc_modulus() * num_processes)
         padded_ro_bs = compute_padded_shape(global_bs, padded_num_devices)
         padded_nro_bs = compute_padded_shape(
-            global_bs * cfg.num_candidates, padded_num_devices
+            global_bs * num_candidates_per_sample, padded_num_devices
         )
         expanded_batch = copy.deepcopy(batch)
         resize_batch_inplace(
@@ -220,7 +176,7 @@ def _build_compiled_train_step(
         resize_batch_inplace(
             expanded_batch,
             target_b_ro=global_bs,
-            target_b_nro=global_bs * cfg.num_candidates,
+            target_b_nro=global_bs * num_candidates_per_sample,
         )
         override_bs = global_bs
 
@@ -234,39 +190,40 @@ def _build_compiled_train_step(
         all_labels,
     )
 
-    # Compute KJT key -> num_embeddings map BEFORE DMP/backend.setup, while the
-    # EC still exposes embedding_configs() (the sharded post-DMP wrapper does not).
+    # Compute KJT key -> num_embeddings map BEFORE backend.setup, while the EC
+    # still exposes embedding_configs() (the sharded post-DMP wrapper does not).
     key_to_size: Dict[str, int] = compute_kjt_key_to_size(model)
 
-    # Capture KJT keys for the runtime reconstruction inside train_step.
-    # Computed against the uniform batch here so they're available BEFORE
-    # we (optionally) swap ``batch`` to the first replay batch below, and
-    # BEFORE backend.setup() runs (the JAX backend needs them to size
-    # per-feature seq_lens in init_sc_embedding_variables).
+    # Capture KJT keys against the uniform batch BEFORE the trace batch swap
+    # below; needed by set_recir_kjt_keys and (for JAX) backend.seq_lens.
     ro_kjt_keys: List[str] = list(batch.ro_id_list_features.keys())
     nro_kjt_keys: List[str] = list(batch.nro_id_list_features.keys())
     _unary = batch.unary_features
     assert _unary is not None
     unary_kjt_keys: List[str] = list(_unary.keys())
 
-    _module_config = model.module_config  # pyre-ignore[16]
-    contextual_budgets_for_pad = dict(_module_config.contextual_feature_to_max_length)
+    # Per-key RO budgets for eager pad in data_pipe (matches PRT's per-key
+    # padding for ro_id_list_features). nro/unary use a single global formula
+    # (B * num_candidates) inside data_pipe; ro is per-key so we compute it
+    # here from the same module_config that PRT reads.
+    contextual_budgets_for_pad = dict(module_config.contextual_feature_to_max_length)
     ro_per_key_budgets: List[int] = [
-        cfg.local_batch_size * contextual_budgets_for_pad.get(k, cfg.max_uih_seq_len)
+        trainer_cfg.local_batch_size
+        * contextual_budgets_for_pad.get(k, int(module_config.hstu_max_seq_len))
         for k in ro_kjt_keys
     ]
 
     # Pick the trace batch: prefer the first real-data batch so trace and
     # runtime see the same pytree schema; fall back to a synthetic random
     # batch only when no data_pipe is configured.
-    if cfg.enable_padding and feature_config is not None:
+    if trainer_cfg.enable_padding and feature_config is not None:
         if data_pipe is not None:
             trace_iter = replay_batch_iter(
                 data_pipe,
                 key_to_size,
                 max_steps=1,
-                local_batch_size=cfg.local_batch_size,
-                num_candidates=cfg.num_candidates,
+                local_batch_size=trainer_cfg.local_batch_size,
+                num_candidates=num_candidates_per_sample,
                 ro_target_keys=ro_kjt_keys,
                 nro_target_keys=nro_kjt_keys,
                 unary_target_keys=unary_kjt_keys,
@@ -282,7 +239,7 @@ def _build_compiled_train_step(
             batch = _create_random_train_batch(
                 feature_config,
                 device,
-                batch_size=cfg.local_batch_size,
+                batch_size=trainer_cfg.local_batch_size,
             )
             logger.info("[TRACE] using synthetic random batch for trace")
 
@@ -292,16 +249,21 @@ def _build_compiled_train_step(
     ec = model.recblock.tokenizer_stack.mot_sparse_arch._sparse_arch._embedding_collection
     table_configs = ec.embedding_configs()
 
-    # Build overrides BEFORE backend.setup(). _build_overrides runs the sparse
-    # arch eagerly and captures its output via a forward hook; doing this against
-    # the original unmodified model is cleanest.
+    # Build overrides BEFORE backend.setup(). The override builder runs the
+    # sparse arch eagerly and captures its output (and, for JAX, the input
+    # KJT) via forward hooks; doing this against the original unmodified
+    # model is cleanest.
     overrides = backend.get_override(
         model.recblock, batch_sample, device, override_bs, num_ranks, num_processes
     )
 
     # Set up embedding storage (DMP for CPU, SparseCore for TPU).
     model, dense_opt = backend.setup(
-        model, table_configs, cfg.embedding_lr, cfg.dense_lr, num_processes
+        model,
+        table_configs,
+        trainer_cfg.embedding_lr,
+        trainer_cfg.dense_lr,
+        num_processes,
     )
 
     opt = dense_opt
@@ -311,7 +273,7 @@ def _build_compiled_train_step(
     )
 
     region_transforms: List[Any] = []
-    if cfg.enable_padding:
+    if trainer_cfg.enable_padding:
         region_transforms = [
             PaddingRegionTransform(
                 jagged_pairs={
@@ -324,15 +286,21 @@ def _build_compiled_train_step(
                         per_sample_budgets=1,
                         batch_size_arg="nro_float_features",
                         count_arg="num_candidates",
-                        max_per_sample_count=cfg.num_candidates,
+                        max_per_sample_count=num_candidates_per_sample,
                     ),
                 },
                 batch_size_arg="ro_float_features",
-                # Align to lcm(GSPMD devices, total SC count) so PRT's
-                # runtime delivery matches the override-build sample's
-                # padded shape (which uses the same modulus above).
-                num_devices=math.lcm(num_ranks, backend.sc_modulus() * num_processes),
+                # Align to lcm(GSPMD devices, total SC count) so PRT's runtime
+                # delivery matches the override-build sample's padded shape
+                # (which uses the same modulus above).
+                num_devices=padded_num_devices,
                 num_processes=num_processes,
+                skip_args={
+                    "ro_id_list_values",
+                    "ro_id_list_lengths",
+                    "nro_id_list_values",
+                    "nro_id_list_lengths",
+                },
             ),
         ]
 
@@ -450,11 +418,11 @@ def _compile_with_xsurface_dispatchers(
     return make_compiled_runner(compiled_obj)
 
 
-def _is_jax_profiling_enabled(cfg: RankFMConfig) -> bool:
+def _is_jax_profiling_enabled(trainer_cfg: RankFMTrainerConfig) -> bool:
     """Check if JAX profiling should be enabled (TPU present + start step > 0)."""
     try:
         is_tpu = len(jax.devices()) > 0 and jax.devices()[0].platform == "tpu"
-        return is_tpu and cfg.profile_start_step > 0
+        return is_tpu and trainer_cfg.profile_start_step > 0
     except (RuntimeError, IndexError):
         logger.warning("Could not detect JAX TPU platform, profiling disabled")
         return False
@@ -539,7 +507,7 @@ def _log_batch_info(step: int, batch: Any) -> None:
 
 def _next_training_batch(
     step: int,
-    cfg: RankFMConfig,
+    trainer_cfg: RankFMTrainerConfig,
     batch: Any,
     replay_iter: Optional[Iterator[Any]],
     feature_config: Any,
@@ -550,18 +518,19 @@ def _next_training_batch(
             return next(replay_iter)
         except StopIteration:
             return None
-    if cfg.enable_padding and feature_config is not None and step > 1:
+    if trainer_cfg.enable_padding and feature_config is not None and step > 1:
         torch.manual_seed(step)
         return _create_random_train_batch(
             feature_config,
             torch.device("cpu"),
-            batch_size=cfg.local_batch_size,
+            batch_size=trainer_cfg.local_batch_size,
         )
     return batch
 
 
 def _build_replay_iter(
-    cfg: RankFMConfig,
+    trainer_cfg: RankFMTrainerConfig,
+    num_candidates: int,
     data_pipe: Optional[BatchReplayPipe],
     key_to_size: Optional[Dict[str, int]],
     ro_target_keys: Optional[List[str]] = None,
@@ -579,9 +548,9 @@ def _build_replay_iter(
     return replay_batch_iter(
         data_pipe,
         key_to_size or {},
-        max_steps=cfg.max_steps,
-        local_batch_size=cfg.local_batch_size,
-        num_candidates=cfg.num_candidates,
+        max_steps=trainer_cfg.max_steps,
+        local_batch_size=trainer_cfg.local_batch_size,
+        num_candidates=num_candidates,
         ro_target_keys=ro_target_keys,
         nro_target_keys=nro_target_keys,
         unary_target_keys=unary_target_keys,
@@ -590,7 +559,7 @@ def _build_replay_iter(
 
 
 def _run_training_loop(
-    cfg: RankFMConfig,
+    trainer_cfg: RankFMTrainerConfig,
     train_step: Any,
     model: nn.Module,
     opt: torch.optim.Optimizer,
@@ -608,22 +577,22 @@ def _run_training_loop(
       1. ``data_pipe`` is set => iterate over real batches loaded from GCS
          (or local mirror). KJT IDs are clamped via ``key_to_size``.
          PaddingRegionTransform pads each loaded batch to static budgets.
-      2. ``cfg.enable_padding`` + ``feature_config`` => fresh random
+      2. ``trainer_cfg.enable_padding`` + ``feature_config`` => fresh random
          (jagged) batch per step; padded at trace time.
       3. otherwise => reuse the closure-captured uniform batch every step.
     """
-    jax_profiling = _is_jax_profiling_enabled(cfg)
+    jax_profiling = _is_jax_profiling_enabled(trainer_cfg)
     profiling_active = False
     if jax_profiling:
         logger.info(
-            f"JAX profiling enabled: steps {cfg.profile_start_step}-{cfg.profile_end_step}, "
-            f"dir={cfg.profile_dir}"
+            f"JAX profiling enabled: steps {trainer_cfg.profile_start_step}-"
+            f"{trainer_cfg.profile_end_step}, dir={trainer_cfg.profile_dir}"
         )
 
     model.train(True)
     mode = "replay" if data_pipe is not None else "synthetic"
     logger.info(
-        f"Starting training ({mode}): {cfg.max_steps} steps, global_bs={global_bs}"
+        f"Starting training ({mode}): {trainer_cfg.max_steps} steps, global_bs={global_bs}"
     )
     start_time = time.time()
     # The override was traced with the synthetic batch's key order. At
@@ -638,7 +607,8 @@ def _run_training_loop(
         list(batch.unary_features.keys()) if batch.unary_features is not None else None
     )
     replay_iter = _build_replay_iter(
-        cfg,
+        trainer_cfg,
+        int(model.module_config.hstu_max_output_len),  # pyre-ignore[16]
         data_pipe,
         key_to_size,
         ro_target_keys=ro_target_keys,
@@ -647,15 +617,17 @@ def _run_training_loop(
         ro_per_key_budgets=ro_per_key_budgets,
     )
 
-    for step in range(1, cfg.max_steps + 1):
-        if jax_profiling and step == cfg.profile_start_step:
-            if not cfg.profile_dir.startswith("gs://"):
-                os.makedirs(cfg.profile_dir, exist_ok=True)
-            jax.profiler.start_trace(cfg.profile_dir)
+    for step in range(1, trainer_cfg.max_steps + 1):
+        if jax_profiling and step == trainer_cfg.profile_start_step:
+            if not trainer_cfg.profile_dir.startswith("gs://"):
+                os.makedirs(trainer_cfg.profile_dir, exist_ok=True)
+            jax.profiler.start_trace(trainer_cfg.profile_dir)
             profiling_active = True
             logger.info(f"[PROFILE] Started trace at step {step}")
 
-        next_batch = _next_training_batch(step, cfg, batch, replay_iter, feature_config)
+        next_batch = _next_training_batch(
+            step, trainer_cfg, batch, replay_iter, feature_config
+        )
         if next_batch is None:
             logger.info(f"Replay pipe exhausted at step {step}; ending training.")
             break
@@ -669,16 +641,17 @@ def _run_training_loop(
         sync_device_state_to_torch(train_step)
         step_time = time.time() - step_start
 
-        if jax_profiling and step == cfg.profile_end_step and profiling_active:
+        if jax_profiling and step == trainer_cfg.profile_end_step and profiling_active:
             jax.profiler.stop_trace()
             profiling_active = False
             logger.info(
-                f"[PROFILE] Stopped trace at step {step} — saved to {cfg.profile_dir}"
+                f"[PROFILE] Stopped trace at step {step} — saved to "
+                f"{trainer_cfg.profile_dir}"
             )
 
         if is_main:
-            logger.info(f"Step {step}/{cfg.max_steps} | time={step_time:.2f}s")
-        if jax_profiling and cfg.enable_memory_log and is_main:
+            logger.info(f"Step {step}/{trainer_cfg.max_steps} | time={step_time:.2f}s")
+        if jax_profiling and trainer_cfg.enable_memory_log and is_main:
             _log_hbm_memory()
 
     total_time = time.time() - start_time
@@ -686,13 +659,14 @@ def _run_training_loop(
     if profiling_active and jax_profiling:
         jax.profiler.stop_trace()
         logger.info(
-            f"[PROFILE] Stopped trace (training ended) — saved to {cfg.profile_dir}"
+            f"[PROFILE] Stopped trace (training ended) — saved to "
+            f"{trainer_cfg.profile_dir}"
         )
 
     if is_main:
         logger.info(
-            f"Training complete: {cfg.max_steps} steps in {total_time:.1f}s "
-            f"({total_time / cfg.max_steps:.2f}s/step)"
+            f"Training complete: {trainer_cfg.max_steps} steps in {total_time:.1f}s "
+            f"({total_time / trainer_cfg.max_steps:.2f}s/step)"
         )
 
 
@@ -710,56 +684,65 @@ def main() -> None:
         f"local_device_count={jax.local_device_count()}, "
         f"process_index={jax.process_index()}"
     )
-    cfg = RankFMConfig.from_args()
-    logger.info(f"Config: {cfg}")
+    trainer_cfg, model_args = parse_cli()
+    logger.info(f"Trainer config: {trainer_cfg}")
+    logger.info(f"Model args: {model_args}")
 
     # --- 1. Build embedding backend and init PG ---
-    backend = build_embedding_backend(cfg.embedding_backend)
+    backend = build_embedding_backend(trainer_cfg.embedding_backend)
     gloo_rank, gloo_world = backend.init_pg()
     is_main = gloo_rank == 0
 
-    # --- 2. Apply CLI knobs to xsurface_test_utils' TestConfigProvider ---
-    _patch_test_config_provider(cfg)
+    # --- 2. Mesh shapes ---
+    # global_bs = local_batch_size * gloo_world (NOT * num_ranks).
+    # num_ranks (jax.device_count) is the GSPMD mesh size used for grad
+    # averaging; gloo_world is the number of OS processes contributing
+    # data.  global_bs must equal local_batch_size * gloo_world for the
+    # override's cached_output (sized at global_bs) to match the
+    # expanded trace input.
+    num_tpu_devices = jax.device_count()
+    num_ranks = num_tpu_devices if num_tpu_devices > 1 else gloo_world
+    global_bs = trainer_cfg.local_batch_size * gloo_world
 
-    # --- 3. Build data_pipe (BEFORE compile, so the trace batch can be
+    # --- 3. Build module + feature config (single source of truth) ---
+    module_config, feature_config = build_module_config(model_args)
+
+    # --- 4. Build data_pipe (BEFORE compile, so the trace batch can be
     # pulled from it and the trace schema matches every runtime batch). ---
     data_pipe: Optional[BatchReplayPipe] = None
-    if cfg.gcs_data_path:
+    if trainer_cfg.gcs_data_path:
         # When --data_file_template is set, generate filenames programmatically
         # and skip directory enumeration (avoids the 58-min ls /mnt/barnfs
         # tax). One file per epoch — the rotating window in
         # replay_batch_iter provides per-step diversity within that file.
         explicit_files: Optional[List[str]] = None
-        if cfg.data_file_template:
-            explicit_files = [cfg.data_file_template.format(i=1)]
+        if trainer_cfg.data_file_template:
+            explicit_files = [trainer_cfg.data_file_template.format(i=1)]
             logger.info(
                 f"Direct-read mode: file_list={explicit_files} (template "
-                f"'{cfg.data_file_template}')"
+                f"'{trainer_cfg.data_file_template}')"
             )
         data_pipe = BatchReplayPipe(
-            path=cfg.gcs_data_path,
+            path=trainer_cfg.gcs_data_path,
             rank=gloo_rank,
             world_size=gloo_world,
-            replicate_across_ranks=cfg.data_replicate_across_ranks,
+            replicate_across_ranks=trainer_cfg.data_replicate_across_ranks,
             file_list=explicit_files,
         )
         logger.info(
             f"Replay pipe: {len(data_pipe)} batches for rank {gloo_rank} "
-            f"(replicate={cfg.data_replicate_across_ranks})"
+            f"(replicate={trainer_cfg.data_replicate_across_ranks})"
         )
     else:
         logger.info("Using synthetic data (no --gcs_data_path)")
 
-    # --- 4. Build model + overrides + compiled train_step.
+    # --- 5. Build model + overrides + compiled train_step.
     # _build_compiled_train_step pulls the FIRST batch from ``data_pipe``
     # (when set) and uses it as the trace batch, so the gm's input pytree
     # schema matches every subsequent runtime batch from the same pipe.
     # ``ro_per_key_budgets`` is returned here for the training loop's
     # replay iter to reuse the same per-key budgets we used at trace time.
     torch.manual_seed(0)
-    num_tpu_devices = jax.device_count()
-    num_ranks = num_tpu_devices if num_tpu_devices > 1 else gloo_world
-    global_bs = cfg.local_batch_size * gloo_world
     (
         train_step,
         model,
@@ -769,7 +752,9 @@ def main() -> None:
         key_to_size,
         ro_per_key_budgets,
     ) = _build_compiled_train_step(
-        cfg,
+        trainer_cfg,
+        module_config,
+        feature_config,
         backend=backend,
         num_ranks=num_ranks,
         num_processes=gloo_world,
@@ -777,16 +762,16 @@ def main() -> None:
         data_pipe=data_pipe,
     )
 
-    # --- 5. Train ---
+    # --- 6. Train ---
     _run_training_loop(
-        cfg,
+        trainer_cfg,
         train_step,
         model,
         opt,
         batch,
         is_main,
         global_bs,
-        feature_config=feature_config if cfg.enable_padding else None,
+        feature_config=feature_config if trainer_cfg.enable_padding else None,
         data_pipe=data_pipe,
         key_to_size=key_to_size,
         ro_per_key_budgets=ro_per_key_budgets,
