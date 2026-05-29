@@ -653,6 +653,17 @@ def _run_training_loop(
         ro_per_key_budgets=ro_per_key_budgets,
     )
 
+    # Sync device_state -> torch every N steps. Per-step sync_device_state_to_torch
+    # was costing ~200ms/iter directly (XLA→torch copy of every parameter) plus
+    # ~400ms/iter indirectly (it blocks JAX, preventing TPU compute from overlapping
+    # the next iter's data prep). We only need the sync for: (a) periodic backpressure
+    # so JAX's submit queue doesn't grow unbounded, (b) accurate timing measurement,
+    # (c) final checkpointing. SYNC_INTERVAL controls (a) and (b); the post-loop sync
+    # below covers (c).
+    SYNC_INTERVAL = 10
+    last_sync_t = time.time()
+    last_sync_step = 0
+
     for step in range(1, cfg.max_steps + 1):
         if jax_profiling and step == cfg.profile_start_step:
             if not cfg.profile_dir.startswith("gs://"):
@@ -670,10 +681,11 @@ def _run_training_loop(
         if is_main:
             _log_batch_info(step, batch)
 
-        step_start = time.time()
+        # Async submit. With the fast path enabled (XLADeviceStateManager keeps
+        # parameters resident as JAX arrays between calls), train_step returns
+        # immediately; TPU executes in the background overlapped with the next
+        # iter's _next_training_batch.
         train_step(model, opt, *_extract_train_step_args(batch))
-        sync_device_state_to_torch(train_step)
-        step_time = time.time() - step_start
 
         if jax_profiling and step == cfg.profile_end_step and profiling_active:
             jax.profiler.stop_trace()
@@ -682,8 +694,22 @@ def _run_training_loop(
                 f"[PROFILE] Stopped trace at step {step} — saved to {cfg.profile_dir}"
             )
 
-        if is_main:
-            logger.info(f"Step {step}/{cfg.max_steps} | time={step_time:.2f}s")
+        is_last_step = step == cfg.max_steps
+        if step % SYNC_INTERVAL == 0 or is_last_step:
+            sync_device_state_to_torch(train_step)
+            now = time.time()
+            window_steps = step - last_sync_step
+            window_secs = now - last_sync_t
+            avg_step_s = window_secs / window_steps if window_steps else 0.0
+            if is_main:
+                logger.info(
+                    f"Step {step}/{cfg.max_steps} | "
+                    f"avg step (last {window_steps}) = {avg_step_s:.3f}s "
+                    f"({window_steps / window_secs:.2f} steps/s)"
+                )
+            last_sync_t = now
+            last_sync_step = step
+
         if jax_profiling and cfg.enable_memory_log and is_main:
             _log_hbm_memory()
 
