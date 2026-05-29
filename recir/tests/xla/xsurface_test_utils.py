@@ -11,7 +11,7 @@ functions used by both the fake-tracing-compat test and the XLA compile test.
 
 import contextlib
 import unittest
-from typing import Any, cast, Dict, Generator, List, Optional, Tuple
+from typing import Any, Callable, cast, Dict, Generator, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -830,50 +830,61 @@ def _build_overrides(
     ]
 
 
-def _build_full_model(
-    device: torch.device,
-) -> Tuple[BlueReelsVDDTrainV3, BlueReelsVDDFeatureConfig]:
-    """Build the full V3 xsurface model with test-sized configs.
+@contextlib.contextmanager
+def _ec_sparse_arch_on(device: torch.device) -> Generator[None, None, None]:
+    """Force ``ECSparseArch`` to build its embedding tables on ``device``.
 
-    The post-refactor model class takes a pre-built ``RecBlock`` and a
-    duck-typed ``module_config``. We construct the ``RecBlock`` externally via
-    ``build_recblock_from_xsurface_config`` from ``udd_fm_train_v3``.
+    ``ECSparseArch.__init__`` defaults to ``torch.device("meta")`` when no
+    ``device=`` is passed by the caller. Letting it stay on meta would force
+    every test to call ``model.to_empty(device)`` afterwards to materialize
+    the tables, which in turn blows away every parameter and non-persistent
+    buffer in the model.
+
+    Patching the default at construction time lets the entire model build
+    correctly on CPU in one pass, so no post-hoc re-init is needed.
     """
-    config_provider = TestConfigProvider()
-    config = config_provider.create_config()
-    module_config = cast(BlueReelsVDDModuleConfig, config.module_config)
-    feature_config = cast(BlueReelsVDDFeatureConfig, config.feature_config)
-    # Trim each STU stack to a single layer to keep the test cheap.
-    # Also disable ``use_cuda_attention`` on every attn config so the kernel
-    # selection in ``hstu_cross_mha`` falls back to the pure-PyTorch path.
-    # The CUDA path calls ``torch.ops.hstu.hstu_mha_{fwd,bwd}`` which lacks
-    # Meta kernel registration and breaks make_fx FakeTensor tracing.
+    original_init: Callable[..., None] = ECSparseArch.__init__
+
+    def patched_init(  # pyre-ignore[2,3]
+        self: ECSparseArch, *args: Any, **kwargs: Any
+    ) -> None:
+        kwargs.setdefault("device", device)
+        original_init(self, *args, **kwargs)
+
+    ECSparseArch.__init__ = patched_init  # pyre-ignore[8]
+    try:
+        yield
+    finally:
+        ECSparseArch.__init__ = original_init  # pyre-ignore[8]
+
+
+def build_model_from_config(
+    module_config: BlueReelsVDDModuleConfig,
+    device: torch.device,
+) -> BlueReelsVDDTrainV3:
+    """Build the V3 xsurface model from a preconfigured ``module_config``."""
     for stack in module_config.stu_stack_configs:
-        stack.stu_configs = stack.stu_configs[:1]
         for stu_config in stack.stu_configs:
-            # ``STUSelfAttnConfig`` is NamedTuple-based; use ``_replace``.
             stu_config.attn_config = stu_config.attn_config._replace(
                 use_cuda_attention=False
             )
 
-    recblock = build_recblock_from_xsurface_config(
-        module_config=module_config,
-        is_train=True,
-        custom_kernel=False,
-    )
-    model = BlueReelsVDDTrainV3(
-        module_config=module_config,
-        recblock=recblock,
-        is_train=True,
-    )
-    # Force pure PyTorch kernels (Triton kernels lack FakeTensor support).
+    with _ec_sparse_arch_on(device):
+        recblock = build_recblock_from_xsurface_config(
+            module_config=module_config,
+            is_train=True,
+            custom_kernel=False,
+        )
+        model = BlueReelsVDDTrainV3(
+            module_config=module_config,
+            recblock=recblock,
+            is_train=True,
+        )
+    model.to(device)
+
+    # Force pure PyTorch kernels (Triton kernels lack TPU support).
     model.recursive_setattr("_hammer_kernel", HammerKernel.PYTORCH)
-
-    # Disable bf16 training: XLA's GSPMD collective-permute disallows
-    # mixed precision, and the model's explicit .to(bf16) casts create
-    # bf16 intermediates alongside f32 ECSparseArch outputs.
     model.recursive_setattr("_bf16_training", False)
-
     # Zero out all remaining dropout. torchax's aten.bernoulli uses a PRNG
     # key stored in the Environment as mutable state; on the second jit call
     # the leaked tracer reference causes UnexpectedTracerError.
@@ -883,21 +894,29 @@ def _build_full_model(
         if isinstance(m, torch.nn.Dropout):
             m.p = 0.0
 
-    # The post-refactor ``UnaryEmbeddingBagBatched`` is already a pure PyTorch
-    # implementation (see hammer/v3/models/udd_fm_v3/modules.py), so the
-    # legacy fbgemm -> pytorch swap is no longer needed.
+    return model
 
-    model.to_empty(device=device)
-    # Use f32 for all floating-point params/buffers.  XLA's GSPMD
-    # collective-permute disallows mixed precision (f32 + bf16), and
-    # ECSparseArch's EmbeddingCollection calls .float() on lookup results,
-    # so using bf16 params creates a dtype mismatch.
-    for p in model.parameters():
-        if p.is_floating_point():
-            p.data = p.data.to(torch.float32)
-    for _buf_name, buf in model.named_buffers():
-        if buf.is_floating_point():
-            buf.data = buf.data.to(torch.float32)
+
+def _build_full_model(
+    device: torch.device,
+    disable_seq_len_sampling: bool = False,
+) -> Tuple[BlueReelsVDDTrainV3, BlueReelsVDDFeatureConfig]:
+    """Build the full V3 xsurface model with test-sized configs.
+
+    Thin wrapper over :func:`build_model_from_config`: constructs the
+    module/feature configs via TestConfigProvider, trims STU stacks to
+    a single layer to keep tests cheap, then delegates the model build
+    + FakeTensor-tracing-safe wiring to ``build_model_from_config``.
+    """
+    config = TestConfigProvider().create_config()
+    module_config = cast(BlueReelsVDDModuleConfig, config.module_config)
+    feature_config = cast(BlueReelsVDDFeatureConfig, config.feature_config)
+    if disable_seq_len_sampling:
+        module_config.hstu_seq_len_sampling_configs = None
+    # Trim each STU stack to a single layer to keep the test cheap.
+    for stack in module_config.stu_stack_configs:
+        stack.stu_configs = stack.stu_configs[:1]
+    model = build_model_from_config(module_config, device)
     return model, feature_config
 
 
