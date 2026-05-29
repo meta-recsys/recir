@@ -1045,6 +1045,102 @@ def resize_kjt_b(kjt: KeyedJaggedTensor, target_b: int) -> KeyedJaggedTensor:
     )
 
 
+def resize_kjt_per_key_lengths(
+    kjt: KeyedJaggedTensor,
+    per_key_per_sample_budgets: Dict[str, int],
+    batch_size: int,
+) -> KeyedJaggedTensor:
+    """Resize each key's per-sample length to its configured budget."""
+    keys = kjt.keys()
+    K = len(keys)
+    cur_lengths = kjt.lengths()
+    cur_values = kjt.values()
+    assert cur_lengths.shape[0] == K * batch_size, (
+        f"KJT lengths size {cur_lengths.shape[0]} != "
+        f"num_keys ({K}) * batch_size ({batch_size})"
+    )
+
+    new_lengths_parts: List[torch.Tensor] = []
+    new_values_parts: List[torch.Tensor] = []
+    cur_offset = 0
+
+    for k_idx, key in enumerate(keys):
+        key_lengths = cur_lengths[k_idx * batch_size : (k_idx + 1) * batch_size]
+        key_total = int(key_lengths.sum().item())
+        key_values = cur_values[cur_offset : cur_offset + key_total]
+        cur_offset += key_total
+
+        if key not in per_key_per_sample_budgets:
+            new_lengths_parts.append(key_lengths)
+            new_values_parts.append(key_values)
+            continue
+
+        budget = int(per_key_per_sample_budgets[key])
+        new_key_lengths = torch.full(
+            (batch_size,),
+            budget,
+            dtype=key_lengths.dtype,
+            device=key_lengths.device,
+        )
+
+        if budget == 0:
+            new_key_values = torch.empty(
+                0, dtype=key_values.dtype, device=key_values.device
+            )
+        elif key_total == 0:
+            new_key_values = torch.zeros(
+                (budget * batch_size,),
+                dtype=key_values.dtype,
+                device=key_values.device,
+            )
+        else:
+            cum = torch.cat(
+                [
+                    torch.zeros(1, dtype=key_lengths.dtype, device=key_lengths.device),
+                    key_lengths.cumsum(0),
+                ]
+            )
+            sample_parts: List[torch.Tensor] = []
+            for b in range(batch_size):
+                start = int(cum[b].item())
+                end = int(cum[b + 1].item())
+                sample_data = key_values[start:end]
+                sample_len = end - start
+                if sample_len >= budget:
+                    sample_parts.append(sample_data[:budget])
+                elif sample_len == 0:
+                    sample_parts.append(
+                        torch.zeros(
+                            (budget,),
+                            dtype=key_values.dtype,
+                            device=key_values.device,
+                        )
+                    )
+                else:
+                    n_full = budget // sample_len
+                    n_extra = budget - n_full * sample_len
+                    parts = [sample_data] * n_full
+                    if n_extra > 0:
+                        parts.append(sample_data[:n_extra])
+                    sample_parts.append(torch.cat(parts))
+            new_key_values = torch.cat(sample_parts)
+
+        new_lengths_parts.append(new_key_lengths)
+        new_values_parts.append(new_key_values)
+
+    new_lengths = torch.cat(new_lengths_parts)
+    new_values = (
+        torch.cat(new_values_parts)
+        if new_values_parts
+        else torch.empty(0, dtype=cur_values.dtype, device=cur_values.device)
+    )
+    return KeyedJaggedTensor.from_lengths_sync(
+        keys=keys,
+        values=new_values,
+        lengths=new_lengths,
+    )
+
+
 def resize_batch_inplace(
     batch: MTMLROOTrainBatch, target_b_ro: int, target_b_nro: int
 ) -> None:
@@ -1060,9 +1156,10 @@ def resize_batch_inplace(
     tokenizer's call to the sparse arch in :func:`_build_overrides`, and
     the forward hook then never fires, leaving the cached output empty.
 
-    ``num_candidates`` is regenerated as a roughly-uniform distribution
-    of ``target_b_nro`` across ``target_b_ro`` slots so every entry is
-    at least ``floor(target_b_nro / target_b_ro)``.
+    ``num_candidates`` is distributed as ``target_b_nro // target_b_ro``
+    floor with first ``remainder`` samples getting +1, so
+    ``sum(num_candidates) == target_b_nro`` exactly -- mirrors PRT's
+    ``pad_count_to_sum`` runtime behavior.
     """
     if batch.ro_float_features.shape[0] != target_b_ro:
         batch.ro_float_features = _tile_dim0(batch.ro_float_features, target_b_ro)

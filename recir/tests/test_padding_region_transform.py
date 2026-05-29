@@ -840,7 +840,8 @@ class BsIdxCountArgIntegrationTest(unittest.TestCase):
 
     def _make_tensors(self) -> Tuple[torch.Tensor, ...]:
         # B_RO=16, jagged num_candidates summing to B_NRO=77 (max=11).
-        # pair_bs (upper bound) = 16 * 11 = 176; pair_padded_bs = 176 + 4 = 180.
+        # padded_bs = ceil(16/4)*4 = 16, == B_RO → +4 = 20.
+        # pair_padded_bs = padded_bs * max_c = 20 * 11 = 220.
         num_candidates = torch.tensor(
             [1, 2, 3, 4, 5, 6, 7, 8, 9, 1, 2, 3, 4, 5, 6, 11], dtype=torch.long
         )
@@ -855,12 +856,17 @@ class BsIdxCountArgIntegrationTest(unittest.TestCase):
             num_candidates,
         )
 
-    def test_pair_padded_bs_uses_unified_algo(self) -> None:
-        """pair_bs = 16 * 11 = 176; ceil(176/4)*4 = 176, == pair_bs → +4 = 180."""
+    def test_pair_padded_bs_uses_padded_bs_times_max_count(self) -> None:
+        """pair_padded_bs = padded_bs * max_count = 20 * 11 = 220.
+
+        Override-build (rankfm) uses ``padded_ro_bs * num_candidates_per_sample``
+        for ``padded_nro_bs``; PRT mirrors that so trace-time pair shape and
+        runtime pair shape agree.
+        """
         t = self._make_transform()
         new_args, _ = t.transform_inputs(self._make_tensors(), {})
-        # nro_float: 77 → 180
-        self.assertEqual(new_args[1].shape, (180, 4))
+        # nro_float: 77 → 220
+        self.assertEqual(new_args[1].shape, (220, 4))
 
     def test_count_arg_uses_pad_count_to_sum(self) -> None:
         """num_candidates should be padded by pad_count_to_sum."""
@@ -869,24 +875,24 @@ class BsIdxCountArgIntegrationTest(unittest.TestCase):
         self.assertGreater(len(cnt_nodes), 0)
 
     def test_padded_num_candidates_sum_matches(self) -> None:
-        """sum(padded num_candidates) == padded_B_NRO — the cross-tensor
+        """sum(padded num_candidates) == pair_padded_bs — the cross-tensor
         invariant that pad_count_to_sum exists to maintain."""
         t = self._make_transform()
         new_args, _ = t.transform_inputs(self._make_tensors(), {})
         # padded num_candidates is at idx 4 (last positional arg)
         padded_count = new_args[4]
-        # B_RO=16, padded_bs=20; pair_padded_bs=180 → sum should be 180
+        # B_RO=16, padded_bs=20; pair_padded_bs = padded_bs * max_c = 220
         self.assertEqual(padded_count.shape, (20,))
-        self.assertEqual(int(padded_count.sum().item()), 180)
+        self.assertEqual(int(padded_count.sum().item()), 220)
 
     def test_dummy_count_distributed_evenly(self) -> None:
-        """Deficit (180-77=103) split across the 4 dummy entries:
-        per_d=25, rem=3 → first 3 dummies get +1."""
+        """Deficit (220-77=143) split across the 4 dummy entries:
+        per_d=35, rem=3 → first 3 dummies get +1."""
         t = self._make_transform()
         new_args, _ = t.transform_inputs(self._make_tensors(), {})
         padded_count = new_args[4]
         dummy = padded_count[16:]
-        self.assertEqual(dummy.tolist(), [26, 26, 26, 25])
+        self.assertEqual(dummy.tolist(), [36, 36, 36, 35])
 
     def test_no_count_arg_then_bs_idx_rejected(self) -> None:
         """Sanity: without count_arg the same config is rejected."""
