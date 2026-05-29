@@ -86,6 +86,14 @@ def compute_padded_shape(
     slot of headroom.  ``pad_jagged_lengths`` and ``pad_count_to_sum`` need
     at least one dummy slot to absorb budget deficits, so the jagged path
     always requires strict-greater.
+
+    Callers that need an additional divisibility constraint (e.g. SparseCore
+    CSR sharding requires per-key budget to be a multiple of
+    ``local_dev × num_sc`` per host = total-SC count globally) should LCM
+    the SC constraint into ``num_devices`` themselves before calling, e.g.::
+
+        effective = math.lcm(num_ranks, sc_modulus * num_processes)
+        compute_padded_shape(size, effective)
     """
     padded = int(math.ceil(size / num_devices)) * num_devices
     if padded == size and must_be_strictly_greater:
@@ -601,7 +609,13 @@ class PaddingRegionTransform(RegionTransform):
             ``shape[batch_dim]`` is the default batch size (used for
             batch-dim padding and as the default for jagged pairs
             that don't specify their own ``batch_size_arg``).
-        num_devices: Local device count.
+        num_devices: GLOBAL device count (= jax.device_count() for full
+            GSPMD over all hosts), used as the divisor in
+            ``compute_padded_shape`` to ensure the padded shape can be
+            sharded evenly across all devices. Callers that also need a
+            downstream divisibility constraint (e.g. SparseCore CSR shard
+            width per host × num hosts) should LCM that into ``num_devices``
+            at the call site.
         batch_dim: Which dimension is the batch dimension (default 0).
 
     Example::
@@ -640,6 +654,12 @@ class PaddingRegionTransform(RegionTransform):
         self._raw_jagged_pairs: Dict[str, JaggedPairConfig] = jagged_pairs
         self._raw_batch_size_arg: str = batch_size_arg
         self._pad_id_base: int = next(_INSTANCE_ID_COUNTER) * _PAD_ID_STRIDE
+        # num_devices is the GLOBAL sharding modulus the padded shape must
+        # divide. For GSPMD over JAX devices this is jax.device_count().
+        # Callers that need a downstream consumer (e.g. SparseCore CSR
+        # sharding) to also divide the result must LCM that constraint into
+        # ``num_devices`` themselves:
+        #   num_devices = math.lcm(num_ranks, sc_modulus * num_processes)
         self.num_devices: int = num_devices
         # num_processes is the number of OS processes (= num_hosts) the
         # GSPMD pipeline runs across. Pad ops use it to map FX-trace global
