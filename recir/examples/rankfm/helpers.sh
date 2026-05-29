@@ -46,6 +46,12 @@ rankfm_submit() {
         echo "Yaml not found: $yaml" >&2
         return 1
     fi
+    local yaml_ns
+    yaml_ns=$(awk '/^[[:space:]]*namespace:/ {print $2; exit}' "$yaml")
+    if [ -n "$yaml_ns" ]; then
+        NS="$yaml_ns"
+        export NS
+    fi
     local js_name
     js_name=$(kubectl create -f "$yaml" --context="$CTX" -n "$NS" \
         -o jsonpath='{.metadata.name}')
