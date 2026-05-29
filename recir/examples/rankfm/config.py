@@ -25,7 +25,7 @@ from __future__ import annotations
 import argparse
 import dataclasses
 from dataclasses import dataclass
-from typing import Any, Tuple
+from typing import Any, Dict, Tuple
 
 from hammer.v3.models.udd_fm_v3.batch_loader import BlueReelsVDDFeatureConfig
 from hammer.v3.models.udd_fm_v3.udd_fm_config import (
@@ -98,6 +98,12 @@ class RankFMModelArgs:
     # Sequence-length sampling (data-side dropout during training)
     disable_seq_len_sampling: bool = False
 
+    # Per-sample RO history token budget for static_shape_mode.
+    # Applies to every key in ``merge_item_uih_feature_mapping``;
+    # contextual keys take their per-feature max length; the timestamp
+    # key takes 1.  Lower than ``max_uih_seq_len`` shrinks the HSTU dense buffer
+    seq_ro_per_sample_budget: int = 24
+
 
 # ---------------------------------------------------------------------------
 # Module-config builder (single source of truth for CLI -> module_config)
@@ -106,6 +112,8 @@ class RankFMModelArgs:
 
 def build_module_config(
     model_args: RankFMModelArgs,
+    *,
+    enable_padding: bool,
 ) -> Tuple[BlueReelsVDDModuleConfig, BlueReelsVDDFeatureConfig]:
     """CLI args -> fully configured (module_config, feature_config)."""
     config: RecModelFamilyConfig = ConfigProvider().create_config()
@@ -138,12 +146,40 @@ def build_module_config(
     if model_args.disable_seq_len_sampling:
         module_config.hstu_seq_len_sampling_configs = None
 
+    # Static-shape mode (TPU/GSPMD path).
+    if enable_padding:
+        module_config.static_shape_mode = True
+        module_config.static_nro_per_sample_budget = model_args.num_candidates
+        module_config.static_ro_per_sample_budgets = _build_static_ro_budgets(
+            module_config, model_args.seq_ro_per_sample_budget
+        )
+
     # Sync feature config with the test constants so randgen produces
     # shapes that match the padding budgets and override expectations.
     feature_config.history_len = model_args.max_uih_seq_len
     feature_config.num_candidates_per_request = model_args.num_candidates
 
     return module_config, feature_config
+
+
+def _build_static_ro_budgets(
+    module_config: BlueReelsVDDModuleConfig, seq_budget: int
+) -> Dict[str, int]:
+    """Build per-key per-sample RO token budgets.
+
+    Sequential (history) RO keys all share ``seq_budget`` (the
+    preprocessor's per-key split assumes uniform per-key lengths within
+    the seq group). Contextual RO keys take their per-feature max
+    length. The timestamp key takes 1 (matches
+    ``jagged_to_padded_dense(max_lengths=[1])`` in
+    ``FeaturePreprocessorWrapper``).
+    """
+    seq_ro_keys = {ro for ro, _nro in module_config.merge_item_uih_feature_mapping}
+    budgets: Dict[str, int] = {k: seq_budget for k in seq_ro_keys}
+    for k, max_len in module_config.contextual_feature_to_max_length:
+        budgets[k] = int(max_len)
+    budgets[module_config.hstu_sparse_timestamp_feature_name] = 1
+    return budgets
 
 
 # ---------------------------------------------------------------------------
