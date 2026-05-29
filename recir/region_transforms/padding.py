@@ -770,9 +770,10 @@ class PaddingRegionTransform(RegionTransform):
             if bs_idx is not None:
                 assert max_count is not None  # enforced in bind_signature
                 pair_bs = batch_size * max_count
+                pair_padded_bs = padded_bs * max_count
             else:
                 pair_bs = batch_size
-            pair_padded_bs = compute_padded_shape(pair_bs, nd)
+                pair_padded_bs = padded_bs
             # num_keys is derived from the actual lengths tensor shape at trace time
             actual_pair_bs = (
                 tensors[bs_idx].shape[dim] if bs_idx is not None else batch_size

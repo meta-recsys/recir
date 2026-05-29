@@ -401,106 +401,6 @@ def select_rows_slice(batch: Any, start: int, n: int) -> Any:
 
 
 # ---------------------------------------------------------------------------
-# KJT key reordering (to match override's trace-time key order)
-# ---------------------------------------------------------------------------
-
-
-def _reorder_kjt_keys(
-    kjt: KeyedJaggedTensor,
-    target_keys: List[str],
-) -> KeyedJaggedTensor:
-    """Permute KJT so its keys are in ``target_keys`` order.
-
-    Required when downstream code (e.g., a trace-time override) expects
-    keys in a fixed order but the runtime KJT (from the data dump) has
-    them in a different order. The override reconstructs KJTs as
-    ``KeyedJaggedTensor(keys=hardcoded_order, values=runtime_values, ...)``,
-    which silently misaligns keys and values if orders differ.
-
-    All keys in ``target_keys`` must be present in ``kjt.keys()``.
-    Extra keys in ``kjt`` not in ``target_keys`` are dropped.
-    """
-    if kjt.variable_stride_per_key():
-        raise NotImplementedError("_reorder_kjt_keys does not support VS yet")
-
-    current_keys = list(kjt.keys())
-    if current_keys == target_keys:
-        return kjt  # already in correct order
-
-    current_to_idx = {k: i for i, k in enumerate(current_keys)}
-    missing = [k for k in target_keys if k not in current_to_idx]
-    if missing:
-        raise ValueError(f"_reorder_kjt_keys: target keys missing from KJT: {missing}")
-
-    F_old = len(current_keys)
-    lengths = kjt.lengths()
-    values = kjt.values()
-    weights = kjt.weights_or_none()
-    B = kjt.stride()
-
-    per_key_lens = lengths.view(F_old, B)  # [F_old, B]
-    per_key_total = per_key_lens.sum(dim=1)
-    key_offsets = torch.cat(
-        [torch.zeros(1, dtype=per_key_total.dtype), per_key_total.cumsum(0)]
-    ).tolist()
-
-    new_lengths_per_key: List[torch.Tensor] = []
-    new_values_chunks: List[torch.Tensor] = []
-    new_weights_chunks: List[torch.Tensor] = [] if weights is not None else []
-
-    for k in target_keys:
-        old_idx = current_to_idx[k]
-        new_lengths_per_key.append(per_key_lens[old_idx])
-        v_start = key_offsets[old_idx]
-        v_end = key_offsets[old_idx + 1]
-        new_values_chunks.append(values[v_start:v_end])
-        if weights is not None:
-            new_weights_chunks.append(weights[v_start:v_end])
-
-    new_lengths = torch.stack(new_lengths_per_key, dim=0).flatten().contiguous()
-    new_values = torch.cat(new_values_chunks).contiguous()
-    new_weights = (
-        torch.cat(new_weights_chunks).contiguous() if weights is not None else None
-    )
-
-    return KeyedJaggedTensor(
-        keys=list(target_keys),
-        values=new_values,
-        lengths=new_lengths,
-        weights=new_weights,
-        stride=B,
-    )
-
-
-def reorder_batch_keys(
-    batch: Any,
-    ro_target_keys: Optional[List[str]] = None,
-    nro_target_keys: Optional[List[str]] = None,
-    unary_target_keys: Optional[List[str]] = None,
-) -> Any:
-    """Apply key reordering to ro/nro/unary KJTs in a batch.
-
-    Pass None for any KJT that doesn't need reordering.
-    """
-    fields: Dict[str, Any] = {}
-    if ro_target_keys is not None:
-        fields["ro_id_list_features"] = _reorder_kjt_keys(
-            batch.ro_id_list_features, ro_target_keys
-        )
-    if nro_target_keys is not None:
-        fields["nro_id_list_features"] = _reorder_kjt_keys(
-            batch.nro_id_list_features, nro_target_keys
-        )
-    if unary_target_keys is not None and batch.unary_features is not None:
-        fields["unary_features"] = _reorder_kjt_keys(
-            batch.unary_features, unary_target_keys
-        )
-    if not fields:
-        return batch
-    return dataclasses.replace(batch, **fields)
-
-
-# ---------------------------------------------------------------------------
 # Static-shape padding (so runtime shapes match the trace-time fake batch and
 # downstream XLA submodules don't see data-dependent dims). This is the
 # eager equivalent of PaddingRegionTransform, applied per-rank before yield.
@@ -706,9 +606,6 @@ def replay_batch_iter(
     max_steps: int,
     local_batch_size: int,
     num_candidates: int,
-    ro_target_keys: Optional[List[str]] = None,
-    nro_target_keys: Optional[List[str]] = None,
-    unary_target_keys: Optional[List[str]] = None,
     ro_per_key_budgets: Optional[List[int]] = None,
 ) -> Iterator[Any]:
     """Yield up to ``max_steps`` ready-to-train batches from ``data_pipe``.
@@ -719,13 +616,7 @@ def replay_batch_iter(
          expects per-rank ``local_batch_size`` rows. The window rotates
          across steps (``yielded % n_windows``) so each step sees different
          rows of the loaded file rather than reusing rows 0..n-1.
-      2. ``reorder_batch_keys`` (optional) — permute the KJT keys (and
-         corresponding values/lengths) to match a target order. Required
-         because the PreprocessorOverride was traced with synthetic-batch
-         key order; at runtime it reconstructs the KJT with hardcoded
-         trace-time keys applied to whatever values the data_pipe yields,
-         and silently misaligns them per key if orders differ.
-      3. ``remap_batch_ids`` — modulo loaded KJT IDs into the model's hash
+      2. ``remap_batch_ids`` — modulo loaded KJT IDs into the model's hash
          space (the dump was preprocessed under a different ``hash_size_cap``).
 
     All static-shape padding (B, sum-num_candidates, per-key NRO budget)
@@ -747,17 +638,6 @@ def replay_batch_iter(
             window = yielded % n_windows
             start = window * local_batch_size
             batch = select_rows_slice(batch, start, local_batch_size)
-            if (
-                ro_target_keys is not None
-                or nro_target_keys is not None
-                or unary_target_keys is not None
-            ):
-                batch = reorder_batch_keys(
-                    batch,
-                    ro_target_keys=ro_target_keys,
-                    nro_target_keys=nro_target_keys,
-                    unary_target_keys=unary_target_keys,
-                )
             batch = remap_batch_ids(batch, key_to_size)
             nc = batch.num_candidates
             real_total = int(nc.sum())

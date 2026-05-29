@@ -58,6 +58,7 @@ from recir.tests.xla.xsurface_test_utils import (
     _create_uniform_train_batch,
     build_model_from_config,
     resize_batch_inplace,
+    resize_kjt_per_key_lengths,
 )
 
 from .config import build_module_config, parse_cli, RankFMTrainerConfig
@@ -88,6 +89,25 @@ SPMD_DECOMP_TABLE[torch.ops.gr.batched_complete_cumsum.default] = (
 )
 
 logger: logging.Logger = logging.getLogger(__name__)
+
+
+def _resolve_nro_per_sample(
+    module_config: BlueReelsVDDModuleConfig,
+    enable_padding: bool,
+) -> int:
+    """NRO budget is the source of truth for padding-related shapes when
+    padding is enabled — PRT's ``max_per_sample_count`` and the override-
+    build sample's ``padded_nro_bs`` must compute the same ``pair_padded_bs``,
+    so they both have to read this value. Falls back to ``hstu_max_output_len``
+    when padding is off (no budget needed).
+    """
+    if enable_padding:
+        budget = module_config.static_nro_per_sample_budget
+        assert budget is not None, (
+            "static_nro_per_sample_budget must be set when enable_padding=True"
+        )
+        return budget
+    return int(module_config.hstu_max_output_len)
 
 
 def _setup_logging() -> None:
@@ -121,9 +141,8 @@ def _build_compiled_train_step(
     iter can reuse the same numbers we used at trace time).
 
     When ``data_pipe`` is set, the *first* batch read from it is used as
-    the trace batch -- guarantees the trace's pytree schema (especially
-    ``all_labels`` keys, KJT key order) matches every subsequent runtime
-    batch from the same pipe.
+    BOTH the override-build sample and the FX trace batch -- guarantees
+    the trace's pytree schema matches every subsequent runtime batch.
     """
     device = torch.device("cpu")
     model = build_model_from_config(module_config, device)
@@ -132,8 +151,9 @@ def _build_compiled_train_step(
         if p.is_floating_point():
             p.requires_grad_(True)
 
-    num_candidates_per_sample: int = int(module_config.hstu_max_output_len)
-
+    num_candidates_per_sample: int = _resolve_nro_per_sample(
+        module_config, trainer_cfg.enable_padding
+    )
     # Effective sharding modulus = lcm(GSPMD device count, total SC count).
     # For JAX: lcm(jax.device_count()=256, sc_modulus(=16) × num_processes(=32)
     # = 512) = 512.  For CPU: lcm(num_ranks, 1 × num_processes) = num_ranks
@@ -141,18 +161,37 @@ def _build_compiled_train_step(
     # CSR width (per-host SC × num_hosts).
     padded_num_devices: int = math.lcm(num_ranks, backend.sc_modulus() * num_processes)
 
-    # Per-rank batch (NOT global). Each pod feeds its own local mini-batch to
-    # train_step at runtime; recir's _make_batch_transform expands the trace-
-    # time inputs by num_processes (=gloo_world) to produce a global view for
-    # GSPMD.  Use uniform (non-ROO) batches so B_NRO = local_bs * num_candidates
-    # is deterministic across ranks - required by the GSPMD shard-divisibility
-    # check on jagged tensor totals.
+    # Compute KJT key -> num_embeddings map BEFORE backend.setup AND BEFORE
+    # any data_pipe pull below (replay_batch_iter uses it to clamp loaded IDs
+    # into the model's hash space). EC.embedding_configs() only exists pre-DMP.
+    key_to_size: Dict[str, int] = compute_kjt_key_to_size(model)
+
+    # Initial batch — drives both the override-build sample AND the FX trace
+    # batch. With data_pipe set, the first real batch becomes the source of
+    # truth for KJT key set/order, all_labels keys, and presence of optional
+    # features (no runtime reordering needed). Synthetic uniform fallback
+    # keeps B_NRO = local_bs * num_candidates deterministic across ranks for
+    # the GSPMD shard-divisibility check on jagged tensor totals.
     torch.manual_seed(0)
-    batch = _create_uniform_train_batch(
-        feature_config,
-        device,
-        batch_size=trainer_cfg.local_batch_size,
-    )
+    if data_pipe is not None:
+        sample_iter = replay_batch_iter(
+            data_pipe,
+            key_to_size,
+            max_steps=1,
+            local_batch_size=trainer_cfg.local_batch_size,
+            num_candidates=num_candidates_per_sample,
+        )
+        batch = next(sample_iter)
+        logger.info(
+            "[OVERRIDE+TRACE] using first replay batch (real data) for both "
+            "override-build sample and FX trace"
+        )
+    else:
+        batch = _create_uniform_train_batch(
+            feature_config,
+            device,
+            batch_size=trainer_cfg.local_batch_size,
+        )
 
     if trainer_cfg.enable_padding:
         # Override-build sample uses GLOBAL sizes (matches PRT's pad_to_static
@@ -161,15 +200,24 @@ def _build_compiled_train_step(
         # (both at global). At runtime, fwd_fn returns PER-HOST data so
         # _to_sharded_jax can expand per-host to global, matching PRT runtime.
         padded_ro_bs = compute_padded_shape(global_bs, padded_num_devices)
-        padded_nro_bs = compute_padded_shape(
-            global_bs * num_candidates_per_sample, padded_num_devices
-        )
+        # padded_nro_bs = padded_ro_bs × per-sample NRO budget. Each RO sample
+        # contributes exactly static_nro_per_sample_budget NRO entries, so the
+        # NRO dimension scales with the (already padded) RO batch. Divisibility
+        # by padded_num_devices follows from padded_ro_bs alignment.
+        padded_nro_bs = padded_ro_bs * num_candidates_per_sample
         expanded_batch = copy.deepcopy(batch)
         resize_batch_inplace(
             expanded_batch,
             target_b_ro=padded_ro_bs,
             target_b_nro=padded_nro_bs,
         )
+        # Force each RO key's per-sample length to its configured budget.
+        if module_config.static_ro_per_sample_budgets:
+            expanded_batch.ro_id_list_features = resize_kjt_per_key_lengths(
+                expanded_batch.ro_id_list_features,
+                module_config.static_ro_per_sample_budgets,
+                batch_size=padded_ro_bs,
+            )
         override_bs = padded_ro_bs
     else:
         expanded_batch = copy.deepcopy(batch)
@@ -190,58 +238,33 @@ def _build_compiled_train_step(
         all_labels,
     )
 
-    # Compute KJT key -> num_embeddings map BEFORE backend.setup, while the EC
-    # still exposes embedding_configs() (the sharded post-DMP wrapper does not).
-    key_to_size: Dict[str, int] = compute_kjt_key_to_size(model)
-
-    # Capture KJT keys against the uniform batch BEFORE the trace batch swap
-    # below; needed by set_recir_kjt_keys and (for JAX) backend.seq_lens.
     ro_kjt_keys: List[str] = list(batch.ro_id_list_features.keys())
     nro_kjt_keys: List[str] = list(batch.nro_id_list_features.keys())
     _unary = batch.unary_features
     assert _unary is not None
     unary_kjt_keys: List[str] = list(_unary.keys())
 
-    # Per-key RO budgets for eager pad in data_pipe (matches PRT's per-key
-    # padding for ro_id_list_features). nro/unary use a single global formula
-    # (B * num_candidates) inside data_pipe; ro is per-key so we compute it
-    # here from the same module_config that PRT reads.
-    contextual_budgets_for_pad = dict(module_config.contextual_feature_to_max_length)
+    ro_per_sample_budgets: Dict[str, int] = (
+        module_config.static_ro_per_sample_budgets
+        or dict(module_config.contextual_feature_to_max_length)
+    )
     ro_per_key_budgets: List[int] = [
         trainer_cfg.local_batch_size
-        * contextual_budgets_for_pad.get(k, int(module_config.hstu_max_seq_len))
+        * ro_per_sample_budgets.get(k, int(module_config.hstu_max_seq_len))
         for k in ro_kjt_keys
     ]
 
-    # Pick the trace batch: prefer the first real-data batch so trace and
-    # runtime see the same pytree schema; fall back to a synthetic random
-    # batch only when no data_pipe is configured.
-    if trainer_cfg.enable_padding and feature_config is not None:
-        if data_pipe is not None:
-            trace_iter = replay_batch_iter(
-                data_pipe,
-                key_to_size,
-                max_steps=1,
-                local_batch_size=trainer_cfg.local_batch_size,
-                num_candidates=num_candidates_per_sample,
-                ro_target_keys=ro_kjt_keys,
-                nro_target_keys=nro_kjt_keys,
-                unary_target_keys=unary_kjt_keys,
-                ro_per_key_budgets=ro_per_key_budgets,
-            )
-            batch = next(trace_iter)
-            logger.info(
-                "[TRACE] using first replay batch (real data) for trace; "
-                "training loop will re-iterate data_pipe from the start"
-            )
-        else:
-            torch.manual_seed(0)
-            batch = _create_random_train_batch(
-                feature_config,
-                device,
-                batch_size=trainer_cfg.local_batch_size,
-            )
-            logger.info("[TRACE] using synthetic random batch for trace")
+    # When no data_pipe is available, swap the override-build's uniform batch
+    # for a synthetic ROO (jagged) batch to be used in the actual training.
+    # With data_pipe, ``batch`` is already the first real batch — no swap needed.
+    if trainer_cfg.enable_padding and feature_config is not None and data_pipe is None:
+        torch.manual_seed(0)
+        batch = _create_random_train_batch(
+            feature_config,
+            device,
+            batch_size=trainer_cfg.local_batch_size,
+        )
+        logger.info("[TRACE] using synthetic batch for trace (no data_pipe)")
 
     # Extract table configs from the EC (before backend.setup() mutates anything).
     # pyre-ignore[16]: dynamic submodule traversal through hammer v3 nn.Module
@@ -268,9 +291,7 @@ def _build_compiled_train_step(
 
     opt = dense_opt
 
-    model.set_recir_kjt_keys(  # pyre-ignore[29]
-        ro_kjt_keys, nro_kjt_keys, unary_kjt_keys
-    )
+    model.set_recir_kjt_keys(ro_kjt_keys, nro_kjt_keys, unary_kjt_keys)
 
     region_transforms: List[Any] = []
     if trainer_cfg.enable_padding:
@@ -533,9 +554,6 @@ def _build_replay_iter(
     num_candidates: int,
     data_pipe: Optional[BatchReplayPipe],
     key_to_size: Optional[Dict[str, int]],
-    ro_target_keys: Optional[List[str]] = None,
-    nro_target_keys: Optional[List[str]] = None,
-    unary_target_keys: Optional[List[str]] = None,
     ro_per_key_budgets: Optional[List[int]] = None,
 ) -> Optional[Iterator[Any]]:
     if data_pipe is None:
@@ -551,9 +569,6 @@ def _build_replay_iter(
         max_steps=trainer_cfg.max_steps,
         local_batch_size=trainer_cfg.local_batch_size,
         num_candidates=num_candidates,
-        ro_target_keys=ro_target_keys,
-        nro_target_keys=nro_target_keys,
-        unary_target_keys=unary_target_keys,
         ro_per_key_budgets=ro_per_key_budgets,
     )
 
@@ -595,25 +610,14 @@ def _run_training_loop(
         f"Starting training ({mode}): {trainer_cfg.max_steps} steps, global_bs={global_bs}"
     )
     start_time = time.time()
-    # The override was traced with the synthetic batch's key order. At
-    # runtime, the override reconstructs the KJT with hardcoded keys (in
-    # trace-time order) but applies them to whatever values our data_pipe
-    # produces. If our KJT has keys in a different order than the trace-time
-    # batch, values get silently misaligned per key.
-    # Force our data_pipe output to match the synthetic batch's key order.
-    ro_target_keys: List[str] = list(batch.ro_id_list_features.keys())
-    nro_target_keys: List[str] = list(batch.nro_id_list_features.keys())
-    unary_target_keys: Optional[List[str]] = (
-        list(batch.unary_features.keys()) if batch.unary_features is not None else None
-    )
     replay_iter = _build_replay_iter(
         trainer_cfg,
-        int(model.module_config.hstu_max_output_len),  # pyre-ignore[16]
+        _resolve_nro_per_sample(
+            model.module_config,  # pyre-ignore[6]
+            trainer_cfg.enable_padding,
+        ),
         data_pipe,
         key_to_size,
-        ro_target_keys=ro_target_keys,
-        nro_target_keys=nro_target_keys,
-        unary_target_keys=unary_target_keys,
         ro_per_key_budgets=ro_per_key_budgets,
     )
 
@@ -705,7 +709,10 @@ def main() -> None:
     global_bs = trainer_cfg.local_batch_size * gloo_world
 
     # --- 3. Build module + feature config (single source of truth) ---
-    module_config, feature_config = build_module_config(model_args)
+    module_config, feature_config = build_module_config(
+        model_args,
+        enable_padding=trainer_cfg.enable_padding,
+    )
 
     # --- 4. Build data_pipe (BEFORE compile, so the trace batch can be
     # pulled from it and the trace schema matches every runtime batch). ---
