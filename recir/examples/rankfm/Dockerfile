@@ -13,8 +13,15 @@ WORKDIR /app
 
 RUN pip install --upgrade pip
 
-# PyTorch CPU (recir bridges to XLA via torchax)
-RUN pip install torch --index-url https://download.pytorch.org/whl/cpu
+# PyTorch CPU (recir bridges to XLA via torchax).
+# Pinned: torch 2.10 / fbgemm-gpu-cpu 1.5 — latest tuple in
+# fbgemm_gpu/__init__.py's _fbgemm_torch_compat_table. torchrec stops at 1.4
+# on PyPI (no 1.5+ release); it's tolerant of newer torch/fbgemm. fbgemm 1.4
+# is too old: its jagged ops (dense_to_jagged etc.) lack the meta-kernel
+# registrations that recir.trace's FakeTensor pass needs. Leaving versions
+# unpinned lets pip pull fbgemm 1.7.0, which is built against a torch nightly
+# ABI (torch::headeronly::Tag is only in torch >=2.12.dev) and breaks at import.
+RUN pip install 'torch==2.10.*' --index-url https://download.pytorch.org/whl/cpu
 
 # JAX with TPU support
 RUN pip install "jax[tpu]"
@@ -22,9 +29,11 @@ RUN pip install "jax[tpu]"
 # JAX TPU embedding for SparseCore embedding lookup
 RUN pip install jax-tpu-embedding
 
-# torchrec + fbgemm (CPU variant for TPU machines)
-RUN pip install torchrec && \
-    pip install fbgemm-gpu-cpu --force-reinstall || true
+# torchrec + fbgemm (CPU variant for TPU machines).
+# Drop the `|| true` swallowing — we want this layer to fail loudly if the
+# pinned wheels become unavailable, not produce a silently broken image.
+RUN pip install 'torchrec==1.4.*' && \
+    pip install 'fbgemm-gpu-cpu==1.5.*' --force-reinstall
 
 # triton (required by generative-recommenders common.py)
 RUN pip install triton

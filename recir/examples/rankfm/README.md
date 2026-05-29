@@ -24,7 +24,7 @@ sudo dnf install -y --disablerepo='*' --enablerepo='*google*' \
 # at https://fb.workplace.com/groups/registryusers with #pingoncall fbpkg.
 HTTPS_PROXY=http://fwdproxy:8080 gcloud auth login
 HTTPS_PROXY=http://fwdproxy:8080 \
-    gcloud container clusters get-credentials recir-v7-128 \
+    gcloud container clusters get-credentials tpu-prod-training-cluster \
     --region us-central1 --project mrs-tpu-y317h
 
 # --- Every session ---
@@ -97,14 +97,14 @@ podman run --rm -it \
 
 ```bash
 kubectl create -f recir/examples/rankfm/rankfm-4chip.yaml \
-  --context=gke_mrs-tpu-y317h_us-central1_recir-v7-128
+  --context=gke_mrs-tpu-y317h_us-central1_tpu-prod-training-cluster
 ```
 
 ### Run on a 128-chip TPU slice
 
 ```bash
 kubectl create -f recir/examples/rankfm/rankfm-128chip.yaml \
-  --context=gke_mrs-tpu-y317h_us-central1_recir-v7-128
+  --context=gke_mrs-tpu-y317h_us-central1_tpu-prod-training-cluster
 ```
 
 Use `kubectl create` (not `apply`) — the JobSet YAML uses `generateName` so each
@@ -123,8 +123,8 @@ invocation spawns a new run with an auto-suffixed name (e.g.
 ### Monitor
 
 ```bash
-kubectl get pods -o wide -w --context=gke_mrs-tpu-y317h_us-central1_recir-v7-128
-kubectl logs <pod-name> --context=gke_mrs-tpu-y317h_us-central1_recir-v7-128
+kubectl get pods -o wide -w --context=gke_mrs-tpu-y317h_us-central1_tpu-prod-training-cluster
+kubectl logs <pod-name> --context=gke_mrs-tpu-y317h_us-central1_tpu-prod-training-cluster
 ```
 
 ### Bash helpers (submit / monitor / iterate loop)
