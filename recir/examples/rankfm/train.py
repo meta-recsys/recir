@@ -333,6 +333,12 @@ def _build_compiled_train_step(
                 # padded shape (which uses the same modulus above).
                 num_devices=math.lcm(num_ranks, backend.sc_modulus() * num_processes),
                 num_processes=num_processes,
+                skip_args={
+                    "ro_id_list_values",
+                    "ro_id_list_lengths",
+                    "nro_id_list_values",
+                    "nro_id_list_lengths",
+                },
             ),
         ]
 
