@@ -46,9 +46,12 @@ from recir.tests.xla.gspmd_test_utils import assert_hlo_has_collective
 from recir.tests.xla.xsurface_test_utils import (
     _build_full_model,
     _build_overrides,
+    _create_random_train_batch,
     _create_uniform_train_batch,
     _make_sample_input,
     _verify_traced_graph,
+    DummyPreprocessorStack,
+    DummySparseArch,
     resize_batch_inplace,
     TEST_BATCH_SIZE,
     TEST_MAX_UIH_SEQ_LEN,
@@ -89,7 +92,7 @@ class XSurfaceFakeTracingCompatTest(unittest.TestCase):
         (which lack .numel()), causing an AttributeError during make_fx.
         """
         device = torch.device("cpu")
-        model, feature_config = _build_full_model(device)
+        model, feature_config = _build_full_model(device, disable_seq_len_sampling=True)
 
         # Build overrides for RecBlock's preprocessor + sparse arch.
         recblock_sample, _, _ = _make_sample_input(model.recblock, device)
@@ -183,7 +186,7 @@ class TestXSurfaceXLACompile(unittest.TestCase):
         torch.manual_seed(42)
         device = torch.device("cpu")
         global_bs = TEST_BATCH_SIZE * self.num_ranks
-        model, feature_config = _build_full_model(device)
+        model, feature_config = _build_full_model(device, disable_seq_len_sampling=True)
 
         for p in model.parameters():
             if p.is_floating_point():
@@ -423,3 +426,62 @@ class TestXSurfaceXLACompile(unittest.TestCase):
             "Expected recir_padding ops in compiled graph but found none — "
             "PaddingRegionTransform may not have inserted any pad nodes.",
         )
+
+    def test_xsurface_padding_numerical_parity(self) -> None:
+        """Padded vs unpadded compile must produce identical weight updates.
+
+        Padding adds dummy entries to satisfy static-shape constraints, but
+        ``PaddingRegionTransform`` pairs each forward pad op with an
+        ``unpad_grad`` / ``unpad_jagged_grad`` on the backward, and
+        ``supervision_label``/``supervision_weight`` are padded with zeros
+        (so dummy candidates contribute zero loss). After one train step
+        from identical seeded init, parameters and buffers should match
+        bit-exactly. If this test fails, the padding op pairing is broken.
+        """
+        nd = self.num_ranks
+        global_bs = TEST_BATCH_SIZE * nd
+        self.assertGreater(
+            compute_padded_shape(global_bs, nd),
+            global_bs,
+            "padding must add ≥1 dummy sample at the B_RO dim",
+        )
+        self.assertGreater(
+            compute_padded_shape(global_bs * TEST_NUM_CANDIDATES, nd),
+            global_bs * TEST_NUM_CANDIDATES,
+            "padding must add ≥1 dummy pair at the B_NRO dim",
+        )
+
+        _, model_no_pad = self._build_compiled_train_step(use_padding=False)
+        _, model_padded = self._build_compiled_train_step(use_padding=True)
+
+        def state_tensors(m: nn.Module) -> Dict[str, torch.Tensor]:
+            # Skip override scaffolding: `DummyPreprocessorStack` and
+            # `DummySparseArch` cache the real upstream module's output as
+            # buffers (`_kjt_values_*`, `_kjt_lengths_*`, `_tensor_*`,
+            # `_jt_values_*`, `_jt_lengths_*`, `_grad_anchor`). They aren't
+            # part of the trainable model state we want to compare.
+            skip_prefixes = tuple(
+                mod_name + "."
+                for mod_name, mod in m.named_modules()
+                if isinstance(mod, (DummyPreprocessorStack, DummySparseArch))
+            )
+            state: Dict[str, torch.Tensor] = {}
+            for n, p in m.named_parameters():
+                if not n.startswith(skip_prefixes):
+                    state[n] = p
+            for n, b in m.named_buffers():
+                if not n.startswith(skip_prefixes):
+                    state[n] = b
+            return state
+
+        pad_state = state_tensors(model_padded)
+        ref_state = state_tensors(model_no_pad)
+        self.assertEqual(set(pad_state.keys()), set(ref_state.keys()))
+        for name, ref in ref_state.items():
+            torch.testing.assert_close(
+                pad_state[name],
+                ref,
+                atol=1e-4,
+                rtol=1e-3,
+                msg=lambda msg, n=name: f"state {n} diverged after train step: {msg}",
+            )
