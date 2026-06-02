@@ -102,7 +102,7 @@ spec:
                 --data_replicate_across_ranks
                 --profile_start_step 3
                 --profile_end_step 8
-                --profile_dir "gs://mrs-tpu-y317h/tpu-profiles/${JOBSET_NAME}"
+                --profile_dir "gs://cq-enablement-mrs-foundation_mrs_tpu_y317h/tpu-profiles/${JOBSET_NAME}"
               ports:
               - containerPort: 8471
               resources:
