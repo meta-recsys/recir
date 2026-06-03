@@ -84,7 +84,18 @@ rankfm_mvai_logs() {
         return 1
     fi
     echo "Tailing: $rank0"
-    kubectl logs -f "$rank0" --context="$CTX" -n "$NS"
+    # Retry: when called manually the rankfm-mvai container may still be
+    # ContainerCreating/PodInitializing (image pull, barnfs CSI / gcsfuse mount),
+    # which makes `kubectl logs` fail with a BadRequest until it starts.
+    local attempt
+    for attempt in $(seq 1 60); do
+        kubectl logs -f "$rank0" --container rankfm-mvai \
+            --context="$CTX" -n "$NS" && return 0
+        echo "  rank-0 container not ready yet (attempt $attempt); retrying..." >&2
+        sleep 5
+    done
+    echo "rank-0 logs still unavailable after retries; check 'rankfm_mvai_status'." >&2
+    return 1
 }
 
 rankfm_mvai_logs_all() {
@@ -143,11 +154,20 @@ rankfm_mvai_iterate() {
     local yaml="${1:-$_RANKFM_MVAI_DEFAULT_YAML}"
     ( cd "$_RANKFM_MVAI_FBCODE_ROOT" && "$_RANKFM_MVAI_BUILD_SCRIPT" ) || return 1
     rankfm_mvai_submit "$yaml" || return 1
-    echo "Waiting for rank 0 to be Running before tailing..."
-    until kubectl get pods --context="$CTX" -n "$NS" \
-        -l "jobset.sigs.k8s.io/jobset-name=$JS" \
-        -o jsonpath='{.items[*].status.phase}' 2>/dev/null \
-        | grep -q Running; do
+    echo "Waiting for rank 0's container to start before tailing..."
+    # Wait for the rank-0 pod's 'rankfm-mvai' container to actually be Running --
+    # NOT just for any pod's phase to be Running. With 32 pods, another pod
+    # reaches Running while rank-0 is still ContainerCreating/PodInitializing
+    # (image pull, barnfs CSI mount, gcsfuse sidecar), so tailing rank-0 then
+    # fails with "is waiting to start: PodInitializing". Poll rank-0's container
+    # state.running instead.
+    local rank0=""
+    until [ -n "$rank0" ] && kubectl get pod "$rank0" --context="$CTX" -n "$NS" \
+        -o jsonpath='{.status.containerStatuses[?(@.name=="rankfm-mvai")].state.running.startedAt}' \
+        2>/dev/null | grep -q .; do
+        rank0=$(kubectl get pods --context="$CTX" -n "$NS" \
+            -l "jobset.sigs.k8s.io/jobset-name=$JS" -o name 2>/dev/null \
+            | grep 'worker-0-0-' | head -1 | sed 's|pod/||')
         sleep 5
     done
     rankfm_mvai_logs
