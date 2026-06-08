@@ -62,7 +62,12 @@ from recir.tests.xla.xsurface_test_utils import (
 )
 
 from .config import build_module_config, parse_cli, RankFMTrainerConfig
-from .data_pipe import BatchReplayPipe, compute_kjt_key_to_size, replay_batch_iter
+from .data_pipe import (
+    BatchReplayPipe,
+    compute_kjt_key_to_size,
+    prefetch_iter,
+    replay_batch_iter,
+)
 from .embedding import build_embedding_backend
 
 # Bootstrap gr::batched_complete_cumsum if the C++ library failed to load
@@ -563,7 +568,7 @@ def _build_replay_iter(
             "Replay mode but key_to_size is None; loaded IDs will not be "
             "clamped against model table sizes (may IndexError)."
         )
-    return replay_batch_iter(
+    replay_iter = replay_batch_iter(
         data_pipe,
         key_to_size or {},
         max_steps=trainer_cfg.max_steps,
@@ -571,6 +576,18 @@ def _build_replay_iter(
         num_candidates=num_candidates,
         ro_per_key_budgets=ro_per_key_budgets,
     )
+    # Overlap file load / zstd decompress / pad with the device train_step by
+    # producing batches on a background thread (profiles show ~200ms+/step of
+    # otherwise-serial CPU load in front of each step). No-op when the buffer
+    # depth is 0.
+    if trainer_cfg.data_prefetch_buffer > 0:
+        logger.info(
+            f"Batch prefetch enabled (buffer={trainer_cfg.data_prefetch_buffer})"
+        )
+        replay_iter = prefetch_iter(
+            replay_iter, buffer_size=trainer_cfg.data_prefetch_buffer
+        )
+    return replay_iter
 
 
 def _run_training_loop(
