@@ -15,9 +15,11 @@
 #   rankfm_kill              delete the current $JS
 #   rankfm_iterate [yaml]    build_image_podman.sh -> submit -> tail rank 0
 #
-# Override CTX in your environment to point at a different cluster, or NS to
-# target a different team namespace:
-#     export CTX=gke_<project>_<region>_<cluster>
+# By default CTX is the currently-active kubeconfig context. Override it to
+# point at a different cluster (use `kubectl config get-contexts` to see the
+# exact name — newer gcloud uses `<project>/<region>/<cluster>`, older uses
+# `gke_<project>_<region>_<cluster>`), or NS to target a different namespace:
+#     export CTX=mrs-tpu-y317h/us-central1/tpu-prod-training-cluster
 #     export NS=ns-<your-team>
 #
 # Defaults assume the prod training cluster documented in
@@ -29,7 +31,26 @@ _RANKFM_FBCODE_ROOT="$(cd "${_RANKFM_HELPERS_DIR}/../../.." && pwd)"
 _RANKFM_DEFAULT_YAML="${_RANKFM_HELPERS_DIR}/rankfm-128chip.yaml"
 _RANKFM_BUILD_SCRIPT="${_RANKFM_HELPERS_DIR}/build_image_podman.sh"
 
-: "${CTX:=gke_mrs-tpu-y317h_us-central1_tpu-prod-training-cluster}"
+# Context name format varies by gcloud version: older gcloud mints
+# `gke_<project>_<region>_<cluster>` (underscores), newer gcloud mints
+# `<project>/<region>/<cluster>` (slashes). Rather than hardcode one and
+# break on the other, default to whatever context is currently active in
+# the kubeconfig (set by `gcloud container clusters get-credentials`).
+# Override CTX explicitly if you target a different cluster.
+: "${CTX:=$(kubectl config current-context 2>/dev/null)}"
+: "${CTX:=mrs-tpu-y317h/us-central1/tpu-prod-training-cluster}"
+# Self-heal a stale CTX: if the configured context isn't actually present in
+# the kubeconfig (e.g. inherited from an older `source helpers.sh` that used
+# the legacy `gke_<project>_<region>_<cluster>` name), fall back to whatever
+# context is currently active rather than failing every kubectl call.
+if ! kubectl config get-contexts -o name 2>/dev/null | grep -qxF "$CTX"; then
+    _ctx_active="$(kubectl config current-context 2>/dev/null)"
+    if [ -n "$_ctx_active" ]; then
+        echo "helpers.sh: CTX '$CTX' not found in kubeconfig; using active context '$_ctx_active'" >&2
+        CTX="$_ctx_active"
+    fi
+    unset _ctx_active
+fi
 : "${NS:=ns-enablement-mrs-foundation}"
 export CTX NS
 

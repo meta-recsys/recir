@@ -96,15 +96,17 @@ podman run --rm -it \
 ### Run on a 4-chip TPU slice (smoke)
 
 ```bash
+# Context name format varies by gcloud version. Check yours with
+# `kubectl config get-contexts`; newer gcloud uses the slash form below.
 kubectl create -f recir/examples/rankfm/rankfm-4chip.yaml \
-  --context=gke_mrs-tpu-y317h_us-central1_tpu-prod-training-cluster
+  --context=mrs-tpu-y317h/us-central1/tpu-prod-training-cluster
 ```
 
 ### Run on a 128-chip TPU slice
 
 ```bash
 kubectl create -f recir/examples/rankfm/rankfm-128chip.yaml \
-  --context=gke_mrs-tpu-y317h_us-central1_tpu-prod-training-cluster
+  --context=mrs-tpu-y317h/us-central1/tpu-prod-training-cluster
 ```
 
 Use `kubectl create` (not `apply`) — the JobSet YAML uses `generateName` so each
@@ -123,8 +125,8 @@ invocation spawns a new run with an auto-suffixed name (e.g.
 ### Monitor
 
 ```bash
-kubectl get pods -o wide -w --context=gke_mrs-tpu-y317h_us-central1_tpu-prod-training-cluster
-kubectl logs <pod-name> --context=gke_mrs-tpu-y317h_us-central1_tpu-prod-training-cluster
+kubectl get pods -o wide -w --context=mrs-tpu-y317h/us-central1/tpu-prod-training-cluster
+kubectl logs <pod-name> --context=mrs-tpu-y317h/us-central1/tpu-prod-training-cluster
 ```
 
 ### Bash helpers (submit / monitor / iterate loop)
@@ -149,8 +151,10 @@ rankfm_kill                  # delete current $JS
 rankfm_iterate               # build_image_podman.sh -> submit -> tail rank 0
 ```
 
-Override the cluster by exporting `CTX=gke_<project>_<region>_<cluster>` before
-sourcing. The script also exports `HTTPS_PROXY=http://fwdproxy:8080` so
+By default `CTX` is your active kubeconfig context (and a stale exported `CTX`
+that isn't in the kubeconfig is auto-corrected to the active one). Override it
+by exporting `CTX=<project>/<region>/<cluster>` (run `kubectl config
+get-contexts` for the exact name) before sourcing. The script also exports `HTTPS_PROXY=http://fwdproxy:8080` so
 `kubectl` works on Meta devservers; unset it if you're elsewhere.
 
 Note: `rankfm_kill` only deletes the current `$JS`. If a previous JobSet is
