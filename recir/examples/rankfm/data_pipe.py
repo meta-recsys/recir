@@ -24,6 +24,9 @@ Public surface:
     replay_batch_iter            yields ready-to-train batches from a
                                  BatchReplayPipe (slice + remap + per-step
                                  NRO-budget log)
+    prefetch_iter                background-thread prefetch wrapper that
+                                 overlaps batch load/decompress/pad with the
+                                 consumer's device compute
 """
 
 from __future__ import annotations
@@ -33,9 +36,11 @@ import io
 import json
 import logging
 import os
+import queue
 import subprocess
 import tempfile
-from typing import Any, Dict, Iterator, List, Optional
+import threading
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -655,3 +660,52 @@ def replay_batch_iter(
             )
             yield batch
             yielded += 1
+
+
+def prefetch_iter(source: Iterator[Any], buffer_size: int = 2) -> Iterator[Any]:
+    """Run ``source`` on a background thread so the next batch is produced
+    while the consumer is busy (e.g. the device ``train_step``).
+
+    The entire ``replay_batch_iter`` chain — file download, zstd decompress,
+    slice, remap, pad — is CPU/IO work that otherwise runs serially in front
+    of each step, leaving the TPU idle (~200ms+/step in profiles). Pulling it
+    onto a worker thread overlaps it with the prior step's device compute.
+    A thread (not a process) is used because ``torch.load`` + zstd decompress
+    + the XLA device wait all release the GIL, so they run concurrently, and
+    we avoid serializing the (large) batch tensors across a process boundary.
+
+    The worker stays at most ``buffer_size`` batches ahead (bounded
+    ``queue.Queue``) to cap memory. ``StopIteration`` from ``source`` ends the
+    wrapper normally; any other exception is re-raised in the consumer thread.
+    Set ``buffer_size <= 0`` to disable prefetch (returns ``source`` as-is).
+    """
+    if buffer_size <= 0:
+        return source
+
+    # Each queue item is tagged: ("item", batch) | ("done", None) | ("error", exc).
+    q: "queue.Queue[Tuple[str, Any]]" = queue.Queue(maxsize=buffer_size)
+
+    def _worker() -> None:
+        try:
+            for item in source:
+                q.put(("item", item))
+        except Exception as e:  # noqa: BLE001 -- propagated to consumer below
+            q.put(("error", e))
+        else:
+            q.put(("done", None))
+
+    # Daemon so a stuck/blocked worker never holds up process exit (train.py
+    # force-exits via os._exit at the end anyway).
+    threading.Thread(target=_worker, name="batch-prefetch", daemon=True).start()
+
+    def _drain() -> Iterator[Any]:
+        while True:
+            kind, payload = q.get()
+            if kind == "item":
+                yield payload
+            elif kind == "done":
+                return
+            else:  # "error"
+                raise payload
+
+    return _drain()

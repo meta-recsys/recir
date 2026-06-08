@@ -59,6 +59,10 @@ class RankFMTrainerConfig:
     gcs_data_path: str = ""
     data_file_template: str = ""
     data_replicate_across_ranks: bool = False
+    # Background-thread batch prefetch depth: how many batches the loader may
+    # prepare ahead of the training loop so file load / zstd decompress / pad
+    # overlap the device train_step. 0 disables prefetch (synchronous load).
+    data_prefetch_buffer: int = 2
 
     # Embedding backend: "cpu" (torchrec DMP) | "tpu" (JAX/SparseCore).
     # Validated by ``build_embedding_backend`` in ``embedding/__init__.py``.
