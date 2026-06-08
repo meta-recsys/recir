@@ -134,7 +134,6 @@ autocast_policy: dict[Any, CastPolicy] = {
     torch.ops.aten.polar.default: CastPolicy.FP32,
     torch.ops.aten.prod.default: CastPolicy.FP32,
     torch.ops.aten.prod.dim_int: CastPolicy.FP32,
-    torch.ops.aten.prod.dim_Dimname: CastPolicy.FP32,
     torch.ops.aten.quantile.default: CastPolicy.FP32,
     torch.ops.aten.quantile.scalar: CastPolicy.FP32,
     torch.ops.aten.nanquantile.default: CastPolicy.FP32,
@@ -233,5 +232,4 @@ autocast_policy: dict[Any, CastPolicy] = {
     torch.ops.aten.stack.default: CastPolicy.PROMOTE,
     torch.ops.aten.cat.default: CastPolicy.PROMOTE,
     torch.ops.aten.index_copy.default: CastPolicy.PROMOTE,
-    torch.ops.aten.index_copy.dimname: CastPolicy.PROMOTE,
 }
