@@ -23,6 +23,9 @@
 # pyre-strict
 
 
+import os
+import statistics
+import time
 import unittest
 from copy import deepcopy
 from typing import Callable, List, Tuple
@@ -31,7 +34,7 @@ import torch
 from functorch import make_fx
 from generative_recommenders.common import HammerKernel, set_dev_mode
 from generative_recommenders.modules.stu import STU, STULayer, STULayerConfig, STUStack
-from recir.api import compile, COMPILED_OBJECT_KEY
+from recir.api import compile, COMPILED_OBJECT_KEY, sync_device_state_to_torch
 from recir.backends import XLAGSPMDBackend
 from recir.distributed.parallel_mode import DataParallel, GSPMDParallel
 
@@ -113,6 +116,16 @@ def build_inputs(
     x_offsets[1:] = torch.cumsum(x_lengths, dim=0)
     total_seq_len = int(x_offsets[-1].cpu().item())
     x = torch.randn(int(total_seq_len), embedding_dim, dtype=torch.bfloat16)
+    # Pad the jagged value rows up to a multiple of num_devices so GSPMD's
+    # batch-sharding split (np.split along dim 0 in
+    # recir.lowering.xla_lower._to_sharded_jax) divides evenly across the
+    # local devices. total_seq_len is the sum of random per-sample lengths,
+    # so it is generally not divisible. The trailing pad rows fall beyond
+    # x_offsets[-1], so the model never indexes them. No-op when
+    # num_devices == 1 (the default for the single-device / DTensor tests).
+    pad_rows = (-total_seq_len) % num_devices
+    if pad_rows:
+        x = torch.cat([x, torch.zeros(pad_rows, embedding_dim, dtype=x.dtype)], dim=0)
     return x, x_lengths, x_offsets, max_seq_len, num_targets
 
 
@@ -550,7 +563,7 @@ class STUXLATest(unittest.TestCase):
                 tpu_devices = jax.devices("tpu")
                 if tpu_devices:
                     self.fail(
-                        f"TPU devices available but JAX defaulted to "
+                        "TPU devices available but JAX defaulted to "
                         f"{platform}: {self.devices}"
                     )
             except RuntimeError:
@@ -564,7 +577,11 @@ class STUXLATest(unittest.TestCase):
         num_devices = len(self.devices)
         mod = Model(kernel=HammerKernel.PYTORCH).cpu()
         opt = torch.optim.SGD(mod.parameters(), lr=0.01, foreach=False)
-        x, x_lengths, x_offsets, max_seq_len, num_targets = build_inputs(num_devices)
+        # x_offsets is intentionally not passed to the compiled step: an
+        # offsets tensor has shape [B + 1], which is never divisible by
+        # num_devices and so cannot be batch-sharded by GSPMD. It is
+        # recomputed on-device from the (batch-sharded) lengths below.
+        x, x_lengths, _x_offsets, max_seq_len, num_targets = build_inputs(num_devices)
 
         @compile(
             parallel_mode=GSPMDParallel(
@@ -580,16 +597,265 @@ class STUXLATest(unittest.TestCase):
             opt: torch.optim.Optimizer,
             x: torch.Tensor,
             x_lengths: torch.Tensor,
-            x_offsets: torch.Tensor,
             max_seq_len: int,
             num_targets: torch.Tensor,
         ) -> None:
+            # Build jagged offsets from the lengths inside the graph rather
+            # than passing a global [B + 1] offsets input (which is not
+            # batch-shardable). GSPMD computes this cumsum over the logical
+            # global lengths and reshards as needed for the HSTU jagged ops.
+            x_offsets = torch.cat(
+                [x_lengths.new_zeros(1), torch.cumsum(x_lengths, dim=0)]
+            )
             mod(x, x_lengths, x_offsets, max_seq_len, num_targets).sum().backward()
             opt.step()
 
-        train_step(mod, opt, x, x_lengths, x_offsets, max_seq_len, num_targets)
+        train_step(mod, opt, x, x_lengths, max_seq_len, num_targets)
 
         # Verify parameters were updated and are valid
         for p in mod.parameters():
             self.assertFalse(torch.isnan(p).any().item())
             self.assertFalse(torch.isinf(p).any().item())
+
+
+def _has_tpu() -> bool:
+    """Check if JAX has TPU devices available."""
+    try:
+        import jax  # @manual
+
+        devices = jax.devices()
+        return len(devices) >= 1 and devices[0].platform == "tpu"
+    except Exception:
+        return False
+
+
+@unittest.skipUnless(_has_tpu(), "Requires JAX with TPU devices")
+class STUBenchmark(unittest.TestCase):
+    """Latency / throughput benchmark for the STU/HSTU operator on XLA (TPU).
+
+    Skipped unless ``STU_BENCH=1`` so it never runs during the normal
+    ``python -m unittest recir.tests.stu_test`` suite. It mirrors the dlrmv3
+    ``infer_benchmark`` structure (warmup -> ``perf_counter`` measured loop ->
+    p50/p95/p99 + throughput) but exercises the same compiled STU step as
+    ``STUXLATest.test_stu_train``, reusing ``build_inputs`` / ``Model``.
+
+    Inputs are sharded across all local devices exactly like ``test_stu_train``:
+    ``build_inputs`` pads the jagged values to a multiple of ``num_devices`` and
+    the step rebuilds the ``[B + 1]`` offsets on-device from the batch-sharded
+    lengths (the global offsets tensor is not batch-shardable).
+
+    Env knobs:
+      ``STU_BENCH=1``                enable (required)
+      ``STU_BENCH_MODE=train|forward``  fwd+bwd+opt vs fwd-only (default train)
+      ``STU_BENCH_WARMUP=<int>``     warmup steps incl. XLA compile (default 5)
+      ``STU_BENCH_STEPS=<int>``      measured steps (default 50)
+      ``STU_BENCH_PROFILE_DIR=<dir>``  if set, emit a JAX xplane trace there
+                                     (use a ``gs://`` path on TPU to retrieve it)
+      ``STU_BENCH_DUMP_COST=1``      log compiled ``cost_analysis()`` once
+
+    Run on a TPU slice by overriding the JobSet ``command`` (see
+    ``recir/tests/helpers.sh`` / ``stu-test-4chip.yaml``), e.g.::
+
+        STU_BENCH=1 STU_BENCH_STEPS=50 \\
+            python3 -u -m unittest recir.tests.stu_test.STUBenchmark.test_stu_latency
+    """
+
+    def setUp(self) -> None:
+        import jax  # @manual
+
+        try:
+            import recir.lowering.fbgemm_fallback  # noqa: F401
+        except ImportError:
+            pass
+
+        self.devices = jax.devices()
+        if len(self.devices) < 1:
+            self.skipTest("No JAX devices available")
+        # Verify we're running on TPU (not GPU) - this benchmark is TPU-specific
+        if self.devices[0].platform != "tpu":
+            self.skipTest(f"Benchmark requires TPU, found {self.devices[0].platform}")
+
+    @unittest.skipUnless(  # pyre-ignore[56]
+        os.environ.get("STU_BENCH") == "1", "set STU_BENCH=1 to run the benchmark"
+    )
+    def test_stu_latency(self) -> None:
+        """Benchmark STU forward (or forward+backward) latency on XLA GSPMD."""
+        torch.manual_seed(42)
+        set_dev_mode(True)
+
+        mode: str = os.environ.get("STU_BENCH_MODE", "train")
+        self.assertIn(mode, ("train", "forward"))
+        num_warmup = int(os.environ.get("STU_BENCH_WARMUP", "5"))
+        num_steps = int(os.environ.get("STU_BENCH_STEPS", "50"))
+        profile_dir = os.environ.get("STU_BENCH_PROFILE_DIR")
+
+        num_devices = len(self.devices)
+        mod = Model(kernel=HammerKernel.PYTORCH).cpu()
+        x, x_lengths, _x_offsets, max_seq_len, num_targets = build_inputs(num_devices)
+
+        step: Callable[..., object]
+        run_step: Callable[[], object]
+        step, run_step = self._build_step(
+            mode, num_devices, mod, x, x_lengths, max_seq_len, num_targets
+        )
+
+        def run_and_barrier() -> None:
+            # Force the asynchronously-dispatched device work to complete before
+            # the timer stops. In ``forward`` mode ``run_step`` returns a host
+            # torch tensor (the runner's jax->torch conversion already forced a
+            # device->host sync). In ``train`` mode the step returns None, so we
+            # wait on the in-place weight update via sync_device_state_to_torch.
+            run_step()
+            if mode == "train":
+                sync_device_state_to_torch(step)
+
+        # Warmup (the first call triggers lazy XLA compilation).
+        for _ in range(num_warmup):
+            run_and_barrier()
+
+        if os.environ.get("STU_BENCH_DUMP_COST") == "1":
+            self._log_compiled_cost(step)
+
+        latencies = self._measure(run_and_barrier, num_steps, profile_dir)
+        self.assertGreater(len(latencies), 0)
+        self._report(
+            latencies, mode, num_devices, x_lengths.numel(), max_seq_len, num_warmup
+        )
+
+    def _build_step(
+        self,
+        mode: str,
+        num_devices: int,
+        mod: torch.nn.Module,
+        x: torch.Tensor,
+        x_lengths: torch.Tensor,
+        max_seq_len: int,
+        num_targets: torch.Tensor,
+    ) -> Tuple[Callable[..., object], Callable[[], object]]:
+        """Compile the STU step and return ``(compiled_step, run_step)``.
+
+        ``run_step`` is a zero-arg closure over the (host) inputs so the
+        measured loop stays free of arg-marshalling. The compiled step rebuilds
+        the ``[B + 1]`` offsets on-device from the batch-sharded lengths.
+        """
+        parallel_mode = GSPMDParallel(
+            "replicate",
+            loss_reduction="sum",
+            num_ranks=num_devices,
+            num_processes=1,
+        )
+        if mode == "train":
+            # Citrine C2: foreach=False is required by the XLA GSPMD lowering
+            # here and mirrors STUXLATest.test_stu_train (the step under test).
+            opt = torch.optim.SGD(mod.parameters(), lr=0.01, foreach=False)
+
+            @compile(parallel_mode=parallel_mode, backend=XLAGSPMDBackend())
+            def train_step(
+                mod: torch.nn.Module,
+                opt: torch.optim.Optimizer,
+                x: torch.Tensor,
+                x_lengths: torch.Tensor,
+                max_seq_len: int,
+                num_targets: torch.Tensor,
+            ) -> None:
+                x_offsets = torch.cat(
+                    [x_lengths.new_zeros(1), torch.cumsum(x_lengths, dim=0)]
+                )
+                mod(x, x_lengths, x_offsets, max_seq_len, num_targets).sum().backward()
+                opt.step()
+
+            return train_step, lambda: train_step(
+                mod, opt, x, x_lengths, max_seq_len, num_targets
+            )
+
+        # forward-only (inference operator latency)
+        mod.eval()
+
+        @compile(parallel_mode=parallel_mode, backend=XLAGSPMDBackend())
+        def forward_step(
+            mod: torch.nn.Module,
+            x: torch.Tensor,
+            x_lengths: torch.Tensor,
+            max_seq_len: int,
+            num_targets: torch.Tensor,
+        ) -> torch.Tensor:
+            x_offsets = torch.cat(
+                [x_lengths.new_zeros(1), torch.cumsum(x_lengths, dim=0)]
+            )
+            return mod(x, x_lengths, x_offsets, max_seq_len, num_targets)
+
+        return forward_step, lambda: forward_step(
+            mod, x, x_lengths, max_seq_len, num_targets
+        )
+
+    def _measure(
+        self,
+        run_and_barrier: Callable[[], None],
+        num_steps: int,
+        profile_dir: str | None,
+    ) -> List[float]:
+        """Time ``num_steps`` calls; optionally emit a JAX xplane trace."""
+        import jax  # @manual
+
+        latencies: List[float] = []
+        if profile_dir:
+            jax.profiler.start_trace(profile_dir)
+        try:
+            for _ in range(num_steps):
+                t0 = time.perf_counter()
+                run_and_barrier()
+                latencies.append((time.perf_counter() - t0) * 1000.0)  # ms
+        finally:
+            if profile_dir:
+                jax.profiler.stop_trace()
+        return latencies
+
+    def _report(
+        self,
+        latencies: List[float],
+        mode: str,
+        num_devices: int,
+        batch_size: int,
+        max_seq_len: int,
+        num_warmup: int,
+    ) -> None:
+        """Compute p50/p95/p99 + throughput and print a summary table."""
+        latencies.sort()
+        n = len(latencies)
+        p50 = latencies[n // 2]
+        p95 = latencies[min(int(n * 0.95), n - 1)]
+        p99 = latencies[min(int(n * 0.99), n - 1)]
+        mean = statistics.mean(latencies)
+        throughput = batch_size / (mean / 1000.0)
+
+        platform = self.devices[0].platform
+        print("\n" + "=" * 72)
+        print("  STU/HSTU XLA latency benchmark")
+        print("=" * 72)
+        print(
+            f"  platform={platform} devices={num_devices} mode={mode} "
+            f"batch={batch_size} max_seq_len={max_seq_len}"
+        )
+        print(f"  warmup={num_warmup} steps  measured={n} steps")
+        print("-" * 72)
+        print(
+            f"  mean={mean:.3f}ms  p50={p50:.3f}ms  p95={p95:.3f}ms  "
+            f"p99={p99:.3f}ms  throughput={throughput:.0f} samples/s"
+        )
+        print("=" * 72)
+
+    def _log_compiled_cost(self, step: Callable[..., object]) -> None:
+        """Best-effort log of XLA static cost for each compiled subgraph."""
+        compiled_obj = step.__dict__.get(COMPILED_OBJECT_KEY)
+        if compiled_obj is None:
+            return
+        for name, module in compiled_obj.gm.named_modules():
+            jax_compiled = getattr(module, "_jax_compiled", None)
+            if jax_compiled is None:
+                continue
+            try:
+                cost = jax_compiled.cost_analysis()
+            except Exception as e:  # noqa: BLE001 - diagnostics only
+                print(f"[cost] {name or '<root>'}: cost_analysis failed: {e}")
+                continue
+            print(f"[cost] {name or '<root>'}: {cost}")

@@ -166,6 +166,39 @@ kubectl get jobsets --context="$CTX"
 kubectl delete jobset/<old-name> --context="$CTX"
 ```
 
+## Running `stu_test.py` on TPU
+
+The same `rankfm_tpu` image can run `recir/tests/stu_test.py` (the STU /
+`generative_recommenders` recir-compile test suite) directly on a TPU slice.
+`build_image_podman.sh` ships `recir/tests/stu_test.py` in the image, and
+`recir/tests/stu-test-4chip.yaml` runs it as a single-node job via
+`python3 -u -m unittest -v recir.tests.stu_test`.
+
+`recir/tests/helpers.sh` mirrors `helpers.sh` with `stu_*` functions:
+
+```bash
+source recir/tests/helpers.sh
+
+stu_submit                   # submit default 4-chip yaml; sets $JS
+stu_status                   # pods for current $JS, with node placement
+stu_logs                     # tail the test pod
+stu_dump_logs                # dump pod logs to /tmp/stulogs/, summarize OK/FAILED
+stu_traceback                # full traceback from the test pod
+stu_kill                     # delete current $JS
+
+stu_iterate                  # build_image_podman.sh -> submit -> tail test pod
+```
+
+Or submit the yaml directly:
+
+```bash
+kubectl create -f recir/tests/stu-test-4chip.yaml \
+  --context=gke_mrs-tpu-y317h_us-central1_recir-v7-128
+```
+
+GPU-only tests in the suite self-skip on TPU; the JAX-backed tests run against
+the slice's TPU devices.
+
 ## Architecture
 
 ```

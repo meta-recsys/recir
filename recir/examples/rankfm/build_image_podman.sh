@@ -55,13 +55,15 @@ RSYNC_EXCLUDES=(
 )
 
 # recir + setup.py
-# Keep recir/tests/xla/xsurface_test_utils.py (imported by train.py) but
+# Keep recir/tests/xla/xsurface_test_utils.py (imported by train.py) and
+# recir/tests/stu_test.py (run by recir/tests/helpers.sh on TPU), but
 # exclude every other test file. Includes MUST precede excludes — rsync's
 # first-match-wins evaluation order means a bare `--exclude=tests` would
 # prune the whole tree before the includes are seen.
 rsync -a \
     --include='tests/' \
     --include='tests/__init__.py' \
+    --include='tests/stu_test.py' \
     --include='tests/xla/' \
     --include='tests/xla/__init__.py' \
     --include='tests/xla/xsurface_test_utils.py' \
