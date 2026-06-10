@@ -16,9 +16,13 @@ class BackendType(Enum):
     XLA_SHARD_MAP: Lower to XLA via torchax/JAX with shard_map for explicit
         collectives. Maps _c10d_functional ops to JAX collectives via shard_map.
     XLA_GSPMD: Lower to XLA via torchax/JAX with GSPMD auto-parallelism.
+    TORCHTPU: Lower to TPU via torch_tpu (StableHLO/PJRT, no JAX). Each dense
+        subgraph is compiled with torch_tpu's TpuBackend (aot_autograd ->
+        StaticCompiler -> fx_to_mlir -> compile_mlir).
     """
 
     INDUCTOR = "inductor"
     XLA_DYNAMO_BRIDGE = "xla_dynamo_bridge"
     XLA_SHARD_MAP = "xla_shard_map"
     XLA_GSPMD = "xla_gspmd"
+    TORCHTPU = "torchtpu"

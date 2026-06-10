@@ -554,15 +554,29 @@ class DummyPreprocess(nn.Module):
             else:
                 L = self.static_uih_len
             emb_lengths.append(
-                torch.full((batch_size,), L, dtype=torch.long) + _batch_dep_long
+                torch.full((batch_size,), L, dtype=torch.long, device=uih_values.device)
+                + _batch_dep_long
             )
-            emb_values.append(torch.zeros(total_len, self.embedding_dim) + _batch_dep)
+            emb_values.append(
+                torch.zeros(total_len, self.embedding_dim, device=uih_values.device)
+                + _batch_dep
+            )
         uih_seq_lengths = (
-            torch.full((batch_size,), self.static_uih_len, dtype=torch.long)
+            torch.full(
+                (batch_size,),
+                self.static_uih_len,
+                dtype=torch.long,
+                device=uih_values.device,
+            )
             + _batch_dep_long
         )
         num_candidates = (
-            torch.full((batch_size,), self.static_num_candidates, dtype=torch.long)
+            torch.full(
+                (batch_size,),
+                self.static_num_candidates,
+                dtype=torch.long,
+                device=uih_values.device,
+            )
             + _batch_dep_long
         )
         payload_features: Dict[str, torch.Tensor] = {}
@@ -576,19 +590,25 @@ class DummyPreprocess(nn.Module):
                 cand_name not in self.item_emb_feature_names
                 and uih_name not in self.user_emb_feature_names
             ):
-                payload_features[uih_name] = torch.zeros(total_uih, dtype=torch.long)
-                payload_features[cand_name] = torch.zeros(total_cand, dtype=torch.long)
+                payload_features[uih_name] = torch.zeros(
+                    total_uih, dtype=torch.long, device=uih_values.device
+                )
+                payload_features[cand_name] = torch.zeros(
+                    total_cand, dtype=torch.long, device=uih_values.device
+                )
         payload_features["uih_offsets"] = torch.arange(
             0,
             total_uih + self.static_uih_len,
             self.static_uih_len,
             dtype=torch.long,
+            device=uih_values.device,
         )
         payload_features["candidate_offsets"] = torch.arange(
             0,
             total_cand + self.static_num_candidates,
             self.static_num_candidates,
             dtype=torch.long,
+            device=uih_values.device,
         )
         raw_output = (
             emb_lengths,

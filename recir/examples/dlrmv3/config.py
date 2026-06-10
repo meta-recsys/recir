@@ -44,7 +44,10 @@ class DLRMv3Config:
     embedding_lr: float = 0.1
 
     # Embedding backend
-    embedding_backend: str = "tpu"  # "cpu" (torchrec DMP) | "tpu" (JAX/SparseCore)
+    embedding_backend: str = "tpu"  # "cpu" (torchrec DMP) | "tpu" (SparseCore)
+
+    # Compile backend
+    compile_backend: str = "torchax"  # "torchax" (XLA GSPMD) | "torchtpu"
 
     # Profiling
     profile_start_step: int = -1
@@ -89,7 +92,14 @@ class DLRMv3Config:
             type=str,
             default=cfg.embedding_backend,
             choices=["cpu", "tpu"],
-            help="'cpu': torchrec DMP on CPU; 'tpu': JAX/SparseCore (default)",
+            help="'cpu': TorchRec on CPU; 'tpu': SparseCore (default)",
+        )
+        p.add_argument(
+            "--compile_backend",
+            type=str,
+            default=cfg.compile_backend,
+            choices=["torchax", "torchtpu"],
+            help="'torchax': XLA GSPMD (default); 'torchtpu': TorchTPUBackend",
         )
 
         # Preset: small (for smoke testing)
@@ -142,6 +152,7 @@ class DLRMv3Config:
             dense_lr=args.dense_lr,
             embedding_lr=args.embedding_lr,
             embedding_backend=args.embedding_backend,
+            compile_backend=args.compile_backend,
             profile_start_step=args.profile_start_step,
             profile_end_step=args.profile_end_step,
             profile_dir=args.profile_dir,

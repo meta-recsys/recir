@@ -34,7 +34,7 @@ from __future__ import annotations
 import itertools
 import operator
 import threading
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import torch
 from torch import fx
@@ -114,7 +114,7 @@ def _wrap_with_save_for_backward(
     # eager_dispatch is imported from. Keep it local to the helper.
     import torch.utils._pytree as pytree
 
-    state: dict[str, Optional[List[torch.Tensor]]] = {"saved": None}
+    state: dict[str, Any] = {"saved": None, "pending": 0}
 
     def fwd(*inputs: torch.Tensor) -> Tuple[torch.Tensor, ...]:
         with torch.enable_grad():
@@ -122,14 +122,27 @@ def _wrap_with_save_for_backward(
         flat = [
             t for t in pytree.tree_leaves(raw_output) if isinstance(t, torch.Tensor)
         ]
-        state["saved"] = [t for t in flat if t.requires_grad]
+        saved = [t for t in flat if t.requires_grad]
+        state["saved"] = saved
+        state["pending"] = len(saved)
         return tuple(t.detach() for t in flat)
 
     def bwd(grad: torch.Tensor, grad_idx: int = 0) -> None:
         saved = state["saved"]
         if saved is not None and grad_idx < len(saved):
             s = saved[grad_idx]
-            is_last = grad_idx == len(saved) - 1
+            # Grads may arrive in any grad_idx order (the torch_tpu compiled
+            # backward emits them descending), so count down the outstanding
+            # saved leaves instead of assuming grad_idx == len-1 is last; freeing
+            # early would drop every later grad (here: the SparseCore embedding).
+            state["pending"] = int(state["pending"]) - 1
+            is_last = int(state["pending"]) == 0
+            # The grad arrives from the compiled (e.g. torch_tpu) region on the
+            # compute device, but the eager-saved activation may live on a
+            # different device (e.g. cpu for a torchrec embedding). Move the
+            # grad to the saved tensor's device for the eager backward. No-op
+            # when devices already match (e.g. the torchax/XLA path).
+            grad = grad.to(s.device)
             torch.autograd.backward([s], [grad / num_ranks], retain_graph=not is_last)
             if is_last:
                 state["saved"] = None
