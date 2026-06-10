@@ -5,15 +5,18 @@
 
 # pyre-strict
 
-"""Pluggable embedding backends for DLRMv3: CPU/torchrec or JAX/SparseCore.
+"""Pluggable embedding backends for DLRMv3.
 
-Two backends share the same EmbeddingBackend ABC:
+Embedding backends share the same EmbeddingBackend ABC:
 
   CPUTorchRecBackend  — torchrec DMP ROW_WISE on CPU via gloo PG.
 
   JAXTPUBackend — jax_tpu_embedding SparseCore: tables as EmbeddingVariables
                   sharded on SparseCore HW, lookup via tpu_sparse_dense_matmul,
                   Adagrad fused on-chip. No gloo PG required.
+
+  TorchTPUEmbBackend — torch_tpu SparseCore path selected lazily for
+                       compile_backend="torchtpu".
 
 Architecture for JAXTPUBackend:
   - SparseCoreLookup wraps tpu_sparse_dense_matmul in jax.jit.  Calling it
@@ -28,7 +31,8 @@ Batch-size constraint (local_batch_size must be a multiple of
 local_device_count × num_sc_per_device; e.g. multiples of 32 on TPU v7x
 with 8 JAX devices/pod and 4 SparseCores/device).
 
-Selected at runtime via DLRMv3Config.embedding_backend ("cpu" | "tpu").
+Selected at runtime via DLRMv3Config.embedding_backend ("cpu" | "tpu")
+and DLRMv3Config.compile_backend ("torchax" | "torchtpu").
 """
 
 from __future__ import annotations
@@ -132,6 +136,102 @@ def _kjt_to_numpy(
         result[key] = arr
         id_offset += total_ids_k
     return result
+
+
+def build_jte_sparsecore_feature_specs(
+    table_configs: list[EmbeddingConfig],
+    seq_lens: dict[str, int],
+    local_bs: int,
+    num_sc: int,
+    global_dev: int,
+    embedding_lr: float,
+) -> dict[str, Any]:
+    """Reuse JTE processing to define SparseCore table/feature layout."""
+    _, jte_spec, jte_stacking, _ = _lazy_jte()
+    feature_specs: dict[str, Any] = {}
+    for tc in table_configs:
+        # ONE TableSpec per table, shared by all features on it.
+        # Duplicate TableSpec objects with the same name corrupt auto_stack_tables.
+        table_spec = jte_spec.TableSpec(
+            vocabulary_size=tc.num_embeddings,
+            embedding_dim=tc.embedding_dim,
+            initializer=jax.nn.initializers.truncated_normal(
+                stddev=1.0 / tc.embedding_dim**0.5
+            ),
+            optimizer=jte_spec.AdagradOptimizerSpec(
+                learning_rate=embedding_lr,
+                initial_accumulator_value=0.0,
+            ),
+            combiner="sum",  # no-op for 1-ID samples (sequence token trick)
+            name=tc.name,
+        )
+        for fname in tc.feature_names:
+            seq_len = seq_lens.get(fname, 1)
+            if seq_len > 1:
+                # Sequence feature: each token = separate 1-ID sample.
+                feat_input_shape: tuple[int, int] = (local_bs * seq_len, 1)
+                feat_output_shape: tuple[int, int] = (
+                    local_bs * seq_len,
+                    tc.embedding_dim,
+                )
+            else:
+                feat_input_shape = (local_bs, 1)
+                feat_output_shape = (local_bs, tc.embedding_dim)
+            feature_specs[fname] = jte_spec.FeatureSpec(
+                name=fname,
+                table_spec=table_spec,
+                input_shape=feat_input_shape,
+                output_shape=feat_output_shape,
+            )
+        logger.info(
+            f"SparseCore table '{tc.name}': "
+            f"({tc.num_embeddings}, {tc.embedding_dim}), "
+            f"features={tc.feature_names}"
+        )
+
+    # Keep each table in its own singleton stack instead of using
+    # auto_stack_tables(). auto_stack_tables groups all DLRMv3 tables into one
+    # tensor that exceeds SparseCore per-tensor limits at default hash_size.
+    for tc in table_configs:
+        jte_stacking.stack_tables(
+            feature_specs,
+            table_names=[tc.name],
+            global_device_count=global_dev,
+            num_sc_per_device=num_sc,
+            stack_name=tc.name,
+        )
+    return feature_specs
+
+
+def init_jte_sparsecore_embedding_variables(
+    feature_specs: dict[str, Any],
+    num_sc: int,
+    global_sharding: Any,
+) -> dict[str, Any]:
+    """Reuse JTE processing to initialize state in SparseCore layout."""
+    jte_embedding, _, _, _ = _lazy_jte()
+    table_specs = jte_embedding.get_table_specs(feature_specs)
+    stacks: dict[str, list[Any]] = collections.defaultdict(list)
+    for tspec in jax.tree.leaves(table_specs):
+        stacks[tspec.setting_in_stack.stack_name].append(tspec)
+    for ts in stacks.values():
+        ts.sort(key=lambda t: t.setting_in_stack.row_offset_in_shard)
+
+    sharding_axis = next(s for s in global_sharding.spec if s is not None)
+    per_table_width = global_sharding.mesh.size * num_sc
+    rngs = jax.random.split(jax.random.PRNGKey(0), per_table_width * len(stacks))
+    emb_vars: dict[str, Any] = {}
+    for i, (stack_name, ts) in enumerate(stacks.items()):
+        rngs_for_table = rngs[i * per_table_width : (i + 1) * per_table_width]
+        emb_vars[stack_name] = jte_embedding._init_stacked_embedding_table(
+            rng=rngs_for_table,
+            stack_name=stack_name,
+            table_specs=ts,
+            global_sharding=global_sharding,
+            sharding_axis=sharding_axis,
+            num_sparsecore_per_device=num_sc,
+        )
+    return emb_vars
 
 
 # ---------------------------------------------------------------------------
@@ -454,6 +554,14 @@ class JAXPreprocess:
 class EmbeddingBackend(ABC):
     """Backend-agnostic interface for embedding storage, lookup, and PG init."""
 
+    def __init__(self) -> None:
+        # SparseCore (tpu) backends require these to be set by the driver
+        # before setup(); CPU backends leave them at the defaults. Declared on
+        # the base so the generic train.py driver can assign them through the
+        # base type.
+        self.seq_lens: dict[str, int] = {}
+        self.global_batch_size: int = 0
+
     @abstractmethod
     def init_pg(self) -> tuple[int, int]:
         """Initialize process group. Returns (rank, world_size)."""
@@ -647,8 +755,6 @@ class JAXTPUBackend(EmbeddingBackend):
         if self.global_batch_size <= 0:
             raise RuntimeError("Set backend.global_batch_size before calling setup()")
 
-        jte_embedding, jte_spec, jte_stacking, _ = _lazy_jte()
-
         # Build jte FeatureSpec / TableSpec from EmbeddingConfig list.
         # Use per-process batch size (not global) for input/output_shape so that
         # SparseCore buffers match what each process actually processes.
@@ -675,63 +781,14 @@ class JAXTPUBackend(EmbeddingBackend):
                 f"local_device_count ({local_dev}) × num_sc_per_device ({num_sc})"
                 f" = {local_dev * num_sc}"
             )
-        feature_specs: dict[str, Any] = {}
-        for tc in table_configs:
-            # ONE TableSpec per table, shared by all features on it.
-            # Duplicate TableSpec objects with the same name corrupt auto_stack_tables.
-            table_spec = jte_spec.TableSpec(
-                vocabulary_size=tc.num_embeddings,
-                embedding_dim=tc.embedding_dim,
-                initializer=jax.nn.initializers.truncated_normal(
-                    stddev=1.0 / tc.embedding_dim**0.5
-                ),
-                optimizer=jte_spec.AdagradOptimizerSpec(
-                    learning_rate=embedding_lr,
-                    initial_accumulator_value=0.0,
-                ),
-                combiner="sum",  # no-op for 1-ID samples (sequence token trick)
-                name=tc.name,
-            )
-            for fname in tc.feature_names:
-                seq_len = self.seq_lens.get(fname, 1)
-                if seq_len > 1:
-                    # Sequence feature: each token = separate 1-ID sample (RecML trick).
-                    # input  (local_bs * seq_len, 1)  — one row per token position
-                    # output (local_bs * seq_len, emb_dim) — per-token embedding
-                    feat_input_shape: tuple[int, int] = (local_bs * seq_len, 1)
-                    feat_output_shape: tuple[int, int] = (
-                        local_bs * seq_len,
-                        tc.embedding_dim,
-                    )
-                else:
-                    feat_input_shape = (local_bs, 1)
-                    feat_output_shape = (local_bs, tc.embedding_dim)
-                feature_specs[fname] = jte_spec.FeatureSpec(
-                    name=fname,
-                    table_spec=table_spec,
-                    input_shape=feat_input_shape,
-                    output_shape=feat_output_shape,
-                )
-            logger.info(
-                f"SparseCore table '{tc.name}': "
-                f"({tc.num_embeddings}, {tc.embedding_dim}), "
-                f"features={tc.feature_names}"
-            )
-
-        # Place each table in its own singleton stack instead of using
-        # auto_stack_tables(). auto_stack_tables groups all tables into a single
-        # StackedTableSpec, which at default hash_size=10M produces a 30 GB
-        # tensor (3 tables × 10M × 256 × f32) that exceeds SC's 16 GiB
-        # per-tensor HBM limit and fails tpu_sparse_dense_matmul with
-        # INVALID_ARGUMENT. Per-table singleton stacks keep each at ~10 GB.
-        for tc in table_configs:
-            jte_stacking.stack_tables(
-                feature_specs,
-                table_names=[tc.name],
-                global_device_count=global_dev,
-                num_sc_per_device=num_sc,
-                stack_name=tc.name,
-            )
+        feature_specs = build_jte_sparsecore_feature_specs(
+            table_configs,
+            self.seq_lens,
+            local_bs,
+            num_sc,
+            global_dev,
+            embedding_lr,
+        )
 
         # Mesh over all 256 JAX devices; each process holds its local 8 shards.
         devices = np.array(jax.devices())
@@ -740,34 +797,13 @@ class JAXTPUBackend(EmbeddingBackend):
             mesh, jax.sharding.PartitionSpec("x", None)
         )
 
-        # Init EmbeddingVariables sharded on SparseCore.
-        # Workaround: init_embedding_variables compares PartitionSpec with plain
-        # tuples via !=, which always returns True in newer JAX where PartitionSpec
-        # is no longer a tuple subclass. Call _init_stacked_embedding_table directly
-        # to skip the broken validation, replicating init_embedding_variables logic.
-        table_specs = jte_embedding.get_table_specs(feature_specs)
-        stacks: dict[str, list[Any]] = collections.defaultdict(list)
-        for tspec in jax.tree.leaves(table_specs):
-            stacks[tspec.setting_in_stack.stack_name].append(tspec)
-        for ts in stacks.values():
-            ts.sort(key=lambda t: t.setting_in_stack.row_offset_in_shard)
-
-        sharding_axis = next(s for s in global_sharding.spec if s is not None)
-        per_table_width = global_sharding.mesh.size * num_sc
-        rngs = jax.random.split(jax.random.PRNGKey(0), per_table_width * len(stacks))
-        emb_vars: dict[str, Any] = {}
-        for i, (stack_name, ts) in enumerate(stacks.items()):
-            rngs_for_table = rngs[i * per_table_width : (i + 1) * per_table_width]
-            emb_vars[stack_name] = jte_embedding._init_stacked_embedding_table(
-                rng=rngs_for_table,
-                stack_name=stack_name,
-                table_specs=ts,
-                global_sharding=global_sharding,
-                sharding_axis=sharding_axis,
-                num_sparsecore_per_device=num_sc,
-            )
+        # Reuse JTE processing to initialize table + optimizer state in
+        # physical SparseCore layout.
+        emb_vars = init_jte_sparsecore_embedding_variables(
+            feature_specs, num_sc, global_sharding
+        )
         logger.info(
-            f"SparseCore: initialized {len(stacks)} stacked tables, "
+            f"SparseCore: initialized {len(emb_vars)} stacked tables, "
             f"num_sc_per_device={num_sc}"
         )
 
@@ -811,11 +847,25 @@ class JAXTPUBackend(EmbeddingBackend):
 # ---------------------------------------------------------------------------
 
 
-def build_embedding_backend(embedding_backend: str) -> EmbeddingBackend:
+def build_embedding_backend(
+    embedding_backend: str,
+    compile_backend: str = "torchax",
+) -> EmbeddingBackend:
+    if compile_backend == "torchtpu" and embedding_backend == "tpu":
+        # Local import — embedding_torchtpu imports from this module, so we
+        # import lazily to break the cycle at module-load time.
+        # pyre-ignore[21]: embedding_torchtpu lives in a sibling buck target;
+        # the lazy import is intentional and resolved at runtime.
+        from recir.examples.dlrmv3.embedding_torchtpu import TorchTPUEmbBackend
+
+        # pyre-ignore[16]: see comment on import above.
+        return TorchTPUEmbBackend()
     if embedding_backend == "cpu":
         return CPUTorchRecBackend()
-    if embedding_backend == "tpu":
+    if compile_backend == "torchax" and embedding_backend == "tpu":
         return JAXTPUBackend()
     raise ValueError(
-        f"Unknown embedding_backend: {embedding_backend!r}. Use 'cpu' or 'tpu'."
+        "Unknown backend combination: "
+        f"embedding_backend={embedding_backend!r}, "
+        f"compile_backend={compile_backend!r}."
     )

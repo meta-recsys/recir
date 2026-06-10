@@ -10,24 +10,38 @@
 DLRMv3 E2E training on GKE TPU v7x.
 
 Supports two embedding backends (--embedding_backend):
-  cpu        torchrec DMP ROW_WISE on CPU + gloo PG
-  tpu JAX-native tables + JAX gather / tpu_sparse_dense_matmul
+  cpu        TorchRec embeddings on CPU with eager graph break
+  tpu        SparseCore tables
 
-Dense HSTU path always runs on TPU via recir @compile + XLA GSPMD.
+Supports two compile backends (--compile_backend):
+  torchax    recir @compile + XLA GSPMD (default)
+  torchtpu   recir @compile + TorchTPUBackend (single-device)
 
 Usage:
     python -u -m recir.examples.dlrmv3.train --preset small --max_steps 10
+    python -u -m recir.examples.dlrmv3.train \\
+        --compile_backend torchax --embedding_backend cpu --preset small
     python -u -m recir.examples.dlrmv3.train --max_steps 20 --profile_start_step 5 --profile_end_step 10
     python -u -m recir.examples.dlrmv3.train --preset small --max_steps 5 \\
-        --embedding_backend tpu
+        --compile_backend torchtpu --embedding_backend tpu
 """
 
 from __future__ import annotations
 
 import logging
 import os
+import sys
 import time
 from typing import Any
+
+# When invoked as a script, restart once with backend autoload disabled. Python
+# imports recir/__init__.py before executing this module, and that import path
+# can import torch; in this pod's venv, torch autoloads torch_tpu and claims
+# PrivateUse1 before TorchAX can register it as "jax". The TorchTPU branch
+# explicitly loads torch_tpu later during runtime init.
+if __name__ == "__main__" and os.environ.get("TORCH_DEVICE_BACKEND_AUTOLOAD") != "0":
+    os.environ["TORCH_DEVICE_BACKEND_AUTOLOAD"] = "0"
+    os.execvpe(sys.orig_argv[0], sys.orig_argv, os.environ)
 
 import fbgemm_gpu  # noqa: F401 -- force C++ op registration before fallback
 import jax
@@ -49,9 +63,12 @@ from torchrec.distributed.model_parallel import DistributedModelParallel
 from torchrec.modules.embedding_configs import EmbeddingConfig
 
 from .config import DLRMv3Config
-from .embedding import build_embedding_backend, EmbeddingBackend, JAXTPUBackend
+from .embedding import build_embedding_backend, EmbeddingBackend
 
 logger: logging.Logger = logging.getLogger(__name__)
+
+_MAX_TORCHTPU_EMB_STATE_GIB = 24.0
+_DLRMV3_TABLE_COUNT = 3
 
 
 def _setup_logging() -> None:
@@ -135,7 +152,7 @@ def create_model_and_data(
     return wrapper, table_configs, emb_keys, batch, hstu_config
 
 
-def _run_training_loop(
+def _run_training_loop(  # noqa: C901 - driver loop: backend-dispatch + profiling branches
     cfg: DLRMv3Config,
     backend: EmbeddingBackend,
     model: nn.Module,
@@ -149,9 +166,9 @@ def _run_training_loop(
 ) -> None:
     """Execute the compiled training loop with optional JAX profiling."""
     # Create the dispatcher (orchestrator-style override) for the embedding
-    # backend.  Both CPU and JAX backends expose ``install_eager`` +
+    # backend. All embedding backends expose ``install_eager`` +
     # ``install_graph`` (the dispatcher pattern), so the same compile
-    # orchestrator (`compile_with_jax_embedding`) works for both.
+    # orchestrator (`compile_with_jax_embedding`) works across compile backends.
     dummy = DummyPreprocess(
         emb_keys=emb_keys,
         batch_size=cfg.local_batch_size,
@@ -162,12 +179,37 @@ def _run_training_loop(
         item_emb_feature_names=hstu_config.item_embedding_feature_names,
         hstu_configs=hstu_config,
     )
+    if cfg.compile_backend == "torchtpu":
+        dummy = dummy.to("tpu")
     dispatcher = backend.get_dispatcher(dummy, num_ranks=num_ranks)
 
-    # compile_ranks: use all JAX devices when on TPU (device_count > 1 on TPU,
-    # = 1 on CPU-only machines where we fall back to the gloo world size).
-    num_tpu_devices = jax.device_count()
-    compile_ranks = num_tpu_devices if num_tpu_devices > 1 else num_ranks
+    if cfg.compile_backend == "torchax":
+        # compile_ranks: use all JAX devices when on TPU (device_count > 1 on TPU,
+        # = 1 on CPU-only machines where we fall back to the gloo world size).
+        num_tpu_devices = jax.device_count()
+        compile_ranks = num_tpu_devices if num_tpu_devices > 1 else num_ranks
+        parallel_mode = GSPMDParallel(
+            "replicate",
+            loss_reduction="sum",
+            num_ranks=compile_ranks,
+            num_processes=num_ranks,
+        )
+        compile_backend = XLAGSPMDBackend()
+        trace_inputs = local_batch
+    else:
+        from recir.backends import TorchTPUBackend
+        from recir.distributed.parallel_mode import DataParallel
+
+        compile_ranks = num_ranks
+        parallel_mode = DataParallel(
+            "replicate",
+            loss_reduction="sum",
+            num_ranks=compile_ranks,
+            num_processes=num_ranks,
+            device_type="tpu",
+        )
+        compile_backend = TorchTPUBackend()
+        trace_inputs = tuple(t.to("tpu") for t in local_batch)
 
     def train_step_fn(
         mod: nn.Module,
@@ -192,25 +234,22 @@ def _run_training_loop(
         train_step_fn,
         model_to_train_for_compile,
         dense_opt,
-        *local_batch,
+        *trace_inputs,
         dispatcher=dispatcher,
-        parallel_mode=GSPMDParallel(
-            "replicate",
-            loss_reduction="sum",
-            num_ranks=compile_ranks,
-            num_processes=num_ranks,
-        ),
-        backend=XLAGSPMDBackend(),
+        parallel_mode=parallel_mode,
+        backend=compile_backend,
     )
 
-    # JAX profiler setup — enabled when on TPU and profile_start_step > 0
+    # JAX profiler setup — enabled when on TPU and profile_start_step > 0.
+    # TorchTPU profiling is handled outside this train.py path for now.
     profiling_active = False
     jax_profiling = False
-    try:
-        is_tpu = len(jax.devices()) > 0 and jax.devices()[0].platform == "tpu"
-        jax_profiling = is_tpu and cfg.profile_start_step > 0
-    except (RuntimeError, IndexError):
-        logger.warning("Could not detect JAX TPU platform, profiling disabled")
+    if cfg.compile_backend == "torchax":
+        try:
+            is_tpu = len(jax.devices()) > 0 and jax.devices()[0].platform == "tpu"
+            jax_profiling = is_tpu and cfg.profile_start_step > 0
+        except (RuntimeError, IndexError):
+            logger.warning("Could not detect JAX TPU platform, profiling disabled")
     if jax_profiling:
         logger.info(
             f"JAX profiling enabled: steps {cfg.profile_start_step}-{cfg.profile_end_step}, "
@@ -274,26 +313,77 @@ def _run_training_loop(
         )
 
 
-def main() -> None:
-    # Must be called before any JAX operation. On GKE TPU the PJRT plugin reads
-    # coordinator address and process index from TPU runtime metadata automatically.
-    # Without this, each pod runs as jax.process_count()=1 and the SparseCore
-    # hardware collective (which spans all 128 chips) deadlocks.
-    jax.distributed.initialize()
+def main() -> None:  # noqa: C901 - top-level driver: linear backend-dispatch branches
     _setup_logging()
-    logger.info(
-        f"[DIST] jax.distributed.initialize() done: "
-        f"process_count={jax.process_count()}, "
-        f"device_count={jax.device_count()}, "
-        f"local_device_count={jax.local_device_count()}, "
-        f"process_index={jax.process_index()}"
-    )
     cfg = DLRMv3Config.from_args()
+
+    # Validate backend-specific assumptions before model/storage allocation.
+    if cfg.compile_backend == "torchax":
+        privateuse1_backend = torch._C._get_privateuse1_backend_name()
+        if privateuse1_backend == "tpu":
+            raise RuntimeError(
+                "torch_tpu has already claimed PyTorch PrivateUse1, but "
+                "--compile_backend torchax needs TorchAX to register it as "
+                "'jax'. Re-run the torchax path with "
+                "TORCH_DEVICE_BACKEND_AUTOLOAD=0."
+            )
+    elif cfg.embedding_backend == "tpu":
+        # SparseCore keeps table values plus one Adagrad accumulator slot.
+        emb_state_gib = (
+            cfg.hash_size * cfg.embedding_dim * _DLRMV3_TABLE_COUNT * 2 * 4 / (1024**3)
+        )
+        if emb_state_gib > _MAX_TORCHTPU_EMB_STATE_GIB:
+            raise ValueError(
+                "The single-device torch_tpu path would place about "
+                f"{emb_state_gib:.2f} GiB of embedding table+Adagrad state on "
+                "one TPU device. Use --preset small/medium or reduce --hash_size."
+            )
+        if cfg.profile_start_step > 0:
+            logger.warning(
+                "JAX profiling flags are ignored for --compile_backend torchtpu"
+            )
+
     logger.info(f"Config: {cfg}")
 
-    # --- 1. Build embedding backend and init PG ---
-    backend = build_embedding_backend(cfg.embedding_backend)
-    gloo_rank, gloo_world = backend.init_pg()
+    # --- 1. Build embedding backend and init runtime ---
+    backend = build_embedding_backend(cfg.embedding_backend, cfg.compile_backend)
+    if cfg.compile_backend == "torchax":
+        # Must be called before any JAX operation. On GKE TPU the PJRT plugin
+        # reads coordinator address and process index from TPU runtime metadata
+        # automatically. Without this, each pod runs as jax.process_count()=1
+        # and the SparseCore hardware collective can deadlock.
+        jax.distributed.initialize()
+        logger.info(
+            f"[DIST] jax.distributed.initialize() done: "
+            f"process_count={jax.process_count()}, "
+            f"device_count={jax.device_count()}, "
+            f"local_device_count={jax.local_device_count()}, "
+            f"process_index={jax.process_index()}"
+        )
+        gloo_rank, gloo_world = backend.init_pg()
+    elif cfg.compile_backend == "torchtpu":
+        # torch_tpu is provided by the TPU runtime venv, not a buck dep, so it
+        # is imported lazily on the torchtpu path only.
+        # pyre-ignore[21]: torch_tpu is resolved at runtime, not build time.
+        from torch_tpu._loader import load as load_torchtpu
+
+        load_torchtpu()
+
+        if cfg.embedding_backend == "tpu":
+            gloo_rank, gloo_world = backend.init_pg()
+        else:
+            if not dist.is_initialized():
+                store = dist.TCPStore("127.0.0.1", 0, 1, is_master=True)
+                dist.init_process_group(
+                    backend="gloo", store=store, rank=0, world_size=1
+                )
+            gloo_rank, gloo_world = dist.get_rank(), dist.get_world_size()
+    else:
+        raise ValueError(
+            f"train.py supports --compile_backend torchax or torchtpu, got "
+            f"{cfg.compile_backend!r}."
+        )
+
     is_main = gloo_rank == 0
     global_bs = cfg.local_batch_size * gloo_world
 
@@ -302,12 +392,18 @@ def main() -> None:
     wrapper, table_configs, emb_keys, local_batch, hstu_config = create_model_and_data(
         cfg, global_bs
     )
+    if cfg.compile_backend == "torchtpu":
+        from torchrec.modules.embedding_modules import EmbeddingCollection
+
+        wrapper = wrapper.to("tpu")
+        for mod in wrapper.modules():
+            if isinstance(mod, EmbeddingCollection):
+                mod.to("cpu")
 
     # --- 3. Set up embedding storage ---
-    if isinstance(backend, JAXTPUBackend):
-        # UIH seq features: uih_len tokens per sample (token-as-sample trick)
-        # Candidate features: num_candidates IDs per sample (same trick)
-        # Contextual features (viewer_id, dummy_contexual): pooled, stay at default 1
+    if cfg.embedding_backend == "tpu":
+        # UIH/candidate features use the token-as-sample trick; contextual
+        # features stay pooled length 1 in the embedding backends.
         backend.seq_lens = {
             "uih_post_id": cfg.uih_len,
             "uih_owner_id": cfg.uih_len,
@@ -315,6 +411,7 @@ def main() -> None:
             "item_owner_id": cfg.num_candidates,
         }
         backend.global_batch_size = global_bs
+
     model, dense_opt = backend.setup(
         wrapper, table_configs, cfg.embedding_lr, cfg.dense_lr, gloo_world
     )
