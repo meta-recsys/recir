@@ -52,6 +52,10 @@ RUN pip install pyre-extensions iopath
 # zstandard: decompress .pt.zst dataporter batches in BatchReplayPipe
 RUN pip install zstandard
 
+# google-cloud-storage: upload parity_result.json to the tenant GCS bucket
+# from parity_forward_loss.py (`from google.cloud import storage`).
+RUN pip install google-cloud-storage
+
 # Copy and install recir with XLA + rec extras
 COPY recir /app/recir
 COPY setup.py /app/setup.py

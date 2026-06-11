@@ -1,0 +1,73 @@
+# RankFM forward-loss parity on a single 2x2x1 TPU v7x host (4 chips).
+#
+# Models the team's ads_rankagi parity-job.yaml: a single-host (2x2x1, 4-chip)
+# pod that BYPASSES Kueue (no kueue.x-k8s.io/queue-name label) and schedules
+# straight onto one TPU host -- so it needs 4 chips, not a 64-chip 4x4x4 cube.
+# Single host => single process => parity_forward_loss.py runs as-is
+# (PARITY_DEVICE=tpu; no jax.distributed multi-host init).
+#
+# Prereqs: the rankfm_tpu image must be (re)built+pushed AFTER committing
+# parity_forward_loss.py so the module is present in the image.
+#
+# Submit (after approval):
+#   kubectl create -f recir/examples/rankfm/rankfm-parity-4chip.yaml \
+#     -n ns-mrs-core-shared
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  generateName: rankfm-parity-
+  namespace: ns-mrs-core-shared
+spec:
+  replicatedJobs:
+  - name: worker
+    replicas: 1
+    template:
+      spec:
+        parallelism: 1
+        completions: 1
+        backoffLimit: 0
+        template:
+          spec:
+            serviceAccountName: default
+            containers:
+            - name: parity
+              # Personal tag so we never clobber the shared rankfm_tpu:latest
+              # used by the RankFM training configs. Build with:
+              #   IMAGE_TAG=plund-parity bash recir/examples/rankfm/build_image_podman.sh
+              image: us-central1-docker.pkg.dev/mrs-tpu-y317h/recml/rankfm_tpu:plund-parity
+              imagePullPolicy: Always
+              env:
+              - name: PYTHONUNBUFFERED
+                value: "1"
+              - name: PJRT_DEVICE
+                value: "TPU"
+              - name: PARITY_DEVICE
+                value: "tpu"
+              command:
+              - bash
+              - -c
+              - |
+                set -euo pipefail
+                echo "=== libtpu upgrade (v7x chip-ID support, mirrors parity-job.yaml) ==="
+                pip install --quiet --upgrade --pre libtpu \
+                  -f https://storage.googleapis.com/libtpu-releases/index.html \
+                  -f https://storage.googleapis.com/libtpu-wheels/index.html || true
+                echo "=== jax devices ==="
+                python3 -c "import jax; print(jax.devices())"
+                echo "=== forward-loss parity (CPU eager bf16 vs TPU compiled) ==="
+                python3 -u -m recir.examples.rankfm.parity_forward_loss
+              ports:
+              - containerPort: 8471
+              resources:
+                limits:
+                  google.com/tpu: 4
+                requests:
+                  google.com/tpu: 4
+            nodeSelector:
+              cloud.google.com/gke-tpu-accelerator: tpu7x
+              cloud.google.com/gke-tpu-topology: 2x2x1
+            tolerations:
+            - key: google.com/tpu
+              operator: Exists
+              effect: NoSchedule
+            restartPolicy: Never
