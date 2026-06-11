@@ -19,6 +19,36 @@ class XLADeviceStateManager(DeviceStateManager):
             if isinstance(m, _XLAModule):
                 m.keep_jax_output = value
 
+    @staticmethod
+    def _convert_flat_state_to_jax(
+        flat_state: List[torch.Tensor],
+    ) -> List[Any]:
+        """Convert flat_state tensors from PyTorch to JAX arrays on TPU.
+
+        For inference, state tensors (model weights) are passed
+        through the parent FX graph:
+
+        They enter _XLAModule as inputs but are not returned as outputs.
+
+        This means process_outputs can never capture them as JAX arrays —
+        they always remain whatever type was in flat_inps, i.e. torch.Tensor.
+
+        Converting them here, once, and caching in
+        device_state ensures _XLAModule._t2j_safe / _to_sharded_jax sees
+        jax.Array on subsequent calls and skips the per-tensor dispatch.
+        """
+        import jax  # @manual
+        from recir.torchax.ops.mappings import t2j  # @manual
+
+        jax_device = jax.local_devices()[0]
+        jax_state: List[Any] = []
+        for t in flat_state:
+            if isinstance(t, torch.Tensor):
+                jax_state.append(jax.device_put(t2j(t), jax_device))
+            else:
+                jax_state.append(t)
+        return jax_state
+
     def prepare_inputs(
         self,
         gm: torch.fx.GraphModule,
@@ -26,9 +56,21 @@ class XLADeviceStateManager(DeviceStateManager):
         user_inps: List[Any],
         last_train_step: bool,
     ) -> List[Any]:
-        self._used_fast_path = self.device_state is not None and not last_train_step
+        # First call (device_state is None) and not the last training step:
+        # convert state tensors to JAX arrays once and cache. On subsequent
+        # calls, _XLAModule._t2j_safe / _to_sharded_jax sees jax.Array and
+        # returns immediately, skipping per-tensor dispatch.
+        # For training, process_outputs overwrites device_state with updated
+        # weights from the graph output after each step, so this initial
+        # conversion is overwritten and does not affect correctness.
+        if self.device_state is None and not last_train_step:
+            self.device_state = self._convert_flat_state_to_jax(flat_state)
+        device_state = self.device_state
+        self._used_fast_path = not last_train_step
         if self._used_fast_path:
-            device_state = self.device_state
+            # Only the fast path consumes the cached JAX device_state. The slow
+            # path (last_train_step) returns flat_state and may legitimately have
+            # device_state is None — process_outputs resets it at each last step.
             assert device_state is not None
             self._set_keep_jax_output(gm, True)
             return device_state + user_inps
