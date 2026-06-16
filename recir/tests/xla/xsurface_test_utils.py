@@ -16,6 +16,7 @@ from typing import Any, Callable, cast, Dict, Generator, List, Optional, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from hammer.ops.bf16_train_utils import set_autocast_factory
 from hammer.utils import HammerKernel
 from hammer.v3.models.udd_fm_v3.batch_loader import BlueReelsVDDFeatureConfig
 from hammer.v3.models.udd_fm_v3.udd_fm_config import (
@@ -45,6 +46,7 @@ from recir.eager_dispatch import (
     mark_input,
     mark_output_with_bwd,
 )
+from recir.torchax.amp import hammer_autocast_factory
 from torchrec import JaggedTensor, KeyedJaggedTensor
 
 
@@ -861,6 +863,7 @@ def _ec_sparse_arch_on(device: torch.device) -> Generator[None, None, None]:
 def build_model_from_config(
     module_config: BlueReelsVDDModuleConfig,
     device: torch.device,
+    bf16_training: bool = False,
 ) -> BlueReelsVDDTrainV3:
     """Build the V3 xsurface model from a preconfigured ``module_config``."""
     for stack in module_config.stu_stack_configs:
@@ -884,7 +887,15 @@ def build_model_from_config(
 
     # Force pure PyTorch kernels (Triton kernels lack TPU support).
     model.recursive_setattr("_hammer_kernel", HammerKernel.PYTORCH)
-    model.recursive_setattr("_bf16_training", False)
+    # Route the shared hammer.autocast() call sites to torchax AMP on this
+    # TPU/JAX build (torch.autocast("cuda", ...) is inert without CUDA tensors).
+    # Installed unconditionally here; the per-site enabled gate (_bf16_training)
+    # is what controls whether bf16 actually engages.
+    set_autocast_factory(hammer_autocast_factory)
+    # bf16: default False keeps the historical fp32 TPU behavior. When True, the
+    # HSTU L1/L2 blocks + composer + loss run bf16 (the explicit activation casts
+    # plus hammer.autocast -> torchax AMP at the same sites the GPU uses).
+    model.recursive_setattr("_bf16_training", bf16_training)
     # Zero out all remaining dropout. torchax's aten.bernoulli uses a PRNG
     # key stored in the Environment as mutable state; on the second jit call
     # the leaked tracer reference causes UnexpectedTracerError.
@@ -1198,6 +1209,8 @@ def _create_random_train_batch(
     feature_config: BlueReelsVDDFeatureConfig,
     device: torch.device,
     batch_size: int = TEST_BATCH_SIZE,
+    num_candidates: int = -1,
+    pin_memory: bool = False,
 ) -> MTMLROOTrainBatch:
     """Generate a random MTMLROOTrainBatch via RandomROODataSourceConfig.
 
@@ -1205,16 +1218,22 @@ def _create_random_train_batch(
     (``_RO_HISTORY_FEATURES``, ``_RO_CONTEXTUAL_FEATURES``,
     ``_NRO_FEATURES``).  ``randgen`` produces jagged num_candidates and
     variable RO history lengths when given a RecROORandGenContext.
+
+    ``num_candidates`` overrides the per-request candidate count; when left at
+    the ``-1`` sentinel it falls back to ``TEST_NUM_CANDIDATES`` (preserving the
+    default used by the xsurface unit tests).
+
+    ``pin_memory`` pins the generated host buffers for faster async H2D transfer.
     """
     B = batch_size
-    C = TEST_NUM_CANDIDATES
+    C = num_candidates if num_candidates > 0 else TEST_NUM_CANDIDATES
 
     data_source_config = RandomROODataSourceConfig(
         batch_size=B,
         num_batches=1,
         num_generate=1,
         num_candidates=C,
-        pin_memory=False,
+        pin_memory=pin_memory,
     )
     data_pipe = RandomDataPipe(
         feature_config=feature_config,
