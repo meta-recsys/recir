@@ -1864,6 +1864,90 @@ def _aten_bitwise_right_shift(input: Any, other: Any) -> Any:
 
 
 # aten.embedding_dense_backward
+#
+# Backward of F.embedding for a DATA-PARALLEL (DP-replicated) weight.
+#
+# This op is deliberately kept OUT of recir.torchax.decompositions.DECOMPOSITIONS.
+# The default torch decomposition lowers it to a generic scatter-add
+# (aten.index_put). Under GSPMD, a scatter-add into a {replicated} table whose
+# indices/updates are batch-sharded on the scatter (token) dim is partitioned by
+# ALL-GATHERING the indices and the per-token grad up to the global token set and
+# then doing one global scatter -- i.e. it all-reduces the huge [N_global, D]
+# activation grad (17.8GB / ~87ms per table in the rankfm 128-way DP run) instead
+# of the small [num_weights, D] table grad. To force the cheap order (per-device
+# LOCAL scatter-add, then ONE all-reduce of [num_weights, D]) we make the
+# per-device locality explicit with shard_map + psum.
+#
+# ASSUMPTIONS (hold for recir's single "torch_dist" DP mesh):
+#   * weight is DP-replicated. Row-/FSDP-sharded embedding tables go through
+#     recir.seq_embedding (ring-shift) or aten._embedding_bag, NOT aten.embedding,
+#     so the remaining aten.embedding calls are the replicated dense/EC tables.
+#   * indices / grad_output are batch-sharded on axis 0 (per-sample inputs), the
+#     same convention as recir.shard_batch0 and the ring-shift path.
+# Single-device runs short-circuit to a plain local scatter (no collective).
+_DP_AXIS = "torch_dist"
+
+
+@op(torch.ops.aten.embedding_dense_backward)  # pyre-ignore[56]
+def _aten_embedding_dense_backward(
+    grad_output: Any,
+    indices: Any,
+    num_weights: Any,
+    padding_idx: Any = -1,
+    scale_grad_by_freq: Any = False,
+) -> Any:
+    dim = grad_output.shape[-1]
+    num_weights = int(num_weights)
+
+    def _table_grad(grad_flat: Any, idx_flat: Any) -> Any:
+        gw = jnp.zeros((num_weights, dim), dtype=grad_flat.dtype)
+        return gw.at[idx_flat].add(grad_flat)
+
+    def _counts(idx_flat: Any) -> Any:
+        c = jnp.zeros((num_weights,), dtype=jnp.float32)
+        return c.at[idx_flat].add(1.0)
+
+    def _scale(gw: Any, counts: Any) -> Any:
+        inv = jnp.where(counts > 0, 1.0 / counts, 0.0).astype(gw.dtype)
+        return gw * inv[:, None]
+
+    world_size = len(jax.devices())
+    if world_size <= 1:
+        # No DP axis to reduce over -- plain local scatter-add.
+        grad_flat = grad_output.reshape(-1, dim)
+        idx_flat = indices.reshape(-1)
+        grad_weight = _table_grad(grad_flat, idx_flat)
+        if scale_grad_by_freq:
+            grad_weight = _scale(grad_weight, _counts(idx_flat))
+    else:
+        mesh = jax.sharding.Mesh(jax.devices(), (_DP_AXIS,))
+        spec = jax.sharding.PartitionSpec
+
+        def _per_device(grad_out_s: Any, idx_s: Any) -> Any:
+            # Runs on each device with only its local batch shard. The scatter is
+            # therefore local; psum sums the small [num_weights, D] table grad.
+            grad_flat = grad_out_s.reshape(-1, dim)
+            idx_flat = idx_s.reshape(-1)
+            gw = jax.lax.psum(_table_grad(grad_flat, idx_flat), axis_name=_DP_AXIS)
+            if scale_grad_by_freq:
+                counts = jax.lax.psum(_counts(idx_flat), axis_name=_DP_AXIS)
+                gw = _scale(gw, counts)
+            return gw
+
+        grad_weight = jax.shard_map(
+            _per_device,
+            mesh=mesh,
+            in_specs=(
+                spec(_DP_AXIS, *([None] * (grad_output.ndim - 1))),
+                spec(_DP_AXIS, *([None] * (indices.ndim - 1))),
+            ),
+            out_specs=spec(),  # replicated after psum
+            check_vma=False,
+        )(grad_output, indices)
+
+    if padding_idx is not None and int(padding_idx) >= 0:
+        grad_weight = grad_weight.at[int(padding_idx)].set(0.0)
+    return grad_weight
 
 
 # aten.sum

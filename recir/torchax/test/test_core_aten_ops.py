@@ -1375,6 +1375,59 @@ class TestCoreAtenOps(unittest.TestCase):
         kwargs = {}
         run_export_and_compare(self, torch.ops.aten.embedding, args, kwargs)
 
+    def test_aten_embedding_dense_backward_0(self) -> None:
+        # grad_output[*idx_shape, D], indices, num_weights, padding_idx, scale
+        args = (
+            torch.randn((4, 5, 8)).to(torch.float32),
+            torch.randint(0, 10, (4, 5)).to(torch.int64),
+            10,
+            -1,
+            False,
+        )
+        kwargs = {}
+        run_export_and_compare(
+            self, torch.ops.aten.embedding_dense_backward, args, kwargs
+        )
+
+    def test_aten_embedding_dense_backward_1_padding_idx(self) -> None:
+        args = (
+            torch.randn((4, 5, 8)).to(torch.float32),
+            torch.randint(0, 10, (4, 5)).to(torch.int64),
+            10,
+            3,  # padding_idx -> that row's grad must be zero
+            False,
+        )
+        kwargs = {}
+        run_export_and_compare(
+            self, torch.ops.aten.embedding_dense_backward, args, kwargs
+        )
+
+    def test_aten_embedding_dense_backward_2_scale_by_freq(self) -> None:
+        args = (
+            torch.randn((4, 5, 8)).to(torch.float32),
+            torch.randint(0, 10, (4, 5)).to(torch.int64),
+            10,
+            -1,
+            True,  # scale each row's grad by 1/frequency
+        )
+        kwargs = {}
+        run_export_and_compare(
+            self, torch.ops.aten.embedding_dense_backward, args, kwargs
+        )
+
+    def test_aten_embedding_dense_backward_3_1d_indices(self) -> None:
+        args = (
+            torch.randn((10, 8)).to(torch.float32),
+            torch.randint(0, 10, (10,)).to(torch.int64),
+            10,
+            -1,
+            False,
+        )
+        kwargs = {}
+        run_export_and_compare(
+            self, torch.ops.aten.embedding_dense_backward, args, kwargs
+        )
+
     def test_aten_eq_Scalar_0(self) -> None:
         args = (
             torch.randint(0, 10, (10, 10)).to(torch.int32),
