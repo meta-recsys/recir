@@ -987,16 +987,31 @@ def trace(  # noqa: C901 — orchestration: dispatches on parallel_mode flavor (
                     **parametrize_kwargs,
                 ),
             )
-            # When region transforms are active, gm_fwd already contains the
-            # allgather ops (baked in during the parametrized trace), so we
-            # must NOT also pass ``collectives_fn`` to ``_local_compile`` —
-            # that would double-allgather and corrupt gradients.
+            # Whether the OUTER trace must parametrize dense params with
+            # ``collectives_fn`` depends on the dense style, NOT merely on
+            # whether region transforms exist:
+            #   * FULLY_SHARD always adds ``RegatherTransform``, which bakes the
+            #     dense allgather collectives into its ``gm_fwd``; re-applying
+            #     here would double-allgather, so pass [].
+            #   * REPLICATE has NO dense region transform (HybridParallel only
+            #     adds the embedding-scoped ``SparseEmbeddingTransform``), so the
+            #     dense-grad all_reduce must be inserted by parametrizing dense
+            #     params in the outer trace. Embedding params are excluded so
+            #     they keep their all_to_all path (``None`` when no embeddings).
+            if dp_style == DataParallelStyle.FULLY_SHARD:
+                _outer_parametrize_fns: List[
+                    Callable[[torch.Tensor], torch.Tensor]
+                ] = []
+                _outer_exclude_fqns: Optional[set[str]] = None
+            else:
+                _outer_parametrize_fns = [collectives_fn]
+                _outer_exclude_fqns = embedding_param_fqns
             local_result = _local_compile(
                 callable_,
                 *args,
                 fake_mode=fake_mode,
-                _parametrize_fns=[] if dp_transforms else [collectives_fn],
-                _exclude_param_fqns=embedding_param_fqns if not dp_transforms else None,
+                _parametrize_fns=_outer_parametrize_fns,
+                _exclude_param_fqns=_outer_exclude_fqns,
                 **kwargs,
             )
     else:
@@ -1600,16 +1615,30 @@ def _compile_data_parallel_v2(
         # 8. Set up parametrize fns and trace via _local_compile.
         #    Region transform context managers scope the rewritten forwards
         #    to this block — originals are restored when the ExitStack exits.
-        #    When region transforms are active, gm_fwd already contains the
-        #    allgather ops (baked in during the parametrized trace), so we
-        #    must NOT also pass collectives_fn to _local_compile — that would
-        #    double-allgather and corrupt gradients.
+        #
+        #    Whether the OUTER trace must parametrize the dense params with
+        #    ``collectives_fn`` depends on the dense style, NOT merely on
+        #    whether region transforms exist:
+        #      * FULLY_SHARD always adds ``RegatherTransform``, which bakes the
+        #        dense allgather collectives into its ``gm_fwd``; re-applying
+        #        ``collectives_fn`` here would double-allgather, so pass [].
+        #      * REPLICATE has NO dense region transform (HybridParallel only
+        #        adds the embedding-scoped ``SparseEmbeddingTransform``), so the
+        #        dense-grad all_reduce must be inserted by parametrizing dense
+        #        params in the outer trace. Embedding params are excluded so
+        #        they keep their all_to_all path (``None`` when no embeddings).
+        if dp_style == DataParallelStyle.FULLY_SHARD:
+            _outer_parametrize_fns: List[Callable[[torch.Tensor], torch.Tensor]] = []
+            _outer_exclude_fqns: Optional[set[str]] = None
+        else:
+            _outer_parametrize_fns = [collectives_fn]
+            _outer_exclude_fqns = embedding_param_fqns
         local_result = _local_compile(
             func,
             *args,
             fake_mode=fake_mode,
-            _parametrize_fns=[] if transforms else [collectives_fn],
-            _exclude_param_fqns=embedding_param_fqns if not transforms else None,
+            _parametrize_fns=_outer_parametrize_fns,
+            _exclude_param_fqns=_outer_exclude_fqns,
             **kwargs,
         )
 
