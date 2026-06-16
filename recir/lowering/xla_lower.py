@@ -432,9 +432,46 @@ class _XLAModule(torch.nn.Module):
             assert isinstance(tensor, jax.Array), (
                 f"Expected torch.Tensor or jax.Array, got {type(tensor)}"
             )
-            return tensor
-
-        nparray = _XLAModule._torch_to_numpy_for_jax(tensor)
+            # A jax.Array reaches here as a cached device_state entry (the
+            # XLADeviceStateManager fast path): _convert_flat_state_to_jax
+            # device_puts the model state onto a single local device on the
+            # first step, so it carries a SingleDeviceSharding. On a multi-host
+            # mesh that disagrees with the GSPMD executable's declared
+            # in_sharding and raises "Computation was compiled for input
+            # shardings that disagree with the shardings of arguments". Re-shard
+            # it to the layout this input expects -- the SAME layout a torch
+            # tensor would get -- so the fix is generic across replicated /
+            # batch / FSDP rather than special-cased to one of them.
+            #
+            # AOT prebuild uses a compile-only client that cannot device_put;
+            # the run closure short-circuits before exec, so pass through.
+            if _AOT_TOPOLOGY.get() is not None:
+                return tensor
+            # Target sharding for this input (mirrors the torch branches below).
+            ndim = tensor.ndim
+            if is_batch_input:
+                _spec: List[Any] = [None] * max(ndim, input_batch_dim + 1)
+                _spec[input_batch_dim] = "torch_dist"
+                target = NamedSharding(mesh, P(*_spec))
+            elif is_fsdp_weight:
+                target = NamedSharding(mesh, P("torch_dist", *([None] * (ndim - 1))))
+            else:
+                target = NamedSharding(mesh, P())
+            # Fast path: already laid out correctly (e.g. device_state captured
+            # from the executable's mesh-sharded outputs on later steps) -> reuse
+            # as-is, avoiding a host round-trip on every step.
+            if tensor.sharding == target:
+                return tensor
+            # Needs resharding: bring to host and fall through to the unified
+            # construction below (replicated / batch / FSDP, identical to the
+            # torch path). NB a plain jax.device_put(tensor, target) fails on a
+            # multi-process mesh ("CopyArrays only supports destination device
+            # list of the same size as the array device lists") -- a single-
+            # device array can't be copied straight onto the global mesh; the
+            # local-buffer assembly below is the multi-process-safe path.
+            nparray = np.asarray(jax.device_get(tensor))
+        else:
+            nparray = _XLAModule._torch_to_numpy_for_jax(tensor)
 
         local_devices = _get_local_devices()
         num_local = len(local_devices)
