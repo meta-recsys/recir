@@ -21,6 +21,14 @@ class DeviceStateManager:
         self.device_state: Optional[List[Any]] = None
         self._used_fast_path: bool = False
         self.torch_device: torch.device = torch_device
+        # When True, process_outputs returns the raw (JAX) step output instead of
+        # materializing it to torch every step. This lets a training loop defer the
+        # output device->host pull to a cadence so JAX can pipeline (the host runs
+        # ahead, overlapping step i+1's H2D/dispatch with step i's compute). The
+        # caller is responsible for materializing the output when it actually needs
+        # the values (e.g. metric logging). No effect for the base manager (whose
+        # outputs are already torch); honored by XLADeviceStateManager.
+        self.keep_output_jax: bool = False
 
     def prepare_inputs(
         self,
@@ -44,6 +52,11 @@ class DeviceStateManager:
                 assert isinstance(updated, torch.Tensor)
                 if updated.data_ptr() != state_tensor.data_ptr():
                     state_tensor.copy_(updated)
+        return output
+
+    def materialize_output(self, output: Any) -> Any:
+        """Convert a (possibly deferred) step output to torch. No-op for the base
+        manager, whose outputs are already torch. See ``keep_output_jax``."""
         return output
 
     def sync_to_torch(
