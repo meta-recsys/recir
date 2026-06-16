@@ -8,6 +8,7 @@
 import contextlib
 import contextvars
 import logging
+import os
 from typing import Any, Callable, Generator, List, Optional, Tuple
 
 import jax  # @manual
@@ -131,6 +132,151 @@ class _XLAModule(torch.nn.Module):
         # returned by ``_build_*_executable`` prefer this attribute over a
         # fresh JAX cache lookup.
         self._jax_compiled: Optional[Any] = None
+        # Guard so RECIR_DUMP_GRAPHS dumps each subgraph's FX + XLA graph once.
+        self._dumped_graphs: bool = False
+
+    def _maybe_dump_graphs(self, tag: str) -> None:  # noqa: C901
+        """Diagnostic: when RECIR_DUMP_GRAPHS is set, log this subgraph's FX
+        graph and its compiled XLA HLO so you can verify lowering (e.g. that
+        aten.embedding_dense_backward survives and produces a small [vocab,D]
+        all-reduce rather than a gathered [N_global,D] one) directly from the
+        run log -- no trace download needed.
+
+        RECIR_DUMP_GRAPHS=1     -> embedding/index/scatter/collective lines only.
+        RECIR_DUMP_GRAPHS=full  -> the entire FX graph + full HLO.
+        """
+        mode = os.environ.get("RECIR_DUMP_GRAPHS", "")
+        if mode in ("", "0", "false", "False") or self._dumped_graphs:
+            return
+        self._dumped_graphs = True
+        full = mode.lower() == "full"
+
+        # 1. FX graph (the aten ops JaxInterpreter lowers).
+        targets = [
+            str(n.target) for n in self.gm.graph.nodes if n.op == "call_function"
+        ]
+        keys = (
+            "embedding",
+            "index_select",
+            "index_add",
+            "index_put",
+            "index",
+            "scatter",
+            "all_reduce",
+            "all_to_all",
+        )
+        emb_ops = sorted({t for t in targets if any(k in t for k in keys)})
+        logger.info(
+            "[RECIR_DUMP_GRAPHS] subgraph=%s backend=%s n_call_function=%d "
+            "embedding/index/scatter ops=%s",
+            tag,
+            self.backend_type.value,
+            len(targets),
+            emb_ops,
+        )
+
+        # 1b. For each index/embedding/scatter node, report operand shapes and
+        # walk operand-0 back to its source placeholder/get_attr (parameter) so
+        # we can identify WHICH table (by [vocab, D] shape + param name) each
+        # index_add/index_select belongs to. stack_trace is stripped by the
+        # recir transforms, but this data-flow info is not.
+        def _shape(n: Any) -> str:
+            v = getattr(n, "meta", {}).get("val") if hasattr(n, "meta") else None
+            return str(tuple(v.shape)) if v is not None and hasattr(v, "shape") else "?"
+
+        _passthrough: Tuple[str, ...] = (
+            "view",
+            "reshape",
+            "_to_copy",
+            "to.",
+            "clone",
+            "detach",
+            "expand",
+            "t.",
+            "transpose",
+            "unsqueeze",
+            "squeeze",
+            "contiguous",
+            "_unsafe_view",
+            "constant_pad_nd",
+            "slice",
+            "select.",
+        )
+
+        def _trace_source(n: Any, depth: int = 12) -> str:
+            cur = n
+            for _ in range(depth):
+                if not hasattr(cur, "op"):
+                    return f"const({cur})"
+                if cur.op in ("placeholder", "get_attr"):
+                    return f"{cur.op}:{cur.target} {_shape(cur)}"
+                if cur.op == "call_function" and cur.args:
+                    t = str(cur.target)
+                    a0 = cur.args[0]
+                    if any(p in t for p in _passthrough) and hasattr(a0, "op"):
+                        cur = a0
+                        continue
+                    return f"{t} {_shape(cur)}"
+                return f"{getattr(cur, 'op', '?')}:{getattr(cur, 'target', cur)}"
+            return "<too deep>"
+
+        node_keys = ("index_select", "index_add", "index_put", "index", "embedding")
+        for n in self.gm.graph.nodes:
+            if n.op != "call_function":
+                continue
+            t = str(n.target)
+            if not any(k in t for k in node_keys):
+                continue
+            try:
+                arg_shapes = [
+                    _shape(a) if hasattr(a, "op") else f"lit:{a}"[:80]
+                    for a in n.args[:2]
+                ]
+                weight_src = _trace_source(n.args[0]) if n.args else "?"
+                logger.info(
+                    "[RECIR_DUMP_GRAPHS] subgraph=%s node=%s target=%s out=%s "
+                    "args=%s weight<-%s",
+                    tag,
+                    n.name,
+                    t,
+                    _shape(n),
+                    arg_shapes,
+                    weight_src,
+                )
+            except Exception as e:  # never let diagnostics break the run
+                logger.warning(
+                    "[RECIR_DUMP_GRAPHS] node=%s trace failed: %s", n.name, e
+                )
+        if full:
+            logger.info(
+                "[RECIR_DUMP_GRAPHS] subgraph=%s FX graph:\n%s",
+                tag,
+                self.gm.graph,
+            )
+
+        # 2. XLA HLO (collectives + scatters, with shapes + op_name metadata).
+        hlo = self.xla_hlo_text
+        if hlo:
+            if full:
+                logger.info("[RECIR_DUMP_GRAPHS] subgraph=%s HLO:\n%s", tag, hlo)
+            else:
+                lines = [
+                    ln.strip()
+                    for ln in hlo.splitlines()
+                    if "=" in ln
+                    and any(
+                        k in ln.lower() for k in ("all-reduce", "all-gather", "scatter")
+                    )
+                ]
+                logger.info(
+                    "[RECIR_DUMP_GRAPHS] subgraph=%s HLO collectives/scatters "
+                    "(%d lines):\n%s",
+                    tag,
+                    len(lines),
+                    "\n".join(ln[:240] for ln in lines),
+                )
+        else:
+            logger.info("[RECIR_DUMP_GRAPHS] subgraph=%s HLO not captured yet", tag)
 
     def _postprocess_jax_output(
         self, jax_out: Any, input_device: torch.device
@@ -287,6 +433,7 @@ class _XLAModule(torch.nn.Module):
                 f"Expected torch.Tensor or jax.Array, got {type(tensor)}"
             )
             return tensor
+
         nparray = _XLAModule._torch_to_numpy_for_jax(tensor)
 
         local_devices = _get_local_devices()
@@ -717,6 +864,10 @@ class _XLAModule(torch.nn.Module):
             result = self.compiled(*args)
             if self.xla_hlo_text is None and hasattr(self.compiled, "hlo_text"):
                 self.xla_hlo_text = self.compiled.hlo_text  # pyre-ignore[16]
+            try:
+                self._maybe_dump_graphs(tag)
+            except Exception as e:  # diagnostics must never break training
+                logger.warning("[RECIR_DUMP_GRAPHS] dump failed: %s", e)
             return result
 
 
