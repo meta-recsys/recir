@@ -531,3 +531,219 @@ class PropagateBatchInputMetaTest(unittest.TestCase):
 
         self.assertTrue(out.meta.get("is_batch_input"))
         self.assertEqual(out.meta.get("batch_dim"), 0)
+
+
+class IndexingScatterPropagationTest(unittest.TestCase):
+    """Batch-dim propagation through the HSTU jagged indexing/scatter ops.
+
+    select / index / index_select / index_put / scatter_add previously broke
+    propagation, so the [B*S, D] activation tensors lost their batch tag and
+    GSPMD replicated them -- inserting an all-reduce over the FULL GLOBAL
+    buffer for each (rankfm bench: ~154 all-reduces of f32[276640,512],
+    ~473ms/step, ~45% of the step). These tests pin the propagation so the
+    activations stay sharded and those collectives disappear.
+    """
+
+    def _run_propagation_on(self, graph: fx.Graph) -> fx.GraphModule:
+        gm = fx.GraphModule(torch.nn.Module(), graph)
+        propagate_batch_input_meta(gm)
+        return gm
+
+    # ---- select.int ----
+    def test_select_non_batch_dim_preserves_batch(self) -> None:
+        """select([B, K, D], dim=1) -> [B, D]: batch stays at 0."""
+        graph = fx.Graph()
+        x = _make_placeholder(graph, "x", torch.empty(128, 4, 64), batch_dim=0)
+        out = graph.call_function(torch.ops.aten.select.int, args=(x, 1, 0))
+        _set_val(out, torch.empty(128, 64))
+        graph.output(out)
+
+        self._run_propagation_on(graph)
+
+        self.assertTrue(out.meta.get("is_batch_input"))
+        self.assertEqual(out.meta.get("batch_dim"), 0)
+
+    def test_select_negative_dim_preserves_batch(self) -> None:
+        """select([B, K, D], dim=-1) -> [B, K]: negative dim normalized."""
+        graph = fx.Graph()
+        x = _make_placeholder(graph, "x", torch.empty(128, 4, 64), batch_dim=0)
+        out = graph.call_function(torch.ops.aten.select.int, args=(x, -1, 0))
+        _set_val(out, torch.empty(128, 4))
+        graph.output(out)
+
+        self._run_propagation_on(graph)
+
+        self.assertTrue(out.meta.get("is_batch_input"))
+        self.assertEqual(out.meta.get("batch_dim"), 0)
+
+    def test_select_left_of_batch_shifts_batch_down(self) -> None:
+        """batch_dim=1, select(dim=0) -> output batch_dim shifts to 0."""
+        graph = fx.Graph()
+        x = _make_placeholder(graph, "x", torch.empty(4, 128, 64), batch_dim=1)
+        out = graph.call_function(torch.ops.aten.select.int, args=(x, 0, 0))
+        _set_val(out, torch.empty(128, 64))
+        graph.output(out)
+
+        self._run_propagation_on(graph)
+
+        self.assertTrue(out.meta.get("is_batch_input"))
+        self.assertEqual(out.meta.get("batch_dim"), 0)
+
+    def test_select_along_batch_dim_does_not_propagate(self) -> None:
+        """Selecting the batch axis itself removes it -> no propagation."""
+        graph = fx.Graph()
+        x = _make_placeholder(graph, "x", torch.empty(128, 4, 64), batch_dim=0)
+        out = graph.call_function(torch.ops.aten.select.int, args=(x, 0, 0))
+        _set_val(out, torch.empty(4, 64))
+        graph.output(out)
+
+        self._run_propagation_on(graph)
+
+        self.assertFalse(out.meta.get("is_batch_input", False))
+
+    # ---- index_select ----
+    def test_index_select_non_batch_dim_preserves_batch(self) -> None:
+        """index_select([B, D], dim=1, idx): batch preserved at 0."""
+        graph = fx.Graph()
+        x = _make_placeholder(graph, "x", torch.empty(128, 64), batch_dim=0)
+        idx = _untagged_placeholder(graph, "idx", torch.empty(8, dtype=torch.int64))
+        out = graph.call_function(torch.ops.aten.index_select.default, args=(x, 1, idx))
+        _set_val(out, torch.empty(128, 8))
+        graph.output(out)
+
+        self._run_propagation_on(graph)
+
+        self.assertTrue(out.meta.get("is_batch_input"))
+        self.assertEqual(out.meta.get("batch_dim"), 0)
+
+    def test_index_select_along_batch_dim_does_not_propagate(self) -> None:
+        """Gathering along the sharded batch axis must NOT propagate."""
+        graph = fx.Graph()
+        x = _make_placeholder(graph, "x", torch.empty(128, 64), batch_dim=0)
+        idx = _untagged_placeholder(graph, "idx", torch.empty(8, dtype=torch.int64))
+        out = graph.call_function(torch.ops.aten.index_select.default, args=(x, 0, idx))
+        _set_val(out, torch.empty(8, 64))
+        graph.output(out)
+
+        self._run_propagation_on(graph)
+
+        self.assertFalse(out.meta.get("is_batch_input", False))
+
+    # ---- scatter_add ----
+    def test_scatter_add_non_batch_dim_preserves_batch(self) -> None:
+        """scatter_add([B, D], dim=1, idx, src): batch preserved at 0."""
+        graph = fx.Graph()
+        x = _make_placeholder(graph, "x", torch.empty(128, 64), batch_dim=0)
+        idx = _untagged_placeholder(
+            graph, "idx", torch.empty(128, 64, dtype=torch.int64)
+        )
+        src = _make_placeholder(graph, "src", torch.empty(128, 64), batch_dim=0)
+        out = graph.call_function(
+            torch.ops.aten.scatter_add.default, args=(x, 1, idx, src)
+        )
+        _set_val(out, torch.empty(128, 64))
+        graph.output(out)
+
+        self._run_propagation_on(graph)
+
+        self.assertTrue(out.meta.get("is_batch_input"))
+        self.assertEqual(out.meta.get("batch_dim"), 0)
+
+    def test_scatter_add_along_batch_dim_does_not_propagate(self) -> None:
+        """scatter along the batch axis must NOT propagate."""
+        graph = fx.Graph()
+        x = _make_placeholder(graph, "x", torch.empty(128, 64), batch_dim=0)
+        idx = _untagged_placeholder(
+            graph, "idx", torch.empty(128, 64, dtype=torch.int64)
+        )
+        src = _make_placeholder(graph, "src", torch.empty(128, 64), batch_dim=0)
+        out = graph.call_function(
+            torch.ops.aten.scatter_add.default, args=(x, 0, idx, src)
+        )
+        _set_val(out, torch.empty(128, 64))
+        graph.output(out)
+
+        self._run_propagation_on(graph)
+
+        self.assertFalse(out.meta.get("is_batch_input", False))
+
+    # ---- index.Tensor ----
+    def test_index_tensor_preserves_batch(self) -> None:
+        """index([B, D], [None, idx]) preserves batch_dim (feature-dim gather)."""
+        graph = fx.Graph()
+        x = _make_placeholder(graph, "x", torch.empty(128, 64), batch_dim=0)
+        idx = _untagged_placeholder(graph, "idx", torch.empty(8, dtype=torch.int64))
+        out = graph.call_function(torch.ops.aten.index.Tensor, args=(x, [None, idx]))
+        _set_val(out, torch.empty(128, 8))
+        graph.output(out)
+
+        self._run_propagation_on(graph)
+
+        self.assertTrue(out.meta.get("is_batch_input"))
+        self.assertEqual(out.meta.get("batch_dim"), 0)
+
+    # ---- index_put ----
+    def test_index_put_preserves_batch(self) -> None:
+        """index_put output shape == self shape -> batch_dim preserved.
+
+        This is the op whose replicated fallback produced the 566MB
+        scatter-add all-reduces; keeping the tag keeps it sharded.
+        """
+        graph = fx.Graph()
+        x = _make_placeholder(graph, "x", torch.empty(128, 64), batch_dim=0)
+        idx = _untagged_placeholder(graph, "idx", torch.empty(10, dtype=torch.int64))
+        vals = _untagged_placeholder(graph, "vals", torch.empty(10, 64))
+        out = graph.call_function(
+            torch.ops.aten.index_put.default, args=(x, [idx], vals, True)
+        )
+        _set_val(out, torch.empty(128, 64))
+        graph.output(out)
+
+        self._run_propagation_on(graph)
+
+        self.assertTrue(out.meta.get("is_batch_input"))
+        self.assertEqual(out.meta.get("batch_dim"), 0)
+
+    def test_jagged_chain_preserves_batch_end_to_end(self) -> None:
+        """index_select -> scatter_add -> index_put: the tag survives the
+        whole jagged marshalling chain (mirrors the embedding->HSTU path)."""
+        graph = fx.Graph()
+        # Mimic the embedding graph-break output: batch-tagged [B*S, D].
+        emb = _make_placeholder(graph, "emb", torch.empty(2048, 64), batch_dim=0)
+
+        sel_idx = _untagged_placeholder(
+            graph, "sel_idx", torch.empty(8, dtype=torch.int64)
+        )
+        gathered = graph.call_function(
+            torch.ops.aten.index_select.default, args=(emb, 1, sel_idx)
+        )
+        _set_val(gathered, torch.empty(2048, 8))
+
+        sc_idx = _untagged_placeholder(
+            graph, "sc_idx", torch.empty(2048, 8, dtype=torch.int64)
+        )
+        sc_src = _make_placeholder(graph, "sc_src", torch.empty(2048, 8), batch_dim=0)
+        scattered = graph.call_function(
+            torch.ops.aten.scatter_add.default, args=(gathered, 1, sc_idx, sc_src)
+        )
+        _set_val(scattered, torch.empty(2048, 8))
+
+        put_idx = _untagged_placeholder(
+            graph, "put_idx", torch.empty(4, dtype=torch.int64)
+        )
+        put_vals = _untagged_placeholder(graph, "put_vals", torch.empty(2048, 4))
+        put = graph.call_function(
+            torch.ops.aten.index_put.default,
+            args=(scattered, [None, put_idx], put_vals),
+        )
+        _set_val(put, torch.empty(2048, 8))
+        graph.output(put)
+
+        self._run_propagation_on(graph)
+
+        for node in (gathered, scattered, put):
+            self.assertTrue(
+                node.meta.get("is_batch_input"),
+                f"is_batch_input not propagated through {node.target}",
+            )
+            self.assertEqual(node.meta.get("batch_dim"), 0)

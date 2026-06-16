@@ -296,10 +296,46 @@ def _output_batch_dim_for(
     if target == aten.constant_pad_nd.default:
         return input_batch_dim
 
-    # index / gather: shape-preserving on non-indexed dims. Conservatively
-    # propagate batch_dim (assumes indexing isn't along the batch axis,
-    # which is true for our preprocessor's bucketize-based indexing).
-    if target in (aten.index.Tensor, aten.gather.default):
+    # ---- Indexing / scatter on the jagged (embedding) activation path ----
+    # These ops drive the HSTU jagged<->dense marshalling. Without batch_dim
+    # propagation here, the [B*S, D] activation tensors lose their batch tag,
+    # so _jit_gspmd marks them REPLICATED and GSPMD inserts an all-reduce
+    # over the FULL GLOBAL buffer for each one (rankfm bench: ~154 all-reduces
+    # of f32[276640,512] = ~473ms/step, ~45% of the step). Keeping the tag
+    # lets the activations stay sharded [B*S/world, D] with no collective.
+
+    # select(input, dim, index): removes axis ``dim`` (output ndim =
+    # input ndim - 1). The batch axis survives unless it IS the selected
+    # axis; selecting an axis left of batch shifts batch down by one.
+    if target in (aten.select.int, getattr(aten.select_copy, "int", None)):
+        dim = _normalize_dim(node, cast(int, node.args[1]))
+        if dim is None or dim == input_batch_dim:
+            return None
+        return input_batch_dim - 1 if dim < input_batch_dim else input_batch_dim
+
+    # index_select(input, dim, index) / scatter_add(input, dim, index, src):
+    # output ndim == input ndim, shape preserved except along ``dim``. The
+    # batch axis is preserved as long as we don't index/scatter along it
+    # (operating on the sharded batch axis would need cross-device data).
+    if target in (aten.index_select.default, aten.scatter_add.default):
+        dim = _normalize_dim(node, cast(int, node.args[1]))
+        if dim is None or dim == input_batch_dim:
+            return None
+        return input_batch_dim
+
+    # index / _unsafe_index / gather (shape-preserving on non-indexed dims)
+    # and index_put / _unsafe_index_put (output shape == self shape).
+    # Conservatively propagate batch_dim, assuming the advanced indexing is
+    # NOT along the batch axis (true for the preprocessor's bucketize-based
+    # indexing and the HSTU jagged feature-dim scatter). ``index_put`` is the
+    # op whose replicated fallback produced the 566MB scatter-add all-reduces.
+    if target in (
+        aten.index.Tensor,
+        aten.gather.default,
+        getattr(getattr(aten, "_unsafe_index", None), "Tensor", None),
+        aten.index_put.default,
+        getattr(getattr(aten, "_unsafe_index_put", None), "default", None),
+    ):
         return input_batch_dim
 
     # view / reshape / _unsafe_view(input, sizes): default-passthrough.
@@ -375,6 +411,26 @@ def _passthrough_if_rank_ok(node: fx.Node, input_batch_dim: int) -> Optional[int
     if input_batch_dim >= len(sizes):
         return None
     return input_batch_dim
+
+
+def _normalize_dim(node: fx.Node, dim: int) -> Optional[int]:
+    """Normalize a possibly-negative ``dim`` against the input tensor's ndim.
+
+    The input tensor is the first positional arg (``self``) for the
+    select / index_select / scatter_add family. Returns None when the input
+    ndim can't be determined (so the caller leaves the node untagged).
+    """
+    if dim >= 0:
+        return dim
+    if not node.args:
+        return None
+    inp = node.args[0]
+    if not isinstance(inp, fx.Node):
+        return None
+    val = inp.meta.get("val")
+    if not hasattr(val, "ndim"):
+        return None
+    return val.ndim + dim
 
 
 def _reduce_passthrough(node: fx.Node, input_batch_dim: int) -> Optional[int]:
