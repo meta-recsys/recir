@@ -511,7 +511,7 @@ def export_bundle(
         *sample_inputs,
         fake_mode=fake_mode,
     )
-    assert result.opt is None and not result.named_states, (
+    assert not result.opts and not result.named_states, (
         "forward-only trace must produce no optimizer state"
     )
 

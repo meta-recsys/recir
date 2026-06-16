@@ -18,6 +18,7 @@ from typing import (
     FrozenSet,
     List,
     Optional,
+    Sequence,
     Set,
     Tuple,
     Type,
@@ -50,6 +51,11 @@ from torch.distributed.tensor.placement_types import Partial
 from torch.fx import GraphModule
 from torch.fx.experimental.proxy_tensor import make_fx
 from torch.fx.passes.shape_prop import _extract_tensor_metadata
+
+
+# Backward-compat for ``shard_params*``: historically a single
+# Optional[Optimizer]; multi-opt callers (sparse + dense partition) pass a list.
+OptOrOpts = Union[None, torch.optim.Optimizer, Sequence[torch.optim.Optimizer]]
 
 
 def compute_local_shape(global_shape: Any, mesh: DeviceMesh, placements: Any) -> Any:
@@ -421,7 +427,7 @@ def _gen_shard_spec(
     out_specs = tuple(
         [DTensorSpec(mesh=mesh, placements=(Shard(shard_dim),))] * num_outputs
     )
-    return OpSpec(output_specs=out_specs, input_specs=input_specs)  # pyre-ignore[6]
+    return OpSpec(output_specs=out_specs, input_specs=input_specs)
 
 
 def _gen_replicate_spec(
@@ -431,7 +437,7 @@ def _gen_replicate_spec(
 ) -> OpSpec:
     """Util function to generate a replicate strategy."""
     out_specs = tuple([DTensorSpec(mesh=mesh, placements=(Replicate(),))] * num_outputs)
-    return OpSpec(output_specs=out_specs, input_specs=input_specs)  # pyre-ignore[6]
+    return OpSpec(output_specs=out_specs, input_specs=input_specs)
 
 
 def _gen_partial_strategy(mesh: DeviceMesh, grad_reduction: str = "avg") -> OpSpec:
@@ -1104,7 +1110,7 @@ def partitioner(graph: GraphModule) -> GraphModule:
 def shard_params_and_states(
     model: nn.Module,
     params_buffers: Dict[str, torch.Tensor],
-    opt: Optional[torch.optim.Optimizer],
+    opt: OptOrOpts,
     mesh: DeviceMesh,
     parallel_style: DataParallelStyle,
     shard_filter: Optional[Callable[[str, torch.Tensor], bool]] = None,
@@ -1116,12 +1122,18 @@ def shard_params_and_states(
     collectives to reconstruct full tensors before compute). We must
     actually shard the real tensors in params_buffers to match, otherwise
     the allgather will double the already-full tensors.
+
+    ``opt`` accepts None, a single Optimizer, or a Sequence (for multi-opt
+    sparse + dense setups). Each opt's state and param_groups are migrated
+    from old to new Parameter identity after the swap.
     """
     if parallel_style != DataParallelStyle.FULLY_SHARD:
         return set()
 
+    opts = _normalize_opts(opt)
     sharded_keys: Set[str] = set()
     shard_spec = DTensorSpec(mesh=mesh, placements=(Shard(0),))
+    old_to_new: List[Tuple[torch.Tensor, torch.Tensor, DTensorSpec]] = []
     for key in list(params_buffers.keys()):
         old_param = params_buffers[key]
         if shard_filter is not None and not shard_filter(key, old_param):
@@ -1138,10 +1150,8 @@ def shard_params_and_states(
             requires_grad=old_param.requires_grad,
         )
         setattr(parent, atoms[-1], new_param)
-        if opt is not None and old_param in opt.state:
-            state = opt.state.pop(old_param)
-            _shard_state_dict(state, shard_spec)
-            opt.state[new_param] = state
+        old_to_new.append((old_param, new_param, shard_spec))
+    _migrate_opt_after_param_swap(opts, old_to_new)
     return sharded_keys
 
 
@@ -1335,10 +1345,50 @@ def _shard_state_dict(
                 state[key] = partition_value(state[key], shard_spec)
 
 
+def _normalize_opts(
+    opt: OptOrOpts,
+) -> List[torch.optim.Optimizer]:
+    """Normalize a single-or-list-or-None opt argument to a list."""
+    if opt is None:
+        return []
+    if isinstance(opt, torch.optim.Optimizer):
+        return [opt]
+    return list(opt)
+
+
+def _migrate_opt_after_param_swap(
+    opts: List[torch.optim.Optimizer],
+    old_to_new: List[Tuple[torch.Tensor, torch.Tensor, DTensorSpec]],
+) -> None:
+    """For each opt, migrate state[old_param] -> state[new_param] (with
+    state tensor sharding) AND rewrite every param_group's `params`
+    list to swap old_param -> new_param. Each entry in ``old_to_new``
+    is ``(old_param, new_param, shard_spec_used_for_old)``.
+
+    Called ONCE per sharding pass with the full set of (old, new) pairs
+    that the pass created; the sharding itself only runs once even
+    though we loop over multiple optimizers here.
+    """
+    for opt in opts:
+        for old_param, new_param, shard_spec in old_to_new:
+            if old_param in opt.state:
+                state = opt.state.pop(old_param)
+                _shard_state_dict(state, shard_spec)
+                opt.state[new_param] = state
+        # param_groups rewrite is unconditional - even if a group's
+        # params list doesn't contain any of the swapped params, the
+        # list comprehension is a no-op for unaffected entries.
+        id_to_new: Dict[int, torch.Tensor] = {
+            id(old): new for old, new, _ in old_to_new
+        }
+        for group in opt.param_groups:
+            group["params"] = [id_to_new.get(id(p), p) for p in group["params"]]
+
+
 def shard_params_by_plan(
     model: nn.Module,
     params_buffers: Dict[str, torch.Tensor],
-    opt: Optional[torch.optim.Optimizer],
+    opt: OptOrOpts,
     mesh: DeviceMesh,
     dense_style: DataParallelStyle,
     embedding_param_fqns: Set[str],
@@ -1350,23 +1400,32 @@ def shard_params_by_plan(
         on the vocabulary dimension, regardless of ``dense_style``.
       - Dense params: ``Shard(0)`` if ``dense_style`` is ``FULLY_SHARD``,
         otherwise left unsharded (replicated).
+
+    ``opt`` accepts None, a single Optimizer, or a Sequence of Optimizers
+    (for sparse + dense multi-opt setups). For each opt passed, the
+    optimizer's ``state`` dict and every ``param_group['params']`` list
+    are migrated from old Parameter identity to new Parameter identity
+    after the shard-driven Parameter object swap.
     """
+    opts = _normalize_opts(opt)
     sharded_keys: Set[str] = set()
     shard_spec = DTensorSpec(mesh=mesh, placements=(Shard(0),))
+    # Collect (old, new, spec) for every Parameter swapped in this pass
+    # so a single post-pass migration loop can update all opts together
+    # without re-running sharding per opt.
+    old_to_new: List[Tuple[torch.Tensor, torch.Tensor, DTensorSpec]] = []
     for key in list(params_buffers.keys()):
         if key in embedding_param_fqns or dense_style == DataParallelStyle.FULLY_SHARD:
             sharded_keys.add(key)
             old_param = params_buffers[key]
             _shard_param(model, params_buffers, key, shard_spec)
-            if opt is not None and old_param in opt.state:
-                state = opt.state.pop(old_param)
-                _shard_state_dict(state, shard_spec)
-                # Retrieve the nn.Parameter that _shard_param set on the model
-                # (params_buffers[key] is a plain tensor, not the Parameter).
-                obj: Any = model
-                for atom in key.split("."):
-                    obj = getattr(obj, atom)
-                opt.state[obj] = state
+            # Retrieve the nn.Parameter that _shard_param set on the model
+            # (params_buffers[key] is a plain tensor, not the Parameter).
+            new_param: Any = model
+            for atom in key.split("."):
+                new_param = getattr(new_param, atom)
+            old_to_new.append((old_param, new_param, shard_spec))
+    _migrate_opt_after_param_swap(opts, old_to_new)
     return sharded_keys
 
 
