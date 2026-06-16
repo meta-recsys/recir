@@ -72,6 +72,31 @@ from torch.nn.utils import stateless
 logger: logging.Logger = logging.getLogger(__name__)
 
 
+def _maybe_dump_fx_graph(gm: torch.fx.GraphModule) -> None:
+    """When RECIR_DUMP_GRAPHS is set, log the make_fx-output graph: readable code
+    plus a per-node op/target/out-shape/stack-trace listing. The stack traces are
+    still attached at this stage (before the downstream recir transforms strip
+    them), so op sources can be inspected without a TPU run. Diagnostics must
+    never break compile, so all failures are swallowed.
+    """
+    if os.environ.get("RECIR_DUMP_GRAPHS", "") in ("", "0", "false", "False"):
+        return
+    try:
+        logger.info(
+            "[RECIR_DUMP_GRAPHS] make_fx output (readable):\n%s",
+            gm.print_readable(print_output=False),
+        )
+        lines = []
+        for n in gm.graph.nodes:
+            val = n.meta.get("val") if hasattr(n, "meta") else None
+            shp = tuple(val.shape) if val is not None and hasattr(val, "shape") else ""
+            st = (n.meta.get("stack_trace") or "").replace("\n", " || ")
+            lines.append(f"{n.op} | {n.target} | out={shp} | {st}")
+        logger.info("[RECIR_DUMP_GRAPHS] make_fx per-node:\n%s", "\n".join(lines))
+    except Exception as e:  # noqa: BLE001 -- diagnostics must never break compile
+        logger.warning("[RECIR_DUMP_GRAPHS] make_fx dump failed: %s", e)
+
+
 class _PyTreeCodeGenOutputsOnly(_PyTreeCodeGen):
     # pyre-ignore[3]
     def process_inputs(self, *args: Any) -> Any:
@@ -329,6 +354,8 @@ def _local_compile(
             decomposition_table=SPMD_DECOMP_TABLE,  # type: ignore[arg-type]
             _allow_non_fake_inputs=False,
         )(params, buffers, named_states, args, kwargs)
+
+    _maybe_dump_fx_graph(gm)
 
     # Re-register tensor ``get_attr`` constants as ``_AttrKind.CONSTANT``.
     #
