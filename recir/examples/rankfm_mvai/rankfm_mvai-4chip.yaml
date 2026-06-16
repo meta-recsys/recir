@@ -41,7 +41,7 @@ spec:
                 --embedding_backend cpu
                 --profile_start_step 3
                 --profile_end_step 8
-                --profile_dir "gs://mrs-tpu-y317h/tpu-profiles/${JOBSET_NAME}"
+                --profile_dir "gs://cq-mrs-core-shared_mrs_tpu_y317h/tpu-profiles/${JOBSET_NAME}"
               ports:
               - containerPort: 8471
               resources:

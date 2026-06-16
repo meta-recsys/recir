@@ -104,15 +104,17 @@ podman run --rm -it rankfm_mvai_tpu:latest
 ### Run on a 4-chip TPU slice (smoke)
 
 ```bash
+# Context name format varies by gcloud version. Check yours with
+# `kubectl config get-contexts`; newer gcloud uses the slash form below.
 kubectl create -f recir/examples/rankfm_mvai/rankfm_mvai-4chip.yaml \
-  --context=gke_mrs-tpu-y317h_us-central1_tpu-prod-training-cluster
+  --context=mrs-tpu-y317h/us-central1/tpu-prod-training-cluster
 ```
 
 ### Run on a 128-chip TPU slice
 
 ```bash
 kubectl create -f recir/examples/rankfm_mvai/rankfm_mvai-128chip.yaml \
-  --context=gke_mrs-tpu-y317h_us-central1_tpu-prod-training-cluster
+  --context=mrs-tpu-y317h/us-central1/tpu-prod-training-cluster
 ```
 
 Use `kubectl create` (not `apply`) — the JobSet YAML uses `generateName` so each
@@ -145,9 +147,11 @@ rankfm_mvai_iterate               # build_image_podman.sh -> submit -> tail rank
 ```
 
 `rankfm_mvai_submit` autodetects the target namespace from the yaml's
-`namespace:` field (falls back to `$NS`, default `ns-enablement-mrs-foundation`).
-Override the cluster by exporting `CTX=gke_<project>_<region>_<cluster>` before
-sourcing. The script also exports `HTTPS_PROXY=http://fwdproxy:8080` so
+`namespace:` field (falls back to `$NS`, default `ns-mrs-core-shared`).
+By default `CTX` is your active kubeconfig context (and a stale exported `CTX`
+that isn't in the kubeconfig is auto-corrected to the active one). Override it
+by exporting `CTX=<project>/<region>/<cluster>` (run `kubectl config
+get-contexts` for the exact name) before sourcing. The script also exports `HTTPS_PROXY=http://fwdproxy:8080` so
 `kubectl` works on Meta devservers; unset it if you're elsewhere.
 
 Note: `rankfm_mvai_kill` only deletes the current `$JS`. If a previous JobSet is

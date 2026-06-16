@@ -130,6 +130,11 @@ class RecirXLATrainPipelineProvider(
         self,
         model: nn.Module,
         optimizer: torch.optim.Optimizer,
+        # `device` is part of the RecTrainPipelineProvider interface (the
+        # mvai_cloud RecTrainer passes it by keyword); recir derives device
+        # placement from the RecirCompileContext / GSPMDParallel, so it is
+        # accepted here but unused.
+        device: Optional[torch.device] = None,
         pg: Optional[Any] = None,
     ) -> RecTrainPipeline[Any, Tuple[torch.Tensor, Dict[str, Any]]]:
         ctx: Optional[RecirCompileContext] = cast(
