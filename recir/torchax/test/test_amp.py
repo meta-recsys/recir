@@ -55,6 +55,29 @@ class AutocastTest(unittest.TestCase):
 
             self.assertTrue(torch.allclose(c.cpu(), c_cpu))
 
+    def test_auto_cast_cat_stack_promote(self) -> None:
+        # cat/stack use the PROMOTE policy and take a LIST of tensors as their
+        # first arg. Regression for "'list' object has no attribute 'dtype'":
+        # execute_policy must flatten args instead of assuming each is a tensor.
+        with self.env:
+            a = torch.randn(2, 2, device="jax")
+            b = torch.randn(2, 2, device="jax")
+            with recir.torchax.amp.autocast("jax", dtype=torch.bfloat16, env=self.env):
+                cat = torch.cat([a, b], dim=0)
+                stk = torch.stack([a, b], dim=0)
+            # PROMOTE keeps the widest float dtype among inputs (both fp32) -> fp32.
+            self.assertEqual(cat.dtype, torch.float32)
+            self.assertEqual(stk.dtype, torch.float32)
+
+    def test_auto_cast_cat_mixed_dtype_promotes_to_widest(self) -> None:
+        with self.env:
+            a = torch.randn(2, 2, device="jax")
+            b = torch.randn(2, 2, device="jax").to(torch.bfloat16)
+            with recir.torchax.amp.autocast("jax", dtype=torch.bfloat16, env=self.env):
+                cat = torch.cat([a, b], dim=0)
+            # Widest of {fp32, bf16} is fp32, so the bf16 input is up-cast.
+            self.assertEqual(cat.dtype, torch.float32)
+
 
 if __name__ == "__main__":
     unittest.main()
