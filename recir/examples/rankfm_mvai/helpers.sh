@@ -15,7 +15,9 @@
 #   rankfm_mvai_dump_logs         dump every pod's logs to /tmp/ranklogs/, summarize
 #   rankfm_mvai_traceback [rank]  show full Traceback from one rank's dumped log
 #   rankfm_mvai_kill              delete the current $JS
-#   rankfm_mvai_iterate [yaml]    build_image_podman.sh -> submit -> tail rank 0
+#   rankfm_mvai_iterate [yaml]    build -> submit -> tail rank 0 -> archive TB to Manifold
+#                                 (set RANKFM_MVAI_TB_UPLOAD=0 to skip the upload)
+#   rankfm_mvai_tb_to_manifold [job]  copy a run's TensorBoard events GCS -> Manifold
 #
 # By default CTX is the currently-active kubeconfig context. Override it to
 # point at a different cluster (use `kubectl config get-contexts` to see the
@@ -63,6 +65,16 @@ export CTX NS
 : "${NO_PROXY:=localhost,127.0.0.1,.googleapis.com}"
 export HTTPS_PROXY HTTP_PROXY NO_PROXY
 
+# TensorBoard archival (rankfm_mvai_tb_to_manifold): the TPU pods write TB event
+# files to gs://$TB_GCS_BUCKET/tensorboard/$JOB (the ns-mrs-core-shared SA-owned
+# bucket, matching the yaml). The pods can only reach GCS (GKE Workload
+# Identity), so we mirror a run's events into a Manifold bucket that the
+# internal `tensorboard` build / on-demand service can read directly.
+: "${TB_GCS_BUCKET:=cq-mrs-core-shared_mrs_tpu_y317h}"
+: "${TB_MANIFOLD_PATH:=mrs_recsys_gcp/tree/tensorboard}"
+: "${TB_MANIFOLD_TTL:=2592000}"  # 30d; mrs_recsys_gcp is a user-data bucket w/ TTL deletion plan
+export TB_GCS_BUCKET TB_MANIFOLD_PATH TB_MANIFOLD_TTL
+
 rankfm_mvai_submit() {
     local yaml="${1:-$_RANKFM_MVAI_DEFAULT_YAML}"
     if [ ! -f "$yaml" ]; then
@@ -105,7 +117,10 @@ rankfm_mvai_logs() {
         return 1
     fi
     echo "Tailing: $rank0"
-    kubectl logs -f "$rank0" --context="$CTX" -n "$NS"
+    # --pod-running-timeout makes kubectl wait for the container to start instead
+    # of erroring with "PodInitializing" while the image pulls and the gcsfuse +
+    # barnfs mounts come up, so this streams the live log instead of racing init.
+    kubectl logs -f "$rank0" --context="$CTX" -n "$NS" --pod-running-timeout=10m
 }
 
 rankfm_mvai_logs_all() {
@@ -172,4 +187,58 @@ rankfm_mvai_iterate() {
         sleep 5
     done
     rankfm_mvai_logs
+    # rankfm_mvai_logs returns when rank 0 finishes. Unless disabled, wait for the
+    # whole JobSet to reach a terminal state (all ranks done + gcsfuse flushed to
+    # GCS), then archive this run's TensorBoard events to Manifold. Set
+    # RANKFM_MVAI_TB_UPLOAD=0 to skip (e.g. long runs you don't want to block on).
+    if [ "${RANKFM_MVAI_TB_UPLOAD:-1}" = "1" ]; then
+        echo "Waiting for JobSet $JS to finish before archiving TensorBoard..."
+        local state=""
+        while [ -z "$state" ]; do
+            state=$(kubectl get jobset "$JS" --context="$CTX" -n "$NS" \
+                -o jsonpath='{.status.terminalState}' 2>/dev/null)
+            [ -z "$state" ] && sleep 10
+        done
+        echo "JobSet $JS terminalState=$state; archiving TensorBoard to Manifold..."
+        rankfm_mvai_tb_to_manifold "$JS"
+    fi
+}
+
+# Copy a run's TensorBoard event files from GCS to Manifold so they can be
+# viewed with the internal `tensorboard` build or the on-demand TB service
+# (pip/OSS tensorboard cannot read manifold://). Usage:
+#   rankfm_mvai_tb_to_manifold [jobset-name]   # defaults to current $JS
+# View afterwards:
+#   tensorboard --logdir manifold://$TB_MANIFOLD_PATH/<job>
+rankfm_mvai_tb_to_manifold() {
+    local job="${1:-$JS}"
+    if [ -z "$job" ]; then
+        echo "usage: rankfm_mvai_tb_to_manifold <jobset-name> (or submit first to set \$JS)" >&2
+        return 1
+    fi
+    local src="gs://${TB_GCS_BUCKET}/tensorboard/${job}"
+    local dst="${TB_MANIFOLD_PATH}/${job}"
+    local tmp
+    tmp=$(mktemp -d "/tmp/tb-${job}.XXXXXX") || return 1
+
+    echo "[1/2] Downloading ${src}/ -> ${tmp} ..."
+    if ! gcloud storage cp -r "${src}/*" "${tmp}/"; then
+        echo "No TensorBoard data at ${src} (did the run log any scalars yet?)" >&2
+        rm -rf "$tmp"
+        return 1
+    fi
+
+    # mrs_recsys_gcp is a user-data bucket with a TTL deletion plan: writes are
+    # rejected (HTTP 400) unless both --userData and --ttl are specified.
+    echo "[2/2] Uploading -> manifold://${dst} (isUserData=true, ttl=${TB_MANIFOLD_TTL}s) ..."
+    if ! manifold putr --userData=true --ttl="${TB_MANIFOLD_TTL}" "${tmp}" "${dst}"; then
+        echo "manifold upload failed" >&2
+        rm -rf "$tmp"
+        return 1
+    fi
+
+    rm -rf "$tmp"
+    echo "Done. View with:"
+    echo "  tensorboard --logdir manifold://${dst}"
+    echo "  https://www.internalfb.com/intern/tensorboard/?dir=manifold://${dst}"
 }
