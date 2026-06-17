@@ -139,24 +139,77 @@ def _rematerialize_optimizer(
     opt: torch.optim.Optimizer,
     named_states: Dict[str, Any],
     params: Dict[str, nn.Parameter],
+    mod: Optional[nn.Module] = None,
+    real_id_to_fqn: Optional[Dict[int, str]] = None,
 ) -> Generator[None, None, None]:
+    """Temporarily point ``opt``'s state and param_groups at the proxy
+    (FakeTensor) params used during make_fx tracing, restoring on exit.
+    Both must be rewired or the traced ``step()`` is a silent no-op:
+    ``opt.state`` is keyed by Parameter identity, and ``param_group["params"]``
+    is the list ``step()`` iterates to know what to update.
+
+    Multi-opt (sparse + dense): each call only touches the FQNs ITS opt owns,
+    derived by mapping each Parameter in ``opt.param_groups`` back to its FQN.
+
+    ``real_id_to_fqn`` MUST come from the real, pre-reparametrize params (what
+    ``opt.param_groups`` still holds). Inside the reparametrize context
+    ``mod.named_parameters()`` returns proxies whose ids miss, so ``owned_fqns``
+    ends up empty -> no-op step, zero optimizer ops in the GM. Prefer the
+    caller-supplied map; fall back to ``mod.named_parameters()`` only without
+    reparametrize.
+    """
     assert opt is not None
 
-    # update opt.state with proxy tensors
-    orig_states = copy(opt.state)
-    for n in named_states:
-        # opt.state's key type is string, but optimizer uses Parameter as keys
-        opt.state[params[n]] = named_states[n]  # type: ignore[index]
+    # Build id -> fqn from real (pre-reparametrize) Parameters.
+    if real_id_to_fqn is None and mod is not None:
+        real_id_to_fqn = {
+            id(p): fqn for fqn, p in mod.named_parameters(remove_duplicate=False)
+        }
 
-    # FIXME: support multiple parameter groups
-    param_group = opt.param_groups[0]
-    orig_params = param_group["params"]
-    param_group["params"] = params.values()
+    if real_id_to_fqn is not None:
+        owned_fqns: set[str] = set()
+        for group in opt.param_groups:
+            for p in group["params"]:
+                fqn = real_id_to_fqn.get(id(p))
+                if fqn is not None:
+                    owned_fqns.add(fqn)
+    else:
+        # No identity map available: legacy "this opt owns everything"
+        # behavior, correct only for single-opt no-reparametrize setups.
+        owned_fqns = set(named_states.keys())
+
+    # update opt.state with proxy tensors (this opt's owned FQNs only)
+    orig_states = copy(opt.state)
+    for n, state in named_states.items():
+        if n in owned_fqns:
+            # opt.state's key type is Parameter, but indexed by FQN here
+            opt.state[params[n]] = state  # type: ignore[index]
+
+    # Rewrite every param_group's params list to point at the proxy
+    # Parameter for each owned FQN, preserving per-group membership.
+    orig_params_per_group: List[Any] = [group["params"] for group in opt.param_groups]
+    if real_id_to_fqn is not None:
+        for group in opt.param_groups:
+            new_list: List[Any] = []
+            for p in group["params"]:
+                fqn = real_id_to_fqn.get(id(p))
+                if fqn is not None and fqn in params:
+                    new_list.append(params[fqn])
+                else:
+                    new_list.append(p)
+            group["params"] = new_list
+    else:
+        # Legacy fallback: assign all proxy params to every group.
+        # Correct only when one opt owns exactly all model params.
+        proxy_param_values = list(params.values())
+        for group in opt.param_groups:
+            group["params"] = proxy_param_values
 
     try:
         yield
     finally:
-        param_group["params"] = orig_params
+        for group, orig in zip(opt.param_groups, orig_params_per_group):
+            group["params"] = orig
         opt.state = orig_states
 
 
@@ -213,7 +266,7 @@ def _dedup_collectives(gm: fx.GraphModule) -> fx.GraphModule:
 class _CompiledResult:
     gm: fx.GraphModule
     mod: nn.Module
-    opt: Optional[torch.optim.Optimizer]
+    opts: List[torch.optim.Optimizer]
     flat_state: List[torch.Tensor]
     state_manager: DeviceStateManager
     # Transforms added by the sub-path (e.g. ``_compile_data_parallel_v2``
@@ -227,7 +280,7 @@ class _CompiledResult:
 class _LocalCompiledResult:
     gm: fx.GraphModule
     mod: nn.Module
-    opt: Optional[torch.optim.Optimizer]
+    opts: List[torch.optim.Optimizer]
     params: Dict[str, nn.Parameter]
     buffers: Dict[str, torch.Tensor]
     named_states: Dict[str, Any]
@@ -273,34 +326,52 @@ def _local_compile(
             context manager.  If None, no additional wrapping is applied.
         **kwargs: Keyword arguments to the train_step function.
     """
-    # 1. Extract nn.Module and Optimizer from args and kwargs
+    # 1. Extract nn.Module and Optimizer(s) from args and kwargs
     # FIXME(@mrshenli): support multiple nn.Module instances
-    # FIXME(@mrshenli): support multiple Optiimzer instances
     # FIXME(@mrshenli): need to broadcast model to sync parameters
     mod: Optional[nn.Module] = None
-    opt: Optional[torch.optim.Optimizer] = None
+    opts: List[torch.optim.Optimizer] = []
     for arg in pytree.arg_tree_leaves(*args, **kwargs):
         if isinstance(arg, nn.Module):
             assert mod is None, "Only support single nn.Module for now"
             mod = arg
         if isinstance(arg, torch.optim.Optimizer):
-            assert opt is None, "Only support single Optimizer for now"
-            opt = arg
+            opts.append(arg)
 
     assert mod is not None, "Couldn't find nn.Module instances from the arguments."
     _mod: nn.Module = mod
-    _opt: Optional[torch.optim.Optimizer] = opt
+    _opts: List[torch.optim.Optimizer] = opts
 
     # 2. Trace stateless version of the train_step
     params = dict(mod.named_parameters(remove_duplicate=False))
     buffers = dict(mod.named_buffers(remove_duplicate=False))
 
-    named_states: Dict[str, Any]
-    named_states = {}
-    if opt is not None:
+    # Snapshot the id -> FQN map from the REAL (pre-reparametrize)
+    # Parameter objects. `opt.param_groups['params']` holds these real
+    # Parameter instances (recir's shard_params_by_plan already
+    # migrated them to post-shard identity). Once
+    # `stateless._reparametrize_module` enters inside stateless_func,
+    # `mod.named_parameters()` returns proxies whose ids no longer
+    # match the real Params in `opt.param_groups`, so the lookup MUST
+    # be done out here to correctly identify each opt's owned params.
+    real_id_to_fqn: Dict[int, str] = {id(p): n for n, p in params.items()}
+
+    # Collect per-param optimizer state across ALL opts into one
+    # FQN-keyed dict. Each Parameter must belong to at most one opt
+    # (otherwise two opts would both step it, double-updating).
+    named_states: Dict[str, Any] = {}
+    fqn_to_opt_idx: Dict[str, int] = {}
+    for opt_idx, opt in enumerate(opts):
         for n, p in params.items():
             if p in opt.state:
+                assert n not in named_states, (
+                    f"Parameter {n!r} has optimizer state in multiple "
+                    f"Optimizers (opts[{fqn_to_opt_idx[n]}] and "
+                    f"opts[{opt_idx}]); each param must be owned by "
+                    f"exactly one Optimizer."
+                )
                 named_states[n] = opt.state[p]  # type: ignore[index]
+                fqn_to_opt_idx[n] = opt_idx
 
     # Lift states and parameters as function arguments so that make_fx
     # can trace operations applied to them.
@@ -312,12 +383,26 @@ def _local_compile(
         args: Any,
         kwargs: Any,
     ) -> Any:
-        with (
-            stateless._reparametrize_module(_mod, {**params, **buffers}),
-            _rematerialize_optimizer(_opt, named_states, params)
-            if _opt
-            else nullcontext(),
-        ):
+        with ExitStack() as opt_stack:
+            opt_stack.enter_context(
+                stateless._reparametrize_module(_mod, {**params, **buffers})
+            )
+            # Per-opt rematerialize so each opt's state + param_groups
+            # are rewritten to point at the proxy params, scoped to
+            # the FQNs that opt actually owns. Pass the pre-built
+            # real-id -> fqn map (built outside this closure, before
+            # reparametrize); querying mod.named_parameters() INSIDE
+            # the reparametrize context returns proxies whose ids do
+            # not match the real Params in opt.param_groups.
+            for opt in _opts:
+                opt_stack.enter_context(
+                    _rematerialize_optimizer(
+                        opt,
+                        named_states,
+                        params,
+                        real_id_to_fqn=real_id_to_fqn,
+                    )
+                )
             with ExitStack() as stack:
                 for fn in _parametrize_fns or []:
                     stack.enter_context(
@@ -414,7 +499,7 @@ def _local_compile(
             node.meta["fqn"] = params_buffers_fqns[placeholder_idx]
         placeholder_idx += 1
 
-    return _LocalCompiledResult(gm, mod, opt, params, buffers, named_states, constants)
+    return _LocalCompiledResult(gm, mod, opts, params, buffers, named_states, constants)
 
 
 def _make_batch_transform(
@@ -514,7 +599,7 @@ def _tag_batch_inputs(
 def _finalize_graph(
     gm: fx.GraphModule,
     mod: nn.Module,
-    opt: Optional[torch.optim.Optimizer],
+    opts: List[torch.optim.Optimizer],
     params_and_buffers: Dict[str, Any],
     named_states: Dict[str, Any],
     input_batch_dim: int,
@@ -532,7 +617,7 @@ def _finalize_graph(
     # is_batch_input / batch_dim. Without this, downstream subgraph
     # placeholders default to replicated and JAX sees per-process shape
     propagate_batch_input_meta(gm)
-    return _CompiledResult(gm, mod, opt, flat_state, DeviceStateManager())
+    return _CompiledResult(gm, mod, opts, flat_state, DeviceStateManager())
 
 
 @dataclass
@@ -705,7 +790,7 @@ class _TraceContext:
     """
 
     mod: nn.Module
-    opt: Optional[torch.optim.Optimizer]
+    opts: List[torch.optim.Optimizer]
     params: Dict[str, nn.Parameter]
     buffers: Dict[str, torch.Tensor]
     named_states: Dict[str, Any]
@@ -813,15 +898,16 @@ def trace(  # noqa: C901 — orchestration: dispatches on parallel_mode flavor (
         if bind is not None:
             bind(callable_)
 
-    # Pre-extract mod (and opt for the DP/HybridParallel branch's pre-trace
-    # ``shard_params`` call); ``_local_compile`` re-extracts both itself.
+    # Pre-extract mod (and all opts for the DP/HybridParallel branch's
+    # pre-trace ``shard_params`` call); ``_local_compile`` re-extracts both
+    # itself. Multi-opt setups (sparse + dense partition) pass >1 Optimizer.
     mod: Optional[nn.Module] = None
-    opt: Optional[torch.optim.Optimizer] = None
+    opts: List[torch.optim.Optimizer] = []
     for arg in pytree.arg_tree_leaves(*args, **kwargs):
         if isinstance(arg, nn.Module) and mod is None:
             mod = arg
-        if isinstance(arg, torch.optim.Optimizer) and opt is None:
-            opt = arg
+        if isinstance(arg, torch.optim.Optimizer):
+            opts.append(arg)
     assert mod is not None, "recir.trace requires an nn.Module in the arguments"
     _mod: nn.Module = mod
 
@@ -902,9 +988,9 @@ def trace(  # noqa: C901 — orchestration: dispatches on parallel_mode flavor (
         )
 
         # Shard params on the module and optimizer states.  Mutates the dict
-        # and the module in-place; also updates ``opt.state`` so that
+        # and the module in-place; also updates each ``opt.state`` so that
         # parameter -> state mappings remain valid post-shard.
-        parallel_mode.shard_params(_mod, params_and_buffers, opt)
+        parallel_mode.shard_params(_mod, params_and_buffers, opts)
 
         # Apply region transforms AFTER sharding, with parametrization.  The
         # traced forward includes allgather ops from ``collectives_insertion``
@@ -1004,7 +1090,7 @@ def trace(  # noqa: C901 — orchestration: dispatches on parallel_mode flavor (
     propagate_batch_input_meta(local_result.gm)
     ctx = _TraceContext(
         mod=local_result.mod,
-        opt=local_result.opt,
+        opts=local_result.opts,
         params=local_result.params,
         buffers=local_result.buffers,
         named_states=local_result.named_states,
@@ -1149,16 +1235,19 @@ def compile_from_gm(  # noqa: C901 — orchestration: stages 4-8 of the pipeline
         # re-extract named_states by walking the now-sharded module, then
         # ``partition_from_module``.
         params_and_buffers = {**ctx.params, **ctx.buffers}
-        sharded_keys = parallel_mode.shard_params(ctx.mod, params_and_buffers, ctx.opt)
+        sharded_keys = parallel_mode.shard_params(ctx.mod, params_and_buffers, ctx.opts)
         named_states = {}
-        _opt = ctx.opt
-        if _opt is not None and len(_opt.state) > 0:
-            # ``shard_params`` may have re-keyed ``opt.state`` to the new
+        _opts = ctx.opts
+        if any(len(o.state) > 0 for o in _opts):
+            # ``shard_params`` may have re-keyed each ``opt.state`` to the new
             # (post-shard) Parameter identities; walk the live module to pick
-            # up the current binding.
+            # up the current binding across ALL optimizers (sparse + dense
+            # partition each own a disjoint subset of params).
             for n, p in ctx.mod.named_parameters(remove_duplicate=False):
-                if p in _opt.state:
-                    named_states[n] = _opt.state[p]  # type: ignore[index]
+                for o in _opts:
+                    if p in o.state:
+                        named_states[n] = o.state[p]  # type: ignore[index]
+                        break
             # Coverage check: ``shard_params`` may re-key params off the
             # module so the walk above misses entries that ``trace`` captured
             # in ``ctx.named_states``. Warn (rather than silently drop) so
@@ -1172,14 +1261,20 @@ def compile_from_gm(  # noqa: C901 — orchestration: stages 4-8 of the pipeline
                     sorted(dropped),
                 )
         else:
-            # Either no optimizer was supplied, or ``_opt.state`` is empty
-            # (optimizer not stepped yet, or a partial-lower path that
+            # Either no optimizer was supplied, or every ``opt.state`` is
+            # empty (optimizer not stepped yet, or a partial-lower path that
             # never populated state).  In both cases ``ctx.named_states``
             # — captured by ``trace`` — is the authoritative snapshot;
             # fall through so we do not silently discard it.
             named_states = ctx.named_states
+        # ``partition_from_module`` accepts ``optimizer`` only for API
+        # back-compat and never reads it; pass the first opt (or None).
         gm = parallel_mode.partition_from_module(
-            gm, ctx.mod, ctx.opt, params_and_buffers, named_states
+            gm,
+            ctx.mod,
+            _opts[0] if _opts else None,
+            params_and_buffers,
+            named_states,
         )
 
         # GSPMD-specific tag_grad fixup.  ``partition_from_module`` is a no-op
@@ -1329,7 +1424,7 @@ def compile_from_gm(  # noqa: C901 — orchestration: stages 4-8 of the pipeline
     return _CompiledResult(
         gm=final_gm,
         mod=ctx.mod,
-        opt=ctx.opt,
+        opts=ctx.opts,
         flat_state=flat_state,
         state_manager=backend.device_state_manager(),
     )
@@ -1415,14 +1510,16 @@ def _compile_data_parallel_v2(
         dp_style = parallel_mode.parallel_style
     world_size: int = parallel_mode.num_ranks
 
-    # 1. Pre-extract mod/opt (need originals for pre-trace sharding).
+    # 1. Pre-extract mod and ALL Optimizer instances (need originals
+    #    for pre-trace sharding; multi-opt setups partition params into
+    #    sparse + dense buckets and pass two opts).
     mod: Optional[nn.Module] = None
-    opt: Optional[torch.optim.Optimizer] = None
+    opts: List[torch.optim.Optimizer] = []
     for arg in pytree.arg_tree_leaves(*args, **kwargs):
         if isinstance(arg, nn.Module):
             mod = arg
         if isinstance(arg, torch.optim.Optimizer):
-            opt = arg
+            opts.append(arg)
     assert mod is not None
     _mod: nn.Module = mod
 
@@ -1499,8 +1596,10 @@ def _compile_data_parallel_v2(
 
     # 6. Shard params on the module and optimizer states.
     #    shard_params mutates both the dict and the module in-place.
-    #    It also updates opt.state so that parameter→state mappings remain valid.
-    parallel_mode.shard_params(_mod, params_and_buffers, opt)
+    #    It also updates each opt's state + param_groups so that
+    #    parameter -> state mappings remain valid after sparse Parameter
+    #    identity swaps.
+    parallel_mode.shard_params(_mod, params_and_buffers, opts)
 
     # 7. Apply region transforms AFTER sharding, with parametrization.
     #    The traced forward includes allgather ops from collectives_insertion
@@ -1545,7 +1644,7 @@ def _compile_data_parallel_v2(
     result = _finalize_graph(
         local_result.gm,
         local_result.mod,
-        local_result.opt,
+        local_result.opts,
         {**local_result.params, **local_result.buffers},
         local_result.named_states,
         parallel_mode.input_batch_dim,
@@ -1641,12 +1740,12 @@ def _compile_gspmd(
     # (_to_sharded_jax bridges the gap). Sharding before _finalize_graph
     # means flat_state is built from already-sharded tensors.
     sharded_keys = parallel_mode.shard_params(
-        local_result.mod, params_and_buffers, local_result.opt
+        local_result.mod, params_and_buffers, local_result.opts
     )
     result = _finalize_graph(
         gm,
         local_result.mod,
-        local_result.opt,
+        local_result.opts,
         params_and_buffers,
         local_result.named_states,
         input_batch_dim=parallel_mode.input_batch_dim,

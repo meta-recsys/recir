@@ -83,7 +83,7 @@ class TraceReturnsGmAndFlatStateTest(unittest.TestCase):
         ctx = _get_trace_ctx(gm)
         self.assertIsInstance(ctx, _TraceContext)
         self.assertIs(ctx.mod, model)
-        self.assertIs(ctx.opt, opt)
+        self.assertEqual(ctx.opts, [opt])
 
 
 class CompileFromGmTest(unittest.TestCase):
@@ -106,7 +106,7 @@ class CompileFromGmTest(unittest.TestCase):
         self.assertIsInstance(compiled.gm, fx.GraphModule)
         self.assertIsNotNone(compiled.flat_state)
         self.assertIs(compiled.mod, model)
-        self.assertIs(compiled.opt, opt)
+        self.assertEqual(compiled.opts, [opt])
 
     def test_compile_from_gm_invokes_optimize_passes(self) -> None:
         """Each pass in backend.optimize_passes is called on (gm, flat_state)."""

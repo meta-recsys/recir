@@ -15,6 +15,7 @@ import torch.nn as nn
 from recir.backend import BackendType
 from recir.distributed.data_parallel import (
     DataParallelStyle,
+    OptOrOpts,
     partition_data_parallel,
     shard_params_and_states,
     shard_params_by_plan,
@@ -133,12 +134,19 @@ class ParallelMode(ABC):
         self,
         model: torch.nn.Module,
         params_and_buffers: Dict[str, Any],
-        opt: Optional[torch.optim.Optimizer],
+        opt: OptOrOpts,
     ) -> Set[str]:
         """
         Shard model parameters and optimizer states according to the
-        parallel mode's strategy.  Updates ``opt.state`` in-place so
-        that parameter→state mappings remain valid after sharding.
+        parallel mode's strategy.  Updates ``opt.state`` and
+        ``opt.param_groups`` in-place for every optimizer passed in so
+        that parameter -> state mappings AND param_groups['params']
+        lists remain valid after the Parameter identity swap that
+        sharding performs.
+
+        ``opt`` accepts either a single Optimizer (backward compat),
+        a list of Optimizers (multi-opt sparse + dense partition),
+        or None (no optimizer).
 
         Returns:
             Set of keys in ``params_and_buffers`` that were actually sharded.
@@ -198,7 +206,7 @@ class GSPMDParallel(ParallelMode):
     def num_ranks(self) -> int:
         if self._num_ranks is not None:
             return self._num_ranks
-        import jax  # @manual  # pyre-ignore[21]
+        import jax  # @manual
 
         return jax.device_count()
 
@@ -216,7 +224,7 @@ class GSPMDParallel(ParallelMode):
         # so use the topology-aware ratio when one is active.
         if _AOT_TOPOLOGY.get() is not None:
             return len(_get_global_devices()) // max(1, len(_get_local_devices()))
-        import jax  # @manual  # pyre-ignore[21]
+        import jax  # @manual
 
         return jax.process_count()
 
@@ -237,7 +245,7 @@ class GSPMDParallel(ParallelMode):
         self,
         model: torch.nn.Module,
         params_and_buffers: Dict[str, Any],
-        opt: Optional[torch.optim.Optimizer],
+        opt: OptOrOpts,
     ) -> Set[str]:
         if self.parallel_style != "fully_shard":
             return set()
@@ -359,7 +367,7 @@ class DataParallel(ParallelMode):
         if self._num_ranks is not None:
             return self._num_ranks
         if self._is_xla_backend:
-            import jax  # @manual  # pyre-ignore[21]
+            import jax  # @manual
 
             return jax.device_count()
         return dist.get_world_size() if dist.is_initialized() else 1
@@ -369,7 +377,7 @@ class DataParallel(ParallelMode):
         if self._num_processes is not None:
             return self._num_processes
         if self._is_xla_backend:
-            import jax  # @manual  # pyre-ignore[21]
+            import jax  # @manual
 
             return jax.process_count()
         return dist.get_world_size() if dist.is_initialized() else 1
@@ -431,7 +439,7 @@ class DataParallel(ParallelMode):
         self,
         model: torch.nn.Module,
         params_and_buffers: Dict[str, Any],
-        opt: Optional[torch.optim.Optimizer],
+        opt: OptOrOpts,
     ) -> Set[str]:
         return shard_params_and_states(
             model,
@@ -553,7 +561,7 @@ class HybridParallel(ParallelMode):
         self,
         model: torch.nn.Module,
         params_and_buffers: Dict[str, Any],
-        opt: Optional[torch.optim.Optimizer],
+        opt: OptOrOpts,
     ) -> Set[str]:
         return shard_params_by_plan(
             model,

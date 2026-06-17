@@ -340,6 +340,130 @@ class TraceTrainStepTest(DTensorTestBase):
     def test_adam_fused(self) -> None:
         self._test_adam(foreach=False, fused=True)
 
+    @skip_if_lt_x_gpu(2)
+    @with_comms
+    def test_multi_optimizer(self) -> None:
+        """Two optimizers, each owning a disjoint subset of params, both step
+        inside the compiled GM (the multi-optimizer ``recir.api`` path).
+
+        Parameter parity vs DDP running the same two-optimizer split proves
+        BOTH ``opt.step()`` calls were traced + executed: if only one stepped,
+        the other layer's weights would not update in the compiled step and
+        would diverge from the reference. Distinct LRs (0.01 vs 0.1) also catch
+        the two optimizers being coalesced into one.
+
+        Uses the lazy ``@compile()`` decorator (like ``test_sgd`` /
+        ``test_tied_parameters``) so tracing happens on the first compiled call
+        -- AFTER the optimizer states are materialized below -- which is what
+        lifts both optimizers' state into ``flat_state`` (the trace-time
+        ``named_states`` snapshot in ``_local_compile``).
+        """
+
+        @compile()
+        def train_step(
+            mod: nn.Module,
+            opt0: torch.optim.Optimizer,
+            opt1: torch.optim.Optimizer,
+            inp: torch.Tensor,
+        ) -> None:
+            mod(inp).sum().backward()
+            opt0.step()
+            opt1.step()
+
+        torch.manual_seed(0)
+        mod = nn.Sequential(
+            nn.Linear(10, 10, bias=False),
+            nn.Linear(10, 10, bias=False),
+        ).cuda(self.rank)
+        inp = torch.randn(2, 10).cuda(self.rank)
+
+        # opt0 owns layer 0's weight, opt1 owns layer 1's weight (disjoint).
+        params = list(mod.parameters())
+        opt0 = torch.optim.Adam([params[0]], lr=0.01, foreach=True, capturable=True)
+        opt1 = torch.optim.Adam([params[1]], lr=0.1, foreach=True, capturable=True)
+
+        ddp_mod = DDP(deepcopy(mod), device_ids=[self.rank])
+        ddp_params = list(ddp_mod.parameters())
+        ddp_opt0 = torch.optim.Adam([ddp_params[0]], lr=0.01, foreach=True)
+        ddp_opt1 = torch.optim.Adam([ddp_params[1]], lr=0.1, foreach=True)
+
+        ddp_inp = deepcopy(inp)
+        # Materialize optimizer states with one eager step on each side BEFORE
+        # the first compiled call (so the @compile trace snapshots both states).
+        mod(inp).sum().backward()
+        opt0.step()
+        opt1.step()
+        opt0.zero_grad()
+        opt1.zero_grad()
+        ddp_mod(ddp_inp).sum().backward()
+        ddp_opt0.step()
+        ddp_opt1.step()
+        ddp_opt0.zero_grad()
+        ddp_opt1.zero_grad()
+
+        # Compiled step: traces now (state populated), both opts step in the GM.
+        train_step(mod, opt0, opt1, inp)
+
+        # Reference step.
+        ddp_mod(ddp_inp).sum().backward()
+        ddp_opt0.step()
+        ddp_opt1.step()
+
+        for p1, p2 in zip(mod.parameters(), ddp_mod.parameters()):
+            self.assertEqual(p1, p2)
+
+    @skip_if_lt_x_gpu(2)
+    @with_comms
+    def test_multi_param_group(self) -> None:
+        """A single optimizer with TWO param_groups (different LRs) traces +
+        steps every group, exercising ``_rematerialize_optimizer`` rewriting
+        EVERY ``param_group['params']`` (not just ``param_groups[0]``).
+
+        The distinct per-group LRs (0.01 vs 0.1) mean that if the second group
+        were not rewired onto the proxy params, layer 1's weight would not be
+        updated by the compiled step and would diverge from the DDP reference.
+
+        Uses the lazy ``@compile()`` decorator so the trace (driven by
+        ``_test_optimizer``'s first ``train_step`` call) runs after the
+        optimizer state is materialized.
+        """
+
+        @compile()
+        def train_step(
+            mod: nn.Module, opt: torch.optim.Optimizer, inp: torch.Tensor
+        ) -> None:
+            mod(inp).sum().backward()
+            opt.step()
+
+        torch.manual_seed(0)
+        mod = nn.Sequential(
+            nn.Linear(10, 10, bias=False),
+            nn.Linear(10, 10, bias=False),
+        ).cuda(self.rank)
+        inp = torch.randn(2, 10).cuda(self.rank)
+
+        params = list(mod.parameters())
+        opt = torch.optim.Adam(
+            [
+                {"params": [params[0]], "lr": 0.01},
+                {"params": [params[1]], "lr": 0.1},
+            ],
+            foreach=True,
+            capturable=True,
+        )
+
+        ddp_mod = DDP(deepcopy(mod), device_ids=[self.rank])
+        ddp_params = list(ddp_mod.parameters())
+        ddp_opt = torch.optim.Adam(
+            [
+                {"params": [ddp_params[0]], "lr": 0.01},
+                {"params": [ddp_params[1]], "lr": 0.1},
+            ],
+            foreach=True,
+        )
+
+        self._test_optimizer(mod, ddp_mod, opt, ddp_opt, inp, train_step)
+
     def _test_train_step_override(self) -> None:
         transform_targets: list[Any] = []
 
