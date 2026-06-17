@@ -27,10 +27,40 @@ Usage:
     import recir.lowering.fbgemm_fallback  # noqa: F401 -- registers ops as side effect
 """
 
+import logging
 from typing import List, Optional, Sequence, Tuple
 
 import torch
 from recir.decompositions import SPMD_DECOMP_TABLE
+
+logger: logging.Logger = logging.getLogger(__name__)
+
+
+# jagged_impl.py was eliminated: route the base jagged<->dense gathers through
+# the recir custom ops so they get the shard-local shard_map lowering on TPU
+# (and a single torch reference impl in recir/ops/jagged_ops.py). These thin
+# wrappers keep the composite ops + fbgemm-absent registrations below working.
+def _jagged_to_padded_dense_impl(
+    values: torch.Tensor,
+    offsets: List[torch.Tensor],
+    max_lengths: Sequence[int],
+    padding_value: float = 0.0,
+) -> torch.Tensor:
+    import recir.ops.jagged_ops  # noqa: F401
+
+    return torch.ops.recir.jagged_to_padded_dense(
+        values, offsets, list(max_lengths), padding_value
+    )
+
+
+def _dense_to_jagged_forward_impl(
+    dense: torch.Tensor,
+    offsets: List[torch.Tensor],
+    total_L: Optional[int] = None,
+) -> torch.Tensor:
+    import recir.ops.jagged_ops  # noqa: F401
+
+    return torch.ops.recir.dense_to_jagged(dense, offsets, total_L)[0]
 
 
 def _is_fbgemm_available() -> bool:
@@ -52,82 +82,6 @@ def _batched_complete_cumsum_impl(values: torch.Tensor) -> torch.Tensor:
     cumsum = torch.cumsum(values, dim=1)
     zeros = torch.zeros_like(values.narrow(1, 0, 1))
     return torch.cat([zeros, cumsum], dim=1)
-
-
-def _jagged_to_padded_dense_impl(
-    values: torch.Tensor,
-    offsets: List[torch.Tensor],
-    max_lengths: Sequence[int],
-    padding_value: float = 0.0,
-) -> torch.Tensor:
-    seq_offsets = offsets[0]
-    max_len = max_lengths[0]
-    B = seq_offsets.shape[0] - 1
-
-    starts = seq_offsets[:-1]  # (B,)
-    lengths = seq_offsets[1:] - seq_offsets[:-1]  # (B,)
-    col_range = torch.arange(max_len, device=values.device)  # (N,)
-    mask = col_range.unsqueeze(0) < lengths.unsqueeze(1)  # (B, N)
-
-    flat_indices = starts.unsqueeze(1) + col_range.unsqueeze(0)  # (B, N)
-    flat_indices = flat_indices.clamp(0, max(values.shape[0] - 1, 0))
-
-    if values.dim() == 1:
-        gathered = values[flat_indices.reshape(-1)].reshape(B, max_len)
-        result = torch.where(mask, gathered, torch.full_like(gathered, padding_value))
-    else:
-        flat_idx = flat_indices.reshape(-1)
-        gathered = values[flat_idx].reshape(B, max_len, *values.shape[1:])
-        mask_exp = mask.reshape(B, max_len, *([1] * (values.dim() - 1)))
-        mask_exp = mask_exp.expand_as(gathered)
-        result = torch.where(
-            mask_exp, gathered, torch.full_like(gathered, padding_value)
-        )
-    return result
-
-
-def _dense_to_jagged_forward_impl(
-    dense: torch.Tensor,
-    offsets: List[torch.Tensor],
-    total_L: Optional[int] = None,
-) -> torch.Tensor:
-    """Forward-only variant: returns just the jagged values tensor."""
-    seq_offsets = offsets[0]
-    N = dense.shape[1]
-
-    if total_L is None:
-        total_L = int(seq_offsets[-1].item())
-
-    lengths = seq_offsets[1:] - seq_offsets[:-1]  # (B,)
-    col_range = torch.arange(N, device=dense.device)  # (N,)
-    mask = col_range.unsqueeze(0) < lengths.unsqueeze(1)  # (B, N)
-
-    dest_indices = seq_offsets[:-1].unsqueeze(1) + col_range.unsqueeze(0)  # (B, N)
-    dest_indices = torch.where(mask, dest_indices, torch.zeros_like(dest_indices))
-    dest_indices = dest_indices.clamp(0, max(total_L - 1, 0))
-
-    if dense.dim() == 2:
-        result = torch.zeros(total_L, dtype=dense.dtype, device=dense.device)
-        src = torch.where(mask, dense, torch.zeros_like(dense))
-        result = result.scatter_add(0, dest_indices.reshape(-1), src.reshape(-1))
-    else:
-        D = dense.shape[2]
-        result = torch.zeros(total_L, D, dtype=dense.dtype, device=dense.device)
-        mask_exp = mask.unsqueeze(-1).expand_as(dense)
-        src = torch.where(mask_exp, dense, torch.zeros_like(dense))
-        dest_exp = dest_indices.unsqueeze(-1).expand_as(dense)
-        result = result.scatter_add(0, dest_exp.reshape(-1, D), src.reshape(-1, D))
-
-    return result
-
-
-def _jagged_to_padded_dense_backward_impl(
-    grad_output: torch.Tensor,
-    offsets: List[torch.Tensor],
-    total_L: int,
-) -> torch.Tensor:
-    """Backward of jagged_to_padded_dense: converts dense grad to jagged."""
-    return _dense_to_jagged_forward_impl(grad_output, offsets, total_L)
 
 
 def _dense_to_jagged_impl(
@@ -267,7 +221,7 @@ def register_fbgemm_fallbacks() -> bool:
         )(_jagged_to_padded_dense_impl)
         torch.library.impl(
             lib, "jagged_to_padded_dense_backward", "CompositeImplicitAutograd"
-        )(_jagged_to_padded_dense_backward_impl)
+        )(_dense_to_jagged_forward_impl)
         torch.library.impl(
             lib, "asynchronous_complete_cumsum", "CompositeImplicitAutograd"
         )(_asynchronous_complete_cumsum_impl)
@@ -285,18 +239,60 @@ def register_fbgemm_fallbacks() -> bool:
     # decomposes these ops into standard aten ops for XLA/JAX lowering.
     # This is needed even when fbgemm is installed because the real
     # fbgemm CUDA kernels segfault during fake-tensor tracing on TPU.
+    #
+    # For jagged<->dense conversions, route to recir custom ops that have
+    # shard_map lowerings (keeps activations batch-sharded on TPU/GSPMD).
+    # The import is done lazily inside the routing functions to avoid
+    # circular dependency at module load time.
+
+    def _route_to_recir_jagged_to_padded_dense(
+        values: torch.Tensor,
+        offsets: List[torch.Tensor],
+        max_lengths: Sequence[int],
+        padding_value: float = 0.0,
+    ) -> torch.Tensor:
+        import recir.ops.jagged_ops  # noqa: F401
+
+        return torch.ops.recir.jagged_to_padded_dense(
+            values, offsets, list(max_lengths), padding_value
+        )
+
+    def _route_to_recir_dense_to_jagged(
+        dense: torch.Tensor,
+        offsets: List[torch.Tensor],
+        total_L: Optional[int] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        import recir.ops.jagged_ops  # noqa: F401
+
+        return torch.ops.recir.dense_to_jagged(dense, offsets, total_L)
+
+    def _route_to_recir_dense_to_jagged_forward(
+        dense: torch.Tensor,
+        offsets: List[torch.Tensor],
+        total_L: Optional[int] = None,
+    ) -> torch.Tensor:
+        # dense_to_jagged_forward / jagged_to_padded_dense_backward are
+        # single-Tensor ops; reuse the tuple route and drop the offsets output.
+        return _route_to_recir_dense_to_jagged(dense, offsets, total_L)[0]
+
     SPMD_DECOMP_TABLE[torch.ops.fbgemm.jagged_to_padded_dense.default] = (
-        _jagged_to_padded_dense_impl
+        _route_to_recir_jagged_to_padded_dense
     )
-    SPMD_DECOMP_TABLE[torch.ops.fbgemm.dense_to_jagged.default] = _dense_to_jagged_impl
+    SPMD_DECOMP_TABLE[torch.ops.fbgemm.dense_to_jagged.default] = (
+        _route_to_recir_dense_to_jagged
+    )
     SPMD_DECOMP_TABLE[torch.ops.fbgemm.dense_to_jagged_forward.default] = (
-        _dense_to_jagged_forward_impl
+        _route_to_recir_dense_to_jagged_forward
     )
     SPMD_DECOMP_TABLE[torch.ops.fbgemm.jagged_to_padded_dense_forward.default] = (
-        _jagged_to_padded_dense_impl
+        _route_to_recir_jagged_to_padded_dense
     )
+    # Backward of jagged_to_padded_dense is dense_to_jagged. Route it to the
+    # shard-local recir custom op too (NOT the inline _impl), otherwise the
+    # backward pass does a global gather over [total_L, D] -> replicated 65GB
+    # buffer -> HBM OOM (forwards route to recir but the backward did not).
     SPMD_DECOMP_TABLE[torch.ops.fbgemm.jagged_to_padded_dense_backward.default] = (
-        _jagged_to_padded_dense_backward_impl
+        _route_to_recir_dense_to_jagged_forward
     )
     SPMD_DECOMP_TABLE[torch.ops.fbgemm.asynchronous_complete_cumsum.default] = (
         _asynchronous_complete_cumsum_impl
