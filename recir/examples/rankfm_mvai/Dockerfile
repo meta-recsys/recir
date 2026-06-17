@@ -61,6 +61,11 @@ RUN pip install zstandard
 # the mvai_cloud trainer. Pin matches mvai_cloud/requirements.txt.
 RUN pip install pyzstd==0.19.1
 
+# tensorboard: torch.utils.tensorboard.SummaryWriter backend used by mvai's
+# TensorboardLogger (enabled via MetricsConfig.tensorboard_logger=True). Not in
+# the rankfm image; rankfm_mvai needs it because RecTrainer can log scalars to TB.
+RUN pip install tensorboard
+
 # Copy and install recir with XLA + rec extras
 COPY recir /app/recir
 COPY setup.py /app/setup.py

@@ -31,6 +31,7 @@ spec:
           metadata:
             annotations:
               cloud.google.com/gke-tpu-slice-topology: "4x4x8"
+              gke-gcsfuse/volumes: "true"
           spec:
             serviceAccountName: default
             containers:
@@ -55,6 +56,13 @@ spec:
               - name: TPU_LIBRARY_INIT_TIMEOUT
                 value: "1800"
               - name: JOBSET_NAME
+                valueFrom:
+                  fieldRef:
+                    fieldPath: metadata.labels['jobset.sigs.k8s.io/jobset-name']
+              # mvai's TensorboardLogger writes to
+              # /mnt/gcs/mvai_cloud/tensorboard/$MVAI_JOB_NAME (metrics.py:103-114);
+              # set it to the jobset name so each run gets its own TB subdir.
+              - name: MVAI_JOB_NAME
                 valueFrom:
                   fieldRef:
                     fieldPath: metadata.labels['jobset.sigs.k8s.io/jobset-name']
@@ -114,6 +122,8 @@ spec:
               - name: barnfs-data
                 mountPath: /mnt/barnfs
                 readOnly: true
+              - name: tensorboard
+                mountPath: /mnt/gcs/mvai_cloud
             nodeSelector:
               cloud.google.com/gke-tpu-accelerator: tpu7x
               cloud.google.com/gke-tpu-topology: "4x4x8"
@@ -134,3 +144,16 @@ spec:
                 readOnly: true
                 volumeAttributes:
                   sourcePath: "gs://mrs-tpu-y317h/datasets/udd_fm_20260415_dump/"
+            # TensorBoard scalar-metrics (loss/QPS/NE) sink. mvai's
+            # TensorboardLogger hardcodes /mnt/gcs/mvai_cloud/tensorboard/$MVAI_JOB_NAME
+            # (metrics.py); back that path with a gcsfuse RW mount of the
+            # SA-owned bucket so the event files persist to GCS (mirrors how
+            # mvai_cloud's GPU cluster persists TB). Requires the
+            # ns-mrs-core-shared default SA to have write access to
+            # this bucket (same SA + bucket as the profiler-output fix).
+            - name: tensorboard
+              csi:
+                driver: gcsfuse.csi.storage.gke.io
+                volumeAttributes:
+                  bucketName: cq-mrs-core-shared_mrs_tpu_y317h
+                  mountOptions: "implicit-dirs"
