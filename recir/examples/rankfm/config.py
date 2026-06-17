@@ -78,6 +78,12 @@ class RankFMTrainerConfig:
     profile_dir: str = "/tmp/tpu_profile"
     enable_memory_log: bool = False
 
+    # TensorBoard scalar logging. Empty tb_dir disables TB entirely.
+    # Local paths write directly; gs:// paths buffer to a local tempdir
+    # during training and upload on flush/close (gcsfs has no append).
+    tb_dir: str = ""
+    tb_log_every: int = 10
+
 
 @dataclass
 class RankFMModelArgs:

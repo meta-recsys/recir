@@ -45,6 +45,60 @@ logger: logging.Logger = logging.getLogger(__name__)
 _ROW_WISE_MIN_ROWS_PER_RANK: int = 100
 
 
+# Embedding parameters all live under this submodule path in the bare
+# (un-DMP'd) BlueReelsVDDTrainV3 graph. The multi-rank DMP path applies a
+# row-wise-adagrad-style update in-backward via fbgemm's FUSED kernel for
+# embedding tables; the single-node path doesn't get FUSED, so we use plain
+# Adagrad (element-wise accumulator) here as the same idea at full precision.
+# Without per-param adaptive LR, plain SGD@embedding_lr=0.1 on a hot id makes
+# the model diverge within ~40 steps on real BarnFS data.
+_EMBEDDING_PARAM_PREFIX: str = (
+    "recblock.tokenizer_stack.mot_sparse_arch._sparse_arch._embedding_collection"
+)
+
+
+def _build_single_node_optimizer(
+    model: nn.Module,
+    embedding_lr: float,
+    dense_lr: float,
+) -> torch.optim.Optimizer:
+    """Adagrad with two param groups: embeddings at embedding_lr (matches FUSED
+    RowWiseAdagrad in the DMP path), dense at dense_lr. Dense on Adagrad is
+    harmless — the accumulator can only shrink the LR, never grow it.
+    """
+    emb_params: List[torch.Tensor] = []
+    dense_params: List[torch.Tensor] = []
+    for name, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+        if name.startswith(_EMBEDDING_PARAM_PREFIX):
+            emb_params.append(p)
+        else:
+            dense_params.append(p)
+    logger.info(
+        "Single-node optimizer: %d embedding params (lr=%g), %d dense params (lr=%g)",
+        len(emb_params),
+        embedding_lr,
+        len(dense_params),
+        dense_lr,
+    )
+    param_groups: List[Dict[str, Any]] = []
+    if emb_params:
+        param_groups.append({"params": emb_params, "lr": embedding_lr})
+    if dense_params:
+        param_groups.append({"params": dense_params, "lr": dense_lr})
+    # initial_accumulator_value=0.1 stops Adagrad's cold-start pathology:
+    # with accumulator=0, the step-1 update degenerates to ±lr·sign(g) (the
+    # gradient magnitude cancels out), which on millions of embedding rows
+    # initialized in U(-0.1, 0.1) flips signs everywhere and triggers NaN by
+    # step 2. With initial_accumulator=0.1, step 1 = lr·g / sqrt(0.1+g²) which
+    # is bounded by lr·g/sqrt(0.1) for small g and ≈lr for large g -- a sane
+    # bootstrap until the per-param accumulator builds up.
+    return torch.optim.Adagrad(
+        param_groups, initial_accumulator_value=0.1, foreach=True
+    )
+
+
 class _ECSharder(EmbeddingCollectionSharder):
     def __init__(
         self,
@@ -116,7 +170,7 @@ class CPURankFMBackend(EmbeddingBackend):
     ) -> Tuple[nn.Module, torch.optim.Optimizer]:
         if not dist.is_initialized():
             logger.info("Single-node: skipping DMP, using model directly")
-            return model, torch.optim.SGD(model.parameters(), lr=dense_lr, foreach=True)
+            return model, _build_single_node_optimizer(model, embedding_lr, dense_lr)
 
         pg = dist.distributed_c10d._get_default_group()
         sharders = [

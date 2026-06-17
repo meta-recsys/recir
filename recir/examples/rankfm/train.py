@@ -124,6 +124,41 @@ def _setup_logging() -> None:
     )
 
 
+def _build_data_pipe(
+    trainer_cfg: RankFMTrainerConfig,
+    gloo_rank: int,
+    gloo_world: int,
+) -> Optional[BatchReplayPipe]:
+    """Construct the replay pipe iff ``--gcs_data_path`` was given.
+
+    Direct-read template path skips the 58-min ``ls /mnt/barnfs`` enumeration
+    when ``--data_file_template`` is set; one file per epoch is enough since
+    the rotating window in ``replay_batch_iter`` provides per-step diversity.
+    """
+    if not trainer_cfg.gcs_data_path:
+        logger.info("Using synthetic data (no --gcs_data_path)")
+        return None
+    explicit_files: Optional[List[str]] = None
+    if trainer_cfg.data_file_template:
+        explicit_files = [trainer_cfg.data_file_template.format(i=1)]
+        logger.info(
+            f"Direct-read mode: file_list={explicit_files} (template "
+            f"'{trainer_cfg.data_file_template}')"
+        )
+    pipe = BatchReplayPipe(
+        path=trainer_cfg.gcs_data_path,
+        rank=gloo_rank,
+        world_size=gloo_world,
+        replicate_across_ranks=trainer_cfg.data_replicate_across_ranks,
+        file_list=explicit_files,
+    )
+    logger.info(
+        f"Replay pipe: {len(pipe)} batches for rank {gloo_rank} "
+        f"(replicate={trainer_cfg.data_replicate_across_ranks})"
+    )
+    return pipe
+
+
 def _build_compiled_train_step(
     trainer_cfg: RankFMTrainerConfig,
     module_config: BlueReelsVDDModuleConfig,
@@ -733,32 +768,7 @@ def main() -> None:
 
     # --- 4. Build data_pipe (BEFORE compile, so the trace batch can be
     # pulled from it and the trace schema matches every runtime batch). ---
-    data_pipe: Optional[BatchReplayPipe] = None
-    if trainer_cfg.gcs_data_path:
-        # When --data_file_template is set, generate filenames programmatically
-        # and skip directory enumeration (avoids the 58-min ls /mnt/barnfs
-        # tax). One file per epoch — the rotating window in
-        # replay_batch_iter provides per-step diversity within that file.
-        explicit_files: Optional[List[str]] = None
-        if trainer_cfg.data_file_template:
-            explicit_files = [trainer_cfg.data_file_template.format(i=1)]
-            logger.info(
-                f"Direct-read mode: file_list={explicit_files} (template "
-                f"'{trainer_cfg.data_file_template}')"
-            )
-        data_pipe = BatchReplayPipe(
-            path=trainer_cfg.gcs_data_path,
-            rank=gloo_rank,
-            world_size=gloo_world,
-            replicate_across_ranks=trainer_cfg.data_replicate_across_ranks,
-            file_list=explicit_files,
-        )
-        logger.info(
-            f"Replay pipe: {len(data_pipe)} batches for rank {gloo_rank} "
-            f"(replicate={trainer_cfg.data_replicate_across_ranks})"
-        )
-    else:
-        logger.info("Using synthetic data (no --gcs_data_path)")
+    data_pipe = _build_data_pipe(trainer_cfg, gloo_rank, gloo_world)
 
     # --- 5. Build model + overrides + compiled train_step.
     # _build_compiled_train_step pulls the FIRST batch from ``data_pipe``
