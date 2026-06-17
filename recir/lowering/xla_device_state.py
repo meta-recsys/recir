@@ -63,14 +63,30 @@ class XLADeviceStateManager(DeviceStateManager):
         # For training, process_outputs overwrites device_state with updated
         # weights from the graph output after each step, so this initial
         # conversion is overwritten and does not affect correctness.
-        if self.device_state is None and not last_train_step:
+        #
+        # IMPORTANT: _convert_flat_state_to_jax uses single-device device_put,
+        # which is only correct on a single device. On a multi-device GSPMD mesh
+        # the compiled program requires per-arg mesh shardings (e.g. replicated
+        # P() for DP/dense params), so single-device placement fails the input
+        # sharding check. For multi-device we leave device_state unset on the
+        # first call and fall through to the slow path; _XLAModule._to_sharded_jax
+        # then applies the correct shardings (and the meta-init branch), and
+        # process_outputs caches the correctly-sharded JAX device_state so the
+        # fast path is used on subsequent steps.
+        import jax  # @manual
+
+        if (
+            self.device_state is None
+            and not last_train_step
+            and jax.device_count() == 1
+        ):
             self.device_state = self._convert_flat_state_to_jax(flat_state)
         device_state = self.device_state
-        self._used_fast_path = not last_train_step
+        self._used_fast_path = device_state is not None and not last_train_step
         if self._used_fast_path:
             # Only the fast path consumes the cached JAX device_state. The slow
-            # path (last_train_step) returns flat_state and may legitimately have
-            # device_state is None — process_outputs resets it at each last step.
+            # path (last_train_step, or the first multi-device call) returns
+            # flat_state and may legitimately have device_state is None.
             assert device_state is not None
             self._set_keep_jax_output(gm, True)
             return device_state + user_inps
@@ -92,9 +108,30 @@ class XLADeviceStateManager(DeviceStateManager):
             self.device_state = None
         else:
             self.device_state = updated_flat[:num_state]
+        # Phase-3 pipelining: optionally skip the per-step output device->host
+        # materialization so the caller can pull it on a cadence (lets JAX run the
+        # host ahead, overlapping the next step's H2D/dispatch with this step's
+        # compute). On the last step we always materialize so callers get a torch
+        # result. device_state above is unaffected (state still stays on-device).
+        if self.keep_output_jax and not last_train_step:
+            return output
         if not isinstance(output, torch.Tensor) and output is not None:
             output = _jax_to_torch(output, self.torch_device)
         return output
+
+    def materialize_output(self, output: Any) -> Any:
+        """Convert a deferred (JAX) step output to torch. Passes through values
+        that are already torch (or tuples/lists thereof). Used by callers that set
+        ``keep_output_jax=True`` and pull the output on a cadence."""
+        if output is None:
+            return None
+        if isinstance(output, torch.Tensor):
+            return output
+        if isinstance(output, (list, tuple)) and all(
+            isinstance(x, torch.Tensor) or x is None for x in output
+        ):
+            return output
+        return _jax_to_torch(output, self.torch_device)
 
     def _sync_flat_state(
         self,
