@@ -77,7 +77,7 @@ class XSurfaceFakeTracingCompatTest(unittest.TestCase):
     and data-dependent operations during tracing.
     """
 
-    def test_make_fx_fake_trace_full_model(self) -> None:
+    def _run_full_model_trace(self, bf16: bool = False) -> None:
         """Trace the full BlueReelsVDDTrainV3 via _local_compile.
 
         Builds the complete V3 model (RecBlock + over-arch) and traces
@@ -93,6 +93,11 @@ class XSurfaceFakeTracingCompatTest(unittest.TestCase):
         """
         device = torch.device("cpu")
         model, feature_config = _build_full_model(device, disable_seq_len_sampling=True)
+        if bf16:
+            # Exercise the HSTU/loss explicit bf16 activation casts under make_fx.
+            # (The train_step torchax AMP autocast only affects the JAX dispatch,
+            # not make_fx tracing, so that path is validated on the TPU run.)
+            model.recursive_setattr("_bf16_training", True)
 
         # Build overrides for RecBlock's preprocessor + sparse arch.
         recblock_sample, _, _ = _make_sample_input(model.recblock, device)
@@ -165,6 +170,16 @@ class XSurfaceFakeTracingCompatTest(unittest.TestCase):
             fake_mode=fake_mode,
         )
         _verify_traced_graph(self, result.gm)
+
+    def test_make_fx_fake_trace_full_model(self) -> None:
+        """fp32 (default) end-to-end make_fx trace."""
+        self._run_full_model_trace(bf16=False)
+
+    def test_make_fx_fake_trace_full_model_bf16(self) -> None:
+        """end-to-end make_fx trace with _bf16_training=True (HSTU/loss bf16
+        activation casts). Guards against the bf16 stream casts breaking
+        FakeTensor tracing before a TPU run."""
+        self._run_full_model_trace(bf16=True)
 
 
 # ---------------------------------------------------------------------------
