@@ -56,6 +56,10 @@ RUN pip install zstandard
 # from parity_forward_loss.py (`from google.cloud import storage`).
 RUN pip install google-cloud-storage
 
+# tensorboard: SummaryWriter backend for the CPU eager TB logger
+# (recir.examples.rankfm.train_cpu_eager._TbWriter).
+RUN pip install tensorboard
+
 # Copy and install recir with XLA + rec extras
 COPY recir /app/recir
 COPY setup.py /app/setup.py
