@@ -46,6 +46,86 @@ class TestSingleProcessMultiDevice(unittest.TestCase):
     num_processes=1, num_ranks=N (all local devices in one process).
     """
 
+    def test_replicated_embedding_backward_local_scatter_allreduce(self) -> None:
+        """Replicated nn.Embedding backward must lower to a LOCAL scatter into
+        [vocab, D] followed by a single [vocab, D] all-reduce (via the torchax
+        _aten_embedding_dense_backward shard_map+psum op), NOT GSPMD's
+        gather-the-[N_global, D]-activation-then-global-scatter pattern.
+
+        Regression test for the rankfm DP-replicated embedding all-reduce
+        bottleneck (see HANDOVER_dense_embedding_allreduce.md). Requires that
+        aten.embedding_dense_backward is preserved through the GSPMD lowering
+        (it is kept out of recir.torchax.decompositions.DECOMPOSITIONS).
+        """
+        import jax  # @manual
+        from recir.lowering.xla_lower import _XLAModule
+
+        if len(jax.devices()) < 2:
+            self.skipTest("Need >= 2 JAX devices")
+        num_ranks = len(jax.devices())
+
+        torch.manual_seed(0)
+        vocab, dim = 16, 4
+
+        class EmbModel(torch.nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.emb = torch.nn.Embedding(vocab, dim)
+                self.lin = torch.nn.Linear(dim, 1)
+
+            def forward(self, idx: torch.Tensor) -> torch.Tensor:
+                return self.lin(self.emb(idx)).sum()
+
+        model = EmbModel().cpu()
+        opt = torch.optim.SGD(model.parameters(), lr=0.01, foreach=False)
+        # Global token count (32*ranks*8) >> vocab so a gather-based partitioning
+        # would produce a much larger collective than [vocab, D].
+        idx = torch.randint(0, vocab, (32 * num_ranks, 8))
+
+        @compile(
+            parallel_mode=GSPMDParallel(
+                "replicate",
+                loss_reduction="sum",
+                num_ranks=num_ranks,
+                num_processes=1,
+            ),
+            backend=XLAGSPMDBackend(),
+        )
+        def train_step(
+            mod: torch.nn.Module, opt: torch.optim.Optimizer, idx: torch.Tensor
+        ) -> None:
+            mod(idx).backward()
+            opt.step()
+
+        train_step(model, opt, idx)
+        compiled_obj = train_step.__dict__["_compiled_obj"]
+
+        # 1. embedding_dense_backward must survive to the lowered subgraph.
+        lowered_ops: set[str] = set()
+        for m in compiled_obj.gm.modules():
+            if isinstance(m, _XLAModule):
+                for n in m.gm.graph.nodes:
+                    if n.op == "call_function":
+                        lowered_ops.add(str(n.target))
+        self.assertIn(
+            "aten.embedding_dense_backward.default",
+            lowered_ops,
+            f"embedding_dense_backward was decomposed; lowered ops: {sorted(lowered_ops)}",
+        )
+
+        # 2. The HLO must show our shard_map+psum op fired (cheap order).
+        hlo_texts = [
+            m.xla_hlo_text
+            for m in compiled_obj.gm.modules()
+            if isinstance(m, _XLAModule) and m.xla_hlo_text
+        ]
+        joined = "\n".join(hlo_texts)
+        self.assertIn(
+            "aten::embedding_dense_backward/shard_map/psum",
+            joined,
+            "embedding_dense_backward did not lower via the DP shard_map+psum op",
+        )
+
     def setUp(self):
         import jax  # @manual
 

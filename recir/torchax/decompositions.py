@@ -434,8 +434,13 @@ DECOMPOSITIONS: dict[Any, Any] = decomp.get_decompositions(
         torch.ops.aten.elu_.default,
         torch.ops.aten.elu_backward.default,
         torch.ops.aten.elu_backward.grad_input,
-        torch.ops.aten.embedding_dense_backward.default,
-        torch.ops.aten.embedding_dense_backward.out,
+        # NOTE: aten.embedding_dense_backward is intentionally NOT decomposed.
+        # The torch decomposition lowers it to a generic scatter-add
+        # (aten.index_put), which GSPMD partitions into an all-gather of the
+        # [N_global, D] activation grad + a global scatter for a DP-replicated
+        # table. We instead provide a DP-aware lowering in jaten.py
+        # (_aten_embedding_dense_backward) that does a local scatter + a single
+        # [num_weights, D] all-reduce. Keep this op out of the decomp table.
         torch.ops.aten.empty_like.default,
         torch.ops.aten.empty_like.out,
         torch.ops.aten._euclidean_dist.default,
