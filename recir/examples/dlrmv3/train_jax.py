@@ -41,9 +41,9 @@ import fbgemm_gpu  # noqa: F401 -- force C++ op registration before fallback
 import jax
 import jax.numpy as jnp
 import numpy as np
+import recir.examples.dlrmv3.jfbgemm  # noqa: F401 -- registers fbgemm→JAX lowerings for torchax dispatch
 import recir.lowering.fbgemm_fallback  # noqa: F401 -- registers fbgemm torch fallbacks + monkey-patches concat_2D_jagged
 import recir.torchax as torchax
-import recir.torchax.ops.jfbgemm  # noqa: F401 -- registers fbgemm→JAX lowerings for torchax dispatch
 import torch
 import torch.nn as nn
 from recir.tests.xla.dlrmv3_test_utils import (
@@ -163,7 +163,7 @@ def build_training_fns(
                     consumed by _run_training_loop.
 
     NOTE: DlrmV3Dense uses fbgemm ops (asynchronous_complete_cumsum, concat_2D_jagged).
-    These need torchax JAX implementations registered via recir.torchax.ops.jfbgemm
+    These need torchax JAX implementations registered via recir.examples.dlrmv3.jfbgemm
     (imported at module level in train.py).
     """
     jte_embedding: Any
