@@ -206,7 +206,7 @@ def _aten_index_select(x: Any, dim: Any, index: Any) -> Any:
     return jnp.take(x, index, dim)
 
 
-@op(torch.ops.aten.cholesky)  # pyre-ignore[56]
+@op(torch.ops.aten.linalg_cholesky)  # pyre-ignore[56]
 def _aten_cholesky(input: Any, upper: Any = False) -> Any:
     return jax.scipy.linalg.cholesky(input, lower=(not upper))
 
