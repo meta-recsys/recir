@@ -79,8 +79,18 @@ def execute_policy(
                 is_float, lambda a: a.to(torch.float32), (args, kwargs)
             )
         case CastPolicy.PROMOTE:
-            dtypes = {a.dtype for a in args}
-            widest = max((dtype.itemsize, dtype) for dtype in dtypes)[1]
+            # Promote all float inputs to the widest float dtype among them.
+            # Args may contain non-tensors and nested containers (e.g. cat/stack
+            # take a LIST of tensors), so flatten and look only at float tensor
+            # leaves instead of assuming every top-level arg is a tensor.
+            float_leaves = [
+                a
+                for a in pytree.tree_leaves((args, kwargs))
+                if isinstance(a, torch.Tensor) and a.is_floating_point()
+            ]
+            if not float_leaves:
+                return args, kwargs
+            widest = max(float_leaves, key=lambda t: t.dtype.itemsize).dtype
             return pytree.tree_map_only(
                 is_float, lambda a: a.to(widest), (args, kwargs)
             )
@@ -99,6 +109,24 @@ def autocast(
         env = recir.torchax.default_env()
     with env.override_property(autocast_dtype=dtype):
         yield
+
+
+def hammer_autocast_factory(
+    device_type: Any,
+    *,
+    dtype: torch.dtype = torch.bfloat16,
+    enabled: bool = True,
+) -> "contextlib.AbstractContextManager[None]":
+    """Backend factory for ``hammer.ops.bf16_train_utils.set_autocast_factory``.
+
+    recir installs this on the TPU/JAX build so the shared ``hammer.autocast()``
+    call sites route to torchax AMP (``torch.autocast("cuda", ...)`` is inert on
+    the torchax path, which has no CUDA tensors). ``hammer.autocast`` already maps
+    ``enabled=False`` to a no-op before reaching here; the guard is defensive.
+    """
+    if not enabled:
+        return contextlib.nullcontext()
+    return autocast(device_type, dtype=dtype)
 
 
 # https://github.com/pytorch/pytorch/blob/05faba40287cf7d8734da96cb2e904f39710bf29/aten/src/ATen/autocast_mode.cpp#L327
