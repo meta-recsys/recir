@@ -190,6 +190,78 @@ class RecirJaggedOpsTest(unittest.TestCase):
         )
 
 
+class RecirJaggedConcatSplitDispatchTest(unittest.TestCase):
+    """Verifies importing recir.lowering.fbgemm_fallback redirects the
+    generative_recommenders concat/split dispatch leaves to the recir custom
+    ops -- i.e. the model path actually HITS recir, not merely that the ops
+    exist. The patch targets are module-globals the dispatchers resolve at call
+    time, so the identity check here mirrors runtime resolution. (The hammer /
+    RankFM leaves are patched the same way but live in a target without a hammer
+    dep, so they are covered by the TPU bench, not this CPU test.)"""
+
+    def test_gen_rec_concat_routes_to_recir(self) -> None:
+        import recir.lowering.fbgemm_fallback  # noqa: F401
+        from generative_recommenders.ops.pytorch import pt_jagged_tensors
+
+        # The leaf the gen_rec concat dispatcher resolves must now be the recir
+        # routing wrapper installed by fbgemm_fallback (defined in that module).
+        self.assertEqual(
+            pt_jagged_tensors._concat_2D_jagged_jagged.__module__,
+            "recir.lowering.fbgemm_fallback",
+        )
+
+        ol = torch.tensor([0, 2, 3, 6], dtype=torch.int64)
+        orr = torch.tensor([0, 1, 3, 4], dtype=torch.int64)
+        D = 4
+        vl = torch.arange(6 * D, dtype=torch.float32).reshape(6, D)
+        vr = (torch.arange(4 * D, dtype=torch.float32) + 100.0).reshape(4, D)
+        got = pt_jagged_tensors.pytorch_concat_2D_jagged(
+            values_left=vl,
+            values_right=vr,
+            max_len_left=3,
+            max_len_right=2,
+            offsets_left=ol,
+            offsets_right=orr,
+        )
+        want = torch.ops.recir.concat_2d_jagged(vl, ol, vr, orr)
+        self.assertTrue(torch.equal(got, want))
+
+    def test_gen_rec_split_routes_to_recir(self) -> None:
+        import recir.lowering.fbgemm_fallback  # noqa: F401
+        from generative_recommenders.ops.pytorch import pt_jagged_tensors
+
+        self.assertEqual(
+            pt_jagged_tensors.pytorch_split_2D_jagged.__module__,
+            "recir.lowering.fbgemm_fallback",
+        )
+
+        # Uniform lengths so B*max_len == total rows (exact recir split shapes);
+        # concat then split must round-trip through the patched leaves.
+        B, ll, lr, D = 3, 2, 2, 4
+        ol = torch.arange(0, (B + 1) * ll, ll, dtype=torch.int64)
+        orr = torch.arange(0, (B + 1) * lr, lr, dtype=torch.int64)
+        vl = torch.arange(B * ll * D, dtype=torch.float32).reshape(B * ll, D)
+        vr = (torch.arange(B * lr * D, dtype=torch.float32) + 100.0).reshape(B * lr, D)
+        combined = pt_jagged_tensors.pytorch_concat_2D_jagged(
+            values_left=vl,
+            values_right=vr,
+            max_len_left=ll,
+            max_len_right=lr,
+            offsets_left=ol,
+            offsets_right=orr,
+        )
+        left, right = pt_jagged_tensors.pytorch_split_2D_jagged(
+            max_seq_len=ll + lr,
+            values=combined,
+            max_len_left=ll,
+            max_len_right=lr,
+            offsets_left=ol,
+            offsets_right=orr,
+        )
+        self.assertTrue(torch.equal(left, vl))
+        self.assertTrue(torch.equal(right, vr))
+
+
 class RecirJaggedOpsMakeFxTest(unittest.TestCase):
     """Regression for 'Mixing fake modes NYI': the register_fake kernels must
     allocate outputs in the ambient fake mode (no new FakeTensorMode). Tracing
@@ -340,6 +412,65 @@ class RecirJaggedOpsMultiDeviceJitTest(unittest.TestCase):
 
         out = jax.jit(f)(dense, offs)
         self.assertEqual(tuple(out.shape), (total_l,))  # jagged 1D
+
+    def test_concat_split_numerics_multidevice_jit(self) -> None:
+        """Numerics for the concat/split lowerings on the path the RankFM TPU
+        bench actually uses: multi-device shard_map under jax.jit, with
+        NON-UNIFORM per-sample lengths.
+
+        Each sample's left/right lengths differ (la=[1,3,2], lb=[2,1,2]), and the
+        pattern repeats once per device so every device's local total is equal --
+        i.e. the even (batch-sharded) split lands on sample boundaries, the
+        precondition the lowering's shard_map relies on. We check the concat
+        against an explicit per-sample-interleave oracle (cat(left[b], right[b])
+        for each sample b) and that split inverts it. This is what catches a
+        flat-concat / flat-split implementation (which would interleave across
+        sample boundaries); shape-only tests do not.
+        """
+        import jax
+        import jax.numpy as jnp
+        import numpy as np
+        from recir.torchax.ops.jagged_ops import (
+            _recir_concat_2d_jagged,
+            _recir_split_2d_jagged,
+        )
+
+        w = len(jax.devices())
+        if w < 2:
+            self.skipTest("need >= 2 jax devices")
+        # per-device-repeating non-uniform lengths -> each device's total equal
+        la = np.array([1, 3, 2] * w, dtype=np.int32)
+        lb = np.array([2, 1, 2] * w, dtype=np.int32)
+        b = la.shape[0]
+        ol = np.concatenate([[0], np.cumsum(la)]).astype(np.int32)
+        orr = np.concatenate([[0], np.cumsum(lb)]).astype(np.int32)
+        tl, tr = int(ol[-1]), int(orr[-1])
+
+        for d in (1, 4):  # 1D and 2D jagged values
+            shp_l = (tl,) if d == 1 else (tl, d)
+            shp_r = (tr,) if d == 1 else (tr, d)
+            vl = np.arange(int(np.prod(shp_l)), dtype=np.float32).reshape(shp_l)
+            vr = (np.arange(int(np.prod(shp_r)), dtype=np.float32) + 1000.0).reshape(
+                shp_r
+            )
+
+            # oracle concat: per-sample [left[i], right[i]] concatenated in order
+            parts = []
+            for i in range(b):
+                parts.append(vl[ol[i] : ol[i + 1]])
+                parts.append(vr[orr[i] : orr[i + 1]])
+            oracle = np.concatenate(parts, axis=0)
+
+            out = jax.jit(lambda a, b_, c, e: _recir_concat_2d_jagged(a, b_, c, e))(
+                jnp.asarray(vl), jnp.asarray(ol), jnp.asarray(vr), jnp.asarray(orr)
+            )
+            np.testing.assert_allclose(np.asarray(out), oracle)
+
+            left, right = jax.jit(
+                lambda v, a, c: _recir_split_2d_jagged(v, a, c, tl, tr)
+            )(jnp.asarray(oracle), jnp.asarray(ol), jnp.asarray(orr))
+            np.testing.assert_allclose(np.asarray(left), vl)
+            np.testing.assert_allclose(np.asarray(right), vr)
 
 
 if __name__ == "__main__":

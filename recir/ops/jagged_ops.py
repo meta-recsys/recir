@@ -6,17 +6,20 @@
 
 # pyre-strict
 
-"""``recir::dense_to_jagged`` and ``recir::jagged_to_padded_dense`` custom ops.
+"""``recir::dense_to_jagged``, ``recir::jagged_to_padded_dense``,
+``recir::concat_2d_jagged``, and ``recir::split_2d_jagged`` custom ops.
 
-These ops provide shard-local jagged<->dense conversions for non-uniform offsets
+These ops provide shard-local jagged operations for non-uniform offsets
 on TPU/GSPMD. The torchax lowering runs inside jax.shard_map over the
-"torch_dist" batch axis, keeping activations batch-sharded and avoiding the
-122GB replicated buffer OOM.
+"torch_dist" batch axis, keeping activations batch-sharded and avoiding
+the 122GB replicated buffer OOM.
 
-The ops are each other's backward (dense_to_jagged <-> jagged_to_padded_dense).
+The ops are each other's backward:
+- dense_to_jagged <-> jagged_to_padded_dense
+- concat_2d_jagged <-> split_2d_jagged
 """
 
-from typing import List, Optional, Sequence
+from typing import Any, List, Optional, Sequence
 
 import torch
 # Pure-torch jagged<->dense gathers (eager-CPU fallback for the custom ops
@@ -118,8 +121,20 @@ _DENSE_TO_JAGGED_SCHEMA = "dense_to_jagged(Tensor dense, Tensor[] offsets, int? 
 # Schema for jagged_to_padded_dense: (values, offsets, max_lengths, padding_value?) -> Tensor
 _JAGGED_TO_PADDED_DENSE_SCHEMA = "jagged_to_padded_dense(Tensor values, Tensor[] offsets, int[] max_lengths, float padding_value=0) -> Tensor"
 
+# Schema for concat_2d_jagged: (values_left, offsets_left, values_right, offsets_right) -> Tensor
+# Concatenates two jagged tensors along the sequence dimension. The backward is
+# split_2d_jagged (registered via register_autograd), so no separate backward op.
+_CONCAT_2D_JAGGED_SCHEMA = "concat_2d_jagged(Tensor values_left, Tensor offsets_left, Tensor values_right, Tensor offsets_right) -> Tensor"
+
+# Schema for split_2d_jagged: (values, offsets_left, offsets_right) -> (Tensor, Tensor)
+# Splits a jagged tensor into left and right parts. The backward is
+# concat_2d_jagged (registered via register_autograd), so no separate backward op.
+_SPLIT_2D_JAGGED_SCHEMA = "split_2d_jagged(Tensor values, Tensor offsets_left, Tensor offsets_right, int seq_len_a, int seq_len_b) -> (Tensor, Tensor)"
+
 _LIB.define(_DENSE_TO_JAGGED_SCHEMA)
 _LIB.define(_JAGGED_TO_PADDED_DENSE_SCHEMA)
+_LIB.define(_CONCAT_2D_JAGGED_SCHEMA)
+_LIB.define(_SPLIT_2D_JAGGED_SCHEMA)
 
 
 def _dense_to_jagged_cpu(
@@ -198,3 +213,165 @@ def _jagged_to_padded_dense_fake(
     # Allocate in the ambient fake mode (no new FakeTensorMode -- see above).
     out = values.new_empty(out_shape)
     return out
+
+
+def _concat_2d_jagged_cpu(
+    values_left: torch.Tensor,
+    offsets_left: torch.Tensor,
+    values_right: torch.Tensor,
+    offsets_right: torch.Tensor,
+) -> torch.Tensor:
+    """CPU fallback: per-sample interleave concat via searchsorted+index_select.
+
+    Self-contained (no hammer/generative_recommenders import) to avoid a BUCK
+    dependency cycle with the dispatchers that route into this op.
+    """
+    n = offsets_left.shape[0] - 1
+    la = offsets_left[1:] - offsets_left[:-1]
+    comb = offsets_left + offsets_right  # cumulative combined offsets
+    total = values_left.shape[0] + values_right.shape[0]
+    p = torch.arange(total, device=values_left.device)
+    b = torch.clamp(torch.searchsorted(comb[1:], p, right=True), 0, n - 1)
+    intra = p - comb[b]
+    is_left = intra < la[b]
+    src_left = torch.clamp(offsets_left[b] + intra, 0, values_left.shape[0] - 1)
+    src_right = torch.clamp(
+        offsets_right[b] + (intra - la[b]), 0, values_right.shape[0] - 1
+    )
+    gl = values_left.index_select(0, src_left)
+    gr = values_right.index_select(0, src_right)
+    mask = is_left if values_left.dim() == 1 else is_left.unsqueeze(-1)
+    return torch.where(mask, gl, gr)
+
+
+def _split_2d_jagged_cpu(
+    values: torch.Tensor,
+    offsets_left: torch.Tensor,
+    offsets_right: torch.Tensor,
+    seq_len_a: int,
+    seq_len_b: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """CPU fallback: inverse interleave split via searchsorted+index_select.
+
+    Self-contained (no hammer import) to avoid a BUCK dependency cycle with the
+    dispatcher that routes into this op.
+    """
+    n = offsets_left.shape[0] - 1
+    pa = torch.arange(seq_len_a, device=values.device)
+    ba = torch.clamp(torch.searchsorted(offsets_left[1:], pa, right=True), 0, n - 1)
+    left = values.index_select(
+        0, torch.clamp(pa + offsets_right[ba], 0, values.shape[0] - 1)
+    )
+    pb = torch.arange(seq_len_b, device=values.device)
+    bb = torch.clamp(torch.searchsorted(offsets_right[1:], pb, right=True), 0, n - 1)
+    right = values.index_select(
+        0, torch.clamp(pb + offsets_left[bb + 1], 0, values.shape[0] - 1)
+    )
+    return left, right
+
+
+# Register CPU implementations
+_LIB.impl("concat_2d_jagged", _concat_2d_jagged_cpu, "CompositeExplicitAutograd")
+_LIB.impl("split_2d_jagged", _split_2d_jagged_cpu, "CompositeExplicitAutograd")
+
+
+# Fake tensor implementations
+@torch.library.register_fake("recir::concat_2d_jagged")
+def _concat_2d_jagged_fake(
+    values_left: torch.Tensor,
+    offsets_left: torch.Tensor,
+    values_right: torch.Tensor,
+    offsets_right: torch.Tensor,
+) -> torch.Tensor:
+    """Fake tensor implementation for concat."""
+    # Output size is sum of input sizes
+    total_L = values_left.shape[0] + values_right.shape[0]
+    if values_left.dim() == 1:
+        out_shape = (total_L,)
+    else:
+        out_shape = (total_L, values_left.shape[1])
+    out = values_left.new_empty(out_shape)
+    return out
+
+
+@torch.library.register_fake("recir::split_2d_jagged")
+def _split_2d_jagged_fake(
+    values: torch.Tensor,
+    offsets_left: torch.Tensor,
+    offsets_right: torch.Tensor,
+    seq_len_a: int,
+    seq_len_b: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fake tensor implementation for split (static output sizes)."""
+    if values.dim() == 1:
+        left_shape = (seq_len_a,)
+        right_shape = (seq_len_b,)
+    else:
+        D = values.shape[1]
+        left_shape = (seq_len_a, D)
+        right_shape = (seq_len_b, D)
+
+    left = values.new_empty(left_shape)
+    right = values.new_empty(right_shape)
+    return left, right
+
+
+# Autograd for concat/split (they are duals)
+def _concat_2d_jagged_autograd_setup_context(
+    ctx: Any,
+    inputs: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+    output: torch.Tensor,
+) -> None:
+    values_left, offsets_left, values_right, offsets_right = inputs
+    ctx.save_for_backward(offsets_left, offsets_right)
+    ctx.left_shape = values_left.shape
+    ctx.right_shape = values_right.shape
+
+
+def _concat_2d_jagged_autograd_backward(
+    ctx: Any,
+    grad_output: torch.Tensor,
+) -> tuple[torch.Tensor, None, torch.Tensor, None]:
+    # Backward of concat is split (per-sample), NOT a flat slice.
+    offsets_left, offsets_right = ctx.saved_tensors
+    seq_len_a = ctx.left_shape[0]
+    seq_len_b = ctx.right_shape[0]
+    grad_left, grad_right = torch.ops.recir.split_2d_jagged(
+        grad_output, offsets_left, offsets_right, seq_len_a, seq_len_b
+    )
+    return grad_left, None, grad_right, None
+
+
+def _split_2d_jagged_autograd_setup_context(
+    ctx: Any,
+    inputs: tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, int],
+    output: tuple[torch.Tensor, torch.Tensor],
+) -> None:
+    values, offsets_left, offsets_right, seq_len_a, seq_len_b = inputs
+    ctx.save_for_backward(offsets_left, offsets_right)
+    ctx.values_shape = values.shape
+
+
+def _split_2d_jagged_autograd_backward(
+    ctx: Any,
+    grad_left: torch.Tensor,
+    grad_right: torch.Tensor,
+) -> tuple[torch.Tensor, None, None, None, None]:
+    # Backward of split is concat (per-sample), NOT a flat cat.
+    offsets_left, offsets_right = ctx.saved_tensors
+    grad_output = torch.ops.recir.concat_2d_jagged(
+        grad_left, offsets_left, grad_right, offsets_right
+    )
+    return grad_output, None, None, None, None
+
+
+torch.library.register_autograd(
+    "recir::concat_2d_jagged",
+    _concat_2d_jagged_autograd_backward,
+    setup_context=_concat_2d_jagged_autograd_setup_context,
+)
+torch.library.register_autograd(
+    "recir::split_2d_jagged",
+    _split_2d_jagged_autograd_backward,
+    setup_context=_split_2d_jagged_autograd_setup_context,
+)

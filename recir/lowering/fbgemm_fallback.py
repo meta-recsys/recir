@@ -28,7 +28,7 @@ Usage:
 """
 
 import logging
-from typing import List, Optional, Sequence, Tuple
+from typing import Any, List, Optional, Sequence, Tuple
 
 import torch
 from recir.decompositions import SPMD_DECOMP_TABLE
@@ -311,73 +311,168 @@ def register_fbgemm_fallbacks() -> bool:
 register_fbgemm_fallbacks()
 
 
-# ── Static-shape jagged op swaps ───────────────────────────────────────
-# The generative_recommenders jagged ops use data-dependent masking that
-# produces tensors with data-dependent shapes, failing make_fx tracing.
-# We monkey-patch the pytorch implementations to use static-shape
-# alternatives when max_len_left/max_len_right are provided.
+# ── Route jagged concat/split to recir shard-local custom ops ──────────
+# The generative_recommenders / hammer 2D-jagged concat+split helpers use
+# data-dependent masking that (a) fails make_fx tracing and (b) on TPU/GSPMD
+# materializes a replicated [total_L, D] buffer (OOM). Route them to the recir
+# custom ops, which have shard_map lowerings that keep activations
+# batch-sharded. The recir ops are each other's backward (register_autograd in
+# recir/ops/jagged_ops.py), so loss.backward() differentiates them correctly.
 
+# Kept at module scope (not inside the routing fn) so autodeps keeps the
+# gen_rec dep; the routing fn references it.
 from generative_recommenders.ops.pytorch import (  # noqa: E402
     pt_jagged_tensors as _pt_jt,
 )
 
-_orig_concat_2D_jagged_jagged = _pt_jt._concat_2D_jagged_jagged
-_orig_split_2D_jagged_jagged = _pt_jt._split_2D_jagged_jagged
 
+def _route_jagged_to_recir() -> None:
+    """Monkey-patch the generative_recommenders and hammer 2D-jagged concat/split
+    leaves to the recir custom ops -- centralized here instead of importing recir
+    inside the model code.
 
-def _static_concat_2D_jagged_jagged(
-    values_left: torch.Tensor,
-    values_right: torch.Tensor,
-    max_len_left: int,
-    max_len_right: int,
-    offsets_left: torch.Tensor,
-    offsets_right: torch.Tensor,
-) -> torch.Tensor:
-    B = offsets_left.shape[0] - 1
-    D = values_left.shape[-1]
-    left_3d = values_left.reshape(B, max_len_left, D)
-    right_3d = values_right.reshape(B, max_len_right, D)
-    return torch.cat([left_3d, right_3d], dim=1).reshape(-1, D)
+    Patch targets are the leaf functions the dispatchers resolve as module-globals
+    at call time (verified call graph), so the patch actually takes effect:
+      - DlrmV3Dense (gen_rec) -> pt_jagged_tensors._concat_2D_jagged_jagged /
+        pytorch_split_2D_jagged
+      - RankFM (hammer) -> hammer.ops.jagged.pytorch_concat_2D_jagged_jagged /
+        hammer.ops.pytorch.jagged._split_2d_jagged_no_prefix
 
+    The hammer side uses a dynamic import (module name as a variable) so autodeps
+    does NOT add a static build dependency on hammer -- the dlrmv3 image is
+    OSS-only (no hammer) yet still imports this module; in the RankFM image hammer
+    is present at runtime and the patches apply.
+    """
 
-_pt_jt._concat_2D_jagged_jagged = _static_concat_2D_jagged_jagged  # type: ignore[assignment]
+    # ---- generative_recommenders (DlrmV3Dense) ----
+    _orig_split_2D_jagged_jagged = _pt_jt._split_2D_jagged_jagged
 
+    def _recir_concat_2D_jagged_jagged(
+        values_left: torch.Tensor,
+        values_right: torch.Tensor,
+        max_len_left: int,
+        max_len_right: int,
+        offsets_left: torch.Tensor,
+        offsets_right: torch.Tensor,
+    ) -> torch.Tensor:
+        import recir.ops.jagged_ops  # noqa: F401
 
-def _static_pytorch_split_2D_jagged(
-    max_seq_len: int,
-    values: torch.Tensor,
-    max_len_left: Optional[int],
-    max_len_right: Optional[int],
-    offsets_left: Optional[torch.Tensor],
-    offsets_right: Optional[torch.Tensor],
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    if offsets_left is None:
-        assert max_len_left is not None
-        assert offsets_right is not None
-        offsets_left = max_len_left * torch.arange(
-            offsets_right.shape[0], device=values.device
+        return torch.ops.recir.concat_2d_jagged(
+            values_left, offsets_left, values_right, offsets_right
         )
-    if offsets_right is None:
-        assert max_len_right is not None
-        assert offsets_left is not None
-        offsets_right = max_len_right * torch.arange(
-            offsets_left.shape[0], device=values.device
+
+    _pt_jt._concat_2D_jagged_jagged = _recir_concat_2D_jagged_jagged  # type: ignore[assignment]
+
+    def _recir_pytorch_split_2D_jagged(
+        max_seq_len: int,
+        values: torch.Tensor,
+        max_len_left: Optional[int],
+        max_len_right: Optional[int],
+        offsets_left: Optional[torch.Tensor],
+        offsets_right: Optional[torch.Tensor],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if offsets_left is None:
+            assert max_len_left is not None
+            assert offsets_right is not None
+            offsets_left = max_len_left * torch.arange(
+                offsets_right.shape[0], device=values.device
+            )
+        if offsets_right is None:
+            assert max_len_right is not None
+            assert offsets_left is not None
+            offsets_right = max_len_right * torch.arange(
+                offsets_left.shape[0], device=values.device
+            )
+        if max_len_left is not None and max_len_right is not None:
+            import recir.ops.jagged_ops  # noqa: F401
+
+            # Static output rows. For the uniform path total left/right rows
+            # equal B * max_len; matches the prior static-shape swap's shapes.
+            B = offsets_left.shape[0] - 1
+            return torch.ops.recir.split_2d_jagged(
+                values,
+                offsets_left,
+                offsets_right,
+                B * max_len_left,
+                B * max_len_right,
+            )
+        return _orig_split_2D_jagged_jagged(
+            max_seq_len=max_seq_len,
+            values=values,
+            offsets_left=offsets_left,
+            offsets_right=offsets_right,
         )
-    if max_len_left is not None and max_len_right is not None:
-        B = offsets_left.shape[0] - 1
-        D = values.shape[-1]
-        values_3d = values.reshape(B, max_seq_len, D)
-        left = values_3d[:, :max_len_left, :].reshape(-1, D)
-        right = values_3d[:, max_len_left : max_len_left + max_len_right, :].reshape(
-            -1, D
+
+    # No torch.fx.wrap: the recir tracer is make_fx, which records the recir op
+    # regardless (and ignores fx.wrap); fx.wrap only matters for symbolic_trace,
+    # which does not run on the recir/TPU path that imports this module.
+    _pt_jt.pytorch_split_2D_jagged = _recir_pytorch_split_2D_jagged  # type: ignore[assignment]
+
+    # ---- hammer (RankFM), best-effort ----
+    def _opt_import(name: str) -> Any:
+        import importlib
+
+        try:
+            return importlib.import_module(name)
+        except ImportError:
+            return None
+
+    _h_jagged = _opt_import("hammer.ops.jagged")
+    _h_pt_jagged = _opt_import("hammer.ops.pytorch.jagged")
+    if _h_jagged is None or _h_pt_jagged is None:
+        return
+
+    _orig_concat = _h_jagged.pytorch_concat_2D_jagged_jagged
+
+    def _recir_pytorch_concat_2D_jagged_jagged(
+        max_seq_len_left: int,
+        offsets_left: torch.Tensor,
+        values_left: torch.Tensor,
+        max_seq_len_right: int,
+        offsets_right: torch.Tensor,
+        values_right: torch.Tensor,
+        is_replace: bool = False,
+        n_prefix_from_right: int = 0,
+    ) -> torch.Tensor:
+        # recir concat handles the plain interleave only; defer the replace /
+        # prefix variants to the original implementation.
+        if is_replace or n_prefix_from_right != 0:
+            return _orig_concat(
+                max_seq_len_left,
+                offsets_left,
+                values_left,
+                max_seq_len_right,
+                offsets_right,
+                values_right,
+                is_replace,
+                n_prefix_from_right,
+            )
+        import recir.ops.jagged_ops  # noqa: F401
+
+        return torch.ops.recir.concat_2d_jagged(
+            values_left, offsets_left, values_right, offsets_right
         )
-        return left, right
-    return _orig_split_2D_jagged_jagged(
-        max_seq_len=max_seq_len,
-        values=values,
-        offsets_left=offsets_left,
-        offsets_right=offsets_right,
-    )
+
+    _h_jagged.pytorch_concat_2D_jagged_jagged = _recir_pytorch_concat_2D_jagged_jagged
+
+    def _recir_split_2d_jagged_no_prefix(
+        values: torch.Tensor,
+        offsets_left: torch.Tensor,
+        offsets_right: torch.Tensor,
+        seq_len_a: Optional[int] = None,
+        seq_len_b: Optional[int] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        import recir.ops.jagged_ops  # noqa: F401
+
+        if seq_len_a is None:
+            seq_len_a = int(offsets_left[-1].item())
+        if seq_len_b is None:
+            seq_len_b = int(values.shape[0]) - seq_len_a
+        return torch.ops.recir.split_2d_jagged(
+            values, offsets_left, offsets_right, seq_len_a, seq_len_b
+        )
+
+    _h_pt_jagged._split_2d_jagged_no_prefix = _recir_split_2d_jagged_no_prefix
 
 
-_pt_jt.pytorch_split_2D_jagged = torch.fx.wrap(_static_pytorch_split_2D_jagged)  # type: ignore[assignment]
+_route_jagged_to_recir()
