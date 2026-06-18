@@ -549,6 +549,7 @@ class Environment(contextlib.ContextDecorator):
 
     def load_ops(self) -> None:
         from recir.torchax.ops import (  # noqa: F401
+            jagged_ops,
             jaten,
             jc10d,
             jtorch,
