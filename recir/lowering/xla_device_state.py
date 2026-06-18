@@ -44,7 +44,17 @@ class XLADeviceStateManager(DeviceStateManager):
         jax_state: List[Any] = []
         for t in flat_state:
             if isinstance(t, torch.Tensor):
-                jax_state.append(jax.device_put(t2j(t), jax_device))
+                if t.is_meta:
+                    # On-device-init params (FSDP / seq-embedding tables) are meta
+                    # tensors with no host data, so t2j() -> t.cpu() would raise
+                    # "Cannot copy out of meta tensor". Leave them unconverted:
+                    # _XLAModule._to_sharded_jax has a meta branch that generates
+                    # each device's shard directly in HBM via jax.random (no host
+                    # alloc / H2D). After the first step, process_outputs caches the
+                    # materialized jax.Array, so this only matters on the first call.
+                    jax_state.append(t)
+                else:
+                    jax_state.append(jax.device_put(t2j(t), jax_device))
             else:
                 jax_state.append(t)
         return jax_state
