@@ -1,8 +1,8 @@
 # (c) Meta Platforms, Inc. and affiliates. Confidential and proprietary.
 
-"""Real-TPU backward correctness + perf bench for ``ringshift_embedding_lookup``.
+"""Real-TPU backward correctness tests for ``ringshift_embedding_lookup``.
 
-Three ``unittest.TestCase`` classes:
+Two ``unittest.TestCase`` classes:
 
   * ``RingshiftBwdW4Test`` -- W=4 backward correctness suite on a single
     4-chip TPU pod. Compares ``jax.grad(forward_loss)`` (which goes through
@@ -19,23 +19,17 @@ Three ``unittest.TestCase`` classes:
   * ``RingshiftBwdW32Test`` -- W=32 backward correctness on a 32-host TPU-v7x
     slice (``devices[::8]`` -- 1 device per host across all 32 hosts).
 
-  * ``RingshiftBwdPerfTest`` -- multi-iter wall-clock measurement of
-    forward-only and forward+backward (``jit(value_and_grad(loss))``) for the
-    fused ringshift kernel vs the ``lax.ragged_all_to_all`` reference at
-    W=32/64/128. Reports median + p99 + the estimated backward-only delta
-    (forward+backward minus forward-only).
-
-These are intended to run under the JobSet manifests in ``manifests/`` --
-each manifest invokes one method (or the whole W=4 suite) on a TPU-v7x
-topology sized for that W.
+These run under the JobSet manifests in ``manifests/`` -- each manifest
+invokes one method (or the whole W=4 suite) on a TPU-v7x topology sized for
+that W. Perf/scale benchmarking lives in the standalone ``ringshift_bench``
+argparse binary, not here.
 """
 
 from __future__ import annotations
 
 import functools
-import statistics
+import os
 import sys
-import time
 import unittest
 
 import jax
@@ -54,6 +48,20 @@ def _has_tpu() -> bool:
         return any(d.platform == "tpu" for d in jax.devices())
     except Exception:
         return False
+
+
+# Multi-host init: jax.devices() only sees the full TPU slice after
+# jax.distributed.initialize(). Auto-detected from the TPU runtime --
+# TPU_WORKER_HOSTNAMES (GKE) / MEGASCALE_COORDINATOR_ADDRESS (GCE/multislice)
+# are injected by the runtime (the same signals jax's GkeTpuCluster uses), so a
+# no-arg initialize() then picks up coordinator/num_processes/process_id
+# automatically. Must run before jax.devices(); skipped on CPU/dev (where
+# initialize() would raise) and idempotent across re-imports.
+if not jax.distributed.is_initialized() and (
+    os.environ.get("TPU_WORKER_HOSTNAMES")
+    or os.environ.get("MEGASCALE_COORDINATOR_ADDRESS")
+):
+    jax.distributed.initialize()
 
 
 # ---------------------------------------------------------------------------
@@ -309,6 +317,50 @@ class RingshiftBwdW4Test(unittest.TestCase):
             target,
         )
         self._log("W4_BASE", f"PASS max_diff={d:.6e}")
+        self.assertLessEqual(d, self.ATOL + self.RTOL)
+
+    def test_w4_chunked_recv_correctness(self) -> None:
+        """W=4 skewed grad with a SMALL recv_capacity to force num_chunks > 1.
+
+        Numerical gate for the chunked-recv fix in the BACKWARD kernel: setting
+        recv_capacity below the skewed per-pair payload (~0.6 * MAX_LOCAL_IDS)
+        makes the Phase-2 scatter run in multiple chunks; the table grad must
+        still match the ra2a reference. This is the path whose old single-shot
+        scatter (loop to p3_cnt over recv_capacity-sized tiles) crashed with an
+        OOB read on real-scale skew.
+        """
+        # MAX_LOCAL_IDS=1024 -> per-pair ~0.6*1024 ~= 614 > 256 -> several chunks.
+        self.recv_capacity = 256
+        local_ids, local_id_count = _make_skewed_inputs(
+            self.mesh,
+            self.WORLD_SIZE,
+            self.MAX_LOCAL_IDS,
+            self.V_LOCAL,
+            seed=2,
+        )
+        local_table = _make_random_table(
+            self.mesh,
+            self.WORLD_SIZE,
+            self.V_LOCAL,
+            self.EMBEDDING_DIM,
+            seed=7,
+        )
+        target = _make_random_target(
+            self.mesh,
+            self.WORLD_SIZE,
+            self.MAX_LOCAL_IDS,
+            self.EMBEDDING_DIM,
+            seed=13,
+        )
+        jax.block_until_ready((local_ids, local_id_count, local_table, target))
+        d = self._check_grad_close(
+            "W4_CHUNKED",
+            local_ids,
+            local_id_count,
+            local_table,
+            target,
+        )
+        self._log("W4_CHUNKED", f"PASS max_diff={d:.6e}")
         self.assertLessEqual(d, self.ATOL + self.RTOL)
 
     # ---- 2. Repeated hot row (worst-case duplicate accumulation) ----
@@ -765,231 +817,6 @@ class RingshiftBwdW32Test(unittest.TestCase):
 # ---------------------------------------------------------------------------
 # Multi-iter forward + forward+backward perf bench at W=32/64/128.
 # ---------------------------------------------------------------------------
-
-
-@unittest.skipUnless(_has_tpu(), "Requires real TPU")
-class RingshiftBwdPerfTest(unittest.TestCase):
-    """Multi-iter forward + forward+backward perf bench at W=32/64/128."""
-
-    def _run_backward_bench_with_devices(self, world_size, devices, *, tag) -> None:
-        """Shared helper: time fwd vs fwd+bwd for fused ringshift and ra2a baseline.
-
-        D=128, v_local=8K, max_local_ids=8K, recv_capacity=8K+TILE.
-        Per-rank skewed inputs (75% to hot peer); per-rank random fp32 table
-        and target (gradients depend on real values).
-        """
-        TILE = 128
-        embedding_dim = 128
-        v_local = 8 * 1024
-        max_local_ids = 8 * 1024
-        n_warmup = 5
-        n_measure = 10
-
-        self.assertEqual(
-            len(devices),
-            world_size,
-            f"expected {world_size} devices, got {len(devices)}",
-        )
-        mesh = jax.sharding.Mesh(np.array(devices), ("x",))
-
-        recv_capacity = max_local_ids + TILE
-        recv_capacity = ((recv_capacity + TILE - 1) // TILE) * TILE
-
-        rank0_log = jax.process_index() == 0
-
-        def log(msg):
-            if rank0_log:
-                print(f"[{tag}] {msg}", file=sys.stderr, flush=True)
-
-        log(
-            f"=== W={world_size} D={embedding_dim} v_local={v_local} "
-            f"max_local_ids={max_local_ids} ==="
-        )
-
-        # ---- inputs (skewed IDs + per-rank random fp32 table + target) ----
-        log("creating inputs ...")
-        local_ids, local_id_count = _make_skewed_inputs(
-            mesh, world_size, max_local_ids, v_local, seed=2
-        )
-
-        P = jax.sharding.PartitionSpec
-
-        @functools.partial(
-            jax.shard_map,
-            mesh=mesh,
-            in_specs=(),
-            out_specs=P("x"),
-            check_vma=False,
-        )
-        def make_table_random():
-            rank = jax.lax.axis_index("x")
-            key = jax.random.fold_in(jax.random.PRNGKey(7), rank)
-            return jax.random.normal(
-                key, (1, v_local, embedding_dim), dtype=jnp.float32
-            )
-
-        @functools.partial(
-            jax.shard_map,
-            mesh=mesh,
-            in_specs=(),
-            out_specs=P("x"),
-            check_vma=False,
-        )
-        def make_target_random():
-            rank = jax.lax.axis_index("x")
-            key = jax.random.fold_in(jax.random.PRNGKey(13), rank)
-            return jax.random.normal(
-                key, (1, max_local_ids, embedding_dim), dtype=jnp.float32
-            )
-
-        local_table = make_table_random()
-        target = make_target_random()
-        jax.block_until_ready((local_ids, local_id_count, local_table, target))
-        log("inputs ready")
-
-        # ---- loss closures: tracers passed as args (multi-host safety) ----
-        def fused_loss(local_ids, local_id_count, local_table, target):
-            out = ringshift_embedding_lookup(
-                local_ids,
-                local_id_count,
-                local_table,
-                mesh=mesh,
-                axis_name="x",
-                recv_capacity=recv_capacity,
-                splitter="globalpad",
-            )
-            return jnp.sum(out * target)
-
-        def ref_loss(local_ids, local_id_count, local_table, target):
-            out = ringshift_embedding_lookup_reference_jax(
-                local_ids,
-                local_id_count,
-                local_table,
-                mesh=mesh,
-                axis_name="x",
-            )
-            return jnp.sum(out * target)
-
-        # ---- jit-compiled forward and value+grad pairs ----
-        # value_and_grad gives us forward+backward in a single jitted call.
-        # Forward-only = jit(loss). Subtract for backward-only estimate.
-        fwd_fused_jit = jax.jit(fused_loss)
-        fwd_ref_jit = jax.jit(ref_loss)
-        fb_fused_jit = jax.jit(jax.value_and_grad(fused_loss, argnums=2))
-        fb_ref_jit = jax.jit(jax.value_and_grad(ref_loss, argnums=2))
-
-        args = (local_ids, local_id_count, local_table, target)
-
-        def time_jit(label, fn, n_warmup, n_measure):
-            log(f"-- {label} warmup ({n_warmup} iters) --")
-            for i in range(n_warmup):
-                sync_global_devices(f"{label}_warmup_{i}_start")
-                t0 = time.perf_counter()
-                out = fn(*args)
-                jax.block_until_ready(out)
-                elapsed_ms = (time.perf_counter() - t0) * 1e3
-                log(f"{label} warmup {i}: {elapsed_ms:.1f} ms")
-            sync_global_devices(f"{label}_warmup_done")
-
-            log(f"-- {label} measure ({n_measure} iters) --")
-            times_ms = []
-            for i in range(n_measure):
-                sync_global_devices(f"{label}_meas_{i}_start")
-                t0 = time.perf_counter()
-                out = fn(*args)
-                jax.block_until_ready(out)
-                elapsed_ms = (time.perf_counter() - t0) * 1e3
-                times_ms.append(elapsed_ms)
-                log(f"{label} meas {i}: {elapsed_ms:.1f} ms")
-            sync_global_devices(f"{label}_meas_done")
-            return times_ms
-
-        fwd_fused_times = time_jit("fwd_fused", fwd_fused_jit, n_warmup, n_measure)
-        fwd_ref_times = time_jit("fwd_ref", fwd_ref_jit, n_warmup, n_measure)
-        fb_fused_times = time_jit("fb_fused", fb_fused_jit, n_warmup, n_measure)
-        fb_ref_times = time_jit("fb_ref", fb_ref_jit, n_warmup, n_measure)
-
-        def median(xs):
-            return statistics.median(xs)
-
-        def p99(xs):
-            xs_s = sorted(xs)
-            # With n=10 measurements, p99 is the max -- stable proxy.
-            idx = max(0, int(round(0.99 * (len(xs_s) - 1))))
-            return xs_s[idx]
-
-        fwd_fused_med = median(fwd_fused_times)
-        fwd_fused_p99 = p99(fwd_fused_times)
-        fwd_ref_med = median(fwd_ref_times)
-        fwd_ref_p99 = p99(fwd_ref_times)
-        fb_fused_med = median(fb_fused_times)
-        fb_fused_p99 = p99(fb_fused_times)
-        fb_ref_med = median(fb_ref_times)
-        fb_ref_p99 = p99(fb_ref_times)
-
-        bwd_fused_est = max(0.0, fb_fused_med - fwd_fused_med)
-        bwd_ref_est = max(0.0, fb_ref_med - fwd_ref_med)
-        speedup = (bwd_ref_est / bwd_fused_est) if bwd_fused_est > 0 else float("inf")
-
-        log(
-            f"forward+backward fused: median={fb_fused_med:.1f} ms, "
-            f"p99={fb_fused_p99:.1f} ms"
-        )
-        log(
-            f"forward+backward baseline: median={fb_ref_med:.1f} ms, "
-            f"p99={fb_ref_p99:.1f} ms"
-        )
-        log(
-            f"forward only fused: median={fwd_fused_med:.1f} ms, "
-            f"p99={fwd_fused_p99:.1f} ms"
-        )
-        log(
-            f"forward only baseline: median={fwd_ref_med:.1f} ms, "
-            f"p99={fwd_ref_p99:.1f} ms"
-        )
-        log(f"backward only fused estimate: {bwd_fused_est:.1f} ms")
-        log(f"backward only baseline estimate: {bwd_ref_est:.1f} ms")
-        log(f"backward speedup: {speedup:.2f}x")
-        log(
-            f"=== RESULT: fwd_fused={fwd_fused_times} fwd_ref={fwd_ref_times} "
-            f"fb_fused={fb_fused_times} fb_ref={fb_ref_times}"
-        )
-
-        # Bench should not silently fail -- assert all iterations completed.
-        self.assertEqual(len(fwd_fused_times), n_measure)
-        self.assertEqual(len(fwd_ref_times), n_measure)
-        self.assertEqual(len(fb_fused_times), n_measure)
-        self.assertEqual(len(fb_ref_times), n_measure)
-
-    def test_w32_multi_iter_backward(self) -> None:
-        """W=32 backward perf bench (1 device per host across 32 hosts)."""
-        all_devices = jax.devices()
-        if len(all_devices) < 256:
-            self.skipTest(f"Need 256 logical devices, have {len(all_devices)}")
-        devices = all_devices[::8]
-        self._run_backward_bench_with_devices(
-            world_size=32, devices=devices, tag="BWD_BENCH_W32"
-        )
-
-    def test_w64_multi_iter_backward(self) -> None:
-        """W=64 backward perf bench (2 devices per host across 32 hosts)."""
-        all_devices = jax.devices()
-        if len(all_devices) < 256:
-            self.skipTest(f"Need 256 logical devices, have {len(all_devices)}")
-        devices = all_devices[::4]
-        self._run_backward_bench_with_devices(
-            world_size=64, devices=devices, tag="BWD_BENCH_W64"
-        )
-
-    def test_w128_multi_iter_backward(self) -> None:
-        """W=128 backward perf bench (4 devices per host across 32 hosts)."""
-        all_devices = jax.devices()
-        if len(all_devices) < 256:
-            self.skipTest(f"Need 256 logical devices, have {len(all_devices)}")
-        devices = all_devices[::2]
-        self._run_backward_bench_with_devices(
-            world_size=128, devices=devices, tag="BWD_BENCH_W128"
-        )
 
 
 if __name__ == "__main__":

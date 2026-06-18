@@ -54,6 +54,7 @@ CPU separately).
 from __future__ import annotations
 
 import functools
+import os
 from typing import Tuple
 
 import jax
@@ -62,6 +63,20 @@ import numpy as np
 from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
+
+
+# Ablation knobs (perf-only; correctness is garbage when set). Read once at
+# import; set in the manifest env. Used to attribute the ring-shift per-wave
+# cost in an e2e bench:
+#   RECIR_RINGSHIFT_SKIP_GATHER=1 -> skip the row-by-row gather (fwd) /
+#       scatter-add (bwd) loops, but KEEP the cross-host DMA. Isolates the
+#       TensorCore gather/scatter cost.
+#   RECIR_RINGSHIFT_SKIP_DMA=1    -> skip the cross-host all-to-all DMAs
+#       (phase-1/phase-3 remote copies), but KEEP the gather/scatter. Isolates
+#       the data-movement cost. (All ranks skip symmetrically, so no deadlock.)
+# Setting both -> measures the barrier + fixed-overhead floor.
+_SKIP_GATHER: bool = os.environ.get("RECIR_RINGSHIFT_SKIP_GATHER") == "1"
+_SKIP_DMA: bool = os.environ.get("RECIR_RINGSHIFT_SKIP_DMA") == "1"
 
 
 # ---------------------------------------------------------------------------
@@ -469,10 +484,10 @@ def _split_traffic_ringshift_naive(
                                   Phase 3 emb-back DMA.
     """
     W = world_size
-    # Single-slot recv layout: every wave writes to recv_row_buf[0 : p1_cnt[w]]
-    # and Phase 3 reads from looked_up_buf[0 : p3_cnt[w]]. recv_row_buf is zeroed
-    # at the top of each wave, so waves don't accumulate. Caller must pass
-    # recv_capacity >= max over (s, t) of traffic_matrix[s, t].
+    # Single-slot recv layout: every wave receives one peer's payload at offset 0
+    # of the HBM staging buffer; the kernel consumes it in recv_capacity-sized
+    # VMEM chunks. recv_capacity is the chunk-tile size, NOT a per-pair bound; the
+    # staging buffer is sized to the worst-case single-pair payload.
     recv_off_global = jnp.zeros((W,), dtype=jnp.int32)
     padded_offsets = (jnp.cumsum(send_counts_padded) - send_counts_padded).astype(
         jnp.int32
@@ -511,11 +526,12 @@ def _split_traffic_ringshift_globalpad(
     (= traffic_matrix.max() upper bound) rather than tracked per-input.
     """
     W = world_size
-    # Single-slot recv layout (see naive splitter docstring). Caller must pass
-    # recv_capacity >= max_local_ids + TILE (NO W factor -- single-slot recv
-    # layout means only one peer's payload per wave; per-wave incoming for any
-    # rank is bounded by max_local_ids + TILE - 1, the worst-case all-to-one-
-    # peer skew).
+    # Single-slot recv layout: every wave receives one peer's payload at HBM
+    # offset 0 of the staging buffer. The full per-pair payload (bounded by
+    # max_local_ids + TILE, the worst-case all-to-one-peer skew) is staged in
+    # HBM and consumed by the kernel in recv_capacity-sized VMEM chunks, so the
+    # caller's recv_capacity is only the VMEM chunk-tile size, NOT a per-pair
+    # payload bound.
     recv_off_global = jnp.zeros((W,), dtype=jnp.int32)
     padded_offsets = (jnp.cumsum(send_counts_padded) - send_counts_padded).astype(
         jnp.int32
@@ -548,6 +564,8 @@ def _make_ringshift_single_wave_kernel(
     recv_capacity: int,
     embedding_dim: int,
     v_local: int,
+    axis_name: str,
+    num_chunks: int,
 ):
     """Single-wave all-TC fused f32 ring-shift kernel.
 
@@ -574,6 +592,14 @@ def _make_ringshift_single_wave_kernel(
     ``p3_cnt`` = OPPOSITE side's send count). Necessary because
     ``wait_recv()`` extent is determined by the descriptor's slice, not by
     the recv_sem signals it drains.
+
+    Phase 2 (local gather) is CHUNKED: the full per-pair payload is staged in
+    the HBM recv buffers (sized to ``num_chunks * recv_capacity``), and the
+    table lookup is done ``recv_capacity`` rows at a time through the
+    ``recv_capacity``-sized VMEM tile. This bounds the on-chip working set
+    independently of the per-pair payload, so skewed traffic where a single
+    peer's count exceeds ``recv_capacity`` is handled correctly (the cross-rank
+    DMAs and semaphores are unchanged -- they target the full-size HBM buffers).
     """
 
     def kernel(
@@ -591,6 +617,7 @@ def _make_ringshift_single_wave_kernel(
         looked_up_buf,
         zero_int_vmem,
         zero_emb_vmem,
+        emb_xfer_vmem,
         table_vmem,
         idx_smem,
         send_sem_id,
@@ -599,7 +626,7 @@ def _make_ringshift_single_wave_kernel(
         recv_sem_emb,
     ):
         del out_init_ref  # aliased to out_ref via input_output_aliases
-        my_rank = lax.axis_index("x")
+        my_rank = lax.axis_index(axis_name)
         wave_idx = wave_idx_ref[0]  # traced scalar int32
 
         # All-peer broadcast pre-barrier FIRST. Issuing init ops (sync_copy of
@@ -623,12 +650,14 @@ def _make_ringshift_single_wave_kernel(
             )
         pl.semaphore_wait(sem, world_size)
 
-        # THEN initialize scratches (table prefetch, zero scratches, zero
-        # the recv buffer). After the barrier so init can't race with it.
+        # THEN initialize scratches (table prefetch, zero the VMEM gather tile).
+        # After the barrier so init can't race with it. The HBM recv_row_buf is
+        # NOT pre-zeroed: it is a staging buffer sized for the full per-pair
+        # payload, and the chunked gather below only reads the valid
+        # [0:p3_cnt] region that the Phase-1 DMA populates.
         pltpu.sync_copy(table_ref, table_vmem)
         zero_int_vmem[...] = jnp.zeros_like(zero_int_vmem)
         zero_emb_vmem[...] = jnp.zeros_like(zero_emb_vmem)
-        pltpu.sync_copy(zero_int_vmem, recv_row_buf)
 
         # Phase 1: ID DMA -- send my chunk for the (my_rank+wave_idx)-th
         # peer, receive into recv_row_buf at this wave's recv offset.
@@ -670,23 +699,50 @@ def _make_ringshift_single_wave_kernel(
 
         @pl.when(p1_cnt > 0)
         def _phase1_send():
-            d_send.start()
-            d_send.wait_send()  # only wait for OUR SEND completion (extent p1_cnt)
+            if not _SKIP_DMA:
+                d_send.start()
+                d_send.wait_send()  # only wait for OUR SEND completion (extent p1_cnt)
 
         @pl.when(p3_cnt > 0)
         def _phase1_recv():
-            d_recv.wait_recv()  # drains recv_sem by p3_cnt (peer's send extent)
+            if not _SKIP_DMA:
+                d_recv.wait_recv()  # drains recv_sem by p3_cnt (peer's send extent)
 
-        # Phase 2: local lookup.
-        pltpu.sync_copy(recv_row_buf, idx_smem)
+        # Phase 2: local lookup, CHUNKED through the recv_capacity-sized VMEM
+        # tile so the on-chip working set is bounded regardless of p3_cnt.
+        # recv_row_buf / looked_up_buf are HBM staging buffers holding the full
+        # per-pair payload (staging_capacity = num_chunks * recv_capacity rows);
+        # we gather recv_capacity rows at a time at HBM offset c * recv_capacity.
+        # The row-at-a-time gather targets an f32 VMEM tile (zero_emb_vmem); a
+        # bulk full-tile cast then converts it to emb_xfer_vmem's dtype (bf16
+        # when exchanging in bf16 -- bf16 VMEM disallows dynamic single-row
+        # stores, so the cast must be a full, aligned tile op) before the
+        # sync_copy to the (emb_dtype) HBM staging buffer.
 
         def gather_body(i, __):
             row_idx = idx_smem[i]
+            if _SKIP_DMA:
+                # SKIP_DMA leaves recv_row_buf uninitialized (no DMA populated it);
+                # clamp so the gather stays in-bounds (garbage data, valid timing).
+                row_idx = jnp.clip(row_idx, 0, v_local - 1)
             zero_emb_vmem[pl.ds(i, 1), :] = table_vmem[pl.ds(row_idx, 1), :]
             return None
 
-        lax.fori_loop(0, recv_capacity, gather_body, None)
-        pltpu.sync_copy(zero_emb_vmem, looked_up_buf)
+        for c in range(num_chunks):
+            base = c * recv_capacity  # static (compile-time) HBM offset, mult of TILE
+            chunk_len = jnp.clip(p3_cnt - base, 0, recv_capacity)
+
+            @pl.when(chunk_len > 0)
+            def _gather_chunk(base=base, chunk_len=chunk_len):
+                pltpu.sync_copy(recv_row_buf.at[pl.ds(base, recv_capacity)], idx_smem)
+                if not _SKIP_GATHER:
+                    lax.fori_loop(0, chunk_len, gather_body, None)
+                # Bulk (whole-tile, aligned) cast f32 gather tile -> exchange
+                # dtype, then DMA-stage to HBM. Identity when emb_dtype == f32.
+                emb_xfer_vmem[...] = zero_emb_vmem[...].astype(emb_xfer_vmem.dtype)
+                pltpu.sync_copy(
+                    emb_xfer_vmem, looked_up_buf.at[pl.ds(base, recv_capacity)]
+                )
 
         # Phase 3: emb a2a back to source. p3_cnt is the ACTUAL count of
         # embeddings I'm responsible for in this wave (= what src DMA'd to
@@ -721,12 +777,14 @@ def _make_ringshift_single_wave_kernel(
 
         @pl.when(p3_cnt > 0)
         def _phase3_send():
-            d3_send.start()
-            d3_send.wait_send()  # only wait for OUR SEND completion (p3_cnt * D)
+            if not _SKIP_DMA:
+                d3_send.start()
+                d3_send.wait_send()  # only wait for OUR SEND completion (p3_cnt * D)
 
         @pl.when(p1_cnt > 0)
         def _phase3_recv():
-            d3_recv.wait_recv()  # drains recv_sem_emb by p1_cnt rows x D
+            if not _SKIP_DMA:
+                d3_recv.wait_recv()  # drains recv_sem_emb by p1_cnt rows x D
 
     return kernel
 
@@ -746,6 +804,7 @@ def _ringshift_embedding_lookup_local(
     recv_capacity: int,
     interpret: bool,
     splitter: str,
+    exchange_bf16: bool = False,
 ) -> jax.Array:
     """Per-device ring-shift fused kernel.
 
@@ -753,6 +812,11 @@ def _ringshift_embedding_lookup_local(
         local_ids: ``[max_local_ids]`` int32 -- this rank's padded queries.
         local_id_count: scalar int32 -- actual valid count.
         local_embedding_table: ``[V_local, D]`` f32 -- this rank's shard.
+        exchange_bf16: if True, the embedding all-to-all (Phase-3 DMA) + its HBM
+            staging + the output accumulator are bf16 (halves the cross-host ICI
+            bytes, the S=4096 bottleneck). The table stays f32; the gather casts
+            f32->bf16; the final result is cast back to f32 so the public dtype
+            contract is unchanged.
 
     Returns:
         ``[max_local_ids, D]`` f32 embeddings in caller order.
@@ -761,6 +825,9 @@ def _ringshift_embedding_lookup_local(
     max_local_ids = local_ids.shape[0]
     v_local, embedding_dim = local_embedding_table.shape
     dtype = local_embedding_table.dtype
+    # Dtype of the embedding all-to-all + its staging/output buffers. bf16 halves
+    # the cross-host ICI traffic; the table (gather source) stays f32.
+    emb_dtype = jnp.bfloat16 if exchange_bf16 else dtype
     max_waves = world_size
 
     sorted_row_real, send_counts_real, _sort_perm, reverse_perm = _bucketize_and_sort(
@@ -807,11 +874,23 @@ def _ringshift_embedding_lookup_local(
     HBM = pltpu.MemorySpace.HBM
     SMEM = pltpu.MemorySpace.SMEM
 
+    # The HBM staging buffers (recv_row_buf / looked_up_buf) must hold a full
+    # single-pair payload (<= max_local_ids + TILE <= max_padded). Round up to a
+    # multiple of recv_capacity so the chunked gather's recv_capacity-tile reads stay in
+    # bounds. recv_capacity is now ONLY the VMEM chunk-tile size (a VMEM/perf
+    # knob), no longer a correctness lower bound on the per-pair payload.
+    staging_capacity = (
+        (max_padded + recv_capacity - 1) // recv_capacity
+    ) * recv_capacity
+    num_chunks = staging_capacity // recv_capacity
+
     single_wave_kernel = _make_ringshift_single_wave_kernel(
         world_size=world_size,
         recv_capacity=recv_capacity,
         embedding_dim=embedding_dim,
         v_local=v_local,
+        axis_name=axis_name,
+        num_chunks=num_chunks,
     )
 
     # JAX-level Python wave loop. Each pallas_call gets a UNIQUE
@@ -829,7 +908,7 @@ def _ringshift_embedding_lookup_local(
     # output, then bind that scalar into the next wave's accumulator via
     # ``optimization_barrier`` (XLA can't statically simplify it away). This
     # forces every rank to finish wave w-1 before any rank launches wave w.
-    sorted_emb_padded = jnp.zeros((max_padded, embedding_dim), dtype=dtype)
+    sorted_emb_padded = jnp.zeros((max_padded, embedding_dim), dtype=emb_dtype)
     sync_dep = jnp.float32(0.0)  # initial -- no dep yet
 
     for w_py in range(max_waves):
@@ -856,9 +935,9 @@ def _ringshift_embedding_lookup_local(
         sorted_emb_padded, _recv_row_dummy, _looked_up_dummy = pl.pallas_call(
             single_wave_kernel,
             out_shape=[
-                jax.ShapeDtypeStruct((max_padded, embedding_dim), dtype),
-                jax.ShapeDtypeStruct((recv_capacity,), jnp.int32),
-                jax.ShapeDtypeStruct((recv_capacity, embedding_dim), dtype),
+                jax.ShapeDtypeStruct((max_padded, embedding_dim), emb_dtype),
+                jax.ShapeDtypeStruct((staging_capacity,), jnp.int32),
+                jax.ShapeDtypeStruct((staging_capacity, embedding_dim), emb_dtype),
             ],
             grid_spec=pltpu.PrefetchScalarGridSpec(
                 num_scalar_prefetch=0,
@@ -880,7 +959,12 @@ def _ringshift_embedding_lookup_local(
                 ],
                 scratch_shapes=(
                     pltpu.VMEM((recv_capacity,), jnp.int32),
+                    # zero_emb_vmem: f32 gather tile (row-at-a-time dynamic store
+                    # needs the f32 dim-0 tile of 1; bf16 would require 16-aligned).
                     pltpu.VMEM((recv_capacity, embedding_dim), dtype),
+                    # emb_xfer_vmem: emb_dtype staging tile for the (bf16) DMA out.
+                    pltpu.VMEM((recv_capacity, embedding_dim), emb_dtype),
+                    # table_vmem: stays f32 (gather source).
                     pltpu.VMEM((v_local, embedding_dim), dtype),
                     SMEM((recv_capacity,), jnp.int32),
                     # NO REGULAR barrier sem -- kernel uses
@@ -912,8 +996,9 @@ def _ringshift_embedding_lookup_local(
         # Cross-rank epoch barrier: psum a real value derived from this
         # wave's output (so XLA can't statically simplify). One scalar
         # per rank; ``axis_name`` is bound here because we're inside
-        # shard_map.
-        sync_dep = jax.lax.psum(sorted_emb_padded[0, 0], axis_name)
+        # shard_map. Cast to f32 so the sync token dtype is stable across
+        # waves regardless of the (possibly bf16) exchange dtype.
+        sync_dep = jax.lax.psum(sorted_emb_padded[0, 0].astype(jnp.float32), axis_name)
 
     sorted_emb = _unpad_per_peer(
         sorted_emb_padded,
@@ -923,7 +1008,9 @@ def _ringshift_embedding_lookup_local(
         max_padded,
         world_size,
     )
-    out = sorted_emb[reverse_perm]
+    # Cast back to the table dtype (f32) so the public output contract is
+    # unchanged; only the over-ICI exchange ran in bf16.
+    out = sorted_emb[reverse_perm].astype(dtype)
     return out
 
 
@@ -937,6 +1024,7 @@ def ringshift_embedding_lookup(
     recv_capacity: int,
     interpret: bool = False,
     splitter: str = "globalpad",
+    exchange_bf16: bool = False,
 ) -> jax.Array:
     """Ring-shift fused all-TC f32 jagged a2a + sharded embedding lookup.
 
@@ -964,10 +1052,15 @@ def ringshift_embedding_lookup(
             shards stacked along the leading rank axis.
         mesh: 1D JAX mesh whose only axis is ``axis_name``.
         axis_name: name of the mesh axis the leading dim is sharded on.
-        recv_capacity: per-wave receive buffer size. With single-slot recv
-            layout, only one peer's payload lands per wave; per-wave incoming
-            for any rank is bounded by ``max_local_ids + TILE - 1``. Caller
-            should pass a TILE-aligned value at least that large.
+        recv_capacity: VMEM chunk-tile size for the local gather/scatter, NOT a
+            bound on the per-pair payload. The full per-pair payload is staged in
+            HBM (sized to ``max_local_ids + W*TILE`` rounded up to a multiple of
+            ``recv_capacity``) and the on-chip lookup/scatter-add is processed in
+            ``ceil(staging / recv_capacity)`` chunks of ``recv_capacity`` rows, so
+            arbitrarily skewed traffic is handled with bounded VMEM. Pass a
+            TILE-aligned value; smaller = less VMEM but more chunks (any positive
+            multiple of TILE is correct). Must satisfy
+            ``recv_capacity * embedding_dim * 4`` (x a few VMEM tiles) <= VMEM.
         interpret: if True, run the Pallas kernel under the JAX interpreter
             (CPU-emulated; for unit tests). NOTE: the kernel uses
             runtime-extent slices ``ref.at[pl.ds(start, runtime_count)]`` that
@@ -975,6 +1068,11 @@ def ringshift_embedding_lookup(
         splitter: one of ``"naive"`` or ``"globalpad"``. With single-slot
             recv layout these are functionally equivalent; ``"globalpad"`` is
             the steady-state default.
+        exchange_bf16: if True, the cross-host embedding all-to-all (forward) and
+            gradient all-to-all (backward) run in bf16, halving the ICI bytes (the
+            S=4096 bottleneck). The table stays f32, the table-grad accumulation
+            stays f32, and the public inputs/outputs stay f32 -- only the over-ICI
+            transfer + staging are bf16. Default False (exact f32 behavior).
 
     Returns:
         ``[world_size, max_local_ids, D]`` f32 embeddings in caller order.
@@ -995,6 +1093,68 @@ def ringshift_embedding_lookup(
         recv_capacity,
         interpret,
         splitter,
+        exchange_bf16,
+    )
+
+
+def _block_to_mod_ids(local_ids: jax.Array, world_size: int, v_local: int) -> jax.Array:
+    """Remap block-sharded ids to the MOD-kernel's id space.
+
+    Block layout: id ``i`` lives on rank ``i // v_local`` at row ``i % v_local``.
+    The MOD kernel reads ``table[j % W, j // W]`` for query ``j``. To hit the
+    block location we send ``j = (i % v_local) * W + (i // v_local)``, giving
+    ``j % W == i // v_local`` and ``j // W == i % v_local`` (exact for
+    ``i < v_local * W``). Pure elementwise int math; safe on padding/invalid ids
+    (they are dropped by ``local_id_count`` in the kernel).
+    """
+    return (local_ids % v_local) * world_size + (local_ids // v_local)
+
+
+def ringshift_embedding_lookup_block(
+    local_ids: jax.Array,
+    local_id_count: jax.Array,
+    local_embedding_table: jax.Array,
+    *,
+    mesh: jax.sharding.Mesh,
+    axis_name: str,
+    recv_capacity: int,
+    interpret: bool = False,
+    splitter: str = "globalpad",
+    exchange_bf16: bool = False,
+) -> jax.Array:
+    """Block-sharded variant of :func:`ringshift_embedding_lookup`.
+
+    The base kernel is MOD-sharded: global id ``i`` lives on rank ``i % W`` at
+    local offset ``i // W``. This wrapper supports the layout recir's GSPMD param
+    sharding actually produces -- **contiguous block / FSDP**: a parameter
+    ``[vocab, D]`` split by ``np.split(axis=0)`` so rank ``d`` owns the contiguous
+    rows ``[d*V_local : (d+1)*V_local)``, i.e. id ``i`` lives on rank
+    ``i // V_local`` at local offset ``i % V_local`` (table viewed as
+    ``[W, V_local, D]``).
+
+    It achieves this with a pure **id remap** (:func:`_block_to_mod_ids`) and the
+    UNCHANGED MOD kernel, so the MOD de-risk stays valid (no kernel/custom_vjp
+    edits). The remap is on the non-differentiable ids, so gradients flow to the
+    table unchanged and the table gradient lands in the same block
+    ``[W, V_local, D]`` layout as the parameter.
+
+    Args/Returns: identical to :func:`ringshift_embedding_lookup`, except
+    ``local_embedding_table`` is interpreted as block-sharded (FSDP), the layout
+    recir produces for a row-wise-sharded ``nn.Parameter``.
+    """
+    world_size = local_embedding_table.shape[0]
+    v_local = local_embedding_table.shape[1]
+    mod_ids = _block_to_mod_ids(local_ids, world_size, v_local)
+    return ringshift_embedding_lookup(
+        mod_ids,
+        local_id_count,
+        local_embedding_table,
+        mesh=mesh,
+        axis_name=axis_name,
+        recv_capacity=recv_capacity,
+        interpret=interpret,
+        splitter=splitter,
+        exchange_bf16=exchange_bf16,
     )
 
 
@@ -1031,6 +1191,8 @@ def _make_ringshift_backward_single_wave_kernel(
     recv_capacity: int,
     embedding_dim: int,
     v_local: int,
+    axis_name: str,
+    num_chunks: int,
 ):
     """Single-wave backward kernel: ID DMA + grad DMA + local scatter-add.
 
@@ -1073,11 +1235,11 @@ def _make_ringshift_backward_single_wave_kernel(
         grad_table_acc_ref,  # output HBM, alias of init
         row_recv_buf,  # HBM scratch: [recv_capacity] int32
         grad_recv_buf,  # HBM scratch: [recv_capacity, D] f32
-        grad_emb_vmem,  # VMEM scratch: [recv_capacity, D] f32
+        grad_emb_vmem,  # VMEM scratch: [recv_capacity, D] f32 (scatter tile)
         grad_table_acc_vmem,  # VMEM scratch: [v_local, D] f32
         idx_smem,  # SMEM scratch: [recv_capacity] int32
         zero_int_vmem,  # VMEM scratch: [recv_capacity] int32
-        zero_emb_vmem,  # VMEM scratch: [recv_capacity, D] f32
+        grad_xfer_vmem,  # VMEM scratch: [recv_capacity, D] exch_dtype (bf16 stage)
         send_sem_id,  # DMA sem for Phase 1a send
         recv_sem_id,  # DMA sem for Phase 1a recv
         send_sem_emb,  # DMA sem for Phase 1b send
@@ -1086,7 +1248,7 @@ def _make_ringshift_backward_single_wave_kernel(
         del (
             grad_table_acc_init_ref
         )  # aliased to grad_table_acc_ref via input_output_aliases
-        my_rank = lax.axis_index("x")
+        my_rank = lax.axis_index(axis_name)
         wave_idx = wave_idx_ref[0]
 
         # All-peer broadcast pre-barrier FIRST. Same ordering as the forward
@@ -1105,13 +1267,11 @@ def _make_ringshift_backward_single_wave_kernel(
         pl.semaphore_wait(sem, world_size)
 
         # THEN initialize scratches: load grad_table_acc HBM -> VMEM
-        # (per-wave O(v_local * D) accumulator carry), zero the recv buffers.
+        # (per-wave O(v_local * D) accumulator carry). The HBM staging buffers
+        # row_recv_buf / grad_recv_buf are NOT pre-zeroed: they are sized for the
+        # full per-pair payload and the chunked scatter below only reads the
+        # valid [0:p3_cnt] region that the Phase-1 DMAs populate.
         pltpu.sync_copy(grad_table_acc_ref, grad_table_acc_vmem)
-
-        zero_int_vmem[...] = jnp.zeros_like(zero_int_vmem)
-        zero_emb_vmem[...] = jnp.zeros_like(zero_emb_vmem)
-        pltpu.sync_copy(zero_int_vmem, row_recv_buf)
-        pltpu.sync_copy(zero_emb_vmem, grad_recv_buf)
 
         # Hoist runtime extents (TILE-aligned because both _round_up_tile and
         # the splitter ensure all per-wave per-peer counts/offsets are
@@ -1143,12 +1303,14 @@ def _make_ringshift_backward_single_wave_kernel(
 
         @pl.when(p1_cnt > 0)
         def _phase1a_send():
-            d1a_send.start()
-            d1a_send.wait_send()  # extent p1_cnt
+            if not _SKIP_DMA:
+                d1a_send.start()
+                d1a_send.wait_send()  # extent p1_cnt
 
         @pl.when(p3_cnt > 0)
         def _phase1a_recv():
-            d1a_recv.wait_recv()  # extent p3_cnt = OPPOSITE side's send count
+            if not _SKIP_DMA:
+                d1a_recv.wait_recv()  # extent p3_cnt = OPPOSITE side's send count
 
         # ----- Phase 1b: gradient DMA (split descriptors per direction) -----
         # Same peers as Phase 1a, but D-wide row payload and distinct sems.
@@ -1171,32 +1333,53 @@ def _make_ringshift_backward_single_wave_kernel(
 
         @pl.when(p1_cnt > 0)
         def _phase1b_send():
-            d1b_send.start()
-            d1b_send.wait_send()  # extent p1_cnt rows x D
+            if not _SKIP_DMA:
+                d1b_send.start()
+                d1b_send.wait_send()  # extent p1_cnt rows x D
 
         @pl.when(p3_cnt > 0)
         def _phase1b_recv():
-            d1b_recv.wait_recv()  # extent p3_cnt rows x D
+            if not _SKIP_DMA:
+                d1b_recv.wait_recv()  # extent p3_cnt rows x D
 
         # ----- Phase 2: local scatter-add into grad_table_acc_vmem -----
-        # Bring received IDs into SMEM (scalar reads) and received grads into
-        # VMEM (row-at-a-time reads). idx_smem is sized for the full
-        # recv_capacity even though only the first p3_cnt entries are
-        # populated (the rest are zero from the pre-DMA zero-fill, which is
-        # fine because the scatter loop only iterates 0..p3_cnt).
-        pltpu.sync_copy(row_recv_buf, idx_smem)
-        pltpu.sync_copy(grad_recv_buf, grad_emb_vmem)
+        # CHUNKED through the recv_capacity-sized SMEM/VMEM tiles so on-chip
+        # accesses are bounded regardless of p3_cnt. row_recv_buf / grad_recv_buf
+        # are HBM staging buffers holding the full p3_cnt payload
+        # (staging_capacity = num_chunks * recv_capacity rows); process
+        # recv_capacity rows per chunk at HBM offset c * recv_capacity.
 
         def scatter_body(i, _):
             row_idx = idx_smem[i]
-            # Row-at-a-time read-modify-write (mirrors forward's gather; f32
-            # VMEM dim-0 tile is 1, so single-row pl.ds slices are valid).
+            if _SKIP_DMA:
+                # SKIP_DMA leaves row_recv_buf uninitialized; clamp so the
+                # scatter-add stays in-bounds (garbage data, valid timing).
+                row_idx = jnp.clip(row_idx, 0, v_local - 1)
+            # Row-at-a-time read-modify-write into the f32 accumulator. Both
+            # grad_table_acc_vmem and grad_emb_vmem are f32 here (the f32 dim-0
+            # tile of 1 makes single-row dynamic slices valid; a bf16 tile would
+            # require 16-aligned access).
             cur = grad_table_acc_vmem[pl.ds(row_idx, 1), :]
             delta = grad_emb_vmem[pl.ds(i, 1), :]
             grad_table_acc_vmem[pl.ds(row_idx, 1), :] = cur + delta
             return None
 
-        lax.fori_loop(0, p3_cnt, scatter_body, None)
+        for c in range(num_chunks):
+            base = c * recv_capacity  # static (compile-time) HBM offset, mult of TILE
+            chunk_len = jnp.clip(p3_cnt - base, 0, recv_capacity)
+
+            @pl.when(chunk_len > 0)
+            def _scatter_chunk(base=base, chunk_len=chunk_len):
+                pltpu.sync_copy(row_recv_buf.at[pl.ds(base, recv_capacity)], idx_smem)
+                # DMA-stage the (bf16) grad chunk into the emb_dtype staging tile,
+                # then bulk (whole-tile, aligned) cast up to the f32 scatter tile.
+                # Identity copy when exch_dtype == f32.
+                pltpu.sync_copy(
+                    grad_recv_buf.at[pl.ds(base, recv_capacity), :], grad_xfer_vmem
+                )
+                grad_emb_vmem[...] = grad_xfer_vmem[...].astype(grad_emb_vmem.dtype)
+                if not _SKIP_GATHER:
+                    lax.fori_loop(0, chunk_len, scatter_body, None)
 
         # Write the accumulator back to HBM (aliased to grad_table_acc_ref).
         pltpu.sync_copy(grad_table_acc_vmem, grad_table_acc_ref)
@@ -1216,6 +1399,7 @@ def _ringshift_embedding_lookup_backward_local(
     interpret: bool,
     v_local: int,
     embedding_dim: int,
+    exchange_bf16: bool = False,
 ) -> jax.Array:
     """Per-device backward driver -- wrapped in shard_map by the caller.
 
@@ -1237,6 +1421,11 @@ def _ringshift_embedding_lookup_backward_local(
     max_local_ids = local_ids.shape[0]
     max_waves = world_size
     dtype = grad_out.dtype
+    # Accumulate the table grad in f32 (acc_dtype); exchange the per-row grads
+    # over ICI in exch_dtype (bf16 halves the cross-host bytes). grad_out comes
+    # in f32 and the returned table grad stays f32 (master-weight contract).
+    acc_dtype = dtype
+    exch_dtype = jnp.bfloat16 if exchange_bf16 else dtype
 
     # --- Re-derive splitter outputs (cheap; mirrors forward) ---
     sorted_row_real, send_counts_real, sort_perm, _reverse_perm = _bucketize_and_sort(
@@ -1279,7 +1468,9 @@ def _ringshift_embedding_lookup_backward_local(
     )
     # Permute grad_out by sort_perm so per-peer slices are contiguous, then
     # pad with zero rows (zero gradient = no contribution to scatter sum).
-    grad_emb_sorted = grad_out[sort_perm]
+    # Cast to exch_dtype (bf16) so the per-row grad all-to-all over ICI is
+    # halved; the kernel casts back up to f32 for the scatter-add accumulation.
+    grad_emb_sorted = grad_out[sort_perm].astype(exch_dtype)
     grad_emb_padded = _pad_per_peer_2d(
         grad_emb_sorted,
         send_counts_real,
@@ -1292,11 +1483,21 @@ def _ringshift_embedding_lookup_backward_local(
     HBM = pltpu.MemorySpace.HBM
     SMEM = pltpu.MemorySpace.SMEM
 
+    # HBM staging buffers (row_recv_buf / grad_recv_buf) hold a full single-pair
+    # payload; round up to a multiple of recv_capacity so the chunked scatter's
+    # recv_capacity-tile reads stay in bounds. recv_capacity is the VMEM chunk-tile size.
+    staging_capacity = (
+        (max_padded + recv_capacity - 1) // recv_capacity
+    ) * recv_capacity
+    num_chunks = staging_capacity // recv_capacity
+
     backward_kernel = _make_ringshift_backward_single_wave_kernel(
         world_size=world_size,
         recv_capacity=recv_capacity,
         embedding_dim=embedding_dim,
         v_local=v_local,
+        axis_name=axis_name,
+        num_chunks=num_chunks,
     )
 
     # Per the design: backward collective_ids start at world_size to avoid
@@ -1320,9 +1521,9 @@ def _ringshift_embedding_lookup_backward_local(
         grad_table_acc, _scratch_row, _scratch_grad = pl.pallas_call(
             backward_kernel,
             out_shape=[
-                jax.ShapeDtypeStruct((v_local, embedding_dim), dtype),
-                jax.ShapeDtypeStruct((recv_capacity,), jnp.int32),
-                jax.ShapeDtypeStruct((recv_capacity, embedding_dim), dtype),
+                jax.ShapeDtypeStruct((v_local, embedding_dim), acc_dtype),
+                jax.ShapeDtypeStruct((staging_capacity,), jnp.int32),
+                jax.ShapeDtypeStruct((staging_capacity, embedding_dim), exch_dtype),
             ],
             grid_spec=pltpu.PrefetchScalarGridSpec(
                 num_scalar_prefetch=0,
@@ -1342,11 +1543,21 @@ def _ringshift_embedding_lookup_backward_local(
                     pl.BlockSpec(memory_space=HBM),  # grad_recv_buf scratch
                 ],
                 scratch_shapes=(
-                    pltpu.VMEM((recv_capacity, embedding_dim), dtype),  # grad_emb_vmem
-                    pltpu.VMEM((v_local, embedding_dim), dtype),  # grad_table_acc_vmem
+                    # grad_emb_vmem: f32 scatter tile (row-at-a-time dynamic
+                    # access needs the f32 dim-0 tile of 1).
+                    pltpu.VMEM(
+                        (recv_capacity, embedding_dim), acc_dtype
+                    ),  # grad_emb_vmem
+                    # grad_table_acc_vmem: ALWAYS f32 (accurate scatter-add accum).
+                    pltpu.VMEM(
+                        (v_local, embedding_dim), acc_dtype
+                    ),  # grad_table_acc_vmem
                     SMEM((recv_capacity,), jnp.int32),  # idx_smem
                     pltpu.VMEM((recv_capacity,), jnp.int32),  # zero_int_vmem
-                    pltpu.VMEM((recv_capacity, embedding_dim), dtype),  # zero_emb_vmem
+                    # grad_xfer_vmem: exch_dtype (bf16) grad DMA staging tile.
+                    pltpu.VMEM(
+                        (recv_capacity, embedding_dim), exch_dtype
+                    ),  # grad_xfer_vmem
                     pltpu.SemaphoreType.DMA,  # ID send sem
                     pltpu.SemaphoreType.DMA,  # ID recv sem
                     pltpu.SemaphoreType.DMA,  # grad send sem
@@ -1388,6 +1599,7 @@ def _ringshift_forward_impl(
     recv_capacity: int,
     interpret: bool,
     splitter: str,
+    exchange_bf16: bool,
 ) -> jax.Array:
     """Internal: forward-only impl of the ringshift kernel (no custom_vjp).
 
@@ -1409,6 +1621,7 @@ def _ringshift_forward_impl(
             recv_capacity=recv_capacity,
             interpret=interpret,
             splitter=splitter,
+            exchange_bf16=exchange_bf16,
         )
         return out[None, ...]
 
@@ -1433,6 +1646,7 @@ def _ringshift_backward_impl(
     recv_capacity: int,
     interpret: bool,
     splitter: str,
+    exchange_bf16: bool,
 ) -> jax.Array:
     """Internal: backward impl that wraps `_ringshift_embedding_lookup_backward_local`
     in a shard_map. Returns ``[world_size, v_local, D]`` (caller-shape).
@@ -1460,6 +1674,7 @@ def _ringshift_backward_impl(
             interpret=interpret,
             v_local=v_local,
             embedding_dim=embedding_dim,
+            exchange_bf16=exchange_bf16,
         )
         return gt[None, ...]
 
@@ -1479,7 +1694,7 @@ def _ringshift_backward_impl(
 # API :func:`ringshift_embedding_lookup` preserves the existing keyword-only
 # signature; this inner function exists only because custom_vjp can't take
 # static kwargs directly.
-@functools.partial(jax.custom_vjp, nondiff_argnums=(3, 4, 5, 6, 7))
+@functools.partial(jax.custom_vjp, nondiff_argnums=(3, 4, 5, 6, 7, 8))
 def _ringshift_with_grad(
     local_ids: jax.Array,
     local_id_count: jax.Array,
@@ -1489,6 +1704,7 @@ def _ringshift_with_grad(
     recv_capacity: int,
     interpret: bool,
     splitter: str,
+    exchange_bf16: bool,
 ) -> jax.Array:
     return _ringshift_forward_impl(
         local_ids,
@@ -1499,6 +1715,7 @@ def _ringshift_with_grad(
         recv_capacity=recv_capacity,
         interpret=interpret,
         splitter=splitter,
+        exchange_bf16=exchange_bf16,
     )
 
 
@@ -1511,6 +1728,7 @@ def _ringshift_with_grad_fwd(
     recv_capacity,
     interpret,
     splitter,
+    exchange_bf16,
 ):
     """Forward + save residuals for backward.
 
@@ -1535,6 +1753,7 @@ def _ringshift_with_grad_fwd(
         recv_capacity=recv_capacity,
         interpret=interpret,
         splitter=splitter,
+        exchange_bf16=exchange_bf16,
     )
     # local_embedding_table.shape is the user-facing 3-tuple
     # (world_size, v_local, D); strip the rank axis for the per-device
@@ -1556,6 +1775,7 @@ def _ringshift_with_grad_bwd(
     recv_capacity,
     interpret,
     splitter,
+    exchange_bf16,
     residuals,
     grad_out,
 ):
@@ -1576,6 +1796,7 @@ def _ringshift_with_grad_bwd(
         recv_capacity=recv_capacity,
         interpret=interpret,
         splitter=splitter,
+        exchange_bf16=exchange_bf16,
     )
     return (None, None, grad_table)
 

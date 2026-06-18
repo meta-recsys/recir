@@ -1,0 +1,141 @@
+# Ring-shift FWD+BWD halt repro probe (skewed traffic + rankfm system envvars).
+#
+# Backward twin of rankfm-scale-perf-skewed.yaml. The forward-only skewed probes
+# (ringshift-rankfm-scale-skewed-8dbf5 / -9bxd6) PASSED even with skew + the aligned
+# LIBTPU_INIT_ARGS async-collective flags -> the standalone FORWARD kernel does not
+# reproduce the scratch-arg-5 halt. The real rankfm run trains (value_and_grad), so
+# the BACKWARD kernel (_make_ringshift_backward_single_wave_kernel) is the next
+# untested differentiator. This runs fwd+bwd standalone with the same skewed traffic
+# and aligned system env.
+#
+# Differences from rankfm-scale-bwd-perf.yaml (the passing uniform backward probe):
+#   * --distribution skewed  -> 75%-hot-peer skewed id generator.
+#   * --max-local-ids 34816 -> mirrors the failing rankfm-64chip-s512 run.
+#   * recv_capacity stays 8192.
+#   * SYSTEM-LEVEL ENVVARS aligned with rankfm-64chip-s512.yaml (LIBTPU_INIT_ARGS,
+#     fault/diagnostic, verbose logging, XLA HLO dump).
+#
+# NOTE on scratch-arg numbering: in the BACKWARD kernel scratch arg 5 = send_sem_id
+# (Phase-1a ID send), NOT recv_sem_id. A backward halt would report "arg 5" too but
+# point at a different semaphore than the forward kernel.
+#
+# Expected: if this halts (and the log shows `uniform=False`), the backward kernel is
+# the culprit. If it passes, the trigger needs the full rankfm graph integration
+# (ring-shift collective sharing the SPMD module with HSTU + DP collectives).
+#
+# Rebuild required: the --distribution flag + the `input distribution: uniform=...`
+# log line are source changes in ringshift_bwd.py -> rebuild the image via
+# recir/examples/embedding/build_image_podman.sh before submitting.
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  generateName: ringshift-rankfm-bwd-skewed-
+  namespace: ns-mrs-core-shared
+  labels:
+    kueue.x-k8s.io/queue-name: lq-training
+    x.tpu.cloud.google.com/slice-autoprovisioning: "async"
+spec:
+  replicatedJobs:
+  - name: worker
+    replicas: 1
+    template:
+      metadata:
+        labels:
+          x.tpu.google.com/inject-slice-selector: "true"
+      spec:
+        parallelism: 16
+        completions: 16
+        completionMode: Indexed
+        backoffLimit: 0
+        template:
+          metadata:
+            annotations:
+              cloud.google.com/gke-tpu-slice-topology: "4x4x4"
+          spec:
+            serviceAccountName: default
+            containers:
+            - name: bench
+              image: us-central1-docker.pkg.dev/mrs-tpu-y317h/recml/ringshift_tpu:latest
+              imagePullPolicy: Always
+              env:
+              - name: PYTHONUNBUFFERED
+                value: "1"
+              - name: JAX_DISTRIBUTED_INITIALIZATION_TIMEOUT
+                value: "1800"
+              - name: TPU_INIT_TIMEOUT_SECONDS
+                value: "1800"
+              - name: TPU_LIBRARY_INIT_TIMEOUT
+                value: "1800"
+              # === SYSTEM-LEVEL ENVVARS ALIGNED WITH rankfm-64chip-s512.yaml ===
+              # PRIME SUSPECT: aggressive async collective permute/fusion/overlap can
+              # reorder the ring-shift custom-call's DMAs vs its per-wave barrier +
+              # unique collective_id ordering and leave a DMA sem nonzero.
+              - name: LIBTPU_INIT_ARGS
+                value: >-
+                  --xla_tpu_megacore_fusion_allow_ags=false
+                  --xla_enable_async_collective_permute=true
+                  --xla_tpu_enable_ag_backward_pipelining=true
+                  --xla_tpu_enable_data_parallel_all_reduce_opt=true
+                  --xla_tpu_data_parallel_opt_different_sized_ops=true
+                  --xla_tpu_enable_async_collective_fusion=true
+                  --xla_tpu_enable_async_collective_fusion_multiple_steps=true
+                  --xla_tpu_overlap_compute_collective_tc=true
+                  --xla_tpu_all_gather_collective_matmul_mode=post_spmd
+                  --xla_tpu_reduce_scatter_collective_matmul_mode=post_spmd
+                  --xla_enable_async_all_gather=true
+              # Crash diagnostics (mirror rankfm).
+              - name: PYTHONFAULTHANDLER
+                value: "1"
+              - name: TORCH_SHOW_CPP_STACKTRACES
+                value: "1"
+              - name: TORCH_DISABLE_ADDR2LINE
+                value: "1"
+              - name: JAX_TRACEBACK_FILTERING
+                value: "off"
+              # Verbose libtpu + HLO pass logging (mirror rankfm).
+              - name: TPU_STDERR_LOG_LEVEL
+                value: "0"
+              - name: TF_CPP_VMODULE
+                value: "hlo_pass_pipeline=2,deepsea_compiler_hlo_passes=2"
+              # Capture post-partition HLO. JAX_COMPILATION_CACHE_DIR intentionally
+              # NOT set so XLA recompiles and dumps.
+              - name: XLA_FLAGS
+                value: >-
+                  --xla_dump_to=/tmp/xladump
+                  --xla_dump_hlo_as_text
+                  --xla_dump_hlo_module_re=jit_jax_fn
+              # Rankfm-scale knobs.
+              # Mirror the failing rankfm-64chip-s512 run (max_local_ids ~34.7k,
+              # tile-aligned to 34816) instead of the 98304 uniform-perf value.
+              # Skewed traffic (75% to one hot peer). The `input distribution:
+              # uniform=False` log line confirms this knob took effect.
+              command:
+              - bash
+              - -c
+              - |
+                set +e
+                echo "Job Start: $(date) host: $(hostname)"
+                cd /app/recir
+                timeout 2300 python3 -u -m recir.examples.embedding.ringshift_bench --mode bwd --world-size 128 --dim 256 --v-local 8192 --max-local-ids 34816 --recv-capacity 8192 --distribution skewed 2>&1
+                EXIT=$?
+                echo ""
+                echo "BENCH_EXIT=$EXIT"
+                echo "Job End: $(date)"
+                if [ "$EXIT" -ne 0 ]; then
+                  echo "[post-mortem] non-zero exit -> sleeping 7200s so this pod (incl. rank-0) survives GC for kubectl logs / exec / cp /tmp/xladump"
+                  sleep 7200
+                fi
+                exit $EXIT
+              ports:
+              - containerPort: 8471
+              resources:
+                limits:
+                  google.com/tpu: 4
+            nodeSelector:
+              cloud.google.com/gke-tpu-accelerator: tpu7x
+              cloud.google.com/gke-tpu-topology: "4x4x4"
+            tolerations:
+            - key: "google.com/tpu"
+              operator: "Exists"
+              effect: "NoSchedule"
+            restartPolicy: Never

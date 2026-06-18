@@ -1,0 +1,77 @@
+# Rankfm-scale FWD+BWD perf probe for the fused ringshift embedding lookup.
+#
+# De-risks the BACKWARD at rankfm scale before wiring --embedding_backend
+# ringshift (the backend trains via value_and_grad, so the bwd kernel must also
+# fit/run at our scale). Same scale + scaffolding as rankfm-scale-perf.yaml.
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  generateName: ringshift-rankfm-bwd-
+  namespace: ns-mrs-core-shared
+  labels:
+    kueue.x-k8s.io/queue-name: lq-training
+    x.tpu.cloud.google.com/slice-autoprovisioning: "async"
+spec:
+  replicatedJobs:
+  - name: worker
+    replicas: 1
+    template:
+      metadata:
+        labels:
+          x.tpu.google.com/inject-slice-selector: "true"
+      spec:
+        parallelism: 16
+        completions: 16
+        completionMode: Indexed
+        backoffLimit: 0
+        template:
+          metadata:
+            annotations:
+              cloud.google.com/gke-tpu-slice-topology: "4x4x4"
+          spec:
+            serviceAccountName: default
+            containers:
+            - name: bench
+              image: us-central1-docker.pkg.dev/mrs-tpu-y317h/recml/ringshift_tpu:latest
+              imagePullPolicy: Always
+              env:
+              - name: PYTHONUNBUFFERED
+                value: "1"
+              # Ablation knobs (perf-only): SKIP_GATHER skips TC gather/scatter
+              # (keeps DMA); SKIP_DMA skips cross-host a2a (keeps gather). 0/0=full.
+              - name: RECIR_RINGSHIFT_SKIP_GATHER
+                value: "0"
+              - name: RECIR_RINGSHIFT_SKIP_DMA
+                value: "0"
+              - name: JAX_DISTRIBUTED_INITIALIZATION_TIMEOUT
+                value: "1800"
+              - name: TPU_INIT_TIMEOUT_SECONDS
+                value: "1800"
+              - name: TPU_LIBRARY_INIT_TIMEOUT
+                value: "1800"
+              command:
+              - bash
+              - -c
+              - |
+                set +e
+                echo "Job Start: $(date) host: $(hostname)"
+                cd /app/recir
+                timeout 2300 python3 -u -m recir.examples.embedding.ringshift_bench --mode bwd --world-size 128 --dim 256 --v-local 8192 --max-local-ids 98304 --recv-capacity 8192 --distribution uniform 2>&1
+                EXIT=$?
+                echo ""
+                echo "BENCH_EXIT=$EXIT"
+                echo "Job End: $(date)"
+                exit $EXIT
+              ports:
+              - containerPort: 8471
+              resources:
+                limits:
+                  google.com/tpu: 4
+            nodeSelector:
+              cloud.google.com/gke-tpu-accelerator: tpu7x
+              cloud.google.com/gke-tpu-topology: "4x4x4"
+            tolerations:
+            - key: "google.com/tpu"
+              operator: "Exists"
+              effect: "NoSchedule"
+            restartPolicy: Never
