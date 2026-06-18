@@ -28,6 +28,7 @@ import unittest
 import jax.numpy as jnp
 import numpy as np
 from recir.ops.pallas.embeddings.ringshift import (
+    _block_to_mod_ids,
     _bucketize_and_sort,
     _derive_offsets,
     _pad_per_peer,
@@ -502,6 +503,38 @@ class ReferenceTest(unittest.TestCase):
         np.testing.assert_array_equal(out[1, 0], global_table[5])
         np.testing.assert_array_equal(out[1, 1], global_table[2])
         np.testing.assert_array_equal(out[1, 2], global_table[7])
+
+
+class BlockToModRemapTest(unittest.TestCase):
+    """Validates the block-sharded id remap (_block_to_mod_ids) used by
+    ringshift_embedding_lookup_block: remapping block ids into the MOD kernel's
+    id space + the MOD reference lookup must equal a direct block lookup.
+    """
+
+    def test_remap_matches_block_lookup(self) -> None:
+        rng = np.random.default_rng(0)
+        world_size, v_local, d = 4, 8, 16
+        vocab = world_size * v_local
+        max_local_ids = 10
+        global_table = rng.standard_normal((vocab, d)).astype(np.float32)
+        # Block / FSDP layout: rank r owns contiguous rows [r*v_local:(r+1)*v_local],
+        # i.e. table3d[r, k] == global row r*v_local + k.
+        table3d = global_table.reshape(world_size, v_local, d)
+        ids = np.zeros((world_size, max_local_ids), dtype=np.int32)
+        counts = rng.integers(1, max_local_ids + 1, size=(world_size,)).astype(np.int32)
+        for r in range(world_size):
+            ids[r, : counts[r]] = rng.integers(0, vocab, size=(int(counts[r]),))
+        mod_ids = np.asarray(_block_to_mod_ids(jnp.asarray(ids), world_size, v_local))
+        out = ringshift_embedding_lookup_reference(mod_ids, counts, table3d, world_size)
+        for r in range(world_size):
+            for i in range(int(counts[r])):
+                np.testing.assert_array_equal(out[r, i], global_table[ids[r, i]])
+
+    def test_remap_formula(self) -> None:
+        # W=4, v_local=8: block id i -> (i % 8) * 4 + i // 8.
+        ids = jnp.array([[0, 7, 8, 31]], dtype=jnp.int32)
+        got = np.asarray(_block_to_mod_ids(ids, 4, 8))
+        np.testing.assert_array_equal(got, np.array([[0, 28, 1, 31]], dtype=np.int32))
 
 
 if __name__ == "__main__":
