@@ -1,0 +1,94 @@
+# Rankfm-scale perf probe for the fused ringshift embedding lookup.
+#
+# De-risk step before wiring a full --embedding_backend ringshift: confirms the
+# op compiles + runs at the rankfm HSTU embedding scale and measures fused
+# (on-TC ring-shift) vs the ra2a baseline.
+#
+# Scale (env-tunable below), matching the rankfm 64-chip run:
+#   D=256, ~1M global vocab (V_local 8192 * W 128), per-rank query fan-in ~96K
+#   (the rankfm run observed ~77k ids/partition), W=128 over a 4x4x4
+#   (64-chip, 2 cores/chip) v7x slice.
+#
+# Multi-host scaffolding (ns-mrs-core-shared, slice-autoprovisioning,
+# inject-slice-selector, Indexed completion, tolerations, init timeouts) mirrors
+# rankfm-64chip-bench.yaml so it schedules on the same cluster. Uses the
+# ringshift_tpu image (build via recir/examples/embedding/build_image_podman.sh).
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  generateName: ringshift-rankfm-scale-
+  namespace: ns-mrs-core-shared
+  labels:
+    kueue.x-k8s.io/queue-name: lq-training
+    x.tpu.cloud.google.com/slice-autoprovisioning: "async"
+spec:
+  replicatedJobs:
+  - name: worker
+    replicas: 1
+    template:
+      metadata:
+        labels:
+          x.tpu.google.com/inject-slice-selector: "true"
+      spec:
+        parallelism: 16
+        completions: 16
+        completionMode: Indexed
+        backoffLimit: 0
+        template:
+          metadata:
+            annotations:
+              cloud.google.com/gke-tpu-slice-topology: "4x4x4"
+          spec:
+            serviceAccountName: default
+            containers:
+            - name: bench
+              image: us-central1-docker.pkg.dev/mrs-tpu-y317h/recml/ringshift_tpu:latest
+              imagePullPolicy: Always
+              env:
+              - name: PYTHONUNBUFFERED
+                value: "1"
+              # Required: init the global TPU mesh so jax.devices() sees all 128
+              # cores; jax.distributed init is auto-detected from the TPU runtime.
+              # Ablation knobs (perf-only): SKIP_GATHER skips TC gather/scatter
+              # (keeps DMA); SKIP_DMA skips cross-host a2a (keeps gather). 0/0=full.
+              - name: RECIR_RINGSHIFT_SKIP_GATHER
+                value: "0"
+              - name: RECIR_RINGSHIFT_SKIP_DMA
+                value: "0"
+              - name: JAX_DISTRIBUTED_INITIALIZATION_TIMEOUT
+                value: "1800"
+              - name: TPU_INIT_TIMEOUT_SECONDS
+                value: "1800"
+              - name: TPU_LIBRARY_INIT_TIMEOUT
+                value: "1800"
+              # Rankfm-scale knobs (see ringshift_bench.py).
+              # Per-wave VMEM recv buffer. With uniform-random ids (rankfm) the
+              # per-wave incoming per peer is ~max_local_ids/W (~768), so a small
+              # buffer suffices; recv_capacity*D*4 must fit the 64MB VMEM scratch
+              # (8192*256*4 = 8MB; the skewed default ~max_local_ids would be 100MB).
+              command:
+              - bash
+              - -c
+              - |
+                set +e
+                echo "Job Start: $(date) host: $(hostname)"
+                cd /app/recir
+                timeout 2300 python3 -u -m recir.examples.embedding.ringshift_bench --mode fwd --world-size 128 --dim 256 --v-local 8192 --max-local-ids 98304 --recv-capacity 8192 --distribution uniform 2>&1
+                EXIT=$?
+                echo ""
+                echo "BENCH_EXIT=$EXIT"
+                echo "Job End: $(date)"
+                exit $EXIT
+              ports:
+              - containerPort: 8471
+              resources:
+                limits:
+                  google.com/tpu: 4
+            nodeSelector:
+              cloud.google.com/gke-tpu-accelerator: tpu7x
+              cloud.google.com/gke-tpu-topology: "4x4x4"
+            tolerations:
+            - key: "google.com/tpu"
+              operator: "Exists"
+              effect: "NoSchedule"
+            restartPolicy: Never

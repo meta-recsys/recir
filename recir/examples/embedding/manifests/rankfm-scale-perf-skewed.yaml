@@ -1,0 +1,152 @@
+# Ring-shift halt repro probe (skewed traffic + rankfm system envvars).
+#
+# A/B twin of rankfm-scale-perf.yaml. Differences from the passing perf manifest:
+#   * --distribution skewed  -> 75%-hot-peer skewed id generator (per-pair >> recv).
+#   * --max-local-ids 34816 -> mirrors the failing rankfm-64chip-s512 run.
+#   * recv_capacity stays at 8192.
+#   * SYSTEM-LEVEL ENVVARS aligned with rankfm-64chip-s512.yaml (LIBTPU_INIT_ARGS
+#     async-collective flags, fault/diagnostic, verbose logging, XLA HLO dump).
+#
+# CONTEXT: the first skewed run (JobSet ringshift-rankfm-scale-skewed-8dbf5) PASSED
+# (BENCH_EXIT=0) even with per-pair p3 ~= 20.9k through the 8192 recv buffer. That
+# REFUTED the recv-capacity-overflow hypothesis: the recv semaphore is signaled by
+# the sender's count and drained by the receiver's count (both = per-pair traffic),
+# so an overflow corrupts memory but keeps the sem balanced -> no halt.
+#
+# That run also OMITTED LIBTPU_INIT_ARGS. The rankfm run sets aggressive async
+# collective permute/fusion/overlap flags; the ring-shift kernel relies on a precise
+# per-wave barrier + unique collective_id ordering. PRIME NEW HYPOTHESIS: async
+# collective scheduling reorders the custom-call's DMAs and leaves a DMA semaphore
+# (recv_sem_id, scratch arg 5, forward) nonzero -> RuntimeUnexpectedCoreHalt.
+#
+# Expected: if this run now halts (uniform OR skewed), the async-collective system
+# env is the trigger, not the kernel's data-dependent logic.
+#
+# Same image + scaffolding as rankfm-scale-perf.yaml (rebuild via
+# recir/examples/embedding/build_image_podman.sh after the ringshift_fwd.py
+# --distribution flag change).
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  generateName: ringshift-rankfm-scale-skewed-
+  namespace: ns-mrs-core-shared
+  labels:
+    kueue.x-k8s.io/queue-name: lq-training
+    x.tpu.cloud.google.com/slice-autoprovisioning: "async"
+spec:
+  replicatedJobs:
+  - name: worker
+    replicas: 1
+    template:
+      metadata:
+        labels:
+          x.tpu.google.com/inject-slice-selector: "true"
+      spec:
+        parallelism: 16
+        completions: 16
+        completionMode: Indexed
+        backoffLimit: 0
+        template:
+          metadata:
+            annotations:
+              cloud.google.com/gke-tpu-slice-topology: "4x4x4"
+          spec:
+            serviceAccountName: default
+            containers:
+            - name: bench
+              image: us-central1-docker.pkg.dev/mrs-tpu-y317h/recml/ringshift_tpu:latest
+              imagePullPolicy: Always
+              env:
+              - name: PYTHONUNBUFFERED
+                value: "1"
+              # Required: init the global TPU mesh so jax.devices() sees all 128
+              # cores; jax.distributed init is auto-detected from the TPU runtime.
+              - name: JAX_DISTRIBUTED_INITIALIZATION_TIMEOUT
+                value: "1800"
+              - name: TPU_INIT_TIMEOUT_SECONDS
+                value: "1800"
+              - name: TPU_LIBRARY_INIT_TIMEOUT
+                value: "1800"
+              # === SYSTEM-LEVEL ENVVARS ALIGNED WITH rankfm-64chip-s512.yaml ===
+              # The passing perf manifest sets NONE of these; the failing rankfm run
+              # sets all of them. To make this an honest A/B (isolating traffic/graph,
+              # not the TPU/XLA runtime), mirror the rankfm system env here.
+              #
+              # PRIME SUSPECT: LIBTPU_INIT_ARGS enables aggressive async collective
+              # permute / fusion / overlap. The ring-shift kernel relies on a precise
+              # per-wave barrier + unique collective_id ordering; async collective
+              # scheduling can reorder the custom-call's DMAs and leave a DMA sem
+              # nonzero. The standalone skewed run (8dbf5) WITHOUT these flags passed,
+              # so this is the next variable to test.
+              - name: LIBTPU_INIT_ARGS
+                value: >-
+                  --xla_tpu_megacore_fusion_allow_ags=false
+                  --xla_enable_async_collective_permute=true
+                  --xla_tpu_enable_ag_backward_pipelining=true
+                  --xla_tpu_enable_data_parallel_all_reduce_opt=true
+                  --xla_tpu_data_parallel_opt_different_sized_ops=true
+                  --xla_tpu_enable_async_collective_fusion=true
+                  --xla_tpu_enable_async_collective_fusion_multiple_steps=true
+                  --xla_tpu_overlap_compute_collective_tc=true
+                  --xla_tpu_all_gather_collective_matmul_mode=post_spmd
+                  --xla_tpu_reduce_scatter_collective_matmul_mode=post_spmd
+                  --xla_enable_async_all_gather=true
+              # Crash diagnostics (mirror rankfm): dump every thread's Python stack on
+              # a C-level fatal signal, include C++ stacks, skip slow addr2line, keep
+              # JAX framework frames in any surfaced traceback.
+              - name: PYTHONFAULTHANDLER
+                value: "1"
+              - name: TORCH_SHOW_CPP_STACKTRACES
+                value: "1"
+              - name: TORCH_DISABLE_ADDR2LINE
+                value: "1"
+              - name: JAX_TRACEBACK_FILTERING
+                value: "off"
+              # Verbose libtpu + HLO pass logging (mirror rankfm) so a halt/segfault
+              # names the kernel/pass in the log channel (pod FS is lost on crash).
+              - name: TPU_STDERR_LOG_LEVEL
+                value: "0"
+              - name: TF_CPP_VMODULE
+                value: "hlo_pass_pipeline=2,deepsea_compiler_hlo_passes=2"
+              # Capture the post-partition HLO (replica_groups + Mosaic body) of the
+              # halting shard_map. NOTE: JAX_COMPILATION_CACHE_DIR is intentionally
+              # NOT set here (unlike rankfm) so XLA actually recompiles and dumps;
+              # setting the cache is what suppressed the /tmp/xladump on the rankfm run.
+              - name: XLA_FLAGS
+                value: >-
+                  --xla_dump_to=/tmp/xladump
+                  --xla_dump_hlo_as_text
+                  --xla_dump_hlo_module_re=jit_jax_fn
+              # Rankfm-scale knobs (see ringshift_bench.py).
+              # Mirror the failing rankfm-64chip-s512 run (max_local_ids ~34.7k,
+              # tile-aligned to 34816) instead of the 98304 uniform-perf value.
+              # Skewed traffic: route 75% of ids to one hot peer so a single
+              # per-pair count (~0.6 * max_local_ids ~= 20.9k) overflows the
+              # 8192 recv buffer. This is the variable under test.
+              # Same too-small per-wave recv buffer as the real run.
+              command:
+              - bash
+              - -c
+              - |
+                set +e
+                echo "Job Start: $(date) host: $(hostname)"
+                cd /app/recir
+                timeout 2300 python3 -u -m recir.examples.embedding.ringshift_bench --mode fwd --world-size 128 --dim 256 --v-local 8192 --max-local-ids 34816 --recv-capacity 8192 --distribution skewed 2>&1
+                EXIT=$?
+                echo ""
+                echo "BENCH_EXIT=$EXIT"
+                echo "Job End: $(date)"
+                exit $EXIT
+              ports:
+              - containerPort: 8471
+              resources:
+                limits:
+                  google.com/tpu: 4
+            nodeSelector:
+              cloud.google.com/gke-tpu-accelerator: tpu7x
+              cloud.google.com/gke-tpu-topology: "4x4x4"
+            tolerations:
+            - key: "google.com/tpu"
+              operator: "Exists"
+              effect: "NoSchedule"
+            restartPolicy: Never
