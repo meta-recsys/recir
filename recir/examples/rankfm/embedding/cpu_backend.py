@@ -35,7 +35,6 @@ from torchrec.distributed.planner import EmbeddingShardingPlanner, Topology
 from torchrec.distributed.planner.types import ParameterConstraints
 from torchrec.distributed.types import ShardingEnv, ShardingType
 from torchrec.modules.embedding_configs import EmbeddingConfig
-from torchrec.optim.keyed import KeyedOptimizerWrapper
 from torchrec.optim.optimizers import in_backward_optimizer_filter
 
 logger: logging.Logger = logging.getLogger(__name__)
@@ -165,12 +164,11 @@ class CPURankFMBackend(EmbeddingBackend):
         model: nn.Module,
         table_configs: List[EmbeddingConfig],
         embedding_lr: float,
-        dense_lr: float,
         world_size: int,
-    ) -> Tuple[nn.Module, torch.optim.Optimizer]:
+    ) -> nn.Module:
         if not dist.is_initialized():
             logger.info("Single-node: skipping DMP, using model directly")
-            return model, _build_single_node_optimizer(model, embedding_lr, dense_lr)
+            return model
 
         pg = dist.distributed_c10d._get_default_group()
         sharders = [
@@ -228,14 +226,17 @@ class CPURankFMBackend(EmbeddingBackend):
             device=torch.device("cpu"),
             init_data_parallel=False,
         )
-        dense_opt: torch.optim.Optimizer = KeyedOptimizerWrapper(
-            dict(in_backward_optimizer_filter(dmp.named_parameters())),
-            lambda params: torch.optim.SGD(params, lr=dense_lr, foreach=True),
-        )
         logger.info("CPURankFMBackend: DMP initialized (world=%d)", world_size)
         # Return dmp.module so isinstance(orig_submodule, ECSparseArch) still works -
         # DMP shards the EmbeddingCollection in-place but doesn't replace ECSparseArch.
-        return dmp.module, dense_opt
+        return dmp.module
+
+    def dense_named_parameters(self, model: nn.Module) -> Dict[str, nn.Parameter]:
+        # Single-node: everything is dense (no DMP / FUSED embeddings). DMP:
+        # exclude the in-backward (FUSED) embedding params via the standard filter.
+        if not dist.is_initialized():
+            return dict(model.named_parameters())
+        return dict(in_backward_optimizer_filter(model.named_parameters()))
 
     def get_override(
         self,

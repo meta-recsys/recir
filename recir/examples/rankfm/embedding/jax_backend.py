@@ -194,9 +194,8 @@ class JAXRankFMBackend(EmbeddingBackend):
         model: nn.Module,
         table_configs: List[EmbeddingConfig],
         embedding_lr: float,
-        dense_lr: float,
         world_size: int,
-    ) -> Tuple[nn.Module, torch.optim.Optimizer]:
+    ) -> nn.Module:
         if not self._feature_padded_input_sizes:
             raise RuntimeError(
                 "JAXRankFMBackend.get_override() must be called before "
@@ -212,18 +211,16 @@ class JAXRankFMBackend(EmbeddingBackend):
         )
         self._jax_ec = jax_ec
         self._jax_ec_ref[0] = jax_ec
+        logger.info("JAXRankFMBackend: SparsecoreBackedEC initialized")
+        return model
 
-        # Dense params only - embedding state lives in emb_vars on SparseCore.
-        dense_params = [
-            p
+    def dense_named_parameters(self, model: nn.Module) -> Dict[str, nn.Parameter]:
+        # Embedding state lives in emb_vars on SparseCore; everything else is dense.
+        return {
+            name: p
             for name, p in model.named_parameters()
             if "_embedding_collection" not in name
-        ]
-        opt: torch.optim.Optimizer = torch.optim.SGD(
-            dense_params, lr=dense_lr, foreach=True
-        )
-        logger.info("JAXRankFMBackend: SparsecoreBackedEC initialized")
-        return model, opt
+        }
 
     def get_override(
         self,

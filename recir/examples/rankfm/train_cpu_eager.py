@@ -46,6 +46,7 @@ from recir.tests.xla.xsurface_test_utils import (
 from .config import build_module_config, parse_cli, RankFMTrainerConfig
 from .data_pipe import BatchReplayPipe, compute_kjt_key_to_size, replay_batch_iter
 from .embedding import build_embedding_backend
+from .embedding.cpu_backend import _build_single_node_optimizer
 from .train import (
     _build_data_pipe,
     _build_replay_iter,
@@ -454,8 +455,9 @@ def main() -> None:
     Forces ``embedding_backend='cpu'`` (DMP/CPU is the only eager-runnable
     backend) and ``enable_padding=False`` (PaddingRegionTransform is a
     compile-only concept). Works for both single-process (gloo_world=1,
-    backend.setup returns plain SGD) and multi-rank gloo launches (DMP
-    ROW_WISE/TABLE_WISE sharding + gradient all-reduce via gloo).
+    all params in one Adagrad optimizer) and multi-rank gloo launches
+    (DMP ROW_WISE/TABLE_WISE sharding + FUSED in-backward embedding
+    optimizer + dense-only Adagrad via gloo).
     """
     _setup_logging()
     trainer_cfg, model_args = parse_cli()
@@ -487,13 +489,26 @@ def main() -> None:
     data_pipe = _build_data_pipe(trainer_cfg, gloo_rank, gloo_world)
 
     core = _build_eager_core(trainer_cfg, module_config, feature_config, data_pipe)
-    model, opt = backend.setup(
+    model = backend.setup(
         core.model,
         core.table_configs,
         trainer_cfg.embedding_lr,
-        trainer_cfg.dense_lr,
         gloo_world,
     )
+    if dist.is_initialized():
+        dense_params = list(backend.dense_named_parameters(model).values())
+        opt: torch.optim.Optimizer = torch.optim.Adagrad(
+            dense_params,
+            lr=trainer_cfg.dense_lr,
+            initial_accumulator_value=0.1,
+            foreach=True,
+        )
+    else:
+        opt = _build_single_node_optimizer(
+            model,
+            trainer_cfg.embedding_lr,
+            trainer_cfg.dense_lr,
+        )
     # pyre-ignore[29]: nn.Module attribute access returns Union[Module, Tensor]
     #   per pyre's stubs; set_recir_kjt_keys is a runtime method on the model.
     model.set_recir_kjt_keys(core.ro_kjt_keys, core.nro_kjt_keys, core.unary_kjt_keys)
