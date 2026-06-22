@@ -29,7 +29,7 @@ placeholder loss tensor that RecTrainer only uses for ``loss.cpu()`` logging.
 from __future__ import annotations
 
 import logging
-from typing import Any, cast, Dict, Iterator, Optional, Tuple
+from typing import Any, Dict, Iterator, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -37,85 +37,26 @@ from minimal_viable_ai.core.trainer.train_pipeline import (
     RecTrainPipeline,
     RecTrainPipelineProvider,
 )
-from recir.api import sync_device_state_to_torch
-from recir.backends import XLAGSPMDBackend
-from recir.distributed.parallel_mode import GSPMDParallel
-
-# Reuse rankfm's compile driver + arg extractor verbatim (do NOT copy). The
-# nested train_step_fn inside _build_compiled_train_step is not importable, so
-# it is reproduced below byte-for-byte.
-from recir.examples.rankfm.train import (
-    _compile_with_xsurface_dispatchers,
-    _extract_train_step_args,
-)
-
-from .model_family import RecirCompileContext
 
 logger: logging.Logger = logging.getLogger(__name__)
 
 
-# pyre-ignore -- mirror of rankfm/train.py:336 train_step_fn (nested there).
-def _train_step_fn(
-    mod: nn.Module,
-    opt: torch.optim.Optimizer,
-    ro_float_features: torch.Tensor,
-    nro_float_features: torch.Tensor,
-    ro_id_list_values: torch.Tensor,
-    ro_id_list_lengths: torch.Tensor,
-    nro_id_list_values: torch.Tensor,
-    nro_id_list_lengths: torch.Tensor,
-    unary_values: torch.Tensor,
-    unary_lengths: torch.Tensor,
-    num_candidates: torch.Tensor,
-    supervision_label_t: torch.Tensor,
-    supervision_weight_t: torch.Tensor,
-    all_labels: Dict[str, torch.Tensor],
-) -> None:
-    all_losses, _ = mod(
-        ro_float_features,
-        nro_float_features,
-        ro_id_list_values,
-        ro_id_list_lengths,
-        nro_id_list_values,
-        nro_id_list_lengths,
-        unary_values,
-        unary_lengths,
-        num_candidates,
-        supervision_label_t,
-        supervision_weight_t,
-        all_labels,
-    )
-    loss: torch.Tensor = all_losses.sum()
-    loss.backward()
-    opt.step()
-
-
 class RecirXLATrainPipeline(RecTrainPipeline[Any, Tuple[torch.Tensor, Dict[str, Any]]]):
-    """RecTrainPipeline whose step is a recir XLA-GSPMD compiled train_step."""
+    """Thin pipeline: the self-compiling model owns compile + run + sync."""
 
-    def __init__(
-        self,
-        model: nn.Module,
-        optimizer: torch.optim.Optimizer,
-        train_step: Any,
-    ) -> None:
+    def __init__(self, model: nn.Module) -> None:
         self._model = model
-        self._optimizer = optimizer
-        self._train_step = train_step
-        self._model.train(True)
 
     def progress(
         self, dataloader_iter: Iterator[Any]
     ) -> Tuple[torch.Tensor, Dict[str, Any]]:
         batch = next(dataloader_iter)
-        # Compiled rankfm step: fwd -> backward -> opt.step on TPU (recir).
-        self._train_step(self._model, self._optimizer, *_extract_train_step_args(batch))
-        sync_device_state_to_torch(self._train_step)
-        # rankfm's train_step_fn returns None; RecTrainer only needs a tensor
-        # to call loss.cpu() on for logging and a ret dict for metrics.
-        loss = torch.zeros(1)
-        ret: Dict[str, Any] = {}
-        return loss, ret
+        # The wrapper lazily compiles on the first call, then runs fwd -> backward
+        # (fires the SparseCore sparse Adagrad off-GM) -> dense opt.step on TPU,
+        # and syncs device state. Its (device-resident) return is ignored here;
+        # placeholder loss for RecTrainer's host-side loss.cpu() logging.
+        self._model(batch)
+        return torch.zeros(1), {}
 
     def on_train_end(self) -> None:
         logger.info("RecirXLATrainPipeline: training complete.")
@@ -124,8 +65,9 @@ class RecirXLATrainPipeline(RecTrainPipeline[Any, Tuple[torch.Tensor, Dict[str, 
 class RecirXLATrainPipelineProvider(
     RecTrainPipelineProvider[Any, Tuple[torch.Tensor, Dict[str, Any]]]
 ):
-    """Builds the recir-compiled train_step from the model's RecirCompileContext."""
+    """Returns the thin pipeline; all compile work lives in the model wrapper."""
 
+    # pyre-ignore
     def create_train_pipeline(
         self,
         model: nn.Module,
@@ -136,33 +78,5 @@ class RecirXLATrainPipelineProvider(
         # accepted here but unused.
         device: Optional[torch.device] = None,
         pg: Optional[Any] = None,
-    ) -> RecTrainPipeline[Any, Tuple[torch.Tensor, Dict[str, Any]]]:
-        ctx: Optional[RecirCompileContext] = cast(
-            Optional[RecirCompileContext],
-            getattr(model, "_recir_compile_ctx", None),
-        )
-        assert ctx is not None, (
-            "model._recir_compile_ctx missing -- RankFMMvaiModelFamily."
-            "create_train_module_and_optimizer must run before "
-            "RecirXLATrainPipelineProvider.create_train_pipeline."
-        )
-
-        parallel_mode = GSPMDParallel(
-            "replicate",
-            loss_reduction="sum",
-            num_ranks=ctx.num_ranks,
-            num_processes=ctx.num_processes,
-        )
-
-        train_step = _compile_with_xsurface_dispatchers(
-            model,
-            optimizer,
-            ctx.trace_batch,
-            ctx.overrides,
-            _train_step_fn,
-            parallel_mode=parallel_mode,
-            backend=XLAGSPMDBackend(),
-            region_transforms=ctx.region_transforms,
-        )
-
-        return RecirXLATrainPipeline(model, optimizer, train_step)
+    ) -> RecirXLATrainPipeline:
+        return RecirXLATrainPipeline(model)
