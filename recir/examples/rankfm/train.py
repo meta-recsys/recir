@@ -60,6 +60,7 @@ from recir.tests.xla.xsurface_test_utils import (
     resize_batch_inplace,
     resize_kjt_per_key_lengths,
 )
+from torchrec.optim.keyed import KeyedOptimizerWrapper
 
 from .config import build_module_config, parse_cli, RankFMTrainerConfig
 from .data_pipe import (
@@ -321,15 +322,25 @@ def _build_compiled_train_step(
     )
 
     # Set up embedding storage (DMP for CPU, SparseCore for TPU).
-    model, dense_opt = backend.setup(
+    model = backend.setup(
         model,
         table_configs,
         trainer_cfg.embedding_lr,
-        trainer_cfg.dense_lr,
         num_processes,
     )
 
-    opt = dense_opt
+    dense_params = backend.dense_named_parameters(model)
+    if dist.is_initialized():
+        opt: torch.optim.Optimizer = KeyedOptimizerWrapper(
+            dict(dense_params),
+            lambda params: torch.optim.SGD(
+                params, lr=trainer_cfg.dense_lr, foreach=True
+            ),
+        )
+    else:
+        opt = torch.optim.SGD(
+            list(dense_params.values()), lr=trainer_cfg.dense_lr, foreach=True
+        )
 
     model.set_recir_kjt_keys(ro_kjt_keys, nro_kjt_keys, unary_kjt_keys)
 

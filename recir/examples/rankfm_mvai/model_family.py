@@ -73,6 +73,7 @@ from recir.tests.xla.xsurface_test_utils import (
     resize_kjt_per_key_lengths,
 )
 from torch.utils.data import IterableDataset
+from torchrec.optim.keyed import KeyedOptimizerWrapper
 
 logger: logging.Logger = logging.getLogger(__name__)
 
@@ -363,14 +364,29 @@ class RankFMMvaiModelFamily(BlueReelsVDDModelFamily):
             num_processes,
         )
 
-        # 9. Embedding storage (DMP for cpu / SparseCore for tpu).
-        model, dense_opt = backend.setup(
+        # 9. Embedding storage (DMP for cpu / SparseCore for tpu). backend.setup
+        #    no longer builds the dense optimizer; build it here over the
+        #    backend's dense params (the embedding update is backend-owned:
+        #    FUSED in-backward for cpu DMP / SparseCore for tpu). Mirrors
+        #    rankfm/train.py.
+        model = backend.setup(
             model,
             table_configs,
             trainer_cfg.embedding_lr,
-            trainer_cfg.dense_lr,
             num_processes,
         )
+        dense_params = backend.dense_named_parameters(model)
+        if dist.is_initialized():
+            dense_opt: torch.optim.Optimizer = KeyedOptimizerWrapper(
+                dict(dense_params),
+                lambda params: torch.optim.SGD(
+                    params, lr=trainer_cfg.dense_lr, foreach=True
+                ),
+            )
+        else:
+            dense_opt = torch.optim.SGD(
+                list(dense_params.values()), lr=trainer_cfg.dense_lr, foreach=True
+            )
 
         # pyre-ignore[29]: backend.setup returns Module; set_recir_kjt_keys is dynamic.
         model.set_recir_kjt_keys(ro_kjt_keys, nro_kjt_keys, unary_kjt_keys)
