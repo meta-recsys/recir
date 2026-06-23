@@ -342,10 +342,21 @@ class EmbeddingBackend(ABC):
         model: nn.Module,
         table_configs: list[EmbeddingConfig],
         embedding_lr: float,
-        dense_lr: float,
         world_size: int,
-    ) -> tuple[nn.Module, torch.optim.Optimizer]:
-        """Set up embedding storage. Returns (model, optimizer)."""
+    ) -> nn.Module:
+        """Set up embedding storage (sparse side only) and return the (possibly
+        DMP-wrapped) model.
+        """
+        ...
+
+    @abstractmethod
+    def dense_named_parameters(self, model: nn.Module) -> dict[str, nn.Parameter]:
+        """Trainable DENSE params (those NOT owned/trained by the embedding
+        backend), as an FQN -> Parameter dict.
+
+        Backend-specific: the DMP backend uses ``in_backward_optimizer_filter``;
+        the SparseCore backend excludes the embedding collection.
+        """
         ...
 
     def sc_modulus(self) -> int:
