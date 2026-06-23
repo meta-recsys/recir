@@ -1173,6 +1173,32 @@ def _strip_profiler_nodes(gm: torch.fx.GraphModule) -> torch.fx.GraphModule:
     return gm
 
 
+def _strip_mark_boundary_nodes(gm: torch.fx.GraphModule) -> torch.fx.GraphModule:
+    """Remove ``recir::mark_boundary`` identity ops before XLA segmentation.
+
+    In the ``compile()`` decorator path, ``install_graph`` is never called so
+    ``mark_boundary`` ops planted by ``install_eager`` remain in the graph.
+    They have no torchax/JAX lowering, but marking them XLA-incompatible would
+    create graph breaks that expose jax arrays to eager torch ops.  Since
+    ``mark_boundary`` is pure identity (returns its first arg unchanged),
+    we simply replace each call with its tensor input and erase the node.
+    """
+    changed = False
+    for node in reversed(list(gm.graph.nodes)):
+        if (
+            node.op == "call_function"
+            and isinstance(node.target, torch._ops.OpOverload)
+            and node.target.name() == "recir::mark_boundary"
+        ):
+            node.replace_all_uses_with(node.args[0])
+            gm.graph.erase_node(node)
+            changed = True
+    if changed:
+        gm.graph.eliminate_dead_code()
+        gm.recompile()
+    return gm
+
+
 def partial_lower_xla(
     gm: torch.fx.GraphModule,
     backend_type: BackendType = BackendType.XLA_SHARD_MAP,
@@ -1186,6 +1212,7 @@ def partial_lower_xla(
     # Strip profiler ops before segmentation so their ScriptObject
     # handles never become XLA subgraph inputs.
     gm = _strip_profiler_nodes(gm)
+    gm = _strip_mark_boundary_nodes(gm)
     # Re-propagate is_batch_input/batch_dim. The first pass runs at trace
     # time in ``recir.api._finalize_graph`` / ``recir.trace`` before any
     # post-trace mutation (e.g. mivilm surgery splicing new subgraphs in).
