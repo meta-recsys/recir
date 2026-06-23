@@ -31,7 +31,13 @@ from __future__ import annotations
 from recir.sparsecore.backend import EmbeddingBackend
 
 
-def build_embedding_backend(embedding_backend: str) -> EmbeddingBackend:
+def build_embedding_backend(
+    embedding_backend: str,
+    *,
+    ringshift_min_rows: int = 4096,
+    fsdp_min_rows: int = -1,
+    on_device_init: bool = True,
+) -> EmbeddingBackend:
     if embedding_backend == "cpu":
         from .cpu_backend import CPURankFMBackend
 
@@ -40,6 +46,15 @@ def build_embedding_backend(embedding_backend: str) -> EmbeddingBackend:
         from .jax_backend import JAXRankFMBackend
 
         return JAXRankFMBackend()
+    if embedding_backend == "in_graph":
+        from .in_graph_embedding_backend import InGraphEmbeddingBackend
+
+        return InGraphEmbeddingBackend(
+            ringshift_min_rows=ringshift_min_rows,
+            fsdp_min_rows=fsdp_min_rows,
+            on_device_init=on_device_init,
+        )
     raise ValueError(
-        f"Unknown embedding_backend: {embedding_backend!r}. Use 'cpu' or 'tpu'."
+        f"Unknown embedding_backend: {embedding_backend!r}. "
+        f"Use 'cpu', 'tpu', or 'in_graph'."
     )
