@@ -32,12 +32,27 @@ from __future__ import annotations
 
 import logging
 import os
+from typing import Any, cast, List, Optional, Tuple, TYPE_CHECKING
 
 import fbgemm_gpu  # noqa: F401 -- force C++ op registration before fallback
 import jax
 import recir.lowering.fbgemm_fallback  # noqa: F401 -- registers SPMD_DECOMP_TABLE entries
 import torch
 import torch.distributed as dist
+from hammer.v3.models.udd_fm_v3.udd_fm_config import BlueReelsVDDModuleConfig
+from minimal_viable_ai.core.ranking_common.metrics.ctr import FixedStepCTR
+from minimal_viable_ai.core.ranking_common.metrics.mse import FixedStepMSE
+from minimal_viable_ai.core.ranking_common.metrics.ne import FixedStepNE
+
+# minimal_viable_ai is provided at RUNTIME via the Docker image (Dockerfile
+# rsyncs fbcode/mvai_cloud/minimal_viable_ai -- the lightweight RankingSGD* API
+# this example targets). pyre type-checks against the canonical buck package
+# //minimal_viable_ai instead (a different, RankingMTML* API with no
+# RankingMetricDef), so under the type checker we stub it as Any.
+if TYPE_CHECKING:
+    RankingMetricDef = Any
+else:
+    from minimal_viable_ai.core.ranking_common.train_pipeline import RankingMetricDef
 from minimal_viable_ai.core.trainer.job_resolver import JobResolver
 from minimal_viable_ai.core.trainer.trainer import RecTrainer
 from recir.decompositions import SPMD_DECOMP_TABLE
@@ -66,6 +81,38 @@ SPMD_DECOMP_TABLE[torch.ops.gr.batched_complete_cumsum.default] = (
 )
 
 logger: logging.Logger = logging.getLogger(__name__)
+
+
+def _build_cls_reg_partition(
+    module_config: BlueReelsVDDModuleConfig,
+) -> Tuple[List[str], List[int], List[str], List[int]]:
+    """Partition the udd_fm_v3 tasks into cls/reg buckets for metric reporting.
+
+    Mirrors mvai_cloud/.../models/udd_fm/train.py:226-242 exactly. rankfm_mvai
+    runs the SAME model (hammer udd_fm_v3 ``BlueReelsVDDTrainV3``) so the same
+    task structure (num_main_tasks / num_main_reg_tasks / has_unpersonalized /
+    num_unpersonalized_tasks) applies. The naive split using only
+    num_main_reg_tasks is wrong when has_unpersonalized=True because the
+    unpersonalized tasks live AFTER the regression block and are trained as
+    classification (sigmoid+BCE); without this account, metric reporting would
+    compute classification NE on regression heads and vice versa.
+    """
+    all_task_names = list(module_config.task_names)
+    n_total = module_config.num_main_tasks
+    n_reg = module_config.num_main_reg_tasks
+    if module_config.has_unpersonalized:
+        n_unpers = module_config.num_unpersonalized_tasks
+        cls_end = n_total - n_reg - n_unpers
+        reg_end = n_total - n_unpers
+        cls_indices = list(range(cls_end)) + list(range(reg_end, n_total))
+        reg_indices = list(range(cls_end, reg_end))
+    else:
+        cls_end = n_total - n_reg
+        cls_indices = list(range(cls_end))
+        reg_indices = list(range(cls_end, n_total))
+    cls_task_names = [all_task_names[i] for i in cls_indices]
+    reg_task_names = [all_task_names[i] for i in reg_indices]
+    return cls_task_names, cls_indices, reg_task_names, reg_indices
 
 
 def _setup_logging() -> None:
@@ -118,6 +165,38 @@ def _resolve_dist_env() -> None:
     )
 
 
+def _force_cpu_barrier() -> None:
+    """Route torch.distributed.barrier() onto CPU instead of the TPU accelerator.
+
+    The udd_fm metric set (NE/CTR/MSE) syncs cross-rank at report time:
+    torchmetrics Metric.compute() -> gather_all_tensors() -> torch.distributed
+    .barrier(group). Recent torch makes the barrier device-aware via
+    torch._C._get_accelerator(), which on this image returns the
+    torchax/jax-tpu-embedding PrivateUse1 accelerator -- unregistered for c10d --
+    raising "Please register PrivateUse1HooksInterface ...". The process group is
+    gloo and all metric state is on CPU, so replace barrier with a CPU all_reduce:
+    a full cross-rank sync that never queries the accelerator. The all_gather of
+    the (CPU) metric tensors that follows still runs, so the reported NE/CTR/MSE
+    stay GLOBALLY correct across all ranks. No mvai_cloud / torchmetrics edits.
+    """
+    import torch.distributed.distributed_c10d as c10d
+
+    def _cpu_barrier(
+        group: Optional[Any] = None,
+        async_op: bool = False,
+        device_ids: Optional[List[int]] = None,
+        timeout: Optional[Any] = None,
+    ) -> Optional[Any]:
+        if not (dist.is_available() and dist.is_initialized()):
+            return None
+        pg = group if group is not None else c10d._get_default_group()
+        work = dist.all_reduce(torch.zeros(1), group=pg, async_op=async_op)
+        return work if async_op else None
+
+    c10d.barrier = _cpu_barrier
+    dist.barrier = _cpu_barrier
+
+
 def main() -> None:
     # Must be called before any JAX op. On GKE TPU the PJRT plugin reads the
     # coordinator address + process index from TPU runtime metadata; without
@@ -138,6 +217,9 @@ def main() -> None:
     logger.info(f"Model args: {model_args}")
 
     _resolve_dist_env()
+    # Route torch.distributed.barrier onto CPU before any gloo collective runs
+    # (the metric all-gather at report time). See _force_cpu_barrier.
+    _force_cpu_barrier()
 
     # Inject the rankfm CLI knobs onto the family class (the base RecModelFamily
     # ctor signature -- config/pg/device -- can't carry them).
@@ -146,11 +228,53 @@ def main() -> None:
     model_config = build_model_family_config(trainer_cfg, model_args)
     trainer_config = build_trainer_config(trainer_cfg)
 
+    # Build the cls/reg task partition from the (mutated) udd_fm_v3 module config
+    # -- the SAME model udd_fm runs, so the same task structure applies. This is
+    # passed into the provider so it reports the udd_fm metric set (NE + CTR for
+    # cls tasks, MSE + RMSE for reg tasks, example_count, variable_step_qps).
+    # cast: the canonical mvai RecModelFamilyConfig types .module_config as
+    # `object`; this example only runs the udd_fm BlueReelsVDDModuleConfig.
+    module_config: BlueReelsVDDModuleConfig = cast(
+        BlueReelsVDDModuleConfig, model_config.module_config
+    )
+    cls_task_names, cls_task_indices, reg_task_names, reg_task_indices = (
+        _build_cls_reg_partition(module_config)
+    )
+    report_interval = trainer_config.metrics_config.report_interval
+    batch_size = trainer_config.data_source_config.batch_size
+
     RecTrainer(
         model_family_clazz=RankFMMvaiModelFamily,
         trainer_config=trainer_config,
         model_config=model_config,
-        train_pipeline_provider=RecirXLATrainPipelineProvider(),
+        train_pipeline_provider=RecirXLATrainPipelineProvider(
+            cls_metric_defs=[
+                RankingMetricDef(
+                    metric_cls=FixedStepNE,
+                    tasks=cls_task_names,
+                    batch_size=batch_size,
+                    report_interval=report_interval,
+                ),
+                RankingMetricDef(
+                    metric_cls=FixedStepCTR,
+                    tasks=cls_task_names,
+                    batch_size=batch_size,
+                    report_interval=report_interval,
+                ),
+            ],
+            reg_metric_defs=[
+                RankingMetricDef(
+                    metric_cls=FixedStepMSE,
+                    tasks=reg_task_names,
+                    batch_size=batch_size,
+                    report_interval=report_interval,
+                ),
+            ],
+            cls_task_indices=cls_task_indices,
+            reg_task_indices=reg_task_indices,
+            is_variable_step=True,
+            report_interval=report_interval,
+        ),
         job_resolver=JobResolver(),
     ).train()
 
