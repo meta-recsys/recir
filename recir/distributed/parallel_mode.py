@@ -51,6 +51,11 @@ def _create_fake_mesh(
         _rank=0,
     )
     mesh._dim_group_names = [group_name]
+    # DeviceMesh only creates _pg_registry on some init paths / torch versions
+    # (notably not with _init_backend=False); create it if absent so the
+    # FakeProcessGroup registration below works across versions.
+    if getattr(mesh, "_pg_registry", None) is None:
+        mesh._pg_registry = {}
     mesh._pg_registry[group_name] = fake_pg  # pyre-ignore[6]
     return mesh
 
@@ -184,6 +189,15 @@ class GSPMDParallel(ParallelMode):
             auto-detected from jax.device_count() or dist.get_world_size().
         num_processes: Number of OS processes. If None, auto-detected from
             dist.get_world_size() (or 1 if dist is not initialized).
+        fsdp_table_substr: If set, row-wise (FSDP) shard every param whose name
+            contains this substring, regardless of ``parallel_style`` -- e.g.
+            table-only sharding of the in-graph seq-embedding ``_sharded_tables`` on
+            an otherwise-"replicate" model. A no-op when no param matches, so
+            plain "replicate" stays byte-identical.
+
+            TODO: unify this substr-based table sharding with the
+            EmbeddingShardingPlan used in hybrid parallel, and refactor
+            parallel_style (this is a stopgap for table-only FSDP).
     """
 
     def __init__(
@@ -194,12 +208,14 @@ class GSPMDParallel(ParallelMode):
         loss_reduction: str = "sum",
         num_ranks: Optional[int] = None,
         num_processes: Optional[int] = None,
+        fsdp_table_substr: Optional[str] = None,
     ) -> None:
         self.parallel_style = parallel_style
         self.input_batch_dim = input_batch_dim
         self.grad_reduction = "sum" if loss_reduction == "mean" else "avg"
         self._num_ranks = num_ranks
         self._num_processes = num_processes
+        self._fsdp_table_substr = fsdp_table_substr
         self._process_mesh: Optional[DeviceMesh] = None
 
     @property
@@ -247,21 +263,53 @@ class GSPMDParallel(ParallelMode):
         params_and_buffers: Dict[str, Any],
         opt: OptOrOpts,
     ) -> Set[str]:
+        sharded: Set[str] = set()
+
+        # Table-only FSDP sharding: when ``fsdp_table_substr`` is set, row-wise
+        # (FSDP) shard params whose name contains it, regardless of
+        # ``parallel_style`` -- table-only sharding (e.g. the in-graph
+        # seq-embedding ``_sharded_tables``) while every other weight follows the
+        # base style. If no param matches, this is a no-op, so plain "replicate"
+        # stays byte-identical to the no-substr path.
+        if self._fsdp_table_substr is not None:
+            substr: str = self._fsdp_table_substr
+
+            def _is_table(key: str, t: torch.Tensor) -> bool:
+                return (
+                    substr in key
+                    and t.ndim >= 1
+                    and t.shape[0] >= self.num_ranks
+                    and t.shape[0] % self.num_ranks == 0
+                    and t.shape[0] % self.num_processes == 0
+                )
+
+            if any(_is_table(k, t) for k, t in params_and_buffers.items()):
+                sharded = shard_params_and_states(
+                    model,
+                    params_and_buffers,
+                    opt,
+                    self.process_mesh,
+                    DataParallelStyle.FULLY_SHARD,
+                    shard_filter=_is_table,
+                )
+
         if self.parallel_style != "fully_shard":
-            return set()
+            return sharded
 
         # Only shard tensors where the local shard can be evenly split
         # across local devices. This ensures _to_sharded_jax and
-        # _jit_gspmd agree on which tensors are FSDP-sharded.
-        def _can_fsdp(_key: str, t: torch.Tensor) -> bool:
+        # _jit_gspmd agree on which tensors are FSDP-sharded. Skip params already
+        # sharded by the fsdp_table_substr pass above to avoid double-sharding.
+        def _can_fsdp(key: str, t: torch.Tensor) -> bool:
             return (
-                t.ndim >= 1
+                key not in sharded
+                and t.ndim >= 1
                 and t.shape[0] >= self.num_ranks
                 and t.shape[0] % self.num_ranks == 0
                 and t.shape[0] % self.num_processes == 0
             )
 
-        return shard_params_and_states(
+        return sharded | shard_params_and_states(
             model,
             params_and_buffers,
             opt,

@@ -77,6 +77,20 @@ print('All imports OK!')
 "
 
 echo ""
+echo "--- Authenticating to Artifact Registry ---"
+# Use a fresh OAuth2 access token from gcloud (~1h TTL). If gcloud has no
+# active account, prompt the user to log in first. (Mirrors rankfm's
+# build_image_podman.sh -- without this, `podman push` fails with
+# "unable to retrieve auth token: invalid username/password: unauthorized".)
+if ! gcloud auth print-access-token > /dev/null 2>&1; then
+    echo "gcloud has no active credentials. Run 'gcloud auth login' first." >&2
+    exit 1
+fi
+gcloud auth print-access-token | \
+    podman login -u oauth2accesstoken --password-stdin \
+        "https://${REGION}-docker.pkg.dev"
+
+echo ""
 echo "--- Tagging and pushing ---"
 podman tag "${IMAGE_NAME}:${IMAGE_TAG}" "${IMAGE_PATH}"
 podman push "${IMAGE_PATH}"
