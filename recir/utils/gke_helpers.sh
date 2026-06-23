@@ -179,7 +179,13 @@ gke_kill() {
 
 gke_iterate() {
     local yaml="${1:-$_GKE_DEFAULT_YAML}"
-    ( cd "$_GKE_FBCODE_ROOT" && "$_GKE_BUILD_SCRIPT" ) || return 1
+    # GKE_SKIP_BUILD=1 reuses the current :latest image (skip the podman rebuild
+    # when the source is unchanged); unset/0 rebuilds as before.
+    if [ "${GKE_SKIP_BUILD:-0}" = "1" ]; then
+        echo "GKE_SKIP_BUILD=1 -> skipping image build (reusing current :latest)."
+    else
+        ( cd "$_GKE_FBCODE_ROOT" && "$_GKE_BUILD_SCRIPT" ) || return 1
+    fi
     gke_submit "$yaml" || return 1
     echo "Waiting for the ${_GKE_POD_NOUN:-rank-0 pod} to be Running before tailing..."
     until kubectl get pods --context="$CTX" -n "$NS" \

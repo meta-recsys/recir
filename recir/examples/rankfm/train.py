@@ -43,10 +43,13 @@ import torch.nn as nn
 from hammer.v3.models.udd_fm_v3.batch_loader import BlueReelsVDDFeatureConfig
 from hammer.v3.models.udd_fm_v3.udd_fm_config import BlueReelsVDDModuleConfig
 from hammer.v3.modules.recblock import _inputs_to_feature_bundle
-from recir.api import sync_device_state_to_torch
+from recir.api import COMPILED_OBJECT_KEY
 from recir.backends import XLAGSPMDBackend
 from recir.decompositions import SPMD_DECOMP_TABLE
 from recir.distributed.parallel_mode import GSPMDParallel
+from recir.examples.rankfm.embedding.in_graph_embedding_backend import (
+    SHARDED_TABLE_PREFIX,
+)
 from recir.lowering.fbgemm_fallback import _batched_complete_cumsum_impl
 from recir.region_transforms.padding import (
     compute_padded_shape,
@@ -63,13 +66,9 @@ from recir.tests.xla.xsurface_test_utils import (
 from torchrec.optim.keyed import KeyedOptimizerWrapper
 
 from .config import build_module_config, parse_cli, RankFMTrainerConfig
-from .data_pipe import (
-    BatchReplayPipe,
-    compute_kjt_key_to_size,
-    prefetch_iter,
-    replay_batch_iter,
-)
+from .data_pipe import BatchReplayPipe, compute_kjt_key_to_size, replay_batch_iter
 from .embedding import build_embedding_backend
+from .prefetch import PrefetchingIterator
 
 # Bootstrap gr::batched_complete_cumsum if the C++ library failed to load
 # (e.g. OSS Docker container where hammer/oss/generative_recommenders/ops/cpp
@@ -186,7 +185,9 @@ def _build_compiled_train_step(
     the trace's pytree schema matches every subsequent runtime batch.
     """
     device = torch.device("cpu")
-    model = build_model_from_config(module_config, device)
+    model = build_model_from_config(
+        module_config, device, bf16_training=trainer_cfg.bf16_training
+    )
 
     for p in model.parameters():
         if p.is_floating_point():
@@ -304,6 +305,7 @@ def _build_compiled_train_step(
             feature_config,
             device,
             batch_size=trainer_cfg.local_batch_size,
+            num_candidates=feature_config.num_candidates_per_request,
         )
         logger.info("[TRACE] using synthetic batch for trace (no data_pipe)")
 
@@ -383,6 +385,7 @@ def _build_compiled_train_step(
         loss_reduction="sum",
         num_ranks=num_ranks,
         num_processes=num_processes,
+        fsdp_table_substr=SHARDED_TABLE_PREFIX,
     )
 
     # pyre-ignore
@@ -401,8 +404,8 @@ def _build_compiled_train_step(
         supervision_label_t: torch.Tensor,
         supervision_weight_t: torch.Tensor,
         all_labels: Dict[str, torch.Tensor],
-    ) -> None:
-        all_losses, _ = mod(
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        all_losses, named_tensors = mod(
             ro_float_features,
             nro_float_features,
             ro_id_list_values,
@@ -419,6 +422,10 @@ def _build_compiled_train_step(
         loss: torch.Tensor = all_losses.sum()
         loss.backward()
         opt.step()
+        # recir's compiled-step output handling materializes tensor/list/tuple
+        # results back to the host (NOT dict), so return a fixed tuple:
+        # (total loss, per-task loss vector).
+        return loss.detach(), named_tensors["loss"].detach()
 
     train_step = _compile_with_xsurface_dispatchers(
         model,
@@ -579,27 +586,57 @@ def _log_batch_info(step: int, batch: Any) -> None:
     )
 
 
-def _next_training_batch(
-    step: int,
+def _batch_source(
     trainer_cfg: RankFMTrainerConfig,
-    batch: Any,
+    first_batch: Any,
     replay_iter: Optional[Iterator[Any]],
     feature_config: Any,
-) -> Optional[Any]:
-    """Resolve the batch for ``step``. Returns None if the replay pipe is exhausted."""
-    if replay_iter is not None:
-        try:
-            return next(replay_iter)
-        except StopIteration:
-            return None
-    if trainer_cfg.enable_padding and feature_config is not None and step > 1:
-        torch.manual_seed(step)
-        return _create_random_train_batch(
-            feature_config,
-            torch.device("cpu"),
-            batch_size=trainer_cfg.local_batch_size,
-        )
-    return batch
+    start_step: int,
+) -> Iterator[Any]:
+    """Yield one batch per training step (steps ``start_step+1 .. max_steps``).
+
+    Mirrors the three batch-source modes (replay / synthetic-per-step / reuse).
+    Written as a generator so it can be wrapped by :class:`PrefetchingIterator`
+    to overlap batch build/load with on-device compute. Terminates when the
+    replay pipe is exhausted or all steps are produced.
+    """
+    for step in range(start_step + 1, trainer_cfg.max_steps + 1):
+        if replay_iter is not None:
+            try:
+                yield next(replay_iter)
+            except StopIteration:
+                return
+        elif trainer_cfg.enable_padding and feature_config is not None and step > 1:
+            torch.manual_seed(step)
+            yield _create_random_train_batch(
+                feature_config,
+                torch.device("cpu"),
+                batch_size=trainer_cfg.local_batch_size,
+                num_candidates=feature_config.num_candidates_per_request,
+                pin_memory=trainer_cfg.pin_memory,
+            )
+        else:
+            yield first_batch
+
+
+def _make_batch_iter(
+    trainer_cfg: RankFMTrainerConfig,
+    first_batch: Any,
+    replay_iter: Optional[Iterator[Any]],
+    feature_config: Any,
+    start_step: int,
+) -> Tuple[Iterator[Any], Optional[PrefetchingIterator]]:
+    """Build the per-step batch iterator, prefetched on a background thread when
+    ``prefetch_batches > 0``. Returns ``(iterator, prefetcher)``; the prefetcher
+    (if any) must be ``close()``d when iteration ends.
+    """
+    batch_src = _batch_source(
+        trainer_cfg, first_batch, replay_iter, feature_config, start_step
+    )
+    if trainer_cfg.prefetch_batches > 0:
+        prefetcher = PrefetchingIterator(batch_src, depth=trainer_cfg.prefetch_batches)
+        return prefetcher, prefetcher
+    return batch_src, None
 
 
 def _build_replay_iter(
@@ -616,7 +653,7 @@ def _build_replay_iter(
             "Replay mode but key_to_size is None; loaded IDs will not be "
             "clamped against model table sizes (may IndexError)."
         )
-    replay_iter = replay_batch_iter(
+    return replay_batch_iter(
         data_pipe,
         key_to_size or {},
         max_steps=trainer_cfg.max_steps,
@@ -624,21 +661,96 @@ def _build_replay_iter(
         num_candidates=num_candidates,
         ro_per_key_budgets=ro_per_key_budgets,
     )
-    # Overlap file load / zstd decompress / pad with the device train_step by
-    # producing batches on a background thread (profiles show ~200ms+/step of
-    # otherwise-serial CPU load in front of each step). No-op when the buffer
-    # depth is 0.
-    if trainer_cfg.data_prefetch_buffer > 0:
-        logger.info(
-            f"Batch prefetch enabled (buffer={trainer_cfg.data_prefetch_buffer})"
-        )
-        replay_iter = prefetch_iter(
-            replay_iter, buffer_size=trainer_cfg.data_prefetch_buffer
-        )
-    return replay_iter
 
 
-def _run_training_loop(
+def _maybe_log_device_state_fast_path(
+    train_step: Any, step: int, is_main: bool, start_step: int
+) -> None:
+    """One-time probe confirming the XLADeviceStateManager on-device fast path is
+    live: model+optimizer state stays resident on-device (as JAX arrays) between
+    steps, so there is no per-step device->host sync. If this is NOT live, the
+    state would be round-tripped to host every step (the pathology we removed by
+    gating ``sync_device_state_to_torch`` behind checkpointing).
+
+    No-op except on host-0 at a single steady-state step.
+    """
+    if not is_main or step != start_step + 3:
+        return
+    compiled_obj = getattr(train_step, "__dict__", {}).get(COMPILED_OBJECT_KEY)
+    if compiled_obj is None:
+        logger.warning(
+            "[device_state] no compiled object on train_step; cannot probe fast path"
+        )
+        return
+    sm = compiled_obj.state_manager
+    on_device = sm.device_state is not None
+    used_fast_path = getattr(sm, "_used_fast_path", False)
+    num_state = len(sm.device_state) if on_device else 0
+    logger.info(
+        f"[device_state] step {step}: manager={type(sm).__name__} "
+        f"device_state_resident={on_device} used_fast_path={used_fast_path} "
+        f"num_state_tensors={num_state}"
+    )
+    assert on_device and used_fast_path, (
+        "Expected the XLADeviceStateManager on-device fast path to be live "
+        f"(device_state_resident={on_device}, used_fast_path={used_fast_path}). "
+        "Without it, model+optimizer state is synced host<->device every step."
+    )
+
+
+def _enable_output_deferral(train_step: Any, cadence: int) -> bool:
+    """Enable ``keep_output_jax`` on the compiled step's state manager so the
+    per-step output device->host pull can be deferred to ``cadence`` steps (lets
+    JAX pipeline: host runs ahead, overlapping step i+1's H2D with step i's
+    compute). Returns True if deferral was enabled.
+    """
+    if cadence <= 1:
+        return False
+    compiled_obj = getattr(train_step, "__dict__", {}).get(COMPILED_OBJECT_KEY)
+    if compiled_obj is None or not hasattr(
+        compiled_obj.state_manager, "keep_output_jax"
+    ):
+        return False
+    compiled_obj.state_manager.keep_output_jax = True
+    return True
+
+
+def _materialize_output(train_step: Any, output: Any) -> Any:
+    """Materialize a (possibly deferred / JAX) step output to torch."""
+    compiled_obj = getattr(train_step, "__dict__", {}).get(COMPILED_OBJECT_KEY)
+    sm = compiled_obj.state_manager if compiled_obj is not None else None
+    if sm is not None and hasattr(sm, "materialize_output"):
+        return sm.materialize_output(output)
+    return output
+
+
+def _pull_and_log(
+    train_step: Any,
+    pending_outs: List[Any],
+    step: int,
+    step_time: float,
+    trainer_cfg: RankFMTrainerConfig,
+    is_main: bool,
+    batch: Any,
+    jax_profiling: bool,
+) -> None:
+    """Materialize ALL accumulated step outputs (one D2H burst) so the windowed
+    step time reflects real on-device work, then log (host-0).
+
+    Called on cadence/first/last steps. ``pending_outs`` holds the (tiny) JAX
+    output handles for every step since the last pull; materializing blocks once
+    on the last queued step, then all transfer.
+    """
+    for out in pending_outs:
+        _materialize_output(train_step, out)
+    if is_main:
+        _log_batch_info(step, batch)
+        logger.info(f"Step {step}/{trainer_cfg.max_steps} | time={step_time:.2f}s")
+        if jax_profiling and trainer_cfg.enable_memory_log:
+            _log_hbm_memory()
+
+
+def _run_training_loop(  # noqa: C901
     trainer_cfg: RankFMTrainerConfig,
     train_step: Any,
     model: nn.Module,
@@ -650,6 +762,7 @@ def _run_training_loop(
     data_pipe: Optional[BatchReplayPipe] = None,
     key_to_size: Optional[Dict[str, int]] = None,
     ro_per_key_budgets: Optional[List[int]] = None,
+    start_step: int = 0,
 ) -> None:
     """Execute the compiled training loop with optional JAX profiling.
 
@@ -686,42 +799,111 @@ def _run_training_loop(
         ro_per_key_budgets=ro_per_key_budgets,
     )
 
-    for step in range(1, trainer_cfg.max_steps + 1):
-        if jax_profiling and step == trainer_cfg.profile_start_step:
-            if not trainer_cfg.profile_dir.startswith("gs://"):
-                os.makedirs(trainer_cfg.profile_dir, exist_ok=True)
-            jax.profiler.start_trace(trainer_cfg.profile_dir)
-            profiling_active = True
-            logger.info(f"[PROFILE] Started trace at step {step}")
+    # Batch source (one batch/step), optionally prefetched on a background thread.
+    batch_iter, prefetcher = _make_batch_iter(
+        trainer_cfg, batch, replay_iter, feature_config, start_step
+    )
 
-        next_batch = _next_training_batch(
-            step, trainer_cfg, batch, replay_iter, feature_config
-        )
-        if next_batch is None:
-            logger.info(f"Replay pipe exhausted at step {step}; ending training.")
-            break
-        batch = next_batch
+    # Phase-3 pipelining: defer the per-step output pull to a cadence so JAX runs
+    # the host ahead (step i+1's H2D overlaps step i's compute). When enabled,
+    # step time is measured as the wall over each cadence window / steps (a pull
+    # blocks, so the window captures real device time).
+    cadence = max(1, trainer_cfg.pull_metrics_every)
+    deferred = _enable_output_deferral(train_step, cadence)
+    if deferred:
+        logger.info(f"[pipeline] deferring output pull to every {cadence} steps")
+    window_start = time.time()
+    window_n = 0
+    # Accumulate the (tiny) per-step output handles; flushed (one D2H burst) on
+    # each pull so EVERY step's metrics are captured, never dropped.
+    pending_outs: List[Any] = []
 
-        if is_main:
-            _log_batch_info(step, batch)
+    try:
+        for step in range(start_step + 1, trainer_cfg.max_steps + 1):
+            if jax_profiling and step == trainer_cfg.profile_start_step:
+                if not trainer_cfg.profile_dir.startswith("gs://"):
+                    os.makedirs(trainer_cfg.profile_dir, exist_ok=True)
+                jax.profiler.start_trace(trainer_cfg.profile_dir)
+                profiling_active = True
+                logger.info(f"[PROFILE] Started trace at step {step}")
 
-        step_start = time.time()
-        train_step(model, opt, *_extract_train_step_args(batch))
-        sync_device_state_to_torch(train_step)
-        step_time = time.time() - step_start
+            try:
+                batch = next(batch_iter)
+            except StopIteration:
+                logger.info(f"Batch source exhausted at step {step}; ending training.")
+                break
 
-        if jax_profiling and step == trainer_cfg.profile_end_step and profiling_active:
-            jax.profiler.stop_trace()
-            profiling_active = False
-            logger.info(
-                f"[PROFILE] Stopped trace at step {step} — saved to "
-                f"{trainer_cfg.profile_dir}"
+            # Dispatch the step. With deferral, train_step returns a JAX handle
+            # (async, non-blocking) so the host proceeds to the next step's
+            # H2D/dispatch while this step computes on-device. The handle is kept
+            # (cheap: loss scalar + small stats) until the next pull so its metrics
+            # are not lost.
+            out = train_step(model, opt, *_extract_train_step_args(batch))
+            pending_outs.append(out)
+            # While profiling, block per-step so each profiled step lands as its
+            # own fully-captured device module in the trace. Otherwise the async
+            # pipeline + the end-of-window drain collapse many steps into one
+            # markerless block, making it impossible to read the steady-state
+            # per-step time. Profiling-only; the steady training path keeps the
+            # async pipeline (this branch is never taken outside [start,end]).
+            if profiling_active:
+                jax.block_until_ready(out)
+            # NOTE: device state stays resident on-device between steps (the
+            # XLADeviceStateManager fast path); sync_device_state_to_torch is
+            # called just-in-time before checkpointing only (see below).
+            window_n += 1
+
+            # One-time probe (host-0) that the on-device fast path is actually live.
+            _maybe_log_device_state_fast_path(train_step, step, is_main, start_step)
+
+            if (
+                jax_profiling
+                and step == trainer_cfg.profile_end_step
+                and profiling_active
+            ):
+                # Drain in-flight pipelined steps so every dispatched step
+                # completes and lands in the trace before we stop it. Without
+                # this, the host runs ahead and stop_trace cuts the trace off
+                # after only a few device modules. Profiling-only: blocks on the
+                # already-dispatched JAX output handles (no extra D2H, no metric
+                # consumption — they're still pulled normally at the next pull);
+                # the steady training path / pipelining is untouched.
+                if deferred and pending_outs:
+                    jax.block_until_ready(pending_outs)
+                jax.profiler.stop_trace()
+                profiling_active = False
+                logger.info(
+                    f"[PROFILE] Stopped trace at step {step} — saved to "
+                    f"{trainer_cfg.profile_dir}"
+                )
+
+            # Pull the output / update metrics / log on the cadence (and on the
+            # first + last step). Materializing here blocks on the queued steps,
+            # so the window wall is the true per-step time.
+            is_pull = (
+                step % cadence == 0
+                or step == trainer_cfg.max_steps
+                or step == start_step + 1
             )
-
-        if is_main:
-            logger.info(f"Step {step}/{trainer_cfg.max_steps} | time={step_time:.2f}s")
-        if jax_profiling and trainer_cfg.enable_memory_log and is_main:
-            _log_hbm_memory()
+            if is_pull:
+                now = time.time()
+                step_time = (now - window_start) / max(1, window_n)
+                window_start = now
+                window_n = 0
+                _pull_and_log(
+                    train_step,
+                    pending_outs,
+                    step,
+                    step_time,
+                    trainer_cfg,
+                    is_main,
+                    batch,
+                    jax_profiling,
+                )
+                pending_outs = []
+    finally:
+        if prefetcher is not None:
+            prefetcher.close()
 
     total_time = time.time() - start_time
 
@@ -758,7 +940,12 @@ def main() -> None:
     logger.info(f"Model args: {model_args}")
 
     # --- 1. Build embedding backend and init PG ---
-    backend = build_embedding_backend(trainer_cfg.embedding_backend)
+    backend = build_embedding_backend(
+        trainer_cfg.embedding_backend,
+        ringshift_min_rows=trainer_cfg.ringshift_min_rows,
+        fsdp_min_rows=trainer_cfg.fsdp_min_rows,
+        on_device_init=trainer_cfg.on_device_init,
+    )
     gloo_rank, gloo_world = backend.init_pg()
     is_main = gloo_rank == 0
 
@@ -822,6 +1009,7 @@ def main() -> None:
         data_pipe=data_pipe,
         key_to_size=key_to_size,
         ro_per_key_budgets=ro_per_key_budgets,
+        start_step=0,
     )
 
     # Cleanup. JAX's PJRT runtime + libtpu workers + the gloo collective

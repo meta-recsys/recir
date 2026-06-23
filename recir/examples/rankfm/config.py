@@ -78,6 +78,15 @@ class RankFMTrainerConfig:
         )
     )
 
+    # Precision. When True, run the dense tower (HSTU + composer + loss matmuls)
+    # in bf16 on device via recir.torchax AMP autocast + the HSTU's
+    # ``_bf16_training`` activation casts. fp32 master weights are kept (SGD over
+    # fp32 dense params), and layernorm / softmax / loss reductions stay fp32 ---
+    # the same mixed-precision recipe the GPU baseline uses. NOTE: unlike the
+    # other knobs in this dataclass, this DOES change activation dtypes / the FX
+    # graph, so toggling it forces an XLA recompile.
+    bf16_training: bool = False
+
     # Real data replay (synthetic data is used when gcs_data_path is empty)
     gcs_data_path: str = ""
     data_file_template: str = ""
@@ -91,9 +100,44 @@ class RankFMTrainerConfig:
     # Validated by ``build_embedding_backend`` in ``embedding/__init__.py``.
     embedding_backend: str = "cpu"
 
+    # In-graph embedding sharding thresholds (per-table row counts), used only by
+    # the "in_graph" backend. Each table's mode:
+    #   rows >= ringshift_min_rows                 -> ROWWISE (ring-shift)
+    #   fsdp_min_rows <= rows < ringshift_min_rows -> FSDP    (F.embedding)
+    #   rows < fsdp_min_rows                       -> DP       (replicated)
+    # fsdp_min_rows < 0 means "= ringshift_min_rows" (empty FSDP band -> below
+    # ring-shift is DP).
+    ringshift_min_rows: int = 4096
+    fsdp_min_rows: int = -1
+
+    # Embedding table init for the "in_graph" backend. True = meta param +
+    # on-device HBM random init (no host alloc/H2D; needed for huge/1T tables).
+    # False = real host param (materialize + H2D; fine at ~1M rows).
+    on_device_init: bool = True
+
     # Runtime mode: enables PaddingRegionTransform AND flips
     # static_shape_mode on the model config (since the two must agree).
     enable_padding: bool = True
+
+    # Input-pipeline overlap (host->device). prefetch_batches>0 builds/loads the
+    # next batch(es) on a background thread; pin_memory pins host batch buffers.
+    # NOTE: defaulted OFF. For the synthetic bench these regressed slightly — the
+    # batch build is cheap and isn't the bottleneck (the H2D is, and it overlaps
+    # via JAX async dispatch once per-step output materialization is deferred; see
+    # Phase 3 / `_pull_metrics_every`). The background producer thread only adds
+    # GIL contention with the main thread's critical-path H2D here. Re-enable for
+    # a real (slow) GCS data pipeline, where overlapping the load does help.
+    prefetch_batches: int = 0
+    pin_memory: bool = False
+
+    # Phase-3 pipelining: pull the step outputs (loss/metrics) host-ward only every
+    # N steps instead of every step. Deferring the per-step output materialization
+    # lets JAX run the host ahead, overlapping step i+1's H2D/dispatch with step
+    # i's compute (the input gap collapses toward the device floor). EVERY step's
+    # output handle is retained and flushed in one D2H burst at the pull, so no
+    # batch's metrics are dropped — only the host<->device sync cadence changes.
+    # 1 = pull every step (no pipelining).
+    pull_metrics_every: int = 10
 
     # Profiling
     profile_start_step: int = -1
@@ -127,6 +171,12 @@ class RankFMModelArgs:
     # Sequence shapes (architectural maxes)
     max_uih_seq_len: int = 32
     num_candidates: int = 8
+
+    # L2 (second HSTU stack) max sequence length. When > 0 this pins
+    # hstu_l2_max_seq_len directly (used to align with the GPU bench at 512);
+    # when 0 (default) it falls back to the historical max_uih_seq_len // 4
+    # derivation, preserving behavior for existing users.
+    l2_max_seq_len: int = 0
 
     # Sequence-length sampling (data-side dropout during training)
     disable_seq_len_sampling: bool = False
@@ -173,7 +223,11 @@ def build_module_config(
 
     # Sequence shapes.
     module_config.hstu_max_seq_len = model_args.max_uih_seq_len
-    module_config.hstu_l2_max_seq_len = max(1, model_args.max_uih_seq_len // 4)
+    module_config.hstu_l2_max_seq_len = (
+        model_args.l2_max_seq_len
+        if model_args.l2_max_seq_len > 0
+        else max(1, model_args.max_uih_seq_len // 4)
+    )
     module_config.hstu_max_output_len = model_args.num_candidates
 
     if model_args.disable_seq_len_sampling:
