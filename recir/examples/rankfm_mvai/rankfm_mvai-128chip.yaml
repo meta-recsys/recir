@@ -112,7 +112,10 @@ spec:
                 --data_replicate_across_ranks
                 --profile_start_step 3
                 --profile_end_step 8
-                --profile_dir "gs://cq-mrs-core-shared_mrs_tpu_y317h/tpu-profiles/${JOBSET_NAME}"
+                --profile_dir "gs://cq-mrs-core-shared_mrs_tpu_y317h/tpu-profiles/${JOBSET_NAME}" ;
+                rc=$? ;
+                if [ "${RANK}" = "0" ]; then echo "Copying TensorBoard events -> gs://cq-mrs-core-shared_mrs_tpu_y317h/tensorboard/${JOBSET_NAME} ..." ; mkdir -p /mnt/gcs-out/tensorboard/${JOBSET_NAME} ; cp /mnt/gcs/mvai_cloud/tensorboard/${JOBSET_NAME}/* /mnt/gcs-out/tensorboard/${JOBSET_NAME}/ || true ; fi ;
+                exit $rc
               ports:
               - containerPort: 8471
               resources:
@@ -122,8 +125,14 @@ spec:
               - name: barnfs-data
                 mountPath: /mnt/barnfs
                 readOnly: true
+              # Local emptyDir: TB events are written here during training (fast).
+              # Writing TB straight to gcsfuse rate-limits (HTTP 429) on the
+              # growing events file and stalls the loop -- see volumes below.
               - name: tensorboard
                 mountPath: /mnt/gcs/mvai_cloud
+              # gcsfuse: rank 0 copies the finished events here at end of run.
+              - name: tb-gcs
+                mountPath: /mnt/gcs-out
             nodeSelector:
               cloud.google.com/gke-tpu-accelerator: tpu7x
               cloud.google.com/gke-tpu-topology: "4x4x8"
@@ -144,14 +153,21 @@ spec:
                 readOnly: true
                 volumeAttributes:
                   sourcePath: "gs://mrs-tpu-y317h/datasets/udd_fm_20260415_dump/"
-            # TensorBoard scalar-metrics (loss/QPS/NE) sink. mvai's
-            # TensorboardLogger hardcodes /mnt/gcs/mvai_cloud/tensorboard/$MVAI_JOB_NAME
-            # (metrics.py); back that path with a gcsfuse RW mount of the
-            # SA-owned bucket so the event files persist to GCS (mirrors how
-            # mvai_cloud's GPU cluster persists TB). Requires the
-            # ns-mrs-core-shared default SA to have write access to
-            # this bucket (same SA + bucket as the profiler-output fix).
+            # TensorBoard events. mvai's TensorboardLogger hardcodes
+            # /mnt/gcs/mvai_cloud/tensorboard/$MVAI_JOB_NAME (metrics.py) and
+            # appends to a single events file at every metric report. Backing
+            # that path with gcsfuse makes gcsfuse re-upload the whole growing
+            # (non-empty) file on each flush ("legacy staged writes"), which
+            # exceeds GCS's per-object write rate limit (HTTP 429), stalls the
+            # per-step report, and drags the whole synchronized loop. So write TB
+            # to a LOCAL emptyDir during training instead...
             - name: tensorboard
+              emptyDir: {}
+            # ...and have rank 0 copy the finished events to the SA-owned bucket
+            # once at end of run (a new file written sequentially uses gcsfuse
+            # streaming writes -> no rate limiting). Requires the
+            # ns-mrs-core-shared default SA to have write access to this bucket.
+            - name: tb-gcs
               csi:
                 driver: gcsfuse.csi.storage.gke.io
                 volumeAttributes:
