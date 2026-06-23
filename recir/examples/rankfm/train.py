@@ -334,12 +334,14 @@ def _build_compiled_train_step(
         opt: torch.optim.Optimizer = KeyedOptimizerWrapper(
             dict(dense_params),
             lambda params: torch.optim.SGD(
-                params, lr=trainer_cfg.dense_lr, foreach=True
+                params, lr=trainer_cfg.dense_optimizer_config.lr, foreach=True
             ),
         )
     else:
         opt = torch.optim.SGD(
-            list(dense_params.values()), lr=trainer_cfg.dense_lr, foreach=True
+            list(dense_params.values()),
+            lr=trainer_cfg.dense_optimizer_config.lr,
+            foreach=True,
         )
 
     model.set_recir_kjt_keys(ro_kjt_keys, nro_kjt_keys, unary_kjt_keys)

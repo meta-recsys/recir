@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, Tuple
 
 from hammer.v3.models.udd_fm_v3.batch_loader import BlueReelsVDDFeatureConfig
@@ -33,6 +33,10 @@ from hammer.v3.models.udd_fm_v3.udd_fm_config import (
     ConfigProvider,
 )
 from minimal_viable_ai.core.model_family_api.configs import RecModelFamilyConfig
+from minimal_viable_ai.core.model_family_api.optimizer_configs import OptimConfig
+from torchrec.distributed.embedding_types import OptimType
+from torchrec.optim.clipping import GradientClipping
+from torchrec.optim.warmup import WarmupPolicy, WarmupStage
 
 
 # ---------------------------------------------------------------------------
@@ -52,8 +56,27 @@ class RankFMTrainerConfig:
 
     # Training
     max_steps: int = 20
-    dense_lr: float = 0.01
     embedding_lr: float = 0.1
+    dense_optimizer_config: OptimConfig = field(
+        default_factory=lambda: OptimConfig(
+            optim_type=OptimType.ADAMW,
+            lr=0.0004,
+            eps=0.00001,
+            beta1=0.9,
+            beta2=0.998,
+            weight_decay=0.0001,
+            max_gradient=1.0,
+            gradient_clipping=GradientClipping.VALUE,
+            lr_warmup_schedule=[
+                WarmupStage(
+                    policy=WarmupPolicy.LINEAR,
+                    max_iters=37500,
+                    value=0.1,
+                    lr_scale=1.0,
+                )
+            ],
+        )
+    )
 
     # Real data replay (synthetic data is used when gcs_data_path is empty)
     gcs_data_path: str = ""
@@ -200,13 +223,21 @@ def _build_static_ro_budgets(
 # ---------------------------------------------------------------------------
 
 
-def _add_dataclass_args(parser: argparse.ArgumentParser, cls: Any) -> None:
+def _add_dataclass_args(
+    parser: argparse.ArgumentParser,
+    cls: Any,
+    skip: frozenset[str] = frozenset(),
+) -> None:
     """Register `--<field>` CLI args for each primitive field of *cls*.
 
     Booleans get a paired ``--<field>`` / ``--no_<field>`` toggle so launchers
-    can flip either direction regardless of the dataclass default.
+    can flip either direction regardless of the dataclass default. Fields named
+    in ``skip`` are not CLI-exposed (e.g. optimizer LR knobs that live only in
+    the dataclass / config objects).
     """
     for f in dataclasses.fields(cls):
+        if f.name in skip:
+            continue
         default = f.default
         flag = f"--{f.name}"
         if f.type == "bool":
@@ -226,7 +257,9 @@ def _add_dataclass_args(parser: argparse.ArgumentParser, cls: Any) -> None:
 def parse_cli() -> Tuple[RankFMTrainerConfig, RankFMModelArgs]:
     """Parse argv, returning dataclass instances with any --flag overrides applied."""
     parser = argparse.ArgumentParser()
-    _add_dataclass_args(parser, RankFMTrainerConfig)
+    # Optimizer LR knobs are config-only (dense_optimizer_config / embedding_lr),
+    # not CLI-exposed.
+    _add_dataclass_args(parser, RankFMTrainerConfig, skip=frozenset({"embedding_lr"}))
     _add_dataclass_args(parser, RankFMModelArgs)
     args = parser.parse_args()
     trainer_cfg = RankFMTrainerConfig(

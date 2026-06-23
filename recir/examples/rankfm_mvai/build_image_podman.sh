@@ -135,6 +135,31 @@ rsync -a "${RSYNC_EXCLUDES[@]}" "${FBCODE_DIR}/mvai_cloud/minimal_viable_ai/" "$
 # staged from fbsource so the build doesn't need outbound internet)
 rsync -a "${RSYNC_EXCLUDES[@]}" "${FBCODE_DIR}/generative_recommenders/" "${STAGING_DIR}/generative_recommenders/"
 
+# mrs + hpc: the udd_fm_v3 inter_arch DCN (use_inter_arch=True) imports
+# create_module from mrs/.../dense_sparse/workplace.py. Its whole import tree is
+# torchrec-only at runtime: module_config.py's hpc...blue_reels_model_config
+# import is wrapped in try/except ImportError (the field annotation is a quoted
+# forward ref, so it never evaluates when the name is absent), and dotdcn.py only
+# pulls the torchrec-only general_arch_utils. Stage exactly the files reachable
+# at runtime (NOT the rest of mrs/hpc, which pulls the torchrec.fb / hpc.new
+# chains) plus __init__.py markers for every package dir along each path.
+DCN_FILES=(
+    "mrs/ranking/interaction/dense_sparse/module_config.py"
+    "mrs/ranking/interaction/dense_sparse/workplace.py"
+    "mrs/ranking/interaction/dense_sparse/dotdcn.py"
+    "mrs/ranking/interaction/single_input/frozen/dcn_v0.py"
+    "hpc/torchrec/models/feed/experiments/general_arch_utils.py"
+)
+for rel in "${DCN_FILES[@]}"; do
+    mkdir -p "${STAGING_DIR}/$(dirname "$rel")"
+    rsync -a "${FBCODE_DIR}/${rel}" "${STAGING_DIR}/${rel}"
+    d="$(dirname "$rel")"
+    while [ "$d" != "." ]; do
+        touch "${STAGING_DIR}/${d}/__init__.py"
+        d="$(dirname "$d")"
+    done
+done
+
 echo "============================================"
 echo "  Building RankFM-MVAI TPU image"
 echo "  Source:  ${RECIR_DIR}"
