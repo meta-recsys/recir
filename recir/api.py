@@ -585,7 +585,7 @@ def _tag_batch_inputs(
             continue
         val = node.meta.get("val", None)
         if isinstance(val, torch.Tensor):
-            is_batch = tensor_idx >= num_model_tensors
+            is_batch = tensor_idx >= num_model_tensors and val.dim() > 0
             node.meta["is_batch_input"] = is_batch
             node.meta["is_weight"] = not is_batch
             if is_batch:

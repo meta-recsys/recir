@@ -42,6 +42,7 @@ import torch.distributed as dist
 import torch.nn as nn
 from hammer.v3.models.udd_fm_v3.batch_loader import BlueReelsVDDFeatureConfig
 from hammer.v3.models.udd_fm_v3.udd_fm_config import BlueReelsVDDModuleConfig
+from hammer.v3.models.udd_fm_v3.utils import world_candidate_sum
 from hammer.v3.modules.recblock import _inputs_to_feature_bundle
 from recir.api import COMPILED_OBJECT_KEY
 from recir.backends import XLAGSPMDBackend
@@ -376,6 +377,8 @@ def _build_compiled_train_step(
                     "ro_id_list_lengths",
                     "nro_id_list_values",
                     "nro_id_list_lengths",
+                    "candidate_sum",
+                    "world_candidate_sum",
                 },
             ),
         ]
@@ -404,6 +407,8 @@ def _build_compiled_train_step(
         supervision_label_t: torch.Tensor,
         supervision_weight_t: torch.Tensor,
         all_labels: Dict[str, torch.Tensor],
+        candidate_sum: torch.Tensor,
+        world_candidate_sum: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         all_losses, named_tensors = mod(
             ro_float_features,
@@ -418,6 +423,8 @@ def _build_compiled_train_step(
             supervision_label_t,
             supervision_weight_t,
             all_labels,
+            candidate_sum,
+            world_candidate_sum,
         )
         loss: torch.Tensor = all_losses.sum()
         loss.backward()
@@ -543,6 +550,8 @@ def _extract_train_step_args(
         batch.supervision_label.t().contiguous(),
         batch.supervision_weight.t().contiguous(),
         batch.all_labels,
+        batch.num_candidates.sum(),
+        world_candidate_sum(batch.num_candidates),
     )
 
 
