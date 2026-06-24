@@ -1094,6 +1094,8 @@ def _jax_to_torch(t: Any, device: torch.device) -> Any:
         return [_jax_to_torch(x, device) for x in t]
     if isinstance(t, tuple):
         return tuple(_jax_to_torch(x, device) for x in t)
+    if isinstance(t, dict):
+        return {k: _jax_to_torch(v, device) for k, v in t.items()}
     src_is_bf16 = hasattr(t, "dtype") and getattr(t.dtype, "name", "") == "bfloat16"
     if hasattr(t, "addressable_shards") and t.addressable_shards:
         shards = t.addressable_shards
