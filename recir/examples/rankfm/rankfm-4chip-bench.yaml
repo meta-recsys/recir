@@ -1,0 +1,107 @@
+# RankFM (xsurface V3) GPU-vs-TPU aligned benchmark on a 4-chip TPU v7 slice.
+#
+# Apples-to-apples counterpart to the GPU bench
+# (hammer/v3/models/udd_fm_v3/toy/bench_gpu.sh). Same model/config/data; only the
+# hardware differs. Synthetic data (no --gcs_data_path), fixed sequence length,
+# all sequence-length sampling OFF, global batch = 512.
+#
+# Sequence length S is supplied via the RANKFM_S env var (set to 4096 below). To
+# sweep the TPU ceiling, resubmit with a different RANKFM_S, e.g.:
+#   kubectl create -f rankfm-4chip-bench.yaml   (uses the RANKFM_S set below)
+# or edit the RANKFM_S value below per submit.
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  generateName: rankfm-4chip-bench-
+  namespace: ns-mrs-core-shared
+spec:
+  replicatedJobs:
+  - name: worker
+    replicas: 1
+    template:
+      spec:
+        parallelism: 1
+        completions: 1
+        template:
+          spec:
+            containers:
+            - name: rankfm
+              image: us-central1-docker.pkg.dev/mrs-tpu-y317h/recml/rankfm_tpu:latest
+              imagePullPolicy: Always
+              env:
+              - name: PYTHONUNBUFFERED
+                value: "1"
+              - name: MASTER_PORT
+                value: "29500"
+              # libtpu compiler flags to overlap the data-parallel gradient
+              # all-reduces with backward compute. Without these, the trace
+              # showed 227 unfused all-reduces/step (~473ms, 45% of the step)
+              # with 0% overlap. Two groups:
+              #   * async collective fusion + compute/collective overlap
+              #   * data-parallel all-reduce optimization (TPU analog of DDP
+              #     gradient bucketing), incl. different-sized grads
+              # Flag names verified against a working Meta TPU setup (LWM:
+              # assistant/multimodal/world_model/third_party/LWM/scripts/
+              # run_train_text.sh). NOTE: libtpu FATALs on an unknown flag; if
+              # the pod dies at JAX init with "Unknown flag", drop the offender.
+              - name: LIBTPU_INIT_ARGS
+                value: >-
+                  --xla_tpu_megacore_fusion_allow_ags=false
+                  --xla_enable_async_collective_permute=true
+                  --xla_tpu_enable_ag_backward_pipelining=true
+                  --xla_tpu_enable_data_parallel_all_reduce_opt=true
+                  --xla_tpu_data_parallel_opt_different_sized_ops=true
+                  --xla_tpu_enable_async_collective_fusion=true
+                  --xla_tpu_enable_async_collective_fusion_multiple_steps=true
+                  --xla_tpu_overlap_compute_collective_tc=true
+                  --xla_enable_async_all_gather=true
+              # UIH history length S (-> --uih-history-len / seq_ro_per_sample_budget).
+              # Override per submit to sweep sequence length.
+              - name: RANKFM_S
+                value: "4096"
+              - name: JOBSET_NAME
+                valueFrom:
+                  fieldRef:
+                    fieldPath: metadata.labels['jobset.sigs.k8s.io/jobset-name']
+              # JAX persistent compilation cache: skip the ~22 min cold XLA
+              # compile on reruns (e.g. the S sweep). Shared across jobs; keyed by
+              # HLO + config so different S/layers get separate entries. The two
+              # threshold knobs force JAX to cache EVERY executable (defaults skip
+              # small/fast compiles).
+              - name: JAX_COMPILATION_CACHE_DIR
+                value: "gs://cq-mrs-core-shared_mrs_tpu_y317h/jax-compile-cache"
+              - name: JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES
+                value: "-1"
+              - name: JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS
+                value: "0"
+              command:
+              - sh
+              - -c
+              - >-
+                python3 -u -m recir.examples.rankfm.train
+                --local_batch_size 512
+                --hash_size_cap 1000000
+                --l1_num_layers 8
+                --l2_num_layers 10
+                --max_uih_seq_len "${RANKFM_S}"
+                --l2_max_seq_len 512
+                --num_candidates 10
+                --seq_ro_per_sample_budget "${RANKFM_S}"
+                --max_steps 50
+                --disable_seq_len_sampling
+                --enable_padding
+                --embedding_backend cpu
+                --bf16_training
+                --profile_start_step 25
+                --profile_end_step 40
+                --profile_dir "gs://cq-mrs-core-shared_mrs_tpu_y317h/tpu-profiles/${JOBSET_NAME}"
+                --enable_memory_log
+              ports:
+              - containerPort: 8471
+              resources:
+                limits:
+                  google.com/tpu: 4
+            nodeSelector:
+              cloud.google.com/gke-tpu-accelerator: tpu7x
+              cloud.google.com/gke-tpu-topology: 2x2x1
+            restartPolicy: Never
