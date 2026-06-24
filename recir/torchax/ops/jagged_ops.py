@@ -231,16 +231,30 @@ def _jax_concat_2d_jagged(
     )
     intra_offset = positions - combined_offsets[batch_idx]  # offset within the sample
     is_left = intra_offset < lengths_left[batch_idx]
-    source_left = jnp.clip(
-        offsets_left[batch_idx] + intra_offset, 0, values_left.shape[0] - 1
-    )
-    source_right = jnp.clip(
-        offsets_right[batch_idx] + (intra_offset - lengths_left[batch_idx]),
-        0,
-        values_right.shape[0] - 1,
-    )
-    gathered_left = values_left[source_left]
-    gathered_right = values_right[source_right]
+    # Guard against an empty side: when one operand has 0 rows (e.g. an empty
+    # left jagged tensor, or a per-device shard that received no rows under
+    # shard_map), ``values.shape[0] - 1`` is -1 and the gather of a size-1
+    # slice from a zero-length dim is out of range。
+    if values_left.shape[0] == 0:
+        gathered_left = jnp.zeros(
+            (out_total,) + values_left.shape[1:], dtype=values_left.dtype
+        )
+    else:
+        source_left = jnp.clip(
+            offsets_left[batch_idx] + intra_offset, 0, values_left.shape[0] - 1
+        )
+        gathered_left = values_left[source_left]
+    if values_right.shape[0] == 0:
+        gathered_right = jnp.zeros(
+            (out_total,) + values_right.shape[1:], dtype=values_right.dtype
+        )
+    else:
+        source_right = jnp.clip(
+            offsets_right[batch_idx] + (intra_offset - lengths_left[batch_idx]),
+            0,
+            values_right.shape[0] - 1,
+        )
+        gathered_right = values_right[source_right]
     out = jnp.where(
         _bcast_mask(is_left, gathered_left.ndim), gathered_left, gathered_right
     )
@@ -264,6 +278,11 @@ def _jax_split_2d_jagged(
     right[p] lives at values[p + offsets_left[sample + 1]].
     """
     batch_size = offsets_left.shape[0] - 1
+    # Guard against an empty input buffer
+    if values.shape[0] == 0:
+        left = jnp.zeros((seq_len_a,) + values.shape[1:], dtype=values.dtype)
+        right = jnp.zeros((seq_len_b,) + values.shape[1:], dtype=values.dtype)
+        return left, right
     positions_left = jnp.arange(seq_len_a)
     batch_idx_left = jnp.clip(
         jnp.searchsorted(offsets_left[1:], positions_left, side="right"),

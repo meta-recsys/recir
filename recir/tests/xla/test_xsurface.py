@@ -42,7 +42,7 @@ from recir.region_transforms.padding import (
     JaggedPairConfig,
     PaddingRegionTransform,
 )
-from recir.tests.xla.gspmd_test_utils import assert_hlo_has_collective
+from recir.tests.xla.gspmd_test_utils import _iter_subgraphs, assert_hlo_has_collective
 from recir.tests.xla.xsurface_test_utils import (
     _build_full_model,
     _build_overrides,
@@ -226,9 +226,7 @@ class TestXSurfaceXLACompile(unittest.TestCase):
         if use_padding:
             nd = self.num_ranks
             padded_bs = compute_padded_shape(global_bs, nd)
-            # Uniform batch ⇒ trace-time B_NRO = global_bs * C.
-            trace_pair_bs = global_bs * TEST_NUM_CANDIDATES
-            pair_padded_bs = compute_padded_shape(trace_pair_bs, nd)
+            pair_padded_bs = padded_bs * TEST_NUM_CANDIDATES
             override_bs = padded_bs
             # Deep-copy + resize avoids a second large-batch
             # ``RandomDataPipe`` call that can SIGABRT in its C++
@@ -394,8 +392,7 @@ class TestXSurfaceXLACompile(unittest.TestCase):
     def test_xsurface_has_xla_subgraphs(self) -> None:
         """Verify XLA subgraphs exist in setup/main/cleanup graphs."""
         compiled_obj, _ = self._build_compiled_train_step()
-        for gm_name in ("setup_gm", "main_gm", "cleanup_gm"):
-            gm = getattr(compiled_obj.gm, gm_name)
+        for gm_name, gm in _iter_subgraphs(compiled_obj.gm):
             xla_modules = [m for m in gm.modules() if isinstance(m, _XLAModule)]
             self.assertGreaterEqual(
                 len(xla_modules),
@@ -426,8 +423,7 @@ class TestXSurfaceXLACompile(unittest.TestCase):
         }
         seen_graphs: set[int] = set()
         pad_op_count = 0
-        for gm_name in ("setup_gm", "main_gm", "cleanup_gm"):
-            gm = getattr(compiled_obj.gm, gm_name)
+        for _, gm in _iter_subgraphs(compiled_obj.gm):
             for sub in [gm, *gm.modules()]:
                 if not hasattr(sub, "graph") or id(sub.graph) in seen_graphs:
                     continue
