@@ -755,6 +755,7 @@ class _XLAModule(torch.nn.Module):
         node: torch.fx.Node,
         placeholder_indices: dict[torch.fx.Node, int],
         is_fsdp_sharded: List[bool],
+        out_shape: Optional[Tuple[int, ...]] = None,
     ) -> Optional[int]:
         visited: set[torch.fx.Node] = set()
         queue = [node]
@@ -766,7 +767,21 @@ class _XLAModule(torch.nn.Module):
             if n.op == "placeholder":
                 idx = placeholder_indices.get(n)
                 if idx is not None and is_fsdp_sharded[idx]:
-                    return idx
+                    # Only attribute FSDP sharding to this output if the FSDP
+                    # placeholder is the param being CARRIED/updated by the output
+                    # (same shape). Without this, a *replicated* param's grad/update
+                    # -- which reaches an FSDP param through the shared loss graph --
+                    # would be mis-sharded P("torch_dist", None) (breaks when mixing
+                    # FSDP + replicated params, e.g. table-only sharding: a small
+                    # [100, D] table or a dense weight grad traced to the big table).
+                    if out_shape is None:
+                        return idx
+                    pval = n.meta.get("val", None)
+                    pshape = (
+                        tuple(getattr(pval, "shape", ())) if pval is not None else None
+                    )
+                    if pshape == out_shape:
+                        return idx
                 continue  # don't traverse beyond any placeholder
             for inp in n.all_input_nodes:
                 if inp not in visited:
@@ -829,17 +844,22 @@ class _XLAModule(torch.nn.Module):
                 out_sharding_list.append(batch_sharded)
                 continue
             leaf = out_leaves[i]
+            out_val = (
+                leaf.meta.get("val", None) if isinstance(leaf, torch.fx.Node) else None
+            )
+            out_shape = (
+                tuple(out_val.shape)
+                if out_val is not None and hasattr(out_val, "shape")
+                else None
+            )
             fsdp_src = (
-                self._find_fsdp_source(leaf, placeholder_indices, is_fsdp_sharded)
+                self._find_fsdp_source(
+                    leaf, placeholder_indices, is_fsdp_sharded, out_shape
+                )
                 if isinstance(leaf, torch.fx.Node)
                 else None
             )
             if fsdp_src is not None:
-                out_val = (
-                    leaf.meta.get("val", None)
-                    if isinstance(leaf, torch.fx.Node)
-                    else None
-                )
                 if out_val is not None and hasattr(out_val, "ndim"):
                     ndim = out_val.ndim
                 elif fsdp_src < len(args) and hasattr(args[fsdp_src], "ndim"):

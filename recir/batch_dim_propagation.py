@@ -259,6 +259,29 @@ def _output_batch_dim_for(
     if target == aten.embedding.default:
         return input_batch_dim
 
+    # recir::ringshift_embedding(ids[B,S], lengths[B], weight[V,D]) -> [B,S,D]: the custom
+    # ring-shift embedding op. Like aten.embedding, the batched ids' batch_dim is
+    # preserved at the output (dim 0). WITHOUT this rule the op is not in the safe
+    # list, so its [B,S,D] activation is left untagged -> _jit_gspmd defaults it to
+    # REPLICATED -> a [global_batch*seq, D] tensor is materialized per device
+    # (~tens of GB) -> XLA SPMD partitioner segfault. (String match avoids importing
+    # the op def into recir core / registration-order issues.)
+    # NOTE: only the FORWARD is tagged. The backward returns grad_weight[V,D] whose
+    # dim 0 is the VOCAB (not batch) and is FSDP-sharded via _find_fsdp_source;
+    # tagging it batch_dim=0 would wrongly batch-shard the vocab dim.
+    if str(target) == "recir.ringshift_embedding.default":
+        return input_batch_dim
+
+    # recir::fsdp_embedding(ids[B*S], weight[V,D]) -> [B*S, D]: the FSDP dense
+    # lookup custom op. Like aten.embedding, the batched ids' batch_dim (dim 0) is
+    # preserved at the output. It is a custom op (not covered by the aten.embedding
+    # rule above), so tag it here too; otherwise its activation is left untagged ->
+    # REPLICATED -> per-device full materialization -> SPMD segfault. As with
+    # ring-shift, only the FORWARD is tagged (the backward grad_weight[V,D] dim 0 is
+    # the VOCAB, FSDP-sharded via _find_fsdp_source).
+    if str(target) == "recir.fsdp_embedding.default":
+        return input_batch_dim
+
     # convolution(input, weight, ...): input is [N, C, *spatial]; the conv
     # walks the spatial dims and emits [N, C_out, *spatial_out]. As long as
     # input_batch_dim points at the N axis (the typical case), the output
