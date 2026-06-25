@@ -1216,8 +1216,9 @@ def _create_random_train_batch(
 
     All keys, shapes, and per-key lengths come from the feature config
     (``_RO_HISTORY_FEATURES``, ``_RO_CONTEXTUAL_FEATURES``,
-    ``_NRO_FEATURES``).  ``randgen`` produces jagged num_candidates and
-    variable RO history lengths when given a RecROORandGenContext.
+    ``_NRO_FEATURES``).  ``randgen`` produces jagged num_candidates (up to
+    ``num_candidates``) and variable RO history lengths when given a
+    RecROORandGenContext.
 
     ``num_candidates`` overrides the per-request candidate count; when left at
     the ``-1`` sentinel it falls back to ``TEST_NUM_CANDIDATES`` (preserving the

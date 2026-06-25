@@ -160,6 +160,111 @@ def _build_data_pipe(
     return pipe
 
 
+def make_padding_region_transforms(
+    num_candidates_per_sample: int,
+    padded_num_devices: int,
+    num_processes: int,
+) -> List[Any]:
+    """Build the rankfm train-step PaddingRegionTransform list.
+
+    Extracted so the prod train loop (``_build_compiled_train_step``) and the
+    parity test (``parity_forward_loss``) share ONE definition -- a drift in
+    ``skip_args`` / ``jagged_pairs`` between them would silently break parity.
+    """
+    return [
+        PaddingRegionTransform(
+            jagged_pairs={
+                # RO/NRO id-list pairs are opted out below -- they only
+                # flow into PreprocessorDispatcher (a CPU graph break)
+                # and stay at local stride throughout the preprocessor.
+                # The dispatcher handles the padding.
+                "unary_values": JaggedPairConfig(
+                    "unary_lengths",
+                    per_sample_budgets=1,
+                    batch_size_arg="nro_float_features",
+                    count_arg="num_candidates",
+                    max_per_sample_count=num_candidates_per_sample,
+                ),
+            },
+            batch_size_arg="ro_float_features",
+            # Align to lcm(GSPMD devices, total SC count) so PRT's runtime
+            # delivery matches the override-build sample's padded shape
+            # (which uses the same modulus above).
+            num_devices=padded_num_devices,
+            num_processes=num_processes,
+            skip_args={
+                "ro_id_list_values",
+                "ro_id_list_lengths",
+                "nro_id_list_values",
+                "nro_id_list_lengths",
+                "candidate_sum",
+                "world_candidate_sum",
+            },
+        ),
+    ]
+
+
+def prepare_override_build_sample(
+    batch: Any,
+    module_config: BlueReelsVDDModuleConfig,
+    global_bs: int,
+    num_candidates_per_sample: int,
+    padded_num_devices: int,
+    enable_padding: bool,
+) -> Tuple[Any, int]:
+    """Resize ``batch`` to the override-build size; return ``(batch_sample,
+    override_bs)``.
+
+    The override-build sample is sized at GLOBAL (padded when padding is on) so
+    the override cached_output shapes match the FX trace + PRT pad outputs.
+    Shared by prod train and the parity test so the override sizing cannot
+    drift from the PaddingRegionTransform sizing.
+    """
+    if enable_padding:
+        # Override-build sample uses GLOBAL (padded) sizes -- matches PRT's
+        # pad_to_static fake kernel which also returns the global target_size,
+        # so FX trace shapes are consistent across override outputs and PRT pad
+        # outputs. At runtime fwd_fn returns PER-HOST data and _to_sharded_jax
+        # expands per-host -> global, matching PRT runtime.
+        padded_ro_bs = compute_padded_shape(global_bs, padded_num_devices)
+        # padded_nro_bs = padded_ro_bs * per-sample NRO budget: each RO sample
+        # contributes exactly static_nro_per_sample_budget NRO entries.
+        padded_nro_bs = padded_ro_bs * num_candidates_per_sample
+        expanded_batch = copy.deepcopy(batch)
+        resize_batch_inplace(
+            expanded_batch,
+            target_b_ro=padded_ro_bs,
+            target_b_nro=padded_nro_bs,
+        )
+        # Force each RO key's per-sample length to its configured budget.
+        if module_config.static_ro_per_sample_budgets:
+            expanded_batch.ro_id_list_features = resize_kjt_per_key_lengths(
+                expanded_batch.ro_id_list_features,
+                module_config.static_ro_per_sample_budgets,
+                batch_size=padded_ro_bs,
+            )
+        override_bs = padded_ro_bs
+    else:
+        expanded_batch = copy.deepcopy(batch)
+        resize_batch_inplace(
+            expanded_batch,
+            target_b_ro=global_bs,
+            target_b_nro=global_bs * num_candidates_per_sample,
+        )
+        override_bs = global_bs
+
+    all_labels = expanded_batch.all_labels
+    assert all_labels is not None
+    batch_sample = _inputs_to_feature_bundle(
+        expanded_batch.ro_id_list_features,
+        None,
+        expanded_batch.nro_id_list_features,
+        expanded_batch.num_candidates,
+        all_labels,
+    )
+    return batch_sample, override_bs
+
+
 def _build_compiled_train_step(
     trainer_cfg: RankFMTrainerConfig,
     module_config: BlueReelsVDDModuleConfig,
@@ -236,49 +341,13 @@ def _build_compiled_train_step(
             batch_size=trainer_cfg.local_batch_size,
         )
 
-    if trainer_cfg.enable_padding:
-        # Override-build sample uses GLOBAL sizes (matches PRT's pad_to_static
-        # fake kernel which also returns global ``target_size``). Keeps FX
-        # trace shapes consistent across override outputs and PRT pad outputs
-        # (both at global). At runtime, fwd_fn returns PER-HOST data so
-        # _to_sharded_jax can expand per-host to global, matching PRT runtime.
-        padded_ro_bs = compute_padded_shape(global_bs, padded_num_devices)
-        # padded_nro_bs = padded_ro_bs × per-sample NRO budget. Each RO sample
-        # contributes exactly static_nro_per_sample_budget NRO entries, so the
-        # NRO dimension scales with the (already padded) RO batch. Divisibility
-        # by padded_num_devices follows from padded_ro_bs alignment.
-        padded_nro_bs = padded_ro_bs * num_candidates_per_sample
-        expanded_batch = copy.deepcopy(batch)
-        resize_batch_inplace(
-            expanded_batch,
-            target_b_ro=padded_ro_bs,
-            target_b_nro=padded_nro_bs,
-        )
-        # Force each RO key's per-sample length to its configured budget.
-        if module_config.static_ro_per_sample_budgets:
-            expanded_batch.ro_id_list_features = resize_kjt_per_key_lengths(
-                expanded_batch.ro_id_list_features,
-                module_config.static_ro_per_sample_budgets,
-                batch_size=padded_ro_bs,
-            )
-        override_bs = padded_ro_bs
-    else:
-        expanded_batch = copy.deepcopy(batch)
-        resize_batch_inplace(
-            expanded_batch,
-            target_b_ro=global_bs,
-            target_b_nro=global_bs * num_candidates_per_sample,
-        )
-        override_bs = global_bs
-
-    all_labels = expanded_batch.all_labels
-    assert all_labels is not None
-    batch_sample = _inputs_to_feature_bundle(
-        expanded_batch.ro_id_list_features,
-        None,
-        expanded_batch.nro_id_list_features,
-        expanded_batch.num_candidates,
-        all_labels,
+    batch_sample, override_bs = prepare_override_build_sample(
+        batch,
+        module_config,
+        global_bs,
+        num_candidates_per_sample,
+        padded_num_devices,
+        trainer_cfg.enable_padding,
     )
 
     ro_kjt_keys: List[str] = list(batch.ro_id_list_features.keys())
@@ -351,37 +420,9 @@ def _build_compiled_train_step(
 
     region_transforms: List[Any] = []
     if trainer_cfg.enable_padding:
-        region_transforms = [
-            PaddingRegionTransform(
-                jagged_pairs={
-                    # RO/NRO id-list pairs are opted out below — they only
-                    # flow into PreprocessorDispatcher (a CPU graph break)
-                    # and stay at local stride throughout the preprocessor.
-                    # The dispatcher handles the padding.
-                    "unary_values": JaggedPairConfig(
-                        "unary_lengths",
-                        per_sample_budgets=1,
-                        batch_size_arg="nro_float_features",
-                        count_arg="num_candidates",
-                        max_per_sample_count=num_candidates_per_sample,
-                    ),
-                },
-                batch_size_arg="ro_float_features",
-                # Align to lcm(GSPMD devices, total SC count) so PRT's runtime
-                # delivery matches the override-build sample's padded shape
-                # (which uses the same modulus above).
-                num_devices=padded_num_devices,
-                num_processes=num_processes,
-                skip_args={
-                    "ro_id_list_values",
-                    "ro_id_list_lengths",
-                    "nro_id_list_values",
-                    "nro_id_list_lengths",
-                    "candidate_sum",
-                    "world_candidate_sum",
-                },
-            ),
-        ]
+        region_transforms = make_padding_region_transforms(
+            num_candidates_per_sample, padded_num_devices, num_processes
+        )
 
     parallel_mode = GSPMDParallel(
         "replicate",
