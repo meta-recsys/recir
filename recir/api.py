@@ -516,15 +516,42 @@ def _make_batch_transform(
 
     def _get_full_batch_arg(arg: torch.Tensor) -> torch.Tensor:
         fake_arg = fake_mode.from_tensor(arg)
+        # Return the fake input untouched in two no-op cases:
+        #   * No mini-batch dim to expand/shrink: 0-d scalar tensors (or any
+        #     tensor whose rank is <= input_batch_dim). Indexing the missing
+        #     dim below would otherwise IndexError.
+        #   * ratio == 1 (documented no-op). Skipping here is also what keeps
+        #     dynamic shapes alive: falling through to ``int(curr_batch *
+        #     ratio)`` would emit an equality guard that specializes the batch
+        #     SymInt to its trace-time value, silently freezing the per-batch
+        #     (candidate) dimension on the single-device-per-process path.
+        if fake_arg.ndim <= input_batch_dim or ratio == 1:
+            return fake_arg
         curr_batch = fake_arg.shape[input_batch_dim]
-        target_batch = max(1, int(curr_batch * ratio))
-        if target_batch > curr_batch:
+        # Integer expand (ratio > 1 and integer-valued).
+        if isinstance(ratio, int) or (
+            isinstance(ratio, float) and ratio > 1.0 and ratio.is_integer()
+        ):
+            n = int(ratio)
             repeat_dims = [1] * arg.ndim
-            repeat_dims[input_batch_dim] = target_batch // curr_batch
+            repeat_dims[input_batch_dim] = n
             return fake_arg.repeat(repeat_dims)
-        elif target_batch < curr_batch:
-            return fake_arg.narrow(input_batch_dim, 0, target_batch)
-        return fake_arg
+        # Integer fraction shrink (ratio = 1/N, N integer >= 2).
+        if isinstance(ratio, float) and 0 < ratio < 1.0:
+            inv = 1.0 / ratio
+            if inv.is_integer():
+                n = int(inv)
+                target_batch = curr_batch // n  # SymInt // int -> SymInt
+                return fake_arg.narrow(input_batch_dim, 0, target_batch)
+        # Any other ratio (non-integer and non-1/N) could only be applied via
+        # ``int(curr_batch * ratio)``, which specializes the batch SymInt and
+        # silently breaks dynamic shapes. No current caller produces such a
+        # ratio (HDP/DP -> 1/N; GSPMD -> integer num_processes), so reject it
+        # instead of specializing behind the caller's back.
+        raise AssertionError(
+            f"_make_batch_transform: unsupported batch ratio {ratio!r}; "
+            "expected 1, a positive integer, or 1/N for integer N >= 2."
+        )
 
     return _get_full_batch_arg
 

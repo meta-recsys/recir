@@ -353,7 +353,7 @@ class TraceableMoTPreprocessor(nn.Module):
         builder = FeatureBundleBuilder()
         builder.set(InputFeatures.UIH_ID_LIST, ro_kjt)
         builder.set(InputFeatures.CANDIDATE_ID_LIST, nro_kjt)
-        builder.set(InputFeatures.NUM_CANDIDATES, num_candidates)
+        builder.set(InputFeatures.NUM_CANDIDATES, num_candidates.to(torch.int64))
         if self._has_uih_float and ro_float.numel() > 0:
             builder.set(InputFeatures.UIH_FLOAT, ro_float)
         if self._has_supervision_weight and sup_weight.numel() > 0:
@@ -452,10 +452,22 @@ class TraceableMoTPreprocessor(nn.Module):
                 torch._check_is_size(sz)
                 out.append(torch.empty(sz, dtype=dtype, device=ro_values.device))
             elif kind == "batch_dense_2d":
-                _, _, dim0, dtype = spec
-                sz = ctx.new_dynamic_size()
-                torch._check_is_size(sz)
-                out.append(torch.empty(dim0, sz, dtype=dtype, device=ro_values.device))
+                # Both dims SymInt. Previously dim 0 was baked from the
+                # sample's val.shape[0] as a concrete int. That worked for
+                # per-user-batch outputs (PAST_TIMESTAMPS, where dim 0 = B
+                # is constant across batches) but broke for per-candidate
+                # outputs (DENSE_TIMESTAMPS, where dim 0 = num_candidates.sum()
+                # varies per batch). The sample value would bake into
+                # downstream view/cat ops and assert at runtime on any batch
+                # with a different total candidate count.
+                # `dim0` is still in the spec tuple for backwards compat but
+                # ignored here.
+                _, _, _dim0, dtype = spec
+                sz0 = ctx.new_dynamic_size()
+                torch._check_is_size(sz0)
+                sz1 = ctx.new_dynamic_size()
+                torch._check_is_size(sz1)
+                out.append(torch.empty(sz0, sz1, dtype=dtype, device=ro_values.device))
             elif kind in ("batch_dense_1d", "high_dim_tensor"):
                 # Both store full concrete shape from sample (1D per-batch
                 # vs >=3D fallback) -- same handling here.
