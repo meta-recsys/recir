@@ -24,12 +24,14 @@ if "xla_force_host_platform_device_count" not in _existing_xla_flags:
 
 import copy
 import unittest
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, List, Tuple
+from unittest.mock import patch
 
 import jax  # @manual
 import torch
 import torch.nn as nn
 from hammer.v3.models.udd_fm_v3.udd_fm_train_v3 import BlueReelsVDDTrainV3
+from hammer.v3.models.udd_fm_v3.utils import world_candidate_sum
 from hammer.v3.modules.recblock import _inputs_to_feature_bundle
 from recir.api import _local_compile, compile, sync_device_state_to_torch
 from recir.backends import XLAGSPMDBackend
@@ -46,7 +48,6 @@ from recir.tests.xla.gspmd_test_utils import _iter_subgraphs, assert_hlo_has_col
 from recir.tests.xla.xsurface_test_utils import (
     _build_full_model,
     _build_overrides,
-    _create_random_train_batch,
     _create_uniform_train_batch,
     _make_sample_input,
     _verify_traced_graph,
@@ -115,7 +116,6 @@ class XSurfaceFakeTracingCompatTest(unittest.TestCase):
 
         model.set_recir_kjt_keys(ro_kjt.keys(), nro_kjt.keys(), unary_kjt.keys())
 
-        # pyre-ignore
         def forward_fn(
             mod: BlueReelsVDDTrainV3,
             ro_float_features: torch.Tensor,
@@ -195,8 +195,10 @@ class TestXSurfaceXLACompile(unittest.TestCase):
         self.num_ranks: int = len(self.devices)
 
     def _build_compiled_train_step(
-        self, num_steps: int = 1, use_padding: bool = False
-    ) -> Tuple[Any, BlueReelsVDDTrainV3]:
+        self,
+        num_steps: int = 1,
+        use_padding: bool = False,
+    ) -> Tuple[Any, BlueReelsVDDTrainV3, List[torch.Tensor]]:
         """Build the model, compile with XLA GSPMD, and run num_steps."""
         torch.manual_seed(42)
         device = torch.device("cpu")
@@ -280,7 +282,6 @@ class TestXSurfaceXLACompile(unittest.TestCase):
                 "replicate",
                 loss_reduction="sum",
                 num_ranks=self.num_ranks,
-                num_processes=1,
             ),
             "backend": XLAGSPMDBackend(),
         }
@@ -321,11 +322,17 @@ class TestXSurfaceXLACompile(unittest.TestCase):
                 },
                 batch_size_arg="ro_float_features",
                 num_devices=self.num_ranks,
-                num_processes=1,
+                skip_args={
+                    "ro_id_list_values",
+                    "ro_id_list_lengths",
+                    "nro_id_list_values",
+                    "nro_id_list_lengths",
+                    "candidate_sum",
+                    "world_candidate_sum",
+                },
             )
             compile_kwargs["region_transforms"] = [padding_transform]
 
-        # pyre-ignore
         def train_step_fn(
             mod: nn.Module,
             opt: torch.optim.Optimizer,
@@ -341,7 +348,9 @@ class TestXSurfaceXLACompile(unittest.TestCase):
             supervision_label_t: torch.Tensor,
             supervision_weight_t: torch.Tensor,
             all_labels: Dict[str, torch.Tensor],
-        ) -> None:
+            candidate_sum: torch.Tensor,
+            world_candidate_sum: torch.Tensor,
+        ) -> torch.Tensor:
             all_losses, _ = mod(
                 ro_float_features,
                 nro_float_features,
@@ -355,15 +364,21 @@ class TestXSurfaceXLACompile(unittest.TestCase):
                 supervision_label_t,
                 supervision_weight_t,
                 all_labels,
+                candidate_sum,
+                world_candidate_sum,
             )
             loss: torch.Tensor = all_losses.sum()
             loss.backward()
             opt.step()
+            return all_losses
 
-        train_step = compile(**compile_kwargs)(train_step_fn)  # pyre-ignore[6]
+        train_step = compile(**compile_kwargs)(train_step_fn)
 
+        candidate_sum = batch.num_candidates.sum()
+        wcs = world_candidate_sum(batch.num_candidates)
+        all_losses_list = []
         for _ in range(num_steps):
-            train_step(
+            step_losses = train_step(
                 model,
                 opt,
                 batch.ro_float_features,
@@ -378,20 +393,24 @@ class TestXSurfaceXLACompile(unittest.TestCase):
                 batch.supervision_label.t().contiguous(),
                 batch.supervision_weight.t().contiguous(),
                 batch.all_labels,
+                candidate_sum,
+                wcs,
             )
             sync_device_state_to_torch(train_step)
+            if step_losses is not None:
+                all_losses_list.append(step_losses.detach().clone())
 
         compiled_obj = train_step.__dict__["_compiled_obj"]
-        return compiled_obj, model
+        return compiled_obj, model, all_losses_list
 
     def test_xsurface_compiles(self) -> None:
         """Verify the full model compiles through the XLA GSPMD pipeline."""
-        compiled_obj, _ = self._build_compiled_train_step()
+        compiled_obj, _, _ = self._build_compiled_train_step()
         self.assertIsNotNone(compiled_obj)
 
     def test_xsurface_has_xla_subgraphs(self) -> None:
         """Verify XLA subgraphs exist in setup/main/cleanup graphs."""
-        compiled_obj, _ = self._build_compiled_train_step()
+        compiled_obj, _, _ = self._build_compiled_train_step()
         for gm_name, gm in _iter_subgraphs(compiled_obj.gm):
             xla_modules = [m for m in gm.modules() if isinstance(m, _XLAModule)]
             self.assertGreaterEqual(
@@ -402,7 +421,7 @@ class TestXSurfaceXLACompile(unittest.TestCase):
 
     def test_xsurface_hlo_has_collective(self) -> None:
         """Verify the compiled HLO contains all-reduce for GSPMD."""
-        compiled_obj, _ = self._build_compiled_train_step()
+        compiled_obj, _, _ = self._build_compiled_train_step()
         assert_hlo_has_collective(self, compiled_obj, "all-reduce", "XLA_GSPMD")
 
     def test_xsurface_compiles_with_padding(self) -> None:
@@ -413,7 +432,7 @@ class TestXSurfaceXLACompile(unittest.TestCase):
         verifying PRT inserted any pad nodes (a silently-skipped PRT would
         still ``assertIsNotNone``).
         """
-        compiled_obj, _ = self._build_compiled_train_step(use_padding=True)
+        compiled_obj, _, _ = self._build_compiled_train_step(use_padding=True)
         self.assertIsNotNone(compiled_obj)
         pad_targets = {
             torch.ops.recir_padding.pad_to_static.default,
@@ -448,6 +467,7 @@ class TestXSurfaceXLACompile(unittest.TestCase):
         (so dummy candidates contribute zero loss). After one train step
         from identical seeded init, parameters and buffers should match
         bit-exactly. If this test fails, the padding op pairing is broken.
+
         """
         nd = self.num_ranks
         global_bs = TEST_BATCH_SIZE * nd
@@ -462,8 +482,12 @@ class TestXSurfaceXLACompile(unittest.TestCase):
             "padding must add ≥1 dummy pair at the B_NRO dim",
         )
 
-        _, model_no_pad = self._build_compiled_train_step(use_padding=False)
-        _, model_padded = self._build_compiled_train_step(use_padding=True)
+        _, model_no_pad, losses_no_pad = self._build_compiled_train_step(
+            use_padding=False,
+        )
+        _, model_padded, losses_padded = self._build_compiled_train_step(
+            use_padding=True,
+        )
 
         def state_tensors(m: nn.Module) -> Dict[str, torch.Tensor]:
             # Skip override scaffolding: `DummyPreprocessorStack` and
@@ -485,6 +509,17 @@ class TestXSurfaceXLACompile(unittest.TestCase):
                     state[n] = b
             return state
 
+        for step_idx, (ref_losses, pad_losses) in enumerate(
+            zip(losses_no_pad, losses_padded)
+        ):
+            torch.testing.assert_close(
+                pad_losses,
+                ref_losses,
+                atol=1e-6,
+                rtol=1e-5,
+                msg=lambda msg, s=step_idx: f"step {s} per-task losses diverged: {msg}",
+            )
+
         pad_state = state_tensors(model_padded)
         ref_state = state_tensors(model_no_pad)
         self.assertEqual(set(pad_state.keys()), set(ref_state.keys()))
@@ -496,3 +531,42 @@ class TestXSurfaceXLACompile(unittest.TestCase):
                 rtol=1e-3,
                 msg=lambda msg, n=name: f"state {n} diverged after train step: {msg}",
             )
+
+
+class WorldCandidateSumTest(unittest.TestCase):
+    """Regression coverage for the multi-host loss-normalization bug: the
+    per-task loss denominator must be the GLOBAL real candidate count, not the
+    per-host ``num_candidates.sum()``."""
+
+    def test_local_sum_when_not_distributed(self) -> None:
+        nc = torch.tensor([2, 3, 4], dtype=torch.int64)
+        out = world_candidate_sum(nc)
+        self.assertEqual(out.item(), 9)
+        self.assertEqual(out.ndim, 0)
+
+    def test_all_reduce_global_sum_when_distributed(self) -> None:
+        nc = torch.tensor([2, 3, 4], dtype=torch.int64)
+
+        def fake_all_reduce(t: torch.Tensor, op: object = None) -> None:
+            t.add_(9)
+
+        with (
+            patch(
+                "hammer.v3.models.udd_fm_v3.utils.dist.is_available",
+                return_value=True,
+            ),
+            patch(
+                "hammer.v3.models.udd_fm_v3.utils.dist.is_initialized",
+                return_value=True,
+            ),
+            patch(
+                "hammer.v3.models.udd_fm_v3.utils.dist.all_reduce",
+                side_effect=fake_all_reduce,
+            ) as mock_ar,
+        ):
+            out = world_candidate_sum(nc)
+
+        mock_ar.assert_called_once()
+        self.assertEqual(mock_ar.call_args.kwargs["op"], torch.distributed.ReduceOp.SUM)
+        self.assertEqual(out.item(), 18)
+        self.assertEqual(nc.sum().item(), 9)

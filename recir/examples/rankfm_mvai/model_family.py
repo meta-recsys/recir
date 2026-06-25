@@ -102,6 +102,8 @@ def _udd_fm_v3_train_step(
     supervision_label_t: torch.Tensor,
     supervision_weight_t: torch.Tensor,
     all_labels: Dict[str, torch.Tensor],
+    candidate_sum: torch.Tensor,
+    world_candidate_sum: torch.Tensor,
 ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
     """Named-signature train step for the GSPMD/TPU compile.
 
@@ -128,6 +130,8 @@ def _udd_fm_v3_train_step(
         supervision_label_t,
         supervision_weight_t,
         all_labels,
+        candidate_sum,
+        world_candidate_sum,
     )
 
 
@@ -278,6 +282,8 @@ class RecirXLACompiledModule(RecirCompiledModuleBase):
                         "ro_id_list_lengths",
                         "nro_id_list_values",
                         "nro_id_list_lengths",
+                        "candidate_sum",
+                        "world_candidate_sum",
                     },
                 ),
             ]
