@@ -15,6 +15,10 @@ RUN pip install --upgrade pip
 # JAX with TPU support (>= 0.10 for tpu_sc + tpu split-DMA primitives).
 RUN pip install "jax[tpu]"
 
+# SparseCore embedding lookup (jte) for the ringshift_bench --backend sc/all arm
+# (the SC-vs-TC comparison). Mirrors recir/examples/dlrmv3/Dockerfile.
+RUN pip install jax-tpu-embedding
+
 # Copy and install recir.
 COPY . /app/recir
 RUN pip install -e "/app/recir"

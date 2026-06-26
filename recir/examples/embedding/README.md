@@ -124,3 +124,58 @@ A perf run prints per-iter timings followed by:
 ```
 
 Compare medians of `ra2a` vs `fused` for the headline speedup.
+
+## SparseCore vs TensorCore (forward)
+
+`ringshift_bench.py` can also benchmark the **existing SparseCore solution**
+(D108080994 / DLRMv3): the raw `@SparseDenseMatmulOp` custom call emitted by
+`recir.examples.dlrmv3.sparsecore_ops.sc_matmul_fwd` (NOT jte's
+`tpu_sparse_dense_matmul` primitive), driven in the non-pooling "sequence token
+trick" mode (valency=1, one id per output row) and distributed across all cores
+via `shard_map` so it triggers the SparseCore all-to-all. `jax_tpu_embedding`
+(jte) is used only for host-side CSR preprocessing + feature/table specs. This is
+measured against the two TensorCore arms at a matched
+`(world_size, dim, max_local_ids, distribution)` shape:
+
+```python
+from recir.examples.embedding.ringshift_bench import main  # --backend {tc,sc,all}
+```
+
+| `--backend` | Arms measured                                                     |
+| ----------- | ----------------------------------------------------------------- |
+| `tc`        | `ra2a` (TC `lax.ragged_all_to_all`) + `fused` (TC ring-shift)     |
+| `sc`        | `sc` (SparseCore `tpu_sparse_dense_matmul`)                       |
+| `all`       | all three (default for `--mode fwd`)                              |
+
+A single headline line carries the medians:
+
+```
+[BENCH_FWD_W128_D256_Q550816_uniform] === RESULT fwd: fused=…ms sc=…ms ===
+```
+
+Notes:
+- The SC arm needs `jax-tpu-embedding` (jte). It is installed in the embedding
+  image (see `Dockerfile`); rebuild via `build_image_podman.sh` before running
+  the SC arm. jte is imported lazily, so `--backend tc` still runs without it.
+- The SC arm meshes its table over **all** `jax.devices()`, so run the
+  comparison with `--device-stride 1` (the SC manifest does) so both backends
+  use the same device set.
+- Host-side CSR preprocessing (`preprocess_sparse_dense_matmul_input`, CPU) is
+  logged separately as `sc CSR preprocess: …ms (host)`; the `sc=…` median is the
+  **device forward** only, for an apples-to-apples comparison with the ring-shift
+  device forward.
+- `bwd` mode is TensorCore-only here (SparseCore backward is out of scope).
+
+Manifest:
+
+| Manifest             | Topology | What it runs                                         |
+| -------------------- | -------- | ---------------------------------------------------- |
+| `rankfm-550k.yaml`   | `4x4x4`  | `--backend all` at rankfm E2E scale (fused/sc, bf16, traces) |
+
+```sh
+./recir/examples/embedding/run_microbench.sh manifests/rankfm-550k.yaml
+```
+
+To add the SC arm to any existing perf manifest, append `--backend all
+--device-stride 1` to its `ringshift_bench` command (after rebuilding the image
+with jte).
