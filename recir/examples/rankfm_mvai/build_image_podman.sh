@@ -201,6 +201,10 @@ from recir.tests.xla.xsurface_test_utils import PreprocessorDispatcher, SparseAr
 # TPU pod startup. (main() is __name__-guarded, so no jax.distributed init runs.)
 import recir.examples.rankfm_mvai.train  # noqa: F401
 print('rankfm_mvai.train entry import: OK')
+# Also import the parity harness (__name__-guarded, no jax init at import) so a
+# missing staged dep fails the BUILD here, not at parity run time.
+import recir.examples.rankfm_mvai.parity_forward_loss  # noqa: F401
+print('rankfm_mvai.parity_forward_loss import: OK')
 print()
 print('All imports OK!')
 "
