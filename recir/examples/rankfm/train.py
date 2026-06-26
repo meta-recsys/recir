@@ -265,7 +265,7 @@ def prepare_override_build_sample(
     return batch_sample, override_bs
 
 
-def _build_compiled_train_step(
+def _build_compiled_train_step(  # noqa: C901
     trainer_cfg: RankFMTrainerConfig,
     module_config: BlueReelsVDDModuleConfig,
     feature_config: BlueReelsVDDFeatureConfig,
@@ -274,11 +274,11 @@ def _build_compiled_train_step(
     num_processes: int,
     global_bs: int,
     data_pipe: Optional[BatchReplayPipe] = None,
-) -> Tuple[Any, Any, Any, Any, Any, Dict[str, int], List[int]]:
+) -> Tuple[Any, Any, Any, Any, Any, Any, Dict[str, int], List[int]]:
     """Build model, batch, overrides, and the compiled train_step.
 
-    Returns ``(train_step, model, opt, batch, feature_config, key_to_size,
-    ro_per_key_budgets)``.  ``key_to_size`` is the model's KJT-feature ->
+    Returns ``(train_step, model, opt, emb_opt, batch, feature_config,
+    key_to_size, ro_per_key_budgets)``.  ``key_to_size`` is the model's KJT-feature ->
     num_embeddings map computed pre-backend.setup (post-DMP the EC is wrapped
     in a ``ShardedEmbeddingCollection`` that doesn't expose
     ``embedding_configs()``); use it to clamp loaded IDs into the model's
@@ -402,6 +402,26 @@ def _build_compiled_train_step(
     )
 
     dense_params = backend.dense_named_parameters(model)
+    # In-graph embedding tables get their OWN optimizer instance, with a separate
+    # learning rate (embedding_lr) from the dense params -- so embeddings are not
+    # tied to the dense optimizer/LR (matching production, where sparse embeddings
+    # are trained separately). SGD is used (stateless) so the second optimizer
+    # traces cleanly; a stateful algorithm (Adam/Adagrad) would need capturable
+    # mode + optimizer-state pre-materialization to trace and persist. Only the
+    # in_graph backend exposes
+    # embedding_named_parameters(); for other backends emb_params is empty and
+    # emb_opt stays None (the single-optimizer path is unchanged). Both opt.step()s
+    # are traced into the one compiled program (recir collects multiple optimizers,
+    # each owning a disjoint set of FQNs).
+    # TODO: support Adagrad (the production sparse-embedding optimizer) for the
+    # embedding optimizer. Adagrad's in-graph step is not traceable as-is (a
+    # step-dependent scalar is read via .item() -> DataDependentOutputException
+    # under make_fx); enabling it needs capturable=True + pre-materializing the
+    # optimizer state before trace so recir lifts/persists it. SGD (below) is the
+    # stateless stopgap.
+    _emb_named_fn = getattr(backend, "embedding_named_parameters", None)
+    emb_params = _emb_named_fn(model) if _emb_named_fn is not None else {}
+    emb_opt: Optional[torch.optim.Optimizer] = None
     if dist.is_initialized():
         opt: torch.optim.Optimizer = KeyedOptimizerWrapper(
             dict(dense_params),
@@ -409,12 +429,25 @@ def _build_compiled_train_step(
                 params, lr=trainer_cfg.dense_optimizer_config.lr, foreach=True
             ),
         )
+        if emb_params:
+            emb_opt = KeyedOptimizerWrapper(
+                dict(emb_params),
+                lambda params: torch.optim.SGD(
+                    params, lr=trainer_cfg.embedding_lr, foreach=True
+                ),
+            )
     else:
         opt = torch.optim.SGD(
             list(dense_params.values()),
             lr=trainer_cfg.dense_optimizer_config.lr,
             foreach=True,
         )
+        if emb_params:
+            emb_opt = torch.optim.SGD(
+                list(emb_params.values()),
+                lr=trainer_cfg.embedding_lr,
+                foreach=True,
+            )
 
     model.set_recir_kjt_keys(ro_kjt_keys, nro_kjt_keys, unary_kjt_keys)
 
@@ -436,6 +469,7 @@ def _build_compiled_train_step(
     def train_step_fn(
         mod: nn.Module,
         opt: torch.optim.Optimizer,
+        emb_opt: Optional[torch.optim.Optimizer],
         ro_float_features: torch.Tensor,
         nro_float_features: torch.Tensor,
         ro_id_list_values: torch.Tensor,
@@ -470,6 +504,10 @@ def _build_compiled_train_step(
         loss: torch.Tensor = all_losses.sum()
         loss.backward()
         opt.step()
+        # In-graph embedding tables are trained by their own optimizer instance
+        # (separate LR from dense); both steps are traced into the compiled graph.
+        if emb_opt is not None:
+            emb_opt.step()
         # recir's compiled-step output handling materializes tensor/list/tuple
         # results back to the host (NOT dict), so return a fixed tuple:
         # (total loss, per-task loss vector).
@@ -478,6 +516,7 @@ def _build_compiled_train_step(
     train_step = _compile_with_xsurface_dispatchers(
         model,
         opt,
+        emb_opt,
         batch,
         overrides,
         train_step_fn,
@@ -490,6 +529,7 @@ def _build_compiled_train_step(
         train_step,
         model,
         opt,
+        emb_opt,
         batch,
         feature_config,
         key_to_size,
@@ -500,6 +540,7 @@ def _build_compiled_train_step(
 def _compile_with_xsurface_dispatchers(
     model: nn.Module,
     opt: torch.optim.Optimizer,
+    emb_opt: Optional[torch.optim.Optimizer],
     batch: Any,
     dispatchers: List[Any],
     callable_: Any,
@@ -526,6 +567,7 @@ def _compile_with_xsurface_dispatchers(
         callable_,
         model_to_train,
         opt,
+        emb_opt,
         *_extract_train_step_args(batch),
         parallel_mode=parallel_mode,
         region_transforms=region_transforms,
@@ -805,6 +847,7 @@ def _run_training_loop(  # noqa: C901
     train_step: Any,
     model: nn.Module,
     opt: torch.optim.Optimizer,
+    emb_opt: Optional[torch.optim.Optimizer],
     batch: Any,
     is_main: bool,
     global_bs: int,
@@ -888,7 +931,7 @@ def _run_training_loop(  # noqa: C901
             # H2D/dispatch while this step computes on-device. The handle is kept
             # (cheap: loss scalar + small stats) until the next pull so its metrics
             # are not lost.
-            out = train_step(model, opt, *_extract_train_step_args(batch))
+            out = train_step(model, opt, emb_opt, *_extract_train_step_args(batch))
             pending_outs.append(out)
             # While profiling, block per-step so each profiled step lands as its
             # own fully-captured device module in the trace. Otherwise the async
@@ -1031,6 +1074,7 @@ def main() -> None:
         train_step,
         model,
         opt,
+        emb_opt,
         batch,
         feature_config,
         key_to_size,
@@ -1052,6 +1096,7 @@ def main() -> None:
         train_step,
         model,
         opt,
+        emb_opt,
         batch,
         is_main,
         global_bs,
