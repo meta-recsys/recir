@@ -207,6 +207,22 @@ def build_module_config(
     for table in module_config.embedding_tables.values():
         table.num_embeddings = min(table.num_embeddings, model_args.hash_size_cap)
 
+    # Per-feature hash size (post-cap), passed to the synthetic data generator so
+    # it samples each id over its table's full num_embeddings. This makes
+    # row-wise/block-sharding spread ids across all ranks; without it the toy
+    # generator drew tiny ids that all land on shard 0, degenerating the
+    # ring-shift all-to-all to a single hot peer (~100x slower lookup).
+    feature_hash_sizes: Dict[str, int] = {}
+    for table in module_config.embedding_tables.values():
+        for feat in table.features:
+            feature_hash_sizes[feat] = table.num_embeddings
+    for emb in module_config.additional_embeddings.values():
+        emb_feats = emb.features
+        if emb_feats:
+            for feat in emb_feats:
+                feature_hash_sizes[feat] = emb.num_embeddings
+    feature_config.feature_hash_sizes = feature_hash_sizes
+
     # STU stack trim.
     if len(module_config.stu_stack_configs) >= 1:
         module_config.stu_stack_configs[
