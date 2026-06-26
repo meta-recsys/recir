@@ -86,14 +86,15 @@ if ! gcloud auth print-access-token > /dev/null 2>&1; then
     echo "gcloud has no active credentials. Run 'gcloud auth login' first." >&2
     exit 1
 fi
-gcloud auth print-access-token | \
-    podman login -u oauth2accesstoken --password-stdin \
-        "https://${REGION}-docker.pkg.dev"
 
 echo ""
 echo "--- Tagging and pushing ---"
 podman tag "${IMAGE_NAME}:${IMAGE_TAG}" "${IMAGE_PATH}"
-podman push "${IMAGE_PATH}"
+# NOTE: push/login must go through with-proxy on a devserver (external egress),
+# otherwise the registry host fails to resolve / is blocked. The build above is
+# already proxied; the push was not, which silently broke `:latest` pushes.
+with-proxy bash -c "gcloud auth print-access-token | podman login -u oauth2accesstoken --password-stdin ${REGION}-docker.pkg.dev"
+with-proxy podman push "${IMAGE_PATH}"
 
 echo ""
 echo "============================================"

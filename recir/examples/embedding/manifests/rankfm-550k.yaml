@@ -1,0 +1,84 @@
+# SC-vs-TC forward run ALIGNED to rankfm-64chip-bench.yaml's embedding config.
+#
+# Mirrors the rankfm-64chip seq-embedding lookup scale so the ring-shift `fused`
+# number lines up with what rankfm would feed its lookup:
+#   * dim=256              (nonpooled_post_id seq table, hammer udd_fm_config.py)
+#   * max_local_ids=262144 (= (local_batch 512 / 8 hosts-per-128-cores) * S=4096;
+#                           the manifest's "~271k" is this rounded)
+#   * recv_capacity=16384  (rankfm RECIR_RINGSHIFT_RECV_CAPACITY)
+#   * --exchange-bf16      (rankfm RECIR_RINGSHIFT_EXCHANGE_BF16=1; bf16 a2a)
+#   * v_local=8192         -> global vocab 1,048,576 (rankfm --hash_size_cap 1e6)
+#   * uniform, W=128, fwd, --backend all (ra2a ~= rankfm's FSDP F.embedding TC
+#                           path; fused = ring-shift; sc = SparseCore)
+#
+# REQUIRES the image rebuilt with the --exchange-bf16-capable ringshift_bench.py.
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  generateName: ringshift-rankfm-550k-
+  namespace: ns-mrs-core-shared
+  labels:
+    kueue.x-k8s.io/queue-name: lq-training
+    x.tpu.cloud.google.com/slice-autoprovisioning: "async"
+spec:
+  replicatedJobs:
+  - name: worker
+    replicas: 1
+    template:
+      metadata:
+        labels:
+          x.tpu.google.com/inject-slice-selector: "true"
+      spec:
+        parallelism: 16
+        completions: 16
+        completionMode: Indexed
+        backoffLimit: 0
+        template:
+          metadata:
+            annotations:
+              cloud.google.com/gke-tpu-slice-topology: "4x4x4"
+          spec:
+            serviceAccountName: default
+            containers:
+            - name: bench
+              image: us-central1-docker.pkg.dev/mrs-tpu-y317h/recml/ringshift_tpu:latest
+              imagePullPolicy: Always
+              env:
+              - name: PYTHONUNBUFFERED
+                value: "1"
+              - name: RECIR_RINGSHIFT_LOG_LOAD
+                value: "1"
+              - name: JAX_DISTRIBUTED_INITIALIZATION_TIMEOUT
+                value: "1800"
+              - name: TPU_INIT_TIMEOUT_SECONDS
+                value: "1800"
+              - name: TPU_LIBRARY_INIT_TIMEOUT
+                value: "1800"
+              command:
+              - bash
+              - -c
+              - |
+                set +e
+                echo "Job Start: $(date) host: $(hostname)"
+                cd /app/recir
+                timeout 2300 python3 -u -m recir.examples.embedding.ringshift_bench --mode fwd --backend all --world-size 128 --dim 256 --v-local 8192 --max-local-ids 550816 --skip-ra2a --recv-capacity 16384 --exchange-bf16 --distribution uniform --device-stride 1 --iters 5 --warmup 3 --trace-dir gs://cq-mrs-core-shared_mrs_tpu_y317h/tpu-profiles/scvstc-rankfm-550k --trace-iters 3 2>&1
+                EXIT=$?
+                echo ""
+                echo "BENCH_EXIT=$EXIT"
+                echo "KEEPALIVE: sleeping 1200s so logs (RS_LOAD/RESULT) are grabbable before cleanup"
+                sleep 1200
+                echo "Job End: $(date)"
+                exit $EXIT
+              ports:
+              - containerPort: 8471
+              resources:
+                limits:
+                  google.com/tpu: 4
+            nodeSelector:
+              cloud.google.com/gke-tpu-accelerator: tpu7x
+              cloud.google.com/gke-tpu-topology: "4x4x4"
+            tolerations:
+            - key: "google.com/tpu"
+              operator: "Exists"
+              effect: "NoSchedule"
+            restartPolicy: Never

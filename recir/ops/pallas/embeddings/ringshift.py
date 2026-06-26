@@ -75,8 +75,18 @@ from jax.experimental.pallas import tpu as pltpu
 #       (phase-1/phase-3 remote copies), but KEEP the gather/scatter. Isolates
 #       the data-movement cost. (All ranks skip symmetrically, so no deadlock.)
 # Setting both -> measures the barrier + fixed-overhead floor.
+#   RECIR_RINGSHIFT_SKIP_PREFETCH=1 -> skip the per-wave 8MB table shard
+#       sync_copy(table_ref -> table_vmem) (fwd) / grad-acc prefetch (bwd).
+#       Isolates the HBM->VMEM table-prefetch cost (gather then reads garbage
+#       VMEM -> output invalid, perf-only). KEEP gather/DMA.
 _SKIP_GATHER: bool = os.environ.get("RECIR_RINGSHIFT_SKIP_GATHER") == "1"
 _SKIP_DMA: bool = os.environ.get("RECIR_RINGSHIFT_SKIP_DMA") == "1"
+_SKIP_PREFETCH: bool = os.environ.get("RECIR_RINGSHIFT_SKIP_PREFETCH") == "1"
+# RECIR_RINGSHIFT_LOG_LOAD=1 -> rank-0 prints the per-rank ring-shift LOAD
+# (valid id count, per-peer send counts, per-wave DMA rows p1, per-wave gather
+# rows p3, total DMA bytes) so the E2E vs microbench load can be compared
+# directly before attributing per-phase time.
+_LOG_LOAD: bool = os.environ.get("RECIR_RINGSHIFT_LOG_LOAD") == "1"
 
 
 # ---------------------------------------------------------------------------
@@ -655,7 +665,8 @@ def _make_ringshift_single_wave_kernel(
         # NOT pre-zeroed: it is a staging buffer sized for the full per-pair
         # payload, and the chunked gather below only reads the valid
         # [0:p3_cnt] region that the Phase-1 DMA populates.
-        pltpu.sync_copy(table_ref, table_vmem)
+        if not _SKIP_PREFETCH:
+            pltpu.sync_copy(table_ref, table_vmem)
         zero_int_vmem[...] = jnp.zeros_like(zero_int_vmem)
         zero_emb_vmem[...] = jnp.zeros_like(zero_emb_vmem)
 
@@ -857,6 +868,35 @@ def _ringshift_embedding_lookup_local(
         )
     else:
         raise ValueError(f"unknown splitter {splitter}")
+
+    if _LOG_LOAD:
+        # Print on ALL ranks (include rank id): on GKE TPU, JAX process 0 lands
+        # on a random worker pod, so a rank-0-only print may not be on the pod the
+        # log-capture dumps. Per-rank lines also expose load imbalance.
+        jax.debug.print(
+            "[RS_LOAD] rank={r} max_local_ids={mli} valid={v} sendreal_sum={sr} "
+            "sendreal_max={srm} p1_sum={p1s} p1_max={p1m} p3_sum={p3s} "
+            "p3_max={p3m} dim={d} exch_bytes={eb} gather_rows={gr}",
+            r=my_rank,
+            mli=max_local_ids,
+            v=local_id_count,
+            sr=jnp.sum(send_counts_real),
+            srm=jnp.max(send_counts_real),
+            p1s=jnp.sum(p1_cnt),
+            p1m=jnp.max(p1_cnt),
+            p3s=jnp.sum(p3_cnt),
+            p3m=jnp.max(p3_cnt),
+            d=embedding_dim,
+            eb=jnp.sum(p1_cnt) * embedding_dim * (2 if exchange_bf16 else 4),
+            gr=jnp.sum(p3_cnt),
+        )
+
+        # Per-wave p1/p3 vectors (ALL ranks, with rank id, so worker-0-0's log
+        # captures them regardless of which pod is process 0). Correlate hot waves
+        # (period-8 offsets) with payload: large => data concentration (H2/H3),
+        # small/uniform => ICI-topology latency (H1).
+        jax.debug.print("[RS_P1CNT] rank={r} {x}", r=my_rank, x=p1_cnt)
+        jax.debug.print("[RS_P3CNT] rank={r} {x}", r=my_rank, x=p3_cnt)
 
     # Tight upper bound for send buffer (sum of TILE-padded per-peer chunks):
     # sum_p send_counts_padded[p] <= sum_p send_counts_real[p] + W*(TILE-1)
