@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # (c) Meta Platforms, Inc. and affiliates. Confidential and proprietary.
 #
-# One-shot driver for the GPU-vs-TPU TPU benchmark run.
+# One-shot driver for the RankFM-MVAI TPU benchmark run.
 #
 # Follows the README "Every session" + "Kick off training" flow:
 #   cd <fbcode>
-#   source recir/examples/rankfm/helpers.sh   # defines rankfm_*, exports CTX
-#   rankfm_iterate <yaml>                      # build_image_podman.sh -> kubectl create -> tail rank 0
+#   source recir/examples/rankfm_mvai/helpers.sh   # defines rankfm_mvai_*, exports CTX
+#   rankfm_mvai_iterate <yaml>                      # build_image_podman.sh -> kubectl create -> tail rank 0
 #
 # ...but captures EVERYTHING (build + submit + full rank-0 training log) to a
 # single log file, then retrieves the xprof TPU trace from GCS so you can view
@@ -16,8 +16,8 @@
 #   --profile_start_step 3 --profile_end_step 13
 #   --profile_dir gs://mrs-tpu-y317h/tpu-profiles/<JOBSET_NAME>
 #   --enable_memory_log
-# train.py calls jax.profiler.start_trace/stop_trace on those steps (same
-# pattern as rankagi mivilm/jax_profiler.py) and writes the .xplane.pb to GCS.
+# RecirXLATrainPipeline.progress calls jax.profiler.start_trace/stop_trace on
+# those steps and writes the .xplane.pb to GCS.
 #
 # Usage:
 #   ./run_tpu_bench.sh [yaml]
@@ -25,22 +25,22 @@
 # Set RANKFM_SKIP_BUILD=1 to skip the podman image rebuild and reuse the current
 # :latest image (use ONLY when recir/ source is unchanged -- e.g. iterating on a
 # yaml env knob like RECIR_RINGSHIFT_RECV_CAPACITY or RANKFM_S):
-#   RANKFM_SKIP_BUILD=1 ./run_tpu_bench.sh rankfm-64chip-s512.yaml
+#   RANKFM_SKIP_BUILD=1 ./run_tpu_bench.sh rankfm_mvai-64chip-bench.yaml
 #
-# yaml defaults to recir/examples/rankfm/rankfm-4chip-bench.yaml.
+# yaml defaults to recir/examples/rankfm_mvai/rankfm_mvai-4chip-bench.yaml.
 # Set RANKFM_S in the yaml (env var) to sweep sequence length {512,1024,2048,3072};
 # the value is parsed into the log filename. Logs + trace are saved under
-# recir/examples/rankfm/bench_logs/ (in-repo, survives /tmp cleanup).
+# recir/examples/rankfm_mvai/bench_logs/ (in-repo, survives /tmp cleanup).
 
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FBCODE_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
-# Resolve the yaml arg to an ABSOLUTE path: helpers (rankfm_iterate/submit) cd to
+# Resolve the yaml arg to an ABSOLUTE path: helpers (gke_iterate/submit) cd to
 # the image-build dir before `kubectl create -f`, so a relative arg would not be
 # found at submit time. Accept either a CWD-relative path or a bare name living
 # next to this script.
-YAML_ARG="${1:-${SCRIPT_DIR}/rankfm-4chip-bench.yaml}"
+YAML_ARG="${1:-${SCRIPT_DIR}/rankfm_mvai-4chip-bench.yaml}"
 if [ -f "${YAML_ARG}" ]; then
     YAML="$(cd "$(dirname "${YAML_ARG}")" && pwd)/$(basename "${YAML_ARG}")"
 elif [ -f "${SCRIPT_DIR}/${YAML_ARG}" ]; then
@@ -55,7 +55,7 @@ S="$(awk '/name: RANKFM_S/{f=1; next} f && /value:/{v=$2; gsub(/"/,"",v); print 
 [ -z "${S}" ] && S="unknown"
 
 TS="$(date +%Y%m%d-%H%M%S)"
-# Persist logs inside the repo (recir/examples/rankfm/bench_logs) so they
+# Persist logs inside the repo (recir/examples/rankfm_mvai/bench_logs) so they
 # survive /tmp cleanup. Override with RANKFM_BENCH_LOG_DIR. Traces are NOT saved
 # locally -- they stay in GCS and are pushed to Kernelhub (see below).
 LOG_DIR="${RANKFM_BENCH_LOG_DIR:-${SCRIPT_DIR}/bench_logs}"
@@ -69,11 +69,11 @@ TRACE_BUCKET="gs://cq-mrs-core-shared_mrs_tpu_y317h/tpu-profiles"
 # Manifold bucket that kernelhub/perfetto reads from. The worker trace is
 # uploaded here after the run so it can be opened in the browser directly.
 KERNELHUB_BUCKET="perfdoctor_gpu_traces_test"
-KERNELHUB_BASE="tree/traces/test/${USER}/rankfm"
+KERNELHUB_BASE="tree/traces/test/${USER}/rankfm_mvai"
 KH_URL=""
 
 echo "================================================================" | tee "${LOG}"
-echo "RankFM TPU benchmark run" | tee -a "${LOG}"
+echo "RankFM-MVAI TPU benchmark run" | tee -a "${LOG}"
 echo "  fbcode root : ${FBCODE_ROOT}" | tee -a "${LOG}"
 echo "  yaml        : ${YAML}" | tee -a "${LOG}"
 echo "  seq len S   : ${S}" | tee -a "${LOG}"
@@ -95,14 +95,14 @@ source "${SCRIPT_DIR}/helpers.sh"
 # build_image_podman.sh -> rankfm_submit (exports $JS) -> wait Running -> tail rank 0.
 # Tee the whole thing so build + submit + streamed training log are all captured.
 # NOTE: use process substitution (`> >(tee ...)`), NOT a pipe (`| tee`). A pipe
-# runs rankfm_iterate in a subshell, so its `export JS=...` would be lost here.
+# runs rankfm_mvai_iterate in a subshell, so its `export JS=...` would be lost here.
 # RANKFM_SKIP_BUILD=1 -> skip the podman rebuild (gke_iterate reads GKE_SKIP_BUILD).
 export GKE_SKIP_BUILD="${RANKFM_SKIP_BUILD:-0}"
-rankfm_iterate "${YAML}" > >(tee -a "${LOG}") 2>&1
+rankfm_mvai_iterate "${YAML}" > >(tee -a "${LOG}") 2>&1
 # Let the process-substitution tee drain before we append more to ${LOG}.
 sleep 1
 
-# $JS was exported by rankfm_submit inside rankfm_iterate (same shell).
+# $JS was exported by gke_submit inside rankfm_mvai_iterate (same shell).
 if [ -z "${JS:-}" ]; then
     echo "WARNING: JS not set; submit may have failed. See ${LOG}." | tee -a "${LOG}"
     ln -sf "${LOG}" "${LATEST}"
@@ -139,7 +139,7 @@ if gsutil ls "${TRACE_BUCKET}/${JS}/" >/dev/null 2>&1; then
     SRC_TRACE=$(gsutil ls -r "${TRACE_BUCKET}/${JS}/**" 2>/dev/null \
         | grep "worker-0-0.trace.json.gz$" | head -1)
     if [ -n "${SRC_TRACE}" ] && command -v manifold >/dev/null 2>&1; then
-        TMP_TRACE=$(mktemp "/tmp/rankfm-trace-${JS}-XXXXXX.json.gz")
+        TMP_TRACE=$(mktemp "/tmp/rankfm-mvai-trace-${JS}-XXXXXX.json.gz")
         if gsutil cp "${SRC_TRACE}" "${TMP_TRACE}" >/dev/null 2>&1; then
             KH_PATH="${KERNELHUB_BASE}/${JS}-worker-0-0.trace.json.gz"
             manifold mkdirs "${KERNELHUB_BUCKET}/${KERNELHUB_BASE}" >/dev/null 2>&1 || true

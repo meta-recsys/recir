@@ -11,7 +11,7 @@
 import unittest
 from typing import Iterator
 
-from recir.examples.rankfm.prefetch import PrefetchingIterator
+from recir.examples.rankfm_mvai.prefetch import PrefetchingIterator
 
 
 class PrefetchingIteratorTest(unittest.TestCase):

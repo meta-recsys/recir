@@ -6,7 +6,7 @@
 # Single host => single process => parity_forward_loss.py runs as-is
 # (PARITY_DEVICE=tpu; no jax.distributed multi-host init).
 #
-# Prereqs: the rankfm_tpu image must be (re)built+pushed AFTER committing
+# Prereqs: the rankfm_mvai_tpu image must be (re)built+pushed AFTER committing
 # parity_forward_loss.py so the module is present in the image.
 #
 # Submit (after approval):
@@ -31,10 +31,10 @@ spec:
             serviceAccountName: default
             containers:
             - name: parity
-              # Personal tag so we never clobber the shared rankfm_tpu:latest
+              # Personal tag so we never clobber the shared rankfm_mvai_tpu:latest
               # used by the RankFM training configs. Build with:
               #   IMAGE_TAG=plund-parity bash recir/examples/rankfm/build_image_podman.sh
-              image: us-central1-docker.pkg.dev/mrs-tpu-y317h/recml/rankfm_tpu:plund-parity
+              image: us-central1-docker.pkg.dev/mrs-tpu-y317h/recml/rankfm_mvai_tpu:plund-parity
               imagePullPolicy: Always
               env:
               - name: PYTHONUNBUFFERED
@@ -55,7 +55,7 @@ spec:
                 echo "=== jax devices ==="
                 python3 -c "import jax; print(jax.devices())"
                 echo "=== forward-loss parity (CPU eager bf16 vs TPU compiled) ==="
-                python3 -u -m recir.examples.rankfm.parity_forward_loss
+                python3 -u -m recir.examples.rankfm_mvai.parity_forward_loss
               ports:
               - containerPort: 8471
               resources:

@@ -217,7 +217,7 @@ class TestXSurfaceXLACompile(unittest.TestCase):
         # num_candidates_per_request`` exactly.  Using a jagged ROO batch
         # for trace input desyncs the post-pad ``r_dense`` from
         # ``r_inter`` at ``_forward_post_hstu``'s cat.  Mirrors
-        # ``recir/examples/rankfm/train.py``.
+        # ``recir/examples/rankfm_mvai/xsurface_helpers.py``.
         feature_config.num_candidates_per_request = TEST_NUM_CANDIDATES
         feature_config.history_len = TEST_MAX_UIH_SEQ_LEN
         batch = _create_uniform_train_batch(

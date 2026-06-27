@@ -8,14 +8,13 @@
 
 """RankFM (xsurface V3) TPU training, driven by the mvai_cloud RecTrainer.
 
-Runs the SAME model as recir/examples/rankfm (the hammer/v3 udd_fm
-``BlueReelsVDDTrainV3``) on TPU via recir XLA-GSPMD, but orchestrated by the
-mvai_cloud training framework (RecTrainer + RecModelFamily + RecTrainPipeline)
-instead of rankfm's bespoke train.py loop.
+Runs the hammer/v3 udd_fm ``BlueReelsVDDTrainV3`` on TPU via recir XLA-GSPMD,
+orchestrated by the mvai_cloud training framework (RecTrainer + RecModelFamily +
+RecTrainPipeline).
 
 The TPU path is achieved WITHOUT editing mvai_cloud:
   * ``jax.distributed.initialize()`` is called here, before RecTrainer is
-    constructed (mirrors rankfm/train.py:682).
+    constructed.
   * ``SystemConfig(use_gpu=False)`` makes RecTrainer take its CPU/gloo device
     branch (trainer.py:81-83); recir lowers the dense graph to TPU via
     ``jax.devices()`` regardless of the torch device being cpu.
@@ -65,6 +64,7 @@ from .train_common import (
     setup_logging,
 )
 from .train_pipeline import RecirXLATrainPipelineProvider
+from .xsurface_helpers import _is_jax_profiling_enabled
 
 logger: logging.Logger = logging.getLogger(__name__)
 
@@ -73,7 +73,7 @@ def main() -> None:
     # Must be called before any JAX op. On GKE TPU the PJRT plugin reads the
     # coordinator address + process index from TPU runtime metadata; without
     # this each pod is jax.process_count()==1 and the SparseCore collective
-    # (which spans all chips) deadlocks. Mirrors rankfm/train.py:682.
+    # (which spans all chips) deadlocks.
     jax.distributed.initialize()
     setup_logging()
     logger.info(
@@ -115,6 +115,12 @@ def main() -> None:
     report_interval = trainer_config.metrics_config.report_interval
     batch_size = trainer_config.data_source_config.batch_size
 
+    # JAX profiling is gated on a real TPU + a positive profile_start_step; on
+    # CPU / when unset it is a no-op. The trace (when enabled) lands in
+    # profile_dir (gs://.../tpu-profiles/<JOBSET_NAME>) and is fetched by
+    # run_tpu_bench.sh.
+    jax_profiling = _is_jax_profiling_enabled(trainer_cfg)
+
     RecTrainer(
         model_family_clazz=RankFMMvaiModelFamily,
         trainer_config=trainer_config,
@@ -146,14 +152,18 @@ def main() -> None:
             reg_task_indices=reg_task_indices,
             is_variable_step=True,
             report_interval=report_interval,
+            jax_profiling=jax_profiling,
+            profile_start_step=trainer_cfg.profile_start_step,
+            profile_end_step=trainer_cfg.profile_end_step,
+            profile_dir=trainer_cfg.profile_dir,
+            enable_memory_log=trainer_cfg.enable_memory_log,
         ),
         job_resolver=JobResolver(),
     ).train()
 
     # Cleanup. JAX's PJRT runtime + libtpu workers + any gloo collective thread
     # keep the process alive after train() returns, so the JobSet pod never
-    # reaches Completed. Shut both down, then force-exit (mirrors
-    # rankfm/train.py:787-798).
+    # reaches Completed. Shut both down, then force-exit.
     if dist.is_initialized():
         dist.destroy_process_group()
     try:

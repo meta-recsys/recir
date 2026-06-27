@@ -37,7 +37,7 @@ from recir.lowering.fbgemm_fallback import _batched_complete_cumsum_impl
 logger: logging.Logger = logging.getLogger(__name__)
 
 # Bootstrap gr::batched_complete_cumsum if the C++ library failed to load
-# (same as rankfm/train.py:74-89). recir's SPMD decomp table replaces this op
+# (shared gr-op bootstrap). recir's SPMD decomp table replaces this op
 # with _batched_complete_cumsum_impl at XLA lowering time, but the op must
 # exist as a valid OpOverload first.
 try:
@@ -121,7 +121,7 @@ def resolve_dist_env() -> None:
         # 127.0.0.1 (which makes every pod rendezvous with itself and hang
         # "waiting for all ranks to join"). Prefer an explicit MASTER_ADDR
         # (FQDN) from the JobSet; else the first TPU_PROCESS_ADDRESSES host.
-        # Mirrors recir/examples/rankfm/embedding/cpu_backend.py::init_pg.
+        # Mirrors the embedding cpu_backend init_pg.
         if "MASTER_ADDR" not in os.environ and addr_list:
             os.environ["MASTER_ADDR"] = addr_list[0].split(":")[0]
     else:

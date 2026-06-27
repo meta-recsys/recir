@@ -20,7 +20,7 @@ and NE behave sensibly for many steps here, then any future parity
 divergence is a lowering bug, not a baseline bug.
 
 Run:
-    buck2 run //recir/examples/rankfm:train_cpu_eager -- --max_steps 50
+    buck2 run //recir/examples/rankfm_mvai:train_cpu_eager -- --max_steps 50
 """
 
 from __future__ import annotations
@@ -47,7 +47,7 @@ from .config import build_module_config, parse_cli, RankFMTrainerConfig
 from .data_pipe import BatchReplayPipe, compute_kjt_key_to_size, replay_batch_iter
 from .embedding import build_embedding_backend
 from .embedding.cpu_backend import _build_single_node_optimizer
-from .train import (
+from .xsurface_helpers import (
     _build_data_pipe,
     _build_replay_iter,
     _extract_train_step_args,
@@ -499,7 +499,7 @@ def main() -> None:
         dense_params = list(backend.dense_named_parameters(model).values())
         opt: torch.optim.Optimizer = torch.optim.Adagrad(
             dense_params,
-            lr=trainer_cfg.dense_lr,
+            lr=trainer_cfg.dense_optimizer_config.lr,
             initial_accumulator_value=0.1,
             foreach=True,
         )
@@ -507,7 +507,7 @@ def main() -> None:
         opt = _build_single_node_optimizer(
             model,
             trainer_cfg.embedding_lr,
-            trainer_cfg.dense_lr,
+            trainer_cfg.dense_optimizer_config.lr,
         )
     # pyre-ignore[29]: nn.Module attribute access returns Union[Module, Tensor]
     #   per pyre's stubs; set_recir_kjt_keys is a runtime method on the model.

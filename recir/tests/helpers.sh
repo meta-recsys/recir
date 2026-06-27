@@ -23,7 +23,7 @@
 #     export CTX=mrs-tpu-y317h/us-central1/tpu-prod-training-cluster
 #     export NS=ns-<your-team>
 #
-# The image is the same rankfm_tpu image used by the rankfm example
+# The image is the rankfm_mvai_tpu image used by the rankfm_mvai example
 # (recir + generative_recommenders are baked in). stu_test.py ships in that
 # image because build_image_podman.sh includes recir/tests/stu_test.py in the
 # staged context. The default 4-chip yaml runs the test as a single-node job.
@@ -37,8 +37,8 @@ source "${_STU_FBCODE_ROOT}/recir/utils/gke_helpers.sh"
 
 _GKE_DEFAULT_YAML="${_STU_HELPERS_DIR}/stu-test-4chip.yaml"
 _GKE_FBCODE_ROOT="$_STU_FBCODE_ROOT"
-# The test image is the rankfm_tpu image; reuse its build script.
-_GKE_BUILD_SCRIPT="${_STU_FBCODE_ROOT}/recir/examples/rankfm/build_image_podman.sh"
+# The test image is the rankfm_mvai_tpu image; reuse its build script.
+_GKE_BUILD_SCRIPT="${_STU_FBCODE_ROOT}/recir/examples/rankfm_mvai/build_image_podman.sh"
 _GKE_LOG_DIR="/tmp/stulogs"
 _GKE_POD_NOUN="test pod"
 _GKE_SUMMARY_TITLE="Per-pod test-result summary"

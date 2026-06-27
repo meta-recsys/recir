@@ -8,7 +8,7 @@
 """Custom embedding ops for the in-graph RankFM embedding path.
 
 Defines the ``recir::*`` ops used by ``InGraphSparseArch``
-(``recir/examples/rankfm/embedding/in_graph_embedding_backend.py``):
+(``recir/examples/rankfm_mvai/embedding/in_graph_embedding_backend.py``):
 
   * ``ringshift_embedding`` -- ROWWISE sequence lookup, lowered on the
     recir/torchax TPU path to the on-TensorCore ring-shift kernel (see

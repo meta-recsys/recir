@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Shared bash helpers for submitting and monitoring GKE TPU JobSets. Sourced by
-# recir/tests/helpers.sh and recir/examples/rankfm/helpers.sh -- not meant to be
+# recir/tests/helpers.sh and recir/examples/rankfm_mvai/helpers.sh -- not meant to be
 # sourced directly.
 #
 # A wrapper helpers.sh should:

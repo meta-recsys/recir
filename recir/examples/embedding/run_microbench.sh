@@ -37,7 +37,7 @@ LATEST="${LOG_DIR}/${NAME}-latest.log"
 cd "${FBCODE_ROOT}" || exit 1
 # helpers.sh exports CTX/NS + HTTPS_PROXY and the gateway kube context.
 # shellcheck source=/dev/null
-source "${FBCODE_ROOT}/recir/examples/rankfm/helpers.sh"
+source "${FBCODE_ROOT}/recir/examples/rankfm_mvai/helpers.sh"
 
 {
     echo "=== microbench run: ${NAME} @ ${TS} ==="

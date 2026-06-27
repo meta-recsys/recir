@@ -43,7 +43,9 @@ def build_embedding_backend(
         # int64 offsets: int32 overflows / SEGVs in fbgemm.permute_2D_sparse_data
         # at large global batch (multi-host). The in_graph / tpu backends don't
         # use torchrec's a2a, so only patch here. See _torchrec_patches.
-        from recir.examples.rankfm._torchrec_patches import apply_seq_a2a_int64_patch
+        from recir.examples.rankfm_mvai._torchrec_patches import (
+            apply_seq_a2a_int64_patch,
+        )
 
         from .cpu_backend import CPURankFMBackend
 

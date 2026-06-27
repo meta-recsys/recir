@@ -26,7 +26,7 @@ spec:
           spec:
             containers:
             - name: rankfm
-              image: us-central1-docker.pkg.dev/mrs-tpu-y317h/recml/rankfm_tpu:latest
+              image: us-central1-docker.pkg.dev/mrs-tpu-y317h/recml/rankfm_mvai_tpu:latest
               imagePullPolicy: Always
               env:
               - name: PYTHONUNBUFFERED
@@ -78,7 +78,7 @@ spec:
               - sh
               - -c
               - >-
-                python3 -u -m recir.examples.rankfm.train
+                python3 -u -m recir.examples.rankfm_mvai.train
                 --local_batch_size 512
                 --hash_size_cap 1000000
                 --l1_num_layers 8
