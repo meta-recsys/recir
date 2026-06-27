@@ -492,14 +492,32 @@ class InGraphEmbeddingBackend(EmbeddingBackend):
         )
         return rank, world
 
+    def dense_named_parameters(self, model: nn.Module) -> Dict[str, nn.Parameter]:
+        emb_prefixes = (SHARDED_TABLE_PREFIX, DP_TABLE_PREFIX)
+        return {
+            n: p
+            for n, p in model.named_parameters()
+            if not any(pre in n for pre in emb_prefixes)
+        }
+
+    def embedding_named_parameters(self, model: nn.Module) -> Dict[str, nn.Parameter]:
+        # The in-graph embedding table params (plain FSDP nn.Parameters looked up +
+        # grad'd inside the compiled graph). train.py builds a dedicated in-graph
+        # optimizer over these; see dense_named_parameters() for the split.
+        emb_prefixes = (SHARDED_TABLE_PREFIX, DP_TABLE_PREFIX)
+        return {
+            n: p
+            for n, p in model.named_parameters()
+            if any(pre in n for pre in emb_prefixes)
+        }
+
     def setup(
         self,
         model: nn.Module,
         table_configs: List[EmbeddingConfig],
         embedding_lr: float,
-        dense_lr: float,
         world_size: int,
-    ) -> Tuple[nn.Module, torch.optim.Optimizer]:
+    ) -> nn.Module:
         if not self._feature_seqlens:
             raise RuntimeError(
                 "InGraphEmbeddingBackend.get_override() must run before setup()."
@@ -527,28 +545,16 @@ class InGraphEmbeddingBackend(EmbeddingBackend):
         # the opaque ringshift_embedding op into the single compiled GSPMD program.
         sparse_arch._embedding_collection = new_ec
         emb_prefixes = (SHARDED_TABLE_PREFIX, DP_TABLE_PREFIX)
-        table_params = [
-            p
-            for n, p in model.named_parameters()
+        n_table_params = sum(
+            1
+            for n, _ in model.named_parameters()
             if any(pre in n for pre in emb_prefixes)
-        ]
-        dense_params = [
-            p
-            for n, p in model.named_parameters()
-            if not any(pre in n for pre in emb_prefixes)
-        ]
-        opt: torch.optim.Optimizer = torch.optim.SGD(
-            [
-                {"params": dense_params, "lr": dense_lr},
-                {"params": table_params, "lr": embedding_lr},
-            ],
-            foreach=True,
         )
         logger.info(
             f"InGraphEmbeddingBackend: in-graph seq embedding installed "
-            f"({len(table_params)} table params @ lr={embedding_lr})"
+            f"({n_table_params} table params; trained by the main optimizer)"
         )
-        return model, opt
+        return model
 
     def get_override(
         self,

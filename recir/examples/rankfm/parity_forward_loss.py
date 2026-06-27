@@ -61,7 +61,7 @@ import json
 import logging
 import sys
 import time
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 import fbgemm_gpu  # noqa: F401 -- force C++ op registration before fallback
 import hammer.v3.modules.core.features.bundle as feature_bundle
@@ -173,6 +173,7 @@ def _count_all_reduce(compiled_obj: Any) -> int:
 def _train_step_fn(
     mod: nn.Module,
     opt: torch.optim.Optimizer,
+    emb_opt: Optional[torch.optim.Optimizer],
     ro_float_features: torch.Tensor,
     nro_float_features: torch.Tensor,
     ro_id_list_values: torch.Tensor,
@@ -261,6 +262,7 @@ def _compiled_step(
     train_step = _compile_with_xsurface_dispatchers(
         model,
         opt,
+        None,  # no dedicated embedding optimizer in the parity harness
         batch,
         overrides,
         _train_step_fn,
@@ -273,7 +275,7 @@ def _compiled_step(
         backend=XLAGSPMDBackend(),
         region_transforms=[],
     )
-    train_step(model, opt, *_extract_train_step_args(batch))
+    train_step(model, opt, None, *_extract_train_step_args(batch))
     sync_device_state_to_torch(train_step)
     compiled_obj = train_step.__dict__["_compiled_obj"]
     all_reduce = _count_all_reduce(compiled_obj)

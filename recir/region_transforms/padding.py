@@ -684,15 +684,48 @@ class PaddingRegionTransform(RegionTransform):
         ] = []
 
     def bind_signature(self, func: Any) -> None:
-        """Resolve string names to positional indices in the signature."""
+        """Resolve the configured arg *names* into positional *indices* in ``func``.
+
+        The transform is configured declaratively by name (``batch_size_arg``,
+        ``jagged_pairs``, ``skip_args``), but at runtime ``transform_inputs``
+        receives the forward inputs as a positional tuple and pads them by index.
+        This runs once (pre-trace) to freeze those names into indices, skipping the
+        leading non-batch args (``mod`` / ``opt`` / module / optimizer params) so
+        the batch indices are not shifted.
+
+        Example:
+            For a traced step::
+
+                def train_step(mod, opt, emb_opt, ro_float_features,
+                               unary_values, unary_lengths, num_candidates): ...
+
+            configured with ``batch_size_arg="ro_float_features"`` and
+            ``jagged_pairs={"unary_values": JaggedPairConfig("unary_lengths",
+            count_arg="num_candidates", ...)}``, the leading ``mod`` / ``opt`` /
+            ``emb_opt`` are skipped, leaving the batch args::
+
+                ["ro_float_features", "unary_values", "unary_lengths", "num_candidates"]
+                #         0                  1                2                3
+
+            so ``self.batch_size_arg_idx == 0`` and the pair resolves to
+            ``v_idx=1, l_idx=2, count_idx=3``.
+        """
         sig = inspect.signature(func)
         names: List[str] = []
         for name, param in sig.parameters.items():
+            if name in ("mod", "opt", "model", "optimizer"):
+                continue
             ann = param.annotation
-            if ann is not inspect.Parameter.empty and isinstance(ann, type):
-                if issubclass(ann, (nn.Module, torch.optim.Optimizer)):
-                    continue
-            elif name in ("mod", "opt", "model", "optimizer"):
+            # Skip nn.Module / torch.optim.Optimizer params so they are not
+            # mistaken for batch tensors. With `from __future__ import annotations`
+            # the annotation is a STRING (e.g. a dedicated embedding optimizer
+            # typed ``Optional[torch.optim.Optimizer]``), so match the resolved
+            # type when available and fall back to the string form otherwise.
+            if isinstance(ann, type) and issubclass(
+                ann, (nn.Module, torch.optim.Optimizer)
+            ):
+                continue
+            if isinstance(ann, str) and ("Optimizer" in ann or "nn.Module" in ann):
                 continue
             names.append(name)
         self._skip_indices = {i for i, n in enumerate(names) if n in self._skip_args}
