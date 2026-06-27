@@ -125,13 +125,23 @@ spec:
               - name: RECIR_RINGSHIFT_EXCHANGE_BF16
                 value: "1"
               # E2E ablation knobs (perf-only; outputs are garbage when set).
-              # Flip across runs to attribute the ring-shift cost:
-              #   SKIP_GATHER=1 -> skip the TC row-by-row gather/scatter, keep DMA
-              #   SKIP_DMA=1    -> skip the cross-host all-to-all, keep gather
-              #   both=1        -> barrier + fixed-overhead floor
+              # Flip across runs to attribute the ring-shift per-wave cost:
+              #   SKIP_GATHER=1   -> skip the TC row-by-row gather/scatter, keep DMA+prefetch
+              #   SKIP_DMA=1      -> skip the cross-host all-to-all, keep gather+prefetch
+              #   SKIP_PREFETCH=1 -> skip the per-wave 8MB table_vmem sync_copy, keep gather+DMA
+              #   all=1           -> barrier + fixed-overhead floor
+              # Decompose: phase_cost = baseline - SKIP_<phase>.
               - name: RECIR_RINGSHIFT_SKIP_GATHER
                 value: "0"
               - name: RECIR_RINGSHIFT_SKIP_DMA
+                value: "0"
+              - name: RECIR_RINGSHIFT_SKIP_PREFETCH
+                value: "0"
+              # Log the per-rank ring-shift LOAD (rank-0): valid id count, per-peer
+              # send counts, per-wave DMA rows (p1) + gather rows (p3), exchange
+              # bytes. Lets us confirm E2E vs microbench move the same #lookups/bytes
+              # before attributing per-phase time. Grep "[RS_LOAD]" in the log.
+              - name: RECIR_RINGSHIFT_LOG_LOAD
                 value: "0"
               # Re-enabled to read jit_jax_fn HLO instruction count after batching
               # (does 12->4 kernels shrink it under the SPMD partitioner limit?).
@@ -178,7 +188,7 @@ spec:
                 --disable_seq_len_sampling
                 --enable_padding
                 --embedding_backend in_graph
-                --ringshift_min_rows 4096000000000000
+                --ringshift_min_rows 4096
                 --fsdp_min_rows 4096
                 --bf16_training
                 --profile_start_step 30
