@@ -32,7 +32,7 @@ spec:
           spec:
             containers:
             - name: rankfm
-              image: us-central1-docker.pkg.dev/mrs-tpu-y317h/recml/rankfm_tpu:cpu-eager
+              image: us-central1-docker.pkg.dev/mrs-tpu-y317h/recml/rankfm_mvai_tpu:cpu-eager
               imagePullPolicy: Always
               env:
               - name: PYTHONUNBUFFERED
@@ -53,7 +53,7 @@ spec:
                   sleep 5 ;
                 done ;
                 echo "barnfs mount ready (after $(($(date +%s) - START))s); starting trainer..." ;
-                python3 -u -m recir.examples.rankfm.train_cpu_eager
+                python3 -u -m recir.examples.rankfm_mvai.train_cpu_eager
                 --max_steps 5000
                 --local_batch_size 32
                 --num_candidates 32

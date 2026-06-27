@@ -89,14 +89,17 @@ from hammer.v3.models.udd_fm_v3.udd_fm_config import BlueReelsVDDModuleConfig
 from hammer.v3.models.udd_fm_v3.udd_fm_train_v3 import BlueReelsVDDTrainV3
 from hammer.v3.modules.recblock import _inputs_to_feature_bundle
 from recir.decompositions import SPMD_DECOMP_TABLE
-from recir.examples.rankfm.config import _build_static_ro_budgets, RankFMTrainerConfig
-from recir.examples.rankfm.embedding import build_embedding_backend
-from recir.examples.rankfm.train import (
+from recir.examples.rankfm_mvai.config import (
+    _build_static_ro_budgets,
+    RankFMTrainerConfig,
+)
+from recir.examples.rankfm_mvai.embedding import build_embedding_backend
+from recir.examples.rankfm_mvai.model_family import _udd_fm_v3_train_step
+from recir.examples.rankfm_mvai.xsurface_helpers import (
     _resolve_nro_per_sample,
     make_padding_region_transforms,
     prepare_override_build_sample,
 )
-from recir.examples.rankfm_mvai.model_family import _udd_fm_v3_train_step
 from recir.lowering.fbgemm_fallback import _batched_complete_cumsum_impl
 from recir.lowering.xla_lower import _XLAModule
 from recir.tests.xla.xsurface_test_utils import (

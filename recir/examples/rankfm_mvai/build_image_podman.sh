@@ -1,7 +1,7 @@
 #!/bin/bash
 # Build the RankFM-MVAI TPU image from fbsource using podman + with-proxy.
-# Same model as recir/examples/rankfm, but driven by the mvai_cloud RecTrainer
-# framework. Stages recir + hammer/v3 + mvai_cloud/minimal_viable_ai into a temp
+# Driven by the mvai_cloud RecTrainer framework. Stages recir + hammer/v3 +
+# mvai_cloud/minimal_viable_ai into a temp
 # build context, then builds and pushes to the GCP Artifact Registry.
 
 set -euo pipefail
@@ -56,13 +56,15 @@ RSYNC_EXCLUDES=(
 )
 
 # recir + setup.py
-# Keep recir/tests/xla/xsurface_test_utils.py (imported by train.py) but
-# exclude every other test file. Includes MUST precede excludes — rsync's
-# first-match-wins evaluation order means a bare `--exclude=tests` would
-# prune the whole tree before the includes are seen.
+# Keep recir/tests/xla/xsurface_test_utils.py (imported by train.py) and
+# recir/tests/stu_test.py (run by recir/tests/helpers.sh on TPU, which reuses
+# this build script), but exclude every other test file. Includes MUST precede
+# excludes -- rsync's first-match-wins evaluation order means a bare
+# `--exclude=tests` would prune the whole tree before the includes are seen.
 rsync -a \
     --include='tests/' \
     --include='tests/__init__.py' \
+    --include='tests/stu_test.py' \
     --include='tests/xla/' \
     --include='tests/xla/__init__.py' \
     --include='tests/xla/xsurface_test_utils.py' \

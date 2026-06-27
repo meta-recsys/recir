@@ -1,12 +1,12 @@
 # RankFM-MVAI (xsurface V3) on GKE TPU v7x — via the mvai_cloud RecTrainer
 
-End-to-end RankFM (xsurface V3 / `BlueReelsVDDTrainV3`) training that runs the
-**same model** as [`recir/examples/rankfm`](../rankfm/README.md), but **driven by
+End-to-end RankFM (xsurface V3 / `BlueReelsVDDTrainV3`) training **driven by
 the `mvai_cloud` training framework** (`RecTrainer` + `RecModelFamily` +
-`RecTrainPipeline` and its config dataclasses) instead of rankfm's bespoke
-`train.py` loop.
+`RecTrainPipeline` and its config dataclasses). This example is self-contained:
+it owns the model/trainer config, the recir embedding backends (cpu / tpu /
+in_graph), the data pipe, and the benchmark driver.
 
-- **Same model**: `BlueReelsVDDTrainV3` (hammer/v3, byte-identical to rankfm).
+- **Model**: `BlueReelsVDDTrainV3` (hammer/v3).
 - **mvai_cloud orchestration**: `RecTrainer` owns the train loop; the
   model/optimizer build and the train step are plugged in via a custom
   `RecModelFamily` and `RecTrainPipeline`.
@@ -22,14 +22,14 @@ to reach TPU, all inside this package (no `mvai_cloud` edits):
 | Seam | mvai_cloud (GPU) | rankfm_mvai (TPU) |
 |---|---|---|
 | Device init | `RecTrainer.__init__` cuda/NCCL | `SystemConfig(use_gpu=False)` CPU/gloo path + `jax.distributed.initialize()` in `main()` (recir lowers the dense graph to TPU via `jax.devices()` regardless of the torch device) |
-| Model + optimizer build | `RecModelFamily.create_train_module_and_optimizer` (TorchRec DMP + FBGEMM fused opt) | `RankFMMvaiModelFamily` overrides it to set up rankfm's recir embedding backend + optimizer |
+| Model + optimizer build | `RecModelFamily.create_train_module_and_optimizer` (TorchRec DMP + FBGEMM fused opt) | `RankFMMvaiModelFamily` overrides it to set up the recir embedding backend + optimizer (incl. the in_graph dedicated embedding optimizer) |
 | Train step | `SimpleSGDTrainPipeline.progress` (eager fwd/bwd/step) | `RecirXLATrainPipeline` runs the recir-compiled `train_step` (`recir.trace` → `compile_from_gm(XLAGSPMDBackend)` → `make_compiled_runner`), then `sync_device_state_to_torch` |
 
 `RankFMMvaiModelFamily` subclasses hammer/v3's `BlueReelsVDDModelFamily` (which
 already builds `BlueReelsVDDTrainV3` in `create_vanilla_train_module` and is a
 `RecModelFamily`), so the hammer family and `RecTrainer` share one consistent
-`RecModelFamily` base. The embedding backends and data pipe are **imported, not
-copied**, from `recir/examples/rankfm`.
+`RecModelFamily` base. The embedding backends, data pipe, and bespoke compile
+helpers all live in this package.
 
 ## Entry point
 
@@ -163,14 +163,39 @@ kubectl get jobsets --context="$CTX"
 kubectl delete jobset/<old-name> --context="$CTX"
 ```
 
-## Relationship to `recir/examples/rankfm`
+## Benchmark driver (`run_tpu_bench.sh`)
 
-| | `recir/examples/rankfm` | `recir/examples/rankfm_mvai` |
-|---|---|---|
-| Model | `BlueReelsVDDTrainV3` (hammer/v3) | `BlueReelsVDDTrainV3` (same) |
-| Train loop | bespoke `train.py` | `mvai_cloud` `RecTrainer` |
-| Model/opt build | inline in `train.py` | `RankFMMvaiModelFamily.create_train_module_and_optimizer` |
-| Train step | inline `train_step` + `@compile` | `RecirXLATrainPipeline.progress` (recir-compiled) |
-| Embedding backend | `recir.examples.rankfm.embedding` | imported from rankfm (CPU default, TPU selectable) |
-| Data | `recir.examples.rankfm.data_pipe` | imported from rankfm (synthetic + barnfs replay) |
-| Image | `rankfm_tpu` | `rankfm_mvai_tpu` |
+`run_tpu_bench.sh` is a one-shot driver that builds the image, submits a JobSet,
+tails rank 0, re-fetches the complete rank-0 log, then retrieves the xprof TPU
+trace from GCS and pushes the rank-0 worker trace to Kernelhub (perfetto). It
+uses the `rankfm_mvai_*` helpers under the hood, so the same `GKE_SKIP_BUILD`
+knob applies (exposed as `RANKFM_SKIP_BUILD`).
+
+```bash
+cd ~/local/fbsource/fbcode
+# defaults to rankfm_mvai-4chip-bench.yaml; pass any bench yaml as $1
+./recir/examples/rankfm_mvai/run_tpu_bench.sh rankfm_mvai-64chip-bench.yaml
+# reuse the current :latest image (recir source unchanged):
+RANKFM_SKIP_BUILD=1 ./recir/examples/rankfm_mvai/run_tpu_bench.sh rankfm_mvai-64chip-bench.yaml
+```
+
+The trace is emitted by `RecirXLATrainPipeline.progress` over
+`[--profile_start_step, --profile_end_step]` to `--profile_dir`
+(`gs://.../tpu-profiles/${JOBSET_NAME}`). Logs land in
+`recir/examples/rankfm_mvai/bench_logs/`.
+
+The `*-bench` yamls exercise the `in_graph` embedding backend (ring-shift
+seq-embedding lookup) with its dedicated embedding optimizer; `cpu` / `tpu`
+backends use the unified dense optimizer only.
+
+## Relationship to the other recir examples
+
+| | `recir/examples/rankfm_mvai` |
+|---|---|
+| Model | `BlueReelsVDDTrainV3` (hammer/v3) |
+| Train loop | `mvai_cloud` `RecTrainer` |
+| Model/opt build | `RankFMMvaiModelFamily.create_train_module_and_optimizer` |
+| Train step | `RecirXLATrainPipeline.progress` (recir-compiled) |
+| Embedding backend | `recir.examples.rankfm_mvai.embedding` (cpu / tpu / in_graph) |
+| Data | `recir.examples.rankfm_mvai.data_pipe` (synthetic + barnfs replay) |
+| Image | `rankfm_mvai_tpu` |

@@ -1,6 +1,6 @@
 # Run recir/tests/stu_test.py on a 4-chip TPU v7 slice (1 node, 2x2x1).
 # Single-node test job: parallelism/completions 1 (no multi-rank ICI needed).
-# Reuses the rankfm_tpu image (recir + generative_recommenders are baked in);
+# Reuses the rankfm_mvai_tpu image (recir + generative_recommenders are baked in);
 # stu_test.py only imports recir.* and generative_recommenders.modules.stu, so
 # no barnfs data mount or overrides are required.
 apiVersion: jobset.x-k8s.io/v1alpha2
@@ -21,7 +21,7 @@ spec:
           spec:
             containers:
             - name: stu-test
-              image: us-central1-docker.pkg.dev/mrs-tpu-y317h/recml/rankfm_tpu:latest
+              image: us-central1-docker.pkg.dev/mrs-tpu-y317h/recml/rankfm_mvai_tpu:latest
               imagePullPolicy: Always
               env:
               - name: PYTHONUNBUFFERED

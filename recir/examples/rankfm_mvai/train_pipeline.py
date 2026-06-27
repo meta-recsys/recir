@@ -19,11 +19,11 @@ example_count, variable_step_qps).
   * ``RecirXLATrainPipeline`` subclasses mvai_cloud's
     ``RankingSGDTrainPipeline`` to reuse its metric construction
     (``__init__``), its ``_update_ranking_metrics(ret)`` cls/reg slicing, and
-    its ``.metrics`` property unchanged. Only ``progress`` is overridden to run
-    the self-compiling model wrapper (instead of the eager fwd/bwd/opt.step) and
-    rebuild the ``{prediction, label, weight}`` ``ret`` dict from the wrapper's
-    return value. ``named_tensors`` already carries DETACHED prediction / label
-    / weight (shape [T, B]) from ``BlueReelsVDDTrainV3.forward``.
+    its ``.metrics`` property unchanged. ``progress`` is overridden to run the
+    self-compiling model wrapper (instead of the eager fwd/bwd/opt.step), rebuild
+    the ``{prediction, label, weight}`` ``ret`` dict from the wrapper's return,
+    and drive the JAX profiler trace over the configured step window (ported from
+    the bespoke rankfm loop so run_tpu_bench.sh's xprof trace fetch keeps working).
   * ``RecirXLATrainPipelineProvider`` reuses mvai_cloud's
     ``RankingSGDTrainPipelineProvider`` to construct the cls/reg/step metric
     lists (including the ``is_variable_step`` swap) exactly as udd_fm/train.py
@@ -35,11 +35,15 @@ Metrics are constructed on CPU because recir returns CPU torch tensors.
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any, Dict, Iterator, List, Optional, Tuple, TYPE_CHECKING
 
+import jax
 import torch
 import torch.nn as nn
 from minimal_viable_ai.core.trainer.train_pipeline import RecTrainPipelineProvider
+
+from .xsurface_helpers import _log_hbm_memory
 
 # minimal_viable_ai is provided at RUNTIME via the Docker image (Dockerfile
 # rsyncs fbcode/mvai_cloud/minimal_viable_ai -- the lightweight RankingSGD* API
@@ -65,10 +69,13 @@ class RecirXLATrainPipeline(RankingSGDTrainPipeline):
 
     Reuses RankingSGDTrainPipeline's metric construction (``__init__``), its
     ``_update_ranking_metrics(ret)`` cls/reg slicing, and its ``.metrics``
-    property. Only ``progress`` is overridden: it runs the self-compiling model
+    property. ``progress`` is overridden: it runs the self-compiling model
     wrapper (which does fwd -> backward -> dense opt.step -> sync internally and
-    returns the detached ``(losses, named_tensors)``) and rebuilds the
-    ``{prediction, label, weight}`` ``ret`` dict the base metric update consumes.
+    returns the detached ``(losses, named_tensors)``), rebuilds the
+    ``{prediction, label, weight}`` ``ret`` dict the base metric update consumes,
+    and drives the JAX profiler trace over [profile_start_step, profile_end_step]
+    (1-indexed step count). RecTrainer owns the step loop, so the profiler hook
+    lives here -- the per-step driver -- rather than around train().
     """
 
     def __init__(
@@ -81,6 +88,11 @@ class RecirXLATrainPipeline(RankingSGDTrainPipeline):
         step_metrics: Optional[List[Any]] = None,
         cls_task_indices: Optional[List[int]] = None,
         reg_task_indices: Optional[List[int]] = None,
+        jax_profiling: bool = False,
+        profile_start_step: int = -1,
+        profile_end_step: int = -1,
+        profile_dir: str = "/tmp/tpu_profile",
+        enable_memory_log: bool = False,
     ) -> None:
         # pyre-ignore[19]: base RankingSGDTrainPipeline is a runtime-only import
         # stubbed as Any (see module-level TYPE_CHECKING block), so pyre resolves
@@ -96,16 +108,56 @@ class RecirXLATrainPipeline(RankingSGDTrainPipeline):
             reg_task_indices=reg_task_indices,
         )
         self._model.train(True)
+        self._jax_profiling = jax_profiling
+        self._profile_start_step = profile_start_step
+        self._profile_end_step = profile_end_step
+        self._profile_dir = profile_dir
+        self._enable_memory_log = enable_memory_log
+        self._step = 0
+        self._profiling_active = False
+        if jax_profiling:
+            logger.info(
+                f"JAX profiling enabled: steps {profile_start_step}-"
+                f"{profile_end_step}, dir={profile_dir}"
+            )
 
     def progress(
         self, dataloader_iter: Iterator[Any]
     ) -> Tuple[torch.Tensor, Dict[str, Any]]:
         batch = next(dataloader_iter)
+        self._step += 1
+
+        # Start the xprof trace at the configured step (before the step runs so
+        # the step lands fully captured). Local dirs are created; gs:// paths are
+        # written directly by the profiler.
+        if self._jax_profiling and self._step == self._profile_start_step:
+            if not self._profile_dir.startswith("gs://"):
+                os.makedirs(self._profile_dir, exist_ok=True)
+            jax.profiler.start_trace(self._profile_dir)
+            self._profiling_active = True
+            logger.info(f"[PROFILE] Started trace at step {self._step}")
+
         # The self-compiling wrapper lazily compiles on the first call, then
-        # runs fwd -> backward (fires the SparseCore sparse opt off-GM) -> dense
-        # opt.step on TPU and syncs device state. It returns the detached
-        # (losses, named_tensors) from recir_core.run_step_and_sync.
+        # runs fwd -> backward (fires the SparseCore sparse opt off-GM, or the
+        # in-graph emb opt in-GM) -> dense opt.step on TPU and syncs device state.
+        # It returns the detached (losses, named_tensors).
         losses, named = self._model(batch)
+
+        if self._profiling_active and self._enable_memory_log:
+            _log_hbm_memory()
+
+        # Stop the trace at the end step (after the step ran).
+        if (
+            self._jax_profiling
+            and self._profiling_active
+            and self._step == self._profile_end_step
+        ):
+            jax.profiler.stop_trace()
+            self._profiling_active = False
+            logger.info(
+                f"[PROFILE] Stopped trace at step {self._step} -- saved to "
+                f"{self._profile_dir}"
+            )
 
         # Rebuild the ret dict RankingSGDTrainPipeline._update_ranking_metrics
         # expects; the metrics were constructed on torch.device("cpu") to match
@@ -120,6 +172,11 @@ class RecirXLATrainPipeline(RankingSGDTrainPipeline):
         return losses, ret
 
     def on_train_end(self) -> None:
+        # Stop any still-active trace (e.g. training ended before profile_end_step).
+        if self._profiling_active:
+            jax.profiler.stop_trace()
+            self._profiling_active = False
+            logger.info("[PROFILE] Stopped trace (training ended).")
         logger.info("RecirXLATrainPipeline: training complete.")
 
 
@@ -130,7 +187,9 @@ class RecirXLATrainPipelineProvider(
 
     Reuses mvai_cloud's ``RankingSGDTrainPipelineProvider`` to construct the
     cls/reg/step metric lists (including the ``is_variable_step`` swap) exactly
-    as udd_fm/train.py does; all compile work lives in the model wrapper.
+    as udd_fm/train.py does; all compile work lives in the model wrapper. The
+    profiling config is threaded into the pipeline so the JAX profiler trace is
+    emitted over the configured step window (consumed by run_tpu_bench.sh).
     """
 
     def __init__(
@@ -141,9 +200,19 @@ class RecirXLATrainPipelineProvider(
         reg_task_indices: Optional[List[int]] = None,
         is_variable_step: bool = True,
         report_interval: int = 1,
+        jax_profiling: bool = False,
+        profile_start_step: int = -1,
+        profile_end_step: int = -1,
+        profile_dir: str = "/tmp/tpu_profile",
+        enable_memory_log: bool = False,
     ) -> None:
         self._cls_task_indices = cls_task_indices
         self._reg_task_indices = reg_task_indices
+        self._jax_profiling = jax_profiling
+        self._profile_start_step = profile_start_step
+        self._profile_end_step = profile_end_step
+        self._profile_dir = profile_dir
+        self._enable_memory_log = enable_memory_log
         # Delegate metric-list construction (and the variable-step swap) to the
         # mvai_cloud provider verbatim -- same args udd_fm/train.py passes.
         # Annotated Any: RankingSGDTrainPipelineProvider is a runtime-only import
@@ -182,4 +251,9 @@ class RecirXLATrainPipelineProvider(
             step_metrics=base_pipeline._step_metrics,
             cls_task_indices=self._cls_task_indices,
             reg_task_indices=self._reg_task_indices,
+            jax_profiling=self._jax_profiling,
+            profile_start_step=self._profile_start_step,
+            profile_end_step=self._profile_end_step,
+            profile_dir=self._profile_dir,
+            enable_memory_log=self._enable_memory_log,
         )

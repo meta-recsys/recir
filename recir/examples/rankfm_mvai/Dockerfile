@@ -1,6 +1,6 @@
-# RankFM-MVAI (xsurface V3) on TPU v7x — same model as recir/examples/rankfm,
-# but DRIVEN BY the mvai_cloud training framework (RecTrainer + RecModelFamily +
-# RecTrainPipeline) instead of rankfm's bespoke train.py loop.
+# RankFM-MVAI (xsurface V3) on TPU v7x - the hammer/v3 udd_fm BlueReelsVDDTrainV3
+# DRIVEN BY the mvai_cloud training framework (RecTrainer + RecModelFamily +
+# RecTrainPipeline).
 #
 # Build context must contain:
 #   <context>/setup.py                   (from recir/github/setup.py)
@@ -55,6 +55,11 @@ RUN pip install pyre-extensions iopath
 
 # zstandard: decompress .pt.zst dataporter batches in BatchReplayPipe
 RUN pip install zstandard
+
+# google-cloud-storage: BatchReplayPipe reads gs:// dumps, and
+# parity_forward_loss.py uploads parity_result.json to a tenant GCS bucket
+# (`from google.cloud import storage`).
+RUN pip install google-cloud-storage
 
 # pyzstd: required by the mvai_cloud RecTrainer import chain
 # (minimal_viable_ai.core.dataloader.preproc_output_data_pipe imports it at
