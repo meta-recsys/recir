@@ -237,8 +237,9 @@ def _compiled_step(
     num_ranks: int,
     num_processes: int,
     padding: bool,
-) -> Tuple[Dict[str, torch.Tensor], int]:
-    """One compiled step via the mvai_cloud pipeline; return (dense params, all-reduce).
+) -> Tuple[Dict[str, torch.Tensor], int, float, Dict[str, Any]]:
+    """One compiled step via the mvai_cloud pipeline; return (dense params,
+    all-reduce count, total scalar loss, small diagnostic exports).
 
     Mirrors RecirXLACompiledModule (rankfm_mvai/model_family.py): build the recir
     embedding backend, expand the override sample, build dispatchers, set up
@@ -337,10 +338,47 @@ def _compiled_step(
     runner = compile_gspmd_step(
         model, dense_opt, batch, dispatchers, spec, train_step_fn=_udd_fm_v3_train_step
     )
-    run_step_and_sync(runner, model, dense_opt, batch)
+    # run_step_and_sync returns (loss, named_tensors) and has already synced
+    # device state to host. Capture the total scalar loss for the loss-value
+    # inertness check (.sum() is robust whether the runner hands back a scalar
+    # total or a per-task vector).
+    losses, named = run_step_and_sync(runner, model, dense_opt, batch)
+    loss_value = float(losses.detach().to(torch.float64).sum())
     all_reduce = _count_all_reduce(runner)
-    logger.info(f"[PARITY] compiled HLO all-reduce ops: {all_reduce}")
-    return _dense_params(backend, model), all_reduce
+    logger.info(
+        f"[PARITY] compiled HLO all-reduce ops: {all_reduce} loss={loss_value:.6f}"
+    )
+    # Capture small per-task / normalization exports for the padded-vs-jagged
+    # breakdown (which task's loss diverges; whether the loss_scale /
+    # num_candidates normalization denominators differ). The big per-sample
+    # tensors (prediction/label/weight) are left for a future metric compare.
+    exports: Dict[str, Any] = {}
+    if isinstance(named, dict):
+        logger.info(f"[PARITY] step export keys: {sorted(named.keys())}")
+        for k in ("loss", "loss_scale", "llw_weights", "num_candidates"):
+            t = named.get(k)
+            if isinstance(t, torch.Tensor):
+                exports[k] = t.detach().to(torch.float64).cpu()
+        # Per-task reductions of the big per-sample tensors. Their sample axis
+        # differs padded-vs-jagged (1024 vs ~514), so only sample-dim sums are
+        # comparable. weight_sum is the key masking check: correctly weight-0
+        # dummy candidates make the total effective weight match jagged.
+        w = named.get("weight")
+        lab = named.get("label")
+        pred = named.get("prediction")
+        if (
+            isinstance(w, torch.Tensor)
+            and isinstance(lab, torch.Tensor)
+            and isinstance(pred, torch.Tensor)
+        ):
+            wf = w.detach().to(torch.float64)
+            labf = lab.detach().to(torch.float64)
+            predf = pred.detach().to(torch.float64)
+            exports["weight_sum"] = wf.sum(dim=-1).cpu()
+            exports["label_wsum"] = (wf * labf).sum(dim=-1).cpu()
+            exports["pred_wsum"] = (wf * predf).sum(dim=-1).cpu()
+            exports["n_samples"] = torch.tensor([float(wf.shape[-1])])
+    return _dense_params(backend, model), all_reduce, loss_value, exports
 
 
 def _compare(
@@ -417,6 +455,58 @@ def _persist_result(result: Dict[str, Any]) -> None:
         logger.warning(f"[PARITY] GCS upload failed (non-fatal): {e}")
 
 
+def _log_export_breakdown(exp_j: Dict[str, Any], exp_p: Dict[str, Any]) -> None:
+    """Compact jagged-vs-padded breakdown of the model's per-task loss /
+    normalization exports, to localize a loss discrepancy.
+
+    One summary line per export -- ``match`` or ``DIFF`` with shape, sums, and
+    max abs diff. For exports that DIFFER, a few indented lines name the worst
+    entries by |diff| (e.g. the offending task index). Exports that agree stay
+    a single line; a shape mismatch (e.g. ``num_candidates`` length) is flagged
+    on its own, since it points straight at a normalization-shape difference.
+    """
+    eps = 1e-6
+    logger.info("[PARITY] export breakdown (j=jagged, p=padded):")
+    for key in (
+        "loss",
+        "loss_scale",
+        "llw_weights",
+        "num_candidates",
+        "weight_sum",
+        "label_wsum",
+        "pred_wsum",
+        "n_samples",
+    ):
+        a = exp_j.get(key)
+        b = exp_p.get(key)
+        if a is None or b is None:
+            logger.info(f"[PARITY]   {key:<15} not exported")
+            continue
+        af = a.flatten()
+        bf = b.flatten()
+        if af.shape != bf.shape:
+            logger.info(
+                f"[PARITY]   {key:<15} SHAPE DIFFERS  j={tuple(a.shape)} "
+                f"p={tuple(b.shape)}  sum j={float(af.sum()):.2f} p={float(bf.sum()):.2f}"
+            )
+            continue
+        diff = (af - bf).abs()
+        max_d = float(diff.max())
+        status = "match" if max_d <= eps else "DIFF "
+        logger.info(
+            f"[PARITY]   {key:<15} {status}  shape={tuple(a.shape)}  "
+            f"sum j={float(af.sum()):.2f} p={float(bf.sum()):.2f}  max|d|={max_d:.2e}"
+        )
+        if max_d > eps and af.numel() > 1:
+            for i in torch.argsort(diff, descending=True)[: min(5, af.numel())]:
+                if float(diff[i]) <= eps:
+                    break
+                logger.info(
+                    f"[PARITY]       [{int(i):>3}] j={float(af[i]):>11.4f} "
+                    f"p={float(bf[i]):>11.4f} d={float(bf[i] - af[i]):>+11.4f}"
+                )
+
+
 def main() -> None:
     logging.basicConfig(
         format="%(levelname).1s%(asctime)s %(filename)s:%(lineno)d] %(message)s",
@@ -455,17 +545,28 @@ def main() -> None:
     # identically, so the dense init + batch are shared; only static_shape_mode +
     # the PaddingRegionTransform differ.
     model_p, batch_p, num_ranks, num_processes = _build_model_and_batch(padding=True)
-    test_params, all_reduce = _compiled_step(
+    test_params, all_reduce, loss_padded, exp_p = _compiled_step(
         model_p, batch_p, num_ranks, num_processes, padding=True
     )
     model_j, batch_j, _, _ = _build_model_and_batch(padding=False)
-    ref_params, all_reduce_j = _compiled_step(
+    ref_params, all_reduce_j, loss_jagged, exp_j = _compiled_step(
         model_j, batch_j, num_ranks, num_processes, padding=False
     )
     logger.info(f"[PARITY] all-reduce ops: padded={all_reduce} jagged={all_reduce_j}")
 
     # ref = jagged (unpadded) ground truth; test = the padded path under test.
     cmp = _compare(ref_params, test_params, rtol, atol)
+    # Loss-value inertness: if padding is inert, the total loss matches the
+    # jagged reference. This is currently DIAGNOSTIC ONLY (logged, NOT gating):
+    # the WEIGHT compare is the verdict (training is inert), but the loss value
+    # still differs because one task's labels derive from num_candidates and so
+    # change under static-shape padding (see _log_export_breakdown -> the single
+    # offending task). Until that label path is padding-safe, gating on the loss
+    # would make the harness perpetually fail. Flip loss_ok into `passed` once
+    # it is fixed.
+    loss_abs = abs(loss_padded - loss_jagged)
+    loss_rel = loss_abs / max(abs(loss_jagged), 1e-12)
+    loss_ok = loss_abs <= atol + rtol * abs(loss_jagged)
     passed = cmp["num_failed"] == 0
 
     logger.info(
@@ -488,7 +589,16 @@ def main() -> None:
             f"[PARITY]   worst: {w['name']} abs={w['abs_diff']:.2e} "
             f"rel={w['rel_diff']:.2e} ref={w['ref']:.2e} {'ok' if w['pass'] else 'FAIL'}"
         )
-    logger.info(f"[PARITY] {'PASS' if passed else 'FAIL'}")
+    logger.info(
+        f"[PARITY] loss (diagnostic, non-gating): jagged={loss_jagged:.6f} "
+        f"padded={loss_padded:.6f} abs={loss_abs:.2e} rel={loss_rel:.2e} "
+        f"{'ok' if loss_ok else 'DIFF'}"
+    )
+    _log_export_breakdown(exp_j, exp_p)
+    logger.info(
+        f"[PARITY] {'PASS' if passed else 'FAIL'} (gated on WEIGHT parity) | "
+        f"loss {'ok' if loss_ok else 'DIFF -- diagnostic, non-gating (see breakdown)'}"
+    )
 
     _persist_result(
         {
@@ -504,6 +614,10 @@ def main() -> None:
             "atol": atol,
             "passed": passed,
             "all_reduce_ops": all_reduce,
+            "loss_padded": loss_padded,
+            "loss_jagged": loss_jagged,
+            "loss_abs_diff": loss_abs,
+            "loss_passed": loss_ok,
             **cmp,
         }
     )
