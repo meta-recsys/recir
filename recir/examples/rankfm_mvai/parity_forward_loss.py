@@ -23,15 +23,28 @@ is actually testable.
 
 Both sides run the SAME compiled framework + optimizer; only padding differs --
 so the result is a clean inertness verdict (optimizer math cancels). The jagged
-(unpadded) run cannot shard across a multi-device mesh, so this is SINGLE-DEVICE
-only.
+(unpadded) run shards across a multi-device mesh by building num_ranks identical
+per-device blocks (see _tile_batch_to_devices), so each device gets a jagged
+block with equal total tokens; set PARITY_CPU_DEVICES>1 (or run on a multi-chip
+mesh) to exercise it.
 
 Run (single-device CPU; no TPU needed -- same graph, CPU XLA compiles it):
     PARITY_DEVICE=cpu PARITY_CPU_DEVICES=1 PARITY_BATCH_RANKS=8 \\
         python3 -u -m recir.examples.rankfm_mvai.parity_forward_loss
+Multi-device CPU (2-device mesh, balanced jagged blocks):
+    PARITY_DEVICE=cpu PARITY_CPU_DEVICES=2 PARITY_BATCH_RANKS=8 \\
+        python3 -u -m recir.examples.rankfm_mvai.parity_forward_loss
 
 Knobs (env vars):
     PARITY_DEVICE       "cpu" (default) | "tpu" (single chip)
+    PARITY_EMB_BACKEND  embedding-lookup backend under test: "in_graph"
+                        (default; ring-shift / FSDP tables lowered into the
+                        compiled GSPMD program; the dedicated embedding optimizer
+                        is traced in, so this uses
+                        the two-optimizer compile path)
+    PARITY_RINGSHIFT_MIN_ROWS / PARITY_FSDP_MIN_ROWS / PARITY_ON_DEVICE_INIT
+                        in_graph table-sharding knobs (defaults 4096 / -1 / 1);
+                        ignored by the cpu / tpu backends
     PARITY_CPU_DEVICES  CPU-spoof device count (default "1"; CC is single-device)
     PARITY_BATCH_RANKS  global_bs = TEST_BATCH_SIZE * (PARITY_BATCH_RANKS or
                         num_ranks). Default "8" so the single-device batch is big
@@ -40,7 +53,6 @@ Knobs (env vars):
     PARITY_INPUT        "random" (default; jagged num_candidates -- padding is
                         meaningful) | "uniform"
     PARITY_NUM_CANDIDATES  NRO candidates per request + static budget (default 32)
-    PARITY_PRECISION    jax matmul precision: "highest" (fp32, default) | "default"
     PARITY_RTOL / PARITY_ATOL  weight-compare tolerances (default 2e-2 / 1e-3)
     PARITY_GCS_DIR      gs:// dir to upload parity_result.json (default: tenant
                         bucket on TPU); unset disables upload
@@ -77,7 +89,7 @@ import fbgemm_gpu  # noqa: F401 -- force C++ op registration before fallback
 import jax  # @manual
 import recir.lowering.fbgemm_fallback  # noqa: F401 -- registers SPMD_DECOMP entries
 import torch
-from hammer.v3.models.udd_fm_v3.batch_loader import BlueReelsVDDFeatureConfig
+import torch.distributed as dist
 from hammer.v3.models.udd_fm_v3.recir_core import (
     compile_gspmd_step,
     RecirCompileSpec,
@@ -85,16 +97,28 @@ from hammer.v3.models.udd_fm_v3.recir_core import (
     run_step_and_sync,
     setup_dense_optimizer_and_warmup,
 )
-from hammer.v3.models.udd_fm_v3.udd_fm_config import BlueReelsVDDModuleConfig
+from hammer.v3.models.udd_fm_v3.recir_core.compile import compile_step
+from hammer.v3.models.udd_fm_v3.recir_core.trace_sample import flatten_batch
 from hammer.v3.models.udd_fm_v3.udd_fm_train_v3 import BlueReelsVDDTrainV3
 from hammer.v3.modules.recblock import _inputs_to_feature_bundle
+from recir.api import sync_device_state_to_torch
+from recir.backends import XLAGSPMDBackend
 from recir.decompositions import SPMD_DECOMP_TABLE
+from recir.distributed.parallel_mode import GSPMDParallel
 from recir.examples.rankfm_mvai.config import (
-    _build_static_ro_budgets,
+    build_module_config,
+    RankFMModelArgs,
     RankFMTrainerConfig,
 )
 from recir.examples.rankfm_mvai.embedding import build_embedding_backend
-from recir.examples.rankfm_mvai.model_family import _udd_fm_v3_train_step
+from recir.examples.rankfm_mvai.embedding.in_graph_embedding_backend import (
+    SHARDED_TABLE_PREFIX,
+)
+from recir.examples.rankfm_mvai.model_family import (
+    _udd_fm_v3_train_step,
+    _udd_fm_v3_train_step_two_opt,
+)
+from recir.examples.rankfm_mvai.train_common import force_cpu_barrier, resolve_dist_env
 from recir.examples.rankfm_mvai.xsurface_helpers import (
     _resolve_nro_per_sample,
     make_padding_region_transforms,
@@ -105,10 +129,11 @@ from recir.lowering.xla_lower import _XLAModule
 from recir.tests.xla.xsurface_test_utils import (
     _create_random_train_batch,
     _create_uniform_train_batch,
+    _tile_dim0,
+    _tile_last_dim,
     build_model_from_config,
-    TEST_BATCH_SIZE,
+    resize_kjt_b,
     TEST_MAX_UIH_SEQ_LEN,
-    TestConfigProvider,
 )
 
 logger: logging.Logger = logging.getLogger(__name__)
@@ -140,6 +165,56 @@ _PARITY_NUM_CANDIDATES: int = int(os.environ.get("PARITY_NUM_CANDIDATES", "32"))
 # non-degenerate batch. 0 => use num_ranks.
 _PARITY_BATCH_RANKS: int = int(os.environ.get("PARITY_BATCH_RANKS", "8"))
 
+# Embedding-lookup backend under test. "cpu" (torchrec DMP) and "tpu" (JAX
+# SparseCore) keep the embedding update OFF the compiled graph -> single dense
+# optimizer. "in_graph" lowers the ring-shift / FSDP tables INTO the GSPMD
+# program as plain params, so it adds a dedicated embedding optimizer and uses
+# the two-optimizer compile path (mirrors model_family._build_compiled_step).
+_PARITY_EMB_BACKEND: str = os.environ.get("PARITY_EMB_BACKEND", "in_graph").lower()
+# in_graph table-sharding thresholds (per-table row counts); ignored by cpu/tpu.
+_PARITY_RINGSHIFT_MIN_ROWS: int = int(
+    os.environ.get("PARITY_RINGSHIFT_MIN_ROWS", "4096")
+)
+_PARITY_FSDP_MIN_ROWS: int = int(os.environ.get("PARITY_FSDP_MIN_ROWS", "-1"))
+_PARITY_ON_DEVICE_INIT: bool = os.environ.get(
+    "PARITY_ON_DEVICE_INIT", "1"
+).lower() not in ("0", "false", "no", "")
+
+
+def _tile_batch_to_devices(batch: Any, num_ranks: int) -> Any:
+    """Replicate a per-device batch into ``num_ranks`` identical contiguous blocks.
+
+    The batch is built at the per-device sample count; tiling it W times along the
+    batch axis yields W identical jagged blocks. recir shards every flat batch
+    tensor with a per-tensor ``np.split(axis=0, W)`` (recir/lowering/xla_lower.py),
+    so identical blocks make every cut land exactly on a device boundary -- equal
+    samples AND equal total tokens per device -- even though per-sample lengths
+    still vary within a block. This is the multi-device generalization of the
+    jagged run (no per-sample padding). For num_ranks == 1 it is a no-op.
+
+    Field handling mirrors ``_construct_override_build_sample`` (ro sized by the
+    request batch, nro/labels/unary sized by the candidate batch); num_candidates
+    is tiled (not recomputed) so sum(num_candidates) stays == the nro batch.
+    """
+    if num_ranks <= 1:
+        return batch
+    g_ro = batch.ro_float_features.shape[0] * num_ranks
+    g_nro = batch.nro_float_features.shape[0] * num_ranks
+    batch.ro_float_features = _tile_dim0(batch.ro_float_features, g_ro)
+    batch.ro_id_list_features = resize_kjt_b(batch.ro_id_list_features, g_ro)
+    batch.nro_float_features = _tile_dim0(batch.nro_float_features, g_nro)
+    batch.nro_id_list_features = resize_kjt_b(batch.nro_id_list_features, g_nro)
+    if batch.unary_features is not None:
+        batch.unary_features = resize_kjt_b(batch.unary_features, g_nro)
+    batch.num_candidates = _tile_dim0(batch.num_candidates, g_ro)
+    batch.supervision_label = _tile_last_dim(batch.supervision_label, g_nro)
+    batch.supervision_weight = _tile_last_dim(batch.supervision_weight, g_nro)
+    all_labels = batch.all_labels
+    if all_labels is not None:
+        for k in list(all_labels.keys()):
+            all_labels[k] = _tile_dim0(all_labels[k], g_nro)
+    return batch
+
 
 def _build_model_and_batch(
     padding: bool,
@@ -157,47 +232,41 @@ def _build_model_and_batch(
     num_processes = 1
     torch.manual_seed(42)
     device = torch.device("cpu")
-    global_bs = TEST_BATCH_SIZE * (_PARITY_BATCH_RANKS or num_ranks)
-
-    config = TestConfigProvider().create_config()
-    module_config = cast(BlueReelsVDDModuleConfig, config.module_config)
-    feature_config = cast(BlueReelsVDDFeatureConfig, config.feature_config)
-    # disable_seq_len_sampling=True
-    module_config.hstu_seq_len_sampling_configs = None
-    # Mirror prod's build_module_config sequence-shape coupling (config.py): the
-    # HSTU history bound, L2 window, and output length must all be sized to the
-    # test's actual sequence, or static_shape_mode's L2-split math goes negative
-    # (l2_left_total = GROUP_SIZE - batch*(hstu_l2_max_seq_len + budget) -> < 0 ->
-    # torch.arange(<0)). Output length must equal the candidate count (one output
-    # token per candidate). Set unconditionally so both cells match.
-    module_config.hstu_max_seq_len = TEST_MAX_UIH_SEQ_LEN
-    module_config.hstu_l2_max_seq_len = max(1, TEST_MAX_UIH_SEQ_LEN // 4)
-    module_config.hstu_max_output_len = _PARITY_NUM_CANDIDATES
-    if padding:
-        module_config.static_shape_mode = True
-        module_config.static_nro_per_sample_budget = _PARITY_NUM_CANDIDATES
-        module_config.static_ro_per_sample_budgets = _build_static_ro_budgets(
-            module_config, _PARITY_SEQ_RO_BUDGET
-        )
-
-    model = build_model_from_config(module_config, device)
+    global_bs = int(os.environ.get("PARITY_GLOBAL_BS", "512"))
+    seq = int(os.environ.get("RANKFM_S", "4096"))
+    model_args = RankFMModelArgs(
+        hash_size_cap=int(os.environ.get("PARITY_HASH_SIZE_CAP", "131072")),
+        l1_num_layers=8,
+        l2_num_layers=10,
+        max_uih_seq_len=seq,
+        l2_max_seq_len=512,
+        num_candidates=10,
+        disable_seq_len_sampling=True,
+        seq_ro_per_sample_budget=seq,
+    )
+    module_config, feature_config = build_module_config(
+        model_args, enable_padding=padding
+    )
+    model = build_model_from_config(module_config, device, bf16_training=True)
     for p in model.parameters():
         if p.is_floating_point():
             p.requires_grad_(True)
-    feature_config.num_candidates_per_request = _PARITY_NUM_CANDIDATES
-    feature_config.history_len = TEST_MAX_UIH_SEQ_LEN
 
+    if global_bs % num_ranks != 0:
+        raise ValueError(
+            f"global batch {global_bs} not divisible by num_ranks {num_ranks}."
+        )
+    bs = global_bs // num_ranks
     if _PARITY_INPUT == "random":
         batch = _create_random_train_batch(
             feature_config,
             device,
-            batch_size=global_bs,
-            num_candidates=_PARITY_NUM_CANDIDATES,
+            batch_size=bs,
+            num_candidates=model_args.num_candidates,
         )
     else:
-        batch = _create_uniform_train_batch(
-            feature_config, device, batch_size=global_bs
-        )
+        batch = _create_uniform_train_batch(feature_config, device, batch_size=bs)
+    batch = _tile_batch_to_devices(batch, num_ranks)
     return model, batch, num_ranks, num_processes
 
 
@@ -249,21 +318,28 @@ def _compiled_step(
     """
     device = torch.device("cpu")
     model.train(True)
-    trainer_cfg = RankFMTrainerConfig()
     module_config = model.module_config
-    global_bs = TEST_BATCH_SIZE * (_PARITY_BATCH_RANKS or num_ranks)
+    # Derive the global batch from the actual batch passed in.
+    global_bs = batch.ro_float_features.shape[0]
 
-    backend = build_embedding_backend("cpu")
+    trainer_cfg = RankFMTrainerConfig()
+    backend = build_embedding_backend(
+        _PARITY_EMB_BACKEND,
+        ringshift_min_rows=_PARITY_RINGSHIFT_MIN_ROWS,
+        fsdp_min_rows=_PARITY_FSDP_MIN_ROWS,
+        on_device_init=_PARITY_ON_DEVICE_INIT,
+    )
+    # cpu/torchrec DMP needs a gloo PG; mirror the family (reuse if already init).
+    if not (dist.is_available() and dist.is_initialized()):
+        backend.init_pg()
     num_candidates_per_sample = _resolve_nro_per_sample(module_config, padding)
     padded_num_devices = math.lcm(num_ranks, backend.sc_modulus() * num_processes)
 
-    # Override-build sample. PADDED: resize to the global padded shape via the
-    # SAME helper prod/train.py uses (so sizing cannot drift). JAGGED: build from
-    # the RAW batch -- the override's NRO must match the actual jagged candidate
-    # count so the DCN inter-arch cat (r_dense vs sparse_embeddings) aligns.
-    # prepare_override_build_sample's non-padding branch rectangular-resizes NRO
-    # to global_bs * num_candidates, which would feed DCN a rectangular sparse
-    # tensor against a jagged dense one.
+    # Override-build sample. PADDED: resize to the global padded shape via the SAME
+    # helper prod/train.py uses. JAGGED: build from the RAW batch so the override's
+    # NRO matches the actual jagged candidate count (prepare_override_build_sample's
+    # non-padding branch rectangular-resizes NRO to global_bs * num_candidates,
+    # which would mismatch the jagged dense path -- the 5120-vs-2808 cat error).
     if padding:
         batch_sample, override_bs = prepare_override_build_sample(
             batch,
@@ -285,11 +361,9 @@ def _compiled_step(
         )
         override_bs = global_bs
 
-    # Table configs from the EC BEFORE backend.setup mutates the model.
     # pyre-ignore[16]: dynamic submodule traversal through the hammer v3 union.
     ec = model.recblock.tokenizer_stack.mot_sparse_arch._sparse_arch._embedding_collection
     table_configs = ec.embedding_configs()
-
     dispatchers = backend.get_override(  # pyre-ignore[16]
         model.recblock,
         batch_sample,
@@ -298,9 +372,6 @@ def _compiled_step(
         num_ranks,
         num_processes,
     )
-    # Embedding storage only (DMP for cpu; skipped single-host). Dense optimizer
-    # is the unified one below, not the backend's. backend.setup returns Module;
-    # for single-host CPU it returns the model unchanged, so cast back.
     model = cast(
         BlueReelsVDDTrainV3,
         backend.setup(model, table_configs, trainer_cfg.embedding_lr, num_processes),
@@ -319,6 +390,14 @@ def _compiled_step(
     dense_opt, _warmup = setup_dense_optimizer_and_warmup(
         model, dense_params, trainer_cfg.dense_optimizer_config, device
     )
+    # in_graph backend only: dedicated SGD opt over the in-graph table params.
+    emb_named_fn = getattr(backend, "embedding_named_parameters", None)
+    emb_params = emb_named_fn(model) if emb_named_fn is not None else {}
+    emb_opt: torch.optim.Optimizer | None = None
+    if emb_params:
+        emb_opt = torch.optim.SGD(
+            list(emb_params.values()), lr=trainer_cfg.embedding_lr, foreach=True
+        )
 
     region_transforms = (
         make_padding_region_transforms(
@@ -335,14 +414,38 @@ def _compiled_step(
         loss_reduction="sum",
         region_transforms=region_transforms,
     )
-    runner = compile_gspmd_step(
-        model, dense_opt, batch, dispatchers, spec, train_step_fn=_udd_fm_v3_train_step
-    )
-    # run_step_and_sync returns (loss, named_tensors) and has already synced
-    # device state to host. Capture the total scalar loss for the loss-value
-    # inertness check (.sum() is robust whether the runner hands back a scalar
-    # total or a per-task vector).
-    losses, named = run_step_and_sync(runner, model, dense_opt, batch)
+    if emb_opt is None:
+        runner = compile_gspmd_step(
+            model,
+            dense_opt,
+            batch,
+            dispatchers,
+            spec,
+            train_step_fn=_udd_fm_v3_train_step,
+        )
+        losses, named = run_step_and_sync(runner, model, dense_opt, batch)
+    else:
+        parallel_mode = GSPMDParallel(
+            "replicate",
+            loss_reduction=spec.loss_reduction,
+            num_ranks=num_ranks,
+            num_processes=num_processes,
+            fsdp_table_substr=SHARDED_TABLE_PREFIX,
+        )
+        runner = compile_step(
+            _udd_fm_v3_train_step_two_opt,
+            model,
+            (dense_opt, emb_opt),
+            batch,
+            parallel_mode=parallel_mode,
+            backend=XLAGSPMDBackend(),
+            dispatchers=dispatchers,
+            region_transforms=region_transforms,
+        )
+        losses, named = runner(model, dense_opt, emb_opt, *flatten_batch(batch))
+        sync_device_state_to_torch(runner)
+    # Capture the total scalar loss for the loss-value inertness check (.sum() is
+    # robust whether the runner hands back a scalar total or a per-task vector).
     loss_value = float(losses.detach().to(torch.float64).sum())
     all_reduce = _count_all_reduce(runner)
     logger.info(
@@ -513,37 +616,37 @@ def main() -> None:
         level=logging.INFO,
         force=True,
     )
-    # Default to fp32 (highest) so the MXU matmuls are deterministic across cells.
-    precision = os.environ.get("PARITY_PRECISION", "highest")
-    jax.config.update("jax_default_matmul_precision", precision)
+    # On GKE TPU, initialize the JAX distributed runtime BEFORE any jax op, like
+    # the trainer (train.py:77): the PJRT plugin reads the coordinator + process
+    # info from the TPU runtime metadata. The CPU-spoof path must NOT call this.
+    if _PARITY_DEVICE == "tpu":
+        jax.distributed.initialize()
+        logger.info(
+            f"[PARITY] jax.distributed.initialize() done: "
+            f"process_count={jax.process_count()} device_count={jax.device_count()}"
+        )
+    # Mirror train.py's pre-trainer setup: resolve the dist env (RANK/WORLD_SIZE/
+    # MASTER_*) and route torch.distributed barriers to CPU. RecTrainer does this
+    # before building the family; replicate it so nothing differs from the bench.
+    resolve_dist_env()
+    force_cpu_barrier()
     rtol = float(os.environ.get("PARITY_RTOL", "2e-2"))
     atol = float(os.environ.get("PARITY_ATOL", "1e-3"))
 
     devices = jax.devices()
     logger.info(
         f"[PARITY] device={_PARITY_DEVICE} jax_platform={devices[0].platform} "
-        f"num_devices={len(devices)} matmul_precision={precision}"
+        f"num_devices={len(devices)}"
     )
-
-    # Compiled-padded-vs-jagged is SINGLE-DEVICE only: the unpadded/jagged run
-    # cannot shard across a multi-device mesh (recir's np.split needs an equal,
-    # sample-aligned batch split -- which padding provides). Fail fast instead of
-    # a cryptic np.split error deep in the jagged step.
-    if len(devices) > 1:
+    if _PARITY_EMB_BACKEND == "tpu" and _PARITY_DEVICE != "tpu":
         raise RuntimeError(
-            f"compiled-padded-vs-jagged parity requires a single-device mesh "
-            f"(got num_devices={len(devices)}). Use PARITY_DEVICE=cpu "
-            f"PARITY_CPU_DEVICES=1 PARITY_BATCH_RANKS=8."
+            "PARITY_EMB_BACKEND=tpu requires a real TPU chip (JAX SparseCore)."
         )
+    logger.info(f"[PARITY] embedding_backend={_PARITY_EMB_BACKEND}")
 
-    logger.info(
-        f"[PARITY] input={_PARITY_INPUT} num_candidates={_PARITY_NUM_CANDIDATES} "
-        f"seq_ro_budget={_PARITY_SEQ_RO_BUDGET}"
-    )
-
-    # Vary ONLY padding, both sides on the compiled path. Each build re-seeds
-    # identically, so the dense init + batch are shared; only static_shape_mode +
-    # the PaddingRegionTransform differ.
+    # Padded-vs-jagged parity: both cells on the compiled path; only padding (the
+    # static_shape_mode + PaddingRegionTransform) differs. ref = jagged ground
+    # truth; test = the padded path under test. WEIGHT parity is the verdict.
     model_p, batch_p, num_ranks, num_processes = _build_model_and_batch(padding=True)
     test_params, all_reduce, loss_padded, exp_p = _compiled_step(
         model_p, batch_p, num_ranks, num_processes, padding=True
@@ -554,21 +657,11 @@ def main() -> None:
     )
     logger.info(f"[PARITY] all-reduce ops: padded={all_reduce} jagged={all_reduce_j}")
 
-    # ref = jagged (unpadded) ground truth; test = the padded path under test.
     cmp = _compare(ref_params, test_params, rtol, atol)
-    # Loss-value inertness: if padding is inert, the total loss matches the
-    # jagged reference. This is currently DIAGNOSTIC ONLY (logged, NOT gating):
-    # the WEIGHT compare is the verdict (training is inert), but the loss value
-    # still differs because one task's labels derive from num_candidates and so
-    # change under static-shape padding (see _log_export_breakdown -> the single
-    # offending task). Until that label path is padding-safe, gating on the loss
-    # would make the harness perpetually fail. Flip loss_ok into `passed` once
-    # it is fixed.
     loss_abs = abs(loss_padded - loss_jagged)
     loss_rel = loss_abs / max(abs(loss_jagged), 1e-12)
     loss_ok = loss_abs <= atol + rtol * abs(loss_jagged)
     passed = cmp["num_failed"] == 0
-
     logger.info(
         f"[PARITY] compared {cmp['num_params_compared']} dense params; "
         f"{cmp['num_failed']} outside tol"
@@ -578,18 +671,6 @@ def main() -> None:
         f"p90={cmp['p90_abs_diff']:.2e} max={cmp['max_abs_diff']:.2e}"
     )
     logger.info(
-        f"[PARITY] rel_diff  median={cmp['median_rel_diff']:.2e} "
-        f"p90={cmp['p90_rel_diff']:.2e} max={cmp['max_rel_diff']:.2e}"
-    )
-    logger.info(
-        f"[PARITY] tolerance (per param): |a-b| <= atol={atol:.1e} + rtol={rtol:.1e}*|a|"
-    )
-    for w in cmp["worst"]:
-        logger.info(
-            f"[PARITY]   worst: {w['name']} abs={w['abs_diff']:.2e} "
-            f"rel={w['rel_diff']:.2e} ref={w['ref']:.2e} {'ok' if w['pass'] else 'FAIL'}"
-        )
-    logger.info(
         f"[PARITY] loss (diagnostic, non-gating): jagged={loss_jagged:.6f} "
         f"padded={loss_padded:.6f} abs={loss_abs:.2e} rel={loss_rel:.2e} "
         f"{'ok' if loss_ok else 'DIFF'}"
@@ -597,9 +678,8 @@ def main() -> None:
     _log_export_breakdown(exp_j, exp_p)
     logger.info(
         f"[PARITY] {'PASS' if passed else 'FAIL'} (gated on WEIGHT parity) | "
-        f"loss {'ok' if loss_ok else 'DIFF -- diagnostic, non-gating (see breakdown)'}"
+        f"loss {'ok' if loss_ok else 'DIFF -- diagnostic, non-gating'}"
     )
-
     _persist_result(
         {
             "device": _PARITY_DEVICE,
@@ -607,9 +687,7 @@ def main() -> None:
             "num_devices": len(devices),
             "num_ranks": num_ranks,
             "num_processes": num_processes,
-            "input": _PARITY_INPUT,
-            "num_candidates": _PARITY_NUM_CANDIDATES,
-            "matmul_precision": precision,
+            "embedding_backend": _PARITY_EMB_BACKEND,
             "rtol": rtol,
             "atol": atol,
             "passed": passed,
