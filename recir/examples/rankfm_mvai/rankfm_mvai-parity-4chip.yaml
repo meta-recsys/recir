@@ -1,16 +1,25 @@
-# RankFM forward-loss parity on a single 2x2x1 TPU v7x host (4 chips).
+# RankFM forward-loss (padding-inertness) parity on a single 2x2x1 TPU v7x host
+# (4 chips => 8 jax devices).
 #
 # Models the team's ads_rankagi parity-job.yaml: a single-host (2x2x1, 4-chip)
 # pod that BYPASSES Kueue (no kueue.x-k8s.io/queue-name label) and schedules
-# straight onto one TPU host -- so it needs 4 chips, not a 64-chip 4x4x4 cube.
-# Single host => single process => parity_forward_loss.py runs as-is
-# (PARITY_DEVICE=tpu; no jax.distributed multi-host init).
+# straight onto one TPU host. parity_forward_loss.py runs the compiled
+# padded-vs-jagged compare across the 8-device mesh (jax.distributed.initialize()
+# inside; the jagged run shards via per-device-balanced blocks).
+#
+# Embedding-lookup backend under test is selected via PARITY_EMB_BACKEND below
+# ("in_graph" ring-shift/FSDP default | "cpu" torchrec DMP | "tpu" SparseCore).
+#
+# NOTE: do NOT upgrade libtpu here -- use the image's libtpu, exactly like the
+# bench (rankfm_mvai-4chip-bench.yaml). A pip --pre libtpu upgrade pulls a libtpu
+# whose deepsea/MXU codegen fails compilation; the image libtpu compiles fine.
 #
 # Prereqs: the rankfm_mvai_tpu image must be (re)built+pushed AFTER committing
-# parity_forward_loss.py so the module is present in the image.
+# parity_forward_loss.py so the module is present in the image (run_parity.sh
+# does this).
 #
-# Submit (after approval):
-#   kubectl create -f recir/examples/rankfm/rankfm-parity-4chip.yaml \
+# Submit (run_parity.sh wraps this):
+#   kubectl create -f recir/examples/rankfm_mvai/rankfm_mvai-parity-4chip.yaml \
 #     -n ns-mrs-core-shared
 apiVersion: jobset.x-k8s.io/v1alpha2
 kind: JobSet
@@ -32,8 +41,7 @@ spec:
             containers:
             - name: parity
               # Personal tag so we never clobber the shared rankfm_mvai_tpu:latest
-              # used by the RankFM training configs. Build with:
-              #   IMAGE_TAG=plund-parity bash recir/examples/rankfm/build_image_podman.sh
+              # used by the RankFM training configs. Build with run_parity.sh.
               image: us-central1-docker.pkg.dev/mrs-tpu-y317h/recml/rankfm_mvai_tpu:plund-parity
               imagePullPolicy: Always
               env:
@@ -43,18 +51,40 @@ spec:
                 value: "TPU"
               - name: PARITY_DEVICE
                 value: "tpu"
+              - name: MASTER_PORT
+                value: "29500"
+              # libtpu/XLA compiler flags mirrored from the bench (megacore fusion
+              # + async-collective overlap) so the TPU codegen path matches.
+              - name: LIBTPU_INIT_ARGS
+                value: >-
+                  --xla_tpu_megacore_fusion_allow_ags=false
+                  --xla_enable_async_collective_permute=true
+                  --xla_tpu_enable_ag_backward_pipelining=true
+                  --xla_tpu_enable_data_parallel_all_reduce_opt=true
+                  --xla_tpu_data_parallel_opt_different_sized_ops=true
+                  --xla_tpu_enable_async_collective_fusion=true
+                  --xla_tpu_enable_async_collective_fusion_multiple_steps=true
+                  --xla_tpu_overlap_compute_collective_tc=true
+                  --xla_enable_async_all_gather=true
+              # Embedding backend under test: in_graph (default) | cpu | tpu.
+              - name: PARITY_EMB_BACKEND
+                value: "in_graph"
+              # in_graph table-sharding knobs (ignored by cpu/tpu); uncomment to
+              # steer which tables use ROWWISE ring-shift / FSDP / DP by row count:
+              # - name: PARITY_RINGSHIFT_MIN_ROWS
+              #   value: "4096"
+              # - name: PARITY_FSDP_MIN_ROWS
+              #   value: "-1"
+              # - name: PARITY_ON_DEVICE_INIT
+              #   value: "1"
               command:
               - bash
               - -c
               - |
-                set -euo pipefail
-                echo "=== libtpu upgrade (v7x chip-ID support, mirrors parity-job.yaml) ==="
-                pip install --quiet --upgrade --pre libtpu \
-                  -f https://storage.googleapis.com/libtpu-releases/index.html \
-                  -f https://storage.googleapis.com/libtpu-wheels/index.html || true
+                set -uo pipefail
                 echo "=== jax devices ==="
                 python3 -c "import jax; print(jax.devices())"
-                echo "=== forward-loss parity (CPU eager bf16 vs TPU compiled) ==="
+                echo "=== padding-inertness parity (compiled-padded vs compiled-jagged; embedding_backend=${PARITY_EMB_BACKEND}) ==="
                 python3 -u -m recir.examples.rankfm_mvai.parity_forward_loss
               ports:
               - containerPort: 8471
