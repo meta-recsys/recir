@@ -1,4 +1,6 @@
 # (c) Meta Platforms, Inc. and affiliates. Confidential and proprietary.
+
+# pyre-unsafe
 """Runtime patches for the pip-installed torchrec used by the TPU bench image.
 
 apply_seq_a2a_int64_patch: fix an int32 offset overflow in torchrec's ROW_WISE
