@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# pyre-unsafe
+
 """Pure PyTorch fallbacks for fbgemm ops used by generative_recommenders.
 
 When fbgemm_gpu is not available (e.g., on TPU), importing this module

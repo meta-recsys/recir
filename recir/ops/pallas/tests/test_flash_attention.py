@@ -1,5 +1,7 @@
 # (c) Meta Platforms, Inc. and affiliates. Confidential and proprietary.
 
+# pyre-unsafe
+
 """Correctness tests for the optimized Pallas FlashAttention kernel.
 
 All tests use ``interpret=True`` to run on CPU for CI (no TPU required).

@@ -4,6 +4,8 @@
 # This source code is licensed under the BSD-3-Clause license found in the
 # LICENSE file in the root directory of this source tree.
 
+# pyre-unsafe
+
 """Workaround for JAX cuda12 plugin path lookup on Buck RE workers.
 
 After the 2026-05-14 buckification of `jax-cuda12-pjrt==0.8.0`

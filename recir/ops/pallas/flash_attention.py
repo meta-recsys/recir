@@ -1,5 +1,7 @@
 # (c) Meta Platforms, Inc. and affiliates. Confidential and proprietary.
 
+# pyre-unsafe
+
 """Optimized Pallas FlashAttention kernel for TPU with target attention mask.
 
 This module provides a tiled FlashAttention-2 implementation using JAX's Pallas
