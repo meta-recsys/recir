@@ -32,6 +32,13 @@ from recir.region_transforms.inference_swap import (
 from recir.region_transforms.recompute import RecomputeTransform
 from recir.region_transforms.regather import RegatherTransform
 from recir.region_transforms.sparse_embedding import SparseEmbeddingTransform
+from recir.region_transforms.training_to_inference import (
+    fabricate_inference_graph,
+    inputs_to_ops,
+    select_inference_outputs,
+    strip_collectives,
+    strip_grad_tags,
+)
 
 __all__ = [
     "RegionTransform",
@@ -42,6 +49,11 @@ __all__ = [
     "apply_inference_swaps",
     "deterministic_argmax",
     "identity_passthrough",
+    "fabricate_inference_graph",
+    "inputs_to_ops",
+    "select_inference_outputs",
+    "strip_collectives",
+    "strip_grad_tags",
     "_apply_region_transforms",
     "_compute_region_io",
     "_discover_autograd_functions",
