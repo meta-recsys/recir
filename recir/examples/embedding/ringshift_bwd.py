@@ -1,5 +1,7 @@
 # (c) Meta Platforms, Inc. and affiliates. Confidential and proprietary.
 
+# pyre-unsafe
+
 """Real-TPU backward correctness tests for ``ringshift_embedding_lookup``.
 
 Two ``unittest.TestCase`` classes:

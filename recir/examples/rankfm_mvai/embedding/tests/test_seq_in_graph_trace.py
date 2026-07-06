@@ -1,5 +1,7 @@
 # (c) Meta Platforms, Inc. and affiliates. Confidential and proprietary.
 
+# pyre-unsafe
+
 """CPU FX-trace check for InGraphSparseArch.
 
 Answers (without TPU): does the in-graph module trace cleanly -- i.e. does the
