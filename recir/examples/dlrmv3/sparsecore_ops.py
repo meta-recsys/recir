@@ -4,6 +4,8 @@
 # This source code is licensed under the BSD-3-Clause license found in the
 # LICENSE file in the root directory of this source tree.
 
+# pyre-unsafe
+
 """jte-free SparseCore forward/backward kernel emission.
 
 Reconstructs the SparseCore custom_calls that jax_tpu_embedding emits, WITHOUT

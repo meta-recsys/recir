@@ -1,5 +1,7 @@
 # (c) Meta Platforms, Inc. and affiliates. Confidential and proprietary.
 
+# pyre-unsafe
+
 """CPU test for on-device (meta) FSDP weight init in _to_sharded_jax.
 
 Verifies that a *meta* FSDP weight is materialized as a correctly-sharded

@@ -1,5 +1,7 @@
 # (c) Meta Platforms, Inc. and affiliates. Confidential and proprietary.
 
+# pyre-unsafe
+
 """Standalone perf benchmark: TensorCore ring-shift vs SparseCore lookup (fwd).
 
 Compares, at a matched ``(world_size, dim, per-rank query count, distribution)``
