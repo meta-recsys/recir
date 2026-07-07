@@ -1,5 +1,7 @@
 # (c) Meta Platforms, Inc. and affiliates. Confidential and proprietary.
 
+# pyre-unsafe
+
 """Fused jagged all-to-all + sharded embedding lookup as Pallas TC + SC kernels.
 
 This module implements a TPU-friendly version of the sharded embedding lookup
