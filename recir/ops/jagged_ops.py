@@ -226,6 +226,13 @@ def _concat_2d_jagged_cpu(
     Self-contained (no hammer/generative_recommenders import) to avoid a BUCK
     dependency cycle with the dispatchers that route into this op.
     """
+    # A globally-empty side has nothing to interleave; the combined jagged is
+    # just the other side (per-sample order is preserved by the offset sums).
+    # Without this, the empty side's index_select clamps to [0, -1] and throws.
+    if values_left.shape[0] == 0:
+        return values_right
+    if values_right.shape[0] == 0:
+        return values_left
     n = offsets_left.shape[0] - 1
     la = offsets_left[1:] - offsets_left[:-1]
     comb = offsets_left + offsets_right  # cumulative combined offsets
