@@ -4,6 +4,8 @@
 # This source code is licensed under the BSD-3-Clause license found in the
 # LICENSE file in the root directory of this source tree.
 
+# pyre-unsafe
+
 """torch_tpu SparseCore embedding backend.
 
 Hosts the SparseCore fwd/bwd kernels on torch_tpu's PJRT via ``pallas.jax_op``

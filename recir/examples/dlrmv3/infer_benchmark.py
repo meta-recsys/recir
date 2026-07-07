@@ -1,3 +1,4 @@
+# pyre-unsafe
 """DLRMv3 HSTU TPU Inference Benchmark.
 
 Measures latency and throughput of the dense (HSTU) forward pass on TPU
