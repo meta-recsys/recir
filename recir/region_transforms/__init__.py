@@ -23,6 +23,12 @@ from recir.region_transforms.core import (
     extract_subgraph,
     replace_region,
 )
+from recir.region_transforms.inference_swap import (
+    apply_inference_swaps,
+    deterministic_argmax,
+    identity_passthrough,
+    InferenceSwapTransform,
+)
 from recir.region_transforms.recompute import RecomputeTransform
 from recir.region_transforms.regather import RegatherTransform
 from recir.region_transforms.sparse_embedding import SparseEmbeddingTransform
@@ -32,6 +38,10 @@ __all__ = [
     "RegatherTransform",
     "RecomputeTransform",
     "SparseEmbeddingTransform",
+    "InferenceSwapTransform",
+    "apply_inference_swaps",
+    "deterministic_argmax",
+    "identity_passthrough",
     "_apply_region_transforms",
     "_compute_region_io",
     "_discover_autograd_functions",
