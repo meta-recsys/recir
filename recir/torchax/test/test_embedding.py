@@ -163,6 +163,7 @@ def make_train_step(
             (loss, aux_data), gradient = grad_fn(weights, buffers, *args)
 
         with jax.named_scope("optimizer_updates"):
+            # pyrefly: ignore [not-iterable]
             updates, opt_state = interop.call_jax(
                 optax_optimizer.update, gradient, opt_state, weights
             )  # type: ignore

@@ -140,6 +140,7 @@ def _make_inputs(
     for sl in seq_lens:
         cu_seqlens.append(cu_seqlens[-1] + sl)
 
+    # pyrefly: ignore [bad-argument-type]
     rng = np.random.RandomState(42)
     q_np = rng.randn(total_tokens, num_heads, head_dim).astype(np.float32)
     k_np = rng.randn(total_tokens, num_kv_heads, head_dim).astype(np.float32)
@@ -348,6 +349,7 @@ class FlashAttentionGradientTest(unittest.TestCase):
         rtol: float = 5e-2,
     ) -> None:
         sm_scale = 1.0 / math.sqrt(head_dim)
+        # pyrefly: ignore [bad-argument-type]
         rng = np.random.RandomState(123)
         q_np = rng.randn(batch_size, seq_len, num_heads, head_dim).astype(np.float32)
         k_np = rng.randn(batch_size, seq_len, num_kv_heads, head_dim).astype(np.float32)

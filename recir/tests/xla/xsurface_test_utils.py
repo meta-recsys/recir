@@ -210,6 +210,7 @@ class DummyPreprocessorStack(nn.Module):
             ro_id_list = sample_bundle.require_kjt(InputFeatures.UIH_ID_LIST)
             nro_id_list = sample_bundle.require_kjt(InputFeatures.CANDIDATE_ID_LIST)
             num_cand = sample_bundle.require_tensor(InputFeatures.NUM_CANDIDATES)
+            # pyrefly: ignore [bad-assignment]
             all_labels: Dict[str, torch.Tensor] = sample_bundle.require(
                 InputFeatures.ALL_LABELS
             )
@@ -721,6 +722,7 @@ def _make_sample_input(
     match KJT keys between the sample and the batch.
     """
     preprocessor: MoTPreprocessor = (  # pyre-ignore[9]
+        # pyrefly: ignore [bad-assignment]
         recblock.preprocessor_stack.mot_preprocessor
     )
     sample_bundle: FeatureBundle = preprocessor.sample_inputs(
@@ -732,6 +734,7 @@ def _make_sample_input(
     ro_id_list = sample_bundle.require_kjt(InputFeatures.UIH_ID_LIST)
     nro_id_list = sample_bundle.require_kjt(InputFeatures.CANDIDATE_ID_LIST)
     num_candidates = sample_bundle.require_tensor(InputFeatures.NUM_CANDIDATES)
+    # pyrefly: ignore [bad-assignment]
     all_labels: Dict[str, torch.Tensor] = sample_bundle.require(
         InputFeatures.ALL_LABELS
     )

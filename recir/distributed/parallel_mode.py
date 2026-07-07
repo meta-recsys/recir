@@ -50,6 +50,7 @@ def _create_fake_mesh(
         _init_backend=False,
         _rank=0,
     )
+    # pyrefly: ignore [bad-assignment]
     mesh._dim_group_names = [group_name]
     # DeviceMesh only creates _pg_registry on some init paths / torch versions
     # (notably not with _init_backend=False); create it if absent so the

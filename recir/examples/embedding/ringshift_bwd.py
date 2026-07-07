@@ -391,6 +391,7 @@ class RingshiftBwdW4Test(unittest.TestCase):
             count = jnp.array(max_local_ids, dtype=jnp.int32)
             return ids[None, :], count[None]
 
+        # pyrefly: ignore [missing-argument, not-iterable]
         local_ids, local_id_count = make_inputs()
         local_table = _make_random_table(
             self.mesh,
@@ -451,6 +452,7 @@ class RingshiftBwdW4Test(unittest.TestCase):
             count = jnp.array(max_local_ids, dtype=jnp.int32)
             return ids[None, :], count[None]
 
+        # pyrefly: ignore [missing-argument, not-iterable]
         local_ids, local_id_count = make_inputs()
         local_table = _make_random_table(
             self.mesh,
@@ -503,6 +505,7 @@ class RingshiftBwdW4Test(unittest.TestCase):
             count = jnp.array(0, dtype=jnp.int32)
             return ids[None, :], count[None]
 
+        # pyrefly: ignore [missing-argument, not-iterable]
         local_ids, local_id_count = make_inputs()
         local_table = _make_random_table(
             self.mesh,
@@ -567,6 +570,7 @@ class RingshiftBwdW4Test(unittest.TestCase):
             count = jnp.array(valid, dtype=jnp.int32)
             return ids[None, :], count[None]
 
+        # pyrefly: ignore [missing-argument, not-iterable]
         local_ids, local_id_count = make_inputs()
         local_table = _make_random_table(
             self.mesh,

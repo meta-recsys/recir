@@ -638,6 +638,7 @@ class UnboundedDynamismExportTest(unittest.TestCase):
         class M(torch.nn.Module):
             def __init__(self) -> None:
                 super().__init__()
+                # pyrefly: ignore [bad-argument-type]
                 self.conv = torch.nn.Conv2d(3, 5, [16, 16])
 
             def forward(self, x: torch.Tensor) -> torch.Tensor:

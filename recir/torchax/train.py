@@ -71,6 +71,7 @@ def make_train_step(
             loss, gradient = grad_fn(weights, buffers, args, label)
 
         with jax.named_scope("optimizer_updates"):
+            # pyrefly: ignore [not-iterable]
             updates, opt_state = interop.call_jax(
                 optax_optimizer.update, gradient, opt_state, weights
             )
@@ -103,6 +104,7 @@ class ScannedModule(torch.nn.Module):
 
         weights = self._stack_layer_weights(module_list)
         self.layer_weights_keys = list(
+            # pyrefly: ignore [missing-attribute]
             self.c.one_mod.state_dict().keys()
         )  # pyre-ignore[16]
         self.params = torch.nn.ParameterDict(

@@ -166,6 +166,7 @@ class InteropTest(unittest.TestCase):
         with jax.default_device(jax.devices("cpu")[0]):
             # move torch.tensor to recir.torchax.tensor CPU
             b = a.to("jax")
+            # pyrefly: ignore [missing-attribute]
             self.assertEqual(b.jax_device.platform, "cpu")
             self.assertEqual(b.device.type, "jax")
 
@@ -173,6 +174,7 @@ class InteropTest(unittest.TestCase):
             # move torch.tensor to recir.torchax.tensor TPU
             with jax.default_device(jax.local_devices("tpu")[0]):
                 c = a.to("jax")
+                # pyrefly: ignore [missing-attribute]
                 self.assertEqual(c.jax_device.platform, "tpu")
                 self.assertEqual(c.device.type, "jax")
 

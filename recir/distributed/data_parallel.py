@@ -320,8 +320,10 @@ def _register_parametrization(
                         value = self._parameters[param_name]
                         for p in self._parametrizations[param_name]:  # type: ignore[index]
                             value = p(value)
+                        # pyrefly: ignore [bad-return]
                         return value
 
+                    # pyrefly: ignore [bad-return]
                     return property(getter)
 
                 for pn in all_param_names:
@@ -354,6 +356,7 @@ def _deregister_parametrization(
         for pn in list(submod._parametrizations):  # type: ignore[union-attr]
             plist = submod._parametrizations[pn]  # type: ignore[index]
             if parametrize_fn in plist:
+                # pyrefly: ignore [missing-attribute]
                 plist.remove(parametrize_fn)
 
         # Restore original class if no parametrizations remain.

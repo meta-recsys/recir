@@ -144,11 +144,13 @@ def _jax_dense_to_jagged_forward_impl(
     if dense.ndim == 2:
         src = jnp.where(mask, dense, jnp.zeros_like(dense))
         result = jnp.zeros(total_L, dtype=dense.dtype)
+        # pyrefly: ignore [missing-attribute]
         return result.at[dest.reshape(-1)].add(src.reshape(-1))
     else:
         D: int = dense.shape[2]
         src = jnp.where(mask[:, :, None], dense, jnp.zeros_like(dense))
         result = jnp.zeros((total_L, D), dtype=dense.dtype)
+        # pyrefly: ignore [missing-attribute]
         return result.at[dest.reshape(-1), :].add(src.reshape(-1, D))
 
 

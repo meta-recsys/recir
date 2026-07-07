@@ -186,6 +186,7 @@ class BackendABCTest(unittest.TestCase):
         """The default validate_with returns None for any parallel_mode."""
 
         class _NoopBackend(Backend):
+            # pyrefly: ignore [bad-override]
             def dispatch(self, gm: object) -> object:
                 return gm
 
@@ -201,6 +202,7 @@ class BackendABCTest(unittest.TestCase):
         """A backend that overrides only dispatch inherits the empty defaults."""
 
         class _MinimalBackend(Backend):
+            # pyrefly: ignore [bad-override]
             def dispatch(self, gm: object) -> object:
                 return gm
 

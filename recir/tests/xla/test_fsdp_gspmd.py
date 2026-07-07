@@ -161,6 +161,7 @@ class TestGSPMDShardParams(unittest.TestCase):
             **dict(model.named_buffers()),
         }
         mode.shard_params(model, params_and_buffers, opt)
+        # pyrefly: ignore [bad-index]
         self.assertEqual(model.running_mean.shape[0], dim // num_procs)
 
 

@@ -378,6 +378,7 @@ else:
 
 
 @unittest.skipUnless(_has_gpu(), "Requires at least 2 GPUs")
+# pyrefly: ignore [invalid-inheritance]
 class STUDTensorTest(DTensorTestBase):
     @property
     def world_size(self) -> int:

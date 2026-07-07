@@ -79,10 +79,12 @@ def _jax_dense_to_jagged_forward_impl(
     if dense.ndim == 2:
         src = jnp.where(mask, dense, jnp.zeros_like(dense))
         result = jnp.zeros(total_L, dtype=dense.dtype)
+        # pyrefly: ignore [missing-attribute]
         return result.at[dest.reshape(-1)].add(src.reshape(-1))
     d: int = dense.shape[2]
     src = jnp.where(mask[:, :, None], dense, jnp.zeros_like(dense))
     result = jnp.zeros((total_L, d), dtype=dense.dtype)
+    # pyrefly: ignore [missing-attribute]
     return result.at[dest.reshape(-1), :].add(src.reshape(-1, d))
 
 
@@ -139,6 +141,7 @@ def _recir_dense_to_jagged(
         ),
         out_specs=jagged_out_spec,  # jagged [local_total_L(, D)] batch-sharded
         check_vma=False,
+        # pyrefly: ignore [bad-argument-count]
     )(dense, lengths)
     result = _with_sharding_constraint(result, jagged_out_spec)
     return result, seq_offsets
@@ -192,6 +195,7 @@ def _recir_jagged_to_padded_dense(
         ),
         out_specs=dense_out_spec,  # dense [B_local, max_len(, D)] batch-sharded
         check_vma=False,
+        # pyrefly: ignore [bad-argument-count]
     )(values, lengths)
     result = _with_sharding_constraint(result, dense_out_spec)
     return result
@@ -259,6 +263,7 @@ def _jax_concat_2d_jagged(
         _bcast_mask(is_left, gathered_left.ndim), gathered_left, gathered_right
     )
     valid = positions < combined_offsets[batch_size]
+    # pyrefly: ignore [missing-attribute, no-matching-overload]
     return jnp.where(_bcast_mask(valid, out.ndim), out, 0)
 
 
@@ -374,6 +379,7 @@ def _recir_concat_2d_jagged(
         in_specs=(values_left_spec, P(_DP_AXIS), values_right_spec, P(_DP_AXIS)),
         out_specs=out_spec,
         check_vma=False,
+        # pyrefly: ignore [bad-argument-count]
     )(values_left, lengths_left, values_right, lengths_right)
     return _with_sharding_constraint(result, out_spec)
 
@@ -428,12 +434,14 @@ def _recir_split_2d_jagged(
 
     values_spec = P(*([_DP_AXIS] + [None] * (values.ndim - 1)))
     out_spec = P(*([_DP_AXIS] + [None] * (values.ndim - 1)))
+    # pyrefly: ignore [not-iterable]
     left, right = jax.shard_map(
         _per_device,
         mesh=mesh,
         in_specs=(values_spec, P(_DP_AXIS), P(_DP_AXIS)),
         out_specs=(out_spec, out_spec),
         check_vma=False,
+        # pyrefly: ignore [bad-argument-count]
     )(values, lengths_left, lengths_right)
     return (
         _with_sharding_constraint(left, out_spec),

@@ -44,6 +44,7 @@ def get_node_tensor_metadata(node: fx.Node, is_required: bool = True) -> TensorM
             f"Callsite expects that ``tensor_meta`` exists in ``{node.name}``, "
             f"but got None instead. Node: {node.op} {node.name} {node.target}"
         )
+    # pyrefly: ignore [bad-return]
     return metadata
 
 

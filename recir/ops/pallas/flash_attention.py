@@ -1123,6 +1123,7 @@ def pallas_flash_attention_batched(
     Returns:
         Output of shape [batch_size, seq_len, num_heads, head_dim].
     """
+    # pyrefly: ignore [bad-return]
     return _pallas_flash_attention_batched_impl(
         q,
         k,

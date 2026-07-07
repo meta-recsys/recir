@@ -362,6 +362,7 @@ class View(torch.Tensor):
         self.replace_source_jax(new_values)
 
     @classmethod
+    # pyrefly: ignore [bad-override]
     def __torch_dispatch__(
         cls,
         func: Any,
@@ -409,6 +410,7 @@ class View(torch.Tensor):
         return self.jax().device
 
     @property
+    # pyrefly: ignore [bad-override]
     def ndim(self) -> int:
         return len(self.shape)
 

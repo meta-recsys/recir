@@ -127,12 +127,14 @@ def main() -> None:
         model_config=model_config,
         train_pipeline_provider=RecirXLATrainPipelineProvider(
             cls_metric_defs=[
+                # pyrefly: ignore [bad-instantiation]
                 RankingMetricDef(
                     metric_cls=FixedStepNE,
                     tasks=cls_task_names,
                     batch_size=batch_size,
                     report_interval=report_interval,
                 ),
+                # pyrefly: ignore [bad-instantiation]
                 RankingMetricDef(
                     metric_cls=FixedStepCTR,
                     tasks=cls_task_names,
@@ -141,6 +143,7 @@ def main() -> None:
                 ),
             ],
             reg_metric_defs=[
+                # pyrefly: ignore [bad-instantiation]
                 RankingMetricDef(
                     metric_cls=FixedStepMSE,
                     tasks=reg_task_names,

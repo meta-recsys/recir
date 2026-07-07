@@ -217,6 +217,7 @@ class RecirXLATrainPipelineProvider(
         # mvai_cloud provider verbatim -- same args udd_fm/train.py passes.
         # Annotated Any: RankingSGDTrainPipelineProvider is a runtime-only import
         # (stubbed Any for pyre -- see the module-level TYPE_CHECKING block).
+        # pyrefly: ignore [bad-instantiation]
         self._metrics_provider: Any = RankingSGDTrainPipelineProvider(
             cls_metric_defs=cls_metric_defs,
             reg_metric_defs=reg_metric_defs,

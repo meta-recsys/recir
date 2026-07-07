@@ -295,7 +295,9 @@ def j2t_autograd(fn: Any, call_jax: Any = call_jax) -> Any:
             @staticmethod
             def forward(ctx: Any, tree_def: Any, *flat_args_kwargs: Any) -> Any:
                 tensors, other = util.partition(
-                    flat_args_kwargs, lambda x: isinstance(x, torch.Tensor)
+                    # pyrefly: ignore [bad-argument-type]
+                    flat_args_kwargs,
+                    lambda x: isinstance(x, torch.Tensor),
                 )
                 # We want the arguments that don't require grads to be closured?
 
