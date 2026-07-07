@@ -1,5 +1,7 @@
 # (c) Meta Platforms, Inc. and affiliates. Confidential and proprietary.
 
+# pyre-unsafe
+
 # Benchmark: Pallas FA3 vs splash_attention vs JAX SDPA
 # Includes forward and backward pass benchmarks.
 #
