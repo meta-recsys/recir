@@ -108,6 +108,7 @@ class TraceDeviceMeshTestBase:
                 get_global_rank(dim_group, i) for i in range(dim_group_size)
             ]
             scattered_tensors = [
+                # pyrefly: ignore [missing-attribute]
                 torch.ones(3, 3, device=self.device_type)
                 * global_rank  # pyre-ignore[16]
                 for global_rank in global_ranks

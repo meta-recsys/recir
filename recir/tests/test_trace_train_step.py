@@ -704,7 +704,9 @@ class TraceTrainStepTest(DTensorTestBase):
             def forward(self, x: torch.Tensor) -> torch.Tensor:
                 # N.B.: setting requires_grad in forward, as deepcopy does not
                 # work for requires_grad=True buffers.
+                # pyrefly: ignore [bad-argument-type, missing-attribute]
                 self.dummy_buffer.requires_grad = True
+                # pyrefly: ignore [bad-argument-type]
                 return torch.matmul(self.fc(x), self.dummy_buffer)
 
         class AssertOptimizer(torch.optim.Optimizer):

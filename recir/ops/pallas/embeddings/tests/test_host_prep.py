@@ -107,6 +107,7 @@ class RoundUpTileTest(unittest.TestCase):
 class DeriveOffsetsTest(unittest.TestCase):
     def test_derive_offsets_consistency(self) -> None:
         """``send_offsets[s, t] + traffic[s, t] == send_offsets[s, t+1]``."""
+        # pyrefly: ignore [bad-argument-type]
         rng = np.random.RandomState(0)
         world_size = 6
         traffic = jnp.array(
@@ -478,6 +479,7 @@ class ReferenceTest(unittest.TestCase):
         v_local = 4
         d = 3
 
+        # pyrefly: ignore [bad-argument-type]
         rng = np.random.RandomState(7)
         global_table = rng.randn(2 * v_local, d).astype(np.float32)
         local_table = np.zeros((world_size, v_local, d), dtype=np.float32)

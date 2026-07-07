@@ -90,6 +90,7 @@ class GraphModuleTransformation:
     def __call__(self, gm: fx.GraphModule) -> Union[IterGraphModule, fx.GraphModule]:
         if self.dump_graphs:
             graph_folder = dump_graphs_to_files(
+                # pyrefly: ignore [bad-argument-type]
                 {"before_transformation_gm": gm.print_readable(False)}
             )
             enable_graph_optimization_dump(graph_folder)
@@ -104,6 +105,7 @@ class GraphModuleTransformation:
 
             if self.dump_graphs:
                 dump_graphs_to_files(
+                    # pyrefly: ignore [bad-argument-type]
                     {"transformed_gm": gm.print_readable(False)},
                     graph_folder,  # type: ignore[possibly-undefined]
                 )
@@ -119,6 +121,7 @@ class GraphModuleTransformation:
 
         if self.dump_graphs:
             dump_graphs_to_files(
+                # pyrefly: ignore [bad-argument-type]
                 {
                     "iter_graph_setup_gm": iter_gm.setup_gm.print_readable(False),
                     "iter_graph_main_gm": iter_gm.main_gm.print_readable(False),

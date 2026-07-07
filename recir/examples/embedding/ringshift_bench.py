@@ -253,6 +253,7 @@ def run_fwd_tc(mesh, cfg, tag) -> tuple[float, float]:
     fused_times = _time_jit(tag, "fused", fused, args, cfg.warmup, cfg.iters)
     _trace_region(tag, cfg, "fused", fused, args)
     ra2a_median = None if ref_times is None else statistics.median(ref_times)
+    # pyrefly: ignore [bad-return]
     return ra2a_median, statistics.median(fused_times)
 
 

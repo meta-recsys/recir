@@ -158,9 +158,11 @@ class TestDLRMv3ECRWTest(DestroyPGMixin, DTensorTestBase):
                 global_bs
             )
             baseline_wrapper = baseline_wrapper.cpu()
+            # pyrefly: ignore [bad-argument-type]
             plan = planner.collective_plan(baseline_wrapper, sharders, pg)
             # Assert sharding plan uses ROW_WISE for all EC tables
             for module_path, module_plan in plan.plan.items():
+                # pyrefly: ignore [missing-attribute]
                 for param_name, param_sharding in module_plan.items():
                     self.assertEqual(
                         param_sharding.sharding_type,
@@ -228,6 +230,7 @@ class TestDLRMv3ECRWTest(DestroyPGMixin, DTensorTestBase):
             torch.manual_seed(0)
             test_wrapper, _, _, _ = create_dlrmv3_wrapper(global_bs)
             test_wrapper = test_wrapper.cpu()
+            # pyrefly: ignore [bad-argument-type]
             test_plan = planner.collective_plan(test_wrapper, sharders, pg)
             test_dmp = DistributedModelParallel(
                 test_wrapper,

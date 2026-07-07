@@ -394,6 +394,7 @@ def ringshift_embedding_lookup_reference_jax(
         out_specs=P(axis_name),
         check_vma=False,
     )
+    # pyrefly: ignore [bad-argument-count, bad-return]
     return sharded(local_ids, local_id_count, local_embedding_table)
 
 
@@ -1672,6 +1673,7 @@ def _ringshift_forward_impl(
         out_specs=P(axis_name),
         check_vma=False,
     )
+    # pyrefly: ignore [bad-argument-count, bad-return]
     return sharded(local_ids, local_id_count, local_embedding_table)
 
 
@@ -1725,6 +1727,7 @@ def _ringshift_backward_impl(
         out_specs=P(axis_name),
         check_vma=False,
     )
+    # pyrefly: ignore [bad-argument-count, bad-return]
     return sharded(grad_out, local_ids, local_id_count)
 
 

@@ -192,6 +192,7 @@ def scale_and_translate(
         )
         raise ValueError(msg)
     if isinstance(method, str):
+        # pyrefly: ignore [bad-assignment]
         method = ResizeMethod.from_string(method)
     if method == ResizeMethod.NEAREST:
         # Nearest neighbor is currently special-cased for straight resize, so skip

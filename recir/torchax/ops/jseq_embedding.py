@@ -88,6 +88,7 @@ def _prep(ids: Any, lengths: Any, weight: Any) -> Tuple[Any, Any, Any, int, int,
 
     # [rows, cols] (sharded on axis 0) -> [W, max_local_ids] (leading axis = the
     # mesh axis), so device d holds exactly its own ids.
+    # pyrefly: ignore [missing-attribute]
     local_ids = ids_dist.reshape(world_size, max_local_ids)
     count = jnp.full((world_size,), max_local_ids, dtype=jnp.int32)
     return local_ids, count, weight3d, batch, seq, dim
@@ -160,6 +161,7 @@ def _jfsdp_embedding(ids: Any, weight: Any) -> Any:
         in_specs=(P(_AXIS, None), P(_AXIS, *([None] * (ids.ndim - 1)))),
         out_specs=P(_AXIS, *([None] * ids.ndim)),
         check_vma=False,
+        # pyrefly: ignore [bad-argument-count]
     )(weight, ids)
 
 
@@ -194,4 +196,5 @@ def _jfsdp_embedding_backward(grad_out: Any, ids: Any, weight: Any) -> Any:
         ),
         out_specs=P(_AXIS, None),  # [v_local, D] per device -> sharded [vocab, D]
         check_vma=False,
+        # pyrefly: ignore [bad-argument-count]
     )(grad_out, ids)

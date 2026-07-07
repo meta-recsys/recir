@@ -168,6 +168,7 @@ class RingshiftFwdCorrectnessTest(unittest.TestCase):
                 key, (1, v_local, embedding_dim), dtype=jnp.float32
             )
 
+        # pyrefly: ignore [missing-argument]
         local_table = make_table_random()
         jax.block_until_ready((local_ids, local_id_count, local_table))
         args = (local_ids, local_id_count, local_table)

@@ -120,11 +120,13 @@ class IterGraph(fx.Graph):
 
         return _InsertPoint(insert_points)
 
+    # pyrefly: ignore [bad-override]
     def inserting_after(self, n: Optional[fx.Node]) -> Any:
         if self._freeze_cross_iter_movement:
             return super().inserting_after(n)
         return self._insert_context("inserting_after", n)
 
+    # pyrefly: ignore [bad-override]
     def inserting_before(self, n: Optional[fx.Node]) -> Any:
         if self._freeze_cross_iter_movement:
             return super().inserting_before(n)
@@ -204,6 +206,7 @@ class IterGraph(fx.Graph):
             if isinstance(graph._codegen, _PyTreeCodeGen):
                 codegen = graph._codegen
                 new_output = list(output.args[0])  # type: ignore[arg-type]
+                # pyrefly: ignore [bad-argument-type]
                 new_output.append(inputs)
                 assert codegen.pytree_info.out_spec is not None
                 original_tree_out = tree_unflatten(

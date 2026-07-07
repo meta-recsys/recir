@@ -163,10 +163,12 @@ class Tensor(torch.Tensor):
     __repr__ = __str__  # pyre-ignore[4]
 
     @property
+    # pyrefly: ignore [bad-override]
     def shape(self) -> torch.Size:
         return torch.Size(self._elem.shape)
 
     @property
+    # pyrefly: ignore [bad-override]
     def ndim(self) -> int:
         return len(self._elem.shape)
 
@@ -193,6 +195,7 @@ class Tensor(torch.Tensor):
     __torch_function__ = torch._C._disabled_torch_function_impl  # pyre-ignore[4]
 
     @classmethod
+    # pyrefly: ignore [bad-override]
     def __torch_dispatch__(
         cls,
         func: Any,
@@ -241,6 +244,7 @@ class Tensor(torch.Tensor):
         return self._elem.device
 
     @property
+    # pyrefly: ignore [bad-override]
     def data(self) -> "Tensor":
         logger.warning("In-place to .data modifications still results a copy on TPU")
         return self

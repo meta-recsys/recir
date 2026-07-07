@@ -205,9 +205,11 @@ class CPURankFMBackend(EmbeddingBackend):
             topology=Topology(world_size=world_size, compute_device="cpu"),
             constraints=constraints,
         )
+        # pyrefly: ignore [bad-argument-type]
         plan = planner.collective_plan(model, sharders, pg)
         logger.info("DMP sharding plan:")
         for module_path, module_plan in plan.plan.items():
+            # pyrefly: ignore [missing-attribute]
             for param_name, param_sharding in module_plan.items():
                 logger.info(
                     "  %s.%s: sharding_type=%s compute_kernel=%s",

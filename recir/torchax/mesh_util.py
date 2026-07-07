@@ -59,6 +59,7 @@ def _shard_first_multiple_of(
             found = True
             sharding.append(axis_name)
         else:
+            # pyrefly: ignore [bad-argument-type]
             sharding.append(None)
     return PartitionSpec(*sharding)
 

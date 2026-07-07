@@ -193,6 +193,7 @@ class BatchDimAnalyzer:
 
         # Op-specific propagation rules run *before* the size-match fallback
         # below.  See ``_BATCH_DIM_PROPAGATION_RULES`` for the rationale.
+        # pyrefly: ignore [bad-argument-type]
         rule = _BATCH_DIM_PROPAGATION_RULES.get(node.target)
         if rule is not None:
             rule_inputs = node.all_input_nodes

@@ -682,9 +682,11 @@ class CPUTorchRecBackend(EmbeddingBackend):
         planner = EmbeddingShardingPlanner(
             topology=Topology(world_size=world_size, compute_device="cpu"),
         )
+        # pyrefly: ignore [bad-argument-type]
         plan = planner.collective_plan(wrapper, sharders, pg)
         logger.info("DMP sharding plan:")
         for module_path, module_plan in plan.plan.items():
+            # pyrefly: ignore [missing-attribute]
             for param_name, param_sharding in module_plan.items():
                 logger.info(
                     f"  {module_path}.{param_name}: {param_sharding.sharding_type}"

@@ -63,6 +63,7 @@ class FlaxTest(unittest.TestCase):
         nn_module: FlaxNNModule = FlaxNNModule(env, flax_model, (inputs,), {})
         res = nn_module.forward(inputs)
 
+        # pyrefly: ignore [bad-argument-type]
         self.assertTrue(jnp.allclose(res.jax(), expected))
 
     def test_flax_functional_call(self) -> None:
@@ -84,6 +85,7 @@ class FlaxTest(unittest.TestCase):
             inputs_torch = torch.ones((1, 28, 28, 1), device="jax")
             state_dict = nn_module.state_dict()
             res = jitted(state_dict, inputs_torch)
+            # pyrefly: ignore [bad-argument-type]
             self.assertTrue(jnp.allclose(res.jax(), expected))
 
     def test_flax_module_nested(self) -> None:

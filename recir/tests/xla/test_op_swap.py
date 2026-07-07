@@ -399,6 +399,7 @@ class TestPallasKernelIntegration(unittest.TestCase):
         # pyre-ignore[16]: torchax tensor has `.jax()` attribute
         x_cpu = torch.tensor(x.jax().__array__())
         expected = x_cpu * 2.0
+        # pyrefly: ignore [missing-attribute]
         self.assertEqual(result.shape, x.shape)
         torch.testing.assert_close(result_cpu, expected, atol=1e-5, rtol=1e-5)
 

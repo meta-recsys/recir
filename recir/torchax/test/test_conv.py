@@ -42,6 +42,7 @@ class CustomConv1(torch.nn.Module):
         self.fc1 = nn.Linear(hidden_layer_size, 2)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # pyrefly: ignore [bad-assignment]
         x = nn.functional.max_pool1d
         x = nn.functional.max_pool1d(nn.functional.relu(self.conv2(x)), 2, stride=2)
         x = torch.flatten(x, 1)

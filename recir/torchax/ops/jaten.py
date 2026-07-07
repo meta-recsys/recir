@@ -1423,7 +1423,15 @@ def max_pool(
     if num_batch_dims == 0:
         input_shape = [1, *input_shape]
     padding = _ceil_mode_padding(
-        padding, input_shape, kernel_size, strides, dilation, ceil_mode
+        # pyrefly: ignore [bad-argument-type]
+        padding,
+        input_shape,
+        # pyrefly: ignore [bad-argument-type]
+        kernel_size,
+        # pyrefly: ignore [bad-argument-type]
+        strides,
+        dilation,
+        ceil_mode,
     )
 
     assert len(kernel_size) == len(strides), (
@@ -1908,6 +1916,7 @@ def _aten_embedding_dense_backward(
         return c.at[idx_flat].add(1.0)
 
     def _scale(gw: Any, counts: Any) -> Any:
+        # pyrefly: ignore [missing-attribute]
         inv = jnp.where(counts > 0, 1.0 / counts, 0.0).astype(gw.dtype)
         return gw * inv[:, None]
 
@@ -1943,9 +1952,11 @@ def _aten_embedding_dense_backward(
             ),
             out_specs=spec(),  # replicated after psum
             check_vma=False,
+            # pyrefly: ignore [bad-argument-count]
         )(grad_output, indices)
 
     if padding_idx is not None and int(padding_idx) >= 0:
+        # pyrefly: ignore [missing-attribute]
         grad_weight = grad_weight.at[int(padding_idx)].set(0.0)
     return grad_weight
 
@@ -2422,7 +2433,9 @@ def _aten_avg_pool(
     padding = _ceil_mode_padding(
         padding,
         input_shape,
+        # pyrefly: ignore [bad-argument-type]
         kernel_size,
+        # pyrefly: ignore [bad-argument-type]
         strides,
         [1] * len(kernel_size),
         ceil_mode,

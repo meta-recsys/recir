@@ -174,6 +174,7 @@ def _sdpa_reference(
 @register_function(torch.nn.functional.one_hot)
 def one_hot(tensor: Any, num_classes: int = -1) -> Any:
     if num_classes == -1:
+        # pyrefly: ignore [bad-assignment]
         num_classes = jnp.max(tensor) + 1
     return jax.nn.one_hot(tensor, num_classes).astype(jnp.int64)  # pyre-ignore[6]
 
@@ -393,6 +394,7 @@ def unravel_index(indices: Any, shape: Any) -> Any:
 @register_function(torch.rand, is_jax_function=True, needs_env=True)
 def rand(*size: Any, **kwargs: Any) -> Any:
     if len(size) == 1 and isinstance(size[0], collections.abc.Iterable):
+        # pyrefly: ignore [bad-assignment]
         size = size[0]
     if "size" in kwargs:
         size = kwargs["size"]
@@ -412,6 +414,7 @@ def randn(
     env: Any = None,
 ) -> Any:
     if len(size) == 1 and isinstance(size[0], collections.abc.Iterable):
+        # pyrefly: ignore [bad-assignment]
         size = size[0]
     return jaten._aten_randn(size, generator=generator, dtype=dtype, env=env)
 

@@ -157,6 +157,7 @@ def _materialize_meta_fsdp_weight(tensor: Any, mesh: Any) -> Any:
         mesh=mesh,
         in_specs=P("torch_dist"),
         out_specs=wspec,
+        # pyrefly: ignore [unexpected-keyword]
         check_vma=False,
     )(jnp.arange(num_global, dtype=jnp.int32))
 
@@ -661,6 +662,7 @@ class _XLAModule(torch.nn.Module):
             mesh=mesh,
             in_specs=in_specs,
             out_specs=out_specs,
+            # pyrefly: ignore [unexpected-keyword]
             check_vma=False,
         )
         jitted: Any = jax.jit(sharded_fn)

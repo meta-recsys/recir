@@ -47,6 +47,7 @@ class FlaxNNModule(torch.nn.Module):
             flax_module.init, prng, *sample_args, **sample_kwargs
         )
 
+        # pyrefly: ignore [bad-argument-type]
         self._params = self._encode_nested_dict(parameter_dict)
 
         self._flax_module = flax_module
