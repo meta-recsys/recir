@@ -1,5 +1,7 @@
 # (c) Meta Platforms, Inc. and affiliates. Confidential and proprietary.
 
+# pyre-unsafe
+
 """CPU-runnable host-prep tests for the ringshift embedding lookup kernel.
 
 These tests exercise the pure-JAX host-side prep helpers used by the fused

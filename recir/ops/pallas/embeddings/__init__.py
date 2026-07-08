@@ -1,5 +1,7 @@
 # (c) Meta Platforms, Inc. and affiliates. Confidential and proprietary.
 
+# pyre-unsafe
+
 from recir.ops.pallas.embeddings.ringshift import (
     ringshift_embedding_lookup,
     ringshift_embedding_lookup_block,
