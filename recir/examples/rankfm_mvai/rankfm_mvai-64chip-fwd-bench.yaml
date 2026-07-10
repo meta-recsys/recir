@@ -1,0 +1,166 @@
+# RankFM (xsurface V3) FORWARD-ONLY benchmark on a 64-chip TPU v7x slice (4x4x4).
+#
+# Forward-only counterpart of rankfm_mvai-64chip-bench.yaml: 16 hosts x 4 chips =
+# 64 chips (128 jax devices), runs recir.examples.rankfm_mvai.forward_benchmark
+# (forward + loss only; no backward / optimizer). Multi-host scaffolding
+# (kueue + slice-autoprovisioning, Indexed parallelism 16, 4x4x4 slice topology,
+# TPU init timeouts, tolerations) mirrors the 64-chip bench.
+#
+# This is the slice where in_graph RING-SHIFT is actually measurable: at 64 chips
+# the 1M table shards to ~1M/128 ~8k rows/shard (~8MB) and fits VMEM, so
+# ringshift_min_rows=fsdp_min_rows=4096 routes the big table onto the ring-shift
+# kernel (unlike the 4-chip slice, where the shard OOMs VMEM -> DP fallback).
+#
+# forward_benchmark uses jax.process_count() for num_processes, so it runs
+# multi-host like train.py. Config via FWD_* env vars. Private image tag.
+# Launch (self-contained; builds+pushes mlui-fwd, never touches :latest):
+#   IMAGE_TAG=mlui-fwd YAML=recir/examples/rankfm_mvai/rankfm_mvai-64chip-fwd-bench.yaml \
+#     ./recir/examples/rankfm_mvai/run_fwd_profile.sh
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  generateName: rankfm-64chip-fwd-bench-
+  namespace: ns-mrs-core-shared
+  labels:
+    kueue.x-k8s.io/queue-name: lq-training
+    x.tpu.cloud.google.com/slice-autoprovisioning: "async"
+spec:
+  replicatedJobs:
+  - name: worker
+    replicas: 1
+    template:
+      metadata:
+        labels:
+          x.tpu.google.com/inject-slice-selector: "true"
+      spec:
+        parallelism: 16
+        completions: 16
+        completionMode: Indexed
+        backoffLimit: 0
+        template:
+          metadata:
+            annotations:
+              cloud.google.com/gke-tpu-slice-topology: "4x4x4"
+          spec:
+            serviceAccountName: default
+            containers:
+            - name: rankfm
+              # Private tag -- never clobber the shared rankfm_mvai_tpu:latest.
+              image: us-central1-docker.pkg.dev/mrs-tpu-y317h/recml/rankfm_mvai_tpu:mlui-fwd
+              imagePullPolicy: Always
+              env:
+              - name: PYTHONUNBUFFERED
+                value: "1"
+              - name: PJRT_DEVICE
+                value: "TPU"
+              - name: FWD_DEVICE
+                value: "tpu"
+              - name: MASTER_PORT
+                value: "29500"
+              # Multi-host TPU init barriers: extend deadlines so slower pods don't
+              # time out the 16-host jax.distributed.initialize().
+              - name: JAX_DISTRIBUTED_INITIALIZATION_TIMEOUT
+                value: "1800"
+              - name: TPU_INIT_TIMEOUT_SECONDS
+                value: "1800"
+              - name: TPU_LIBRARY_INIT_TIMEOUT
+                value: "1800"
+              # libtpu/XLA flags from the 64-chip bench (async collective overlap
+              # across the 4x4x4 ICI torus).
+              - name: LIBTPU_INIT_ARGS
+                value: >-
+                  --xla_tpu_megacore_fusion_allow_ags=false
+                  --xla_enable_async_collective_permute=true
+                  --xla_tpu_enable_ag_backward_pipelining=true
+                  --xla_tpu_enable_data_parallel_all_reduce_opt=true
+                  --xla_tpu_data_parallel_opt_different_sized_ops=true
+                  --xla_tpu_enable_async_collective_fusion=true
+                  --xla_tpu_enable_async_collective_fusion_multiple_steps=true
+                  --xla_tpu_overlap_compute_collective_tc=true
+                  --xla_tpu_all_gather_collective_matmul_mode=post_spmd
+                  --xla_tpu_reduce_scatter_collective_matmul_mode=post_spmd
+                  --xla_enable_async_all_gather=true
+              # in_graph with ring-shift: the 1M table shards to ~8k rows/shard on
+              # 128 devices (fits VMEM) -> both thresholds 4096 route it to the
+              # ring-shift kernel (the real sharded large-table path).
+              - name: FWD_EMB_BACKEND
+                value: "cpu"
+              - name: FWD_RINGSHIFT_MIN_ROWS
+                value: "4096"
+              - name: FWD_FSDP_MIN_ROWS
+                value: "4096"
+              # Real host init (not meta): the 1M tables fit host memory, so init
+              # them ONCE + cache as jax arrays instead of re-materializing the
+              # meta weights every forward step (forward-only doesn't persist them,
+              # unlike training). Set "1" only for tables too big to host-alloc.
+              - name: FWD_ON_DEVICE_INIT
+                value: "0"
+              # Ring-shift kernel tuning (from the 64-chip bench): recv_capacity =
+              # VMEM chunk-tile size; bf16 cross-host exchange halves ICI bytes.
+              - name: RECIR_RINGSHIFT_RECV_CAPACITY
+                value: "16384"
+              - name: RECIR_RINGSHIFT_EXCHANGE_BF16
+                value: "1"
+              # --- model + batch shape (weak-scaling: 512/host x 16 = 8192 global,
+              # ~64/device, same per-chip work as the 4-chip bench) ---
+              - name: FWD_GLOBAL_BS
+                value: "2048"
+              - name: RANKFM_S
+                value: "1024"
+              - name: FWD_SEQ
+                value: "$(RANKFM_S)"
+              - name: FWD_L2_SEQ
+                value: "512"
+              - name: FWD_L1_LAYERS
+                value: "8"
+              - name: FWD_L2_LAYERS
+                value: "10"
+              - name: FWD_NUM_CANDIDATES
+                value: "10"
+              - name: FWD_HASH_SIZE_CAP
+                value: "1000000"
+              - name: FWD_WARMUP
+                value: "5"
+              - name: FWD_STEPS
+                value: "20"
+              # Profiling -> GCS (dir set in the command below) -> Kernelhub via
+              # run_fwd_profile.sh.
+              - name: FWD_PROFILE
+                value: "1"
+              - name: FWD_PROFILE_MODE
+                value: "trace"
+              - name: FWD_SWEEP
+                value: "global_bs=2048,4096,8192;seq=512,1024,2048"
+              - name: JOBSET_NAME
+                valueFrom:
+                  fieldRef:
+                    fieldPath: metadata.labels['jobset.sigs.k8s.io/jobset-name']
+              # JAX persistent compilation cache (skip cold XLA compile on reruns).
+              - name: JAX_COMPILATION_CACHE_DIR
+                value: "gs://cq-mrs-core-shared_mrs_tpu_y317h/jax-compile-cache"
+              - name: JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES
+                value: "-1"
+              - name: JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS
+                value: "0"
+              command:
+              - bash
+              - -c
+              - |
+                set -uo pipefail
+                echo "=== jax devices ==="
+                python3 -c "import jax; print(jax.process_count(), len(jax.devices()))"
+                export FWD_PROFILE_DIR="gs://cq-mrs-core-shared_mrs_tpu_y317h/tpu-profiles/${JOBSET_NAME}"
+                python3 -u -m recir.examples.rankfm_mvai.forward_benchmark
+              ports:
+              - containerPort: 8471
+              resources:
+                limits:
+                  google.com/tpu: 4
+            nodeSelector:
+              cloud.google.com/gke-tpu-accelerator: tpu7x
+              cloud.google.com/gke-tpu-topology: "4x4x4"
+            tolerations:
+            - key: "google.com/tpu"
+              operator: "Exists"
+              effect: "NoSchedule"
+            restartPolicy: Never
