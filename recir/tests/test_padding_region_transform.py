@@ -266,6 +266,53 @@ class PadJaggedValuesOpTest(unittest.TestCase):
         self.assertEqual(values.grad.shape, (8, 2))  # pyre-ignore
         torch.testing.assert_close(values.grad, torch.ones(8, 2))  # pyre-ignore
 
+    def test_tile_pad_fills_with_real_ids(self) -> None:
+        """tile_pad fills each key's deficit by tiling its own real ids (no 0s)."""
+        key0_lens = torch.tensor([3, 2], dtype=torch.long)  # sum=5
+        key1_lens = torch.tensor([4, 6], dtype=torch.long)  # sum=10
+        lengths = torch.cat([key0_lens, key1_lens])
+        values = torch.arange(15, dtype=torch.long)
+
+        result = pad_jagged_values(
+            values, lengths, per_key_budgets=[8, 16], dim=0, tile_pad=True
+        )
+        self.assertEqual(result.shape, (24,))  # 8 + 16
+        # key0: 5 real (0..4) + 3 tiled (arange(3) % 5 -> 0,1,2)
+        torch.testing.assert_close(result[:5], values[:5])
+        torch.testing.assert_close(result[5:8], values[:3])
+        # key1: 10 real (5..14) + 6 tiled (arange(6) % 10 -> 5..10)
+        torch.testing.assert_close(result[8:18], values[5:15])
+        torch.testing.assert_close(result[18:24], values[5:11])
+
+    def test_tile_pad_real_region_and_backward_match_zerofill(self) -> None:
+        """tile_pad changes only the pad region; [0:current] and grad are identical.
+
+        The custom backward slices [0:current], so pad positions are treated as
+        non-differentiable in both modes -- correct for id-lists whose pads are
+        masked out downstream (grad into pad positions is 0).
+        """
+        key0_lens = torch.tensor([3, 2], dtype=torch.long)  # sum=5
+        key1_lens = torch.tensor([4, 1], dtype=torch.long)  # sum=5
+        lengths = torch.cat([key0_lens, key1_lens])
+        base = torch.randn(10, 4)
+
+        v0 = base.clone().requires_grad_(True)
+        v1 = base.clone().requires_grad_(True)
+        r_zero = pad_jagged_values(
+            v0, lengths, per_key_budgets=[8, 8], dim=0, pad_id=310, tile_pad=False
+        )
+        r_tile = pad_jagged_values(
+            v1, lengths, per_key_budgets=[8, 8], dim=0, pad_id=311, tile_pad=True
+        )
+        # Real region identical (key0 [0:5], key1 [8:13]).
+        torch.testing.assert_close(r_tile[:5], r_zero[:5])
+        torch.testing.assert_close(r_tile[8:13], r_zero[8:13])
+        # Backward identical: grad flows only to [0:current] in both modes.
+        r_zero.sum().backward()
+        r_tile.sum().backward()
+        torch.testing.assert_close(v1.grad, v0.grad)  # pyre-ignore
+        torch.testing.assert_close(v1.grad, torch.ones(10, 4))  # pyre-ignore
+
 
 class UnpadJaggedGradOpTest(unittest.TestCase):
     def test_extracts_per_key(self) -> None:
