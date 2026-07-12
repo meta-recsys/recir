@@ -327,11 +327,20 @@ def pad_jagged_values(
     dim: int = 0,
     pad_id: int = -1,
     num_processes: int = 1,
+    tile_pad: bool = False,
 ) -> torch.Tensor:
     """Pad jagged values per-key so each key's segment reaches its budget.
 
     ``per_key_budgets`` are GLOBAL budgets; runtime divides by
     ``num_processes`` to get per-host budgets.
+
+    When ``tile_pad`` is set, each key's deficit is filled by tiling that key's
+    own values (``vals[arange(deficit) % current]``) instead of zeros. This is
+    for embedding id-lists whose pad positions are masked out downstream: it
+    keeps the pad tokens' block-owner distribution uniform (matching the real
+    ids) instead of collapsing every pad to id 0 -> block-owner 0, which
+    otherwise skews the ring-shift all-to-all. Real values stay in
+    ``[0:current]`` so the backward (which slices ``[0:current]``) is unchanged.
     """
     per_host_budgets = [b // num_processes for b in per_key_budgets]
     num_keys = len(per_host_budgets)
@@ -350,6 +359,17 @@ def pad_jagged_values(
             parts.append(key_vals.clone())
         elif current > budget:
             parts.append(key_vals.narrow(dim, 0, budget).clone())
+        elif tile_pad and current > 0:
+            # Fill the deficit by tiling this key's own real ids instead of
+            # zero-filling. For embedding id-lists (pad positions masked out
+            # downstream) this keeps the pad tokens' block-owner distribution
+            # uniform -- matching the real ids -- instead of routing every pad
+            # to id 0 -> block-owner 0, which skews the ring-shift all-to-all.
+            # Real ids stay in [0:current] so backward/fake are unchanged.
+            deficit = budget - current
+            idx = torch.arange(deficit, device=key_vals.device) % current
+            pad_vals = key_vals.index_select(dim, idx)
+            parts.append(torch.cat([key_vals, pad_vals], dim=dim))
         else:
             pw = [0] * (2 * values.ndim)
             pw[2 * (values.ndim - 1 - dim) + 1] = budget - current
@@ -368,6 +388,7 @@ def _pad_jagged_values_fake(
     dim: int = 0,
     pad_id: int = -1,
     num_processes: int = 1,
+    tile_pad: bool = False,
 ) -> torch.Tensor:
     if pad_id >= 0:
         _PAD_JAGGED_SIZES[pad_id] = (values.shape[dim], [])
@@ -458,11 +479,12 @@ pad_to_static.register_autograd(_pad_backward, setup_context=_pad_setup_context)
 
 def _pad_jagged_values_backward(
     ctx: Any, grad: torch.Tensor
-) -> Tuple[torch.Tensor, None, None, None, None, None]:
+) -> Tuple[torch.Tensor, None, None, None, None, None, None]:
     return (
         torch.ops.recir_padding.unpad_jagged_grad(
             grad, ctx.pad_id, ctx.per_key_budgets, ctx.dim, ctx.num_processes
         ),
+        None,
         None,
         None,
         None,
@@ -473,10 +495,10 @@ def _pad_jagged_values_backward(
 
 def _pad_jagged_values_setup_context(
     ctx: Any,
-    inputs: Tuple[torch.Tensor, torch.Tensor, List[int], int, int, int],
+    inputs: Tuple[torch.Tensor, torch.Tensor, List[int], int, int, int, bool],
     output: torch.Tensor,
 ) -> None:
-    _, _, per_key_budgets, dim, pad_id, num_processes = inputs
+    _, _, per_key_budgets, dim, pad_id, num_processes, _ = inputs
     ctx.pad_id = pad_id
     ctx.per_key_budgets = per_key_budgets
     ctx.dim = dim
