@@ -145,6 +145,34 @@ def _round_up_tile(x: jax.Array, tile: int) -> jax.Array:
     return ((x + tile - 1) // tile * tile).astype(jnp.int32)
 
 
+def _peer_id_by_cumsum(exclusive_offsets: jax.Array, n: int) -> jax.Array:
+    """Vectorized replacement for ``clip(searchsorted(off, arange(n), "right")-1, 0, W-1)``.
+
+    ``searchsorted`` over the per-peer offsets lowers to a serialized
+    binary-search ``while`` loop on TPU (memory-bound, ~0 FLOPs). Mapping each
+    flat position to its owning peer is O(n) and vectorized: scatter-add a 1 at
+    each interior peer start, then take an inclusive prefix sum.
+
+    Args:
+        exclusive_offsets: ``[world_size]`` int32 -- the EXCLUSIVE per-peer
+            prefix sums (``exclusive_offsets[0] == 0``). The interior starts
+            ``exclusive_offsets[1:]`` are the boundary markers; empty peers
+            (duplicate offsets) accumulate and out-of-range starts are dropped,
+            so the result saturates at ``world_size - 1`` -- matching the
+            ``clip(..., 0, world_size - 1)`` in the searchsorted form.
+        n: static output length.
+
+    Returns:
+        ``[n]`` int32 peer id for each position ``0..n-1``.
+    """
+    delta = (
+        jnp.zeros((n,), jnp.int32)
+        .at[exclusive_offsets[1:].astype(jnp.int32)]
+        .add(1, mode="drop")
+    )
+    return jnp.cumsum(delta)
+
+
 def _pad_per_peer(
     sorted_row: jax.Array,
     send_counts_real: jax.Array,
@@ -163,11 +191,7 @@ def _pad_per_peer(
     real_offsets = jnp.cumsum(send_counts_real) - send_counts_real
     padded_offsets = jnp.cumsum(send_counts_padded) - send_counts_padded
     pos = jnp.arange(max_padded, dtype=jnp.int32)
-    peer_id = jnp.clip(
-        jnp.searchsorted(padded_offsets, pos, side="right") - 1,
-        0,
-        world_size - 1,
-    )
+    peer_id = _peer_id_by_cumsum(padded_offsets, max_padded)
     local_pad_pos = pos - padded_offsets[peer_id]
     is_real = local_pad_pos < send_counts_real[peer_id]
     src_pos = jnp.clip(real_offsets[peer_id] + local_pad_pos, 0, max_local_ids - 1)
@@ -210,11 +234,7 @@ def _pad_per_peer_2d(
     real_offsets = jnp.cumsum(send_counts_real) - send_counts_real
     padded_offsets = jnp.cumsum(send_counts_padded) - send_counts_padded
     pos = jnp.arange(max_padded, dtype=jnp.int32)
-    peer_id = jnp.clip(
-        jnp.searchsorted(padded_offsets, pos, side="right") - 1,
-        0,
-        world_size - 1,
-    )
+    peer_id = _peer_id_by_cumsum(padded_offsets, max_padded)
     local_pad_pos = pos - padded_offsets[peer_id]
     is_real = local_pad_pos < send_counts_real[peer_id]
     src_pos = jnp.clip(real_offsets[peer_id] + local_pad_pos, 0, max_local_ids - 1)
@@ -241,11 +261,7 @@ def _unpad_per_peer(
     total_real = jnp.sum(send_counts_real)
     pos = jnp.arange(max_local_ids, dtype=jnp.int32)
     in_real = pos < total_real
-    peer_id = jnp.clip(
-        jnp.searchsorted(real_offsets, pos, side="right") - 1,
-        0,
-        world_size - 1,
-    )
+    peer_id = _peer_id_by_cumsum(real_offsets, max_local_ids)
     local_real_pos = pos - real_offsets[peer_id]
     padded_src = jnp.clip(padded_offsets[peer_id] + local_real_pos, 0, max_padded - 1)
     gathered = out_padded[padded_src]

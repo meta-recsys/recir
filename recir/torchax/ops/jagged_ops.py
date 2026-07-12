@@ -206,6 +206,33 @@ def _bcast_mask(mask: Any, ndim: int) -> Any:
     return mask.reshape(mask.shape + (1,) * (ndim - mask.ndim))
 
 
+def _segment_id_by_cumsum(boundaries: Any, n: int) -> Any:
+    """Vectorized replacement for ``clip(searchsorted(cum, arange(n), "right"), 0, B-1)``.
+
+    ``searchsorted`` over a monotonically increasing offsets array lowers to a
+    serialized binary-search ``while`` loop on TPU (memory-bound, ~0 FLOPs). The
+    same "which segment does flat position p fall into" mapping is O(n) and
+    fully vectorized: scatter-add a 1 at each interior segment start, then take
+    an inclusive prefix sum.
+
+    Args:
+        boundaries: ``[num_segments - 1]`` int32 -- the interior segment-start
+            positions (i.e. the cumulative offsets EXCLUDING the leading 0 and
+            the trailing total). Duplicate values (empty segments) accumulate,
+            and out-of-range values (>= n) are dropped, so the result saturates
+            at ``num_segments - 1`` for trailing positions -- matching the
+            ``clip(..., 0, num_segments - 1)`` in the searchsorted form.
+        n: static output length.
+
+    Returns:
+        ``[n]`` int32 segment id for each position ``0..n-1``.
+    """
+    delta = (
+        jnp.zeros((n,), jnp.int32).at[boundaries.astype(jnp.int32)].add(1, mode="drop")
+    )
+    return jnp.cumsum(delta)
+
+
 def _jax_concat_2d_jagged(
     values_left: Any,
     offsets_left: Any,
@@ -227,12 +254,10 @@ def _jax_concat_2d_jagged(
     combined_offsets = offsets_left + offsets_right  # cumulative, [batch_size + 1]
     lengths_left = offsets_left[1:] - offsets_left[:-1]  # [batch_size]
     positions = jnp.arange(out_total)
-    # Sample (batch) index each flat output position belongs to.
-    batch_idx = jnp.clip(
-        jnp.searchsorted(combined_offsets[1:], positions, side="right"),
-        0,
-        batch_size - 1,
-    )
+    # Sample (batch) index each flat output position belongs to. Vectorized
+    # segment-id (cumsum over boundary markers) instead of searchsorted, which
+    # would lower to a serial binary-search while loop on TPU.
+    batch_idx = _segment_id_by_cumsum(combined_offsets[1:batch_size], out_total)
     intra_offset = positions - combined_offsets[batch_idx]  # offset within the sample
     is_left = intra_offset < lengths_left[batch_idx]
     # Guard against an empty side: when one operand has 0 rows (e.g. an empty
@@ -289,11 +314,7 @@ def _jax_split_2d_jagged(
         right = jnp.zeros((seq_len_b,) + values.shape[1:], dtype=values.dtype)
         return left, right
     positions_left = jnp.arange(seq_len_a)
-    batch_idx_left = jnp.clip(
-        jnp.searchsorted(offsets_left[1:], positions_left, side="right"),
-        0,
-        batch_size - 1,
-    )
+    batch_idx_left = _segment_id_by_cumsum(offsets_left[1:batch_size], seq_len_a)
     left = values[
         jnp.clip(positions_left + offsets_right[batch_idx_left], 0, values.shape[0] - 1)
     ]
@@ -301,11 +322,7 @@ def _jax_split_2d_jagged(
         _bcast_mask(positions_left < offsets_left[batch_size], left.ndim), left, 0
     )
     positions_right = jnp.arange(seq_len_b)
-    batch_idx_right = jnp.clip(
-        jnp.searchsorted(offsets_right[1:], positions_right, side="right"),
-        0,
-        batch_size - 1,
-    )
+    batch_idx_right = _segment_id_by_cumsum(offsets_right[1:batch_size], seq_len_b)
     right = values[
         jnp.clip(
             positions_right + offsets_left[batch_idx_right + 1], 0, values.shape[0] - 1
