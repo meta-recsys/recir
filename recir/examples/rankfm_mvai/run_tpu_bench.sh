@@ -110,6 +110,41 @@ if [ -z "${JS:-}" ]; then
 fi
 
 echo | tee -a "${LOG}"
+echo "==== Wait for run to finish / trace to flush (kubectl logs -f drops mid-compile) ====" | tee -a "${LOG}"
+# gke_logs' kubectl logs -f frequently drops under load during the long (~3min)
+# XLA compile and returns while the pod is still Running -- long before the
+# profiler writes the trace at profile_end_step. Previously we then checked GCS
+# once, found no trace, and exited. Instead, poll until the rank-0 pod reaches a
+# terminal phase OR the worker-0-0 trace appears in GCS, printing a heartbeat.
+_deadline=$(( $(date +%s) + 3600 ))
+while :; do
+    RANK0="$(kubectl get pods --context="${CTX}" -n "${NS}" \
+        -l "jobset.sigs.k8s.io/jobset-name=${JS}" -o name 2>/dev/null \
+        | grep 'worker-0-0-' | head -1 | sed 's|pod/||')"
+    if [ -z "${RANK0}" ]; then
+        echo "  rank-0 pod not found; stopping wait." | tee -a "${LOG}"
+        break
+    fi
+    _phase="$(kubectl get pod "${RANK0}" --context="${CTX}" -n "${NS}" \
+        -o jsonpath='{.status.phase}' 2>/dev/null)"
+    if [ "${_phase}" = "Succeeded" ] || [ "${_phase}" = "Failed" ]; then
+        echo "  rank-0 phase=${_phase}; done." | tee -a "${LOG}"
+        break
+    fi
+    if gsutil ls -r "${TRACE_BUCKET}/${JS}/**" 2>/dev/null | grep -q "worker-0-0.trace.json.gz"; then
+        echo "  trace flushed to GCS; proceeding to retrieval." | tee -a "${LOG}"
+        break
+    fi
+    if [ "$(date +%s)" -ge "${_deadline}" ]; then
+        echo "  timed out waiting for finish/trace (60min)." | tee -a "${LOG}"
+        break
+    fi
+    _last="$(kubectl logs "${RANK0}" --context="${CTX}" -n "${NS}" --tail=1 2>/dev/null | tr '\n' ' ' | cut -c1-160)"
+    echo "  [waiting] phase=${_phase:-?} :: ${_last}" | tee -a "${LOG}"
+    sleep 20
+done
+
+echo | tee -a "${LOG}"
 echo "==== Post-run: re-fetch COMPLETE rank-0 log (kubectl logs -f can drop lines) ====" | tee -a "${LOG}"
 # Non-follow pull of the full rank-0 log; appended so the file is authoritative
 # even if the live -f stream was rotated/truncated by kubelet under load.

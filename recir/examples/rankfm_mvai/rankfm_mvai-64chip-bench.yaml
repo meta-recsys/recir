@@ -177,7 +177,6 @@ spec:
               - >-
                 python3 -u -m recir.examples.rankfm_mvai.train
                 --local_batch_size 512
-                --hash_size_cap 1000000
                 --l1_num_layers 8
                 --l2_num_layers 10
                 --max_uih_seq_len "${RANKFM_S}"

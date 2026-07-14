@@ -872,15 +872,27 @@ def build_model_from_config(
     module_config: BlueReelsVDDModuleConfig,
     device: torch.device,
     bf16_training: bool = False,
+    embeddings_on_meta: bool = False,
 ) -> BlueReelsVDDTrainV3:
-    """Build the V3 xsurface model from a preconfigured ``module_config``."""
+    """Build the V3 xsurface model from a preconfigured ``module_config``.
+
+    ``embeddings_on_meta``: when True, the ``ECSparseArch`` embedding tables are
+    built on the ``meta`` device (no host allocation / init) while the dense
+    modules stay on ``device``. Use this for the in_graph + on_device_init path,
+    where ``InGraphEmbeddingBackend.setup()`` replaces the entire embedding
+    collection with fresh on-device (meta -> HBM) tables, so the vanilla host
+    tables are never read. Without this, an uncapped hash size (e.g. 100M rows)
+    would allocate + ``normal_()``-init ~100GB per table on the host,
+    single-threaded, stalling model construction before compile.
+    """
     for stack in module_config.stu_stack_configs:
         for stu_config in stack.stu_configs:
             stu_config.attn_config = stu_config.attn_config._replace(
                 use_cuda_attention=False
             )
 
-    with _ec_sparse_arch_on(device):
+    ec_device = torch.device("meta") if embeddings_on_meta else device
+    with _ec_sparse_arch_on(ec_device):
         recblock = build_recblock_from_xsurface_config(
             module_config=module_config,
             is_train=True,
@@ -891,7 +903,12 @@ def build_model_from_config(
             recblock=recblock,
             is_train=True,
         )
-    model.to(device)
+    if not embeddings_on_meta:
+        model.to(device)
+    # When embeddings_on_meta: the dense modules are already built on ``device``
+    # (torch default) and the embedding tables are intentionally left on meta --
+    # calling model.to(device) here would raise "Cannot copy out of meta tensor".
+    # The in_graph backend materializes real on-device tables in setup().
 
     # Force pure PyTorch kernels (Triton kernels lack TPU support).
     model.recursive_setattr("_hammer_kernel", HammerKernel.PYTORCH)

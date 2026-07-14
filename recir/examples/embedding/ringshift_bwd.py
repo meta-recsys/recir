@@ -10,6 +10,8 @@ Two ``unittest.TestCase`` classes:
     uses the auto-differentiable ``ringshift_embedding_lookup_reference_jax``).
     Tolerances: ``atol=1e-4, rtol=1e-4``. Coverage:
       - ``test_w4_base_correctness``      -- skewed inputs (~75% to hot peer).
+      - ``test_w4_dma_gather_base``       -- large shard -> HBM DMA scatter-add.
+      - ``test_w4_dma_gather_repeated_hot_row`` -- HBM RMW accumulation on one row.
       - ``test_w4_repeated_hot_row``      -- worst-case scatter-add collision.
       - ``test_w4_wave0_self_peer``       -- wave 0 my_src == my_dst == my_rank.
       - ``test_w4_zero_count``            -- ``local_id_count = 0`` everywhere.
@@ -37,6 +39,7 @@ import jax.numpy as jnp
 import numpy as np
 from jax.experimental.multihost_utils import sync_global_devices
 from recir.ops.pallas.embeddings.ringshift import (
+    _use_dma_gather,
     ringshift_embedding_lookup,
     ringshift_embedding_lookup_reference_jax,
 )
@@ -202,6 +205,13 @@ class RingshiftBwdW4Test(unittest.TestCase):
     WORLD_SIZE = 4
     EMBEDDING_DIM = 128
     V_LOCAL = 1024
+    # Large per-shard table that forces the HBM per-row DMA scatter-add path AND
+    # makes the whole-shard VMEM prefetch physically impossible:
+    # V_LOCAL_DMA * EMBEDDING_DIM * 4 = 128MB -- over the 16MB staging budget (so
+    # the kernel selects the DMA path) and over the ~64MB VMEM (so a prefetch
+    # fallback would fail to compile). A PASS therefore proves the DMA scatter-add
+    # path actually executed.
+    V_LOCAL_DMA = 256 * 1024
     MAX_LOCAL_IDS = 1024
     TILE = 128
     ATOL = 1e-4
@@ -362,6 +372,111 @@ class RingshiftBwdW4Test(unittest.TestCase):
         )
         self._log("W4_CHUNKED", f"PASS max_diff={d:.6e}")
         self.assertLessEqual(d, self.ATOL + self.RTOL)
+
+    # ---- 1b. DMA scatter-add path (large table shard) ----
+
+    def test_w4_dma_gather_base(self) -> None:
+        """W=4 backward with a LARGE table shard to force the HBM DMA scatter-add.
+
+        v_local=64K rows/shard at D=128 f32 -> 32MB > the 16MB VMEM staging
+        budget, so the backward kernel read-modify-writes the grad accumulator one
+        row at a time directly in HBM (no whole-shard VMEM staging). Skewed inputs;
+        table grad must still match the ra2a reference within tolerance.
+        """
+        self.assertTrue(
+            _use_dma_gather(self.V_LOCAL_DMA, self.EMBEDDING_DIM, jnp.float32),
+            "V_LOCAL_DMA does not exceed the VMEM budget; test would not exercise "
+            "the DMA scatter-add path",
+        )
+        local_ids, local_id_count = _make_skewed_inputs(
+            self.mesh,
+            self.WORLD_SIZE,
+            self.MAX_LOCAL_IDS,
+            self.V_LOCAL_DMA,
+            seed=2,
+        )
+        local_table = _make_random_table(
+            self.mesh,
+            self.WORLD_SIZE,
+            self.V_LOCAL_DMA,
+            self.EMBEDDING_DIM,
+            seed=7,
+        )
+        target = _make_random_target(
+            self.mesh,
+            self.WORLD_SIZE,
+            self.MAX_LOCAL_IDS,
+            self.EMBEDDING_DIM,
+            seed=13,
+        )
+        jax.block_until_ready((local_ids, local_id_count, local_table, target))
+        d = self._check_grad_close(
+            "W4_DMA_BASE",
+            local_ids,
+            local_id_count,
+            local_table,
+            target,
+        )
+        self._log("W4_DMA_BASE", f"PASS max_diff={d:.6e}")
+        self.assertLessEqual(d, self.ATOL + self.RTOL)
+
+    def test_w4_dma_gather_repeated_hot_row(self) -> None:
+        """W=4 DMA scatter-add with all queries on one row (worst-case collision).
+
+        The key correctness gate for the HBM per-row read-modify-write: every
+        query points to global id 0, so rank 0 accumulates world_size *
+        max_local_ids deltas into row 0. Sequential per-row HBM RMW (each read
+        must observe the previous write) must accumulate ALL contributions -- a
+        racy/overwriting implementation would drop them. Large v_local forces the
+        DMA path.
+        """
+        self.assertTrue(
+            _use_dma_gather(self.V_LOCAL_DMA, self.EMBEDDING_DIM, jnp.float32),
+            "V_LOCAL_DMA does not exceed the VMEM budget; test would not exercise "
+            "the DMA scatter-add path",
+        )
+        P = jax.sharding.PartitionSpec
+        max_local_ids = self.MAX_LOCAL_IDS
+        ed = self.EMBEDDING_DIM
+
+        @functools.partial(
+            jax.shard_map,
+            mesh=self.mesh,
+            in_specs=(),
+            out_specs=(P("x"), P("x")),
+            check_vma=False,
+        )
+        def make_inputs():
+            ids = jnp.zeros((max_local_ids,), dtype=jnp.int32)
+            count = jnp.array(max_local_ids, dtype=jnp.int32)
+            return ids[None, :], count[None]
+
+        # pyrefly: ignore [missing-argument, not-iterable]
+        local_ids, local_id_count = make_inputs()
+        local_table = _make_random_table(
+            self.mesh,
+            self.WORLD_SIZE,
+            self.V_LOCAL_DMA,
+            ed,
+            seed=7,
+        )
+        target = _make_random_target(
+            self.mesh,
+            self.WORLD_SIZE,
+            max_local_ids,
+            ed,
+            seed=13,
+        )
+        jax.block_until_ready((local_ids, local_id_count, local_table, target))
+        d = self._check_grad_close(
+            "W4_DMA_HOTROW",
+            local_ids,
+            local_id_count,
+            local_table,
+            target,
+        )
+        self._log("W4_DMA_HOTROW", f"PASS max_diff={d:.6e}")
+        self.assertGreaterEqual(d, 0.0)
 
     # ---- 2. Repeated hot row (worst-case duplicate accumulation) ----
 
