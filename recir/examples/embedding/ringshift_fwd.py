@@ -28,6 +28,7 @@ import jax.numpy as jnp
 import numpy as np
 from jax.experimental.multihost_utils import sync_global_devices
 from recir.ops.pallas.embeddings.ringshift import (
+    _use_dma_gather,
     ringshift_embedding_lookup,
     ringshift_embedding_lookup_reference_jax,
 )
@@ -89,23 +90,41 @@ class RingshiftFwdCorrectnessTest(unittest.TestCase):
     """Bitwise-identical correctness vs ra2a reference at W=4/32/64/128."""
 
     def _run_correctness_with_devices(
-        self, world_size, devices, recv_capacity: int | None = None
+        self,
+        world_size,
+        devices,
+        recv_capacity: int | None = None,
+        v_local: int = 8 * 1024,
+        expect_dma_gather: bool | None = None,
     ) -> None:
         """Shared helper: run fused vs ra2a correctness check at given W.
 
-        D=128, v_local=8K, max_local_ids=8K. ``recv_capacity`` defaults to
-        max_local_ids+TILE (single-chunk path); pass a SMALLER TILE-aligned value
-        to force the chunked-recv path (num_chunks > 1) -- this is the numerical
-        gate for the chunked gather/scatter (skewed traffic makes a single peer's
-        payload exceed recv_capacity, so multiple chunks are actively used).
+        D=128, ``v_local`` rows/shard (default 8K), max_local_ids=8K.
+        ``recv_capacity`` defaults to max_local_ids+TILE (single-chunk path); pass
+        a SMALLER TILE-aligned value to force the chunked-recv path
+        (num_chunks > 1) -- the numerical gate for the chunked gather/scatter
+        (skewed traffic makes a single peer's payload exceed recv_capacity, so
+        multiple chunks are actively used).
+        ``v_local`` large enough that ``v_local * D * 4`` exceeds the VMEM budget
+        (``_TABLE_VMEM_BUDGET_BYTES``) exercises the HBM per-row DMA-gather path
+        instead of the whole-shard VMEM prefetch; ``expect_dma_gather`` (when set)
+        asserts which path this config takes so the test can't silently drift onto
+        the wrong one.
         Per-rank random fp32 table (different rng key per rank).
         Computes max |out - ref| in-graph; asserts exactly 0.0 (bitwise-identical).
         Prints `[CORRECTNESS_W{N}] max_diff = ...` and PASS/FAIL on rank 0.
         """
         TILE = 128
         embedding_dim = 128
-        v_local = 8 * 1024
         max_local_ids = 8 * 1024
+
+        if expect_dma_gather is not None:
+            self.assertEqual(
+                _use_dma_gather(v_local, embedding_dim, jnp.float32),
+                expect_dma_gather,
+                f"v_local={v_local} D={embedding_dim} does not take the expected "
+                f"path (expect_dma_gather={expect_dma_gather})",
+            )
 
         self.assertEqual(
             len(devices),
@@ -242,6 +261,65 @@ class RingshiftFwdCorrectnessTest(unittest.TestCase):
         devices = all_devices[:4]
         self._run_correctness_with_devices(
             world_size=4, devices=devices, recv_capacity=2048
+        )
+
+    def test_w4_dma_gather(self) -> None:
+        """W=4 correctness with a LARGE table shard to force the HBM DMA-gather.
+
+        v_local=256K rows/shard at D=128 f32 -> 128MB, which is BOTH over the 16MB
+        VMEM staging budget (so the kernel picks the DMA path) AND over the ~64MB
+        VMEM itself (so the whole-shard prefetch path physically cannot compile).
+        A PASS therefore proves the per-row HBM DMA-gather path actually ran --
+        not just that the threshold selected it. Result must stay bitwise-identical
+        to the ra2a reference. Single-host (4 chips) is enough -- the gather is
+        local (no cross-host dependency).
+        """
+        all_devices = jax.devices()
+        if len(all_devices) < 4:
+            self.skipTest(f"Need 4 devices, have {len(all_devices)}")
+        devices = all_devices[:4]
+        self._run_correctness_with_devices(
+            world_size=4,
+            devices=devices,
+            v_local=256 * 1024,
+            expect_dma_gather=True,
+        )
+
+    def test_w4_dma_gather_chunked(self) -> None:
+        """W=4 DMA-gather AND chunked-recv together (num_chunks > 1).
+
+        Combines the large-shard HBM per-row DMA path (v_local=256K, prefetch
+        would OOM VMEM) with a small recv_capacity=2048 so the per-row DMA gather
+        runs inside the multi-chunk loop. Guards the interaction of the two
+        independent tilings.
+        """
+        all_devices = jax.devices()
+        if len(all_devices) < 4:
+            self.skipTest(f"Need 4 devices, have {len(all_devices)}")
+        devices = all_devices[:4]
+        self._run_correctness_with_devices(
+            world_size=4,
+            devices=devices,
+            recv_capacity=2048,
+            v_local=256 * 1024,
+            expect_dma_gather=True,
+        )
+
+    def test_w4_prefetch_path(self) -> None:
+        """W=4 sanity that the default small shard stays on the VMEM prefetch path.
+
+        Explicit guard that v_local=8K (D=128 f32 -> 4MB < 16MB budget) does NOT
+        take the DMA-gather path, so the hybrid threshold keeps the fast path for
+        small tables.
+        """
+        all_devices = jax.devices()
+        if len(all_devices) < 4:
+            self.skipTest(f"Need 4 devices, have {len(all_devices)}")
+        devices = all_devices[:4]
+        self._run_correctness_with_devices(
+            world_size=4,
+            devices=devices,
+            expect_dma_gather=False,
         )
 
     def test_w32_correctness_chunked(self) -> None:

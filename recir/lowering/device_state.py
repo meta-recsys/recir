@@ -5,7 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 # pyre-strict
-from typing import Any, List, Optional
+from typing import Any, List, Optional, Sequence
 
 import torch
 from torch import fx
@@ -21,6 +21,11 @@ class DeviceStateManager:
         self.device_state: Optional[List[Any]] = None
         self._used_fast_path: bool = False
         self.torch_device: torch.device = torch_device
+        # FQNs (fully-qualified names) aligned 1:1 with flat_state, populated at
+        # compile time. Lets sync_to_torch skip specific state entries by name
+        # (e.g. large device-resident embedding tables) rather than by a size
+        # heuristic. None until the compiler attaches it.
+        self.state_fqns: Optional[List[str]] = None
         # When True, process_outputs returns the raw (JAX) step output instead of
         # materializing it to torch every step. This lets a training loop defer the
         # output device->host pull to a cadence so JAX can pipeline (the host runs
@@ -62,5 +67,6 @@ class DeviceStateManager:
     def sync_to_torch(
         self,
         flat_state: List[torch.Tensor],
+        skip_fqns: Optional[Sequence[str]] = None,
     ) -> None:
         pass

@@ -188,8 +188,10 @@ class RankFMModelArgs:
     rebuilding the model.
     """
 
-    # Embedding sizing (cap large hash tables for memory budget on TPU)
-    hash_size_cap: int = 1_000_000
+    # Embedding sizing: cap large hash tables for the TPU memory budget.
+    # 0 (default) disables the cap -> tables keep their natural num_embeddings;
+    # set a positive value to clamp every table's num_embeddings down to it.
+    hash_size_cap: int = 0
 
     # HSTU stack sizing
     l1_num_layers: int = 3
@@ -237,9 +239,10 @@ def build_module_config(
     # udd_fm_train_v3._use_inter_arch) and is all the embedding-perf bench needs.
     module_config.inter_arch_type = None
 
-    # Cap embedding-table hash sizes.
-    for table in module_config.embedding_tables.values():
-        table.num_embeddings = min(table.num_embeddings, model_args.hash_size_cap)
+    # Cap embedding-table hash sizes (hash_size_cap <= 0 disables capping).
+    if model_args.hash_size_cap > 0:
+        for table in module_config.embedding_tables.values():
+            table.num_embeddings = min(table.num_embeddings, model_args.hash_size_cap)
 
     # Per-feature hash size (post-cap), passed to the synthetic data generator so
     # it samples each id over its table's full num_embeddings. This makes

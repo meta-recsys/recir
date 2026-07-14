@@ -32,6 +32,7 @@ import numpy as np
 from recir.ops.pallas.embeddings.ringshift import (
     _block_to_mod_ids,
     _bucketize_and_sort,
+    _dedup_grads_by_id,
     _derive_offsets,
     _pad_per_peer,
     _pad_per_peer_2d,
@@ -91,6 +92,94 @@ class BucketizeAndSortTest(unittest.TestCase):
             np.array(sort_perm)[np.array(reverse_perm)],
             np.arange(max_local_ids, dtype=np.int32),
         )
+
+
+class DedupGradsByIdTest(unittest.TestCase):
+    """Send-side backward grad dedup: sum grads per unique id, unique rows/peer."""
+
+    def test_sums_duplicate_ids(self) -> None:
+        world_size = 4
+        max_local_ids = 8
+        # id 5 (dest1,row1) appears at positions 0,1,4; id 7 (dest3,row1) at 2;
+        # id 12 (dest0,row3) at 3. positions 5-7 are padding (count=5).
+        local_ids = jnp.array([5, 5, 7, 12, 5, 0, 0, 0], dtype=jnp.int32)
+        local_id_count = jnp.array(5, dtype=jnp.int32)
+        # grad[i] = [i+1, -(i+1)] so sums are easy to verify.
+        base = (np.arange(max_local_ids) + 1).astype(np.float32)
+        grad_out = jnp.array(np.stack([base, -base], axis=1), dtype=jnp.float32)
+
+        compact_row, compact_grad, send_counts = _dedup_grads_by_id(
+            local_ids, local_id_count, grad_out, max_local_ids, world_size
+        )
+
+        # unique ids per dest: dest0={12}, dest1={5}, dest2={}, dest3={7}
+        self.assertEqual(list(np.array(send_counts)), [1, 1, 0, 1])
+        # sorted by (dest, id): (dest0,id12,row3), (dest1,id5,row1), (dest3,id7,row1)
+        self.assertEqual(list(np.array(compact_row[:3])), [3, 1, 1])
+        # id5 grad = positions 0,1,4 -> (1)+(2)+(5) = 8 ; id7 = pos2 -> 3 ; id12 = pos3 -> 4
+        np.testing.assert_allclose(
+            np.array(compact_grad[:3]),
+            np.array([[4, -4], [8, -8], [3, -3]], dtype=np.float32),
+        )
+        # Total gradient mass is preserved (dedup only sums, never drops real grad).
+        np.testing.assert_allclose(
+            np.array(compact_grad).sum(axis=0),
+            np.array(grad_out)[:5].sum(axis=0),
+        )
+
+    def test_matches_reference_scatter_add(self) -> None:
+        """Deduped (row, grad) per dest == direct per-(dest,row) grad sum."""
+        world_size = 4
+        max_local_ids = 32
+        rng = np.random.default_rng(0)
+        count = 20
+        ids = rng.integers(0, 40, size=count).astype(np.int32)
+        local_ids = jnp.array(
+            np.concatenate([ids, np.zeros(max_local_ids - count, np.int32)]),
+            dtype=jnp.int32,
+        )
+        local_id_count = jnp.array(count, dtype=jnp.int32)
+        g = rng.standard_normal((max_local_ids, 3)).astype(np.float32)
+        grad_out = jnp.array(g, dtype=jnp.float32)
+
+        compact_row, compact_grad, send_counts = _dedup_grads_by_id(
+            local_ids, local_id_count, grad_out, max_local_ids, world_size
+        )
+        sc = np.array(send_counts)
+        c_row = np.array(compact_row)
+        c_grad = np.array(compact_grad)
+
+        # Reference: per-(dest,row) summed grad over the valid ids.
+        ref = {}
+        for i in range(count):
+            gid = int(ids[i])
+            ref[(gid % world_size, gid // world_size)] = (
+                ref.get((gid % world_size, gid // world_size), np.zeros(3, np.float32))
+                + g[i]
+            )
+        # Unique count per dest must match.
+        for d in range(world_size):
+            self.assertEqual(int(sc[d]), sum(1 for (dd, _) in ref if dd == d))
+        # Walk the front-packed compact output per dest (offsets = cumsum) and
+        # check each (row -> summed grad) against the reference.
+        offs = np.concatenate([[0], np.cumsum(sc)])
+        for d in range(world_size):
+            for j in range(offs[d], offs[d + 1]):
+                np.testing.assert_allclose(
+                    c_grad[j], ref[(d, int(c_row[j]))], rtol=1e-5, atol=1e-5
+                )
+
+    def test_all_padding_yields_zero_counts(self) -> None:
+        world_size = 4
+        max_local_ids = 8
+        local_ids = jnp.zeros(max_local_ids, dtype=jnp.int32)
+        local_id_count = jnp.array(0, dtype=jnp.int32)
+        grad_out = jnp.ones((max_local_ids, 2), dtype=jnp.float32)
+        _, compact_grad, send_counts = _dedup_grads_by_id(
+            local_ids, local_id_count, grad_out, max_local_ids, world_size
+        )
+        self.assertEqual(list(np.array(send_counts)), [0, 0, 0, 0])
+        np.testing.assert_allclose(np.array(compact_grad).sum(), 0.0)
 
 
 class RoundUpTileTest(unittest.TestCase):
