@@ -1177,8 +1177,8 @@ def compile_from_gm(  # noqa: C901 — orchestration: stages 4-8 of the pipeline
     * **Stage 5** -- ``parallel_mode.shard_params`` + ``partition``.
       ``shard_params`` updates ``opt.state`` and may re-key parameters
       in-place; we then re-extract ``named_states`` by walking the
-      now-sharded module and call ``partition_from_module`` to rewrite the
-      graph for the chosen parallelism strategy (DP/FSDP/GSPMD/etc.).
+      now-sharded module.  For DP/FSDP/Hybrid the graph is already
+      parametrized at trace time; GSPMD needs no DTensor partition pass.
       Also re-flattens the graph via ``_to_caller_flattened_graph_module``
       so the caller can invoke ``gm(*flat_state, *user_inputs)`` directly,
       and rebuilds ``flat_state`` from the post-shard params/buffers/states.
@@ -1244,10 +1244,8 @@ def compile_from_gm(  # noqa: C901 — orchestration: stages 4-8 of the pipeline
     #     because the GSPMD lowering inflates placeholders to the global
     #     batch post-trace; sharding before the trace would leave the gm
     #     with per-shard literals that conflict with the inflated
-    #     placeholders.  After sharding we still call
-    #     ``partition_from_module`` (a no-op for the GSPMD partition path,
-    #     kept for symmetry with the abstract :class:`ParallelMode` contract)
-    #     and then scale + erase the autograd-emitted ``_spmd::tag_grad``
+    #     placeholders.  GSPMD needs no DTensor partition pass, so after
+    #     sharding we scale + erase the autograd-emitted ``_spmd::tag_grad``
     #     markers so XLA lowering can proceed.
     sharded_keys: set[str] = set()
     if isinstance(parallel_mode, (DataParallel, HybridParallel)):
@@ -1271,11 +1269,10 @@ def compile_from_gm(  # noqa: C901 — orchestration: stages 4-8 of the pipeline
                     mod=ctx.mod,
                 ).finalize_compiled_graph(gm)
     else:
-        # GSPMDParallel (or future modes that still require a DTensor partition
-        # pass).  Mirror the legacy ``_compile_gspmd`` ordering: shard_params
-        # first (updates ``opt.state`` and may re-key parameters), then
-        # re-extract named_states by walking the now-sharded module, then
-        # ``partition_from_module``.
+        # GSPMDParallel.  Mirror the legacy ``_compile_gspmd`` ordering:
+        # shard_params first (updates ``opt.state`` and may re-key
+        # parameters), then re-extract named_states by walking the
+        # now-sharded module.  GSPMD needs no DTensor partition pass.
         params_and_buffers = {**ctx.params, **ctx.buffers}
         sharded_keys = parallel_mode.shard_params(ctx.mod, params_and_buffers, ctx.opts)
         named_states = {}
@@ -1309,19 +1306,10 @@ def compile_from_gm(  # noqa: C901 — orchestration: stages 4-8 of the pipeline
             # — captured by ``trace`` — is the authoritative snapshot;
             # fall through so we do not silently discard it.
             named_states = ctx.named_states
-        # ``partition_from_module`` accepts ``optimizer`` only for API
-        # back-compat and never reads it; pass the first opt (or None).
-        gm = parallel_mode.partition_from_module(
-            gm,
-            ctx.mod,
-            _opts[0] if _opts else None,
-            params_and_buffers,
-            named_states,
-        )
 
-        # GSPMD-specific tag_grad fixup.  ``partition_from_module`` is a no-op
-        # for GSPMD, so the autograd-emitted ``_spmd::tag_grad`` markers
-        # survive into the lowered graph; they must be scaled (for
+        # GSPMD-specific tag_grad fixup.  GSPMD needs no DTensor partition
+        # pass, so the autograd-emitted ``_spmd::tag_grad`` markers survive
+        # into the lowered graph; they must be scaled (for
         # ``grad_reduction == "avg"``) and erased here.  Mirrors the
         # post-trace block in the legacy ``_compile_gspmd``:
         #   * scale: GSPMD lowers the autograd-emitted grad accumulation
@@ -1965,10 +1953,9 @@ def compile(  # noqa: C901 — orchestration: stages 0-9 + legacy DP/GSPMD wirin
       the legacy ``_compile_and_transform`` ordering; the verb "transform"
       is reserved for these semantic rewrites.
     * **Stage 4 -- partition.** Multi-device graph split:
-      ``parallel_mode.shard_params(...)`` followed by
-      ``parallel_mode.partition_from_module(...)``.  Inserts collectives,
-      rewrites the graph for DP / FSDP / GSPMD / Hybrid, then re-flattens
-      via :func:`_to_caller_flattened_graph_module` and rebuilds
+      ``parallel_mode.shard_params(...)`` (partitioning for DP / FSDP /
+      Hybrid is baked in at trace time; GSPMD needs no DTensor pass), then
+      re-flattens via :func:`_to_caller_flattened_graph_module` and rebuilds
       ``flat_state``.  The verb "partition" is reserved for this distributed
       graph split.
     * **Stage 5 -- optimize** *(Backend)*.  ``backend.optimize_passes``
@@ -2051,7 +2038,7 @@ def compile(  # noqa: C901 — orchestration: stages 0-9 + legacy DP/GSPMD wirin
         parallel_mode (Optional[ParallelMode]): a :class:`ParallelMode`
             instance specifying how to parallelize the callable.  Each
             ``ParallelMode`` owns stage 4 (its
-            :meth:`~ParallelMode.partition_from_module` rewrites the
+            :meth:`~ParallelMode.partition` rewrites the
             graph for the chosen DP / FSDP / GSPMD / Hybrid strategy).
             ``DataParallel()`` is used when ``None`` is passed.
             (Default: ``None``)
