@@ -36,7 +36,7 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Any, Dict, Iterator, List, Optional, Tuple, TYPE_CHECKING
+from typing import Any, cast, Dict, Iterator, List, Optional, Tuple, TYPE_CHECKING
 
 import jax
 import torch
@@ -54,6 +54,8 @@ if TYPE_CHECKING:
     RankingMetricDef = Any
     RankingSGDTrainPipeline = Any
     RankingSGDTrainPipelineProvider = Any
+
+    from .model_family import RecirXLACompiledModule
 else:
     from minimal_viable_ai.core.ranking_common.train_pipeline import (
         RankingMetricDef,
@@ -88,6 +90,7 @@ class RecirXLATrainPipeline(RankingSGDTrainPipeline):
         step_metrics: Optional[List[Any]] = None,
         cls_task_indices: Optional[List[int]] = None,
         reg_task_indices: Optional[List[int]] = None,
+        host_sync_every: int = 1,
         jax_profiling: bool = False,
         profile_start_step: int = -1,
         profile_end_step: int = -1,
@@ -114,6 +117,7 @@ class RecirXLATrainPipeline(RankingSGDTrainPipeline):
         self._profile_dir = profile_dir
         self._enable_memory_log = enable_memory_log
         self._step = 0
+        self._host_sync_every: int = max(1, host_sync_every)
         self._profiling_active = False
         if jax_profiling:
             logger.info(
@@ -139,8 +143,9 @@ class RecirXLATrainPipeline(RankingSGDTrainPipeline):
 
         # The self-compiling wrapper lazily compiles on the first call, then
         # runs fwd -> backward (fires the SparseCore sparse opt off-GM, or the
-        # in-graph emb opt in-GM) -> dense opt.step on TPU and syncs device state.
-        # It returns the detached (losses, named_tensors).
+        # in-graph emb opt in-GM) -> dense opt.step on TPU. It returns the
+        # (losses, named_tensors); metric update runs every step so the
+        # example-count / variable_step_qps stay exact.
         losses, named = self._model(batch)
 
         if self._profiling_active and self._enable_memory_log:
@@ -158,6 +163,16 @@ class RecirXLATrainPipeline(RankingSGDTrainPipeline):
                 f"[PROFILE] Stopped trace at step {self._step} -- saved to "
                 f"{self._profile_dir}"
             )
+
+        # Mirror device-resident state (dense params / LR / metric buffers) back to
+        # torch only every N steps. The next step's math runs entirely from the
+        # cached JAX device_state, so this is pure host-visibility work; doing it
+        # every step serializes ~0.3s/step of device->host copy with no device
+        # overlap. Host params/metric buffers are then fresh every N steps (and at
+        # train end via on_train_end); report_interval=N keeps the metric report
+        # compute on the same cadence.
+        if self._step % self._host_sync_every == 0:
+            cast("RecirXLACompiledModule", self._model).flush_host_state()
 
         # Rebuild the ret dict RankingSGDTrainPipeline._update_ranking_metrics
         # expects; the metrics were constructed on torch.device("cpu") to match
@@ -177,6 +192,9 @@ class RecirXLATrainPipeline(RankingSGDTrainPipeline):
             jax.profiler.stop_trace()
             self._profiling_active = False
             logger.info("[PROFILE] Stopped trace (training ended).")
+        # Final host-state flush so params/buffers are fresh for any end-of-run
+        # inspection/checkpoint even if the last step was not a flush step.
+        cast("RecirXLACompiledModule", self._model).flush_host_state()
         logger.info("RecirXLATrainPipeline: training complete.")
 
 
@@ -208,6 +226,7 @@ class RecirXLATrainPipelineProvider(
     ) -> None:
         self._cls_task_indices = cls_task_indices
         self._reg_task_indices = reg_task_indices
+        self._host_sync_every = report_interval
         self._jax_profiling = jax_profiling
         self._profile_start_step = profile_start_step
         self._profile_end_step = profile_end_step
@@ -252,6 +271,7 @@ class RecirXLATrainPipelineProvider(
             step_metrics=base_pipeline._step_metrics,
             cls_task_indices=self._cls_task_indices,
             reg_task_indices=self._reg_task_indices,
+            host_sync_every=self._host_sync_every,
             jax_profiling=self._jax_profiling,
             profile_start_step=self._profile_start_step,
             profile_end_step=self._profile_end_step,

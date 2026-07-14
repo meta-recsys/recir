@@ -455,7 +455,7 @@ def build_trainer_config(
     return RecTrainerConfig(
         data_source_config=data_source_config,
         system_config=SystemConfig(use_gpu=False, dist_backend="gloo"),
-        metrics_config=MetricsConfig(report_interval=1, tensorboard_logger=True),
+        metrics_config=MetricsConfig(report_interval=10, tensorboard_logger=True),
         model_config_module=("hammer.v3.models.udd_fm_v3.udd_fm_config"),
         checkpoint_config=None,
     )
