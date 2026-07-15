@@ -5,7 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 # pyre-strict
-from typing import Any, List
+from typing import Any, List, Optional, Sequence
 
 import torch
 from recir.lowering.device_state import DeviceStateManager
@@ -162,11 +162,28 @@ class XLADeviceStateManager(DeviceStateManager):
     def sync_to_torch(
         self,
         flat_state: List[torch.Tensor],
+        skip_fqns: Optional[Sequence[str]] = None,
     ) -> None:
         device_state = self.device_state
         if device_state is None:
             return
+        fqns = self.state_fqns
         with torch.no_grad():
             for i, jax_val in enumerate(device_state):
-                if i < len(flat_state):
-                    flat_state[i].copy_(_jax_to_torch(jax_val, self.torch_device))
+                if i >= len(flat_state):
+                    continue
+                # skip_fqns lets callers avoid the per-step device->host copy +
+                # transpose of named state entries (e.g. the on-device embedding-
+                # table shards). Those are updated in-graph and only need a host
+                # copy at checkpoint time; copying them every step is O(table
+                # size) and dominates the step for large tables. Matched as a
+                # substring of the entry's FQN so a table prefix skips the table
+                # and (if present) its optimizer state.
+                if (
+                    skip_fqns
+                    and fqns is not None
+                    and i < len(fqns)
+                    and any(pat in fqns[i] for pat in skip_fqns)
+                ):
+                    continue
+                flat_state[i].copy_(_jax_to_torch(jax_val, self.torch_device))

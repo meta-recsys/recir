@@ -80,6 +80,16 @@ from .xsurface_helpers import (
 
 logger: logging.Logger = logging.getLogger(__name__)
 
+# Per-step device->host state sync (sync_device_state_to_torch) skips state
+# entries whose FQN contains any of these substrings. The on-device embedding
+# tables (InGraphSparseArch's "_sharded_tables" / "_dp_tables" module dicts) are
+# GBs each and are kept resident in the cached JAX device_state across steps, so
+# mirroring them to host every step is O(table-size) waste (D2H copy + layout
+# transpose) that dominates the step at large hash sizes. Dense params / LR /
+# metric buffers don't match and still sync. Full sync (skip_fqns=None) is used
+# before checkpointing/inspecting the tables.
+_EMB_SYNC_SKIP_FQNS: Tuple[str, ...] = ("_sharded_tables", "_dp_tables")
+
 
 def _udd_fm_v3_train_step(
     mod: torch.nn.Module,
@@ -382,7 +392,14 @@ class RecirXLACompiledModule(RecirCompiledModuleBase):
             self._emb_opt,
             *flatten_batch(batch),
         )
-        sync_device_state_to_torch(compiled_step)
+        # Per-step host sync skips the on-device embedding-table shards by FQN
+        # (see _EMB_SYNC_SKIP_FQNS): they are updated in-graph and kept resident
+        # in the cached JAX device_state (fed to the next step), so copying +
+        # transposing them back to host every step is pure O(table-size) waste
+        # that dominates the step for large hash sizes. Small dense params / LR /
+        # metric buffers still sync so host-side logging stays fresh. Do a full
+        # sync (skip_fqns=None) before checkpointing/inspecting the tables.
+        sync_device_state_to_torch(compiled_step, skip_fqns=_EMB_SYNC_SKIP_FQNS)
         return result
 
     def _post_step(self) -> None:
@@ -477,10 +494,20 @@ class RankFMMvaiModelFamily(BlueReelsVDDModelFamily):
         only the kernel/device/precision knobs differ.
         """
         module_config = self._module_config()
+        # For the in_graph backend with on_device_init, build the embedding tables
+        # on meta (no host alloc): backend.setup() replaces them with on-device
+        # HBM tables, so materializing the vanilla host tables is pure waste and,
+        # at large hash sizes (uncapped 100M rows -> ~100GB/table), stalls model
+        # construction on a single-threaded CPU init before compile.
+        embeddings_on_meta = (
+            self._trainer_cfg.embedding_backend == "in_graph"
+            and self._trainer_cfg.on_device_init
+        )
         return build_model_from_config(
             module_config,
             torch.device("cpu"),
             bf16_training=self._trainer_cfg.bf16_training,
+            embeddings_on_meta=embeddings_on_meta,
         )
 
     def create_train_module_and_optimizer(

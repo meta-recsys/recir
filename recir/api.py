@@ -623,6 +623,20 @@ def _tag_batch_inputs(
             node.meta["is_weight"] = False
 
 
+def _compute_state_fqns(structure: Any) -> List[str]:
+    """FQN string per flat_state leaf, aligned with ``pytree.tree_leaves(structure)``.
+
+    ``structure`` must be the SAME object passed to ``tree_leaves`` to build
+    flat_state (params/buffers dict + named_states), so the paths line up 1:1
+    with flat_state. Used to let ``sync_to_torch`` skip entries by name.
+    """
+    try:
+        leaves_with_path, _ = pytree.tree_flatten_with_path(structure)
+        return [pytree.keystr(kp) for kp, _ in leaves_with_path]
+    except Exception:
+        return []
+
+
 def _finalize_graph(
     gm: fx.GraphModule,
     mod: nn.Module,
@@ -644,7 +658,11 @@ def _finalize_graph(
     # is_batch_input / batch_dim. Without this, downstream subgraph
     # placeholders default to replicated and JAX sees per-process shape
     propagate_batch_input_meta(gm)
-    return _CompiledResult(gm, mod, opts, flat_state, DeviceStateManager())
+    result = _CompiledResult(gm, mod, opts, flat_state, DeviceStateManager())
+    result.state_manager.state_fqns = _compute_state_fqns(
+        [params_and_buffers, named_states]
+    )
+    return result
 
 
 @dataclass
@@ -1463,12 +1481,16 @@ def compile_from_gm(  # noqa: C901 — orchestration: stages 4-8 of the pipeline
     # we use the dispatched module here.
     final_gm = cast(fx.GraphModule, dispatched)
 
+    sm = backend.device_state_manager()
+    sm.state_fqns = _compute_state_fqns(
+        [{**ctx.params, **ctx.buffers}, ctx.named_states]
+    )
     return _CompiledResult(
         gm=final_gm,
         mod=ctx.mod,
         opts=ctx.opts,
         flat_state=flat_state,
-        state_manager=backend.device_state_manager(),
+        state_manager=sm,
     )
 
 
@@ -2179,16 +2201,27 @@ def compile(  # noqa: C901 — orchestration: stages 0-9 + legacy DP/GSPMD wirin
     return inner
 
 
-def sync_device_state_to_torch(compiled_fn: Callable[..., Any]) -> None:
+def sync_device_state_to_torch(
+    compiled_fn: Callable[..., Any],
+    skip_fqns: Optional[Sequence[str]] = None,
+) -> None:
     """Synchronize device-resident state back to PyTorch tensors.
     Call before checkpointing or inspecting model parameters.
+
+    ``skip_fqns``: if set, state entries whose FQN contains any of these
+    substrings are NOT copied back to host. Use for per-step syncs to skip large
+    device-resident tensors (e.g. on-device embedding-table shards, matched by
+    their module prefix) whose host copy is only needed at checkpoint time; pass
+    ``None`` (default) for a full sync before checkpointing.
     """
     compiled_obj = compiled_fn.__dict__.get(COMPILED_OBJECT_KEY, None)
     if compiled_obj is None:
         return
     if compiled_obj.state_manager.device_state is None:
         return
-    compiled_obj.state_manager.sync_to_torch(compiled_obj.flat_state)
+    compiled_obj.state_manager.sync_to_torch(
+        compiled_obj.flat_state, skip_fqns=skip_fqns
+    )
 
 
 # Pull through the ``GraphPatch`` type alias so consumers don't need to import
