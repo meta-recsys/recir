@@ -279,6 +279,42 @@ def _torch_binary_scalar_type(scalar: Any, tensor: Any) -> Any:
     return jnp.float32
 
 
+# Above this many bins/needles we keep ``jnp.searchsorted`` (a binary-search
+# ``while`` loop). At or below it we replace searchsorted/bucketize with a flat,
+# fully-vectorized broadcasted compare-and-sum, which avoids the serialized loop
+# (a big TPU win when the sorted array is small but the value array is large).
+# Above the cap the O(len(values) * n_bins) broadcast would waste memory/compute.
+_SEARCHSORTED_VECTORIZE_MAX_BINS: int = 16384
+
+
+def _searchsorted(
+    sorted_sequence: Any,
+    values: Any,
+    side: str,
+    sorter: Any = None,
+) -> Any:
+    """searchsorted that avoids the binary-search ``while`` loop for small arrays.
+
+    ``jnp.searchsorted`` lowers to a serialized binary-search ``while`` loop on
+    TPU. When the sorted array is short along its last axis, the same result is
+    ``sum(a < v)`` (``side="left"``) or ``sum(a <= v)`` (``side="right"``) over
+    that axis -- a single fused reduction, no loop. Works for a 1-D sorted array
+    as well as the batched (n-D) case that recir's batch-dim propagation can
+    produce (it broadcasts along the last, per-row bin axis). The returned
+    insertion index equals that count regardless of ``sorter`` (counting is
+    order-independent). Falls back to ``jnp.searchsorted`` for large sorted
+    arrays where the ``[..., N, L]`` broadcast would be too big.
+    """
+    last = sorted_sequence.shape[-1] if sorted_sequence.ndim >= 1 else 0
+    if 0 < last <= _SEARCHSORTED_VECTORIZE_MAX_BINS:
+        # a: [..., 1, L]  vs  v: [..., N, 1]  -> compare over the last (bin) axis.
+        a = sorted_sequence[..., None, :]
+        v = values[..., None]
+        cmp = a < v if side == "left" else a <= v
+        return cmp.sum(axis=-1).astype(jnp.int32)
+    return jnp.searchsorted(sorted_sequence, values, side=side, sorter=sorter)
+
+
 @op(torch.ops.aten.searchsorted.Tensor)  # pyre-ignore[56]
 def _aten_searchsorted(
     sorted_sequence: Any,
@@ -293,7 +329,7 @@ def _aten_searchsorted(
     jax_side = "right" if right else "left"
     if side is not None:
         jax_side = side
-    res = jnp.searchsorted(sorted_sequence, values, side=jax_side, sorter=sorter)
+    res = _searchsorted(sorted_sequence, values, jax_side, sorter)
     if out_int32:
         res = res.astype(np.dtype(np.int32))
     elif sorted_sequence.dtype == np.dtype(np.int32):
@@ -1139,7 +1175,11 @@ def _aten_bucketize(
     out: Any = None,
 ) -> Any:
     return_type = jnp.int32 if out_int32 else jnp.int64
-    return jnp.digitize(input, boundaries, right=not right).astype(return_type)
+    # torch.bucketize(right=False) -> #{boundaries < x}  (side="left");
+    # torch.bucketize(right=True)  -> #{boundaries <= x} (side="right").
+    # ``_searchsorted`` avoids the binary-search while loop for small boundaries.
+    side = "right" if right else "left"
+    return _searchsorted(boundaries, input, side).astype(return_type)
 
 
 @op(torch.ops.aten.conv2d)  # pyre-ignore[56]
