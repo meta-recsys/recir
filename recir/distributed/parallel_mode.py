@@ -100,41 +100,6 @@ class ParallelMode(ABC):
         """
         raise NotImplementedError
 
-    def partition_from_module(
-        self,
-        gm: GraphModule,
-        model: torch.nn.Module,
-        optimizer: Optional[torch.optim.Optimizer],
-        params_and_buffers: Dict[str, Any],
-        named_states: Dict[str, Any],
-    ) -> GraphModule:
-        """Instance-method adapter for callers still holding a live ``nn.Module`` + ``Optimizer``.
-
-        A legacy caller of ``mode.partition(gm, model, opt, params_and_buffers, named_states, args, kwargs)``
-        migrates by renaming ``.partition`` to ``.partition_from_module`` and
-        dropping the trailing positional ``args`` / ``kwargs`` (the example
-        inputs were never read by any partition implementation).  Splits
-        ``params_and_buffers`` into ``params`` / ``buffers`` via an
-        ``isinstance(v, nn.Parameter)`` check and forwards to the kwargs-only
-        ``partition`` method.  ``model`` and ``optimizer`` are accepted for
-        API back-compat but are not used (they were unused even before the
-        kwargs-only refactor).
-        """
-        params: Dict[str, nn.Parameter] = {
-            k: v for k, v in params_and_buffers.items() if isinstance(v, nn.Parameter)
-        }
-        buffers: Dict[str, torch.Tensor] = {
-            k: v
-            for k, v in params_and_buffers.items()
-            if not isinstance(v, nn.Parameter)
-        }
-        return self.partition(
-            gm,
-            params=params,
-            buffers=buffers,
-            named_states=named_states,
-        )
-
     @abstractmethod
     def shard_params(
         self,
