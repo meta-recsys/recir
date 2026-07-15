@@ -130,8 +130,13 @@ def _pad_kjt_to_cached(
     )  # global cached length sum for each key
     per_host_per_key_budgets = [int(b // num_processes) for b in cached_per_key_global]
     # Values first — uses current_lengths to slide current per-key segments.
+    # tile_pad=True: fill each key's deficit by tiling its own real ids instead
+    # of zero-filling. These KJTs are embedding id-lists whose pad positions are
+    # masked out downstream, so tiling keeps the pad tokens' block-owner
+    # distribution uniform and avoids routing every pad (id 0) to ring-shift
+    # block-owner 0 (which caused the period-8 all-to-all hot wave).
     new_values = torch.ops.recir_padding.pad_jagged_values(
-        current_values, current_lengths, per_host_per_key_budgets, 0, -1, 1
+        current_values, current_lengths, per_host_per_key_budgets, 0, -1, 1, True
     )
     # Lengths next — extends stride; deficit dummies absorb the growth from
     # current per-key sums to per-host cached budgets so sum(new_lengths)
