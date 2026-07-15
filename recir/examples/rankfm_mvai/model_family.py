@@ -392,15 +392,13 @@ class RecirXLACompiledModule(RecirCompiledModuleBase):
             self._emb_opt,
             *flatten_batch(batch),
         )
-        # Per-step host sync skips the on-device embedding-table shards by FQN
-        # (see _EMB_SYNC_SKIP_FQNS): they are updated in-graph and kept resident
-        # in the cached JAX device_state (fed to the next step), so copying +
-        # transposing them back to host every step is pure O(table-size) waste
-        # that dominates the step for large hash sizes. Small dense params / LR /
-        # metric buffers still sync so host-side logging stays fresh. Do a full
-        # sync (skip_fqns=None) before checkpointing/inspecting the tables.
-        sync_device_state_to_torch(compiled_step, skip_fqns=_EMB_SYNC_SKIP_FQNS)
         return result
+
+    def flush_host_state(self) -> None:
+        """Mirror device-resident state back to torch for host consumers."""
+        compiled_step = self._compiled_step
+        if compiled_step is not None:
+            sync_device_state_to_torch(compiled_step, skip_fqns=_EMB_SYNC_SKIP_FQNS)
 
     def _post_step(self) -> None:
         # Advance the dense warmup LR (writes the next iter's value into the 0-d
