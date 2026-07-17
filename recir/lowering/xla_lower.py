@@ -46,6 +46,24 @@ _AOT_TOPOLOGY: contextvars.ContextVar[Optional[Any]] = contextvars.ContextVar(
 )
 
 
+# Cache reshard executables by target sharding. ``_to_sharded_jax`` reshards a
+# prior-step ``device_state`` output that spans non-addressable devices to the
+# input's target sharding via a jitted identity; a fresh ``lambda`` per call
+# would force a NEW jit trace+compile for every FSDP weight every step (~180
+# recompiles/step on a 60-layer Gemma -> ~37s/step of pure compile). The target
+# ``NamedSharding`` is hashable and there are only a handful of distinct ones
+# (fsdp-1d, fsdp-2d, batch, replicated), so cache + reuse across steps/shapes.
+_RESHARD_JIT_CACHE: dict[Any, Any] = {}
+
+
+def _cached_reshard(target: Any) -> Any:
+    fn = _RESHARD_JIT_CACHE.get(target)
+    if fn is None:
+        fn = jax.jit(lambda x: x, out_shardings=target)
+        _RESHARD_JIT_CACHE[target] = fn
+    return fn
+
+
 @contextlib.contextmanager
 def aot_topology(topology_desc: Any) -> Generator[None, None, None]:
     """Override device discovery to a virtual topology for AOT prebuild.
@@ -529,13 +547,23 @@ class _XLAModule(torch.nn.Module):
             # as-is, avoiding a host round-trip on every step.
             if tensor.sharding == target:
                 return tensor
-            # Needs resharding: bring to host and fall through to the unified
-            # construction below (replicated / batch / FSDP, identical to the
-            # torch path). NB a plain jax.device_put(tensor, target) fails on a
-            # multi-process mesh ("CopyArrays only supports destination device
-            # list of the same size as the array device lists") -- a single-
-            # device array can't be copied straight onto the global mesh; the
-            # local-buffer assembly below is the multi-process-safe path.
+            # A device_state entry from a PRIOR step's output that already spans
+            # the mesh across processes (not fully addressable) can't be
+            # host-fetched -- ``jax.device_get`` raises "Fetching value for
+            # jax.Array that spans non-addressable devices". This is the
+            # shard_map multi-process feedback case: the updated FSDP weight
+            # comes back Shard(0)-over-N but with a sharding object that != the
+            # target NamedSharding, so the fast path above misses. Reshard
+            # on-device via a jitted identity (multi-process safe, no host
+            # round-trip) instead of falling through to the host-buffer assembly.
+            if not tensor.is_fully_addressable:
+                return _cached_reshard(target)(tensor)
+            # Fully-addressable (single-device / single-process) array: bring to
+            # host and fall through to the unified construction below. NB a plain
+            # jax.device_put(tensor, target) fails here ("CopyArrays only
+            # supports destination device list of the same size ...") -- a
+            # single-device array can't be copied straight onto the global mesh;
+            # the local-buffer assembly below is the multi-process-safe path.
             nparray = np.asarray(jax.device_get(tensor))
         else:
             # Meta FSDP weights have no host data; materialize each shard
@@ -733,7 +761,17 @@ class _XLAModule(torch.nn.Module):
             # pyrefly: ignore [unexpected-keyword]
             check_vma=False,
         )
-        jitted: Any = jax.jit(sharded_fn)
+        # Pin the output layouts to the SAME NamedShardings the next step's
+        # _to_sharded_jax expects as input targets. Without this the shard_map
+        # (manual-mode, check_vma=False) outputs carry a sharding object that !=
+        # the target NamedSharding, so every device_state feedback misses the
+        # `tensor.sharding == target` fast path and reshards each of the ~180
+        # FSDP weights every step. With it the outputs already match -> zero
+        # per-step reshard (the multi-process feedback loop is a no-op copy).
+        out_shardings = out_treedef.unflatten(
+            [NamedSharding(mesh, spec) for spec in out_spec_list]
+        )
+        jitted: Any = jax.jit(sharded_fn, out_shardings=out_shardings)
         example_global_args = tuple(
             self._to_sharded_jax(
                 a, mesh, is_batch_input=is_batch[j], is_fsdp_weight=is_fsdp[j]
