@@ -1,0 +1,133 @@
+# RankFM-MVAI (xsurface V3, mvai_cloud RecTrainer) ONE-SHARD TPU run -- the
+# matched-config TPU half of the CPU-eager-vs-TPU parity comparison.
+#
+# Identical model/optimizer/data/metric config to rankfm_mvai-128chip.yaml, but
+# on a SINGLE 4-chip tpu7x host (1 pod == 1 gloo rank == 1 data shard). With
+# parallelism=1, JOB_COMPLETION_INDEX=0 so this pod reads rank_0_batch_1 -- the
+# SAME single shard the CPU-eager run (rankfm_mvai-eager-1shard.yaml) consumes.
+# GSPMD replicates the dense graph across the host's 8 jax devices (numerically
+# equivalent to one device); embeddings use the host DMP-FUSED Adagrad backend
+# (--embedding_backend cpu, world=1 -> whole table). So vs the CPU-eager run the
+# ONLY differences are the dense device + the recir/XLA compile -- everything
+# else (AdamW, FUSED Adagrad embeddings, the rank_0 data, the torchrec NE/CTR/MSE
+# metrics, 5000 steps) is identical.
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  generateName: rankfm-mvai-1shard-
+  namespace: ns-mrs-core-shared
+spec:
+  replicatedJobs:
+  - name: worker
+    replicas: 1
+    template:
+      spec:
+        parallelism: 1
+        completions: 1
+        completionMode: Indexed
+        backoffLimit: 0
+        template:
+          metadata:
+            annotations:
+              # Inject the gcsfuse CSI sidecar for the tb-gcs volume below.
+              gke-gcsfuse/volumes: "true"
+          spec:
+            serviceAccountName: default
+            containers:
+            - name: rankfm-mvai
+              image: us-central1-docker.pkg.dev/mrs-tpu-y317h/recml/rankfm_mvai_tpu:latest
+              imagePullPolicy: Always
+              env:
+              - name: PYTHONUNBUFFERED
+                value: "1"
+              # Single 4-chip pod: skip jax.distributed.initialize() (multi-process
+              # coordination only); jax auto-detects the 4 local chips. Avoids the
+              # single-pod mis-init that breaks the eager get_override forward.
+              - name: RANKFM_SINGLE_HOST
+                value: "1"
+              - name: MASTER_PORT
+                value: "29500"
+              - name: JOBSET_NAME
+                valueFrom:
+                  fieldRef:
+                    fieldPath: metadata.labels['jobset.sigs.k8s.io/jobset-name']
+              # MVAI_JOB_NAME MUST equal JOBSET_NAME: the mvai TensorboardLogger
+              # writes events to /mnt/gcs/mvai_cloud/tensorboard/${MVAI_JOB_NAME}
+              # (defaulting to "default" when unset), and the post-run cp below
+              # copies from .../tensorboard/${JOBSET_NAME}. If they differ, the
+              # cp finds nothing and the GCS TensorBoard is empty.
+              - name: MVAI_JOB_NAME
+                valueFrom:
+                  fieldRef:
+                    fieldPath: metadata.labels['jobset.sigs.k8s.io/jobset-name']
+              - name: MAST_HPC_JOB_NAME
+                valueFrom:
+                  fieldRef:
+                    fieldPath: metadata.labels['jobset.sigs.k8s.io/jobset-name']
+              command:
+              - sh
+              - -c
+              # Single pod -> RANK=0 -> reads rank_0_batch_1 (one shard). Same
+              # --data_file_template as the 128-chip run so the data path is
+              # byte-identical; here it just resolves to rank_0.
+              - >-
+                RANK=${JOB_COMPLETION_INDEX:-0} ;
+                FIRST_FILE=rank_${RANK}_batch_1.pt.zst ;
+                echo "Pod $RANK waiting for /mnt/gcs-out/rankfm_1shard_data/$FIRST_FILE as mount-ready probe..." ;
+                START=$(date +%s) ;
+                while [ ! -e /mnt/gcs-out/rankfm_1shard_data/$FIRST_FILE ]; do
+                  sleep 5 ;
+                done ;
+                echo "data mount ready (after $(($(date +%s) - START))s); starting trainer..." ;
+                python3 -u -m recir.examples.rankfm_mvai.train
+                --max_steps 5000
+                --local_batch_size 32
+                --num_candidates 32
+                --hash_size_cap 1000000
+                --l1_num_layers 3
+                --l2_num_layers 11
+                --embedding_backend cpu
+                --gcs_data_path /mnt/gcs-out/rankfm_1shard_data
+                --data_file_template "rank_${RANK}_batch_{i}.pt.zst"
+                --data_replicate_across_ranks
+                --profile_start_step 3
+                --profile_end_step 8
+                --profile_dir "gs://cq-mrs-core-shared_mrs_tpu_y317h/tpu-profiles/${JOBSET_NAME}" ;
+                rc=$? ;
+                if [ "${RANK}" = "0" ]; then echo "Copying TensorBoard events -> gs://cq-mrs-core-shared_mrs_tpu_y317h/tensorboard/${JOBSET_NAME} ..." ; mkdir -p /mnt/gcs-out/tensorboard/${JOBSET_NAME} ; cp /mnt/gcs/mvai_cloud/tensorboard/${JOBSET_NAME}/* /mnt/gcs-out/tensorboard/${JOBSET_NAME}/ || true ; fi ;
+                exit $rc
+              ports:
+              - containerPort: 8471
+              resources:
+                limits:
+                  google.com/tpu: 4
+              volumeMounts:
+              # Data + TB-out share the one gcsfuse mount of the shared bucket:
+              # data is read from /mnt/gcs-out/rankfm_1shard_data, TB events are
+              # copied to /mnt/gcs-out/tensorboard/<jobset> after the run.
+              - name: tensorboard
+                mountPath: /mnt/gcs/mvai_cloud
+              - name: tb-gcs
+                mountPath: /mnt/gcs-out
+            # Direct scheduling on an EXISTING free 4-chip (2x2x1) tpu7x node --
+            # the gke-accelerator-count selector targets standing nodes instead
+            # of triggering the PROVISION_ONLY auto-slice path. Mirrors the
+            # proven rankfm-cpu-eager-4chip scheduling on this cluster.
+            nodeSelector:
+              cloud.google.com/gke-tpu-accelerator: tpu7x
+              cloud.google.com/gke-tpu-topology: "2x2x1"
+              cloud.google.com/gke-accelerator-count: "4"
+            tolerations:
+            - key: "google.com/tpu"
+              operator: "Exists"
+              effect: "NoSchedule"
+            restartPolicy: Never
+            volumes:
+            - name: tensorboard
+              emptyDir: {}
+            - name: tb-gcs
+              csi:
+                driver: gcsfuse.csi.storage.gke.io
+                volumeAttributes:
+                  bucketName: cq-mrs-core-shared_mrs_tpu_y317h
+                  mountOptions: "implicit-dirs"

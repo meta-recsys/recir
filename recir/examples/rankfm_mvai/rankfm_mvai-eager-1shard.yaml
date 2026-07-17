@@ -1,0 +1,132 @@
+# RankFM-MVAI (xsurface V3) CPU-EAGER ONE-SHARD run -- the matched-config CPU
+# half of the CPU-eager-vs-TPU parity comparison (pairs with
+# rankfm_mvai-1shard.yaml).
+#
+# Runs recir.examples.rankfm_mvai.train_cpu_eager: the SAME model + AdamW dense
+# opt + DMP-FUSED Adagrad embeddings + torchrec NE/CTR/MSE metrics + rank_0 data
+# + 5000 steps as the TPU run, but trained EAGERLY on the host CPU (no recir/XLA
+# compile, no TPU). JAX_PLATFORMS=cpu keeps the incidental jax.device_count() in
+# the model build on CPU; the recir compile path is never entered.
+#
+# Scheduling note: this cluster has only tpu7x node pools (no CPU pool), so the
+# pod lands on a 4-chip tpu7x node and uses its HOST CPU. The 4 TPU chips sit
+# idle for the duration -- honest low utilization for a one-off parity run, NOT a
+# utilization-inflation mechanism. WORLD_SIZE=1 -> single gloo rank -> DMP world=1
+# (whole embedding table on this host), matching the 1-shard TPU run.
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  generateName: rankfm-mvai-eager-1shard-
+  namespace: ns-mrs-core-shared
+spec:
+  replicatedJobs:
+  - name: worker
+    replicas: 1
+    template:
+      spec:
+        parallelism: 1
+        completions: 1
+        completionMode: Indexed
+        backoffLimit: 0
+        template:
+          metadata:
+            annotations:
+              gke-gcsfuse/volumes: "true"
+          spec:
+            serviceAccountName: default
+            containers:
+            - name: rankfm-mvai
+              image: us-central1-docker.pkg.dev/mrs-tpu-y317h/recml/rankfm_mvai_tpu:latest
+              imagePullPolicy: Always
+              env:
+              - name: PYTHONUNBUFFERED
+                value: "1"
+              # Force JAX onto CPU (no TPU); the eager path never compiles, so
+              # libtpu/PJRT are never touched.
+              - name: JAX_PLATFORMS
+                value: "cpu"
+              # Single gloo rank: the eager build needs an initialized gloo PG so
+              # CPURankFMBackend.setup takes the DMP+FUSED Adagrad path (matching
+              # the TPU run) rather than the plain-nn.Embedding single-node path.
+              - name: RANK
+                value: "0"
+              - name: WORLD_SIZE
+                value: "1"
+              - name: MASTER_ADDR
+                value: "127.0.0.1"
+              - name: MASTER_PORT
+                value: "29500"
+              - name: JOBSET_NAME
+                valueFrom:
+                  fieldRef:
+                    fieldPath: metadata.labels['jobset.sigs.k8s.io/jobset-name']
+              # MVAI_JOB_NAME MUST equal JOBSET_NAME: the mvai TensorboardLogger
+              # writes events to /mnt/gcs/mvai_cloud/tensorboard/${MVAI_JOB_NAME}
+              # (defaulting to "default" when unset), and the post-run cp below
+              # copies from .../tensorboard/${JOBSET_NAME}. If they differ, the
+              # cp finds nothing and the GCS TensorBoard is empty.
+              - name: MVAI_JOB_NAME
+                valueFrom:
+                  fieldRef:
+                    fieldPath: metadata.labels['jobset.sigs.k8s.io/jobset-name']
+              - name: MAST_HPC_JOB_NAME
+                valueFrom:
+                  fieldRef:
+                    fieldPath: metadata.labels['jobset.sigs.k8s.io/jobset-name']
+              command:
+              - sh
+              - -c
+              - >-
+                RANK=0 ;
+                FIRST_FILE=rank_${RANK}_batch_1.pt.zst ;
+                echo "Pod $RANK waiting for /mnt/gcs-out/rankfm_1shard_data/$FIRST_FILE as mount-ready probe..." ;
+                START=$(date +%s) ;
+                while [ ! -e /mnt/gcs-out/rankfm_1shard_data/$FIRST_FILE ]; do
+                  sleep 5 ;
+                done ;
+                echo "data mount ready (after $(($(date +%s) - START))s); starting CPU-eager trainer..." ;
+                python3 -u -m recir.examples.rankfm_mvai.train_cpu_eager
+                --max_steps 5000
+                --local_batch_size 32
+                --num_candidates 32
+                --hash_size_cap 1000000
+                --l1_num_layers 3
+                --l2_num_layers 11
+                --embedding_backend cpu
+                --gcs_data_path /mnt/gcs-out/rankfm_1shard_data
+                --data_file_template "rank_${RANK}_batch_{i}.pt.zst"
+                --data_replicate_across_ranks ;
+                rc=$? ;
+                echo "Copying TensorBoard events -> gs://cq-mrs-core-shared_mrs_tpu_y317h/tensorboard/${JOBSET_NAME} ..." ; mkdir -p /mnt/gcs-out/tensorboard/${JOBSET_NAME} ; cp /mnt/gcs/mvai_cloud/tensorboard/${JOBSET_NAME}/* /mnt/gcs-out/tensorboard/${JOBSET_NAME}/ || true ;
+                exit $rc
+              resources:
+                limits:
+                  google.com/tpu: 4
+              volumeMounts:
+              # Data + TB-out share the one gcsfuse mount of the shared bucket:
+              # data is read from /mnt/gcs-out/rankfm_1shard_data, TB events are
+              # copied to /mnt/gcs-out/tensorboard/<jobset> after the run.
+              - name: tensorboard
+                mountPath: /mnt/gcs/mvai_cloud
+              - name: tb-gcs
+                mountPath: /mnt/gcs-out
+            # Direct scheduling on an existing free 4-chip (2x2x1) tpu7x node
+            # (host CPU used; chips idle). Mirrors rankfm-cpu-eager-4chip.
+            nodeSelector:
+              cloud.google.com/gke-tpu-accelerator: tpu7x
+              cloud.google.com/gke-tpu-topology: "2x2x1"
+              cloud.google.com/gke-accelerator-count: "4"
+            tolerations:
+            - key: "google.com/tpu"
+              operator: "Exists"
+              effect: "NoSchedule"
+            restartPolicy: Never
+            volumes:
+            - name: tensorboard
+              emptyDir: {}
+            - name: tb-gcs
+              csi:
+                driver: gcsfuse.csi.storage.gke.io
+                volumeAttributes:
+                  bucketName: cq-mrs-core-shared_mrs_tpu_y317h
+                  mountOptions: "implicit-dirs"
