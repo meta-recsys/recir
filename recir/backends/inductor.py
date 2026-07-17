@@ -10,7 +10,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Sequence
+from typing import Any, Sequence, TYPE_CHECKING
 
 from recir.backends.base import Backend, GraphPatch
 from recir.lowering.partial_lower import partial_lower
@@ -20,6 +20,9 @@ from recir.passes import (
     schedule_comm_wait,
 )
 from torch import fx, nn
+
+if TYPE_CHECKING:
+    from recir.distributed.parallel_mode import ParallelMode
 
 
 class InductorBackend(Backend):
@@ -48,3 +51,13 @@ class InductorBackend(Backend):
 
     def dispatch(self, gm: fx.GraphModule) -> nn.Module:
         return partial_lower(gm)
+
+    def validate_with(self, parallel_mode: "ParallelMode") -> None:
+        from recir.distributed.parallel_mode import GSPMDParallel
+
+        if isinstance(parallel_mode, GSPMDParallel):
+            raise ValueError(
+                "InductorBackend is incompatible with GSPMDParallel (GSPMD is an "
+                "XLA-SPMD feature with no CUDA/Inductor equivalent); use "
+                "DataParallel/HybridParallel, or XLAGSPMDBackend on XLA."
+            )

@@ -82,6 +82,20 @@ class InductorBackendTest(unittest.TestCase):
             with self.assertRaises(NotImplementedError):
                 backend.serialize_artifact(None, tmp_dir)  # pyre-ignore[6]
 
+    def test_inductor_validate_with_gspmd_raises(self) -> None:
+        """GSPMDParallel is rejected — GSPMD has no CUDA/Inductor equivalent."""
+        backend = InductorBackend()
+        mode = GSPMDParallel("replicate", num_ranks=1, num_processes=1)
+        with self.assertRaises(ValueError) as ctx:
+            backend.validate_with(mode)
+        self.assertIn("GSPMDParallel", str(ctx.exception))
+
+    def test_inductor_validate_with_data_parallel_passes(self) -> None:
+        """DataParallel is accepted — validate_with is a no-op return."""
+        backend = InductorBackend()
+        result = backend.validate_with(DataParallel("fully_shard"))
+        self.assertIsNone(result)
+
 
 class XLAGSPMDBackendTest(unittest.TestCase):
     """XLAGSPMDBackend properties + validation."""
