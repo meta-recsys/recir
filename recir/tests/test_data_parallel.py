@@ -801,6 +801,20 @@ class _WeightFreeBackend(Backend):
         return gm
 
 
+class TestDataParallelNonXLAPrecondition(unittest.TestCase):
+    """DataParallel.shard_params rejects D>1 on the non-XLA path (CPU-only)."""
+
+    def test_non_xla_d_gt_1_raises(self) -> None:
+        # Non-XLA (real DTensor) shards over process_mesh (size P) but the traced
+        # collectives all-gather over device_mesh (size N); N>P (D>1) would
+        # silently mis-shard, so shard_params must raise before doing any work.
+        mode = DataParallel("fully_shard", num_ranks=4, num_processes=1)
+        model = SimpleMLP()
+        opt = torch.optim.SGD(model.parameters(), lr=0.1, foreach=True)
+        with self.assertRaisesRegex(ValueError, "num_ranks == num_processes"):
+            mode.shard_params(model, dict(model.named_parameters()), opt)
+
+
 class TestBuildDataParallelStrategies(unittest.TestCase):
     """Unit tests for build_data_parallel_strategies edge cases."""
 

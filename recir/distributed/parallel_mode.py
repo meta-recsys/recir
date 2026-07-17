@@ -17,6 +17,7 @@ from recir.distributed.data_parallel import (
     DataParallelStyle,
     OptOrOpts,
     partition_data_parallel,
+    partition_value,
     shard_params_and_states,
     shard_params_by_plan,
 )
@@ -26,10 +27,16 @@ from recir.lowering.xla_lower import (
     _get_local_devices,
 )
 from recir.sharding_plan import EmbeddingShardingPlan
-from torch.distributed.tensor import DeviceMesh
+from torch.distributed.tensor import DeviceMesh, Shard
+from torch.distributed.tensor._dtensor_spec import DTensorSpec
 from torch.fx import GraphModule
 
 logger: logging.Logger = logging.getLogger(__name__)
+
+
+# Keep wrapped fake ProcessGroups alive: the global c10d registry holds only a
+# weak reference, so without this the wrapped PG is GC'd -> "already destroyed".
+_FAKE_PG_KEEPALIVE: dict[str, Any] = {}
 
 
 def _create_fake_mesh(
@@ -58,6 +65,78 @@ def _create_fake_mesh(
     if getattr(mesh, "_pg_registry", None) is None:
         mesh._pg_registry = {}
     mesh._pg_registry[group_name] = fake_pg  # pyre-ignore[6]
+    # DataParallel XLA (shard_map) explicit-collective path only. The traced
+    # body inserts FSDP collectives via DTensor.redistribute (Shard(0)->Replicate
+    # for weights, Partial->Shard(0) for grads); those _c10d_functional.* ops
+    # resolve their group name through the GLOBAL c10d process_registry, NOT
+    # mesh._pg_registry. Two things this comment answers:
+    #
+    #  * Why register a group at all, and why only now: earlier XLA sharding used
+    #    GSPMD (fake_gspmd_*), which auto-partitions via XLA-SPMD and never emits
+    #    DTensor functional collectives, so no group name ever had to resolve;
+    #    GPU DataParallel had a real PG from init_process_group. This is the
+    #    first path that runs DTensor.redistribute with NO real dist init (TPU
+    #    trace time), so the group name would resolve to nothing -> we register a
+    #    fake PG. (DTensor is also used elsewhere for pure sharding *specs*, e.g.
+    #    partition_value/DTensorSpec, which is spec math and needs no live group;
+    #    it's specifically redistribute-driven collective *insertion* that's new.)
+    #
+    #  * Why a NEW ProcessGroup instead of `fake_pg`: `fake_pg` above
+    #    (FakeProcessGroup._create_internal) is a c10d *Backend*, not a
+    #    ProcessGroup -- note it is passed as the backend arg to
+    #    _register_backend below. _register_process_group() and the DTensor
+    #    collective resolver both require a ProcessGroup (the object that exposes
+    #    allgather/reduce_scatter and dispatches down to a backend), so a bare
+    #    Backend can't be registered or called as one. The mesh was built with
+    #    _init_backend=False (no PG of its own), so there's nothing to reuse:
+    #    construct a minimal real ProcessGroup and attach `fake_pg` as its
+    #    per-device CUSTOM backend. At runtime the collectives are executed by the
+    #    shard_map lowering (jax all_gather / psum_scatter over "torch_dist");
+    #    this PG is only the trace-time name-resolution target, hence FakeStore.
+    #
+    # GSPMD (fake_gspmd_*) -> skip, preserving its bare fake-mesh behavior.
+    if group_name.startswith("fake_recir"):
+        try:
+            import torch.distributed.distributed_c10d as _c10d
+            from torch._C._distributed_c10d import ProcessGroup
+            from torch.testing._internal.distributed.fake_pg import FakeStore
+
+            try:
+                existing = _c10d._resolve_process_group(group_name)  # pyre-ignore[6]
+            except Exception:
+                existing = None
+            if existing is not None and existing.size() == size:
+                # Idempotent: a prior trace of the same mesh already registered
+                # this group; re-registering the same name would collide.
+                _FAKE_PG_KEEPALIVE[group_name] = existing
+            else:
+                if existing is not None:
+                    # A group under this name exists with a DIFFERENT size (a
+                    # prior trace used a different mesh, e.g. across tests). Drop
+                    # it first; otherwise _register_process_group collides on the
+                    # name, the error is swallowed below, and the stale wrong-size
+                    # group keeps resolving for DTensor functional collectives.
+                    unregister = getattr(_c10d, "_unregister_process_group", None)
+                    if unregister is not None:
+                        unregister(group_name)  # pyre-ignore[6]
+                wrapped = ProcessGroup(FakeStore(), 0, size)
+                wrapped._register_backend(
+                    torch.device(device_type),
+                    ProcessGroup.BackendType.CUSTOM,
+                    fake_pg,
+                )
+                _c10d._register_process_group(group_name, wrapped)  # pyre-ignore[6]
+                _FAKE_PG_KEEPALIVE[group_name] = wrapped
+        except (ImportError, AttributeError, RuntimeError):
+            # Best-effort: older torch may lack these c10d internals, or the
+            # group may already be registered. The DTensor collective path then
+            # falls back to mesh._pg_registry; log so a genuine registration
+            # failure is visible instead of silently mis-routing collectives.
+            logger.exception(
+                "recir: failed to register wrapped ProcessGroup %r for fake "
+                "mesh; DTensor functional collectives may not resolve this group",
+                group_name,
+            )
     return mesh
 
 
@@ -455,13 +534,63 @@ class DataParallel(ParallelMode):
         params_and_buffers: Dict[str, Any],
         opt: OptOrOpts,
     ) -> Set[str]:
+        # Non-XLA (real DTensor) shards over process_mesh (size P) but the traced
+        # collectives all-gather over device_mesh (size N); the two meshes must
+        # match, so require one device per process (D=1, i.e. N==P). D>1 here
+        # would shard /P while the model spans N>P devices -> silent mis-shard.
+        if not self._is_xla_backend and self.num_ranks != self.num_processes:
+            raise ValueError(
+                "Non-XLA DataParallel requires num_ranks == num_processes "
+                f"(one device per process, D=1); got num_ranks={self.num_ranks} "
+                f"!= num_processes={self.num_processes}. Multi-device-per-process "
+                "(D>1) FSDP is only supported on the XLA shard_map path."
+            )
+        # XLA path shards /N over device_mesh but capture_fsdp_process_store later
+        # snapshots the /P store via num_chunks=num_processes; both require
+        # num_ranks to be an exact multiple of num_processes (D devices/process),
+        # else the /P split produces silently unequal shards.
+        if self._is_xla_backend and self.num_ranks % self.num_processes != 0:
+            raise ValueError(
+                "XLA DataParallel requires num_ranks % num_processes == 0 "
+                f"(D devices/process); got num_ranks={self.num_ranks}, "
+                f"num_processes={self.num_processes}."
+            )
+        # For the XLA path, shard over the SAME mesh that collectives_insertion
+        # all-gathers over (device_mesh, size num_ranks=N). Sharding over
+        # process_mesh (size num_processes=P) traces a /P weight that the N-way
+        # all-gather over-expands to dim0/P*N whenever N>P (TPU: D devices/proc).
+        # GPU is unaffected (N==P). Non-XLA keeps process_mesh.
+        shard_mesh = self.device_mesh if self._is_xla_backend else self.process_mesh
         return shard_params_and_states(
             model,
             params_and_buffers,
             opt,
-            self.process_mesh,
+            shard_mesh,
             self.parallel_style,
         )
+
+    def capture_fsdp_proc_store(
+        self, params_and_buffers: Dict[str, Any]
+    ) -> Optional[Dict[str, Any]]:
+        """Snapshot the per-process (/P) FSDP shard from the FULL pre-shard params.
+
+        ``shard_params`` shards the module over ``device_mesh`` (size N) so
+        make_fx traces a /N per-device weight (the shape the baked N-way
+        all-gather consumes). But that store keeps only rank-0's /N slice,
+        dropping the other D-1 device shards; the runtime ``flat_state`` needs
+        the /P per-process shard instead (full when ``num_processes == 1``),
+        which ``_to_sharded_jax`` re-splits into D device buffers. Capture that
+        /P store here from the full params BEFORE ``shard_params`` mutates them;
+        :func:`compile_from_gm` overwrites ``flat_state`` with it. Returns None
+        for non-XLA / non-FULLY_SHARD (where module==flat_state store is fine).
+        """
+        if not (
+            self._is_xla_backend
+            and self.parallel_style == DataParallelStyle.FULLY_SHARD
+        ):
+            return None
+        spec = DTensorSpec(mesh=self.process_mesh, placements=(Shard(0),))
+        return {k: partition_value(v, spec) for k, v in params_and_buffers.items()}
 
     def partition(
         self,
