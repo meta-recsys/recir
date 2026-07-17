@@ -1271,6 +1271,13 @@ def compile_from_gm(  # noqa: C901 — orchestration: stages 4-8 of the pipeline
         params_and_buffers: Dict[str, Any] = {**ctx.params, **ctx.buffers}
         named_states: Dict[str, Any] = ctx.named_states
 
+        # Let the parallel mode stamp any state-layout meta it produced during
+        # ``shard_params`` onto the graph and substitute its canonical host store
+        # into ``params_and_buffers`` / ``named_states`` (both rebuilt into
+        # ``flat_state`` below). No-op for modes that produce no layout; keeps
+        # this stage layout-agnostic.
+        parallel_mode.apply_state_layout(gm, params_and_buffers, named_states)
+
         # HybridParallel: pattern-match aten.embedding nodes on sharded
         # embedding params and replace with decomposed AllToAll ops via
         # secondary symbolic trace.  Identifies sharded weight
