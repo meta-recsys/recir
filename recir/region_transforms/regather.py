@@ -11,7 +11,7 @@
 from __future__ import annotations
 
 from collections import OrderedDict
-from typing import Any, Callable, Optional, Set
+from typing import Any, Callable, Optional, Sequence, Set
 
 import torch
 import torch.fx as fx
@@ -20,6 +20,7 @@ import torch.utils._pytree as pytree
 from recir.graph_utils import OP
 from recir.region_transforms.base import RegionTransform
 from recir.region_transforms.core import _extract_subgraph, _replace_region
+from recir.region_transforms.recompute import RecomputeTransform
 
 
 def _collect_chain_regions(
@@ -103,6 +104,34 @@ class RegatherTransform(RegionTransform):
 
     def __init__(self, skip_param_fqns: Optional[Set[str]] = None) -> None:
         self.skip_param_fqns: Set[str] = skip_param_fqns or set()
+
+    @staticmethod
+    def skip_fqns_for_recompute(
+        mod: nn.Module,
+        region_transforms: Sequence[RegionTransform],
+        base_skip: Optional[Set[str]] = None,
+    ) -> Set[str]:
+        """Params to exclude from per-op regather: the caller base (e.g. embedding
+        params owned by the row-wise rewrite) plus any param already covered by a
+        RecomputeTransform. That per-layer checkpoint already re-runs the covered
+        layer's forward -- including the weight all-gather -- in the backward, so
+        nesting a per-op regather inside it would gather the weight a redundant
+        3rd time (fwd + layer-recompute + regather-recompute). Skipping keeps 2
+        gathers/weight (fwd + one shared backward recompute), matching JAX, at no
+        extra memory (the enclosing recompute already frees the forward gather)."""
+        skip: Set[str] = set(base_skip or ())
+        recompute = [t for t in region_transforms if isinstance(t, RecomputeTransform)]
+        if recompute:
+            all_fqns = [fqn for fqn, _ in mod.named_parameters(remove_duplicate=False)]
+            for rt in recompute:
+                skip |= {
+                    fqn
+                    for fqn in all_fqns
+                    if any(
+                        fqn == s or fqn.startswith(s + ".") for s in rt.submodule_fqns
+                    )
+                }
+        return skip
 
     def transform_graph(
         self,

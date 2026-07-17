@@ -986,8 +986,14 @@ def trace(  # noqa: C901 — orchestration: dispatches on parallel_mode flavor (
         # them.
         dp_transforms: list[RegionTransform] = []
         if dp_style == DataParallelStyle.FULLY_SHARD:
+            # Per-op regather skips embedding params (owned by the row-wise
+            # rewrite) and any param already covered by a RecomputeTransform;
+            # RegatherTransform owns that policy (keeps api.py transform-blind).
+            regather_skip = RegatherTransform.skip_fqns_for_recompute(
+                _mod, region_transforms_list, base_skip=embedding_param_fqns
+            )
             dp_transforms.append(
-                RegatherTransform(skip_param_fqns=embedding_param_fqns)
+                RegatherTransform(skip_param_fqns=regather_skip or None)
             )
         if region_transforms_list:
             dp_transforms.extend(region_transforms_list)
