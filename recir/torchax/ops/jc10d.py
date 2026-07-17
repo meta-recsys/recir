@@ -30,7 +30,30 @@ from recir.torchax.ops.decorators import op
 
 @op(torch.ops._c10d_functional.all_gather_into_tensor)  # pyre-ignore[56]
 def _c10d_all_gather(input: Any, group_size: int, group_name: str) -> Any:
-    return jax.lax.all_gather(input, "torch_dist")
+    # tiled=True concatenates the shards along dim 0 -> [group_size*k, ...],
+    # matching torch all_gather_into_tensor semantics (FSDP Shard(0)->Replicate
+    # uses gather_dim=0 with no follow-up reshape). tiled=False would prepend a
+    # stacked [group_size, k, ...] axis and break the consuming matmul.
+    return jax.lax.all_gather(input, "torch_dist", tiled=True)
+
+
+@op(torch.ops._c10d_functional.reduce_scatter_tensor)  # pyre-ignore[56]
+def _c10d_reduce_scatter(
+    input: Any, reduceOp: str, group_size: int, group_name: str
+) -> Any:
+    # FSDP grad Partial(reduce)->Shard(0): reduce across "torch_dist" AND scatter
+    # along dim 0. tiled=True divides dim 0 by group_size and keeps rank, matching
+    # torch reduce_scatter_tensor ([N,...]->[N/group_size,...]). psum_scatter only
+    # sums, so divide by group_size for the "avg" (DDP-style) reduction.
+    res = jax.lax.psum_scatter(input, "torch_dist", scatter_dimension=0, tiled=True)
+    if reduceOp == "avg":
+        res = res / group_size
+    elif reduceOp != "sum":
+        raise RuntimeError(
+            f"reduce_scatter reduceOp {reduceOp!r} not supported "
+            "(only 'sum'/'avg'; psum_scatter reduces by sum)"
+        )
+    return res
 
 
 @op(torch.ops._c10d_functional.all_reduce)  # pyre-ignore[56]
