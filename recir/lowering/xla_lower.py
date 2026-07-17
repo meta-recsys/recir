@@ -20,6 +20,7 @@ import torch
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from recir.backend import BackendType
 from recir.batch_dim_propagation import propagate_batch_input_meta
+from recir.distributed.sharding_spec import get_state_layout
 from recir.lowering.lowering_utils import segment_and_lower
 from recir.lowering.op_swap import OpSwapRegistry, swap_ops
 from recir.torchax.ops.mappings import t2j
@@ -654,9 +655,76 @@ class _XLAModule(torch.nn.Module):
         is_batch: List[bool] = [
             n.meta.get("is_batch_input", False) for n in placeholders
         ]
-        in_specs = tuple(P("torch_dist") if b else P() for b in is_batch)
+        is_fsdp: List[bool] = [get_state_layout(n) is not None for n in placeholders]
+        # FSDP weights are fed as /N per-device shards (Shard(0)); the baked
+        # all-gather in the traced body reconstructs the full weight. Batch
+        # inputs are Shard(0) along the batch dim. Everything else replicated.
+        # Without the is_fsdp branch, weights get P() (replicated) and the
+        # body's all-gather double-expands them to N*full.
+        in_specs = tuple(
+            P("torch_dist") if (is_batch[i] or is_fsdp[i]) else P()
+            for i in range(len(placeholders))
+        )
+        # Output specs mirror ``_jit_gspmd``: FSDP-derived outputs (e.g. the
+        # updated weights, which are /N shards after the in-body reduce-scatter)
+        # are Shard(0) so shard_map concatenates the per-device pieces back into
+        # the global tensor; user (torch) outputs, scalars (e.g. a reduced loss),
+        # and replicated outputs stay P() (see the per-leaf handling below). With
+        # a blanket P() (the old behavior) an updated /N weight would be read as
+        # device-0's shard only and shrink by N every step.
         output_node = next(n for n in self.gm.graph.nodes if n.op == "output")
-        out_specs = jax.tree.map(lambda _: P(), output_node.args[0])
+        torch_indices: set[int] = self.torch_output_indices or set()
+        out_leaves, out_treedef = jax.tree.flatten(output_node.args[0])
+        placeholder_indices = {n: k for k, n in enumerate(placeholders)}
+
+        def _leaf_ndim(node: Any) -> int:
+            val = (
+                node.meta.get("val", None) if isinstance(node, torch.fx.Node) else None
+            )
+            return val.ndim if hasattr(val, "ndim") else 0
+
+        out_spec_list: List[Any] = []
+        for i, leaf in enumerate(out_leaves):
+            # User (torch) outputs keep the historical replicated spec — the
+            # only NEW behavior is Shard(0) for FSDP-weight outputs (the
+            # updated /N shards after the in-body reduce-scatter). This keeps
+            # the non-FSDP (replicate) path byte-identical to the old all-P().
+            if i in torch_indices:
+                out_spec_list.append(P())
+                continue
+            ndim = _leaf_ndim(leaf)
+            out_val = (
+                leaf.meta.get("val", None) if isinstance(leaf, torch.fx.Node) else None
+            )
+            out_shape = (
+                tuple(out_val.shape)
+                if out_val is not None and hasattr(out_val, "shape")
+                else None
+            )
+            fsdp_src = (
+                self._find_fsdp_source(leaf, placeholder_indices, is_fsdp, out_shape)
+                if isinstance(leaf, torch.fx.Node)
+                else None
+            )
+            if fsdp_src is not None and ndim >= 1:
+                out_spec_list.append(P("torch_dist", *([None] * (ndim - 1))))
+            elif fsdp_src is not None:
+                # An FSDP-derived output with no usable ndim meta is an
+                # unexpected meta-propagation gap. User (torch) outputs are
+                # already handled above, so this leaf is a carried weight /
+                # optimizer state whose /N Shard(0) out-spec we cannot build. A
+                # replicated P() fallback would read only device-0's shard and
+                # shrink the updated weight by mesh size every step, so fail
+                # loudly instead of silently mis-sharding.
+                raise RuntimeError(
+                    "recir shard_map: FSDP output leaf "
+                    f"{getattr(leaf, 'name', leaf)!r} traces to an FSDP source "
+                    f"placeholder (#{fsdp_src}) but has no usable ndim meta "
+                    f"(ndim={ndim}); cannot build its Shard(0) out-spec."
+                )
+            else:
+                out_spec_list.append(P())
+        out_specs = out_treedef.unflatten(out_spec_list)
         sharded_fn = shard_map(  # pyre-fixme[28]
             jax_fn,
             mesh=mesh,
@@ -667,7 +735,9 @@ class _XLAModule(torch.nn.Module):
         )
         jitted: Any = jax.jit(sharded_fn)
         example_global_args = tuple(
-            self._to_sharded_jax(a, mesh, is_batch_input=is_batch[j])
+            self._to_sharded_jax(
+                a, mesh, is_batch_input=is_batch[j], is_fsdp_weight=is_fsdp[j]
+            )
             for j, a in enumerate(args)
         )
         # Annotate to silence pyre [53] on the ``lowered`` capture below;
@@ -684,7 +754,9 @@ class _XLAModule(torch.nn.Module):
                     self._jax_compiled = lowered.compile()
                 return []
             global_args = tuple(
-                self._to_sharded_jax(a, mesh, is_batch_input=is_batch[j])
+                self._to_sharded_jax(
+                    a, mesh, is_batch_input=is_batch[j], is_fsdp_weight=is_fsdp[j]
+                )
                 for j, a in enumerate(run_args)
             )
             # Prefer an AOT-installed or already-built executable so we
