@@ -26,7 +26,7 @@ import functools
 import math
 import sys
 from collections.abc import Sequence
-from typing import Any
+from typing import Any, Callable
 
 import jax
 import numpy as np
@@ -41,6 +41,31 @@ from recir.torchax.view import View
 # Keys are OpOverload, value is a callable that takes
 # Tensor
 all_ops: dict[Any, Any] = {}
+
+
+def op_if_present(
+    *names: str, **kwargs: Any
+) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+    """Like @op but resolves aten ops by name and skips any absent from the
+    linked torch build.
+
+    Some deprecated ATen ops (e.g. aten.cholesky, removed in favor of
+    aten.linalg_cholesky) no longer exist in newer PyTorch builds; referencing
+    them via torch.ops.aten.<name> raises AttributeError at import time. This
+    guard registers only the ops that exist and is a no-op when none do.
+    """
+    targets: list[Any] = []
+    for name in names:
+        target = getattr(torch.ops.aten, name, None)
+        if target is not None:
+            targets.append(target)
+    if not targets:
+
+        def _identity(func: Callable[..., Any]) -> Callable[..., Any]:
+            return func
+
+        return _identity
+    return op(*targets, **kwargs)
 
 
 @op(  # pyre-ignore[56]
@@ -5600,7 +5625,7 @@ def _aten_log_sigmoid(x: Any) -> Any:
 
 
 # torch.qr
-@op(torch.ops.aten.qr)  # pyre-ignore[56]
+@op_if_present("qr")  # pyre-ignore[56]
 def _aten_qr(input: Any, *args: Any, **kwargs: Any) -> Any:
     jax_mode = "reduced"
     # torch bool param 'simple=True' corresponds to jax 'reduced' mode,
@@ -5738,7 +5763,7 @@ def _get_median_index(x: Any, axis: Any = None, keepdims: Any = False) -> Any:
     return median_index
 
 
-@op(torch.ops.aten.triangular_solve)  # pyre-ignore[56]
+@op_if_present("triangular_solve")  # pyre-ignore[56]
 def _aten_triangular_solve(
     b: Any,
     a: Any,

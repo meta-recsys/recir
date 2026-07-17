@@ -241,9 +241,6 @@ autocast_policy: dict[Any, CastPolicy] = {
     torch.ops.aten.fake_quantize_per_tensor_affine.default: CastPolicy.FP32,
     torch.ops.aten.geqrf.default: CastPolicy.FP32,
     torch.ops.aten._lu_with_info.default: CastPolicy.FP32,
-    torch.ops.aten.qr.default: CastPolicy.FP32,
-    torch.ops.aten.svd.default: CastPolicy.FP32,
-    torch.ops.aten.triangular_solve.default: CastPolicy.FP32,
     torch.ops.aten.fractional_max_pool2d.default: CastPolicy.FP32,
     torch.ops.aten.fractional_max_pool3d.default: CastPolicy.FP32,
     torch.ops.aten.adaptive_max_pool3d.default: CastPolicy.FP32,
@@ -260,3 +257,16 @@ autocast_policy: dict[Any, CastPolicy] = {
     torch.ops.aten.cat.default: CastPolicy.PROMOTE,
     torch.ops.aten.index_copy.default: CastPolicy.PROMOTE,
 }
+
+# torch-2.13 removed several deprecated ATen ops superseded by their linalg_*
+# equivalents (aten.qr, aten.svd, aten.triangular_solve); their eager op objects
+# no longer exist on newer builds. Register the FP32 autocast policy for them
+# only when the linked torch still provides them, so this module stays importable
+# where they are absent.
+autocast_policy.update(
+    {
+        packet.default: CastPolicy.FP32
+        for name in ("qr", "svd", "triangular_solve")
+        if (packet := getattr(torch.ops.aten, name, None)) is not None
+    }
+)
