@@ -10,13 +10,19 @@
 
 from __future__ import annotations
 
-from typing import Any, ClassVar, TYPE_CHECKING
+import functools
+from typing import Any, ClassVar, Optional, Sequence, TYPE_CHECKING
 
 from recir.backend import BackendType
-from recir.backends.base import Backend
+from recir.backends.base import Backend, GraphPatch
 from recir.lowering.device_state import DeviceStateManager
 from recir.lowering.xla_device_state import XLADeviceStateManager
 from recir.lowering.xla_lower import partial_lower_xla
+from recir.passes.fsdp_collectives import (
+    bucket_grad_reduce_scatters as _bucket_grad_reduce_scatters,
+    merge_backward_gathers as _merge_backward_gathers,
+    serialize_backward_gathers as _serialize_backward_gathers,
+)
 from torch import fx, nn
 
 if TYPE_CHECKING:
@@ -83,9 +89,63 @@ class XLAShardMapBackend(_XLABackendBase):
     Requires an explicit-collective parallel mode (DataParallel or
     HybridParallel — anything that retains the collectives in the FX graph
     instead of relying on GSPMD).
+
+    The FSDP shard_map collective optimizations in
+    :mod:`recir.passes.fsdp_collectives` are wired into stage-6
+    ``optimize_passes`` in a fixed order (merge, then bucket, then serialize).
+    The redundant-backward-gather merge is always applied (bit-exact -- it only
+    removes duplicate collective volume); reduce-scatter bucketing and all-gather
+    in-flight limiting are opt-in.
+
+    Args:
+        bucket_reduce_scatters: fuse consecutive per-weight grad reduce_scatters
+            into fewer, larger collectives.
+        max_inflight_all_gathers: cap how many backward full-weight all-gathers
+            may be in flight before forcing a wait (via an optimization barrier),
+            bounding co-resident peak. ``0`` (default) = unbounded (no limiting);
+            ``1`` = strict serial (lowest peak, least overlap); larger = more
+            compute/collective overlap at higher peak.
+        all_gather_min_gib: when ``max_inflight_all_gathers`` >= 1, only limit
+            gathers whose full weight is >= this many GiB (``0`` = all); the
+            co-held base is ~all model weights, so bounding just the largest
+            weights drops peak with far fewer barriers.
+        optimize_passes: explicit stage-6 pass sequence that fully replaces the
+            flag-derived passes above.  ``None`` (default) builds the sequence
+            from the flags (always including merge); pass an explicit list (e.g.
+            ``[]``) to fully control the passes.
+
+    The ``max_inflight_all_gathers`` / ``all_gather_min_gib`` values 2 / 0.15 are
+    the tuned optimum from the Gemma-4-31B @1536/128ch benchmark and reproduce the
+    published number.
     """
 
     _backend_type: ClassVar[BackendType] = BackendType.XLA_SHARD_MAP
+
+    def __init__(
+        self,
+        *,
+        bucket_reduce_scatters: bool = False,
+        max_inflight_all_gathers: int = 0,
+        all_gather_min_gib: float = 0.15,
+        optimize_passes: Optional[Sequence[GraphPatch]] = None,
+        **kwargs: Any,
+    ) -> None:
+        if optimize_passes is None:
+            # The redundant-backward-gather merge is bit-exact and only removes
+            # duplicate collective volume, so it is always applied.
+            passes: list[GraphPatch] = [_merge_backward_gathers]
+            if bucket_reduce_scatters:
+                passes.append(_bucket_grad_reduce_scatters)
+            if max_inflight_all_gathers >= 1:
+                passes.append(
+                    functools.partial(
+                        _serialize_backward_gathers,
+                        window=max_inflight_all_gathers,
+                        min_gib=all_gather_min_gib,
+                    )
+                )
+            optimize_passes = tuple(passes)
+        super().__init__(optimize_passes=optimize_passes, **kwargs)
 
     def validate_with(self, parallel_mode: "ParallelMode") -> None:
         from recir.distributed.parallel_mode import (
