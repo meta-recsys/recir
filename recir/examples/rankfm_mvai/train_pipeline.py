@@ -41,6 +41,7 @@ from typing import Any, cast, Dict, Iterator, List, Optional, Tuple, TYPE_CHECKI
 import jax
 import torch
 import torch.nn as nn
+from hammer.v3.models.udd_fm_v3.recir_core.trace_sample import flatten_batch
 from minimal_viable_ai.core.trainer.train_pipeline import RecTrainPipelineProvider
 
 from .xsurface_helpers import _log_hbm_memory
@@ -277,4 +278,184 @@ class RecirXLATrainPipelineProvider(
             profile_end_step=self._profile_end_step,
             profile_dir=self._profile_dir,
             enable_memory_log=self._enable_memory_log,
+        )
+
+
+class EagerCPUTrainPipeline(RankingSGDTrainPipeline):
+    """CPU-eager counterpart of RecirXLATrainPipeline (same model, no compile).
+
+    This is the matched-config reference for the TPU run: it drives the EXACT
+    same self-compiling model wrapper that RecirXLATrainPipeline does, but never
+    calls ``wrapper(batch)`` (which would lazily compile the GSPMD GM). Instead it
+    runs the wrapper's underlying raw model eagerly on CPU, so the numerics line
+    up axis-for-axis with the TPU run:
+
+      * forward/backward: ``raw_model(*flatten_batch(batch))`` then
+        ``loss.backward()`` -- the same forward the compiled GM traces.
+      * embeddings: the DMP ``EmbeddingComputeKernel.FUSED`` Adagrad fires inside
+        ``loss.backward()`` (CPURankFMBackend.setup takes the DMP+FUSED path
+        because RecTrainer initializes a gloo PG). The TPU run uses the SAME
+        host DMP-FUSED Adagrad (--embedding_backend cpu), so embeddings match.
+      * dense params: a PLAIN ``torch.optim.AdamW`` (capturable=False) with the
+        SAME params/betas/eps/weight_decay as the wrapper's ``TensorLRAdamW``.
+        TensorLRAdamW needs ``capturable=True`` for its 0-d *tensor* LR, which
+        CPU rejects ("params must be on cuda/xla/..."); a tensor LR also can't run
+        under ``capturable=False`` (``addcdiv_`` needs a scalar). The Adam UPDATE
+        MATH is identical, so we snapshot the warmup LR buffer to a Python scalar
+        each step -> byte-equivalent dense update on CPU.
+      * LR warmup + grad clip: the warmup controller mutates the SAME 0-d LR
+        buffer in place each step; we read it for the scalar LR, and replicate
+        TensorLRAdamW.step's ``clip_grad_value_`` on the dense params.
+
+    The metric path (``_update_ranking_metrics``) is reused verbatim, so the
+    reported per-task NE/CTR/MSE are the SAME torchrec metrics the TPU run emits.
+    """
+
+    def __init__(
+        self,
+        model: nn.Module,
+        optimizer: torch.optim.Optimizer,
+        device: torch.device,
+        cls_metrics: Optional[List[Any]] = None,
+        reg_metrics: Optional[List[Any]] = None,
+        step_metrics: Optional[List[Any]] = None,
+        cls_task_indices: Optional[List[int]] = None,
+        reg_task_indices: Optional[List[int]] = None,
+    ) -> None:
+        # pyre-ignore[19]: see RecirXLATrainPipeline.__init__ -- runtime-only base.
+        super().__init__(
+            model,
+            optimizer,
+            device,
+            cls_metrics=cls_metrics,
+            reg_metrics=reg_metrics,
+            step_metrics=step_metrics,
+            cls_task_indices=cls_task_indices,
+            reg_task_indices=reg_task_indices,
+        )
+        # The wrapper compiles lazily on its first __call__; we deliberately never
+        # call it. Reach through to the raw model + dense opt + warmup it built
+        # (backend.setup/DMP already applied, dense AdamW + warmup already wired).
+        # pyre-ignore[16]: wrapper attrs are dynamic.
+        self._raw_model: nn.Module = model._model
+        self._warmup: Any = model._warmup
+
+        # Rebuild the dense optimizer as a plain CPU AdamW (capturable=False,
+        # scalar LR). See the class docstring for why TensorLRAdamW's tensor-LR
+        # capturable=True path can't run on CPU. Same params + hyperparameters ->
+        # identical Adam update.
+        tensor_lr_opt: Any = model._dense_opt  # pyre-ignore[16]
+        self._dense_params: List[nn.Parameter] = [
+            p for group in tensor_lr_opt.param_groups for p in group["params"]
+        ]
+        defaults = tensor_lr_opt.defaults
+        self._dense_opt: torch.optim.Optimizer = torch.optim.AdamW(
+            self._dense_params,
+            lr=defaults["lr"],
+            betas=defaults["betas"],
+            eps=defaults["eps"],
+            weight_decay=defaults["weight_decay"],
+            amsgrad=defaults.get("amsgrad", False),
+            capturable=False,
+            # Citrine C2: multi-tensor AdamW. Same update math (parity preserved);
+            # the dense params are non-sparse (embeddings run DMP-FUSED Adagrad
+            # in-backward, handled separately).
+            foreach=True,
+        )
+        # The warmup controller mutates this 0-d buffer in place (fill_) every
+        # step; it is the SAME tensor TensorLRAdamW bound as its tensor LR. Read
+        # it each step for the current scalar LR.
+        self._lr_buffer: torch.Tensor = tensor_lr_opt.param_groups[0]["lr"]
+        # Match TensorLRAdamW.step's optional grad-value clip on the dense params.
+        self._max_grad: Optional[float] = getattr(tensor_lr_opt, "_max_grad", None)
+        self._raw_model.train(True)
+
+    def progress(
+        self, dataloader_iter: Iterator[Any]
+    ) -> Tuple[torch.Tensor, Dict[str, Any]]:
+        batch = next(dataloader_iter)
+        self._dense_opt.zero_grad(set_to_none=True)
+        # Forward + backward eagerly. loss.backward() fires the DMP-FUSED
+        # embedding Adagrad in-backward (matching the TPU run's host embeddings).
+        all_losses, named = self._raw_model(*flatten_batch(batch))
+        loss = all_losses.sum()
+        loss.backward()
+        # Dense step: clip (matching TensorLRAdamW.step) then AdamW with the
+        # CURRENT warmup LR as a scalar; then advance the warmup buffer for the
+        # next step (the wrapper's _post_step ordering: step uses current LR, then
+        # advance).
+        if self._max_grad is not None:
+            torch.nn.utils.clip_grad_value_(self._dense_params, self._max_grad)
+        lr_val = float(self._lr_buffer.item())
+        for group in self._dense_opt.param_groups:
+            group["lr"] = lr_val
+        self._dense_opt.step()
+        self._warmup.step()
+
+        ret: Dict[str, Any] = {
+            "prediction": named["prediction"].detach(),
+            "label": named["label"].detach(),
+            "weight": named["weight"].detach(),
+        }
+        self._update_ranking_metrics(ret)
+        return all_losses.detach(), ret
+
+    def on_train_end(self) -> None:
+        logger.info("EagerCPUTrainPipeline: training complete.")
+
+
+class EagerCPUTrainPipelineProvider(
+    RecTrainPipelineProvider[Any, Tuple[torch.Tensor, Dict[str, Any]]]
+):
+    """Returns the CPU-eager pipeline + the udd_fm-equivalent metric set.
+
+    Identical wiring to RecirXLATrainPipelineProvider (same metric construction
+    via mvai_cloud's RankingSGDTrainPipelineProvider); only the pipeline class
+    differs (EagerCPUTrainPipeline runs the raw model eagerly, no recir compile).
+    """
+
+    def __init__(
+        self,
+        cls_metric_defs: Optional[List[RankingMetricDef]] = None,
+        reg_metric_defs: Optional[List[RankingMetricDef]] = None,
+        cls_task_indices: Optional[List[int]] = None,
+        reg_task_indices: Optional[List[int]] = None,
+        is_variable_step: bool = True,
+        report_interval: int = 1,
+    ) -> None:
+        self._cls_task_indices = cls_task_indices
+        self._reg_task_indices = reg_task_indices
+        # Annotated Any: RankingSGDTrainPipelineProvider is a runtime-only import
+        # (stubbed Any for pyre -- see the module-level TYPE_CHECKING block).
+        # pyrefly: ignore [bad-instantiation]
+        self._metrics_provider: Any = RankingSGDTrainPipelineProvider(
+            cls_metric_defs=cls_metric_defs,
+            reg_metric_defs=reg_metric_defs,
+            cls_task_indices=cls_task_indices,
+            reg_task_indices=reg_task_indices,
+            is_variable_step=is_variable_step,
+            report_interval=report_interval,
+        )
+
+    # pyre-ignore
+    def create_train_pipeline(
+        self,
+        model: nn.Module,
+        optimizer: torch.optim.Optimizer,
+        device: Optional[torch.device] = None,
+        pg: Optional[Any] = None,
+    ) -> EagerCPUTrainPipeline:
+        cpu_device = torch.device("cpu")
+        base_pipeline = self._metrics_provider.create_train_pipeline(
+            model, optimizer, cpu_device, pg
+        )
+        return EagerCPUTrainPipeline(
+            model,
+            optimizer,
+            cpu_device,
+            cls_metrics=base_pipeline._cls_metrics,
+            reg_metrics=base_pipeline._reg_metrics,
+            step_metrics=base_pipeline._step_metrics,
+            cls_task_indices=self._cls_task_indices,
+            reg_task_indices=self._reg_task_indices,
         )
