@@ -62,6 +62,14 @@ class _PassthroughParallel(ParallelMode):
     ) -> Set[str]:
         return set()
 
+    def apply_state_layout(
+        self,
+        gm: fx.GraphModule,
+        params_and_buffers: Dict[str, Any],
+        named_states: Dict[str, Any],
+    ) -> None:
+        """No-op: this passthrough mode produces no recir_state_layout meta."""
+
     def transform_and_compile(self, gm: fx.GraphModule) -> fx.GraphModule:
         return gm
 
