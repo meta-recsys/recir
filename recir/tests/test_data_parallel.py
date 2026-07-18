@@ -958,6 +958,44 @@ class TestBuildDataParallelStrategies(unittest.TestCase):
         copy_strategy = cast(DataParallelStrategy, strategy_map[copy_node])
         self.assertEqual(copy_strategy.node_type, NodeType.PARAM)
 
+    def test_zero_dim_state_replicated_under_fully_shard(self) -> None:
+        """A 0-dim optimizer state (Adam ``step``) can't be Shard(0); under
+        FULLY_SHARD it must be replicated, while a >=1-dim state still shards."""
+        graph = fx.Graph()
+        p0 = graph.placeholder("param_0")
+        p0.meta["val"] = torch.randn(4, 4)
+        s_nd = graph.placeholder("state_nd")  # >=1-dim state (e.g. exp_avg)
+        s_nd.meta["val"] = torch.randn(4, 4)
+        s_step = graph.placeholder("state_step")  # 0-dim state (Adam step)
+        s_step.meta["val"] = torch.zeros(())
+        act = graph.placeholder("act_0")
+        act.meta["val"] = torch.randn(2, 4)
+        graph.output((p0,))
+        gm = fx.GraphModule(torch.nn.Module(), graph)
+        mesh = self._create_mock_mesh()
+        strategy_map = build_data_parallel_strategies(
+            gm,
+            num_params=1,
+            num_states=2,
+            mesh=mesh,
+            batch_dim=0,
+            parallel_mode=DataParallelStyle.FULLY_SHARD,
+        )
+
+        def _placement(node: fx.Node) -> object:
+            strat = cast(DataParallelStrategy, strategy_map[node])
+            self.assertEqual(strat.node_type, NodeType.STATE)
+            out_specs = strat.op_spec.output_specs
+            spec = out_specs[0] if isinstance(out_specs, tuple) else out_specs
+            assert spec is not None
+            return spec.placements[0]
+
+        # >=1-dim state shards on dim 0; the 0-dim step is replicated instead.
+        nd_placement = _placement(s_nd)
+        self.assertIsInstance(nd_placement, Shard)
+        self.assertEqual(cast(Shard, nd_placement).dim, 0)
+        self.assertIsInstance(_placement(s_step), Replicate)
+
     def _create_replicate_spec(self) -> DTensorSpec:
         """Create a DTensorSpec with Replicate placement for partition_value tests."""
         mesh = self._create_mock_mesh()

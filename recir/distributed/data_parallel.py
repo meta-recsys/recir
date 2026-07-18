@@ -857,8 +857,19 @@ def build_data_parallel_strategies(
                         [NodeType.PARAM], mesh, parallel_mode
                     )
                 else:
+                    # A 0-dim optimizer state (e.g. Adam ``step``) has no dim-0
+                    # to Shard(0); replicate it instead of applying the (possibly
+                    # FULLY_SHARD) parallel_mode. Mirrors the shard_map / GSPMD
+                    # producers' ndim>=1 guard; Adam-only, latent (SGD has no
+                    # such scalar state).
+                    state_val = node.meta.get("val")
+                    state_style = (
+                        DataParallelStyle.REPLICATE
+                        if isinstance(state_val, torch.Tensor) and state_val.ndim == 0
+                        else parallel_mode
+                    )
                     dp_strategy_map[node] = DataParallelStrategy.from_mesh(
-                        [NodeType.STATE], mesh, parallel_mode
+                        [NodeType.STATE], mesh, state_style
                     )
             else:
                 activation_batch_dim_size = node.meta["val"].shape[batch_dim]

@@ -1412,16 +1412,25 @@ def compile_from_gm(  # noqa: C901 — orchestration: stages 4-8 of the pipeline
     if sharded_keys:
         is_sharded: list[bool] = [key in sharded_keys for key in params_and_buffers]
         for fqn, state in named_states.items():
-            is_sharded.extend([fqn in sharded_keys] * len(state))
+            # Count TENSOR leaves only: a non-tensor state entry (e.g. a
+            # Python-int step) is baked as a constant, not lifted as a
+            # placeholder, so counting len(state) would drift the positional idx.
+            for v in state.values():
+                if isinstance(v, torch.Tensor):
+                    is_sharded.append(fqn in sharded_keys)
         tensor_idx = 0
         for node in gm.graph.nodes:
             if node.op != "placeholder":
                 continue
             val = node.meta.get("val", None)
             if isinstance(val, torch.Tensor):
-                node.meta["is_fsdp_sharded"] = (
+                sharded = (
                     is_sharded[tensor_idx] if tensor_idx < len(is_sharded) else False
                 )
+                # A 0-dim opt-state leaf (Adam ``step``) has no dim-0 to Shard(0);
+                # keep it replicated (is_fsdp_sharded=False) so the GSPMD lowering
+                # doesn't /N-shard a scalar. Mirrors the shard_map producer.
+                node.meta["is_fsdp_sharded"] = sharded and val.ndim >= 1
                 tensor_idx += 1
 
     # Stage 4 (post-partition is the legacy ordering used by
