@@ -313,15 +313,16 @@ def _compute_region_io(
         has_external_user = False
         for user in node.users:
             if isinstance(user, fx.Node) and user not in region_set:
-                # aten.detach nodes inserted by make_fx for parameter
-                # tensors are trivial pass-throughs that should not force
-                # intermediate chain nodes to become region outputs.
-                # Ignoring them prevents DTensor intermediates from being
-                # exposed as region outputs, which would cause mixed
+                # aten.detach / aten.alias nodes inserted by the tracer for
+                # parameter tensors are trivial pass-throughs that should not
+                # force intermediate chain nodes to become region outputs.
+                # (torch 2.13 functionalization emits aten.alias where older
+                # torch did not.)  Ignoring them prevents DTensor intermediates
+                # from being exposed as region outputs, which would cause mixed
                 # DTensor/Tensor errors during checkpoint backward.
-                if (
-                    user.op == "call_function"
-                    and user.target is torch.ops.aten.detach.default
+                if user.op == "call_function" and user.target in (
+                    torch.ops.aten.detach.default,
+                    torch.ops.aten.alias.default,
                 ):
                     continue
                 has_external_user = True
@@ -425,16 +426,20 @@ def _replace_region(
             )
 
     for node in reversed(sorted_region):
-        # Before erasing, remove any orphaned aten.detach users that
-        # were excluded from region outputs by _compute_region_io but
-        # still reference this node.  These are trivial pass-throughs
-        # inserted by make_fx that can be safely erased.
+        # Before erasing, remove any orphaned aten.detach / aten.alias users
+        # that were excluded from region outputs by _compute_region_io but
+        # still reference this node.  These are trivial pass-throughs inserted
+        # by the tracer (torch 2.13 emits aten.alias) that can be safely erased.
         for user in list(node.users):
             if (
                 isinstance(user, fx.Node)
                 and user not in region_nodes
                 and user.op == "call_function"
-                and user.target is torch.ops.aten.detach.default
+                and user.target
+                in (
+                    torch.ops.aten.detach.default,
+                    torch.ops.aten.alias.default,
+                )
             ):
                 user.replace_all_uses_with(node)
                 gm.graph.erase_node(user)
