@@ -3090,6 +3090,7 @@ def _aten_fill(
     x: Any,
     value: Any,
     dtype: Any = None,
+    layout: Any = None,
     pin_memory: Any = None,
     memory_format: Any = None,
     device: Any = None,
