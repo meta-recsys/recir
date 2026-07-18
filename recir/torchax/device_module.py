@@ -41,7 +41,7 @@ def get_rng_state() -> list[Any]:
     return []
 
 
-def set_rng_state(new_state: Any, device: Any) -> None:
+def set_rng_state(new_state: Any, device: Any = None) -> None:
     pass
 
 
