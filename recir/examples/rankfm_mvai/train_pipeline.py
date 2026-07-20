@@ -40,10 +40,12 @@ from typing import Any, cast, Dict, Iterator, List, Optional, Tuple, TYPE_CHECKI
 
 import jax
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 from hammer.v3.models.udd_fm_v3.recir_core.trace_sample import flatten_batch
 from minimal_viable_ai.core.trainer.train_pipeline import RecTrainPipelineProvider
 
+from .loss_metric import WindowLoss
 from .xsurface_helpers import _log_hbm_memory
 
 # minimal_viable_ai is provided at RUNTIME via the Docker image (Dockerfile
@@ -65,6 +67,56 @@ else:
     )
 
 logger: logging.Logger = logging.getLogger(__name__)
+
+
+def _build_loss_metric(*metric_lists: Any) -> WindowLoss:
+    """Build a WindowLoss whose rank + report cadence match the sibling metrics
+    (so the loss scalar is written at the same interval as NE/CTR/MSE)."""
+    rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
+    # First sibling metric (across lists, in order) with a report interval; the
+    # `is not None` check keeps interval==1 a valid hit so selection is
+    # deterministic regardless of which list is scanned first.
+    report_interval = 1
+    for lst in metric_lists:
+        for m in lst or []:
+            ri = getattr(m, "_report_interval", None)
+            if ri is not None:
+                report_interval = int(ri)
+                break
+        else:
+            continue
+        break
+    return WindowLoss(rank=rank, report_interval=report_interval)
+
+
+def _cls_task_names(cls_metrics: Optional[List[Any]]) -> List[str]:
+    """Task names for the classification (NE) metrics, in cls_task_indices order
+    (each NE metric exposes its per-task names as `_tasks`)."""
+    names: List[str] = []
+    for m in cls_metrics or []:
+        names.extend(getattr(m, "_tasks", None) or [])
+    return names
+
+
+def _loss_series(
+    losses: torch.Tensor, task_names: List[str], cls_indices: Any
+) -> Dict[str, torch.Tensor]:
+    """Build the {series_key: scalar-tensor} dict for WindowLoss: the aggregate
+    loss plus one entry per NE task. `losses` is the model's per-task loss vector
+    (same task order as `prediction`), so index_select(cls_indices) aligns with
+    the NE tasks. Values stay 0-dim tensors -- WindowLoss accumulates them on
+    device and only syncs to Python scalars at report cadence (Citrine C6: no
+    per-step .item()/.tolist() device-to-host sync in the training loop)."""
+    series: Dict[str, torch.Tensor] = {"loss": losses.detach().sum()}
+    if task_names and cls_indices is not None:
+        try:
+            per_task = losses.detach().index_select(0, cls_indices)
+            if per_task.numel() == len(task_names):
+                for i, name in enumerate(task_names):
+                    series[f"loss/{name}"] = per_task[i]
+        except Exception as e:  # never break training for a metric
+            logger.warning("[loss-metric] per-task loss skipped: %r", e)
+    return series
 
 
 class RecirXLATrainPipeline(RankingSGDTrainPipeline):
@@ -117,6 +169,10 @@ class RecirXLATrainPipeline(RankingSGDTrainPipeline):
         self._profile_end_step = profile_end_step
         self._profile_dir = profile_dir
         self._enable_memory_log = enable_memory_log
+        self._loss_metric: WindowLoss = _build_loss_metric(
+            step_metrics, cls_metrics, reg_metrics
+        )
+        self._loss_task_names: List[str] = _cls_task_names(cls_metrics)
         self._step = 0
         self._host_sync_every: int = max(1, host_sync_every)
         self._profiling_active = False
@@ -185,7 +241,16 @@ class RecirXLATrainPipeline(RankingSGDTrainPipeline):
             "weight": named["weight"],
         }
         self._update_ranking_metrics(ret)
+        # Log the training loss to TB (aggregate + per NE task); the base pipeline
+        # only reports prediction-derived NE/CTR/MSE and drops the loss return.
+        self._loss_metric.update(
+            values=_loss_series(losses, self._loss_task_names, self._cls_indices)
+        )
         return losses, ret
+
+    @property
+    def metrics(self) -> List[Any]:
+        return list(super().metrics) + [self._loss_metric]
 
     def on_train_end(self) -> None:
         # Stop any still-active trace (e.g. training ended before profile_end_step).
@@ -368,6 +433,10 @@ class EagerCPUTrainPipeline(RankingSGDTrainPipeline):
         self._lr_buffer: torch.Tensor = tensor_lr_opt.param_groups[0]["lr"]
         # Match TensorLRAdamW.step's optional grad-value clip on the dense params.
         self._max_grad: Optional[float] = getattr(tensor_lr_opt, "_max_grad", None)
+        self._loss_metric: WindowLoss = _build_loss_metric(
+            step_metrics, cls_metrics, reg_metrics
+        )
+        self._loss_task_names: List[str] = _cls_task_names(cls_metrics)
         self._raw_model.train(True)
 
     def progress(
@@ -398,7 +467,16 @@ class EagerCPUTrainPipeline(RankingSGDTrainPipeline):
             "weight": named["weight"].detach(),
         }
         self._update_ranking_metrics(ret)
+        # Log the training loss to TB (aggregate + per NE task); parity with
+        # RecirXLATrainPipeline. all_losses is the per-task vector.
+        self._loss_metric.update(
+            values=_loss_series(all_losses, self._loss_task_names, self._cls_indices)
+        )
         return all_losses.detach(), ret
+
+    @property
+    def metrics(self) -> List[Any]:
+        return list(super().metrics) + [self._loss_metric]
 
     def on_train_end(self) -> None:
         logger.info("EagerCPUTrainPipeline: training complete.")
