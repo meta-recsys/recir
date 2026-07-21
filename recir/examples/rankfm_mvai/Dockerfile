@@ -27,11 +27,16 @@ RUN pip install --upgrade pip
 # ABI (torch::headeronly::Tag is only in torch >=2.12.dev) and breaks at import.
 RUN pip install 'torch==2.10.*' --index-url https://download.pytorch.org/whl/cpu
 
-# JAX with TPU support
-RUN pip install "jax[tpu]"
+# JAX with TPU support.
+# Pinned <0.11: JAX 0.11.0 removed pltpu.DeviceIdType, which recir's ringshift
+# Pallas kernel (recir/ops/pallas/embeddings/ringshift.py) still uses. Leaving
+# jax unpinned floats past that removal and breaks TPU graph tracing at runtime.
+# 0.10.x still provides the symbol (deprecated, warns).
+RUN pip install "jax[tpu]<0.11"
 
-# JAX TPU embedding for SparseCore embedding lookup
-RUN pip install jax-tpu-embedding
+# JAX TPU embedding for SparseCore embedding lookup. Reassert the jax<0.11
+# constraint so this install can't transitively upgrade jax past the removal.
+RUN pip install jax-tpu-embedding "jax[tpu]<0.11"
 
 # torchrec + fbgemm (CPU variant for TPU machines).
 # Drop the `|| true` swallowing — we want this layer to fail loudly if the
