@@ -21,6 +21,7 @@ from typing import List, Optional, Sequence
 
 import torch
 from torch import fx
+from torch.fx.node import has_side_effect
 
 
 # ---------------------------------------------------------------------------
@@ -86,6 +87,16 @@ def _mark_boundary_backward(ctx, grad_output):
 mark_boundary.register_autograd(
     _mark_boundary_backward, setup_context=_mark_boundary_setup_context
 )
+
+
+# Pin mark_boundary against fx eliminate_dead_code. The graph-break dispatch
+# (recir/eager_dispatch.py) consumes these boundary markers OFF-graph -- the
+# embedding backward fires as a side effect -- so to fx DCE they look dead and
+# get pruned before the sparse dispatcher can wire its ``::bwd::`` markers,
+# freezing the embedding tables on the compiled path. Registered here, at the
+# op's definition site, so importers (eager_dispatch) needn't touch
+# ``torch.ops.recir`` at module-import time.
+has_side_effect(torch.ops.recir.mark_boundary.default)
 
 
 # ---------------------------------------------------------------------------

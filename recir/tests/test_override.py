@@ -13,6 +13,7 @@ from copy import deepcopy
 
 import torch
 from functorch import make_fx
+from recir.eager_dispatch import _dispatch_bwd, install_graph_break_dispatch
 from recir.tests.eager_test_utils import (
     run_graph,
     ToyDense,
@@ -41,6 +42,77 @@ def _has_marker(gm, suffix: str) -> bool:
 
 
 class TestOverride(unittest.TestCase):
+    def test_install_without_backward_removes_backward_markers(self):
+        graph = torch.fx.Graph()
+        x = graph.placeholder("x")
+        x.meta["val"] = torch.ones(1)
+        graph.call_function(
+            torch.ops.recir.mark_boundary.default,
+            args=(x, "disabled::bwd::0"),
+        )
+        graph.output(x)
+        gm = torch.fx.GraphModule({}, graph)
+
+        dispatch_id = install_graph_break_dispatch(
+            gm,
+            "disabled",
+            lambda value: (value,),
+            num_state_tensors=0,
+            register_backward=False,
+        )
+
+        self.assertIsNone(dispatch_id)
+        self.assertFalse(_has_marker(gm, "disabled::bwd::0"))
+        gm.graph.lint()
+
+    def test_sequential_dispatch_install_preserves_backward_nodes(self):
+        graph = torch.fx.Graph()
+        x = graph.placeholder("x")
+        x.meta["val"] = torch.ones(1)
+        first_output = graph.call_function(
+            torch.ops.recir.mark_boundary.default,
+            args=(x, "first::output::0"),
+        )
+        graph.call_function(
+            torch.ops.recir.mark_boundary.default,
+            args=(x, "first::bwd::0"),
+        )
+        second_output = graph.call_function(
+            torch.ops.recir.mark_boundary.default,
+            args=(x, "second::output::0"),
+        )
+        graph.call_function(
+            torch.ops.recir.mark_boundary.default,
+            args=(x, "second::bwd::0"),
+        )
+        graph.output((first_output, second_output))
+        gm = torch.fx.GraphModule({}, graph)
+
+        def dispatch(value):
+            return (value,)
+
+        install_graph_break_dispatch(
+            gm,
+            "first",
+            dispatch,
+            num_state_tensors=0,
+        )
+        self.assertTrue(_has_marker(gm, "second::bwd::0"))
+
+        install_graph_break_dispatch(
+            gm,
+            "second",
+            dispatch,
+            num_state_tensors=0,
+        )
+        gm.graph.eliminate_dead_code()
+        backward_dispatches = [
+            node
+            for node in gm.graph.nodes
+            if node.op == "call_function" and node.target is _dispatch_bwd
+        ]
+        self.assertEqual(len(backward_dispatches), 2)
+
     def test_marker_pairs_appear_in_traced_graph(self):
         """make_fx should produce forward + backward mark_boundary nodes."""
         mod = ToyDummyPreprocess(batch_size=3, embedding_dim=4)
