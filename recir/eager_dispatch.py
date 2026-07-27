@@ -38,6 +38,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import torch
 from torch import fx
+from torch.fx.node import has_side_effect
 
 
 # Module-level dispatch registries. Keyed by an opaque (dispatcher-supplied)
@@ -89,6 +90,25 @@ def _dispatch_bwd(grad: torch.Tensor, dispatch_id: int, grad_idx: int) -> torch.
     """Module-level backward dispatch target used by replaced markers."""
     _BWD_REGISTRY[dispatch_id](grad, grad_idx)
     return grad
+
+
+# Pin the backward dispatch against eliminate_dead_code. Its result is consumed
+# OFF-graph -- the embedding update fires as a side effect (_dispatch_bwd ->
+# torch.autograd.backward -> FUSED / SparseCore Adagrad), so to fx DCE the node
+# looks dead. Without this:
+#   (a) an EARLIER dispatcher's install runs eliminate_dead_code and prunes a
+#       LATER dispatcher's still-unwired ``::bwd::`` markers (so the sparse-arch
+#       backward markers vanish before SparseArchDispatcher.install_graph can
+#       wire them -> install sees bwd_markers=0), and
+#   (b) the final eliminate_dead_code prunes the _dispatch_bwd node itself
+#       (its output feeds only the dead dummy-backward chain).
+# Either way the embedding backward never runs on the compiled path and the
+# embedding tables stay frozen (the dense arch still learns; embeddings do not).
+# Marking _dispatch_bwd impure keeps it through every DCE. The ``mark_boundary``
+# op is pinned the same way, but at its definition site (recir/ops/marker.py) so
+# this module needn't touch ``torch.ops.recir`` at import time; install still
+# explicitly erases each marker it processes, so no stale markers linger.
+has_side_effect(_dispatch_bwd)
 
 
 def _wrap_with_save_for_backward(
@@ -264,6 +284,12 @@ def install_graph_break_dispatch(
     fwd_markers, bwd_markers = _collect_marker_groups(gm, marker_prefix)
     if not fwd_markers and not bwd_markers:
         return None
+
+    if bwd_markers and not register_backward:
+        for marker in bwd_markers:
+            marker.replace_all_uses_with(marker.args[0])
+            gm.graph.erase_node(marker)
+        bwd_markers = []
 
     # Detect input-only graphs: ``::input::`` markers are pure metadata that
     # ``_replace_input_markers`` strips without inserting any dispatch call.
