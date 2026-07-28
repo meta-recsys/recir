@@ -556,15 +556,24 @@ class _XLAModule(torch.nn.Module):
             # target NamedSharding, so the fast path above misses. Reshard
             # on-device via a jitted identity (multi-process safe, no host
             # round-trip) instead of falling through to the host-buffer assembly.
+            #
+            # Replicated batch intermediates may still have a host-local shape.
+            # Resharding changes only their layout, so rebuild them as global batches.
             if not tensor.is_fully_addressable:
-                return _cached_reshard(target)(tensor)
-            # Fully-addressable (single-device / single-process) array: bring to
-            # host and fall through to the unified construction below. NB a plain
-            # jax.device_put(tensor, target) fails here ("CopyArrays only
-            # supports destination device list of the same size ...") -- a
-            # single-device array can't be copied straight onto the global mesh;
-            # the local-buffer assembly below is the multi-process-safe path.
-            nparray = np.asarray(jax.device_get(tensor))
+                replicated = NamedSharding(mesh, P())
+                if is_batch_input and tensor.sharding == replicated:
+                    shards = tensor.addressable_shards
+                    nparray = np.asarray(jax.device_get(shards[0].data))
+                else:
+                    return _cached_reshard(target)(tensor)
+            else:
+                # Fully-addressable (single-device / single-process) array: bring to
+                # host and fall through to the unified construction below. NB a plain
+                # jax.device_put(tensor, target) fails here ("CopyArrays only
+                # supports destination device list of the same size ...") -- a
+                # single-device array can't be copied straight onto the global mesh;
+                # the local-buffer assembly below is the multi-process-safe path.
+                nparray = np.asarray(jax.device_get(tensor))
         else:
             # Meta FSDP weights have no host data; materialize each shard
             # directly on-device via jax.random (see the helper).
