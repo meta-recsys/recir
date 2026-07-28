@@ -271,7 +271,7 @@ _PARAMETRIZATION_CLASS_CACHE: Dict[
 
 def _register_parametrization(
     module: nn.Module,
-    parametrize_fn: Callable[[torch.Tensor], torch.Tensor],
+    parametrize_fn: Callable[..., torch.Tensor],
     recurse: bool = True,
     exclude_param_fqns: Optional[Set[str]] = None,
 ) -> None:
@@ -282,9 +282,17 @@ def _register_parametrization(
     ``parametrize_fn`` in order.  Multiple calls **stack** — each new
     function is appended to the chain.
 
+    Parametrize fns are called as ``fn(value)`` by default.  Fns tagged
+    with ``fn._recir_parametrize_wants_context = True`` receive the
+    owning submodule and parameter name too (``fn(value, submod, pname)``)
+    so they can dispatch on FQN (e.g. QAT applies STE only to target
+    embedding weights).
+
     Args:
         module: The module (and optionally its submodules) to parametrize.
-        parametrize_fn: ``(Tensor) -> Tensor`` applied to the raw parameter.
+        parametrize_fn: ``(Tensor) -> Tensor`` (or
+            ``(Tensor, nn.Module, str) -> Tensor`` when the fn is marked
+            context-aware) applied to the raw parameter.
         recurse: If True, also parametrize all submodules.
         exclude_param_fqns: Optional set of fully-qualified parameter names
             to exclude from parametrization (e.g., embedding params that
@@ -319,7 +327,17 @@ def _register_parametrization(
                     def getter(self: nn.Module) -> torch.Tensor:
                         value = self._parameters[param_name]
                         for p in self._parametrizations[param_name]:  # type: ignore[index]
-                            value = p(value)
+                            # Context-aware fns (marked with
+                            # ``_recir_parametrize_wants_context``) receive
+                            # the owning module + param name so they can
+                            # dispatch on FQN (e.g. QAT applies only to
+                            # target embedding weights). Ordinary fns keep
+                            # the single-arg contract used by
+                            # ``collectives_insertion``.
+                            if getattr(p, "_recir_parametrize_wants_context", False):
+                                value = p(value, self, param_name)
+                            else:
+                                value = p(value)
                         # pyrefly: ignore [bad-return]
                         return value
 
@@ -345,7 +363,7 @@ def _register_parametrization(
 
 def _deregister_parametrization(
     module: nn.Module,
-    parametrize_fn: Callable[[torch.Tensor], torch.Tensor],
+    parametrize_fn: Callable[..., torch.Tensor],
     recurse: bool = True,
 ) -> None:
     """Remove *parametrize_fn* from *module* (inverse of :func:`_register_parametrization`)."""
@@ -373,7 +391,7 @@ def _deregister_parametrization(
 @contextmanager
 def parametrize_params(
     module: nn.Module,
-    parametrize_fn: Callable[[torch.Tensor], torch.Tensor],
+    parametrize_fn: Callable[..., torch.Tensor],
     exclude_param_fqns: Optional[Set[str]] = None,
 ) -> Any:
     """Temporarily register *parametrize_fn* on *module*; remove on exit.
