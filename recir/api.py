@@ -296,7 +296,7 @@ def _local_compile(
     func: Callable[..., Any],
     *args: Any,
     fake_mode: FakeTensorMode,
-    _parametrize_fns: Optional[List[Callable[[torch.Tensor], torch.Tensor]]] = None,
+    _parametrize_fns: Optional[List[Callable[..., torch.Tensor]]] = None,
     _exclude_param_fqns: Optional[set[str]] = None,
     _stateless_func_wrapper: Optional[Callable[..., Any]] = None,
     **kwargs: Any,
@@ -871,6 +871,7 @@ def trace(  # noqa: C901 — orchestration: dispatches on parallel_mode flavor (
     region_transforms: Sequence[RegionTransform] = (),
     input_batch_dim: int = 0,
     parallel_mode: Optional[ParallelMode] = None,
+    _parametrize_fns: Optional[Sequence[Callable[..., torch.Tensor]]] = None,
     **kwargs: Any,
 ) -> Tuple[fx.GraphModule, List[torch.Tensor]]:
     """Stage 2 standalone: trace ``callable_`` into an FX graph module.
@@ -1077,13 +1078,20 @@ def trace(  # noqa: C901 — orchestration: dispatches on parallel_mode flavor (
             #     params in the outer trace. Embedding params are excluded so
             #     they keep their all_to_all path (``None`` when no embeddings).
             if dp_style == DataParallelStyle.FULLY_SHARD:
-                _outer_parametrize_fns: List[
-                    Callable[[torch.Tensor], torch.Tensor]
-                ] = []
+                _outer_parametrize_fns: List[Callable[..., torch.Tensor]] = []
                 _outer_exclude_fqns: Optional[set[str]] = None
             else:
                 _outer_parametrize_fns = [collectives_fn]
                 _outer_exclude_fqns = embedding_param_fqns
+            # User-supplied parametrize fns (e.g. QAT fake-quant) are
+            # appended AFTER collectives so the chain is
+            # ``user_fn(collectives_fn(raw))`` -- collectives run first so
+            # QAT sees the gathered full-precision weight.
+            if _parametrize_fns:
+                _outer_parametrize_fns = [
+                    *_outer_parametrize_fns,
+                    *_parametrize_fns,
+                ]
             local_result = _local_compile(
                 callable_,
                 *args,
@@ -1134,6 +1142,7 @@ def trace(  # noqa: C901 — orchestration: dispatches on parallel_mode flavor (
                 *args,
                 fake_mode=fake_mode,
                 _stateless_func_wrapper=gradients_tagging,
+                _parametrize_fns=list(_parametrize_fns) if _parametrize_fns else None,
                 **kwargs,
             )
 
@@ -1502,6 +1511,7 @@ def _compile_via_backend(
     *,
     eager_preproc: Sequence[Callable[[nn.Module], None]],
     region_transforms: Optional[List[RegionTransform]],
+    _parametrize_fns: Sequence[Callable[..., torch.Tensor]] = (),
     args: Tuple[Any, ...],
     kwargs: Dict[str, Any],
 ) -> _CompiledResult:
@@ -1535,6 +1545,7 @@ def _compile_via_backend(
         region_transforms=rt,
         input_batch_dim=parallel_mode.input_batch_dim,
         parallel_mode=parallel_mode,
+        _parametrize_fns=list(_parametrize_fns) if _parametrize_fns else None,
         **kwargs,
     )
 
@@ -1945,6 +1956,7 @@ def compile(  # noqa: C901 — orchestration: stages 0-9 + legacy DP/GSPMD wirin
     *,
     backend: Optional["Backend"] = None,
     eager_preproc: Sequence[Callable[[nn.Module], None]] = (),
+    _parametrize_fns: Sequence[Callable[..., torch.Tensor]] = (),
 ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
     r"""Compile and optimize a callable, which can be a train step within a training loop.
 
@@ -2137,6 +2149,7 @@ def compile(  # noqa: C901 — orchestration: stages 0-9 + legacy DP/GSPMD wirin
                         backend,
                         eager_preproc=eager_preproc,
                         region_transforms=region_transforms,
+                        _parametrize_fns=_parametrize_fns,
                         args=args,
                         kwargs=kwargs,
                     )
@@ -2146,6 +2159,12 @@ def compile(  # noqa: C901 — orchestration: stages 0-9 + legacy DP/GSPMD wirin
                     # nn.Module argument so multi-module signatures all
                     # benefit), then the gm is partitioned but skips backend
                     # stages 6-10.
+                    if _parametrize_fns:
+                        raise ValueError(
+                            "recir.compile(_parametrize_fns=...) requires "
+                            "backend= to be set (the legacy partition-only "
+                            "path does not forward user parametrize fns)."
+                        )
                     if eager_preproc:
                         for arg in pytree.arg_tree_leaves(*args, **kwargs):
                             if isinstance(arg, nn.Module):
