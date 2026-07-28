@@ -106,7 +106,6 @@ def _udd_fm_v3_train_step(
     supervision_label_t: torch.Tensor,
     supervision_weight_t: torch.Tensor,
     all_labels: Dict[str, torch.Tensor],
-    candidate_sum: torch.Tensor,
     world_candidate_sum: torch.Tensor,
 ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
     """Named-signature single-optimizer train step for the GSPMD/TPU compile.
@@ -134,7 +133,6 @@ def _udd_fm_v3_train_step(
         supervision_label_t,
         supervision_weight_t,
         all_labels,
-        candidate_sum,
         world_candidate_sum,
     )
 
@@ -155,7 +153,6 @@ def _udd_fm_v3_train_step_two_opt(
     supervision_label_t: torch.Tensor,
     supervision_weight_t: torch.Tensor,
     all_labels: Dict[str, torch.Tensor],
-    candidate_sum: torch.Tensor,
     world_candidate_sum: torch.Tensor,
 ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
     """Named-signature two-optimizer train step for the in_graph backend.
@@ -183,7 +180,6 @@ def _udd_fm_v3_train_step_two_opt(
         supervision_label_t,
         supervision_weight_t,
         all_labels,
-        candidate_sum,
         world_candidate_sum,
     )
 
