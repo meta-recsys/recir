@@ -356,8 +356,15 @@ def install_graph_break_dispatch(
                     args=(fwd_call, output_idx),
                 )
                 getitem_node.meta = dict(marker.meta)
-                getitem_node.meta["is_batch_input"] = True
-                getitem_node.meta["batch_dim"] = 0
+                output_val = marker.meta.get("val", None)
+                is_batch_output = not (
+                    isinstance(output_val, torch.Tensor) and output_val.ndim == 0
+                )
+                getitem_node.meta["is_batch_input"] = is_batch_output
+                if is_batch_output:
+                    getitem_node.meta["batch_dim"] = 0
+                else:
+                    getitem_node.meta.pop("batch_dim", None)
             marker.replace_all_uses_with(getitem_node)
             gm.graph.erase_node(marker)
 
