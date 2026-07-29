@@ -15,6 +15,7 @@ buck test fbcode//recir/tests:test_padding_region_transform
 
 import unittest
 from typing import Any, List, Tuple
+from unittest.mock import patch
 
 import torch
 import torch.nn as nn
@@ -22,8 +23,10 @@ from functorch import make_fx
 from recir.region_transforms.padding import (
     JaggedPairConfig,
     mark_padding_graph_breaks,
+    pad_candidate_axis_to_static,
     pad_count_to_sum,
     pad_jagged_lengths,
+    pad_jagged_pair_to_static,
     pad_jagged_values,
     pad_to_static,
     PaddingRegionTransform,
@@ -78,6 +81,20 @@ class PadToStaticOpTest(unittest.TestCase):
         result = pad_to_static(x, target_size=8, dim=0)
         self.assertEqual(result.shape, (8, 16))
         torch.testing.assert_close(result, x[:8])
+
+    @patch("recir.region_transforms.padding.runtime_num_local", return_value=2)
+    def test_pads_per_chip(self, _mock_num_local: Any) -> None:
+        x = torch.arange(4, dtype=torch.float32)
+        result = pad_to_static(x, target_size=8, dim=0)
+        self.assertEqual(result.tolist(), [0, 1, 0, 0, 2, 3, 0, 0])
+
+    @patch("recir.region_transforms.padding.runtime_num_local", return_value=2)
+    def test_trims_per_chip_and_restores_gradients(self, _mock_num_local: Any) -> None:
+        x = torch.arange(8, dtype=torch.float32, requires_grad=True)
+        result = pad_to_static(x, target_size=4, dim=0, pad_id=1)
+        self.assertEqual(result.tolist(), [0, 1, 4, 5])
+        result.backward(torch.tensor([1.0, 2.0, 3.0, 4.0]))
+        self.assertEqual(x.grad.tolist(), [1, 2, 0, 0, 3, 4, 0, 0])  # pyre-ignore
 
     def test_noop_when_exact(self) -> None:
         x = torch.randn(8, 16)
@@ -204,6 +221,20 @@ class PadJaggedValuesOpTest(unittest.TestCase):
         torch.testing.assert_close(result[20:34], values[11:25])
         self.assertTrue(torch.all(result[34:40] == 0))
 
+    @patch("recir.region_transforms.padding.runtime_num_local", return_value=2)
+    def test_single_key_uses_uneven_per_chip_length_totals(
+        self, _mock_num_local: Any
+    ) -> None:
+        lengths = torch.tensor([1, 2, 3, 2], dtype=torch.long)
+        values = torch.arange(8, dtype=torch.float32)
+
+        result = pad_jagged_values(values, lengths, per_key_budgets=[12])
+
+        self.assertEqual(
+            result.tolist(),
+            [0, 1, 2, 0, 0, 0, 3, 4, 5, 6, 7, 0],
+        )
+
     def test_per_key_different_budgets(self) -> None:
         """Keys with different budgets produce different segment sizes."""
         key0_lens = torch.tensor([3, 2], dtype=torch.long)  # sum=5
@@ -314,11 +345,53 @@ class PadJaggedValuesOpTest(unittest.TestCase):
         torch.testing.assert_close(v1.grad, torch.ones(10, 4))  # pyre-ignore
 
 
+class PadJaggedPairToStaticTest(unittest.TestCase):
+    @patch("recir.region_transforms.padding.runtime_num_local", return_value=2)
+    def test_candidate_aware_values_and_lengths_share_chip_layout(
+        self, _mock_num_local: Any
+    ) -> None:
+        count = torch.tensor([1, 2, 3, 1], dtype=torch.long)
+        lengths = torch.ones(7, dtype=torch.long)
+        values = torch.arange(7, dtype=torch.float32)
+
+        padded_values, padded_lengths = pad_jagged_pair_to_static(
+            values,
+            lengths,
+            per_key_budgets=[12],
+            target_batch=10,
+            count=count,
+        )
+
+        self.assertEqual(
+            padded_values.tolist(),
+            [0, 1, 2, 0, 0, 0, 3, 4, 5, 6, 0, 0],
+        )
+        self.assertEqual(
+            padded_lengths.tolist(),
+            [1, 1, 1, 2, 1, 1, 1, 1, 1, 2],
+        )
+        self.assertEqual(int(padded_lengths.sum().item()), padded_values.shape[0])
+
+
+class PadCandidateAxisToStaticTest(unittest.TestCase):
+    @patch("recir.region_transforms.padding.runtime_num_local", return_value=2)
+    def test_builds_per_chip_real_value_mask(self, _mock_num_local: Any) -> None:
+        count = torch.tensor([2, 1, 1, 3], dtype=torch.long)
+        values = torch.ones(7, dtype=torch.float32)
+
+        result = pad_candidate_axis_to_static(values, count, target_size=12)
+
+        self.assertEqual(
+            result.tolist(),
+            [1, 1, 1, 0, 0, 0, 1, 1, 1, 1, 0, 0],
+        )
+
+
 class UnpadJaggedGradOpTest(unittest.TestCase):
     def test_extracts_per_key(self) -> None:
         from recir.region_transforms.padding import _PAD_JAGGED_SIZES
 
-        _PAD_JAGGED_SIZES[300] = (25, [11, 14])
+        _PAD_JAGGED_SIZES[300] = (25, [11, 14], 1)
         grad = torch.randn(40, 4)
         result = unpad_jagged_grad(grad, pad_id=300, per_key_budgets=[20, 20], dim=0)
         self.assertEqual(result.shape, (25, 4))
@@ -484,7 +557,7 @@ class DiscoveryTest(unittest.TestCase):
         layout = transform._discover(tensors)
         self.assertIn(0, layout.batch_indices)
 
-    def test_derived_dim(self) -> None:
+    def test_inferred_pad_targets(self) -> None:
         transform = self._make_transform(
             jagged_pairs={
                 "nro_values": JaggedPairConfig("num_candidates", per_sample_budgets=6),
@@ -492,12 +565,12 @@ class DiscoveryTest(unittest.TestCase):
         )
         tensors = self._make_tensors()
         layout = transform._discover(tensors)
-        self.assertIn(1, layout.derived)
-        self.assertIn(6, layout.derived)
+        self.assertIn(1, layout.inferred_pad_targets)
+        self.assertIn(6, layout.inferred_pad_targets)
         # batch_size=6, num_devices=1 (default), _resolved_pairs non-empty
         # → padded_bs = ceil(6/1)*1 = 6, == 6 → +1 → 7
         # nro pair: pair_padded_bs = 7 ; per_sample=6 → per_key = 6*7 = 42
-        self.assertEqual(layout.derived[1], 42)
+        self.assertEqual(layout.inferred_pad_targets[1], 42)
 
     def test_batch_size_from_arg(self) -> None:
         transform = self._make_transform(

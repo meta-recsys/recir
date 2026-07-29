@@ -46,6 +46,11 @@ from recir.eager_dispatch import (
     mark_input,
     mark_output_with_bwd,
 )
+from recir.region_transforms.padding import (
+    pad_candidate_axis_to_static,
+    pad_jagged_pair_to_static,
+    runtime_num_local,
+)
 from recir.torchax.amp import hammer_autocast_factory
 from torchrec import JaggedTensor, KeyedJaggedTensor
 
@@ -120,31 +125,38 @@ def _pad_kjt_to_cached(
     num_keys: int,
     cached_lengths_buf: torch.Tensor,
     num_processes: int,
+    count: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Pad an output KJT to the per-host cached shape."""
+    """Pad an output KJT to the per-host cached shape.
+
+    ``count`` is the per-sample candidate count (``num_candidates``). When the
+    KJT's per-host stride equals ``sum(count)`` the KJT is CANDIDATE-axis: its
+    rows follow their parent samples and are NOT chip-uniform, so the pad ops
+    split the stride per chip by ``count`` (matching PRT's ``pad_count_to_sum``).
+    A sample-axis KJT (stride == num samples, divisible by num_local) uses the
+    uniform split (``count=None``). Auto-detected so the caller need not know
+    each output KJT's granularity.
+    """
 
     global_stride = int(cached_lengths_buf.shape[0] // num_keys)  # global batch_size
-    per_host_stride = global_stride // num_processes  # local batch_size
     cached_per_key_global = (
         cached_lengths_buf.view(num_keys, global_stride).sum(dim=1).tolist()
     )  # global cached length sum for each key
-    per_host_per_key_budgets = [int(b // num_processes) for b in cached_per_key_global]
-    # Values first — uses current_lengths to slide current per-key segments.
-    # tile_pad=True: fill each key's deficit by tiling its own real ids instead
-    # of zero-filling. These KJTs are embedding id-lists whose pad positions are
-    # masked out downstream, so tiling keeps the pad tokens' block-owner
-    # distribution uniform and avoids routing every pad (id 0) to ring-shift
-    # block-owner 0 (which caused the period-8 all-to-all hot wave).
-    new_values = torch.ops.recir_padding.pad_jagged_values(
-        current_values, current_lengths, per_host_per_key_budgets, 0, -1, 1, True
+    per_key_budgets = [int(b) for b in cached_per_key_global]
+    # Candidate-axis iff the per-host stride matches the candidate total.
+    b_stride = int(current_lengths.shape[0] // num_keys)
+    eff_count = (
+        count if (count is not None and int(count.sum().item()) == b_stride) else None
     )
-    # Lengths next — extends stride; deficit dummies absorb the growth from
-    # current per-key sums to per-host cached budgets so sum(new_lengths)
-    # == sum(per_host_per_key_budgets) == len(new_values).
-    new_lengths = torch.ops.recir_padding.pad_jagged_lengths(
-        current_lengths, per_host_per_key_budgets, per_host_stride, 1
+    return pad_jagged_pair_to_static(
+        current_values,
+        current_lengths,
+        per_key_budgets,
+        global_stride,
+        num_processes=num_processes,
+        count=eff_count,
+        tile_pad=True,
     )
-    return new_values, new_lengths
 
 
 # ---------------------------------------------------------------------------
@@ -477,10 +489,14 @@ class PreprocessorDispatcher:
         if self._orig_stack is None or self._dummy is None:
             return gm, flat_state
 
-        real_stack: nn.Module = self._orig_stack  # pyre-ignore[8]
-        dummy: DummyPreprocessorStack = self._dummy  # pyre-ignore[8]
+        real_stack: nn.Module = self._orig_stack
+        dummy: DummyPreprocessorStack = self._dummy
         num_ranks: int = self._num_ranks
         num_processes_fit: int = self._num_processes
+        # Per-host -> per-device split degree at lowering (np.split(num_local)).
+        # = local devices per host. Used to lay out jagged-total supervision
+        # outputs CHIP-MAJOR so the split lands on per-chip blocks.
+        num_local_fit: int = runtime_num_local()
 
         # Input structure captured at construction time from sample_feature_bundle.
         entries: List[Tuple[FeatureDescriptor, str, Any]] = dummy._input_entries
@@ -523,7 +539,7 @@ class PreprocessorDispatcher:
             # return per-host so _to_sharded_jax can expand to global —
             # matching the per-host behavior of PRT pad ops at runtime.
             def _per_host_target(cached_shape: torch.Size) -> Tuple[int, ...]:
-                out = list(int(s) for s in cached_shape)
+                out = [int(s) for s in cached_shape]
                 if len(out) > 0:
                     out[0] = out[0] // num_processes_fit
                 return tuple(out)
@@ -531,6 +547,25 @@ class PreprocessorDispatcher:
             num_nro_candidates_padded: Optional[torch.Tensor] = output.get_tensor(
                 InputFeatures.NUM_CANDIDATES
             )
+            # Real per-sample candidate counts (summing to the REAL candidate
+            # total) used to split CANDIDATE-axis output KJTs per chip. The
+            # preprocessor only emits the PRT-PADDED num_candidates, so recover
+            # the real per-chip counts by dropping each chip's dummy sample slots,
+            real_num_candidates: Optional[torch.Tensor] = None
+            if num_nro_candidates_padded is not None:
+                ro_stride = bundle.require_kjt(InputFeatures.UIH_ID_LIST).stride()
+                if (
+                    num_local_fit > 1
+                    and num_nro_candidates_padded.shape[0] % num_local_fit == 0
+                    and ro_stride % num_local_fit == 0
+                ):
+                    padded_pb = num_nro_candidates_padded.shape[0] // num_local_fit
+                    real_pb = ro_stride // num_local_fit
+                    real_num_candidates = num_nro_candidates_padded.reshape(
+                        num_local_fit, padded_pb
+                    )[:, :real_pb].reshape(-1)
+                else:
+                    real_num_candidates = num_nro_candidates_padded[:ro_stride]
             seq_basis_lengths: Optional[torch.Tensor] = None
             flat_kjts: List[torch.Tensor] = []
             kjt_i = 0
@@ -548,6 +583,7 @@ class PreprocessorDispatcher:
                         num_keys,
                         cached_l,
                         num_processes_fit,
+                        count=real_num_candidates,
                     )
                     if (
                         desc.name == "merged"
@@ -575,22 +611,155 @@ class PreprocessorDispatcher:
                     )
                 kjt_i += 1
 
+            # Additional-embedding (values, lengths) form a JAGGED PAIR; the
+            # preprocessor just emits them as two separate tensor outputs rather
+            # than a KJT. Pad them through the SAME _pad_kjt_to_cached path the
+            # real KJTs use (num_keys=1).
+            addemb_fitted: Dict[str, torch.Tensor] = {}
+            addemb_pairs: Dict[str, Dict[str, int]] = {}
+            for ti, d_desc in enumerate(output_tensor_descs):
+                if "/additional_emb_input/" not in d_desc.name:
+                    continue
+                if d_desc.name.endswith("/values"):
+                    addemb_pairs.setdefault(d_desc.name[: -len("/values")], {})["v"] = (
+                        ti
+                    )
+                elif d_desc.name.endswith("/lengths"):
+                    addemb_pairs.setdefault(d_desc.name[: -len("/lengths")], {})[
+                        "l"
+                    ] = ti
+            for pair in addemb_pairs.values():
+                if "v" not in pair or "l" not in pair:
+                    continue
+                v_desc = output_tensor_descs[pair["v"]]
+                l_desc = output_tensor_descs[pair["l"]]
+                v_val = output.get(v_desc)
+                l_val = output.get(l_desc)
+                if not (
+                    isinstance(v_val, torch.Tensor) and isinstance(l_val, torch.Tensor)
+                ):
+                    continue
+                cached_v = getattr(dummy, f"_tensor_{pair['v']}")
+                cached_l = getattr(dummy, f"_tensor_{pair['l']}")
+                fitted_v, fitted_l = _pad_kjt_to_cached(
+                    v_val,
+                    l_val,
+                    1,
+                    cached_l,
+                    num_processes_fit,
+                    count=real_num_candidates,
+                )
+                addemb_fitted[v_desc.name] = fitted_v.to(cached_v.dtype)
+                addemb_fitted[l_desc.name] = fitted_l.to(cached_l.dtype)
+
             # Now process tensor outputs; SEQ_LENGTHS gets derived inline
             # as first_key_lengths(HSTU_ID_LIST[i]) + num_candidates.
             flat_tensors: List[torch.Tensor] = []
+            # Local (pre-pad) tensor values by name -- used to derive the
+            # max_sum_contextual constant (LWC - SEQ_LENGTHS) when rebuilding
+            # LENGTHS_WITH_CONTEXTUAL padded below.
+            _local_by_name: Dict[str, Any] = {
+                d.name: output.get(d) for d in output_tensor_descs
+            }
             tensor_i = 0
             for desc in output_tensor_descs:
                 cached_t = getattr(dummy, f"_tensor_{tensor_i}")
                 target_shape = _per_host_target(cached_t.shape)
                 val = output.get(desc)
                 if val is not None and isinstance(val, torch.Tensor):
-                    if (
+                    if desc.name in addemb_fitted:
+                        # Additional-embedding jagged pair, already fitted above
+                        # via the shared KJT path (_pad_kjt_to_cached).
+                        fitted = addemb_fitted[desc.name]
+                    elif (
                         desc.name.endswith("/seq_lengths")
                         and seq_basis_lengths is not None
                         and num_nro_candidates_padded is not None
                     ):
                         fitted = (seq_basis_lengths + num_nro_candidates_padded).to(
                             cached_t.dtype
+                        )
+                    elif (
+                        desc.name.endswith("/lengths_with_contextual")
+                        and seq_basis_lengths is not None
+                        and num_nro_candidates_padded is not None
+                        and isinstance(
+                            _local_by_name.get(
+                                desc.name.replace(
+                                    "/lengths_with_contextual", "/seq_lengths"
+                                )
+                            ),
+                            torch.Tensor,
+                        )
+                    ):
+                        # Rebuild LWC from padded sequence lengths to keep RO/NRO offsets aligned.
+                        _seq_local = _local_by_name[
+                            desc.name.replace(
+                                "/lengths_with_contextual", "/seq_lengths"
+                            )
+                        ]
+                        _ctx = (val - _seq_local).amax()
+                        fitted = (
+                            seq_basis_lengths + num_nro_candidates_padded + _ctx
+                        ).to(cached_t.dtype)
+                    elif desc.name.endswith("nro_padding_mask") and (
+                        num_local_fit > 1
+                        and real_num_candidates is not None
+                        and real_num_candidates.shape[0] % num_local_fit == 0
+                        and int(target_shape[0]) % num_local_fit == 0
+                    ):
+                        # Rebuild the mask per chip so padded NRO candidates are excluded from the loss.
+                        real_mask = val.new_ones(
+                            (int(real_num_candidates.sum().item()),)
+                        )
+                        fitted = pad_candidate_axis_to_static(
+                            real_mask, real_num_candidates, int(target_shape[0])
+                        ).to(cached_t.dtype)
+                    elif desc.name.endswith(
+                        (
+                            "/past_weights",
+                            "/past_watch_times",
+                            "/past_timestamps_jagged",
+                            "/exploded_actions",
+                            "/exploded_action_intensity",
+                            "/bucket_video_wt",
+                            "/bucket_log_video_wt",
+                            "/bucket_vvp",
+                            "/bucket_log_vvp",
+                            "/bucket_vpvd",
+                            "/bucket_log_vpvd",
+                            "/bucket_comment_vpvd",
+                            "/bucket_log_comment_vpvd",
+                        )
+                    ):
+                        # Pad jagged totals by seq_lengths to preserve per-chip boundaries.
+                        real_lengths = _local_by_name.get(
+                            desc.name.rsplit("/", 1)[0] + "/seq_lengths"
+                        )
+                        if not isinstance(real_lengths, torch.Tensor):
+                            raise RuntimeError(
+                                f"Missing seq_lengths for chip-major output {desc.name}"
+                            )
+                        if int(real_lengths.sum().item()) != int(val.shape[0]):
+                            raise RuntimeError(
+                                f"seq_lengths sum does not match {desc.name}: "
+                                f"{int(real_lengths.sum().item())} != {val.shape[0]}"
+                            )
+                        target_total = int(target_shape[0])
+                        if target_total % num_local_fit != 0:
+                            raise RuntimeError(
+                                f"Target size for {desc.name} is not divisible by "
+                                f"num_local={num_local_fit}: {target_total}"
+                            )
+                        fitted = torch.ops.recir_padding.pad_jagged_values(
+                            val,
+                            real_lengths,
+                            [target_total],
+                            0,
+                            -1,
+                            1,
+                            None,
+                            False,
                         )
                     else:
                         fitted = _fit_to_shape(val, target_shape)
@@ -855,9 +1024,7 @@ def _ec_sparse_arch_on(device: torch.device) -> Generator[None, None, None]:
     """
     original_init: Callable[..., None] = ECSparseArch.__init__
 
-    def patched_init(  # pyre-ignore[2,3]
-        self: ECSparseArch, *args: Any, **kwargs: Any
-    ) -> None:
+    def patched_init(self: ECSparseArch, *args: Any, **kwargs: Any) -> None:
         kwargs.setdefault("device", device)
         original_init(self, *args, **kwargs)
 
@@ -865,7 +1032,7 @@ def _ec_sparse_arch_on(device: torch.device) -> Generator[None, None, None]:
     try:
         yield
     finally:
-        ECSparseArch.__init__ = original_init  # pyre-ignore[8]
+        ECSparseArch.__init__ = original_init
 
 
 def build_model_from_config(
@@ -1266,7 +1433,7 @@ def _create_random_train_batch(
         data_source_config=data_source_config,
     )
     batch = cast(MTMLROOTrainBatch, next(iter(data_pipe)))
-    return batch.to(device, non_blocking=False)  # pyre-ignore
+    return batch.to(device, non_blocking=False)
 
 
 def _create_uniform_train_batch(
@@ -1297,4 +1464,4 @@ def _create_uniform_train_batch(
         ),
     )
     batch = cast(MTMLROOTrainBatch, next(iter(data_pipe)))
-    return batch.to(device, non_blocking=False)  # pyre-ignore
+    return batch.to(device, non_blocking=False)
