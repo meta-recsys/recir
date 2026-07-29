@@ -60,7 +60,7 @@ logger: logging.Logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 _PAD_ORIGINAL_SIZES: Dict[int, int] = {}
-_PAD_JAGGED_SIZES: Dict[int, Tuple[int, List[int]]] = {}
+_PAD_JAGGED_SIZES: Dict[int, Tuple[int, List[int], int]] = {}
 
 _INSTANCE_ID_COUNTER: itertools.count[int] = itertools.count()
 _PAD_ID_STRIDE: int = 1_000_000
@@ -106,6 +106,16 @@ def compute_padded_shape(
 # ---------------------------------------------------------------------------
 
 
+def runtime_num_local() -> int:
+    """Local devices per host = the per-host -> per-device ``np.split`` degree."""
+    try:
+        import jax
+
+        return max(1, int(jax.local_device_count()))
+    except Exception:
+        return 1
+
+
 @torch.library.custom_op("recir_padding::pad_to_static", mutates_args=())
 def pad_to_static(
     x: torch.Tensor,
@@ -130,11 +140,24 @@ def pad_to_static(
     current = x.shape[dim]
     if current == per_host_target:
         return x.clone()
+    num_local = runtime_num_local()
+    assert current % num_local == 0 and per_host_target % num_local == 0, (
+        f"pad_to_static: current={current} / target={per_host_target} not "
+        f"divisible by num_local={num_local}"
+    )
+    cur_pb = current // num_local
+    target_pb = per_host_target // num_local
+    x2 = x.unflatten(dim, (num_local, cur_pb))
     if current > per_host_target:
-        return x.narrow(dim, 0, per_host_target).clone()
-    pw = [0] * (2 * x.ndim)
-    pw[2 * (x.ndim - 1 - dim) + 1] = per_host_target - current
-    return F.pad(x, pw, value=pad_value)
+        return x2.narrow(dim + 1, 0, target_pb).flatten(dim, dim + 1).clone()
+    # Pad PER-CHIP so the per-host -> per-device np.split(num_local) lands each
+    # device a uniform block (real rows + its own dummy rows). num_local == 1
+    # degenerates to a single tail-padded block.
+    pw = [0] * (2 * x2.ndim)
+    pad_axis = dim + 1
+    pw[2 * (x2.ndim - 1 - pad_axis) + 1] = target_pb - cur_pb
+    x2 = F.pad(x2, pw, value=pad_value)
+    return x2.flatten(dim, dim + 1)
 
 
 @pad_to_static.register_fake  # pyre-ignore[56]
@@ -180,24 +203,43 @@ def pad_count_to_sum(
     if pad_id >= 0:
         _PAD_ORIGINAL_SIZES[pad_id] = x.shape[0]
     current = x.shape[0]
-    if current >= per_host_target_size:
-        # Edge case: input already at/over target shape.  No dummy slots
-        # to distribute into; bump the last entry to absorb any remaining
-        # sum delta.  Unreachable in the standard flow (pair_padded_bs is
-        # always strictly greater than pair_bs).
-        x = x.narrow(0, 0, per_host_target_size).clone()
-        deficit = per_host_target_sum - int(x.sum().item())
-        if deficit != 0:
-            x[-1] = x[-1] + deficit
-        return x
-    num_dummy = per_host_target_size - current
-    deficit = per_host_target_sum - int(x.sum().item())
-    per_d = deficit // num_dummy
-    rem = deficit - per_d * num_dummy  # 0 .. num_dummy - 1 when deficit >= 0
-    dummy = torch.full((num_dummy,), per_d, dtype=x.dtype, device=x.device)
-    if rem > 0:
-        dummy[:rem] = dummy[:rem] + 1
-    return torch.cat([x, dummy], dim=0)
+    # Distribute the count PER-CHIP: split into num_local blocks, pad each block
+    # to per_host_target_size//num_local entries summing to
+    # per_host_target_sum//num_local, so each device's candidate count + sum is
+    # UNIFORM (the candidate-axis even-split then coincides with the sample axis).
+    # num_local == 1 degenerates to the single tail-append block.
+    num_local = runtime_num_local()
+    assert (
+        current % num_local == 0
+        and per_host_target_size % num_local == 0
+        and per_host_target_sum % num_local == 0
+    ), (
+        f"pad_count_to_sum: current={current} / target_size={per_host_target_size}"
+        f" / target_sum={per_host_target_sum} not divisible by num_local={num_local}"
+    )
+    cur_pb = current // num_local
+    target_pb = per_host_target_size // num_local
+    sum_pb = per_host_target_sum // num_local
+    x_blocks = x.reshape(num_local, cur_pb)
+    num_dummy = target_pb - cur_pb
+    parts: List[torch.Tensor] = []
+    for blk in range(num_local):
+        xb = x_blocks[blk]
+        if num_dummy <= 0:
+            xb = xb.narrow(0, 0, target_pb).clone()
+            d = sum_pb - int(xb.sum().item())
+            if d != 0:
+                xb[-1] = xb[-1] + d
+            parts.append(xb)
+            continue
+        deficit = sum_pb - int(xb.sum().item())
+        per_d = deficit // num_dummy
+        rem = deficit - per_d * num_dummy
+        dummy = torch.full((num_dummy,), per_d, dtype=x.dtype, device=x.device)
+        if rem > 0:
+            dummy[:rem] = dummy[:rem] + 1
+        parts.append(torch.cat([xb, dummy], dim=0))
+    return torch.cat(parts, dim=0)
 
 
 @pad_count_to_sum.register_fake  # pyre-ignore[56]
@@ -232,11 +274,22 @@ def unpad_grad(
     """
     original_size = _PAD_ORIGINAL_SIZES[pad_id]
     current = grad.shape[dim]
-    if current >= original_size:
-        return grad.narrow(dim, 0, original_size).clone()
-    pw = [0] * (2 * grad.ndim)
-    pw[2 * (grad.ndim - 1 - dim) + 1] = original_size - current
-    return F.pad(grad, pw)
+    if current == original_size:
+        return grad.clone()
+    # Reverse the PER-CHIP pad_to_static: per block, take the first
+    # original//num_local (real) of each current//num_local slot (or zero-pad if
+    # the forward narrowed). num_local == 1 degenerates to the plain narrow/pad.
+    num_local = runtime_num_local()
+    cur_pb = original_size // num_local
+    target_pb = current // num_local
+    g2 = grad.unflatten(dim, (num_local, target_pb))
+    if target_pb >= cur_pb:
+        g2 = g2.narrow(dim + 1, 0, cur_pb)
+    else:
+        pw = [0] * (2 * g2.ndim)
+        pw[2 * (g2.ndim - 1 - (dim + 1)) + 1] = cur_pb - target_pb
+        g2 = F.pad(g2, pw)
+    return g2.flatten(dim, dim + 1).clone()
 
 
 @unpad_grad.register_fake  # pyre-ignore[56]
@@ -259,12 +312,45 @@ def _trim_lengths(lengths: torch.Tensor, budget: int) -> torch.Tensor:
     )
 
 
+def _per_chip_real_counts(
+    batch: int, num_local: int, count: Optional[torch.Tensor]
+) -> List[int]:
+    """Real element count owned by each of the ``num_local`` chip blocks along a
+    jagged pair's batch (row) axis.
+
+    ``count is None`` — the batch axis is already chip-major uniform (e.g. the RO
+    sample axis), so each chip owns ``batch // num_local`` rows.
+
+    ``count is not None`` — the batch axis is a *candidate* axis whose rows follow
+    their parent samples, so it is NOT uniform across chips. ``count`` is the
+    per-sample count (sample-granularity, divisible by ``num_local``); chip ``c``
+    owns ``sum(count[c's samples])`` candidates. This mirrors how
+    ``pad_count_to_sum`` distributes the count itself, so every NRO tensor's
+    per-chip candidate boundary is identical.
+    """
+    if count is None:
+        assert batch % num_local == 0, (
+            f"_per_chip_real_counts: batch={batch} not divisible by "
+            f"num_local={num_local} (no count tensor to define per-chip split)"
+        )
+        pb = batch // num_local
+        return [pb] * num_local
+    num_samples = count.shape[0]
+    assert num_samples % num_local == 0, (
+        f"_per_chip_real_counts: num_samples={num_samples} not divisible by "
+        f"num_local={num_local}"
+    )
+    spb = num_samples // num_local
+    return [int(x) for x in count.reshape(num_local, spb).sum(1).tolist()]
+
+
 @torch.library.custom_op("recir_padding::pad_jagged_lengths", mutates_args=())
 def pad_jagged_lengths(
     lengths: torch.Tensor,
     per_key_budgets: List[int],
     target_batch: int,
     num_processes: int = 1,
+    count: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Pad a jagged lengths tensor with dummy entries so that each key's
     total equals its budget and the output has
@@ -273,34 +359,62 @@ def pad_jagged_lengths(
     ``per_key_budgets`` and ``target_batch`` are GLOBAL sizes (matching
     the FX trace shape).  At runtime each host applies ``// num_processes``
     so its local lengths tensor is padded only to its per-host shard size.
+
+    ``count`` is the per-sample count (e.g. ``num_candidates``) when the batch
+    (row) axis is a *candidate* axis: chip ``c`` then owns ``sum(count[c's
+    samples])`` real rows rather than a uniform ``B_real // num_local`` (the real
+    candidates per chip vary with the jagged data).  ``count is None`` keeps the
+    uniform per-chip split used by sample-axis pairs.
     """
     per_host_budgets = [b // num_processes for b in per_key_budgets]
     per_host_target_batch = target_batch // num_processes
     num_keys = len(per_host_budgets)
     B_real = lengths.shape[0] // num_keys
-    num_dummy = per_host_target_batch - B_real
+
+    # Lay out each key PER-CHIP as [chip0: real + dummy | chip1: real + dummy | ...]
+    # so the per-host -> per-device np.split(num_local) gives each device its own
+    # per-chip block (real rows + its own dummy slots, deficit absorbed per
+    # block). num_local == 1 degenerates to a single [real | dummy] block. When
+    # count is set the real-row count per chip is data-dependent (rc_c below),
+    # matching pad_count_to_sum's candidate distribution.
+    num_local = runtime_num_local()
+    assert per_host_target_batch % num_local == 0, (
+        f"pad_jagged_lengths: per_host_target_batch={per_host_target_batch} "
+        f"not divisible by num_local={num_local}"
+    )
+    tpb = per_host_target_batch // num_local
+    rc = _per_chip_real_counts(B_real, num_local, count)
 
     key_lengths = lengths.reshape(num_keys, B_real)
     parts: List[torch.Tensor] = []
     for k in range(num_keys):
-        budget = per_host_budgets[k]
-        kl = key_lengths[k]
-        key_total = int(kl.sum().item())
-        if key_total > budget:
-            kl = _trim_lengths(kl, budget)
-            key_total = budget
-        key_pad = budget - key_total
-        if key_pad > 0 and num_dummy > 0:
-            per_d = key_pad // num_dummy
-            rem = key_pad % num_dummy
-            dummy_k = torch.full(
-                (num_dummy,), per_d, dtype=lengths.dtype, device=lengths.device
-            )
-            if rem > 0:
-                dummy_k[:rem] = dummy_k[:rem] + 1
-        else:
-            dummy_k = torch.zeros(num_dummy, dtype=lengths.dtype, device=lengths.device)
-        parts.append(torch.cat([kl, dummy_k]))
+        budget_pb = per_host_budgets[k] // num_local
+        offset = 0
+        blocks: List[torch.Tensor] = []
+        for c in range(num_local):
+            rc_c = rc[c]
+            bl = key_lengths[k][offset : offset + rc_c]
+            offset += rc_c
+            num_dummy_c = tpb - rc_c
+            block_total = int(bl.sum().item())
+            if block_total > budget_pb:
+                bl = _trim_lengths(bl, budget_pb)
+                block_total = budget_pb
+            block_pad = budget_pb - block_total
+            if block_pad > 0 and num_dummy_c > 0:
+                per_d = block_pad // num_dummy_c
+                rem = block_pad % num_dummy_c
+                dummy_b = torch.full(
+                    (num_dummy_c,), per_d, dtype=lengths.dtype, device=lengths.device
+                )
+                if rem > 0:
+                    dummy_b[:rem] = dummy_b[:rem] + 1
+            else:
+                dummy_b = torch.zeros(
+                    num_dummy_c, dtype=lengths.dtype, device=lengths.device
+                )
+            blocks.append(torch.cat([bl, dummy_b]))
+        parts.append(torch.cat(blocks))
     return torch.cat(parts)
 
 
@@ -310,6 +424,7 @@ def _pad_lengths_fake(
     per_key_budgets: List[int],
     target_batch: int,
     num_processes: int = 1,
+    count: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     # Fake kernel uses the GLOBAL target so FX trace and JAX retrace agree.
     return torch.empty(
@@ -327,6 +442,7 @@ def pad_jagged_values(
     dim: int = 0,
     pad_id: int = -1,
     num_processes: int = 1,
+    count: Optional[torch.Tensor] = None,
     tile_pad: bool = False,
 ) -> torch.Tensor:
     """Pad jagged values per-key so each key's segment reaches its budget.
@@ -334,49 +450,68 @@ def pad_jagged_values(
     ``per_key_budgets`` are GLOBAL budgets; runtime divides by
     ``num_processes`` to get per-host budgets.
 
-    When ``tile_pad`` is set, each key's deficit is filled by tiling that key's
-    own values (``vals[arange(deficit) % current]``) instead of zeros. This is
-    for embedding id-lists whose pad positions are masked out downstream: it
-    keeps the pad tokens' block-owner distribution uniform (matching the real
-    ids) instead of collapsing every pad to id 0 -> block-owner 0, which
-    otherwise skews the ring-shift all-to-all. Real values stay in
-    ``[0:current]`` so the backward (which slices ``[0:current]``) is unchanged.
+    ``count`` (per-sample count, e.g. ``num_candidates``) is passed when the
+    jagged *row* axis is a candidate axis: chip ``c`` then owns ``sum(count[c's
+    samples])`` real rows (rc_c), whose values are narrowed contiguously. When a
+    dense candidate-axis tensor is padded, pass ``count`` as ``lengths`` with a
+    single-key budget: each row is one candidate, so the per-chip value total
+    equals rc_c directly.  ``count is None`` keeps the uniform per-chip split.
+
+    When ``tile_pad`` is set, each per-chip block's deficit is filled by tiling
+    that block's own values (``vals[arange(deficit) % current]``) instead of
+    zeros. This is for embedding id-lists whose pad positions are masked out
+    downstream: it keeps the pad tokens' block-owner distribution uniform
+    (matching the real ids) instead of collapsing every pad to id 0 ->
+    block-owner 0, which otherwise skews the ring-shift all-to-all. Real values
+    stay at the front of each block so the backward (which slices the real
+    prefix) is unchanged.
     """
     per_host_budgets = [b // num_processes for b in per_key_budgets]
     num_keys = len(per_host_budgets)
     B = lengths.shape[0] // num_keys
+    # Pad PER-CHIP to match pad_jagged_lengths: each key is laid out
+    # [chip0: real values padded to budget/num_local | chip1: ...]. Blocks are
+    # contiguous chunks of the real per-key values, so np.split(num_local) lands
+    # each device its own block. num_local == 1 degenerates to the per-host
+    # layout. rc_c is the real row count per chip (data-dependent when count set).
+    num_local = runtime_num_local()
+    rc = _per_chip_real_counts(B, num_local, count)
     key_lengths = lengths.reshape(num_keys, B)
-    per_key_sizes: List[int] = []
+    block_sizes: List[int] = []
     parts: List[torch.Tensor] = []
     offset = 0
     for k in range(num_keys):
-        budget = per_host_budgets[k]
-        key_total = int(key_lengths[k].sum().item())
-        per_key_sizes.append(key_total)
-        key_vals = values.narrow(dim, offset, key_total)
-        current = key_vals.shape[dim]
-        if current == budget:
-            parts.append(key_vals.clone())
-        elif current > budget:
-            parts.append(key_vals.narrow(dim, 0, budget).clone())
-        elif tile_pad and current > 0:
-            # Fill the deficit by tiling this key's own real ids instead of
-            # zero-filling. For embedding id-lists (pad positions masked out
-            # downstream) this keeps the pad tokens' block-owner distribution
-            # uniform -- matching the real ids -- instead of routing every pad
-            # to id 0 -> block-owner 0, which skews the ring-shift all-to-all.
-            # Real ids stay in [0:current] so backward/fake are unchanged.
-            deficit = budget - current
-            idx = torch.arange(deficit, device=key_vals.device) % current
-            pad_vals = key_vals.index_select(dim, idx)
-            parts.append(torch.cat([key_vals, pad_vals], dim=dim))
-        else:
-            pw = [0] * (2 * values.ndim)
-            pw[2 * (values.ndim - 1 - dim) + 1] = budget - current
-            parts.append(F.pad(key_vals, pw))
-        offset += key_total
+        budget_pb = per_host_budgets[k] // num_local
+        cand_off = 0
+        for c in range(num_local):
+            rc_c = rc[c]
+            block_total = int(key_lengths[k][cand_off : cand_off + rc_c].sum().item())
+            cand_off += rc_c
+            block_sizes.append(block_total)
+            block_vals = values.narrow(dim, offset, block_total)
+            offset += block_total
+            current = block_vals.shape[dim]
+            if current == budget_pb:
+                parts.append(block_vals.clone())
+            elif current > budget_pb:
+                parts.append(block_vals.narrow(dim, 0, budget_pb).clone())
+            elif tile_pad and current > 0:
+                # Fill this block's deficit by tiling its own real ids instead of
+                # zero-filling. For embedding id-lists (pad positions masked out
+                # downstream) this keeps the pad tokens' block-owner distribution
+                # uniform -- matching the real ids -- instead of routing every pad
+                # to id 0 -> block-owner 0, which skews the ring-shift all-to-all.
+                # Real ids stay at the block front so backward/fake are unchanged.
+                deficit = budget_pb - current
+                idx = torch.arange(deficit, device=block_vals.device) % current
+                pad_vals = block_vals.index_select(dim, idx)
+                parts.append(torch.cat([block_vals, pad_vals], dim=dim))
+            else:
+                pw = [0] * (2 * values.ndim)
+                pw[2 * (values.ndim - 1 - dim) + 1] = budget_pb - current
+                parts.append(F.pad(block_vals, pw))
     if pad_id >= 0:
-        _PAD_JAGGED_SIZES[pad_id] = (values.shape[dim], per_key_sizes)
+        _PAD_JAGGED_SIZES[pad_id] = (values.shape[dim], block_sizes, num_local)
     return torch.cat(parts, dim=dim)
 
 
@@ -388,13 +523,67 @@ def _pad_jagged_values_fake(
     dim: int = 0,
     pad_id: int = -1,
     num_processes: int = 1,
+    count: Optional[torch.Tensor] = None,
     tile_pad: bool = False,
 ) -> torch.Tensor:
     if pad_id >= 0:
-        _PAD_JAGGED_SIZES[pad_id] = (values.shape[dim], [])
+        _PAD_JAGGED_SIZES[pad_id] = (values.shape[dim], [], 1)
     shape = list(values.shape)
     shape[dim] = sum(per_key_budgets)  # global budget for FX shape
     return torch.empty(shape, dtype=values.dtype, device=values.device)
+
+
+def pad_jagged_pair_to_static(
+    values: torch.Tensor,
+    lengths: torch.Tensor,
+    per_key_budgets: List[int],
+    target_batch: int,
+    *,
+    dim: int = 0,
+    pad_id: int = -1,
+    num_processes: int = 1,
+    count: Optional[torch.Tensor] = None,
+    tile_pad: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Pad a jagged values/lengths pair to shared static per-chip targets."""
+    padded_values = pad_jagged_values(
+        values,
+        lengths,
+        per_key_budgets,
+        dim,
+        pad_id,
+        num_processes,
+        count,
+        tile_pad,
+    )
+    padded_lengths = pad_jagged_lengths(
+        lengths,
+        per_key_budgets,
+        target_batch,
+        num_processes,
+        count,
+    )
+    return padded_values, padded_lengths
+
+
+def pad_candidate_axis_to_static(
+    values: torch.Tensor,
+    count: torch.Tensor,
+    target_size: int,
+    *,
+    dim: int = 0,
+    pad_id: int = -1,
+    num_processes: int = 1,
+) -> torch.Tensor:
+    """Pad one-value-per-candidate data using its per-sample count boundaries."""
+    return pad_jagged_values(
+        values,
+        count,
+        [target_size],
+        dim,
+        pad_id,
+        num_processes,
+    )
 
 
 @torch.library.custom_op("recir_padding::unpad_jagged_grad", mutates_args=())
@@ -411,20 +600,25 @@ def unpad_jagged_grad(
     Uses per-host budgets at runtime to match the forward.
     """
     per_host_budgets = [b // num_processes for b in per_key_budgets]
-    _, per_key_sizes = _PAD_JAGGED_SIZES[pad_id]
+    _, block_sizes, num_local = _PAD_JAGGED_SIZES[pad_id]
+    num_keys = len(per_host_budgets)
     parts: List[torch.Tensor] = []
     offset = 0
-    for k in range(len(per_host_budgets)):
-        budget = per_host_budgets[k]
-        orig = per_key_sizes[k]
-        if budget >= orig:
-            parts.append(grad.narrow(dim, offset, orig).clone())
-        else:
-            key_grad = grad.narrow(dim, offset, budget).clone()
-            pw = [0] * (2 * grad.ndim)
-            pw[2 * (grad.ndim - 1 - dim) + 1] = orig - budget
-            parts.append(F.pad(key_grad, pw))
-        offset += budget
+    # Mirror the per-chip forward: per key, per block, take the first (real)
+    # block_size of each budget/num_local slot; concat back to [B_real per key]
+    # in real order (blocks are contiguous chunks of the real values).
+    for k in range(num_keys):
+        budget_pb = per_host_budgets[k] // num_local
+        for blk in range(num_local):
+            orig = block_sizes[k * num_local + blk]
+            if budget_pb >= orig:
+                parts.append(grad.narrow(dim, offset, orig).clone())
+            else:
+                block_grad = grad.narrow(dim, offset, budget_pb).clone()
+                pw = [0] * (2 * grad.ndim)
+                pw[2 * (grad.ndim - 1 - dim) + 1] = orig - budget_pb
+                parts.append(F.pad(block_grad, pw))
+            offset += budget_pb
     return torch.cat(parts, dim=dim)
 
 
@@ -436,7 +630,7 @@ def _unpad_jagged_grad_fake(
     dim: int = 0,
     num_processes: int = 1,
 ) -> torch.Tensor:
-    total_original, _ = _PAD_JAGGED_SIZES[pad_id]
+    total_original, _, _ = _PAD_JAGGED_SIZES[pad_id]
     shape = list(grad.shape)
     shape[dim] = total_original
     return torch.empty(shape, dtype=grad.dtype, device=grad.device)
@@ -479,11 +673,12 @@ pad_to_static.register_autograd(_pad_backward, setup_context=_pad_setup_context)
 
 def _pad_jagged_values_backward(
     ctx: Any, grad: torch.Tensor
-) -> Tuple[torch.Tensor, None, None, None, None, None, None]:
+) -> Tuple[torch.Tensor, None, None, None, None, None, None, None]:
     return (
         torch.ops.recir_padding.unpad_jagged_grad(
             grad, ctx.pad_id, ctx.per_key_budgets, ctx.dim, ctx.num_processes
         ),
+        None,
         None,
         None,
         None,
@@ -495,10 +690,19 @@ def _pad_jagged_values_backward(
 
 def _pad_jagged_values_setup_context(
     ctx: Any,
-    inputs: Tuple[torch.Tensor, torch.Tensor, List[int], int, int, int, bool],
+    inputs: Tuple[
+        torch.Tensor,
+        torch.Tensor,
+        List[int],
+        int,
+        int,
+        int,
+        Optional[torch.Tensor],
+        bool,
+    ],
     output: torch.Tensor,
 ) -> None:
-    _, _, per_key_budgets, dim, pad_id, num_processes, _ = inputs
+    _, _, per_key_budgets, dim, pad_id, num_processes, _count, _tile_pad = inputs
     ctx.pad_id = pad_id
     ctx.per_key_budgets = per_key_budgets
     ctx.dim = dim
@@ -612,7 +816,13 @@ class _Layout:
         self.padded_bs: int = 0
         self.batch_indices: List[int] = []
         self.jagged_pairs: List[_JaggedPair] = []
-        self.derived: Dict[int, int] = {}
+        self.inferred_pad_targets: Dict[int, int] = {}
+        # Subset of ``inferred_pad_targets`` whose dim0 is a jagged *candidate*
+        # axis, mapping tensor_idx to the
+        # ``count_idx`` whose values define its per-sample segment lengths. These
+        # must be padded count-aware (via pad_jagged_values) rather than by the
+        # count-blind pad_to_static, which assumes a chip-uniform dim0.
+        self.candidate_count_source_indices: Dict[int, int] = {}
 
 
 # ---------------------------------------------------------------------------
@@ -881,6 +1091,7 @@ class PaddingRegionTransform(RegionTransform):
         budgeted_dim0: Dict[int, int] = {}
         total_budget_by_vidx: Dict[int, int] = {}
         pair_bs_to_padded: Dict[int, int] = {}
+        pair_bs_to_count: Dict[int, int] = {}
         bs_idx_set: set[int] = set()
         for jp in layout.jagged_pairs:
             budgeted_dim0[jp.values_idx] = tensors[jp.values_idx].shape[0]
@@ -888,6 +1099,8 @@ class PaddingRegionTransform(RegionTransform):
             if jp.bs_idx is not None:
                 pair_bs_val = tensors[jp.bs_idx].shape[dim]
                 pair_bs_to_padded[pair_bs_val] = jp.padded_bs
+                if jp.count_idx is not None:
+                    pair_bs_to_count[pair_bs_val] = jp.count_idx
                 bs_idx_set.add(jp.bs_idx)  # pyre-ignore
 
         for i, t in enumerate(tensors):
@@ -901,42 +1114,65 @@ class PaddingRegionTransform(RegionTransform):
                 continue
             if t.ndim >= 1:
                 matched = False
-                for v_idx, v_dim0 in budgeted_dim0.items():
-                    if t.shape[0] == v_dim0:
-                        layout.derived[i] = total_budget_by_vidx[v_idx]
+                # Candidate-axis (a jagged pair's batch ref) match takes PRIORITY
+                # over the values-axis (budgeted_dim0) match: when a pair is
+                # 1-value-per-candidate its values dim0 collides with the
+                # candidate count, and such tensors (e.g. supervision_label_t)
+                # MUST be padded count-aware — the count-blind pad_to_static
+                # per-chip split is undefined on the non-uniform candidate axis.
+                for pb, ppb in pair_bs_to_padded.items():
+                    if t.shape[0] == pb:
+                        layout.inferred_pad_targets[i] = ppb
+                        cidx = pair_bs_to_count.get(pb)
+                        if cidx is not None:
+                            layout.candidate_count_source_indices[i] = cidx
                         matched = True
                         break
                 if not matched:
-                    for pb, ppb in pair_bs_to_padded.items():
-                        if t.shape[0] == pb:
-                            layout.derived[i] = ppb
+                    for v_idx, v_dim0 in budgeted_dim0.items():
+                        if t.shape[0] == v_dim0:
+                            layout.inferred_pad_targets[i] = total_budget_by_vidx[v_idx]
+                            matched = True
                             break
 
-        recognized: set[int] = set()
+        self._warn_orphans(tensors, layout, jagged_indices, bs_idx_set, count_indices)
+        return layout
+
+    def _warn_orphans(
+        self,
+        tensors: List[torch.Tensor],
+        layout: _Layout,
+        jagged_indices: Set[int],
+        bs_idx_set: Set[int],
+        count_indices: Set[int],
+    ) -> None:
+        """Log any tensor input not claimed by a batch/jagged/count/derived rule.
+
+        Orphans keep their input_transform-expanded shape and are a likely cause
+        of downstream broadcast errors, so surface them loudly.
+        """
+        recognized: Set[int] = set()
         recognized.update(jagged_indices)
         recognized.update(layout.batch_indices)
         recognized.update(bs_idx_set)
-        recognized.update(layout.derived.keys())
+        recognized.update(layout.inferred_pad_targets.keys())
         recognized.update(count_indices)
         recognized.update(self._skip_indices)
         orphans: List[Tuple[int, List[int]]] = []
         for i, t in enumerate(tensors):
-            if i in recognized:
-                continue
-            if not isinstance(t, torch.Tensor):
+            if i in recognized or not isinstance(t, torch.Tensor):
                 continue
             orphans.append((i, list(t.shape)))
-        if orphans:
-            logger.warning(
-                "[PAD discover] %d orphan tensor input(s) NOT recognized "
-                "(kept input_transform-expanded shape, likely cause of "
-                "downstream broadcast errors):",
-                len(orphans),
-            )
-            for i, shape in orphans:
-                logger.warning("  arg[%d] shape=%s", i, shape)
-
-        return layout
+        if not orphans:
+            return
+        logger.warning(
+            "[PAD discover] %d orphan tensor input(s) NOT recognized "
+            "(kept input_transform-expanded shape, likely cause of "
+            "downstream broadcast errors):",
+            len(orphans),
+        )
+        for i, shape in orphans:
+            logger.warning("  arg[%d] shape=%s", i, shape)
 
     # ------------------------------------------------------------------
     # RegionTransform interface: input pre-transform
@@ -952,6 +1188,17 @@ class PaddingRegionTransform(RegionTransform):
         dim = self.batch_dim
         pid = self._pad_id_base
         np_ = self.num_processes
+        # Snapshot each pair's ORIGINAL (pre-pad) per-sample count tensor before
+        # the pairs loop below rebinds tensors[count_idx] via pad_count_to_sum.
+        # Candidate-axis dense tensors (the NRO batch-ref bs_idx tensor and any
+        # candidate-axis derived/dict tensors) are padded with these counts as
+        # 1-key jagged lengths, so each chip receives its own samples' real
+        # candidates padded to the per-chip budget (matching pad_count_to_sum).
+        original_counts: Dict[int, torch.Tensor] = {}
+        for jp in layout.jagged_pairs:
+            cidx = jp.count_idx
+            if cidx is not None:
+                original_counts[cidx] = tensors[cidx]
         # Pad batch tensors (shape[batch_dim] == batch_size) up to
         # padded_bs.  Per-sample count tensors (e.g. num_candidates) are
         # NOT in batch_indices — they are handled by ``pad_count_to_sum``
@@ -968,8 +1215,20 @@ class PaddingRegionTransform(RegionTransform):
         padded_bs_indices: set[int] = set()
         for jp in layout.jagged_pairs:
             if jp.bs_idx is not None and jp.bs_idx not in padded_bs_indices:
-                tensors[jp.bs_idx] = pad_to_static(  # pyre-ignore
-                    tensors[jp.bs_idx], jp.padded_bs, dim, pid, 0.0, np_
+                # The NRO batch-ref tensor is a candidate-axis dense tensor: its
+                # dim0 is the REAL jagged candidate sum, not a multiple of
+                # num_local, so the count-blind pad_to_static per-chip split is
+                # undefined. Pad it via pad_jagged_values with num_candidates as
+                # a single-key length vector.
+                count_idx = jp.count_idx
+                assert count_idx is not None  # guaranteed by bind_signature
+                tensors[jp.bs_idx] = pad_candidate_axis_to_static(  # pyre-ignore
+                    tensors[jp.bs_idx],
+                    original_counts[count_idx],
+                    jp.padded_bs,
+                    dim=dim,
+                    pad_id=pid,
+                    num_processes=np_,
                 )
                 padded_bs_indices.add(jp.bs_idx)  # pyre-ignore
                 pid += 1
@@ -982,47 +1241,98 @@ class PaddingRegionTransform(RegionTransform):
                     np_,
                 )
                 pid += 1
-            original_lengths = tensors[jp.lengths_idx]
-            tensors[jp.lengths_idx] = pad_jagged_lengths(
+            # When the pair's batch axis is a candidate axis (bs_idx set), its
+            # rows aren't chip-uniform: pass the pre-pad count so the per-chip
+            # split follows num_candidates (matching pad_count_to_sum). Sample-
+            # axis pairs pass count=None and keep the uniform split.
+            pair_count = (
+                original_counts[jp.count_idx] if jp.count_idx is not None else None
+            )
+            padded_values, padded_lengths = pad_jagged_pair_to_static(
+                tensors[jp.values_idx],
                 tensors[jp.lengths_idx],
                 jp.per_key_budgets,
                 jp.padded_bs,
-                np_,
+                dim=dim,
+                pad_id=pid,
+                num_processes=np_,
+                count=pair_count,
             )
-            tensors[jp.values_idx] = pad_jagged_values(
-                tensors[jp.values_idx],
-                original_lengths,
-                jp.per_key_budgets,
-                dim,
-                pid,
-                np_,
-            )
+            tensors[jp.values_idx] = padded_values
+            tensors[jp.lengths_idx] = padded_lengths
             pid += 1
-        for i, target in layout.derived.items():
-            tensors[i] = pad_to_static(tensors[i], target, 0, pid, 0.0, np_)
+        for i, target in layout.inferred_pad_targets.items():
+            cidx = layout.candidate_count_source_indices.get(i)
+            if cidx is not None:
+                # Candidate-axis derived tensor: pad count-aware, same as bs_idx.
+                tensors[i] = pad_candidate_axis_to_static(
+                    tensors[i],
+                    original_counts[cidx],
+                    target,
+                    dim=dim,
+                    pad_id=pid,
+                    num_processes=np_,
+                )
+            else:
+                tensors[i] = pad_to_static(tensors[i], target, 0, pid, 0.0, np_)
             pid += 1
-        # Pad tensor values inside dicts (e.g. all_labels).
-        # Match against both jagged total-values dim and pair batch
-        # dim, since dict values typically have B_NRO (pair_bs), not
-        # the total values count.
-        dim0_to_target: Dict[int, int] = {}
+        self._pad_dict_tensors(tensors, layout, args, original_counts, pid)
+        return tuple(tensors), kwargs
+
+    def _pad_dict_tensors(
+        self,
+        tensors: List[Any],
+        layout: _Layout,
+        args: Tuple[Any, ...],
+        original_counts: Dict[int, torch.Tensor],
+        pid: int,
+    ) -> None:
+        """Pad tensor values inside dict args (e.g. ``all_labels``) in place.
+
+        Match against both the jagged total-values dim and the pair batch dim,
+        since dict values typically have B_NRO (pair_bs), not the total values
+        count.  Candidate-axis dict values (keyed by a pair's pre-pad batch
+        size) must be padded count-aware; values-axis dict values (keyed by a
+        pair's total values dim) can use the plain ``pad_to_static``.  Keyed
+        separately because with ``per_sample_budgets == 1`` a pair's
+        total_budget equals its padded_bs, so keying by target value alone
+        would be ambiguous.
+        """
+        dim = self.batch_dim
+        np_ = self.num_processes
+        cand_axis_dict: Dict[int, Tuple[int, int]] = {}
+        val_axis_dict: Dict[int, int] = {}
         for jp in layout.jagged_pairs:
-            dim0_to_target[args[jp.values_idx].shape[0]] = jp.total_budget
-            if jp.bs_idx is not None:
-                dim0_to_target[args[jp.bs_idx].shape[dim]] = jp.padded_bs
+            val_axis_dict[args[jp.values_idx].shape[0]] = jp.total_budget
+            if jp.bs_idx is not None and jp.count_idx is not None:
+                cand_axis_dict[args[jp.bs_idx].shape[dim]] = (
+                    jp.padded_bs,
+                    jp.count_idx,
+                )
         for i, item in enumerate(tensors):
-            if not isinstance(item, dict):
+            if not isinstance(item, dict) or i in self._skip_indices:
                 continue
             padded_dict = {}
             for k, v in item.items():
                 if isinstance(v, torch.Tensor) and v.ndim >= 1:
-                    target = dim0_to_target.get(v.shape[0])
-                    if target is not None and target != v.shape[0]:
-                        v = pad_to_static(v, target, 0, pid, 0.0, np_)
-                        pid += 1
+                    if v.shape[0] in cand_axis_dict:
+                        tgt, cidx = cand_axis_dict[v.shape[0]]
+                        if tgt != v.shape[0]:
+                            v = pad_candidate_axis_to_static(
+                                v,
+                                original_counts[cidx],
+                                tgt,
+                                pad_id=pid,
+                                num_processes=np_,
+                            )
+                            pid += 1
+                    else:
+                        target = val_axis_dict.get(v.shape[0])
+                        if target is not None and target != v.shape[0]:
+                            v = pad_to_static(v, target, 0, pid, 0.0, np_)
+                            pid += 1
                 padded_dict[k] = v
             tensors[i] = padded_dict
-        return tuple(tensors), kwargs
 
     # ------------------------------------------------------------------
     # RegionTransform interface: post-compile finalization
