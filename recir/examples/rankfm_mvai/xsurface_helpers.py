@@ -399,7 +399,6 @@ def _build_replay_iter(
     num_candidates: int,
     data_pipe: Optional[BatchReplayPipe],
     key_to_size: Optional[Dict[str, int]],
-    ro_per_key_budgets: Optional[List[int]] = None,
 ) -> Optional[Iterator[Any]]:
     if data_pipe is None:
         return None
@@ -414,5 +413,4 @@ def _build_replay_iter(
         max_steps=trainer_cfg.max_steps,
         local_batch_size=trainer_cfg.local_batch_size,
         num_candidates=num_candidates,
-        ro_per_key_budgets=ro_per_key_budgets,
     )
