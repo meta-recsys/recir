@@ -233,12 +233,16 @@ class RecirXLATrainPipeline(RankingSGDTrainPipeline):
 
         # Rebuild the ret dict RankingSGDTrainPipeline._update_ranking_metrics
         # expects; the metrics were constructed on torch.device("cpu") to match
-        # these host CPU tensors. weight=0 marks padded rows so NE/CTR/MSE stay
-        # correct (variable_step_qps may overcount padded rows -- acceptable).
+        # these host CPU tensors. weight=0 keeps padded rows out of NE/CTR/MSE;
+        # num_real_candidates keeps variable-step x-axes and QPS padding-invariant.
         ret: Dict[str, Any] = {
             "prediction": named["prediction"],
             "label": named["label"],
             "weight": named["weight"],
+            # Real (pre-pad) per-host candidate count -> variable-step metrics
+            # x-axis stride (else it falls back to the PADDED labels.size(1)).
+            # Computed from the raw batch so the model needn't emit it.
+            "num_real_candidates": int(batch.num_candidates.sum()),
         }
         self._update_ranking_metrics(ret)
         # Log the training loss to TB (aggregate + per NE task); the base pipeline
@@ -465,6 +469,9 @@ class EagerCPUTrainPipeline(RankingSGDTrainPipeline):
             "prediction": named["prediction"].detach(),
             "label": named["label"].detach(),
             "weight": named["weight"].detach(),
+            # Real (pre-pad) per-host candidate count -> variable-step metrics
+            # x-axis stride (else PADDED labels.size(1)); from the raw batch.
+            "num_real_candidates": int(batch.num_candidates.sum()),
         }
         self._update_ranking_metrics(ret)
         # Log the training loss to TB (aggregate + per NE task); parity with
