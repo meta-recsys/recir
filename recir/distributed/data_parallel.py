@@ -1037,7 +1037,11 @@ def partitioner(graph: GraphModule) -> GraphModule:
                 desired_spec.tensor_meta = input_node.meta["tensor_meta"]
                 input_tensor = input_node.meta["val"]
 
-                def reshard_fn(local_tensor: torch.Tensor) -> torch.Tensor:
+                def reshard_fn(
+                    local_tensor: torch.Tensor,
+                    input_spec: DTensorSpec = input_spec,
+                    desired_spec: DTensorSpec = desired_spec,
+                ) -> torch.Tensor:
                     return redistribute_local_tensor(
                         local_tensor, input_spec, desired_spec
                     )
@@ -1174,6 +1178,113 @@ def shard_params_and_states(
         old_to_new.append((old_param, new_param, shard_spec))
     _migrate_opt_after_param_swap(opts, old_to_new)
     return sharded_keys
+
+
+def shard_optimizer_states_for_replicated_params(
+    model: nn.Module,
+    opt: OptOrOpts,
+    mesh: DeviceMesh,
+    *,
+    parameter_filter: Callable[[str, torch.Tensor], bool],
+    state_keys: FrozenSet[str],
+) -> Set[Tuple[str, str]]:
+    """Row-shard selected optimizer leaves without replacing parameters."""
+    if not state_keys:
+        raise ValueError("State-only optimizer sharding requires state keys")
+
+    opts = _normalize_opts(opt)
+    shard_spec = DTensorSpec(mesh=mesh, placements=(Shard(0),))
+    sharded: Set[Tuple[str, str]] = set()
+    matched_parameters = 0
+    aliases_by_parameter = _group_parameter_aliases(model)
+    pending_shards: List[Tuple[Dict[str, Any], str, torch.Tensor, List[str]]] = []
+
+    for parameter, aliases in aliases_by_parameter.values():
+        if not _select_shared_parameter(parameter, aliases, parameter_filter):
+            continue
+        matched_parameters += 1
+        state = _optimizer_state_for_parameter(opts, parameter, aliases)
+        for state_key in state_keys:
+            value = state.get(state_key)
+            if value is None:
+                raise RuntimeError(
+                    "State-only optimizer sharding is missing required state "
+                    f"{aliases!r}/{state_key!r}"
+                )
+            if not isinstance(value, torch.Tensor):
+                raise RuntimeError(
+                    f"Optimizer state {aliases!r}/{state_key!r} must be a tensor"
+                )
+            if value.ndim == 0 or value.shape != parameter.shape:
+                raise RuntimeError(
+                    "State-only optimizer sharding requires parameter-shaped "
+                    f"ranked tensors: {aliases!r}/{state_key!r} has "
+                    f"shape {tuple(value.shape)}, parameter has "
+                    f"shape {tuple(parameter.shape)}"
+                )
+            pending_shards.append((state, state_key, value, aliases))
+    if matched_parameters == 0:
+        raise RuntimeError("State-only optimizer sharding matched no parameters")
+    for state, state_key, value, aliases in pending_shards:
+        state[state_key] = partition_value(value, shard_spec)
+        sharded.update((fqn, state_key) for fqn in aliases)
+    return sharded
+
+
+def _group_parameter_aliases(
+    model: nn.Module,
+) -> Dict[int, Tuple[nn.Parameter, List[str]]]:
+    aliases_by_parameter: Dict[int, Tuple[nn.Parameter, List[str]]] = {}
+    for fqn, parameter in model.named_parameters(remove_duplicate=False):
+        parameter_id = id(parameter)
+        if parameter_id not in aliases_by_parameter:
+            aliases_by_parameter[parameter_id] = (parameter, [])
+        aliases_by_parameter[parameter_id][1].append(fqn)
+    return aliases_by_parameter
+
+
+def _select_shared_parameter(
+    parameter: nn.Parameter,
+    aliases: Sequence[str],
+    parameter_filter: Callable[[str, torch.Tensor], bool],
+) -> bool:
+    selections = {parameter_filter(fqn, parameter) for fqn in aliases}
+    if len(selections) != 1:
+        raise RuntimeError(
+            "State-only optimizer sharding must select every alias of a "
+            f"shared parameter consistently: aliases={aliases!r}"
+        )
+    return selections == {True}
+
+
+def _optimizer_state_for_parameter(
+    opts: Sequence[torch.optim.Optimizer],
+    parameter: nn.Parameter,
+    aliases: Sequence[str],
+) -> Dict[str, Any]:
+    owners = [
+        optimizer
+        for optimizer in opts
+        if any(
+            candidate is parameter
+            for group in optimizer.param_groups
+            for candidate in group["params"]
+        )
+    ]
+    if len(owners) > 1:
+        raise RuntimeError(
+            f"Optimizer state for {aliases!r} belongs to multiple optimizers"
+        )
+    if not owners:
+        raise RuntimeError(
+            f"State-only optimizer sharding found no state owner for {aliases!r}"
+        )
+    if parameter not in owners[0].state:
+        raise RuntimeError(
+            "State-only optimizer sharding found uninitialized optimizer state for "
+            f"{aliases!r}; initialize the configured state keys before sharding"
+        )
+    return owners[0].state[parameter]
 
 
 def _clone_param_chains_for_backward(

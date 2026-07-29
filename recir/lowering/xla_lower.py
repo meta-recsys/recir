@@ -534,11 +534,11 @@ class _XLAModule(torch.nn.Module):
                 return tensor
             # Target sharding for this input (mirrors the torch branches below).
             ndim = tensor.ndim
-            if is_batch_input:
+            if is_batch_input and 0 <= input_batch_dim < ndim:
                 _spec: List[Any] = [None] * max(ndim, input_batch_dim + 1)
                 _spec[input_batch_dim] = "torch_dist"
                 target = NamedSharding(mesh, P(*_spec))
-            elif is_fsdp_weight:
+            elif is_fsdp_weight and ndim >= 1:
                 target = NamedSharding(mesh, P("torch_dist", *([None] * (ndim - 1))))
             else:
                 target = NamedSharding(mesh, P())
@@ -577,7 +577,7 @@ class _XLAModule(torch.nn.Module):
         else:
             # Meta FSDP weights have no host data; materialize each shard
             # directly on-device via jax.random (see the helper).
-            if is_fsdp_weight and tensor.is_meta:
+            if is_fsdp_weight and tensor.is_meta and tensor.ndim >= 1:
                 return _materialize_meta_fsdp_weight(tensor, mesh)
 
             nparray = _XLAModule._torch_to_numpy_for_jax(tensor)
@@ -616,7 +616,7 @@ class _XLAModule(torch.nn.Module):
         # the same multiplier (see GSPMDParallel.num_processes for the
         # matching property).
         host_count = num_global // num_local
-        if is_batch_input:
+        if is_batch_input and 0 <= input_batch_dim < nparray.ndim:
             global_shape = list(nparray.shape)
             global_shape[input_batch_dim] *= host_count
             ndim = len(global_shape)
@@ -634,7 +634,7 @@ class _XLAModule(torch.nn.Module):
             return jax.make_array_from_single_device_arrays(
                 tuple(global_shape), sharding, local_buffers
             )
-        if is_fsdp_weight:
+        if is_fsdp_weight and nparray.ndim >= 1:
             # FSDP: input is a local shard (after shard_params). Same
             # rationale as the is_batch_input branch above -- the
             # local→global multiplier here must match the gm's baked
@@ -933,25 +933,38 @@ class _XLAModule(torch.nn.Module):
         is_fsdp_meta: List[bool] = [
             n.meta.get("is_fsdp_sharded", False) for n in placeholders
         ]
-        # Build per-input sharding specs and track which inputs are FSDP-sharded.
+        # Build per-input sharding specs and track which inputs are physically
+        # sharded. Batch metadata can survive on tensors whose rank no longer
+        # contains that axis after graph cuts; treat those as replicated instead
+        # of constructing an impossible sharding spec.
         in_shardings = []
+        is_batch_sharded: List[bool] = []
         is_fsdp_sharded: List[bool] = []
         for i, n in enumerate(placeholders):
             if is_batch[i]:
                 val = n.meta.get("val", None)
-                ndim = val.ndim if hasattr(val, "ndim") else 1
+                ndim = val.ndim if hasattr(val, "ndim") else 0
+                if ndim == 0 and i < len(args) and hasattr(args[i], "ndim"):
+                    ndim = args[i].ndim
                 bd = per_input_batch_dim[i]
-                spec_parts: List[Any] = [None] * max(ndim, bd + 1)
-                spec_parts[bd] = "torch_dist"
-                in_shardings.append(NamedSharding(mesh, P(*spec_parts)))
+                if 0 <= bd < ndim:
+                    spec_parts: List[Any] = [None] * max(ndim, bd + 1)
+                    spec_parts[bd] = "torch_dist"
+                    in_shardings.append(NamedSharding(mesh, P(*spec_parts)))
+                    is_batch_sharded.append(True)
+                else:
+                    in_shardings.append(replicated)
+                    is_batch_sharded.append(False)
                 is_fsdp_sharded.append(False)
-            elif is_fsdp_meta[i] and i < len(args) and hasattr(args[i], "ndim"):
+            elif is_fsdp_meta[i] and i < len(args) and getattr(args[i], "ndim", 0) >= 1:
                 ndim = args[i].ndim
                 spec = P("torch_dist", *([None] * (ndim - 1)))
                 in_shardings.append(NamedSharding(mesh, spec))
+                is_batch_sharded.append(False)
                 is_fsdp_sharded.append(True)
             else:
                 in_shardings.append(replicated)
+                is_batch_sharded.append(False)
                 is_fsdp_sharded.append(False)
         batch_sharded = NamedSharding(mesh, P("torch_dist"))
         out_node = next(n for n in self.gm.graph.nodes if n.op == "output")
@@ -968,6 +981,23 @@ class _XLAModule(torch.nn.Module):
             out_val = (
                 leaf.meta.get("val", None) if isinstance(leaf, torch.fx.Node) else None
             )
+            explicit_fsdp_output = (
+                leaf.meta.get("is_fsdp_sharded_output", None)
+                if isinstance(leaf, torch.fx.Node)
+                else None
+            )
+            if explicit_fsdp_output is not None:
+                ndim = out_val.ndim if hasattr(out_val, "ndim") else 0
+                if bool(explicit_fsdp_output) and ndim >= 1:
+                    out_sharding_list.append(
+                        NamedSharding(
+                            mesh,
+                            P("torch_dist", *([None] * (ndim - 1))),
+                        )
+                    )
+                else:
+                    out_sharding_list.append(replicated)
+                continue
             out_shape = (
                 tuple(out_val.shape)
                 if out_val is not None and hasattr(out_val, "shape")
@@ -998,7 +1028,7 @@ class _XLAModule(torch.nn.Module):
         logger.info(
             "Compiling with GSPMD: %d placeholders, %d batch-sharded, %d weight-sharded, mesh=%s",
             len(placeholders),
-            sum(is_batch),
+            sum(is_batch_sharded),
             sum(is_fsdp_sharded),
             mesh.axis_names,
         )

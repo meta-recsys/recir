@@ -11,9 +11,10 @@ Tests FSDP (fully_shard) with GSPMDParallel in a true multi-process
 environment. Requires 4 GPUs (2 processes x 2 GPUs each).
 """
 
-import os
+import socket
 
 import torch
+import torch.distributed as dist
 from recir.api import compile
 from recir.backends import XLAGSPMDBackend
 from recir.distributed.parallel_mode import GSPMDParallel
@@ -32,7 +33,22 @@ from torch.testing._internal.distributed._tensor.common_dtensor import (
     with_comms,
 )
 
-_PORT_OFFSET = 5000
+
+def _shared_jax_coordinator_port(rank: int) -> int:
+    coordinator_port: list[object] = [None]
+    if rank == 0:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+            listener.bind(("127.0.0.1", 0))
+            coordinator_port[0] = listener.getsockname()[1]
+    dist.broadcast_object_list(
+        coordinator_port,
+        src=0,
+        device=torch.device(f"cuda:{rank}"),
+    )
+    port = coordinator_port[0]
+    if not isinstance(port, int):
+        raise RuntimeError(f"Invalid JAX coordinator port: {port!r}")
+    return port
 
 
 class TestMultiProcessFSDP(DestroyPGMixin, DTensorTestBase):
@@ -63,10 +79,9 @@ class TestMultiProcessFSDP(DestroyPGMixin, DTensorTestBase):
         global_input = torch.randn(LOCAL_BS * num_ranks, dim)
         local_input = global_input[self.rank * local_bs : (self.rank + 1) * local_bs]
 
-        master_addr = os.environ.get("MASTER_ADDR", "localhost")
-        master_port = int(os.environ.get("MASTER_PORT", "29500"))
+        coordinator_port = _shared_jax_coordinator_port(self.rank)
         jax.distributed.initialize(
-            coordinator_address=f"{master_addr}:{master_port + _PORT_OFFSET}",
+            coordinator_address=f"127.0.0.1:{coordinator_port}",
             num_processes=self.world_size,
             process_id=self.rank,
             local_device_ids=local_ids,
@@ -79,6 +94,14 @@ class TestMultiProcessFSDP(DestroyPGMixin, DTensorTestBase):
             torch.manual_seed(42)
             model = SimpleMLP(dim=dim).cpu()
             opt = torch.optim.SGD(model.parameters(), lr=0.01, foreach=False)
+            torch.manual_seed(42)
+            reference = SimpleMLP(dim=dim).cpu()
+            reference_opt = torch.optim.SGD(
+                reference.parameters(), lr=0.01, foreach=False
+            )
+            (reference(global_input).sum() / num_ranks).backward()
+            reference_opt.step()
+            reference_params = dict(reference.named_parameters())
 
             @compile(
                 parallel_mode=GSPMDParallel(
@@ -94,6 +117,17 @@ class TestMultiProcessFSDP(DestroyPGMixin, DTensorTestBase):
                 opt.step()
 
             train_step(model, opt, local_input)
+
+            for name, parameter in model.named_parameters():
+                expected_local_shard = reference_params[name].chunk(
+                    self.world_size, dim=0
+                )[self.rank]
+                torch.testing.assert_close(
+                    parameter,
+                    expected_local_shard,
+                    atol=1e-5,
+                    rtol=1e-5,
+                )
 
             compiled_obj = train_step.__dict__["_compiled_obj"]
             fsdp_size = sum(

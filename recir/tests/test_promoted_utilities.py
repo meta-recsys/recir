@@ -14,12 +14,20 @@ the top-level ``recir`` package.
 """
 
 import unittest
+from types import SimpleNamespace
 from typing import List
 
 import recir
 import torch
 import torch.nn as nn
-from recir.api import add_state, extract_subgraph, find_markers, replace_region
+from recir.api import (
+    add_state,
+    COMPILED_OBJECT_KEY,
+    extract_subgraph,
+    find_markers,
+    invalidate_device_state,
+    replace_region,
+)
 from torch import fx
 from torch.fx.experimental.proxy_tensor import make_fx
 
@@ -165,6 +173,22 @@ class AddStateTest(unittest.TestCase):
             indices.append(add_state(gm, flat_state, f"state_{i}", torch.zeros(2, 2)))
         self.assertEqual(indices, [0, 1, 2])
         self.assertEqual(len(flat_state), 3)
+
+
+class InvalidateDeviceStateTest(unittest.TestCase):
+    def test_discards_cached_state_from_compiled_function(self) -> None:
+        state_manager = SimpleNamespace(device_state=[object()])
+
+        def compiled_function() -> None:
+            pass
+
+        compiled_function.__dict__[COMPILED_OBJECT_KEY] = SimpleNamespace(
+            state_manager=state_manager
+        )
+
+        invalidate_device_state(compiled_function)
+
+        self.assertIsNone(state_manager.device_state)
 
 
 class TopLevelExportTest(unittest.TestCase):

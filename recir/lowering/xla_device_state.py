@@ -91,6 +91,13 @@ class XLADeviceStateManager(DeviceStateManager):
             and jax.device_count() == 1
         ):
             self.device_state = self._convert_flat_state_to_jax(flat_state)
+        if last_train_step and self.device_state is not None:
+            # The final slow path consumes every PyTorch flat_state leaf, so
+            # partial/skip-FQN synchronization is not valid here. Keep the cache
+            # until process_outputs completes: if execution raises, the cached
+            # pre-call state remains authoritative and a retry can refresh the
+            # host mirror again.
+            self.sync_to_torch(flat_state)
         device_state = self.device_state
         self._used_fast_path = device_state is not None and not last_train_step
         if self._used_fast_path:
