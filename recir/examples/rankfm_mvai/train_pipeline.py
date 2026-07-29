@@ -119,6 +119,35 @@ def _loss_series(
     return series
 
 
+def _llw_series(named: Dict[str, Any]) -> Dict[str, float]:
+    """LLW `s` (loss_scale) + derived weights as TB scalars, one series per task
+    (plus s_mean/min/max aggregates over all tasks)."""
+    series: Dict[str, float] = {}
+    s = named.get("loss_scale")
+    if isinstance(s, torch.Tensor) and s.numel() > 0:
+        sf = s.detach().float().reshape(-1)
+        series["llw/s_mean"] = float(sf.mean())
+        series["llw/s_min"] = float(sf.min())
+        series["llw/s_max"] = float(sf.max())
+        for i in range(sf.numel()):
+            series[f"llw/s_task_{i}"] = float(sf[i])
+    w = named.get("llw_weights")
+    if isinstance(w, torch.Tensor) and w.numel() > 0:
+        wf = w.detach().float().reshape(-1)
+        for i in range(wf.numel()):
+            series[f"llw/w_task_{i}"] = float(wf[i])
+    return series
+
+
+def _hstu_series(named: Dict[str, Any]) -> Dict[str, float]:
+    """MoT mt_aux (ue.ie) total loss as a TB scalar."""
+    series: Dict[str, float] = {}
+    m = named.get("mt_loss_total")
+    if isinstance(m, torch.Tensor) and m.numel() > 0:
+        series["mt_loss/total"] = float(m.detach().float().reshape(-1)[0])
+    return series
+
+
 class RecirXLATrainPipeline(RankingSGDTrainPipeline):
     """Self-compiling-model pipeline + udd_fm-equivalent ranking metrics.
 
@@ -245,11 +274,14 @@ class RecirXLATrainPipeline(RankingSGDTrainPipeline):
             "num_real_candidates": int(batch.num_candidates.sum()),
         }
         self._update_ranking_metrics(ret)
-        # Log the training loss to TB (aggregate + per NE task); the base pipeline
-        # only reports prediction-derived NE/CTR/MSE and drops the loss return.
-        self._loss_metric.update(
-            values=_loss_series(losses, self._loss_task_names, self._cls_indices)
+        # Log the training loss to TB (aggregate + per NE task + LLW s/weights + MT
+        # mt_loss); the base pipeline only reports prediction-derived NE/CTR/MSE.
+        _series: Dict[str, Any] = _loss_series(
+            losses, self._loss_task_names, self._cls_indices
         )
+        _series.update(_llw_series(named))
+        _series.update(_hstu_series(named))
+        self._loss_metric.update(values=_series)
         return losses, ret
 
     @property
@@ -405,15 +437,15 @@ class EagerCPUTrainPipeline(RankingSGDTrainPipeline):
         # The wrapper compiles lazily on its first __call__; we deliberately never
         # call it. Reach through to the raw model + dense opt + warmup it built
         # (backend.setup/DMP already applied, dense AdamW + warmup already wired).
-        # pyre-ignore[16]: wrapper attrs are dynamic.
-        self._raw_model: nn.Module = model._model
-        self._warmup: Any = model._warmup
+        wrapper: Any = model
+        self._raw_model: nn.Module = wrapper._model
+        self._warmup: Any = wrapper._warmup
 
         # Rebuild the dense optimizer as a plain CPU AdamW (capturable=False,
         # scalar LR). See the class docstring for why TensorLRAdamW's tensor-LR
         # capturable=True path can't run on CPU. Same params + hyperparameters ->
         # identical Adam update.
-        tensor_lr_opt: Any = model._dense_opt  # pyre-ignore[16]
+        tensor_lr_opt: Any = wrapper._dense_opt
         self._dense_params: List[nn.Parameter] = [
             p for group in tensor_lr_opt.param_groups for p in group["params"]
         ]
@@ -479,11 +511,14 @@ class EagerCPUTrainPipeline(RankingSGDTrainPipeline):
             "num_real_candidates": int(batch.num_candidates.sum()),
         }
         self._update_ranking_metrics(ret)
-        # Log the training loss to TB (aggregate + per NE task); parity with
-        # RecirXLATrainPipeline. all_losses is the per-task vector.
-        self._loss_metric.update(
-            values=_loss_series(all_losses, self._loss_task_names, self._cls_indices)
+        # Log the training loss to TB (aggregate + per NE task + LLW s/weights + MT
+        # mt_loss); parity with RecirXLATrainPipeline. all_losses is the per-task vector.
+        _series: Dict[str, Any] = _loss_series(
+            all_losses, self._loss_task_names, self._cls_indices
         )
+        _series.update(_llw_series(named))
+        _series.update(_hstu_series(named))
+        self._loss_metric.update(values=_series)
         return all_losses.detach(), ret
 
     @property
