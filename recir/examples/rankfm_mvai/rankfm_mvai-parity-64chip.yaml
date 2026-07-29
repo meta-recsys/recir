@@ -1,0 +1,103 @@
+# RankFM-MVAI CPU-eager vs TPU-compiled parity on the same 64-chip
+# (16-host, 4x4x4) configuration as rankfm_mvai-64chip.yaml. Both cells run
+# one optimizer step over the replicated rank_0 replay batch with matching model,
+# precision, batch, candidate, hash-size, optimizer, and TPU runtime settings.
+#
+# Submit:
+#   PARITY_SKIP_BUILD=0 IMAGE_TAG=latest \
+#     YAML=recir/examples/rankfm_mvai/rankfm_mvai-parity-64chip.yaml \
+#     PARITY_GCS_DATA_PATH=gs://cq-mrs-core-shared_mrs_tpu_y317h/rankfm_1shard_data \
+#     ./recir/examples/rankfm_mvai/run_parity.sh
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  generateName: rankfm-parity-64chip-
+  namespace: ns-mrs-core-shared
+  labels:
+    kueue.x-k8s.io/queue-name: lq-training
+    x.tpu.cloud.google.com/slice-autoprovisioning: "async"
+spec:
+  replicatedJobs:
+  - name: worker
+    replicas: 1
+    template:
+      metadata:
+        labels:
+          x.tpu.google.com/inject-slice-selector: "true"
+      spec:
+        parallelism: 16
+        completions: 16
+        completionMode: Indexed
+        backoffLimit: 0
+        template:
+          metadata:
+            annotations:
+              cloud.google.com/gke-tpu-slice-topology: "4x4x4"
+          spec:
+            serviceAccountName: default
+            containers:
+            - name: parity
+              image: us-central1-docker.pkg.dev/mrs-tpu-y317h/recml/rankfm_mvai_tpu:latest
+              imagePullPolicy: Always
+              env:
+              - name: PYTHONUNBUFFERED
+                value: "1"
+              - name: PJRT_DEVICE
+                value: "TPU"
+              - name: PARITY_DEVICE
+                value: "tpu"
+              # Match rankfm_mvai-64chip.yaml: fp32, batch 32, hash cap 10000.
+              - name: PARITY_BF16
+                value: "0"
+              - name: PARITY_LOCAL_BATCH_SIZE
+                value: "32"
+              - name: PARITY_HASH_SIZE_CAP
+                value: "10000"
+              # Real e2e data (gs:// URI; no gcsfuse mount needed). Same rank_0 dump
+              # the 64chip trainer reads, replicated across all 16 hosts.
+              - name: PARITY_GCS_DATA_PATH
+                value: "gs://cq-mrs-core-shared_mrs_tpu_y317h/rankfm_1shard_data"
+              - name: PARITY_DATA_FILE_TEMPLATE
+                value: "rank_0_batch_{i}.pt.zst"
+              - name: PARITY_DATA_FILE_INDEX
+                value: "1"
+              - name: MASTER_PORT
+                value: "29500"
+              # Extend the TPU init barrier deadline so slower-mounting pods don't
+              # time out the faster ones at jax.process_index() (mirrors 64chip).
+              - name: JAX_DISTRIBUTED_INITIALIZATION_TIMEOUT
+                value: "1800"
+              - name: TPU_INIT_TIMEOUT_SECONDS
+                value: "1800"
+              - name: TPU_LIBRARY_INIT_TIMEOUT
+                value: "1800"
+              - name: JOBSET_NAME
+                valueFrom:
+                  fieldRef:
+                    fieldPath: metadata.labels['jobset.sigs.k8s.io/jobset-name']
+              - name: PARITY_EMB_BACKEND
+                value: "in_graph"
+              command:
+              - bash
+              - -c
+              - |
+                set -uo pipefail
+                echo "=== jax devices ==="
+                python3 -c "import jax; print(len(jax.devices()), 'devices')" || true
+                echo "=== CPU-eager vs TPU-compiled parity (64 chip) ==="
+                python3 -u -m recir.examples.rankfm_mvai.parity_forward_loss
+              ports:
+              - containerPort: 8471
+              resources:
+                limits:
+                  google.com/tpu: 4
+                requests:
+                  google.com/tpu: 4
+            nodeSelector:
+              cloud.google.com/gke-tpu-accelerator: tpu7x
+              cloud.google.com/gke-tpu-topology: "4x4x4"
+            tolerations:
+            - key: "google.com/tpu"
+              operator: "Exists"
+              effect: "NoSchedule"
+            restartPolicy: Never

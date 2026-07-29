@@ -75,6 +75,7 @@ _BWD_REGISTRY: Dict[int, Callable[[torch.Tensor, int], None]] = {}
 # registry entries.
 _dispatch_id_counter: "itertools.count[int]" = itertools.count()
 _registry_lock: threading.Lock = threading.Lock()
+_gradient_division_lock: threading.Lock = threading.Lock()
 
 
 def _allocate_dispatch_id() -> int:
@@ -113,28 +114,15 @@ has_side_effect(_dispatch_bwd)
 
 def _wrap_with_save_for_backward(
     fwd_fn: Callable[..., object],
-    num_ranks: int,
+    disable_torchrec_gradient_division: bool,
 ) -> Tuple[
     Callable[..., Tuple[torch.Tensor, ...]],
     Callable[[torch.Tensor, int], None],
 ]:
-    """Build (fwd, bwd) closures around ``fwd_fn`` that bridge autograd.
-
-    The forward closure runs ``fwd_fn(*inputs)`` under
-    :func:`torch.enable_grad`, pytree-flattens the tensor leaves, saves the
-    ``requires_grad`` ones, and returns detached copies of all leaves.
-
-    The backward closure runs :func:`torch.autograd.backward` against the
-    saved tensors with ``grad / num_ranks`` (DDP-style mean scaling).
-    """
-    # In-function import: ``torch.utils._pytree`` is only used inside this
-    # single helper, and importing it at module scope would pull torch's
-    # pytree initialization into ``recir.eager_dispatch`` import time —
-    # which creates a circular-import risk with the recir modules that
-    # eager_dispatch is imported from. Keep it local to the helper.
+    """Bridge autograd across a graph break with one combined backward."""
     import torch.utils._pytree as pytree
 
-    state: dict[str, Any] = {"saved": None, "pending": 0}
+    state: dict[str, Any] = {"saved": None, "grads": {}}
 
     def fwd(*inputs: torch.Tensor) -> Tuple[torch.Tensor, ...]:
         with torch.enable_grad():
@@ -142,30 +130,39 @@ def _wrap_with_save_for_backward(
         flat = [
             t for t in pytree.tree_leaves(raw_output) if isinstance(t, torch.Tensor)
         ]
-        saved = [t for t in flat if t.requires_grad]
-        state["saved"] = saved
-        state["pending"] = len(saved)
+        state["saved"] = [t for t in flat if t.requires_grad]
+        state["grads"] = {}
         return tuple(t.detach() for t in flat)
 
     def bwd(grad: torch.Tensor, grad_idx: int = 0) -> None:
         saved = state["saved"]
-        if saved is not None and grad_idx < len(saved):
-            s = saved[grad_idx]
-            # Grads may arrive in any grad_idx order (the torch_tpu compiled
-            # backward emits them descending), so count down the outstanding
-            # saved leaves instead of assuming grad_idx == len-1 is last; freeing
-            # early would drop every later grad (here: the SparseCore embedding).
-            state["pending"] = int(state["pending"]) - 1
-            is_last = int(state["pending"]) == 0
-            # The grad arrives from the compiled (e.g. torch_tpu) region on the
-            # compute device, but the eager-saved activation may live on a
-            # different device (e.g. cpu for a torchrec embedding). Move the
-            # grad to the saved tensor's device for the eager backward. No-op
-            # when devices already match (e.g. the torchax/XLA path).
-            grad = grad.to(s.device)
-            torch.autograd.backward([s], [grad / num_ranks], retain_graph=not is_last)
-            if is_last:
-                state["saved"] = None
+        if saved is None or grad_idx >= len(saved):
+            return
+        grads = state["grads"]
+        grads[grad_idx] = grad.to(saved[grad_idx].device)
+        if len(grads) != len(saved):
+            return
+
+        ordered_grads = [grads[i] for i in range(len(saved))]
+        try:
+            if disable_torchrec_gradient_division:
+                from torchrec.distributed.comm_ops import (
+                    get_gradient_division,
+                    set_gradient_division,
+                )
+
+                with _gradient_division_lock:
+                    previous = get_gradient_division()
+                    set_gradient_division(False)
+                    try:
+                        torch.autograd.backward(saved, ordered_grads)
+                    finally:
+                        set_gradient_division(previous)
+            else:
+                torch.autograd.backward(saved, ordered_grads)
+        finally:
+            state["saved"] = None
+            state["grads"] = {}
 
     return fwd, bwd
 
@@ -262,6 +259,7 @@ def install_graph_break_dispatch(
     *,
     num_state_tensors: int,
     num_ranks: int = 1,
+    disable_torchrec_gradient_division: bool = False,
     register_backward: bool = True,
 ) -> Optional[int]:
     """Replace markers planted under ``marker_prefix`` with a graph-break dispatch.
@@ -278,6 +276,9 @@ def install_graph_break_dispatch(
       idx)`` calls so their downstream users see the runtime dispatch result.
     * ``::bwd::<idx>`` markers (if any) → replaced with ``_dispatch_bwd(...)``
       calls so gradient grads flow into the user-supplied backward callable.
+
+    ``disable_torchrec_gradient_division`` is only for torchrec sparse seams,
+    where the combined backward must produce a cross-host gradient sum.
 
     Returns the allocated dispatch id (``None`` if no markers matched).
     """
@@ -307,7 +308,7 @@ def install_graph_break_dispatch(
         gm.recompile()
         return None
 
-    fwd, bwd = _wrap_with_save_for_backward(fwd_fn, num_ranks)
+    fwd, bwd = _wrap_with_save_for_backward(fwd_fn, disable_torchrec_gradient_division)
     dispatch_id = _allocate_dispatch_id()
     with _registry_lock:
         _FWD_REGISTRY[dispatch_id] = fwd
