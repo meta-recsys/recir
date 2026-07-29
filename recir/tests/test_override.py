@@ -8,6 +8,7 @@ Tests the marker-based override machinery (mark_boundary + dispatcher) using
 a simple toy model without XLA, DMP, or multiprocess complexity.
 """
 
+import operator
 import unittest
 from copy import deepcopy
 
@@ -42,6 +43,34 @@ def _has_marker(gm, suffix: str) -> bool:
 
 
 class TestOverride(unittest.TestCase):
+    def test_scalar_dispatch_output_is_not_batch_sharded(self):
+        graph = torch.fx.Graph()
+        x = graph.placeholder("x")
+        x.meta["val"] = torch.ones(1)
+        output = graph.call_function(
+            torch.ops.recir.mark_boundary.default,
+            args=(x, "scalar::output::0"),
+        )
+        output.meta["val"] = torch.tensor(1.0)
+        graph.output(output)
+        gm = torch.fx.GraphModule({}, graph)
+
+        install_graph_break_dispatch(
+            gm,
+            "scalar",
+            lambda value: (value.sum(),),
+            num_state_tensors=0,
+            register_backward=False,
+        )
+
+        getitem = next(
+            node
+            for node in gm.graph.nodes
+            if node.op == "call_function" and node.target is operator.getitem
+        )
+        self.assertFalse(getitem.meta["is_batch_input"])
+        self.assertNotIn("batch_dim", getitem.meta)
+
     def test_install_without_backward_removes_backward_markers(self):
         graph = torch.fx.Graph()
         x = graph.placeholder("x")

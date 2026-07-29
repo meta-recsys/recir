@@ -181,6 +181,7 @@ def make_padding_region_transforms(
                 "ro_id_list_lengths",
                 "nro_id_list_values",
                 "nro_id_list_lengths",
+                "all_labels",
                 "candidate_sum",
                 "world_candidate_sum",
             },
@@ -349,7 +350,6 @@ def _extract_train_step_args(
         batch.supervision_label.t().contiguous(),
         batch.supervision_weight.t().contiguous(),
         batch.all_labels,
-        batch.num_candidates.sum(),
         world_candidate_sum(batch.num_candidates),
     )
 
