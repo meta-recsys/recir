@@ -327,7 +327,6 @@ class TestXSurfaceXLACompile(unittest.TestCase):
                     "ro_id_list_lengths",
                     "nro_id_list_values",
                     "nro_id_list_lengths",
-                    "candidate_sum",
                     "world_candidate_sum",
                 },
             )
@@ -348,7 +347,6 @@ class TestXSurfaceXLACompile(unittest.TestCase):
             supervision_label_t: torch.Tensor,
             supervision_weight_t: torch.Tensor,
             all_labels: Dict[str, torch.Tensor],
-            candidate_sum: torch.Tensor,
             world_candidate_sum: torch.Tensor,
         ) -> torch.Tensor:
             all_losses, _ = mod(
@@ -364,7 +362,6 @@ class TestXSurfaceXLACompile(unittest.TestCase):
                 supervision_label_t,
                 supervision_weight_t,
                 all_labels,
-                candidate_sum,
                 world_candidate_sum,
             )
             loss: torch.Tensor = all_losses.sum()
@@ -374,7 +371,6 @@ class TestXSurfaceXLACompile(unittest.TestCase):
 
         train_step = compile(**compile_kwargs)(train_step_fn)
 
-        candidate_sum = batch.num_candidates.sum()
         wcs = world_candidate_sum(batch.num_candidates)
         all_losses_list = []
         for _ in range(num_steps):
@@ -393,7 +389,6 @@ class TestXSurfaceXLACompile(unittest.TestCase):
                 batch.supervision_label.t().contiguous(),
                 batch.supervision_weight.t().contiguous(),
                 batch.all_labels,
-                candidate_sum,
                 wcs,
             )
             sync_device_state_to_torch(train_step)
