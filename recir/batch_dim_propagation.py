@@ -291,16 +291,14 @@ def _output_batch_dim_for(
         return input_batch_dim
 
     # embedding_dense_backward(grad_output, indices, num_weights, padding_idx,
-    # scale_grad_by_freq) -> (num_weights, embed_dim). The op reduces over
-    # the leading batch axis of grad_output, so the output tensor is *not*
-    # shape-sharded along the batch axis any more. But surgery downstream
-    # still needs to know this grad came from a batched embedding so that
-    # the AllToAll-based v2 row-wise rewrite can reason about it; we
-    # propagate `is_batch_input` from the grad_output (arg 0) so the tag
-    # survives across the boundary. batch_dim stays the same as the
-    # gradient input's batch_dim.
+    # scale_grad_by_freq) -> grad_weight[V, D]. Dim 0 is the VOCAB axis, NOT the
+    # batch axis (the op reduces over grad_output's batch axis), so it must stay
+    # untagged -> replicated. Tagging batch_dim=0 makes _to_sharded_jax shape-
+    # shard the vocab along the batch mesh axis: a REPLICATED dense embedding
+    # then gets its grad inflated to [V*host_count, D] while its replicated AdamW
+    # state stays [V, D] -> broadcast crash at the optimizer lerp under multi-host.
     if target == aten.embedding_dense_backward.default:
-        return input_batch_dim
+        return None
 
     # cumsum(input, dim): preserves shape. Always propagate batch_dim.
     if target == aten.cumsum.default:
