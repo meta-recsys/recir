@@ -92,12 +92,17 @@ class Run:
     def resolve_pod(self) -> bool:
         """Find the worker-0-0 pod for this jobset (returns True once found)."""
         out = sh(self._kube("get", "pods", "-o", "name"), check=False, quiet=True)
+        found = None
         for line in out.splitlines():
             name = line.replace("pod/", "").strip()
             if self.jobset and self.jobset in name and "worker-0-0" in name:
-                self.pod = name
-                return True
-        return False
+                found = name
+                break
+        if found == self.pod:
+            return found is not None
+        self.pod = found
+        self.container = None
+        return found is not None
 
     def resolve_container(self) -> None:
         if self.pod and not self.container:
@@ -127,10 +132,10 @@ class Run:
             or "Unknown"
         )
 
-    def terminal(self) -> bool:
+    def terminal_state(self) -> str:
         if not self.jobset:
-            return False
-        st = sh(
+            return ""
+        return sh(
             self._kube(
                 "get",
                 "jobset",
@@ -141,7 +146,9 @@ class Run:
             check=False,
             quiet=True,
         ).strip()
-        return bool(st)
+
+    def terminal(self) -> bool:
+        return bool(self.terminal_state())
 
     def logs(self) -> str:
         if not self.pod:
@@ -218,23 +225,61 @@ def compare(a: Run, b: Run, a_ne, b_ne) -> str:
     return "\n".join(lines)
 
 
-def copy_tb_from_gcs(jobset: str, dest_dir: str, bucket: str) -> int:
+def require_completed(runs: Tuple[Run, Run], out_dir: str) -> None:
+    terminal_states = [(run.label, run.terminal_state()) for run in runs]
+    unsuccessful = [
+        (label, state or "not terminal")
+        for label, state in terminal_states
+        if state != "Completed"
+    ]
+    if unsuccessful:
+        details = ", ".join(f"{label}={state}" for label, state in unsuccessful)
+        raise RuntimeError(
+            f"JobSet experiment did not complete successfully: {details}. "
+            f"Logs were saved under {out_dir}."
+        )
+
+
+def copy_tb_from_gcs(
+    jobset: str,
+    dest_dir: str,
+    bucket: str,
+    retries: int = 10,
+    delay_s: int = 30,
+) -> int:
     """Mirror a finished run's TB events from GCS into dest_dir.
 
     Returns total bytes copied (0 if nothing real flushed -- a killed/short run
     leaves only 0/88-byte header files, which we treat as empty).
+
+    Retries with a delay: the pod writes its TB events to gcsfuse in the
+    post-run ``cp`` and then exits, so when we observe the JobSet as Completed
+    the events may not yet be visible in GCS (gcsfuse flush + list eventual
+    consistency). Without the retry, a single early read returns 0 bytes and
+    the run looks like it produced no TensorBoard even though it did.
     """
     os.makedirs(dest_dir, exist_ok=True)
     src = f"gs://{bucket}/tensorboard/{jobset}"
-    sh(
-        ["gcloud", "storage", "cp", "-r", f"{src}/*", f"{dest_dir}/"],
-        check=False,
-        quiet=True,
-    )
     total = 0
-    for dp, _, fs in os.walk(dest_dir):
-        for f in fs:
-            total += os.path.getsize(os.path.join(dp, f))
+    for attempt in range(retries):
+        sh(
+            ["gcloud", "storage", "cp", "-r", f"{src}/*", f"{dest_dir}/"],
+            check=False,
+            quiet=True,
+        )
+        total = 0
+        for dp, _, fs in os.walk(dest_dir):
+            for f in fs:
+                total += os.path.getsize(os.path.join(dp, f))
+        if total > 200:
+            break
+        if attempt < retries - 1:
+            print(
+                f"[tb] {jobset}: {total} bytes in GCS, not flushed yet -- "
+                f"retry {attempt + 1}/{retries - 1} in {delay_s}s",
+                file=sys.stderr,
+            )
+            time.sleep(delay_s)
     return total
 
 
@@ -405,8 +450,10 @@ def main() -> int:
     try:
         while time.time() < deadline:
             for r in (a, b):
-                if not r.pod:
-                    r.resolve_pod()
+                # A JobSet may replace a failed pod with a new random suffix.
+                # Refresh on every poll rather than permanently caching the
+                # first worker-0-0 name.
+                r.resolve_pod()
             a_text = a.logs() if a.pod else ""
             b_text = b.logs() if b.pod else ""
             print(
@@ -434,6 +481,7 @@ def main() -> int:
             with open(os.path.join(args.out_dir, f"{r.label}.log"), "w") as f:
                 f.write(txt)
         a_ne, b_ne = parse_ne(a_text), parse_ne(b_text)
+        require_completed((a, b), args.out_dir)
         report = compare(a, b, a_ne, b_ne)
         print("\n" + "=" * 72)
         print(f"COMPARISON  A=[{a.label}] {a.jobset}   B=[{b.label}] {b.jobset}")

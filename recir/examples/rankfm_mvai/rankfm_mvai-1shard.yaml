@@ -72,6 +72,9 @@ spec:
               # byte-identical; here it just resolves to rank_0.
               - >-
                 RANK=${JOB_COMPLETION_INDEX:-0} ;
+                JOBSET_NAME=$(echo "$HOSTNAME" | sed -E 's/-worker-.*//') ;
+                export JOBSET_NAME ;
+                export MVAI_JOB_NAME="$JOBSET_NAME" ;
                 FIRST_FILE=rank_${RANK}_batch_1.pt.zst ;
                 echo "Pod $RANK waiting for /mnt/gcs-out/rankfm_1shard_data/$FIRST_FILE as mount-ready probe..." ;
                 START=$(date +%s) ;
@@ -82,10 +85,15 @@ spec:
                 python3 -u -m recir.examples.rankfm_mvai.train
                 --max_steps 5000
                 --local_batch_size 32
-                --num_candidates 32
-                --hash_size_cap 1000000
+                --num_candidates 20
+                --no_bf16_training
+                --hash_size_cap 10000
                 --l1_num_layers 3
                 --l2_num_layers 11
+                --max_uih_seq_len 3072
+                --l2_max_seq_len 512
+                --disable_seq_len_sampling
+                --seq_ro_per_sample_budget 3072
                 --embedding_backend cpu
                 --gcs_data_path /mnt/gcs-out/rankfm_1shard_data
                 --data_file_template "rank_${RANK}_batch_{i}.pt.zst"
