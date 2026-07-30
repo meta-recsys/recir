@@ -73,7 +73,6 @@ class _EagerCore(NamedTuple):
     ro_kjt_keys: List[str]
     nro_kjt_keys: List[str]
     unary_kjt_keys: List[str]
-    ro_per_key_budgets: List[int]
     num_candidates_per_sample: int
     table_configs: List[Any]
 
@@ -127,16 +126,6 @@ def _build_eager_core(
     assert _unary is not None
     unary_kjt_keys: List[str] = list(_unary.keys())
 
-    ro_per_sample_budgets: Dict[str, int] = (
-        module_config.static_ro_per_sample_budgets
-        or dict(module_config.contextual_feature_to_max_length)
-    )
-    ro_per_key_budgets: List[int] = [
-        trainer_cfg.local_batch_size
-        * ro_per_sample_budgets.get(k, int(module_config.hstu_max_seq_len))
-        for k in ro_kjt_keys
-    ]
-
     # pyre-ignore[16]: dynamic submodule traversal through hammer v3 nn.Module
     #   union; the runtime path exists on BlueReelsVDDTrainV3.
     ec = model.recblock.tokenizer_stack.mot_sparse_arch._sparse_arch._embedding_collection
@@ -149,7 +138,6 @@ def _build_eager_core(
         ro_kjt_keys=ro_kjt_keys,
         nro_kjt_keys=nro_kjt_keys,
         unary_kjt_keys=unary_kjt_keys,
-        ro_per_key_budgets=ro_per_key_budgets,
         num_candidates_per_sample=num_candidates_per_sample,
         table_configs=table_configs,
     )
@@ -317,7 +305,6 @@ def _run_eager_training_loop(
     feature_config: Optional[BlueReelsVDDFeatureConfig],
     data_pipe: Optional[BatchReplayPipe] = None,
     key_to_size: Optional[Dict[str, int]] = None,
-    ro_per_key_budgets: Optional[List[int]] = None,
     tb: Optional[_TbWriter] = None,
 ) -> None:
     """Pure CPU eager forward/backward/SGD loop with loss + NE + NaN guard.
@@ -360,7 +347,6 @@ def _run_eager_training_loop(
         ),
         data_pipe,
         key_to_size,
-        ro_per_key_budgets=ro_per_key_budgets,
     )
 
     num_cls = _num_classification_tasks(model)
@@ -525,7 +511,6 @@ def main() -> None:
             feature_config=feature_config,
             data_pipe=data_pipe,
             key_to_size=core.key_to_size,
-            ro_per_key_budgets=core.ro_per_key_budgets,
             tb=tb,
         )
     finally:
