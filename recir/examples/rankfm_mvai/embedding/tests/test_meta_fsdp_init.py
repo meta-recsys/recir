@@ -52,6 +52,37 @@ class MetaFSDPInitTest(unittest.TestCase):
         s1 = np.array(jax.device_get(arr.addressable_shards[1].data))
         self.assertFalse(np.allclose(s0, s1), "per-device shards should differ")
 
+    def test_meta_optimizer_state_inits_to_zero(self) -> None:
+        devices = jax.devices()
+        world = len(devices)
+        vocab, dim = 8 * world, 1
+        mesh = Mesh(np.array(devices), ("torch_dist",))
+
+        meta_state = torch.empty(vocab, dim, device="meta")
+        meta_state._recir_meta_init_kind = "zeros"
+
+        arr = _XLAModule._to_sharded_jax(meta_state, mesh, is_fsdp_weight=True)
+
+        host = np.array(jax.device_get(arr))
+        self.assertEqual(tuple(host.shape), (vocab, dim))
+        self.assertTrue(np.all(host == 0.0))
+
+    def test_meta_weight_uses_explicit_uniform_bound(self) -> None:
+        devices = jax.devices()
+        world = len(devices)
+        vocab, dim = 8 * world, 16
+        mesh = Mesh(np.array(devices), ("torch_dist",))
+
+        meta = torch.empty(vocab, dim, device="meta")
+        meta._recir_meta_init_kind = "uniform"
+        meta._recir_meta_init_bound = 0.01
+
+        arr = _XLAModule._to_sharded_jax(meta, mesh, is_fsdp_weight=True)
+
+        host = np.array(jax.device_get(arr))
+        self.assertGreater(float(host.std()), 0.0)
+        self.assertLessEqual(float(np.max(np.abs(host))), 0.01)
+
 
 if __name__ == "__main__":
     unittest.main()

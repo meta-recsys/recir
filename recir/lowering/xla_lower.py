@@ -23,6 +23,7 @@ from recir.batch_dim_propagation import propagate_batch_input_meta
 from recir.distributed.sharding_spec import get_state_layout
 from recir.lowering.lowering_utils import segment_and_lower
 from recir.lowering.op_swap import OpSwapRegistry, swap_ops
+from recir.meta_tensor_init import get_meta_init_spec
 from recir.torchax.ops.mappings import t2j
 
 try:
@@ -116,8 +117,10 @@ def _get_local_devices() -> List[Any]:
     return p0 if p0 else devs
 
 
-# torch -> jax.numpy dtype map for on-device (meta) weight materialization,
+# torch -> jax.numpy dtype map for on-device (meta) tensor materialization,
 # where there is no host tensor to infer the dtype from via numpy.
+
+
 _TORCH_TO_JNP: dict[torch.dtype, Any] = {
     torch.float32: jnp.float32,
     torch.float64: jnp.float64,
@@ -132,17 +135,13 @@ _TORCH_TO_JNP: dict[torch.dtype, Any] = {
 }
 
 
-def _materialize_meta_fsdp_weight(tensor: Any, mesh: Any) -> Any:
-    """On-device random init for a *meta* FSDP weight.
+def _materialize_meta_fsdp_tensor(tensor: Any, mesh: Any) -> Any:
+    """On-device materialization for a *meta* FSDP tensor.
 
-    Each device generates its own shard directly in HBM via jax.random -- NO
-    host allocation, NO H2D. Enables benchmarking huge embedding tables (e.g.
-    1T-row hash) whose full host materialization + transfer would be
-    prohibitive. A meta tensor has no data, so the normal
-    ``_torch_to_numpy_for_jax`` (.cpu()) path can't run. The meta tensor's
-    leading dim is the per-process local shard (= global_rows / num_processes);
-    we rebuild the global shape and shard it row-wise across all devices,
-    matching the real-FSDP layout in ``_to_sharded_jax``.
+    Meta FSDP tensors have no host storage, so the normal torch->numpy path
+    cannot run. Table weights are generated directly in HBM with random uniform
+    initialization. Optimizer state tensors are explicitly marked for zero init
+    during state sharding and must not be randomized.
     """
     num_global = len(_get_global_devices())
     host_count = num_global // len(_get_local_devices())
@@ -154,8 +153,9 @@ def _materialize_meta_fsdp_weight(tensor: Any, mesh: Any) -> Any:
     if _AOT_TOPOLOGY.get() is not None:
         return jax.ShapeDtypeStruct(global_shape, jdtype, sharding=sharding)
     rows_per_device = global_shape[0] // num_global
-    fan_in = trailing[-1] if trailing else 1
-    stddev = 1.0 / float(fan_in) ** 0.5
+    init_kind, bound = get_meta_init_spec(
+        tensor, 1.0 / float(global_shape[0] or 1) ** 0.5
+    )
 
     # Bind statics as default args (not closure captures) to satisfy
     # pyre [53]; shard_map invokes _gen_shard with only the sharded arg.
@@ -163,13 +163,16 @@ def _materialize_meta_fsdp_weight(tensor: Any, mesh: Any) -> Any:
         _idx: Any,
         _rpd: int = rows_per_device,
         _tr: Any = trailing,
-        _sd: float = stddev,
+        _kind: str = init_kind,
+        _b: float = bound,
         _dt: Any = jdtype,
     ) -> Any:
+        if _kind == "zeros":
+            return jnp.zeros((_rpd, *_tr), dtype=_dt)
         gi = jax.lax.axis_index("torch_dist")
         key = jax.random.fold_in(jax.random.PRNGKey(0), gi)
-        shard = jax.random.normal(key, (_rpd, *_tr), dtype=_dt)
-        return (shard * _sd).astype(_dt)
+        shard = jax.random.uniform(key, (_rpd, *_tr), dtype=_dt, minval=-_b, maxval=_b)
+        return shard.astype(_dt)
 
     return shard_map(  # pyre-fixme[28]
         _gen_shard,
@@ -494,7 +497,7 @@ class _XLAModule(torch.nn.Module):
         return t.numpy()
 
     @staticmethod
-    def _to_sharded_jax(
+    def _to_sharded_jax(  # noqa: C901
         tensor: Any,
         mesh: Any,
         is_batch_input: bool = False,
@@ -575,10 +578,10 @@ class _XLAModule(torch.nn.Module):
                 # the local-buffer assembly below is the multi-process-safe path.
                 nparray = np.asarray(jax.device_get(tensor))
         else:
-            # Meta FSDP weights have no host data; materialize each shard
-            # directly on-device via jax.random (see the helper).
+            # Meta FSDP tensors have no host data; materialize each shard
+            # directly on-device (see the helper).
             if is_fsdp_weight and tensor.is_meta:
-                return _materialize_meta_fsdp_weight(tensor, mesh)
+                return _materialize_meta_fsdp_tensor(tensor, mesh)
 
             nparray = _XLAModule._torch_to_numpy_for_jax(tensor)
 
@@ -1296,7 +1299,7 @@ def _strip_profiler_nodes(gm: torch.fx.GraphModule) -> torch.fx.GraphModule:
     # autodeps2 does not introduce the dep that would re-form the
     # cycle. See ``IterGraphModule.named_xla_modules`` for the mirror
     # pattern.
-    from recir.iter_graph_module import IterGraph  # @manual  # pyre-ignore[21]
+    from recir.iter_graph_module import IterGraph  # @manual
 
     changed = False
     for node in reversed(list(gm.graph.nodes)):

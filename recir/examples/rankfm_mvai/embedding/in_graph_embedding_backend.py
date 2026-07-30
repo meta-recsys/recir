@@ -72,6 +72,7 @@ from recir.eager_dispatch import (
     mark_input,
     mark_output_with_bwd,
 )
+from recir.meta_tensor_init import mark_meta_uniform_init
 from recir.sparsecore.backend import (
     EmbeddingBackend,
     EmbeddingSetupResult,
@@ -167,7 +168,8 @@ class InGraphSparseArch(nn.Module):
             for f in tc.feature_names:
                 self._feature_to_table[f] = tc.name
             self._table_mode[tc.name] = mode
-            stddev = 1.0 / (tc.embedding_dim**0.5)
+            # Match the TorchRec EmbeddingCollection init scale
+            init_bound = 1.0 / (tc.num_embeddings**0.5)
             if mode in (TableMode.ROWWISE, TableMode.FSDP):
                 # Both are dim-0 sharded -> pad rows to a multiple of the device
                 # count (the FSDP shard count; also the ring-shift block reshape
@@ -181,13 +183,14 @@ class InGraphSparseArch(nn.Module):
                     p = nn.Parameter(
                         torch.empty(vocab, tc.embedding_dim, device="meta")
                     )
+                    mark_meta_uniform_init(p, init_bound)
                 else:
                     p = nn.Parameter(torch.empty(vocab, tc.embedding_dim))
-                    nn.init.normal_(p, std=stddev)
+                    nn.init.uniform_(p, -init_bound, init_bound)
                 self._sharded_tables[tc.name] = p
             else:  # TableMode.DP
                 p = nn.Parameter(torch.empty(tc.num_embeddings, tc.embedding_dim))
-                nn.init.normal_(p, std=stddev)
+                nn.init.uniform_(p, -init_bound, init_bound)
                 self._dp_tables[tc.name] = p
             logger.info(
                 f"[in_graph] table '{tc.name}': rows={tc.num_embeddings} "
@@ -478,6 +481,58 @@ class SparseArchInputBreakDispatcher:
         return gm, flat_state
 
 
+def _seed_in_graph_tables_from_ec(
+    old_ec: nn.Module, new_ec: "InGraphSparseArch"
+) -> None:
+    """Copy per-table weights from the model's existing torchrec
+    EmbeddingCollection into the in-graph table params, so the in_graph init is
+    BYTE-identical to the cpu EC.
+
+    Only host-materialized tables can be copied. Sharded meta params
+    (on_device_init) materialize on-device via jax.random.
+    """
+    src: Dict[str, torch.Tensor] = {}
+    for n, p in old_ec.named_parameters():
+        parts = n.split(".")
+        # torchrec EmbeddingCollection names weights "embeddings.<table>.weight";
+        # the immediate parent module name is the table (ModuleDict) key.
+        if parts[-1] == "weight" and len(parts) >= 2:
+            src[parts[-2]] = p.detach()
+    if not src:
+        logger.warning(
+            "[seed] no EmbeddingCollection weights found to seed in-graph tables "
+            "(old_ec=%s); in_graph tables keep their random init",
+            type(old_ec).__name__,
+        )
+        return
+    copied = 0
+    skipped_meta = 0
+    with torch.no_grad():
+        for name, p in new_ec._dp_tables.items():
+            if name not in src:
+                continue
+            if src[name].device.type == "meta" or p.device.type == "meta":
+                skipped_meta += 1
+                continue
+            p.copy_(src[name].to(p.dtype))
+            copied += 1
+        for name, p in new_ec._sharded_tables.items():
+            if name not in src:
+                continue
+            if src[name].device.type == "meta" or p.device.type == "meta":
+                skipped_meta += 1
+                continue
+            rows = src[name].shape[0]  # logical vocab; skip the padded tail rows
+            p[:rows].copy_(src[name].to(p.dtype))
+            copied += 1
+    logger.info(
+        "[seed] copied %d EC table(s) into in-graph params "
+        "(%d meta table(s) skipped -> on-device init)",
+        copied,
+        skipped_meta,
+    )
+
+
 class InGraphEmbeddingBackend(EmbeddingBackend):
     def __init__(
         self,
@@ -543,6 +598,11 @@ class InGraphEmbeddingBackend(EmbeddingBackend):
             fsdp_min_rows=self._fsdp_min_rows,
             on_device_init=self._on_device_init,
         )
+        logger.info(
+            f"InGraphEmbeddingBackend: on_device_init={self._on_device_init} "
+            f"(meta param -> on-device HBM random init, no host alloc/H2D)"
+        )
+        _seed_in_graph_tables_from_ec(sparse_arch._embedding_collection, new_ec)
         sparse_arch._embedding_collection = new_ec
 
         embedding_params = self.embedding_named_parameters(model)
