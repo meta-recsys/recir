@@ -1,0 +1,166 @@
+# RankFM-MVAI (xsurface V3, mvai_cloud RecTrainer) 64-chip unified TPU slice
+# (16 hosts, 4x4x4) -- the multi-host counterpart of rankfm_mvai-1shard.yaml:
+# SAME model/optimizer/data/config, just scaled to 16 gloo ranks. Driven by the
+# mvai_cloud RecTrainer; dynamic auto-slice scheduling (tpuxpack), ICI wired at
+# runtime via Slice CR.
+#
+# Data: the gcsfuse rankfm_1shard_data dump (the barnfs udd_fm_* dump it used
+# before was deleted). That dump has ONLY rank_0, so the --data_file_template is
+# FIXED to rank_0 (not rank_${RANK}) + --data_replicate_across_ranks, i.e. all 16
+# ranks read the SAME single shard (REPLICATED, not distinct-per-host). This
+# exercises the cross-host machinery (world_candidate_sum all-reduce, DMP/in_graph
+# sharding, DDP grad-avg) but does NOT exercise distinct per-chip data; a
+# multi-shard dump would be needed for that.
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  generateName: rankfm-mvai-64chip-
+  namespace: ns-mrs-core-shared
+  labels:
+    kueue.x-k8s.io/queue-name: lq-training
+    x.tpu.cloud.google.com/slice-autoprovisioning: "async"
+spec:
+  replicatedJobs:
+  - name: worker
+    replicas: 1
+    template:
+      metadata:
+        labels:
+          x.tpu.google.com/inject-slice-selector: "true"
+      spec:
+        parallelism: 16
+        completions: 16
+        completionMode: Indexed
+        backoffLimit: 0
+        template:
+          metadata:
+            annotations:
+              cloud.google.com/gke-tpu-slice-topology: "4x4x4"
+              gke-gcsfuse/volumes: "true"
+          spec:
+            serviceAccountName: default
+            containers:
+            - name: rankfm-mvai
+              image: us-central1-docker.pkg.dev/mrs-tpu-y317h/recml/rankfm_mvai_tpu:latest
+              imagePullPolicy: Always
+              env:
+              - name: PYTHONUNBUFFERED
+                value: "1"
+              # Loss is already a global mean (per-task loss / world_candidate_sum),
+              # so grad_reduction must be "sum" (no ÷num_ranks): loss_reduction="mean".
+              # model_family.py defaults to "mean" already; pin it explicitly so a
+              # future default change can't silently reintroduce the spurious
+              # ÷num_ranks (which under-scales dense grads and breaks the replicated
+              # multi-host == single-host invariant). Set to "sum" only for A/B.
+              - name: RANKFM_LOSS_REDUCTION
+                value: "mean"
+              - name: MASTER_PORT
+                value: "29500"
+              # Extend the TPU init barrier deadline so slower-mounting pods
+              # don't time out the faster ones at jax.process_index().
+              # JAX_DISTRIBUTED_INITIALIZATION_TIMEOUT covers the JAX-side
+              # wait; TPU_INIT_TIMEOUT_SECONDS / TPU_LIBRARY_INIT_TIMEOUT
+              # covers the libtpu-internal PRE_START_SESSION_BARRIER timeout
+              # (which is what the DEADLINE_EXCEEDED error originates from).
+              - name: JAX_DISTRIBUTED_INITIALIZATION_TIMEOUT
+                value: "1800"
+              - name: TPU_INIT_TIMEOUT_SECONDS
+                value: "1800"
+              - name: TPU_LIBRARY_INIT_TIMEOUT
+                value: "1800"
+              - name: JOBSET_NAME
+                valueFrom:
+                  fieldRef:
+                    fieldPath: metadata.labels['jobset.sigs.k8s.io/jobset-name']
+              # mvai's TensorboardLogger writes to
+              # /mnt/gcs/mvai_cloud/tensorboard/$MVAI_JOB_NAME (metrics.py:103-114);
+              # set it to the jobset name so each run gets its own TB subdir.
+              - name: MVAI_JOB_NAME
+                valueFrom:
+                  fieldRef:
+                    fieldPath: metadata.labels['jobset.sigs.k8s.io/jobset-name']
+              command:
+              - sh
+              - -c
+              # Data: the gcsfuse rankfm_1shard_data dump has ONLY rank_0, so the
+              # --data_file_template is FIXED to rank_0 (not rank_${RANK}) and
+              # --data_replicate_across_ranks makes all 16 ranks read that SAME
+              # single shard (REPLICATED). BatchReplayPipe builds the filename list
+              # from the template (no listdir) and reads on-demand via FUSE lazy
+              # lookup. PaddingRegionTransform pads each loaded batch to fixed
+              # post-pad shapes so ROW_WISE A2A still works across ranks. The probe
+              # below waits for rank_0_batch_1 before reaching jax.process_index().
+              - >-
+                RANK=${JOB_COMPLETION_INDEX:-0} ;
+                FIRST_FILE=rank_0_batch_1.pt.zst ;
+                echo "Pod $RANK waiting for /mnt/gcs-out/rankfm_1shard_data/$FIRST_FILE as mount-ready probe..." ;
+                START=$(date +%s) ;
+                while [ ! -e /mnt/gcs-out/rankfm_1shard_data/$FIRST_FILE ]; do
+                  sleep 5 ;
+                done ;
+                echo "data mount ready (after $(($(date +%s) - START))s); starting trainer..." ;
+                python3 -u -m recir.examples.rankfm_mvai.train
+                --max_steps 5000
+                --local_batch_size 32
+                --num_candidates 20
+                --no_bf16_training
+                --hash_size_cap 10000
+                --l1_num_layers 3
+                --l2_num_layers 11
+                --max_uih_seq_len 3072
+                --l2_max_seq_len 512
+                --disable_seq_len_sampling
+                --seq_ro_per_sample_budget 3072
+                --embedding_backend cpu
+                --gcs_data_path /mnt/gcs-out/rankfm_1shard_data
+                --data_file_template "rank_0_batch_{i}.pt.zst"
+                --data_replicate_across_ranks
+                --profile_start_step 3
+                --profile_end_step 8
+                --profile_dir "gs://cq-mrs-core-shared_mrs_tpu_y317h/tpu-profiles/${JOBSET_NAME}" ;
+                rc=$? ;
+                if [ "${RANK}" = "0" ]; then echo "Copying TensorBoard events -> gs://cq-mrs-core-shared_mrs_tpu_y317h/tensorboard/${JOBSET_NAME} ..." ; mkdir -p /mnt/gcs-out/tensorboard/${JOBSET_NAME} ; cp /mnt/gcs/mvai_cloud/tensorboard/${JOBSET_NAME}/* /mnt/gcs-out/tensorboard/${JOBSET_NAME}/ || true ; fi ;
+                exit $rc
+              ports:
+              - containerPort: 8471
+              resources:
+                limits:
+                  google.com/tpu: 4
+              volumeMounts:
+              # Local emptyDir: TB events are written here during training (fast).
+              # Writing TB straight to gcsfuse rate-limits (HTTP 429) on the
+              # growing events file and stalls the loop -- see volumes below.
+              - name: tensorboard
+                mountPath: /mnt/gcs/mvai_cloud
+              # gcsfuse: rank 0 copies the finished events here at end of run.
+              - name: tb-gcs
+                mountPath: /mnt/gcs-out
+            nodeSelector:
+              cloud.google.com/gke-tpu-accelerator: tpu7x
+              cloud.google.com/gke-tpu-topology: "4x4x4"
+            tolerations:
+            - key: "google.com/tpu"
+              operator: "Exists"
+              effect: "NoSchedule"
+            restartPolicy: Never
+            volumes:
+            # TensorBoard events. mvai's TensorboardLogger hardcodes
+            # /mnt/gcs/mvai_cloud/tensorboard/$MVAI_JOB_NAME (metrics.py) and
+            # appends to a single events file at every metric report. Backing
+            # that path with gcsfuse makes gcsfuse re-upload the whole growing
+            # (non-empty) file on each flush ("legacy staged writes"), which
+            # exceeds GCS's per-object write rate limit (HTTP 429), stalls the
+            # per-step report, and drags the whole synchronized loop. So write TB
+            # to a LOCAL emptyDir during training instead...
+            - name: tensorboard
+              emptyDir: {}
+            # ...and have rank 0 copy the finished events to the SA-owned bucket
+            # once at end of run (a new file written sequentially uses gcsfuse
+            # streaming writes -> no rate limiting). Requires the
+            # ns-mrs-core-shared default SA to have write access to this bucket.
+            - name: tb-gcs
+              csi:
+                driver: gcsfuse.csi.storage.gke.io
+                volumeAttributes:
+                  bucketName: cq-mrs-core-shared_mrs_tpu_y317h
+                  mountOptions: "implicit-dirs"
