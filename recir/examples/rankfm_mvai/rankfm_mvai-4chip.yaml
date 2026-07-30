@@ -1,9 +1,14 @@
-# RankFM-MVAI (xsurface V3, mvai_cloud RecTrainer) training on 4-chip TPU v7 slice (1 node, 2x2x1)
+# RankFM-MVAI (xsurface V3, mvai_cloud RecTrainer) 4-chip TPU v7 run (1 node,
+# 2x2x1) on REAL 1-shard data. Small/fast config (tiny model, 20 steps) for a
+# quick real-data smoke test of the TPU compile + replay path -- the heavier
+# matched-config parity run is rankfm_mvai-1shard.yaml. Reads the same single
+# shard (rankfm_1shard_data: one preprocessed batch, rank_0_batch_1.pt.zst) over
+# gcsfuse, replayed every step.
 apiVersion: jobset.x-k8s.io/v1alpha2
 kind: JobSet
 metadata:
   generateName: rankfm-mvai-4chip-
-  namespace: default
+  namespace: ns-mrs-core-shared
 spec:
   replicatedJobs:
   - name: worker
@@ -12,8 +17,15 @@ spec:
       spec:
         parallelism: 1
         completions: 1
+        completionMode: Indexed
+        backoffLimit: 0
         template:
+          metadata:
+            annotations:
+              # Inject the gcsfuse CSI sidecar for the tb-gcs volume below.
+              gke-gcsfuse/volumes: "true"
           spec:
+            serviceAccountName: default
             containers:
             - name: rankfm-mvai
               image: us-central1-docker.pkg.dev/mrs-tpu-y317h/recml/rankfm_mvai_tpu:latest
@@ -21,33 +33,87 @@ spec:
               env:
               - name: PYTHONUNBUFFERED
                 value: "1"
+              # Single 4-chip pod: skip jax.distributed.initialize() (multi-process
+              # coordination only); jax auto-detects the 4 local chips. Avoids the
+              # single-pod mis-init that breaks the eager get_override forward.
+              - name: RANKFM_SINGLE_HOST
+                value: "1"
               - name: MASTER_PORT
                 value: "29500"
               - name: JOBSET_NAME
                 valueFrom:
                   fieldRef:
                     fieldPath: metadata.labels['jobset.sigs.k8s.io/jobset-name']
+              # MVAI_JOB_NAME MUST equal JOBSET_NAME so the mvai TensorboardLogger
+              # writes events to /mnt/gcs/mvai_cloud/tensorboard/${JOBSET_NAME},
+              # which the post-run cp below copies to GCS.
+              - name: MVAI_JOB_NAME
+                valueFrom:
+                  fieldRef:
+                    fieldPath: metadata.labels['jobset.sigs.k8s.io/jobset-name']
+              - name: MAST_HPC_JOB_NAME
+                valueFrom:
+                  fieldRef:
+                    fieldPath: metadata.labels['jobset.sigs.k8s.io/jobset-name']
               command:
               - sh
               - -c
+              # Single pod -> RANK=0 -> replays rank_0_batch_1.pt.zst (the one
+              # shard) every step via the single-file --data_file_template.
               - >-
+                RANK=${JOB_COMPLETION_INDEX:-0} ;
+                FIRST_FILE=rank_${RANK}_batch_1.pt.zst ;
+                echo "Pod $RANK waiting for /mnt/gcs-out/rankfm_1shard_data/$FIRST_FILE as mount-ready probe..." ;
+                START=$(date +%s) ;
+                while [ ! -e /mnt/gcs-out/rankfm_1shard_data/$FIRST_FILE ]; do
+                  sleep 5 ;
+                done ;
+                echo "data mount ready (after $(($(date +%s) - START))s); starting trainer..." ;
                 python3 -u -m recir.examples.rankfm_mvai.train
                 --max_steps 20
-                --local_batch_size 4
-                --num_candidates 4
+                --local_batch_size 32
+                --num_candidates 32
                 --hash_size_cap 1000
                 --l1_num_layers 1
                 --l2_num_layers 1
                 --embedding_backend cpu
+                --gcs_data_path /mnt/gcs-out/rankfm_1shard_data
+                --data_file_template "rank_${RANK}_batch_{i}.pt.zst"
+                --data_replicate_across_ranks
                 --profile_start_step 3
                 --profile_end_step 8
-                --profile_dir "gs://cq-mrs-core-shared_mrs_tpu_y317h/tpu-profiles/${JOBSET_NAME}"
+                --profile_dir "gs://cq-mrs-core-shared_mrs_tpu_y317h/tpu-profiles/${JOBSET_NAME}" ;
+                rc=$? ;
+                if [ "${RANK}" = "0" ]; then echo "Copying TensorBoard events -> gs://cq-mrs-core-shared_mrs_tpu_y317h/tensorboard/${JOBSET_NAME} ..." ; mkdir -p /mnt/gcs-out/tensorboard/${JOBSET_NAME} ; cp /mnt/gcs/mvai_cloud/tensorboard/${JOBSET_NAME}/* /mnt/gcs-out/tensorboard/${JOBSET_NAME}/ || true ; fi ;
+                exit $rc
               ports:
               - containerPort: 8471
               resources:
                 limits:
                   google.com/tpu: 4
+              volumeMounts:
+              # Data + TB-out share the one gcsfuse mount of the shared bucket:
+              # data is read from /mnt/gcs-out/rankfm_1shard_data, TB events are
+              # copied to /mnt/gcs-out/tensorboard/<jobset> after the run.
+              - name: tensorboard
+                mountPath: /mnt/gcs/mvai_cloud
+              - name: tb-gcs
+                mountPath: /mnt/gcs-out
             nodeSelector:
               cloud.google.com/gke-tpu-accelerator: tpu7x
-              cloud.google.com/gke-tpu-topology: 2x2x1
+              cloud.google.com/gke-tpu-topology: "2x2x1"
+              cloud.google.com/gke-accelerator-count: "4"
+            tolerations:
+            - key: "google.com/tpu"
+              operator: "Exists"
+              effect: "NoSchedule"
             restartPolicy: Never
+            volumes:
+            - name: tensorboard
+              emptyDir: {}
+            - name: tb-gcs
+              csi:
+                driver: gcsfuse.csi.storage.gke.io
+                volumeAttributes:
+                  bucketName: cq-mrs-core-shared_mrs_tpu_y317h
+                  mountOptions: "implicit-dirs"
