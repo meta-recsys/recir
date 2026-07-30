@@ -131,6 +131,14 @@ class BatchReplayPipe:
             # /mnt/barnfs over a 100K-file dataporter dump where os.listdir
             # would take 58+ min). Each filename is opened on-demand inside
             # ``_load_batch``, which is sub-second on FUSE for known names.
+            #
+            # For GCS the blob name must include the object prefix (the path after
+            # gs://bucket/), since _download_bytes addresses blobs from the bucket
+            # root. Local paths address files relative to _local_dir (which already
+            # includes that dir), so they need no prefix. _discover_files already
+            # prefixes its synthesized names; mirror that for explicit entries.
+            if self._is_gcs and self._prefix:
+                file_list = [f"{self._prefix}/{f}" for f in file_list]
             if self._replicate:
                 self._file_list = list(file_list)
             else:
