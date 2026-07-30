@@ -30,6 +30,7 @@ from recir.region_transforms.padding import (
     pad_jagged_values,
     pad_to_static,
     PaddingRegionTransform,
+    trim_per_chip_to_size,
     unpad_grad,
     unpad_jagged_grad,
 )
@@ -125,6 +126,15 @@ class PadToStaticOpTest(unittest.TestCase):
         loss = y.sum()
         loss.backward()
         self.assertEqual(x.grad.shape, (6, 16))  # pyre-ignore
+
+
+class TrimPerChipToSizeTest(unittest.TestCase):
+    def test_removes_each_chip_dummy_suffix(self) -> None:
+        padded = torch.tensor([1, 2, 0, 3, 4, 0])
+
+        result = trim_per_chip_to_size(padded, target_size=4, num_local=2)
+
+        self.assertEqual(result.tolist(), [1, 2, 3, 4])
 
 
 class UnpadGradOpTest(unittest.TestCase):
