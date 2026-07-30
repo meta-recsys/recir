@@ -51,6 +51,20 @@ spec:
                 value: "TPU"
               - name: PARITY_DEVICE
                 value: "tpu"
+              - name: PARITY_BF16
+                value: "0"
+              - name: PARITY_LOCAL_BATCH_SIZE
+                value: "32"
+              - name: PARITY_HASH_SIZE_CAP
+                value: "10000"
+              # Real e2e data (gs:// URI; no gcsfuse mount needed). Same rank_0 dump
+              # the 64chip trainer reads, replicated across all 16 hosts.
+              - name: PARITY_GCS_DATA_PATH
+                value: "gs://cq-mrs-core-shared_mrs_tpu_y317h/rankfm_1shard_data"
+              - name: PARITY_DATA_FILE_TEMPLATE
+                value: "rank_0_batch_{i}.pt.zst"
+              - name: PARITY_DATA_FILE_INDEX
+                value: "1"
               - name: MASTER_PORT
                 value: "29500"
               # libtpu/XLA compiler flags mirrored from the bench (megacore fusion
@@ -75,8 +89,8 @@ spec:
               #   value: "4096"
               # - name: PARITY_FSDP_MIN_ROWS
               #   value: "-1"
-              # - name: PARITY_ON_DEVICE_INIT
-              #   value: "1"
+              - name: PARITY_ON_DEVICE_INIT
+                value: "0"
               command:
               - bash
               - -c

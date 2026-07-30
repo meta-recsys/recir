@@ -1,42 +1,15 @@
 #!/usr/bin/env bash
 # (c) Meta Platforms, Inc. and affiliates. Confidential and proprietary.
 #
-# One-shot driver for the RankFM-MVAI padding-inertness parity on TPU:
-#   build + push the image  ->  submit rankfm_mvai-parity-4chip.yaml  ->  tail logs.
+# One-shot CPU-eager vs TPU-compiled RankFM parity runner.
+# Build and push the image, submit the TPU JobSet, and stream its logs.
 #
-# The parity is a single short pod (parity_forward_loss.py) that runs once and
-# exits, so -- unlike run_tpu_bench.sh -- there is no xprof/trace retrieval; this
-# just streams the pod's stdout until it completes, then re-fetches the full log.
-#
-# Usage:
-#   ./run_parity.sh
-#
-# Env knobs:
-#   IMAGE_TAG           image tag to build/push AND launch (default: plund-parity,
-#                       matching the yaml). The yaml's rankfm_mvai_tpu image is
-#                       patched to this tag in a temp copy so build and submit can
-#                       never drift.
-#   PARITY_EMB_BACKEND  override the yaml's embedding backend: cpu | tpu | in_graph
-#                       (default: leave the yaml's value).
-#   PARITY_SKIP_BUILD=1 skip the podman rebuild and reuse the pushed IMAGE_TAG
-#                       (only when the image already has your current code).
-#   PARITY_RINGSHIFT_MIN_ROWS / PARITY_FSDP_MIN_ROWS / PARITY_ON_DEVICE_INIT /
-#   PARITY_BATCH_RANKS / PARITY_NUM_CANDIDATES / PARITY_INPUT / PARITY_RTOL /
-#   PARITY_ATOL         if set, forwarded into the pod env (injected into the yaml)
-#                       so you can sweep parity knobs without editing the yaml.
-#                       e.g. PARITY_RINGSHIFT_MIN_ROWS=2000000 -> all in_graph
-#                       tables use DP F.embedding (skips the ring-shift kernel).
-#   YAML                parity yaml (default: rankfm_mvai-parity-4chip.yaml).
-#   CTX / NS            kube context / namespace (defaults: current context /
-#                       ns-mrs-core-shared).
-#   DELETE_ON_EXIT=1    delete the JobSet when the script exits (default: keep).
-#
-# Examples:
-#   ./run_parity.sh                                  # build+push, yaml's backend
-#   PARITY_EMB_BACKEND=in_graph ./run_parity.sh      # ring-shift backend
-#   PARITY_EMB_BACKEND=in_graph PARITY_RINGSHIFT_MIN_ROWS=2000000 ./run_parity.sh
-#   IMAGE_TAG=$USER-parity ./run_parity.sh           # isolate from the shared tag
-#   PARITY_SKIP_BUILD=1 ./run_parity.sh              # reuse the already-pushed image
+# Usage: PARITY_GCS_DATA_PATH=gs://bucket/path ./run_parity.sh
+# Required: PARITY_GCS_DATA_PATH
+# Common overrides: IMAGE_TAG, PARITY_SKIP_BUILD, YAML, CTX, NS, DELETE_ON_EXIT,
+# PARITY_RTOL, PARITY_ATOL, PARITY_GRAD_RTOL, PARITY_GRAD_ATOL,
+# PARITY_PRECISION, PARITY_BF16, PARITY_ON_DEVICE_INIT, RANKFM_S, PARITY_HASH_SIZE_CAP,
+# PARITY_DATA_FILE_TEMPLATE, PARITY_DATA_FILE_INDEX, PARITY_LOCAL_BATCH_SIZE.
 
 set -uo pipefail
 
@@ -71,7 +44,6 @@ echo "RankFM-MVAI parity run" | tee -a "${LOG}"
 echo "  fbcode root : ${FBCODE_ROOT}" | tee -a "${LOG}"
 echo "  yaml        : ${YAML}" | tee -a "${LOG}"
 echo "  image tag   : ${IMAGE_TAG}" | tee -a "${LOG}"
-echo "  emb backend : ${PARITY_EMB_BACKEND:-<yaml default>}" | tee -a "${LOG}"
 echo "  context     : ${CTX}" | tee -a "${LOG}"
 echo "  namespace   : ${NS}" | tee -a "${LOG}"
 echo "  log file    : ${LOG}" | tee -a "${LOG}"
@@ -91,22 +63,13 @@ else
     fi
 fi
 
-# 2) Patch a temp copy of the yaml: pin the image tag to IMAGE_TAG (so build and
-#    submit can't drift), optionally override PARITY_EMB_BACKEND, and forward any
-#    PARITY_* tuning knobs set in the environment into the pod env.
+# 2) Patch a temp copy of the yaml: pin the image tag and forward supported
+# parity settings into the pod environment.
 PATCHED="$(mktemp "/tmp/_parity_${IMAGE_TAG}_XXXXXX.yaml")"
 sed -E "s|(rankfm_mvai_tpu):[A-Za-z0-9._-]+|\1:${IMAGE_TAG}|g" "${YAML}" > "${PATCHED}"
 
-if [ -n "${PARITY_EMB_BACKEND:-}" ]; then
-    awk -v val="${PARITY_EMB_BACKEND}" '
-        /name: PARITY_EMB_BACKEND/ {
-            print; getline; sub(/value:.*/, "value: \"" val "\""); print; next
-        }
-        { print }
-    ' "${PATCHED}" > "${PATCHED}.tmp" && mv "${PATCHED}.tmp" "${PATCHED}"
-fi
 
-# Inject extra env entries after PARITY_EMB_BACKEND (14-space env indentation).
+# Inject extra env entries after PARITY_DEVICE (14-space env indentation).
 # The literal "\n" is expanded to newlines by awk -v below.
 EXTRA_ENV=""
 _add_env() {  # $1=name $2=value; skips empty values
@@ -115,23 +78,23 @@ _add_env() {  # $1=name $2=value; skips empty values
         echo "  inject env: $1=$2" | tee -a "${LOG}"
     fi
 }
-_add_env PARITY_RINGSHIFT_MIN_ROWS "${PARITY_RINGSHIFT_MIN_ROWS:-}"
-_add_env PARITY_FSDP_MIN_ROWS "${PARITY_FSDP_MIN_ROWS:-}"
-_add_env PARITY_ON_DEVICE_INIT "${PARITY_ON_DEVICE_INIT:-}"
-_add_env PARITY_BATCH_RANKS "${PARITY_BATCH_RANKS:-}"
-_add_env PARITY_NUM_CANDIDATES "${PARITY_NUM_CANDIDATES:-}"
-_add_env PARITY_INPUT "${PARITY_INPUT:-}"
 _add_env PARITY_RTOL "${PARITY_RTOL:-}"
 _add_env PARITY_ATOL "${PARITY_ATOL:-}"
+_add_env PARITY_GRAD_RTOL "${PARITY_GRAD_RTOL:-}"
+_add_env PARITY_GRAD_ATOL "${PARITY_GRAD_ATOL:-}"
 _add_env PARITY_PRECISION "${PARITY_PRECISION:-}"
-_add_env PARITY_CELLS "${PARITY_CELLS:-}"
-_add_env PARITY_DUMP_HLO "${PARITY_DUMP_HLO:-}"
+_add_env PARITY_BF16 "${PARITY_BF16:-}"
+_add_env PARITY_ON_DEVICE_INIT "${PARITY_ON_DEVICE_INIT:-}"
 _add_env RANKFM_S "${RANKFM_S:-}"
-_add_env PARITY_GLOBAL_BS "${PARITY_GLOBAL_BS:-}"
 _add_env PARITY_HASH_SIZE_CAP "${PARITY_HASH_SIZE_CAP:-}"
+# Replay-data settings. The parity pod has no gcsfuse mount, so use a gs:// URI.
+_add_env PARITY_GCS_DATA_PATH "${PARITY_GCS_DATA_PATH:-}"
+_add_env PARITY_DATA_FILE_TEMPLATE "${PARITY_DATA_FILE_TEMPLATE:-}"
+_add_env PARITY_DATA_FILE_INDEX "${PARITY_DATA_FILE_INDEX:-}"
+_add_env PARITY_LOCAL_BATCH_SIZE "${PARITY_LOCAL_BATCH_SIZE:-}"
 if [ -n "${EXTRA_ENV}" ]; then
     awk -v extra="${EXTRA_ENV}" '
-        /name: PARITY_EMB_BACKEND/ { print; getline; print; printf "%s", extra; next }
+        /name: PARITY_DEVICE/ { print; getline; print; printf "%s", extra; next }
         { print }
     ' "${PATCHED}" > "${PATCHED}.tmp" && mv "${PATCHED}.tmp" "${PATCHED}"
 fi
