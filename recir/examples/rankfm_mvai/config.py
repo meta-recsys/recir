@@ -36,9 +36,13 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import hashlib
+import math
 from dataclasses import dataclass, field
 from typing import Any, Dict, Tuple
 
+import torch
+import torch.distributed as dist
 from hammer.v3.models.udd_fm_v3.batch_loader import BlueReelsVDDFeatureConfig
 from hammer.v3.models.udd_fm_v3.udd_fm_config import (
     BlueReelsVDDModuleConfig,
@@ -59,10 +63,14 @@ from torchrec.optim.warmup import WarmupPolicy, WarmupStage
 __all__ = [
     "RankFMTrainerConfig",
     "RankFMModelArgs",
+    "configs_from_namespace",
+    "create_cli_parser",
     "parse_cli",
     "build_module_config",
     "build_model_family_config",
     "build_trainer_config",
+    "dense_parameter_fingerprint",
+    "GlobalRowEmbeddingInitializer",
 ]
 
 
@@ -83,7 +91,9 @@ class RankFMTrainerConfig:
 
     # Training
     max_steps: int = 20
-    embedding_lr: float = 0.1
+    report_interval: int = 10
+    embedding_lr: float = 0.02
+    embedding_eps: float = 0.001
     dense_optimizer_config: OptimConfig = field(
         default_factory=lambda: OptimConfig(
             optim_type=OptimType.ADAMW,
@@ -107,8 +117,8 @@ class RankFMTrainerConfig:
 
     # Precision. When True, run the dense tower (HSTU + composer + loss matmuls)
     # in bf16 on device via recir.torchax AMP autocast + the HSTU's
-    # ``_bf16_training`` activation casts. fp32 master weights are kept (SGD over
-    # fp32 dense params), and layernorm / softmax / loss reductions stay fp32 ---
+    # ``_bf16_training`` activation casts. fp32 master weights are kept, and
+    # layernorm / softmax / loss reductions stay fp32 ---
     # the same mixed-precision recipe the GPU baseline uses. NOTE: unlike the
     # other knobs in this dataclass, this DOES change activation dtypes / the FX
     # graph, so toggling it forces an XLA recompile.
@@ -179,6 +189,93 @@ class RankFMTrainerConfig:
     tb_log_every: int = 10
 
 
+def dense_parameter_fingerprint(model: torch.nn.Module) -> str:
+    """Return a stable sample hash for initialized non-embedding parameters."""
+    digest = hashlib.sha256()
+    for name, parameter in model.named_parameters():
+        if "_embedding_collection" in name or parameter.is_meta:
+            continue
+        flattened = parameter.detach().reshape(-1)
+        digest.update(name.encode())
+        digest.update(str(tuple(parameter.shape)).encode())
+        if flattened.numel() == 0:
+            continue
+        sample_indices = sorted(
+            {
+                0,
+                flattened.numel() // 3,
+                (2 * flattened.numel()) // 3,
+                flattened.numel() - 1,
+            }
+        )
+        sample = flattened[sample_indices].to(dtype=torch.float64).tolist()
+        digest.update(repr(sample).encode())
+    return digest.hexdigest()[:16]
+
+
+@dataclass(frozen=True)
+class GlobalRowEmbeddingInitializer:
+    """Initialize a full embedding table or row-wise shard identically."""
+
+    table_name: str
+    num_embeddings: int
+    embedding_dim: int
+    minimum: float
+    maximum: float
+    seed: int
+    chunk_rows: int = 8192
+
+    def __call__(self, tensor: torch.Tensor) -> torch.Tensor:
+        if tensor.is_meta or tensor.numel() == 0:
+            return tensor
+        if tensor.dim() != 2 or int(tensor.shape[1]) != self.embedding_dim:
+            raise RuntimeError(
+                f"Unexpected {self.table_name} embedding shape {tuple(tensor.shape)}"
+            )
+
+        local_rows = int(tensor.shape[0])
+        global_row_offset = 0
+        if local_rows != self.num_embeddings:
+            if not dist.is_initialized():
+                raise RuntimeError(
+                    f"Partial {self.table_name} embedding initialized without a "
+                    "distributed process group"
+                )
+            shard_rows = math.ceil(self.num_embeddings / dist.get_world_size())
+            global_row_offset = dist.get_rank() * shard_rows
+            expected_rows = max(
+                0,
+                min(shard_rows, self.num_embeddings - global_row_offset),
+            )
+            if local_rows != expected_rows:
+                raise RuntimeError(
+                    f"Unexpected {self.table_name} shard: rank={dist.get_rank()} "
+                    f"rows={local_rows}, expected={expected_rows}"
+                )
+
+        value_scale = self.maximum - self.minimum
+        column_indices = torch.arange(
+            self.embedding_dim,
+            dtype=torch.int64,
+            device=tensor.device,
+        ).unsqueeze(0)
+        with torch.no_grad():
+            for local_start in range(0, local_rows, self.chunk_rows):
+                local_end = min(local_start + self.chunk_rows, local_rows)
+                row_indices = torch.arange(
+                    global_row_offset + local_start,
+                    global_row_offset + local_end,
+                    dtype=torch.int64,
+                    device=tensor.device,
+                ).unsqueeze(1)
+                linear_indices = row_indices * self.embedding_dim + column_indices
+                hashed = (linear_indices * 1103515245 + self.seed) & 0x7FFFFFFF
+                values = hashed.to(dtype=torch.float32).mul_(1.0 / 0x80000000)
+                values.mul_(value_scale).add_(self.minimum)
+                tensor[local_start:local_end].copy_(values)
+        return tensor
+
+
 @dataclass
 class RankFMModelArgs:
     """CLI overrides for ``BlueReelsVDDModuleConfig``.
@@ -240,9 +337,22 @@ def build_module_config(
     module_config.inter_arch_type = None
 
     # Cap embedding-table hash sizes (hash_size_cap <= 0 disables capping).
-    if model_args.hash_size_cap > 0:
-        for table in module_config.embedding_tables.values():
+    for name, table in module_config.embedding_tables.items():
+        if model_args.hash_size_cap > 0:
             table.num_embeddings = min(table.num_embeddings, model_args.hash_size_cap)
+        default_bound = math.sqrt(1.0 / table.num_embeddings)
+        weight_init_min = getattr(table, "weight_init_min", None)
+        weight_init_max = getattr(table, "weight_init_max", None)
+        table.init_fn = GlobalRowEmbeddingInitializer(
+            table_name=name,
+            num_embeddings=table.num_embeddings,
+            embedding_dim=table.embedding_dim,
+            minimum=(
+                weight_init_min if weight_init_min is not None else -default_bound
+            ),
+            maximum=(weight_init_max if weight_init_max is not None else default_bound),
+            seed=int.from_bytes(hashlib.sha256(name.encode()).digest()[:4], "little"),
+        )
 
     # Per-feature hash size (post-cap), passed to the synthetic data generator so
     # it samples each id over its table's full num_embeddings. This makes
@@ -361,14 +471,20 @@ def _add_dataclass_args(
             parser.add_argument(flag, type=str, default=default)
 
 
-def parse_cli() -> Tuple[RankFMTrainerConfig, RankFMModelArgs]:
-    """Parse argv, returning dataclass instances with any --flag overrides applied."""
-    parser = argparse.ArgumentParser()
-    # Optimizer LR knobs are config-only (dense_optimizer_config / embedding_lr),
-    # not CLI-exposed.
-    _add_dataclass_args(parser, RankFMTrainerConfig, skip=frozenset({"embedding_lr"}))
+def create_cli_parser(
+    description: str | None = None,
+) -> argparse.ArgumentParser:
+    """Create the shared RankFM CLI parser without consuming argv."""
+    parser = argparse.ArgumentParser(description=description)
+    _add_dataclass_args(parser, RankFMTrainerConfig)
     _add_dataclass_args(parser, RankFMModelArgs)
-    args = parser.parse_args()
+    return parser
+
+
+def configs_from_namespace(
+    args: argparse.Namespace,
+) -> Tuple[RankFMTrainerConfig, RankFMModelArgs]:
+    """Build the shared RankFM configs from an already parsed namespace."""
     trainer_cfg = RankFMTrainerConfig(
         **{
             f.name: getattr(args, f.name)
@@ -384,6 +500,11 @@ def parse_cli() -> Tuple[RankFMTrainerConfig, RankFMModelArgs]:
         }
     )
     return trainer_cfg, model_args
+
+
+def parse_cli() -> Tuple[RankFMTrainerConfig, RankFMModelArgs]:
+    """Parse argv, returning dataclass instances with any --flag overrides applied."""
+    return configs_from_namespace(create_cli_parser().parse_args())
 
 
 # ---------------------------------------------------------------------------
@@ -454,8 +575,16 @@ def build_trainer_config(
 
     return RecTrainerConfig(
         data_source_config=data_source_config,
-        system_config=SystemConfig(use_gpu=False, dist_backend="gloo"),
-        metrics_config=MetricsConfig(report_interval=10, tensorboard_logger=True),
+        system_config=SystemConfig(
+            use_gpu=False,
+            dist_backend="gloo",
+            seed_value=0,
+            set_seed=True,
+        ),
+        metrics_config=MetricsConfig(
+            report_interval=trainer_cfg.report_interval,
+            tensorboard_logger=True,
+        ),
         model_config_module=("hammer.v3.models.udd_fm_v3.udd_fm_config"),
         checkpoint_config=None,
     )

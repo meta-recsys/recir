@@ -1,0 +1,110 @@
+# RankFM-MVAI single-host training with the same model, optimizer, data, and
+# per-process batch configuration as rankfm_mvai-128chip.yaml.
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  generateName: rankfm-mvai-1host-
+  namespace: ns-mrs-core-shared
+spec:
+  replicatedJobs:
+  - name: worker
+    replicas: 1
+    template:
+      spec:
+        parallelism: 1
+        completions: 1
+        completionMode: Indexed
+        backoffLimit: 0
+        template:
+          metadata:
+            annotations:
+              gke-gcsfuse/volumes: "true"
+          spec:
+            serviceAccountName: default
+            containers:
+            - name: rankfm-mvai
+              image: us-central1-docker.pkg.dev/mrs-tpu-y317h/recml/rankfm_mvai_tpu:latest
+              imagePullPolicy: Always
+              env:
+              - name: PYTHONUNBUFFERED
+                value: "1"
+              - name: MASTER_PORT
+                value: "29500"
+              - name: RANKFM_TS_ONEHOT_BWD
+                value: "1"
+              - name: JOBSET_NAME
+                valueFrom:
+                  fieldRef:
+                    fieldPath: metadata.labels['jobset.sigs.k8s.io/jobset-name']
+              - name: MVAI_JOB_NAME
+                valueFrom:
+                  fieldRef:
+                    fieldPath: metadata.labels['jobset.sigs.k8s.io/jobset-name']
+              command:
+              - sh
+              - -c
+              - >-
+                RANK=${JOB_COMPLETION_INDEX:-0} ;
+                FIRST_FILE=rank_${RANK}/batch_0/1.pt.zst ;
+                echo "Pod $RANK waiting for /mnt/barnfs/$FIRST_FILE as mount-ready probe..." ;
+                START=$(date +%s) ;
+                while [ ! -e /mnt/barnfs/$FIRST_FILE ]; do
+                  sleep 5 ;
+                done ;
+                echo "barnfs mount ready (after $(($(date +%s) - START))s); starting trainer..." ;
+                python3 -u -m recir.examples.rankfm_mvai.train
+                --max_steps 20
+                --local_batch_size 32
+                --num_candidates 32
+                --hash_size_cap 1000000
+                --l1_num_layers 3
+                --l2_num_layers 11
+                --embedding_backend cpu
+                --gcs_data_path /mnt/barnfs
+                --data_file_template "rank_${RANK}/batch_0/{i}.pt.zst"
+                --data_replicate_across_ranks
+                --profile_start_step 3
+                --profile_end_step 8
+                --profile_dir "gs://cq-mrs-core-shared_mrs_tpu_y317h/tpu-profiles/${JOBSET_NAME}" ;
+                rc=$? ;
+                if [ "${RANK}" = "0" ]; then echo "Copying TensorBoard events -> gs://cq-mrs-core-shared_mrs_tpu_y317h/tensorboard/${JOBSET_NAME} ..." ; mkdir -p /mnt/gcs-out/tensorboard/${JOBSET_NAME} ; cp /mnt/gcs/mvai_cloud/tensorboard/${JOBSET_NAME}/* /mnt/gcs-out/tensorboard/${JOBSET_NAME}/ || true ; fi ;
+                exit $rc
+              ports:
+              - containerPort: 8471
+              resources:
+                limits:
+                  google.com/tpu: 4
+                requests:
+                  google.com/tpu: 4
+              volumeMounts:
+              - name: barnfs-data
+                mountPath: /mnt/barnfs
+                readOnly: true
+              - name: tensorboard
+                mountPath: /mnt/gcs/mvai_cloud
+              - name: tb-gcs
+                mountPath: /mnt/gcs-out
+            nodeSelector:
+              cloud.google.com/gke-tpu-accelerator: tpu7x
+              cloud.google.com/gke-tpu-topology: "2x2x1"
+              cloud.google.com/gke-accelerator-count: "4"
+            tolerations:
+            - key: "google.com/tpu"
+              operator: "Exists"
+              effect: "NoSchedule"
+            restartPolicy: Never
+            volumes:
+            - name: barnfs-data
+              csi:
+                driver: barnfs.csi.meta.com
+                readOnly: true
+                volumeAttributes:
+                  sourcePath: "gs://mrs-tpu-y317h/czheo_test/hammerv3-v0/dataporter_2:prod:dataporter:xdb.mwfs_orchestration_prod:3485:225060:v0/"
+            - name: tensorboard
+              emptyDir: {}
+            - name: tb-gcs
+              csi:
+                driver: gcsfuse.csi.storage.gke.io
+                volumeAttributes:
+                  bucketName: cq-mrs-core-shared_mrs_tpu_y317h
+                  mountOptions: "implicit-dirs"

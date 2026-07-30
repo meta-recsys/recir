@@ -26,6 +26,7 @@ import jax
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+from fbgemm_gpu.split_embedding_configs import EmbOptimType
 from recir.sparsecore.backend import EmbeddingBackend
 from recir.tests.xla.xsurface_test_utils import _build_overrides
 from torchrec.distributed.embedding import EmbeddingCollectionSharder
@@ -49,7 +50,7 @@ _ROW_WISE_MIN_ROWS_PER_RANK: int = 100
 # row-wise-adagrad-style update in-backward via fbgemm's FUSED kernel for
 # embedding tables; the single-node path doesn't get FUSED, so we use plain
 # Adagrad (element-wise accumulator) here as the same idea at full precision.
-# Without per-param adaptive LR, plain SGD@embedding_lr=0.1 on a hot id makes
+# Without per-param adaptive LR, plain SGD on a hot id makes
 # the model diverge within ~40 steps on real BarnFS data.
 _EMBEDDING_PARAM_PREFIX: str = (
     "recblock.tokenizer_stack.mot_sparse_arch._sparse_arch._embedding_collection"
@@ -102,12 +103,9 @@ class _ECSharder(EmbeddingCollectionSharder):
     def __init__(
         self,
         kernel_type: str,
-        fused_params: Dict[str, Any] | None = None,
+        fused_params: Dict[str, Any],
     ) -> None:
         self._kernel_type = kernel_type
-        if fused_params is None:
-            fused_params = {}
-        fused_params.setdefault("learning_rate", 0.1)
         super().__init__(fused_params=fused_params)
 
     def sharding_types(self, compute_device_type: str) -> List[str]:
@@ -121,6 +119,9 @@ class _ECSharder(EmbeddingCollectionSharder):
 
 class CPURankFMBackend(EmbeddingBackend):
     """Original torchrec DMP ROW_WISE/TABLE_WISE on CPU via gloo."""
+
+    def __init__(self, embedding_eps: float = 0.001) -> None:
+        self._embedding_eps = embedding_eps
 
     def init_pg(self) -> Tuple[int, int]:
         jax_rank = jax.process_index()
@@ -170,11 +171,20 @@ class CPURankFMBackend(EmbeddingBackend):
             logger.info("Single-node: skipping DMP, using model directly")
             return model
 
+        logger.info(
+            "Embedding optimizer: EXACT_ROWWISE_ADAGRAD lr=%g eps=%g",
+            embedding_lr,
+            self._embedding_eps,
+        )
         pg = dist.distributed_c10d._get_default_group()
         sharders = [
             _ECSharder(
                 kernel_type=EmbeddingComputeKernel.FUSED.value,
-                fused_params={"learning_rate": embedding_lr},
+                fused_params={
+                    "optimizer": EmbOptimType.EXACT_ROWWISE_ADAGRAD,
+                    "learning_rate": embedding_lr,
+                    "eps": self._embedding_eps,
+                },
             )
         ]
 

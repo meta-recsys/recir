@@ -85,6 +85,9 @@ def main() -> None:
     )
 
     trainer_cfg, model_args = parse_cli()
+    if not trainer_cfg.bf16_training:
+        jax.config.update("jax_default_matmul_precision", "highest")
+        logger.info("JAX matmul precision: highest (fp32 parity mode)")
     logger.info(f"Trainer config: {trainer_cfg}")
     logger.info(f"Model args: {model_args}")
 

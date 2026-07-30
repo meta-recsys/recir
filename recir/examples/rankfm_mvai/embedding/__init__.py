@@ -34,6 +34,7 @@ from recir.sparsecore.backend import EmbeddingBackend
 def build_embedding_backend(
     embedding_backend: str,
     *,
+    embedding_eps: float = 0.001,
     ringshift_min_rows: int = 4096,
     fsdp_min_rows: int = -1,
     on_device_init: bool = True,
@@ -50,7 +51,7 @@ def build_embedding_backend(
         from .cpu_backend import CPURankFMBackend
 
         apply_seq_a2a_int64_patch()
-        return CPURankFMBackend()
+        return CPURankFMBackend(embedding_eps=embedding_eps)
     if embedding_backend == "tpu":
         from .jax_backend import JAXRankFMBackend
 

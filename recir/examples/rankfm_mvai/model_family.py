@@ -33,7 +33,8 @@ from __future__ import annotations
 
 import logging
 import math
-from typing import Any, cast, Dict, List, Optional, Tuple
+from contextlib import contextmanager
+from typing import Any, cast, Dict, Generator, List, Optional, Tuple
 
 import jax
 import torch
@@ -54,6 +55,7 @@ from hammer.v3.models.udd_fm_v3.recir_core.compile import compile_step
 from hammer.v3.models.udd_fm_v3.recir_core.trace_sample import flatten_batch
 from hammer.v3.models.udd_fm_v3.udd_fm_config import BlueReelsVDDModuleConfig
 from hammer.v3.models.udd_fm_v3.udd_fm_family import BlueReelsVDDModelFamily
+from hammer.v3.modules.mot.tokenizers.mot_sparse_arch import ECSparseArch
 from minimal_viable_ai.core.dataloader.dataloader_configs import DataSourceConfig
 from recir.api import sync_device_state_to_torch
 from recir.backends import XLAGSPMDBackend
@@ -69,7 +71,7 @@ from torchrec.optim.keyed import KeyedOptimizerWrapper
 # Local recir backend factory + data pipe helpers + the static-NRO resolver and
 # the shared override/padding helpers. These are the exact same wiring the
 # recir-compiled paths and the parity check use.
-from .config import RankFMModelArgs, RankFMTrainerConfig
+from .config import dense_parameter_fingerprint, RankFMModelArgs, RankFMTrainerConfig
 from .data_pipe import BatchReplayPipe, compute_kjt_key_to_size, replay_batch_iter
 from .embedding import build_embedding_backend
 from .xsurface_helpers import (
@@ -89,6 +91,21 @@ logger: logging.Logger = logging.getLogger(__name__)
 # metric buffers don't match and still sync. Full sync (skip_fqns=None) is used
 # before checkpointing/inspecting the tables.
 _EMB_SYNC_SKIP_FQNS: Tuple[str, ...] = ("_sharded_tables", "_dp_tables")
+
+
+@contextmanager
+def _preserve_sparse_init_rng() -> Generator[None, None, None]:
+    original_init = ECSparseArch.__init__
+
+    def patched_init(self: ECSparseArch, *args: Any, **kwargs: Any) -> None:
+        with torch.random.fork_rng(devices=[]):
+            original_init(self, *args, **kwargs)
+
+    ECSparseArch.__init__ = patched_init  # pyre-ignore[8]
+    try:
+        yield
+    finally:
+        ECSparseArch.__init__ = original_init  # pyre-ignore[8]
 
 
 def _udd_fm_v3_train_step(
@@ -501,12 +518,18 @@ class RankFMMvaiModelFamily(BlueReelsVDDModelFamily):
             self._trainer_cfg.embedding_backend == "in_graph"
             and self._trainer_cfg.on_device_init
         )
-        return build_model_from_config(
-            module_config,
-            torch.device("cpu"),
-            bf16_training=self._trainer_cfg.bf16_training,
-            embeddings_on_meta=embeddings_on_meta,
+        with _preserve_sparse_init_rng():
+            model = build_model_from_config(
+                module_config,
+                torch.device("cpu"),
+                bf16_training=self._trainer_cfg.bf16_training,
+                embeddings_on_meta=embeddings_on_meta,
+            )
+        logger.info(
+            "RankFM dense initialization fingerprint: %s",
+            dense_parameter_fingerprint(model),
         )
+        return model
 
     def create_train_module_and_optimizer(
         self,
@@ -532,6 +555,7 @@ class RankFMMvaiModelFamily(BlueReelsVDDModelFamily):
         # the fallback when nothing has been set up yet.
         backend = build_embedding_backend(
             trainer_cfg.embedding_backend,
+            embedding_eps=trainer_cfg.embedding_eps,
             ringshift_min_rows=trainer_cfg.ringshift_min_rows,
             fsdp_min_rows=trainer_cfg.fsdp_min_rows,
             on_device_init=trainer_cfg.on_device_init,
