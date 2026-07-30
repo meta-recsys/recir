@@ -74,6 +74,11 @@ from jax.experimental.pallas import tpu as pltpu
 
 logger: logging.Logger = logging.getLogger(__name__)
 
+# NOTE: DeviceIdType is referenced as `pl.DeviceIdType` (its canonical location),
+# NOT `pltpu.DeviceIdType`: the `pltpu` re-export was removed in JAX v0.11. Do not
+# "normalize" the `pl.DeviceIdType.MESH` sites below back to `pltpu.` for symmetry
+# with the other pltpu.* calls -- that reintroduces the AttributeError crash.
+
 
 # Ablation knobs (perf-only; correctness is garbage when set). Read once at
 # import; set in the manifest env. Used to attribute the ring-shift per-wave
@@ -826,7 +831,7 @@ def _make_ringshift_single_wave_kernel(
                 sem,
                 1,
                 device_id=(peer,),
-                device_id_type=pltpu.DeviceIdType.MESH,
+                device_id_type=pl.DeviceIdType.MESH,
             )
         pl.semaphore_wait(sem, world_size)
 
@@ -871,7 +876,7 @@ def _make_ringshift_single_wave_kernel(
             send_sem=send_sem_id,
             recv_sem=recv_sem_id,
             device_id=(my_dst,),
-            device_id_type=pltpu.DeviceIdType.MESH,
+            device_id_type=pl.DeviceIdType.MESH,
         )
         d_recv = pltpu.make_async_remote_copy(
             src_ref=sorted_row_ref.at[pl.ds(0, p3_cnt)],
@@ -879,7 +884,7 @@ def _make_ringshift_single_wave_kernel(
             send_sem=send_sem_id,
             recv_sem=recv_sem_id,
             device_id=(my_src,),
-            device_id_type=pltpu.DeviceIdType.MESH,
+            device_id_type=pl.DeviceIdType.MESH,
         )
 
         @pl.when(p1_cnt > 0)
@@ -1004,7 +1009,7 @@ def _make_ringshift_single_wave_kernel(
             send_sem=send_sem_emb,
             recv_sem=recv_sem_emb,
             device_id=(my_src,),  # send back to my source
-            device_id_type=pltpu.DeviceIdType.MESH,
+            device_id_type=pl.DeviceIdType.MESH,
         )
         d3_recv = pltpu.make_async_remote_copy(
             src_ref=looked_up_buf.at[pl.ds(0, p1_cnt), :],
@@ -1012,7 +1017,7 @@ def _make_ringshift_single_wave_kernel(
             send_sem=send_sem_emb,
             recv_sem=recv_sem_emb,
             device_id=(my_dst,),  # peer who will send TO me
-            device_id_type=pltpu.DeviceIdType.MESH,
+            device_id_type=pl.DeviceIdType.MESH,
         )
 
         @pl.when(p3_cnt > 0)
@@ -1556,7 +1561,7 @@ def _make_ringshift_backward_single_wave_kernel(
                 sem,
                 1,
                 device_id=(peer,),
-                device_id_type=pltpu.DeviceIdType.MESH,
+                device_id_type=pl.DeviceIdType.MESH,
             )
         pl.semaphore_wait(sem, world_size)
 
@@ -1587,7 +1592,7 @@ def _make_ringshift_backward_single_wave_kernel(
             send_sem=send_sem_id,
             recv_sem=recv_sem_id,
             device_id=(my_dst,),
-            device_id_type=pltpu.DeviceIdType.MESH,
+            device_id_type=pl.DeviceIdType.MESH,
         )
         d1a_recv = pltpu.make_async_remote_copy(
             src_ref=sorted_row_padded_ref.at[pl.ds(0, p3_cnt)],
@@ -1595,7 +1600,7 @@ def _make_ringshift_backward_single_wave_kernel(
             send_sem=send_sem_id,
             recv_sem=recv_sem_id,
             device_id=(my_src,),
-            device_id_type=pltpu.DeviceIdType.MESH,
+            device_id_type=pl.DeviceIdType.MESH,
         )
 
         @pl.when(p1_cnt > 0)
@@ -1617,7 +1622,7 @@ def _make_ringshift_backward_single_wave_kernel(
             send_sem=send_sem_emb,
             recv_sem=recv_sem_emb,
             device_id=(my_dst,),
-            device_id_type=pltpu.DeviceIdType.MESH,
+            device_id_type=pl.DeviceIdType.MESH,
         )
         d1b_recv = pltpu.make_async_remote_copy(
             src_ref=grad_emb_padded_ref.at[pl.ds(0, p3_cnt), :],
@@ -1625,7 +1630,7 @@ def _make_ringshift_backward_single_wave_kernel(
             send_sem=send_sem_emb,
             recv_sem=recv_sem_emb,
             device_id=(my_src,),
-            device_id_type=pltpu.DeviceIdType.MESH,
+            device_id_type=pl.DeviceIdType.MESH,
         )
 
         @pl.when(p1_cnt > 0)
