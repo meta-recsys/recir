@@ -13,16 +13,15 @@ with ``is_batch_input`` / ``batch_dim`` (mimicking what ``_tag_batch_inputs``
 does at top-level), then run propagation and assert the call_function
 output node inherits the right tags.
 
-The four ops covered here previously broke propagation (logged by
-``propagate_batch_input_meta`` as "input was batched but op not in
-allowlist") and caused JAX broadcast-shape mismatches at lower time
-because the surgery-spliced subgraph placeholders defaulted to replicated:
+The ops covered here include both batch-preserving propagation rules and
+intentional boundaries where the batch axis is reduced away:
 
   * ``recir::mark_boundary`` -- pure identity (used as graph-break marker)
   * ``aten.expand`` -- broadcasts size-1 dims; preserves batch_dim
   * ``aten.view`` -- collapse / expand trailing dims; preserves batch_dim
     when sizes[batch_dim] matches the input size
-  * ``aten.embedding_dense_backward`` -- backward grad for embedding
+  * ``aten.embedding_dense_backward`` -- reduces the batch axis and returns
+    a vocab-shaped weight gradient, so it must drop the batch tag
 """
 
 import unittest
@@ -64,7 +63,7 @@ def _set_val(node: fx.Node, val: torch.Tensor) -> None:
 
 
 class PropagateBatchInputMetaTest(unittest.TestCase):
-    """Tests covering the 4 ops added in v7.1 fix #2."""
+    """Tests for batch metadata propagation rules."""
 
     def _run_propagation_on(self, graph: fx.Graph) -> fx.GraphModule:
         gm = fx.GraphModule(torch.nn.Module(), graph)
@@ -200,9 +199,8 @@ class PropagateBatchInputMetaTest(unittest.TestCase):
         self.assertTrue(viewed.meta.get("is_batch_input"))
         self.assertEqual(viewed.meta.get("batch_dim"), 0)
 
-    def test_embedding_dense_backward_propagates_from_grad(self) -> None:
-        """embedding_dense_backward(grad, indices, V, ..) inherits batch tag
-        from grad (arg 0)."""
+    def test_embedding_dense_backward_drops_batch_tag(self) -> None:
+        """embedding_dense_backward produces a vocab-shaped, unbatched grad."""
         graph = fx.Graph()
         grad = _make_placeholder(graph, "grad", torch.empty(128, 16, 64), batch_dim=0)
         indices = _untagged_placeholder(
@@ -212,16 +210,14 @@ class PropagateBatchInputMetaTest(unittest.TestCase):
             torch.ops.aten.embedding_dense_backward.default,
             args=(grad, indices, 1024, -1, False),
         )
-        # Output shape is [num_weights, embed_dim] -- batch axis collapsed by
-        # the reduction, but we propagate the tag so downstream surgery can
-        # tell this grad came from a batched embedding.
+        # Output shape is [num_weights, embed_dim]; dim 0 is vocab, not batch.
         _set_val(bwd, torch.empty(1024, 64))
         graph.output(bwd)
 
         self._run_propagation_on(graph)
 
-        self.assertTrue(bwd.meta.get("is_batch_input"))
-        self.assertEqual(bwd.meta.get("batch_dim"), 0)
+        self.assertFalse(bwd.meta.get("is_batch_input", False))
+        self.assertNotIn("batch_dim", bwd.meta)
 
     def test_chained_propagation_end_to_end(self) -> None:
         """mark_boundary -> view -> expand: all three should propagate."""

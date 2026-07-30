@@ -431,6 +431,11 @@ class EagerCPUTrainPipeline(RankingSGDTrainPipeline):
             # in-backward, handled separately).
             foreach=True,
         )
+        # Reuse the pre-trace state already allocated for TensorLRAdamW. The
+        # wrapper is never compiled on this path, so transfer ownership to the
+        # CPU optimizer instead of retaining one copy and lazily creating another.
+        self._dense_opt.state.update(tensor_lr_opt.state)
+        tensor_lr_opt.state.clear()
         # The warmup controller mutates this 0-d buffer in place (fill_) every
         # step; it is the SAME tensor TensorLRAdamW bound as its tensor LR. Read
         # it each step for the current scalar LR.
