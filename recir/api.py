@@ -604,7 +604,7 @@ def _resolve_trace_batch_ratio(
 
 
 def _tag_batch_inputs(
-    gm: fx.GraphModule, num_model_tensors: int, input_batch_dim: int
+    gm: fx.GraphModule, num_state_tensors: int, input_batch_dim: int
 ) -> None:
     tensor_idx = 0
     for node in gm.graph.nodes:
@@ -612,13 +612,16 @@ def _tag_batch_inputs(
             continue
         val = node.meta.get("val", None)
         if isinstance(val, torch.Tensor):
-            is_batch = tensor_idx >= num_model_tensors and val.dim() > 0
+            is_state = tensor_idx < num_state_tensors
+            is_batch = not is_state and val.dim() > 0
+            node.meta["is_state_input"] = is_state
             node.meta["is_batch_input"] = is_batch
             node.meta["is_weight"] = not is_batch
             if is_batch:
                 node.meta["batch_dim"] = input_batch_dim
             tensor_idx += 1
         else:
+            node.meta["is_state_input"] = False
             node.meta["is_batch_input"] = False
             node.meta["is_weight"] = False
 
@@ -637,6 +640,199 @@ def _compute_state_fqns(structure: Any) -> List[str]:
         return []
 
 
+def _is_fsdp_sharded_leaf(fqn: str, leaf: Any, sharded_keys: set[str]) -> bool:
+    return fqn in sharded_keys and isinstance(leaf, torch.Tensor) and leaf.ndim >= 1
+
+
+def _build_fsdp_sharded_flags(
+    params_and_buffers: Dict[str, Any],
+    named_states: Dict[str, Any],
+    sharded_keys: set[str],
+    optimizer_state_only_sharded_keys: frozenset[tuple[str, str]] = frozenset(),
+) -> list[bool]:
+    """Return per-tensor FSDP flags in the same pytree order as flat_state."""
+    params_buffers_flags = {
+        fqn: pytree.tree_map(
+            lambda leaf, fqn=fqn: _is_fsdp_sharded_leaf(fqn, leaf, sharded_keys),
+            value,
+        )
+        for fqn, value in params_and_buffers.items()
+    }
+    named_state_flags: Dict[str, Any] = {}
+    for fqn, state in named_states.items():
+        if not isinstance(state, dict):
+            named_state_flags[fqn] = pytree.tree_map(
+                lambda leaf, fqn=fqn: _is_fsdp_sharded_leaf(fqn, leaf, sharded_keys),
+                state,
+            )
+            continue
+        state_flags: Dict[str, Any] = {}
+        for state_key, state_value in state.items():
+            state_flags[state_key] = pytree.tree_map(
+                lambda leaf, fqn=fqn, state_key=state_key: (
+                    _is_fsdp_sharded_leaf(fqn, leaf, sharded_keys)
+                    or (
+                        (fqn, state_key) in optimizer_state_only_sharded_keys
+                        and isinstance(leaf, torch.Tensor)
+                        and leaf.ndim >= 1
+                    )
+                ),
+                state_value,
+            )
+        named_state_flags[fqn] = state_flags
+    flat_values, value_spec = pytree.tree_flatten([params_and_buffers, named_states])
+    flat_flags, flag_spec = pytree.tree_flatten(
+        [params_buffers_flags, named_state_flags]
+    )
+    if value_spec != flag_spec:
+        raise RuntimeError(
+            "FSDP flag tree must mirror flat_state TreeSpec: "
+            f"values={value_spec}, flags={flag_spec}"
+        )
+    return [
+        bool(flat_flags[index])
+        for index, value in enumerate(flat_values)
+        if isinstance(value, torch.Tensor)
+    ]
+
+
+def _align_fsdp_sharded_flags(
+    base_flat_state: Sequence[Any],
+    base_state_flags: Sequence[bool],
+    final_flat_state: Sequence[Any],
+) -> list[bool]:
+    """Carry placement by identity; new transform state is replicated."""
+    base_tensors = [
+        state_value
+        for state_value in base_flat_state
+        if isinstance(state_value, torch.Tensor)
+    ]
+    if len(base_tensors) != len(base_state_flags):
+        raise RuntimeError(
+            "FSDP flags must mirror base flat_state tensor leaves: "
+            f"flags={len(base_state_flags)}, tensors={len(base_tensors)}"
+        )
+    flags_by_identity: Dict[int, bool] = {}
+    for tensor, is_sharded in zip(base_tensors, base_state_flags):
+        tensor_identity = id(tensor)
+        if (
+            tensor_identity in flags_by_identity
+            and flags_by_identity[tensor_identity] != is_sharded
+        ):
+            raise RuntimeError("Aliased state tensor has conflicting FSDP placements")
+        flags_by_identity[tensor_identity] = is_sharded
+    final_flags: list[bool] = []
+    for state_value in final_flat_state:
+        if not isinstance(state_value, torch.Tensor):
+            continue
+        final_flags.append(flags_by_identity.get(id(state_value), False))
+    return final_flags
+
+
+def _annotate_fsdp_state_input_sharding(
+    gm: fx.GraphModule,
+    flat_state: Sequence[Any],
+    state_flags: Sequence[bool],
+) -> None:
+    """Attach placement to the state portion of RecIR's runtime input."""
+    tensor_placeholders = [
+        node
+        for node in gm.graph.nodes
+        if node.op == "placeholder"
+        and isinstance(node.meta.get("val", None), torch.Tensor)
+    ]
+    untagged_placeholders = [
+        node.name for node in tensor_placeholders if "is_state_input" not in node.meta
+    ]
+    if untagged_placeholders:
+        raise RuntimeError(
+            "FSDP state input annotation requires is_state_input metadata on every "
+            f"tensor placeholder; missing={untagged_placeholders!r}"
+        )
+    state_placeholders = [
+        node for node in tensor_placeholders if node.meta["is_state_input"]
+    ]
+    state_values = [value for value in flat_state if isinstance(value, torch.Tensor)]
+    if len(state_values) != len(state_flags):
+        raise RuntimeError(
+            "FSDP flags must mirror final flat_state tensor leaves: "
+            f"state={len(state_values)}, flags={len(state_flags)}"
+        )
+    if len(state_placeholders) != len(state_values):
+        raise RuntimeError(
+            "Compiled graph state inputs must mirror final flat_state: "
+            f"inputs={len(state_placeholders)}, state={len(state_values)}"
+        )
+    for node in tensor_placeholders:
+        node.meta["is_fsdp_sharded"] = False
+    for leaf, state_value, is_sharded in zip(
+        state_placeholders,
+        state_values,
+        state_flags,
+    ):
+        state_identity = id(state_value)
+        prior_identity = leaf.meta.get("recir_state_input_identity")
+        if prior_identity is not None and prior_identity != state_identity:
+            raise RuntimeError(
+                "Compiled graph state input order no longer mirrors flat_state"
+            )
+        leaf.meta["recir_state_input_identity"] = state_identity
+        leaf.meta["is_fsdp_sharded"] = is_sharded
+
+
+def _annotate_fsdp_state_output_sharding(
+    gm: fx.GraphModule,
+    flat_state: Sequence[Any],
+    state_flags: Sequence[bool],
+) -> None:
+    """Attach placement to the state portion of RecIR's runtime output."""
+    if not state_flags:
+        return
+    output_node = next(node for node in gm.graph.nodes if node.op == "output")
+    graph_outputs = output_node.args[0]
+    if not isinstance(graph_outputs, (list, tuple)) or not graph_outputs:
+        raise RuntimeError(
+            "Compiled graph output must contain a user result followed by state"
+        )
+    graph_output_leaves = pytree.tree_leaves(graph_outputs)
+    if len(graph_output_leaves) < len(flat_state):
+        raise RuntimeError(
+            "Compiled graph output must contain every final flat_state leaf: "
+            f"outputs={len(graph_output_leaves)}, state={len(flat_state)}"
+        )
+    raw_state_outputs = graph_output_leaves[-len(flat_state) :] if flat_state else []
+    state_output_leaves = [
+        leaf
+        for leaf in raw_state_outputs
+        if isinstance(leaf, fx.Node)
+        and isinstance(leaf.meta.get("val", None), torch.Tensor)
+    ]
+    state_values = [value for value in flat_state if isinstance(value, torch.Tensor)]
+    if len(state_values) != len(state_flags):
+        raise RuntimeError(
+            "FSDP flags must mirror final flat_state tensor leaves: "
+            f"state={len(state_values)}, flags={len(state_flags)}"
+        )
+    if len(state_output_leaves) != len(state_flags):
+        raise RuntimeError(
+            "Compiled graph state outputs must mirror final flat_state: "
+            f"outputs={len(state_output_leaves)}, flags={len(state_flags)}"
+        )
+    for leaf, state_value, is_sharded in zip(
+        state_output_leaves,
+        state_values,
+        state_flags,
+    ):
+        state_identity = id(state_value)
+        prior_identity = leaf.meta.get("recir_state_output_identity")
+        if prior_identity is not None and prior_identity != state_identity:
+            raise RuntimeError(
+                "Compiled graph state output order no longer mirrors flat_state"
+            )
+        leaf.meta["recir_state_output_identity"] = state_identity
+        leaf.meta["is_fsdp_sharded_output"] = is_sharded
+
+
 def _finalize_graph(
     gm: fx.GraphModule,
     mod: nn.Module,
@@ -652,7 +848,11 @@ def _finalize_graph(
     gm = _to_caller_flattened_graph_module(gm)
     if dedup:
         gm = _dedup_collectives(gm)
-    _tag_batch_inputs(gm, len(flat_state), input_batch_dim)
+    _tag_batch_inputs(
+        gm,
+        sum(isinstance(value, torch.Tensor) for value in flat_state),
+        input_batch_dim,
+    )
     # Propagate batch-input meta through ops so intermediate FX nodes that
     # become subgraph boundaries (after segment_and_lower) inherit
     # is_batch_input / batch_dim. Without this, downstream subgraph
@@ -1156,9 +1356,13 @@ def trace(  # noqa: C901 — orchestration: dispatches on parallel_mode flavor (
     # meta-driven branch in downstream consumers (e.g. mivilm.surgeon's
     # ``_semantic_input_map``) can identify user-input placeholders without
     # relying on the broken ordinal heuristic that misses opt named_states.
-    # The first ``len(flat_state)`` placeholders are params + buffers + opt
-    # named_states; anything past that is a user input.
-    _tag_batch_inputs(local_result.gm, len(flat_state), input_batch_dim)
+    # Tensor placeholders for params, buffers, and optimizer state precede user
+    # inputs; non-tensor state leaves do not occupy tensor-placeholder slots.
+    _tag_batch_inputs(
+        local_result.gm,
+        sum(isinstance(value, torch.Tensor) for value in flat_state),
+        input_batch_dim,
+    )
     # Propagate batch-input meta through ops so intermediate FX nodes that
     # become subgraph boundaries (after later partition/lower) inherit
     # is_batch_input / batch_dim — mirrors the legacy ``_finalize_graph`` flow.
@@ -1281,6 +1485,9 @@ def compile_from_gm(  # noqa: C901 — orchestration: stages 4-8 of the pipeline
     #     sharding we scale + erase the autograd-emitted ``_spmd::tag_grad``
     #     markers so XLA lowering can proceed.
     sharded_keys: set[str] = set()
+    optimizer_state_only_sharded_keys: frozenset[tuple[str, str]] = frozenset()
+    fsdp_base_state: Optional[Tuple[Any, ...]] = None
+    fsdp_state_flags: Optional[list[bool]] = None
     if isinstance(parallel_mode, (DataParallel, HybridParallel)):
         # Trace already sharded; reuse ctx snapshot.
         params_and_buffers: Dict[str, Any] = {**ctx.params, **ctx.buffers}
@@ -1315,6 +1522,11 @@ def compile_from_gm(  # noqa: C901 — orchestration: stages 4-8 of the pipeline
         # now-sharded module.  GSPMD needs no DTensor partition pass.
         params_and_buffers = {**ctx.params, **ctx.buffers}
         sharded_keys = parallel_mode.shard_params(ctx.mod, params_and_buffers, ctx.opts)
+        optimizer_state_only_sharded_keys = getattr(
+            parallel_mode,
+            "optimizer_state_only_sharded_keys",
+            frozenset(),
+        )
         named_states = {}
         _opts = ctx.opts
         if any(len(o.state) > 0 for o in _opts):
@@ -1418,20 +1630,21 @@ def compile_from_gm(  # noqa: C901 — orchestration: stages 4-8 of the pipeline
     # for the GSPMD branch above — the DP/HybridParallel branch consumes
     # the parametrized gm directly and does not need placeholder-level
     # FSDP tagging.
-    if sharded_keys:
-        is_sharded: list[bool] = [key in sharded_keys for key in params_and_buffers]
-        for fqn, state in named_states.items():
-            is_sharded.extend([fqn in sharded_keys] * len(state))
-        tensor_idx = 0
-        for node in gm.graph.nodes:
-            if node.op != "placeholder":
-                continue
-            val = node.meta.get("val", None)
-            if isinstance(val, torch.Tensor):
-                node.meta["is_fsdp_sharded"] = (
-                    is_sharded[tensor_idx] if tensor_idx < len(is_sharded) else False
-                )
-                tensor_idx += 1
+    if sharded_keys or optimizer_state_only_sharded_keys:
+        fsdp_state_flags = _build_fsdp_sharded_flags(
+            params_and_buffers,
+            named_states,
+            sharded_keys,
+            optimizer_state_only_sharded_keys,
+        )
+        fsdp_base_state = tuple(flat_state)
+        placeholder_flags = _align_fsdp_sharded_flags(
+            fsdp_base_state,
+            fsdp_state_flags,
+            flat_state,
+        )
+        _annotate_fsdp_state_input_sharding(gm, flat_state, placeholder_flags)
+        _annotate_fsdp_state_output_sharding(gm, flat_state, placeholder_flags)
 
     # Stage 4 (post-partition is the legacy ordering used by
     # ``_compile_and_transform``): region transforms get a chance to finalize
@@ -1471,6 +1684,15 @@ def compile_from_gm(  # noqa: C901 — orchestration: stages 4-8 of the pipeline
             gm, flat_state = result  # pyre-ignore[9]
         elif isinstance(result, fx.GraphModule):
             gm = result
+
+    if fsdp_base_state is not None and fsdp_state_flags is not None:
+        final_state_flags = _align_fsdp_sharded_flags(
+            fsdp_base_state,
+            fsdp_state_flags,
+            flat_state,
+        )
+        _annotate_fsdp_state_input_sharding(gm, flat_state, final_state_flags)
+        _annotate_fsdp_state_output_sharding(gm, flat_state, final_state_flags)
 
     # Stage 7: optionally wrap in IterGraphModule for cross-iteration passes
     # and lazy-lowering hooks.
@@ -1832,6 +2054,7 @@ def _compile_gspmd(
     sharded_keys = parallel_mode.shard_params(
         local_result.mod, params_and_buffers, local_result.opts
     )
+    optimizer_state_only_sharded_keys = parallel_mode.optimizer_state_only_sharded_keys
     result = _finalize_graph(
         gm,
         local_result.mod,
@@ -1843,20 +2066,28 @@ def _compile_gspmd(
     )
     # Set is_fsdp_sharded on placeholder nodes so _jit_gspmd knows
     # which inputs are local shards.
-    if sharded_keys:
-        is_sharded: list[bool] = [key in sharded_keys for key in params_and_buffers]
-        for fqn, state in local_result.named_states.items():
-            is_sharded.extend([fqn in sharded_keys] * len(state))
-        tensor_idx = 0
-        for node in result.gm.graph.nodes:
-            if node.op != "placeholder":
-                continue
-            val = node.meta.get("val", None)
-            if isinstance(val, torch.Tensor):
-                node.meta["is_fsdp_sharded"] = (
-                    is_sharded[tensor_idx] if tensor_idx < len(is_sharded) else False
-                )
-                tensor_idx += 1
+    if sharded_keys or optimizer_state_only_sharded_keys:
+        is_sharded = _build_fsdp_sharded_flags(
+            params_and_buffers,
+            local_result.named_states,
+            sharded_keys,
+            optimizer_state_only_sharded_keys,
+        )
+        is_sharded = _align_fsdp_sharded_flags(
+            result.flat_state,
+            is_sharded,
+            result.flat_state,
+        )
+        _annotate_fsdp_state_input_sharding(
+            result.gm,
+            result.flat_state,
+            is_sharded,
+        )
+        _annotate_fsdp_state_output_sharding(
+            result.gm,
+            result.flat_state,
+            is_sharded,
+        )
         logger.info(
             "FSDP: %d sharded keys, %d sharded placeholders, flat_state=%d entries",
             len(sharded_keys),
@@ -2241,6 +2472,14 @@ def sync_device_state_to_torch(
     compiled_obj.state_manager.sync_to_torch(
         compiled_obj.flat_state, skip_fqns=skip_fqns
     )
+
+
+def invalidate_device_state(compiled_fn: Callable[..., Any]) -> None:
+    """Discard cached device-resident state so the next call reads PyTorch state."""
+    compiled_obj = compiled_fn.__dict__.get(COMPILED_OBJECT_KEY, None)
+    if compiled_obj is None:
+        return
+    compiled_obj.state_manager.device_state = None
 
 
 # Pull through the ``GraphPatch`` type alias so consumers don't need to import

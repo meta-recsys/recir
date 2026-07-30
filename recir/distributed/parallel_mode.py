@@ -6,9 +6,10 @@
 
 # pyre-strict
 import logging
+import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, replace
-from typing import Any, Callable, Dict, Optional, Set, Tuple
+from typing import Any, Callable, Dict, Optional, Sequence, Set, Tuple
 
 import torch
 import torch.distributed as dist
@@ -19,6 +20,7 @@ from recir.distributed.data_parallel import (
     OptOrOpts,
     partition_data_parallel,
     partition_value,
+    shard_optimizer_states_for_replicated_params,
     shard_params_and_states,
     shard_params_by_plan,
 )
@@ -41,10 +43,138 @@ logger: logging.Logger = logging.getLogger(__name__)
 _FAKE_PG_KEEPALIVE: dict[str, Any] = {}
 
 
+def _rank_for_matching_namespace(
+    source: str,
+    rank: int,
+    source_size: int,
+    expected_size: int,
+) -> Optional[int]:
+    if source_size != expected_size:
+        return None
+    if not 0 <= rank < source_size:
+        raise RuntimeError(f"{source} reported rank {rank} outside [0, {source_size})")
+    return rank
+
+
+def _jax_process_rank(process_count: int) -> Tuple[Optional[int], Optional[str]]:
+    try:
+        import jax  # @manual
+    except ImportError:
+        logger.debug("JAX process topology is unavailable", exc_info=True)
+        return None, None
+    jax_size = int(jax.process_count())
+    jax_rank = int(jax.process_index())
+    resolved = _rank_for_matching_namespace(
+        "JAX process topology",
+        jax_rank,
+        jax_size,
+        process_count,
+    )
+    mismatch = f"jax={jax_size}" if resolved is None else None
+    return resolved, mismatch
+
+
+def _environment_process_rank(
+    process_count: int,
+) -> Tuple[Optional[int], list[str]]:
+    mismatched_namespaces: list[str] = []
+    for rank_var, size_var in (
+        ("JAX_PROCESS_INDEX", "JAX_PROCESS_COUNT"),
+        ("PROCESS_INDEX", "PROCESS_COUNT"),
+        ("RANK", "WORLD_SIZE"),
+    ):
+        raw_rank = os.environ.get(rank_var)
+        if raw_rank is None:
+            continue
+        raw_size = os.environ.get(size_var)
+        if raw_size is None:
+            logger.debug(
+                "Ignoring incomplete process-rank namespace: %s is set without %s",
+                rank_var,
+                size_var,
+            )
+            continue
+        try:
+            rank = int(raw_rank)
+            source_size = int(raw_size)
+        except ValueError as error:
+            raise RuntimeError(
+                f"{rank_var} and {size_var} must be integers; "
+                f"got {raw_rank!r} and {raw_size!r}"
+            ) from error
+        resolved = _rank_for_matching_namespace(
+            f"environment {rank_var}/{size_var}",
+            rank,
+            source_size,
+            process_count,
+        )
+        if resolved is not None:
+            return resolved, mismatched_namespaces
+        mismatched_namespaces.append(f"{rank_var}/{size_var}={source_size}")
+    return None, mismatched_namespaces
+
+
+def _current_process_rank(process_count: int) -> int:
+    if process_count <= 1:
+        return 0
+
+    mismatched_namespaces: list[str] = []
+    if dist.is_available() and dist.is_initialized():
+        torch_size = dist.get_world_size()
+        torch_rank = dist.get_rank()
+        resolved = _rank_for_matching_namespace(
+            "Torch process group",
+            torch_rank,
+            torch_size,
+            process_count,
+        )
+        if resolved is not None:
+            return resolved
+        mismatched_namespaces.append(f"torch={torch_size}")
+
+    jax_rank, jax_mismatch = _jax_process_rank(process_count)
+    if jax_rank is not None:
+        return jax_rank
+    if jax_mismatch is not None:
+        mismatched_namespaces.append(jax_mismatch)
+
+    environment_rank, environment_mismatches = _environment_process_rank(process_count)
+    if environment_rank is not None:
+        return environment_rank
+    mismatched_namespaces.extend(environment_mismatches)
+
+    # AOT and single-process test hosts intentionally model a larger deployment
+    # without joining its process namespace; rank zero is the only local shard.
+    if _AOT_TOPOLOGY.get() is not None:
+        logger.debug(
+            "AOT topology uses emulated process rank zero; ignored namespaces: %s",
+            mismatched_namespaces,
+        )
+        return 0
+    if not mismatched_namespaces:
+        return 0
+    raise RuntimeError(
+        "No distributed rank source matches the process mesh size "
+        f"{process_count}: {', '.join(mismatched_namespaces)}"
+    )
+
+
+def _current_device_rank(num_ranks: int, num_processes: int) -> int:
+    if num_processes <= 0 or num_ranks % num_processes != 0:
+        raise ValueError(
+            "Device mesh requires num_ranks to be divisible by num_processes; "
+            f"got num_ranks={num_ranks}, num_processes={num_processes}"
+        )
+    devices_per_process = num_ranks // num_processes
+    return _current_process_rank(num_processes) * devices_per_process
+
+
 def _create_fake_mesh(
     device_type: str,
     size: int,
     group_name: str,
+    *,
+    rank: int,
 ) -> DeviceMesh:
     """Create a DeviceMesh backed by a FakeProcessGroup.
 
@@ -52,12 +182,14 @@ def _create_fake_mesh(
     """
     from torch._C._distributed_c10d import FakeProcessGroup
 
-    fake_pg = FakeProcessGroup._create_internal(0, size)
+    if not 0 <= rank < size:
+        raise ValueError(f"Fake mesh rank {rank} must be in [0, {size})")
+    fake_pg = FakeProcessGroup._create_internal(rank, size)
     mesh = DeviceMesh(
         device_type,
         torch.arange(size),
         _init_backend=False,
-        _rank=0,
+        _rank=rank,
     )
     # pyrefly: ignore [bad-assignment]
     mesh._dim_group_names = [group_name]
@@ -107,21 +239,23 @@ def _create_fake_mesh(
                 existing = _c10d._resolve_process_group(group_name)  # pyre-ignore[6]
             except Exception:
                 existing = None
-            if existing is not None and existing.size() == size:
+            if (
+                existing is not None
+                and existing.size() == size
+                and existing.rank() == rank
+            ):
                 # Idempotent: a prior trace of the same mesh already registered
                 # this group; re-registering the same name would collide.
                 _FAKE_PG_KEEPALIVE[group_name] = existing
             else:
                 if existing is not None:
-                    # A group under this name exists with a DIFFERENT size (a
-                    # prior trace used a different mesh, e.g. across tests). Drop
-                    # it first; otherwise _register_process_group collides on the
-                    # name, the error is swallowed below, and the stale wrong-size
-                    # group keeps resolving for DTensor functional collectives.
+                    # A group under this name exists for a different topology.
+                    # Drop it first; otherwise the stale size or rank keeps
+                    # resolving for DTensor functional collectives.
                     unregister = getattr(_c10d, "_unregister_process_group", None)
                     if unregister is not None:
                         unregister(group_name)  # pyre-ignore[6]
-                wrapped = ProcessGroup(FakeStore(), 0, size)
+                wrapped = ProcessGroup(FakeStore(), rank, size)
                 wrapped._register_backend(
                     torch.device(device_type),
                     ProcessGroup.BackendType.CUSTOM,
@@ -324,6 +458,10 @@ class GSPMDParallel(ParallelMode):
             TODO: unify this substr-based table sharding with the
             EmbeddingShardingPlan used in hybrid parallel, and refactor
             parallel_style (this is a stopgap for table-only FSDP).
+        fsdp_replicate_param_substrs: If set, leave matching params/buffers
+            replicated even in ``parallel_style="fully_shard"``. This is for
+            structured dimensions whose local shard shape is not a valid model
+            shape during later traces.
     """
 
     def __init__(
@@ -335,6 +473,11 @@ class GSPMDParallel(ParallelMode):
         num_ranks: Optional[int] = None,
         num_processes: Optional[int] = None,
         fsdp_table_substr: Optional[str] = None,
+        fsdp_replicate_param_substrs: Optional[Sequence[str]] = None,
+        fsdp_shard_optimizer_state_for_replicated_param_substrs: Optional[
+            Sequence[str]
+        ] = None,
+        fsdp_sharded_optimizer_state_keys: Optional[Sequence[str]] = None,
     ) -> None:
         self.parallel_style = parallel_style
         self.input_batch_dim = input_batch_dim
@@ -342,7 +485,42 @@ class GSPMDParallel(ParallelMode):
         self._num_ranks = num_ranks
         self._num_processes = num_processes
         self._fsdp_table_substr = fsdp_table_substr
+        self._fsdp_replicate_param_substrs = tuple(fsdp_replicate_param_substrs or ())
+        self._fsdp_shard_optimizer_state_for_replicated_param_substrs = tuple(
+            fsdp_shard_optimizer_state_for_replicated_param_substrs or ()
+        )
+        self._fsdp_sharded_optimizer_state_keys = frozenset(
+            fsdp_sharded_optimizer_state_keys or ()
+        )
+        if bool(self._fsdp_shard_optimizer_state_for_replicated_param_substrs) != bool(
+            self._fsdp_sharded_optimizer_state_keys
+        ):
+            raise ValueError(
+                "State-only optimizer sharding requires both parameter "
+                "substrings and state keys"
+            )
+        if (
+            self._fsdp_shard_optimizer_state_for_replicated_param_substrs
+            and parallel_style != "fully_shard"
+        ):
+            raise ValueError("State-only optimizer sharding requires fully_shard mode")
+        missing_replicate_substrs = set(
+            self._fsdp_shard_optimizer_state_for_replicated_param_substrs
+        ) - set(self._fsdp_replicate_param_substrs)
+        if missing_replicate_substrs:
+            raise ValueError(
+                "State-only optimizer sharding is restricted to explicitly "
+                "replicated parameters; missing replication substrings: "
+                f"{sorted(missing_replicate_substrs)!r}"
+            )
+        self._optimizer_state_only_sharded_keys: frozenset[tuple[str, str]] = (
+            frozenset()
+        )
         self._process_mesh: Optional[DeviceMesh] = None
+
+    @property
+    def optimizer_state_only_sharded_keys(self) -> frozenset[tuple[str, str]]:
+        return self._optimizer_state_only_sharded_keys
 
     @property
     def num_ranks(self) -> int:
@@ -379,7 +557,10 @@ class GSPMDParallel(ParallelMode):
         """
         if self._process_mesh is None:
             self._process_mesh = _create_fake_mesh(
-                "cpu", self.num_processes, "fake_gspmd_process_mesh"
+                "cpu",
+                self.num_processes,
+                "fake_gspmd_process_mesh",
+                rank=_current_process_rank(self.num_processes),
             )
         return self._process_mesh
 
@@ -390,6 +571,9 @@ class GSPMDParallel(ParallelMode):
         opt: OptOrOpts,
     ) -> Set[str]:
         sharded: Set[str] = set()
+
+        def _should_replicate(key: str) -> bool:
+            return any(substr in key for substr in self._fsdp_replicate_param_substrs)
 
         # Table-only FSDP sharding: when ``fsdp_table_substr`` is set, row-wise
         # (FSDP) shard params whose name contains it, regardless of
@@ -403,6 +587,7 @@ class GSPMDParallel(ParallelMode):
             def _is_table(key: str, t: torch.Tensor) -> bool:
                 return (
                     substr in key
+                    and not _should_replicate(key)
                     and t.ndim >= 1
                     and t.shape[0] >= self.num_ranks
                     and t.shape[0] % self.num_ranks == 0
@@ -429,13 +614,14 @@ class GSPMDParallel(ParallelMode):
         def _can_fsdp(key: str, t: torch.Tensor) -> bool:
             return (
                 key not in sharded
+                and not _should_replicate(key)
                 and t.ndim >= 1
                 and t.shape[0] >= self.num_ranks
                 and t.shape[0] % self.num_ranks == 0
                 and t.shape[0] % self.num_processes == 0
             )
 
-        return sharded | shard_params_and_states(
+        sharded |= shard_params_and_states(
             model,
             params_and_buffers,
             opt,
@@ -443,6 +629,40 @@ class GSPMDParallel(ParallelMode):
             DataParallelStyle.FULLY_SHARD,
             shard_filter=_can_fsdp,
         )
+        state_only_substrs = (
+            self._fsdp_shard_optimizer_state_for_replicated_param_substrs
+        )
+        if state_only_substrs:
+
+            def _can_state_only_fsdp(key: str, tensor: torch.Tensor) -> bool:
+                return (
+                    _should_replicate(key)
+                    and any(substr in key for substr in state_only_substrs)
+                    and tensor.ndim >= 1
+                    and tensor.shape[0] >= self.num_ranks
+                    and tensor.shape[0] % self.num_ranks == 0
+                    and tensor.shape[0] % self.num_processes == 0
+                )
+
+            self._optimizer_state_only_sharded_keys = frozenset(
+                shard_optimizer_states_for_replicated_params(
+                    model,
+                    opt,
+                    self.process_mesh,
+                    parameter_filter=_can_state_only_fsdp,
+                    state_keys=self._fsdp_sharded_optimizer_state_keys,
+                )
+            )
+            logger.info(
+                "GSPMD state-only optimizer sharding: %d leaves across %d FQNs",
+                len(self._optimizer_state_only_sharded_keys),
+                len(
+                    {fqn for fqn, _state_key in self._optimizer_state_only_sharded_keys}
+                ),
+            )
+        else:
+            self._optimizer_state_only_sharded_keys = frozenset()
+        return sharded
 
     def apply_state_layout(
         self,
@@ -598,6 +818,7 @@ class DataParallel(ParallelMode):
                     self._device_type,
                     self.num_processes,
                     "fake_recir_process_mesh",
+                    rank=_current_process_rank(self.num_processes),
                 )
             else:
                 self._process_mesh = DeviceMesh(
@@ -621,6 +842,7 @@ class DataParallel(ParallelMode):
                     self._device_type,
                     self.num_ranks,
                     "fake_recir_device_mesh",
+                    rank=_current_device_rank(self.num_ranks, self.num_processes),
                 )
             else:
                 self._device_mesh = DeviceMesh(

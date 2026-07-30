@@ -81,6 +81,16 @@ class ToShardedJaxTest(unittest.TestCase):
         )
         self.assertIs(out, arr)
 
+    def test_scalar_array_with_fsdp_flag_replicates(self) -> None:
+        arr = jax.device_put(np.array(1.0, dtype=np.float32), jax.devices()[0])
+        self.assertIsInstance(arr.sharding, jax.sharding.SingleDeviceSharding)
+
+        out = _XLAModule._to_sharded_jax(arr, self.mesh, is_fsdp_weight=True)
+
+        self.assertEqual(out.sharding, self.replicated)
+        self.assertEqual(out.shape, ())
+        self.assertEqual(float(jax.device_get(out)), 1.0)
+
     def test_single_device_array_resharded_to_fsdp(self) -> None:
         # An FSDP weight cached as a single-device jax.Array is re-sharded along
         # dim 0 across the mesh (P("torch_dist", ...)), not left single-device.
