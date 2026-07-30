@@ -46,7 +46,10 @@ from hammer.v3.models.udd_fm_v3.udd_fm_config import (
 )
 from minimal_viable_ai.core.dataloader.dataloader_configs import RandomDataSourceConfig
 from minimal_viable_ai.core.model_family_api.configs import RecModelFamilyConfig
-from minimal_viable_ai.core.model_family_api.optimizer_configs import OptimConfig
+from minimal_viable_ai.core.model_family_api.optimizer_configs import (
+    OptimConfig,
+    RecOptimizerConfig,
+)
 from minimal_viable_ai.core.trainer.trainer_config_def import (
     MetricsConfig,
     RecTrainerConfig,
@@ -61,6 +64,7 @@ __all__ = [
     "RankFMModelArgs",
     "parse_cli",
     "build_module_config",
+    "build_optimizer_config",
     "build_model_family_config",
     "build_trainer_config",
 ]
@@ -215,6 +219,16 @@ class RankFMModelArgs:
     # contextual keys take their per-feature max length; the timestamp
     # key takes 1.  Lower than ``max_uih_seq_len`` shrinks the HSTU dense buffer
     seq_ro_per_sample_budget: int = 24
+
+
+# ---------------------------------------------------------------------------
+# Optimizer-config builder
+# ---------------------------------------------------------------------------
+
+
+def build_optimizer_config() -> RecOptimizerConfig:
+    """Return the optimizer config carried by the canonical model-family config."""
+    return ConfigProvider().create_config().optimizer_config
 
 
 # ---------------------------------------------------------------------------

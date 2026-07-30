@@ -35,9 +35,11 @@ Batch-size constraint: local_batch_size must be a multiple of
 from __future__ import annotations
 
 import collections
+import enum
 import logging
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
+from dataclasses import dataclass
 from typing import Any, Generator
 
 import jax
@@ -45,6 +47,7 @@ import jax.numpy as jnp
 import numpy as np
 import torch
 import torch.nn as nn
+from minimal_viable_ai.core.model_family_api.optimizer_configs import OptimConfig
 from torchrec.modules.embedding_configs import EmbeddingConfig
 from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor
 
@@ -54,6 +57,48 @@ logger: logging.Logger = logging.getLogger(__name__)
 # ValueError for device kinds it doesn't recognise yet (e.g. "TPU7x"). Fall back
 # to 4 — the value jte uses internally for TPU v5/v6/v7 chips.
 _NUM_SC_PER_DEVICE_FALLBACK: int = 4
+
+
+class SparseUpdatePlacement(enum.Enum):
+    """Where the sparse optimizer update executes."""
+
+    BACKEND_FUSED = "backend_fused"
+    COMPILED_OPTIMIZER = "compiled_optimizer"
+
+
+@dataclass
+class SparseOptimizerRuntime:
+    """Backend-independent description of sparse optimizer execution."""
+
+    placement: SparseUpdatePlacement
+    config: OptimConfig
+    optimizer: torch.optim.Optimizer | None = None
+    lr_buffer: torch.Tensor | None = None
+
+    def __post_init__(self) -> None:
+        if (
+            self.placement == SparseUpdatePlacement.COMPILED_OPTIMIZER
+            and self.optimizer is None
+        ):
+            raise ValueError("A compiled sparse runtime requires an optimizer.")
+        if (
+            self.placement == SparseUpdatePlacement.BACKEND_FUSED
+            and self.optimizer is not None
+        ):
+            raise ValueError("A backend-fused sparse runtime cannot own an optimizer.")
+        if self.config.lr_warmup_schedule and self.lr_buffer is None:
+            raise NotImplementedError(
+                "This backend cannot apply the configured sparse LR schedule."
+            )
+
+
+@dataclass
+class EmbeddingSetupResult:
+    """Artifacts returned by an optimizer-aware embedding backend setup."""
+
+    model: nn.Module
+    dense_named_parameters: dict[str, nn.Parameter]
+    sparse_runtime: SparseOptimizerRuntime
 
 
 def _lazy_jte() -> tuple[Any, Any, Any, Any]:
@@ -336,18 +381,20 @@ class EmbeddingBackend(ABC):
         """Initialize process group. Returns (rank, world_size)."""
         ...
 
-    @abstractmethod
     def setup(
         self,
         model: nn.Module,
         table_configs: list[EmbeddingConfig],
-        embedding_lr: float,
+        sparse_config: OptimConfig,
+        device: torch.device,
         world_size: int,
-    ) -> nn.Module:
-        """Set up embedding storage (sparse side only) and return the (possibly
-        DMP-wrapped) model.
+    ) -> EmbeddingSetupResult:
+        """Set up storage and sparse optimizer ownership in one operation.
+
+        The result tells the caller whether sparse updates execute in a
+        backend-fused path or through a compiled torch optimizer.
         """
-        ...
+        raise NotImplementedError
 
     @abstractmethod
     def dense_named_parameters(self, model: nn.Module) -> dict[str, nn.Parameter]:
