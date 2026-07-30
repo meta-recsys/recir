@@ -66,12 +66,18 @@ import recir.torchax.ops.jseq_embedding  # noqa: F401
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from minimal_viable_ai.core.model_family_api.optimizer_configs import OptimConfig
 from recir.eager_dispatch import (
     install_graph_break_dispatch,
     mark_input,
     mark_output_with_bwd,
 )
-from recir.sparsecore.backend import EmbeddingBackend
+from recir.sparsecore.backend import (
+    EmbeddingBackend,
+    EmbeddingSetupResult,
+    SparseOptimizerRuntime,
+    SparseUpdatePlacement,
+)
 from torchrec.modules.embedding_configs import EmbeddingConfig
 from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor
 
@@ -515,46 +521,62 @@ class InGraphEmbeddingBackend(EmbeddingBackend):
         self,
         model: nn.Module,
         table_configs: List[EmbeddingConfig],
-        embedding_lr: float,
+        sparse_config: OptimConfig,
+        device: torch.device,
         world_size: int,
-    ) -> nn.Module:
+    ) -> EmbeddingSetupResult:
         if not self._feature_seqlens:
             raise RuntimeError(
                 "InGraphEmbeddingBackend.get_override() must run before setup()."
             )
+        if world_size <= 0:
+            raise ValueError(f"world_size must be positive, got {world_size}.")
 
-        # Big-table rows are padded to a multiple of the device count (the FSDP
-        # shard count) so the ring-shift block reshape vocab % W == 0 holds.
-        device_count = jax.device_count()
         sparse_arch = (
             model.recblock.tokenizer_stack.mot_sparse_arch._sparse_arch  # pyre-ignore[16]
         )
         new_ec = InGraphSparseArch(
             table_configs=table_configs,
             feature_seqlens=self._feature_seqlens,
-            world_size=device_count,
+            world_size=world_size,
             ringshift_min_rows=self._ringshift_min_rows,
             fsdp_min_rows=self._fsdp_min_rows,
             on_device_init=self._on_device_init,
         )
-        logger.info(
-            f"InGraphEmbeddingBackend: on_device_init={self._on_device_init} "
-            f"(meta param -> on-device HBM random init, no host alloc/H2D)"
-        )
-        # In-graph swap (no dispatcher): recir.trace will trace new_ec.forward and
-        # the opaque ringshift_embedding op into the single compiled GSPMD program.
         sparse_arch._embedding_collection = new_ec
-        emb_prefixes = (SHARDED_TABLE_PREFIX, DP_TABLE_PREFIX)
-        n_table_params = sum(
-            1
-            for n, _ in model.named_parameters()
-            if any(pre in n for pre in emb_prefixes)
+
+        embedding_params = self.embedding_named_parameters(model)
+        if not embedding_params:
+            raise RuntimeError("In-graph backend installed no embedding parameters.")
+        # Lazy imports preserve this backend's network-free module import. The
+        # recir_core package pulls the full UDD config chain at import time.
+        from hammer.v3.models.udd_fm_v3.recir_core.compile import LR_SPARSE_BUFFER
+        from hammer.v3.models.udd_fm_v3.recir_core.setup import (
+            _build_lr_buffered_optimizer,
+        )
+
+        sparse_optimizer, sparse_lr_buffer = _build_lr_buffered_optimizer(
+            model,
+            list(embedding_params.values()),
+            sparse_config,
+            LR_SPARSE_BUFFER,
+            device,
         )
         logger.info(
-            f"InGraphEmbeddingBackend: in-graph seq embedding installed "
-            f"({n_table_params} table params; trained by the main optimizer)"
+            "InGraphEmbeddingBackend: installed %d table params with %s",
+            len(embedding_params),
+            type(sparse_optimizer).__name__,
         )
-        return model
+        return EmbeddingSetupResult(
+            model=model,
+            dense_named_parameters=self.dense_named_parameters(model),
+            sparse_runtime=SparseOptimizerRuntime(
+                placement=SparseUpdatePlacement.COMPILED_OPTIMIZER,
+                config=sparse_config,
+                optimizer=sparse_optimizer,
+                lr_buffer=sparse_lr_buffer,
+            ),
+        )
 
     def get_override(
         self,
