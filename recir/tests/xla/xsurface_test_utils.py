@@ -870,6 +870,7 @@ class SparseArchDispatcher:
             fwd_fn,
             num_state_tensors=len(flat_state),
             num_ranks=num_ranks,
+            disable_torchrec_gradient_division=True,
         )
         return gm, flat_state
 
