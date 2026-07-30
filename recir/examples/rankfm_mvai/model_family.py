@@ -249,7 +249,7 @@ class RecirXLACompiledModule(RecirCompiledModuleBase):
 
         # Dispatchers BEFORE backend.setup (override builder runs the sparse arch
         # eagerly against the unmodified model).
-        dispatchers = backend.get_override(  # pyre-ignore[16]
+        dispatchers = backend.get_override(
             model.recblock,
             batch_sample,
             device,
@@ -268,16 +268,13 @@ class RecirXLACompiledModule(RecirCompiledModuleBase):
             trainer_cfg.embedding_lr,
             num_processes,
         )
-        # pyre-ignore[29]: backend.setup returns Module; set_recir_kjt_keys is dynamic.
         model.set_recir_kjt_keys(ro_kjt_keys, nro_kjt_keys, unary_kjt_keys)
 
         # Unified dense optimizer: TensorLRAdamW + 0-d LR buffer + WarmupController,
         # the SAME mechanism as the GPU (HDP) cell. recir_train_step rebinds the
         # dense group['lr'] to LR_DENSE_BUFFER during the trace, the controller
         # advances it each step.
-        dense_params = list(
-            backend.dense_named_parameters(model).values()
-        )  # pyre-ignore[16]
+        dense_params = list(backend.dense_named_parameters(model).values())
         dense_opt, warmup = setup_dense_optimizer_and_warmup(
             model, dense_params, trainer_cfg.dense_optimizer_config, device
         )
@@ -327,7 +324,9 @@ class RecirXLACompiledModule(RecirCompiledModuleBase):
             device=device,
             num_ranks=num_ranks,
             num_processes=num_processes,
-            loss_reduction="sum",
+            # RankFM losses use global candidate-count normalization, so GSPMD must sum
+            # per-rank gradient contributions without another world-size division.
+            loss_reduction="mean",
             region_transforms=region_transforms,
         )
         self._model.train(True)
