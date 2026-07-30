@@ -11,9 +11,10 @@ Loads preprocessed ``MTMLROOTrainBatch`` files from GCS or a local directory.
 Per-step shape padding (RO/NRO/unary KJT lengths and values, NRO batch dim,
 ``num_candidates`` shape+sum) is handled entirely by
 ``recir.region_transforms.padding.PaddingRegionTransform`` (wired in
-``train.py``). The data layer only slices the loaded batch to the
-trainer's per-rank ``local_batch_size`` and remaps loaded IDs into the
-model's hash space.
+``train.py``) on the compiled path; the eager path (``train_cpu_eager.py``)
+processes the real jagged batch directly. Either way the data layer yields the
+REAL jagged batch untouched, only slicing to the trainer's per-rank
+``local_batch_size`` and remapping IDs into the model's hash space.
 
 Public surface:
 
@@ -401,200 +402,6 @@ def select_rows_slice(batch: Any, start: int, n: int) -> Any:
 
 
 # ---------------------------------------------------------------------------
-# Static-shape padding (so runtime shapes match the trace-time fake batch and
-# downstream XLA submodules don't see data-dependent dims). This is the
-# eager equivalent of PaddingRegionTransform, applied per-rank before yield.
-# ---------------------------------------------------------------------------
-
-
-def _pad_kjt_per_key(
-    kjt: KeyedJaggedTensor,
-    per_key_budgets: List[int],
-    target_stride: Optional[int] = None,
-) -> KeyedJaggedTensor:
-    """Pad each key's slice of ``kjt.values`` to ``per_key_budgets[k]`` entries.
-
-    If ``target_stride`` is provided and larger than the current stride,
-    the per-row lengths grid is zero-extended along the row axis so the
-    resulting KJT has ``stride == target_stride``. The value deficit goes
-    into the last row of the (post-extension) lengths grid so per-key
-    sum equals ``per_key_budgets[k]`` exactly. If a key already exceeds
-    its budget, values are truncated and lengths are clipped from the tail.
-    """
-    if kjt.variable_stride_per_key():
-        raise NotImplementedError("_pad_kjt_per_key does not support VS")
-
-    keys = list(kjt.keys())
-    F = len(keys)
-    if len(per_key_budgets) != F:
-        raise ValueError(
-            f"per_key_budgets length {len(per_key_budgets)} != num_keys {F}"
-        )
-    B = kjt.stride()
-    values = kjt.values()
-    lengths = kjt.lengths()
-    weights = kjt.weights_or_none()
-
-    new_B = target_stride if target_stride is not None else B
-    if new_B < B:
-        raise ValueError(
-            f"target_stride={new_B} cannot be smaller than current stride={B}"
-        )
-
-    per_key_lens = lengths.view(F, B)
-    if new_B > B:
-        pad_cols = torch.zeros(
-            (F, new_B - B), dtype=per_key_lens.dtype, device=per_key_lens.device
-        )
-        per_key_lens = torch.cat([per_key_lens, pad_cols], dim=1).clone()
-    else:
-        per_key_lens = per_key_lens.clone()
-    per_key_totals = per_key_lens.sum(dim=1).tolist()
-    key_offsets = [0]
-    for t in per_key_totals:
-        key_offsets.append(key_offsets[-1] + int(t))
-
-    new_values_chunks: List[torch.Tensor] = []
-    new_weights_chunks: List[torch.Tensor] = [] if weights is not None else []
-
-    for k_idx in range(F):
-        budget = per_key_budgets[k_idx]
-        v_start = key_offsets[k_idx]
-        v_end = key_offsets[k_idx + 1]
-        actual = int(per_key_totals[k_idx])
-        if actual < budget:
-            deficit = budget - actual
-            pad = torch.zeros(deficit, dtype=values.dtype, device=values.device)
-            new_values_chunks.append(torch.cat([values[v_start:v_end], pad]))
-            per_key_lens[k_idx, -1] = per_key_lens[k_idx, -1] + deficit
-            if weights is not None:
-                w_pad = torch.zeros(deficit, dtype=weights.dtype, device=weights.device)
-                new_weights_chunks.append(torch.cat([weights[v_start:v_end], w_pad]))
-        elif actual > budget:
-            new_values_chunks.append(values[v_start : v_start + budget])
-            row_lens = per_key_lens[k_idx]
-            cumsum = torch.cumsum(row_lens, dim=0)
-            prev_cumsum = cumsum - row_lens
-            per_key_lens[k_idx] = torch.clamp(
-                torch.minimum(row_lens, torch.clamp(budget - prev_cumsum, min=0)),
-                min=0,
-            )
-            if weights is not None:
-                new_weights_chunks.append(weights[v_start : v_start + budget])
-        else:
-            new_values_chunks.append(values[v_start:v_end])
-            if weights is not None:
-                new_weights_chunks.append(weights[v_start:v_end])
-
-    return KeyedJaggedTensor(
-        keys=keys,
-        values=torch.cat(new_values_chunks).contiguous(),
-        lengths=per_key_lens.flatten().contiguous(),
-        weights=(
-            torch.cat(new_weights_chunks).contiguous() if weights is not None else None
-        ),
-        stride=new_B,
-    )
-
-
-def _pad_dense_dim0(t: torch.Tensor, target: int, value: float = 0.0) -> torch.Tensor:
-    """Pad/truncate ``t`` along dim 0 to exactly ``target``."""
-    cur = t.shape[0]
-    if cur == target:
-        return t
-    if cur > target:
-        return t.narrow(0, 0, target).contiguous()
-    pad_shape = (target - cur,) + tuple(t.shape[1:])
-    pad = torch.full(pad_shape, value, dtype=t.dtype, device=t.device)
-    return torch.cat([t, pad], dim=0).contiguous()
-
-
-def _pad_dense_lastdim(
-    t: torch.Tensor, target: int, value: float = 0.0
-) -> torch.Tensor:
-    """Pad/truncate ``t`` along its last dim to exactly ``target``."""
-    cur = t.shape[-1]
-    if cur == target:
-        return t
-    if cur > target:
-        return t.narrow(-1, 0, target).contiguous()
-    pad_shape = tuple(t.shape[:-1]) + (target - cur,)
-    pad = torch.full(pad_shape, value, dtype=t.dtype, device=t.device)
-    return torch.cat([t, pad], dim=-1).contiguous()
-
-
-def pad_batch_to_static_shapes(
-    batch: Any,
-    *,
-    local_batch_size: int,
-    num_candidates: int,
-    ro_per_key_budgets: Optional[List[int]] = None,
-) -> Any:
-    """Force batch to fully-static shapes matching the synthetic trace.
-
-    After this step:
-      * ``num_candidates[i] == num_candidates`` for all i, so
-        ``sum(num_candidates) == local_batch_size * num_candidates`` deterministically.
-      * Dense tensors with batch dim ``sum-nc`` (``nro_float_features``,
-        ``supervision_label/weight`` last dim, ``all_labels[k]`` dim 0) are
-        padded/truncated to ``local_batch_size * num_candidates``.
-      * Each NRO/unary KJT key's values are padded to ``local_batch_size *
-        num_candidates`` entries per key.
-
-    RO id-list features and ``ro_float_features`` keep their existing
-    shapes — RO budgets are per-key and depend on the model's
-    contextual-feature config, which the caller should pre-apply before this
-    step if needed.
-    """
-    fields: Dict[str, Any] = {}
-
-    nc = batch.num_candidates
-    target_sum_nc = local_batch_size * num_candidates
-
-    # Force constant num_candidates per row.
-    fields["num_candidates"] = torch.full_like(nc, num_candidates)
-
-    fields["nro_float_features"] = _pad_dense_dim0(
-        batch.nro_float_features, target_sum_nc
-    )
-    fields["supervision_label"] = _pad_dense_lastdim(
-        batch.supervision_label, target_sum_nc
-    )
-    fields["supervision_weight"] = _pad_dense_lastdim(
-        batch.supervision_weight, target_sum_nc
-    )
-
-    if batch.all_labels is not None:
-        fields["all_labels"] = {
-            k: _pad_dense_dim0(v, target_sum_nc) for k, v in batch.all_labels.items()
-        }
-
-    # Pad NRO and unary KJTs per key. Also extend stride to target_sum_nc
-    # so KJT.stride() == sum-nc (downstream code reshapes lengths as
-    # [num_keys, sum-nc]). NRO/unary use a single shared per-key budget.
-    nro_keys = batch.nro_id_list_features.keys()
-    fields["nro_id_list_features"] = _pad_kjt_per_key(
-        batch.nro_id_list_features,
-        [target_sum_nc] * len(nro_keys),
-        target_stride=target_sum_nc,
-    )
-    if batch.unary_features is not None:
-        unary_keys = batch.unary_features.keys()
-        fields["unary_features"] = _pad_kjt_per_key(
-            batch.unary_features,
-            [target_sum_nc] * len(unary_keys),
-            target_stride=target_sum_nc,
-        )
-
-    if ro_per_key_budgets is not None:
-        fields["ro_id_list_features"] = _pad_kjt_per_key(
-            batch.ro_id_list_features, ro_per_key_budgets
-        )
-
-    return dataclasses.replace(batch, **fields)
-
-
-# ---------------------------------------------------------------------------
 # Top-level orchestrator (the public entry point trainers should use)
 # ---------------------------------------------------------------------------
 
@@ -606,7 +413,6 @@ def replay_batch_iter(
     max_steps: int,
     local_batch_size: int,
     num_candidates: int,
-    ro_per_key_budgets: Optional[List[int]] = None,
 ) -> Iterator[Any]:
     """Yield up to ``max_steps`` ready-to-train batches from ``data_pipe``.
 
@@ -619,9 +425,8 @@ def replay_batch_iter(
       2. ``remap_batch_ids`` — modulo loaded KJT IDs into the model's hash
          space (the dump was preprocessed under a different ``hash_size_cap``).
 
-    All static-shape padding (B, sum-num_candidates, per-key NRO budget)
-    is handled by PaddingRegionTransform at train_step entry. Per-row
-    over-budget jagged lengths are clipped inside the model's own
+    Always yields the REAL jagged batch untouched. On the compiled path RecIR
+    handles the padding. Per-row over-budget jagged lengths are clipped inside the model's own
     ``truncate_ro_features`` (mot_preprocessor.py), so no pre-truncation
     is needed here.
 
@@ -646,12 +451,6 @@ def replay_batch_iter(
                 f"[Replay] step {yielded + 1}: sum(num_candidates)={real_total}, "
                 f"NRO budget={budget} (fill={real_total / budget:.2%}, "
                 f"max nc[i]={int(nc.max())}/{num_candidates})"
-            )
-            batch = pad_batch_to_static_shapes(
-                batch,
-                local_batch_size=local_batch_size,
-                num_candidates=num_candidates,
-                ro_per_key_budgets=ro_per_key_budgets,
             )
             yield batch
             yielded += 1

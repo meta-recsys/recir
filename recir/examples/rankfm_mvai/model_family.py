@@ -341,9 +341,9 @@ class RecirXLACompiledModule(RecirCompiledModuleBase):
         return self._dense_opt
 
     def _build_compiled_step(self, first_batch: Any) -> Any:
-        # Trace with the family-provided (synthetic / replay, padded) trace batch,
-        # not the incoming real batch, so the override + padding shapes the
-        # dispatchers were built for stay consistent.
+        # Trace with the family-provided synthetic/replay batch, not the incoming
+        # runtime batch. PaddingRegionTransform applies the configured static
+        # shapes at trace entry when padding is enabled.
         if self._emb_opt is None:
             # Single dense optimizer (cpu / tpu backends).
             return compile_gspmd_step(
@@ -593,19 +593,6 @@ class RankFMMvaiModelFamily(BlueReelsVDDModelFamily):
                 batch_size=trainer_cfg.local_batch_size,
             )
 
-        # 6. ro_per_key_budgets for the replay datapipe (from the batch keys,
-        #    same pre/post the trace-batch swap below).
-        ro_kjt_keys: List[str] = list(batch.ro_id_list_features.keys())
-        ro_per_sample_budgets: Dict[str, int] = (
-            module_config.static_ro_per_sample_budgets
-            or dict(module_config.contextual_feature_to_max_length)
-        )
-        ro_per_key_budgets: List[int] = [
-            trainer_cfg.local_batch_size
-            * ro_per_sample_budgets.get(k, int(module_config.hstu_max_seq_len))
-            for k in ro_kjt_keys
-        ]
-
         # When no data_pipe, swap the uniform sample for a synthetic ROO (jagged)
         # trace batch.
         if (
@@ -621,15 +608,14 @@ class RankFMMvaiModelFamily(BlueReelsVDDModelFamily):
             )
             logger.info("[TRACE] using synthetic batch for trace (no data_pipe)")
 
-        # 7. Stash the replay-iter inputs so create_train_datapipe (called later
+        # 6. Stash the replay-iter inputs so create_train_datapipe (called later
         #    by RecTrainer.train, on this same family instance) reuses the exact
-        #    data_pipe / key_to_size / budgets created here -- without rebuilding
-        #    the BatchReplayPipe (which would re-enumerate / re-auth GCS).
+        #    data_pipe / key_to_size created here -- without rebuilding the
+        #    BatchReplayPipe (which would re-enumerate / re-auth GCS).
         self._gcs_data_pipe: Optional[BatchReplayPipe] = data_pipe  # pyre-ignore[16]
         self._gcs_key_to_size: Dict[str, int] = key_to_size  # pyre-ignore[16]
-        self._gcs_ro_per_key_budgets: List[int] = ro_per_key_budgets  # pyre-ignore[16]
 
-        # 8. The module owns the recir construction (override, backend.setup,
+        # 7. The module owns the recir construction (override, backend.setup,
         #    padding, compile). It exposes the dense opt we return to the trainer.
         wrapper = RecirXLACompiledModule(
             model=model,
@@ -655,7 +641,7 @@ class RankFMMvaiModelFamily(BlueReelsVDDModelFamily):
         (when --gcs_data_path is set) or synthetic uniform/random batches,
         capped at ``max_steps``.
 
-        The data_pipe / key_to_size / budgets were already created in
+        The data_pipe / key_to_size were already created in
         create_train_module_and_optimizer and live on this family instance, so
         we re-derive the iterator here from the same inputs to keep this method
         self-contained (RecTrainer calls it independently).
@@ -668,7 +654,6 @@ class RankFMMvaiModelFamily(BlueReelsVDDModelFamily):
         )
         data_pipe = getattr(self, "_gcs_data_pipe", None)
         key_to_size = getattr(self, "_gcs_key_to_size", {})
-        ro_per_key_budgets = getattr(self, "_gcs_ro_per_key_budgets", None)
 
         return _RankFMIterableDataset(
             trainer_cfg=trainer_cfg,
@@ -676,7 +661,6 @@ class RankFMMvaiModelFamily(BlueReelsVDDModelFamily):
             num_candidates=num_candidates_per_sample,
             data_pipe=data_pipe,
             key_to_size=key_to_size,
-            ro_per_key_budgets=ro_per_key_budgets,
         )
 
 
@@ -684,7 +668,7 @@ class _RankFMIterableDataset(IterableDataset):
     """Yields MTMLROOTrainBatch objects mirroring the per-step batch source.
 
     Three modes:
-      1. data_pipe set => replay_batch_iter (real data, padded per step).
+      1. data_pipe set => replay_batch_iter (real jagged data per step).
       2. enable_padding + feature_config => fresh random jagged batch / step.
       3. otherwise => the closure-captured uniform batch every step.
     Capped at ``max_steps`` so RecTrainer's loop terminates via StopIteration.
@@ -697,14 +681,12 @@ class _RankFMIterableDataset(IterableDataset):
         num_candidates: int,
         data_pipe: Optional[BatchReplayPipe],
         key_to_size: Dict[str, int],
-        ro_per_key_budgets: Optional[List[int]],
     ) -> None:
         self._trainer_cfg = trainer_cfg
         self._feature_config = feature_config
         self._num_candidates = num_candidates
         self._data_pipe = data_pipe
         self._key_to_size = key_to_size
-        self._ro_per_key_budgets = ro_per_key_budgets
 
     def __iter__(self) -> Any:
         trainer_cfg = self._trainer_cfg
@@ -716,7 +698,6 @@ class _RankFMIterableDataset(IterableDataset):
                 max_steps=trainer_cfg.max_steps,
                 local_batch_size=trainer_cfg.local_batch_size,
                 num_candidates=self._num_candidates,
-                ro_per_key_budgets=self._ro_per_key_budgets,
             )
             return
 
