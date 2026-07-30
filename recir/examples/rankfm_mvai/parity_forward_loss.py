@@ -54,6 +54,7 @@ from recir.decompositions import SPMD_DECOMP_TABLE
 from recir.distributed.parallel_mode import GSPMDParallel
 from recir.examples.rankfm_mvai.config import (
     build_module_config,
+    build_optimizer_config,
     RankFMModelArgs,
     RankFMTrainerConfig,
 )
@@ -427,10 +428,14 @@ def _compiled_step(
         num_ranks,
         num_processes,
     )
-    model = cast(
-        BlueReelsVDDTrainV3,
-        backend.setup(model, table_configs, trainer_cfg.embedding_lr, num_processes),
+    embedding_setup = backend.setup(
+        model,
+        table_configs,
+        build_optimizer_config().sparse.default,
+        device,
+        num_ranks,
     )
+    model = cast(BlueReelsVDDTrainV3, embedding_setup.model)
     unary_kjt = batch.unary_features
     assert unary_kjt is not None
     model.set_recir_kjt_keys(
@@ -439,7 +444,7 @@ def _compiled_step(
         unary_kjt.keys(),
     )
 
-    dense_named = backend.dense_named_parameters(model)
+    dense_named = embedding_setup.dense_named_parameters
     dense_params = list(dense_named.values())
     logger.info(
         f"[PARITY][DENSE-SET] COMPILED-{emb_backend} dist_init={dist.is_initialized()} "
@@ -447,17 +452,18 @@ def _compiled_step(
         f"has_EC={any('_embedding_collection' in n for n in dense_named)} "
         f"has_hstu_posw={any('_pos_weights' in n for n in dense_named)}"
     )
+    sparse_runtime = embedding_setup.sparse_runtime
     dense_opt, _warmup = setup_dense_optimizer_and_warmup(
-        model, dense_params, trainer_cfg.dense_optimizer_config, device
+        model,
+        dense_params,
+        trainer_cfg.dense_optimizer_config,
+        device,
+        sparse_cfg=(
+            sparse_runtime.config if sparse_runtime.lr_buffer is not None else None
+        ),
+        sparse_lr_buffer=sparse_runtime.lr_buffer,
     )
-    # in_graph backend only: dedicated SGD opt over the in-graph table params.
-    emb_named_fn = getattr(backend, "embedding_named_parameters", None)
-    emb_params = emb_named_fn(model) if emb_named_fn is not None else {}
-    emb_opt: torch.optim.Optimizer | None = None
-    if emb_params:
-        emb_opt = torch.optim.SGD(
-            list(emb_params.values()), lr=trainer_cfg.embedding_lr, foreach=True
-        )
+    emb_opt = sparse_runtime.optimizer
 
     region_transforms = (
         make_padding_region_transforms(
@@ -620,10 +626,14 @@ def _eager_step(
     # pyre-ignore[16]: dynamic submodule traversal through the hammer v3 union.
     ec = model.recblock.tokenizer_stack.mot_sparse_arch._sparse_arch._embedding_collection
     table_configs = ec.embedding_configs()
-    model = cast(
-        BlueReelsVDDTrainV3,
-        backend.setup(model, table_configs, trainer_cfg.embedding_lr, num_processes),
+    embedding_setup = backend.setup(
+        model,
+        table_configs,
+        build_optimizer_config().sparse.default,
+        device,
+        num_ranks,
     )
+    model = cast(BlueReelsVDDTrainV3, embedding_setup.model)
     unary_kjt = batch.unary_features
     assert unary_kjt is not None
     model.set_recir_kjt_keys(
@@ -641,7 +651,7 @@ def _eager_step(
     # sharded and masks per-chip correctly.
     # pyre-ignore[16]: dynamic submodule traversal through the hammer v3 union.
     model.recblock.loss_module._num_local = 1
-    dense_named = backend.dense_named_parameters(model)
+    dense_named = embedding_setup.dense_named_parameters
     dense_params = list(dense_named.values())
     logger.info(
         f"[PARITY][DENSE-SET] EAGER dist_init={dist.is_initialized()} "

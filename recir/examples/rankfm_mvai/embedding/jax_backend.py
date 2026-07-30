@@ -41,12 +41,16 @@ import jax
 import torch
 import torch.nn as nn
 from hammer.v3.modules.mot.tokenizers.mot_sparse_arch import ECSparseArch
+from minimal_viable_ai.core.model_family_api.optimizer_configs import OptimConfig
 from recir.eager_dispatch import install_graph_break_dispatch
 from recir.sparsecore.backend import (
     _num_sc_per_device,
     EmbeddingBackend,
+    EmbeddingSetupResult,
     init_sc_embedding_variables,
     SparsecoreBackedEC,
+    SparseOptimizerRuntime,
+    SparseUpdatePlacement,
 )
 from recir.tests.xla.xsurface_test_utils import (
     _disable_sampling,
@@ -193,26 +197,34 @@ class JAXRankFMBackend(EmbeddingBackend):
         self,
         model: nn.Module,
         table_configs: List[EmbeddingConfig],
-        embedding_lr: float,
+        sparse_config: OptimConfig,
+        device: torch.device,
         world_size: int,
-    ) -> nn.Module:
+    ) -> EmbeddingSetupResult:
         if not self._feature_padded_input_sizes:
             raise RuntimeError(
-                "JAXRankFMBackend.get_override() must be called before "
-                "setup() so the per-feature PRT-padded input sizes are "
-                "captured from the cached_input_kjt."
+                "JAXRankFMBackend.get_override() must be called before setup()."
             )
+        if device.type != "cpu":
+            raise ValueError(f"JAX backend expects CPU host state, got {device}.")
 
-        _, _, lookup, jax_ec = init_sc_embedding_variables(
+        _, _, _, jax_ec = init_sc_embedding_variables(
             table_configs=table_configs,
             feature_padded_input_sizes=self._feature_padded_input_sizes,
             world_size=world_size,
-            embedding_lr=embedding_lr,
+            embedding_lr=sparse_config.lr,
         )
         self._jax_ec = jax_ec
         self._jax_ec_ref[0] = jax_ec
         logger.info("JAXRankFMBackend: SparsecoreBackedEC initialized")
-        return model
+        return EmbeddingSetupResult(
+            model=model,
+            dense_named_parameters=self.dense_named_parameters(model),
+            sparse_runtime=SparseOptimizerRuntime(
+                placement=SparseUpdatePlacement.BACKEND_FUSED,
+                config=sparse_config,
+            ),
+        )
 
     def dense_named_parameters(self, model: nn.Module) -> Dict[str, nn.Parameter]:
         # Embedding state lives in emb_vars on SparseCore; everything else is dense.

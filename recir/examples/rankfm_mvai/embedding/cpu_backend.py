@@ -20,20 +20,33 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Any, Dict, List, Tuple
+from typing import Any, cast, Dict, List, Tuple
 
 import jax
 import torch
 import torch.distributed as dist
 import torch.nn as nn
-from recir.sparsecore.backend import EmbeddingBackend
+from minimal_viable_ai.core.model_family_api.model_family import (
+    optim_type_to_optim_class,
+)
+from minimal_viable_ai.core.model_family_api.optimizer_configs import OptimConfig
+from recir.sparsecore.backend import (
+    EmbeddingBackend,
+    EmbeddingSetupResult,
+    SparseOptimizerRuntime,
+    SparseUpdatePlacement,
+)
 from recir.tests.xla.xsurface_test_utils import _build_overrides
+from torch.distributed.optim import (
+    _apply_optimizer_in_backward as apply_optimizer_in_backward,
+)
 from torchrec.distributed.embedding import EmbeddingCollectionSharder
 from torchrec.distributed.embedding_types import EmbeddingComputeKernel
 from torchrec.distributed.model_parallel import DistributedModelParallel
 from torchrec.distributed.planner import EmbeddingShardingPlanner, Topology
 from torchrec.distributed.planner.types import ParameterConstraints
 from torchrec.distributed.types import ShardingEnv, ShardingType
+from torchrec.distributed.utils import optimizer_type_to_emb_opt_type
 from torchrec.modules.embedding_configs import EmbeddingConfig
 from torchrec.optim.optimizers import in_backward_optimizer_filter
 
@@ -44,58 +57,36 @@ logger: logging.Logger = logging.getLogger(__name__)
 _ROW_WISE_MIN_ROWS_PER_RANK: int = 100
 
 
-# Embedding parameters all live under this submodule path in the bare
-# (un-DMP'd) BlueReelsVDDTrainV3 graph. The multi-rank DMP path applies a
-# row-wise-adagrad-style update in-backward via fbgemm's FUSED kernel for
-# embedding tables; the single-node path doesn't get FUSED, so we use plain
-# Adagrad (element-wise accumulator) here as the same idea at full precision.
-# Without per-param adaptive LR, plain SGD@embedding_lr=0.1 on a hot id makes
-# the model diverge within ~40 steps on real BarnFS data.
+# Embedding parameters all live under this submodule path in the bare model.
 _EMBEDDING_PARAM_PREFIX: str = (
     "recblock.tokenizer_stack.mot_sparse_arch._sparse_arch._embedding_collection"
 )
 
 
-def _build_single_node_optimizer(
+def _attach_single_node_sparse_optimizers(
     model: nn.Module,
-    embedding_lr: float,
-    dense_lr: float,
-) -> torch.optim.Optimizer:
-    """Adagrad with two param groups: embeddings at embedding_lr (matches FUSED
-    RowWiseAdagrad in the DMP path), dense at dense_lr. Dense on Adagrad is
-    harmless — the accumulator can only shrink the LR, never grow it.
-    """
-    emb_params: List[torch.Tensor] = []
-    dense_params: List[torch.Tensor] = []
-    for name, p in model.named_parameters():
-        if not p.requires_grad:
+    sparse_config: OptimConfig,
+) -> None:
+    """Attach config-driven in-backward optimizers to bare EC parameters."""
+    attached = 0
+    for name, parameter in model.named_parameters():
+        if not parameter.requires_grad or not name.startswith(_EMBEDDING_PARAM_PREFIX):
             continue
-        if name.startswith(_EMBEDDING_PARAM_PREFIX):
-            emb_params.append(p)
-        else:
-            dense_params.append(p)
-    logger.info(
-        "Single-node optimizer: %d embedding params (lr=%g), %d dense params (lr=%g)",
-        len(emb_params),
-        embedding_lr,
-        len(dense_params),
-        dense_lr,
-    )
-    param_groups: List[Dict[str, Any]] = []
-    if emb_params:
-        param_groups.append({"params": emb_params, "lr": embedding_lr})
-    if dense_params:
-        param_groups.append({"params": dense_params, "lr": dense_lr})
-    # initial_accumulator_value=0.1 stops Adagrad's cold-start pathology:
-    # with accumulator=0, the step-1 update degenerates to ±lr·sign(g) (the
-    # gradient magnitude cancels out), which on millions of embedding rows
-    # initialized in U(-0.1, 0.1) flips signs everywhere and triggers NaN by
-    # step 2. With initial_accumulator=0.1, step 1 = lr·g / sqrt(0.1+g²) which
-    # is bounded by lr·g/sqrt(0.1) for small g and ≈lr for large g -- a sane
-    # bootstrap until the per-param accumulator builds up.
-    return torch.optim.Adagrad(
-        param_groups, initial_accumulator_value=0.1, foreach=True
-    )
+        table_name = name.split(".")[-2]
+        optimizer_class = optim_type_to_optim_class(sparse_config.optim_type)
+        apply_optimizer_in_backward(
+            optimizer_class,
+            [parameter],
+            {
+                "_batch_key": table_name,
+                "learning_rate": sparse_config.lr,
+                "eps": sparse_config.eps,
+            },
+        )
+        attached += 1
+    if attached == 0:
+        raise RuntimeError("CPU backend found no embedding parameters to optimize.")
+    logger.info("Attached in-backward sparse optimizers to %d CPU tables", attached)
 
 
 class _ECSharder(EmbeddingCollectionSharder):
@@ -157,35 +148,66 @@ class CPURankFMBackend(EmbeddingBackend):
             f"Gloo PG initialized: rank={dist.get_rank()}, "
             f"world={dist.get_world_size()}"
         )
+
         return gloo_rank, gloo_world
 
     def setup(
         self,
         model: nn.Module,
         table_configs: List[EmbeddingConfig],
-        embedding_lr: float,
+        sparse_config: OptimConfig,
+        device: torch.device,
+        world_size: int,
+    ) -> EmbeddingSetupResult:
+        if device.type != "cpu":
+            raise ValueError(f"CPU backend requires a CPU device, got {device}.")
+        if dist.is_initialized():
+            model = self._setup_dmp(model, table_configs, sparse_config, world_size)
+        else:
+            _attach_single_node_sparse_optimizers(model, sparse_config)
+            logger.info("Single-node: using config-driven in-backward optimizers")
+
+        return EmbeddingSetupResult(
+            model=model,
+            dense_named_parameters=self.dense_named_parameters(model),
+            sparse_runtime=SparseOptimizerRuntime(
+                placement=SparseUpdatePlacement.BACKEND_FUSED,
+                config=sparse_config,
+            ),
+        )
+
+    def _setup_dmp(
+        self,
+        model: nn.Module,
+        table_configs: List[EmbeddingConfig],
+        config: OptimConfig,
         world_size: int,
     ) -> nn.Module:
-        if not dist.is_initialized():
-            logger.info("Single-node: skipping DMP, using model directly")
-            return model
+        emb_opt_type = optimizer_type_to_emb_opt_type(
+            optim_type_to_optim_class(config.optim_type)
+        )
+        logger.info(
+            "CPURankFMBackend: FUSED embedding optimizer=%s lr=%g eps=%g",
+            emb_opt_type,
+            config.lr,
+            config.eps,
+        )
 
         pg = dist.distributed_c10d._get_default_group()
         sharders = [
             _ECSharder(
                 kernel_type=EmbeddingComputeKernel.FUSED.value,
-                fused_params={"learning_rate": embedding_lr},
+                fused_params={
+                    "optimizer": emb_opt_type,
+                    "learning_rate": config.lr,
+                    "eps": config.eps,
+                },
             )
         ]
 
-        # Per-table sharding: small tables -> TABLE_WISE (avoids <1 row/rank),
-        # large tables -> ROW_WISE (scales across ranks for memory + parallelism).
-        # pyre-ignore[16]: dynamic submodule traversal through hammer v3 nn.Module
-        #   union; the runtime path exists on BlueReelsVDDTrainV3.
-        ec = model.recblock.tokenizer_stack.mot_sparse_arch._sparse_arch._embedding_collection
         row_wise_min = world_size * _ROW_WISE_MIN_ROWS_PER_RANK
         constraints: Dict[str, ParameterConstraints] = {}
-        for table in ec.embedding_configs():
+        for table in table_configs:
             sharding = (
                 ShardingType.ROW_WISE.value
                 if table.num_embeddings >= row_wise_min
@@ -205,12 +227,10 @@ class CPURankFMBackend(EmbeddingBackend):
             topology=Topology(world_size=world_size, compute_device="cpu"),
             constraints=constraints,
         )
-        # pyrefly: ignore [bad-argument-type]
-        plan = planner.collective_plan(model, sharders, pg)
+        plan = planner.collective_plan(model, cast(Any, sharders), pg)
         logger.info("DMP sharding plan:")
         for module_path, module_plan in plan.plan.items():
-            # pyrefly: ignore [missing-attribute]
-            for param_name, param_sharding in module_plan.items():
+            for param_name, param_sharding in cast(Any, module_plan).items():
                 logger.info(
                     "  %s.%s: sharding_type=%s compute_kernel=%s",
                     module_path,
@@ -223,21 +243,14 @@ class CPURankFMBackend(EmbeddingBackend):
             model,
             env=ShardingEnv.from_process_group(pg),
             plan=plan,
-            # pyre-ignore[6]: _ECSharder is a valid ModuleSharder subclass
-            sharders=sharders,
+            sharders=cast(Any, sharders),
             device=torch.device("cpu"),
             init_data_parallel=False,
         )
         logger.info("CPURankFMBackend: DMP initialized (world=%d)", world_size)
-        # Return dmp.module so isinstance(orig_submodule, ECSparseArch) still works -
-        # DMP shards the EmbeddingCollection in-place but doesn't replace ECSparseArch.
         return dmp.module
 
     def dense_named_parameters(self, model: nn.Module) -> Dict[str, nn.Parameter]:
-        # Single-node: everything is dense (no DMP / FUSED embeddings). DMP:
-        # exclude the in-backward (FUSED) embedding params via the standard filter.
-        if not dist.is_initialized():
-            return dict(model.named_parameters())
         return dict(in_backward_optimizer_filter(model.named_parameters()))
 
     def get_override(

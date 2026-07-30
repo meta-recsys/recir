@@ -52,6 +52,7 @@ from recir.decompositions import SPMD_DECOMP_TABLE
 from recir.distributed.parallel_mode import GSPMDParallel
 from recir.examples.rankfm_mvai.config import (
     build_module_config,
+    build_optimizer_config,
     RankFMModelArgs,
     RankFMTrainerConfig,
 )
@@ -349,10 +350,14 @@ def _compile_forward_runner(
         num_ranks,
         num_processes,
     )
-    model = cast(
-        BlueReelsVDDTrainV3,
-        backend.setup(model, table_configs, trainer_cfg.embedding_lr, num_processes),
+    embedding_setup = backend.setup(
+        model,
+        table_configs,
+        build_optimizer_config().sparse.default,
+        device,
+        num_ranks,
     )
+    model = cast(BlueReelsVDDTrainV3, embedding_setup.model)
     # tpu backend: flip id-dropping on the SparseCoreLookup post-setup (reads it
     # per-call); no-op for cpu / in_graph (no _jax_ec).
     if _FWD_ALLOW_ID_DROPPING:
@@ -369,7 +374,7 @@ def _compile_forward_runner(
     )
 
     # Dense opt is required by the compile but never stepped (forward-only).
-    dense_params = list(backend.dense_named_parameters(model).values())
+    dense_params = list(embedding_setup.dense_named_parameters.values())
     dense_opt, _warmup = setup_dense_optimizer_and_warmup(
         model, dense_params, trainer_cfg.dense_optimizer_config, device
     )
