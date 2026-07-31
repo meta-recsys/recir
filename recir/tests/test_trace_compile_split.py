@@ -86,6 +86,19 @@ class TraceReturnsGmAndFlatStateTest(unittest.TestCase):
         self.assertEqual(ctx.opts, [opt])
 
 
+def _two_optimizer_train_step(
+    model: nn.Module,
+    opt0: torch.optim.Optimizer,
+    opt1: torch.optim.Optimizer,
+    x: torch.Tensor,
+) -> None:
+    opt0.zero_grad()
+    opt1.zero_grad()
+    model(x).sum().backward()
+    opt0.step()
+    opt1.step()
+
+
 class CompileFromGmTest(unittest.TestCase):
     """recir.compile_from_gm runs stages 4-10 end-to-end."""
 
@@ -176,6 +189,42 @@ class CompileFromGmTest(unittest.TestCase):
                 backend=_StrictBackend(),
             )
         self.assertIn("deliberate reject", str(ctx.exception))
+
+    def test_compile_from_gm_preserves_optimizer_state_order(self) -> None:
+        model = nn.Sequential(
+            nn.Linear(4, 4, bias=False),
+            nn.Linear(4, 4, bias=False),
+        )
+        first, second = list(model.parameters())
+        second_opt = torch.optim.SGD([second], lr=0.01, momentum=0.9, foreach=True)
+        first_opt = torch.optim.SGD([first], lr=0.01, momentum=0.9, foreach=True)
+        second_buffer = torch.full_like(second, 7.0)
+        first_buffer = torch.full_like(first, 3.0)
+        second_opt.state[second]["momentum_buffer"] = second_buffer
+        first_opt.state[first]["momentum_buffer"] = first_buffer
+        x = torch.randn(2, 4)
+
+        gm, flat_state = recir.trace(
+            _two_optimizer_train_step, model, second_opt, first_opt, x
+        )
+        compiled = recir.compile_from_gm(
+            gm,
+            flat_state,
+            parallel_mode=_PassthroughParallel(),
+            backend=_NoopBackend(),
+        )
+
+        second_idx = next(
+            idx
+            for idx, value in enumerate(compiled.flat_state)
+            if value is second_buffer
+        )
+        first_idx = next(
+            idx
+            for idx, value in enumerate(compiled.flat_state)
+            if value is first_buffer
+        )
+        self.assertLess(second_idx, first_idx)
 
     def test_compile_from_gm_without_trace_ctx_raises(self) -> None:
         """A naked gm (not produced by recir.trace) raises a clear error."""
