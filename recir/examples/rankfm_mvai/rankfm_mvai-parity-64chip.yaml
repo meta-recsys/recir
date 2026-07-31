@@ -1,6 +1,6 @@
 # RankFM-MVAI CPU-eager vs TPU-compiled parity on the same 64-chip
 # (16-host, 4x4x4) configuration as rankfm_mvai-64chip.yaml. Both cells run
-# one optimizer step over the replicated rank_0 replay batch with matching model,
+# three consecutive optimizer steps over rank_0 replay batches with matching model,
 # precision, batch, candidate, hash-size, optimizer, and TPU runtime settings.
 #
 # Submit:
@@ -61,6 +61,8 @@ spec:
                 value: "rank_0_batch_{i}.pt.zst"
               - name: PARITY_DATA_FILE_INDEX
                 value: "1"
+              - name: PARITY_STEPS
+                value: "3"
               - name: MASTER_PORT
                 value: "29500"
               # Extend the TPU init barrier deadline so slower-mounting pods don't
