@@ -32,6 +32,7 @@ import torch.library
 import torch.nn as nn
 import torch.utils._pytree as pytree
 from recir.distributed.batch_dim_utils import BatchDimAnalyzer
+from recir.meta_tensor_init import copy_meta_init_attrs, mark_meta_zero_init
 
 # v1's ``_rewrite_row_wise_embeddings`` (used by ``partition_data_parallel``
 # in the bundle_runtime path) reuses the row-wise embedding decomposition
@@ -542,7 +543,7 @@ def _propagate_param_non_compute_strategy(
     return DataParallelStrategy([node_type], _gen_replicate_spec(mesh))
 
 
-def _propagate_call_function_strategy(
+def _propagate_call_function_strategy(  # noqa: C901
     node: fx.Node,
     dp_strategy_map: Dict[fx.Node, StrategyType],
     mesh: DeviceMesh,
@@ -785,7 +786,7 @@ def _propagate_call_function_strategy(
     dp_strategy_map[node] = DataParallelStrategy(node_types, strategy)
 
 
-def build_data_parallel_strategies(
+def build_data_parallel_strategies(  # noqa: C901
     train_step_graph: GraphModule,
     num_params: int,
     num_states: int,
@@ -975,7 +976,7 @@ def partition_value(val: Any, spec: Union[DTensorSpec, Tuple[DTensorSpec]]) -> A
         raise RuntimeError(f"val type {type(val)} not supported")
 
 
-def partitioner(graph: GraphModule) -> GraphModule:
+def partitioner(graph: GraphModule) -> GraphModule:  # noqa: C901
     shape_adjustment_ops = {
         aten._unsafe_view.default: 1,
         aten.expand.default: 1,
@@ -1165,6 +1166,7 @@ def shard_params_and_states(
             continue
         sharded_keys.add(key)
         local_shard = partition_value(old_param, shard_spec)
+        copy_meta_init_attrs(local_shard, old_param)
         params_buffers[key] = local_shard
         atoms = key.split(".")
         parent = model
@@ -1174,6 +1176,7 @@ def shard_params_and_states(
             local_shard,
             requires_grad=old_param.requires_grad,
         )
+        copy_meta_init_attrs(new_param, old_param)
         setattr(parent, atoms[-1], new_param)
         old_to_new.append((old_param, new_param, shard_spec))
     _migrate_opt_after_param_swap(opts, old_to_new)
@@ -1287,7 +1290,7 @@ def _optimizer_state_for_parameter(
     return owners[0].state[parameter]
 
 
-def _clone_param_chains_for_backward(
+def _clone_param_chains_for_backward(  # noqa: C901
     graph: GraphModule, strategy_map: Dict[fx.Node, StrategyType]
 ) -> None:
     """Clone non-compute-op chains (t, view, reshape, ...) so each compute
@@ -1454,16 +1457,15 @@ def _shard_param(
     """Shard a single parameter in-place and update the model attribute."""
     full_tensor = params_buffers[key]
     local_shard = partition_value(full_tensor, shard_spec)
+    copy_meta_init_attrs(local_shard, full_tensor)
     params_buffers[key] = local_shard
     atoms = key.split(".")
     parent = model
     for atom in atoms[:-1]:
         parent = getattr(parent, atom)
-    setattr(
-        parent,
-        atoms[-1],
-        nn.Parameter(local_shard, requires_grad=full_tensor.requires_grad),
-    )
+    new_param = nn.Parameter(local_shard, requires_grad=full_tensor.requires_grad)
+    copy_meta_init_attrs(new_param, full_tensor)
+    setattr(parent, atoms[-1], new_param)
 
 
 def _shard_state_dict(
@@ -1474,7 +1476,9 @@ def _shard_state_dict(
     if isinstance(state, dict):
         for key in state:
             if isinstance(state[key], torch.Tensor):
-                state[key] = partition_value(state[key], shard_spec)
+                local_state = partition_value(state[key], shard_spec)
+                mark_meta_zero_init(local_state)
+                state[key] = local_state
 
 
 def _normalize_opts(
