@@ -27,6 +27,12 @@ RUN pip install --upgrade pip
 # ABI (torch::headeronly::Tag is only in torch >=2.12.dev) and breaks at import.
 RUN pip install 'torch==2.10.*' --index-url https://download.pytorch.org/whl/cpu
 
+# BarnFS encrypts DCP checkpoint payloads through its sitecustomize hook. TPU
+# jobs enable it with TORCH_ENABLE_BARNFS=ON and set MODEL_TYPE_NAME. GKE jobs
+# also set BARNFS_SHEPHERD_USE_INTERNET=1 to use their metadata identity.
+COPY barnfs-*.whl /tmp/
+RUN pip install /tmp/barnfs-*.whl && rm /tmp/barnfs-*.whl
+
 # JAX with TPU support.
 # Pinned <0.11: JAX 0.11.0 removed pltpu.DeviceIdType, which recir's ringshift
 # Pallas kernel (recir/ops/pallas/embeddings/ringshift.py) still uses. Leaving
@@ -91,6 +97,11 @@ COPY minimal_viable_ai /app/minimal_viable_ai
 # True). NOT the full mrs/hpc trees (those pull torchrec.fb / hpc.new chains).
 COPY mrs /app/mrs
 COPY hpc /app/hpc
+
+# Native BarnFS wheel dependencies absent from python:3.12-slim.
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends libatomic1 libtirpc3 && \
+    rm -rf /var/lib/apt/lists/*
 
 ENV PYTHONPATH="/app:/app/recir:${PYTHONPATH}"
 ENV CUDA_VISIBLE_DEVICES=-1

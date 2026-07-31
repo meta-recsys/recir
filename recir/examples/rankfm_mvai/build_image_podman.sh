@@ -20,12 +20,25 @@ FBCODE_DIR="$(cd "${RECIR_DIR}/.." && pwd)"
 STAGING_DIR="$(mktemp -d)"
 
 # Validate prerequisites
-for cmd in podman rsync gcloud; do
+for cmd in buck2 podman rsync gcloud; do
     if ! command -v "$cmd" > /dev/null 2>&1; then
         echo "Error: '$cmd' not found. Run 'feature install ${cmd/#podman/k8s_tools}' to install it." >&2
         exit 1
     fi
 done
+
+echo "--- Building BarnFS wheel ---"
+BARNFS_WHEEL="$(
+    cd "$FBCODE_DIR"
+    buck2 build @//mode/opt \
+        //ai_infra/privacy_security/security/file_vault/python:barnfs.whl \
+        --show-full-simple-output
+)"
+if [ ! -f "$BARNFS_WHEEL" ]; then
+    echo "ERROR: BarnFS wheel not found at $BARNFS_WHEEL" >&2
+    exit 1
+fi
+cp "$BARNFS_WHEEL" "${STAGING_DIR}/$(basename "$BARNFS_WHEEL")"
 for dir in /var/facebook/x509_identities /var/facebook/credentials; do
     if [ ! -d "$dir" ]; then
         echo "Error: $dir not found." >&2
@@ -183,8 +196,16 @@ podman build \
 
 echo ""
 echo "--- Verifying image ---"
-podman run --rm "${IMAGE_NAME}:${IMAGE_TAG}" python3 -c "
+podman run --rm \
+    -e TORCH_ENABLE_BARNFS=ON \
+    -e MODEL_TYPE_NAME=asset://ai.model.type/infra_mrs_research \
+    "${IMAGE_NAME}:${IMAGE_TAG}" python3 -c "
 import torch; print(f'PyTorch: {torch.__version__}')
+import barnfs; print('BarnFS: OK')
+import torch.distributed.checkpoint as dcp
+assert dcp.save.__module__.endswith('dcp_filesystem_barnfs')
+assert dcp.load.__module__.endswith('dcp_filesystem_barnfs')
+print('BarnFS DCP hotpatch: OK')
 import jax; print(f'JAX: {jax.__version__}')
 import recir; print('recir: OK')
 import torchrec; print('torchrec: OK')

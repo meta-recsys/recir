@@ -229,6 +229,23 @@ class BatchReplayPipe:
             )
             yield batch
 
+    def load_at(self, pos: int) -> Any:
+        """Load the batch at global position ``pos`` in the (cycling) file list.
+
+        ``pos`` is a monotonic counter across the whole run; it wraps around the
+        file list (``pos % len``) once the dataset is exhausted. This lets
+        ``replay_batch_iter`` resume the data stream from a checkpointed pointer
+        (see _RankFMIterableDataset.state_dict) instead of re-reading from 0.
+        """
+        n = len(self._file_list)
+        name = self._file_list[pos % n]
+        batch = self._load_batch(name)
+        logger.info(
+            f"[Replay] rank {self._rank} loaded pos {pos} (file {pos % n + 1}/{n}): "
+            f"{name}"
+        )
+        return batch
+
     def __len__(self) -> int:
         return len(self._file_list)
 
@@ -421,15 +438,16 @@ def replay_batch_iter(
     max_steps: int,
     local_batch_size: int,
     num_candidates: int,
+    start_index: int = 0,
 ) -> Iterator[Any]:
     """Yield up to ``max_steps`` ready-to-train batches from ``data_pipe``.
 
     Composes the standard real-data preprocessing chain in order:
       1. ``select_rows_slice`` — slice the loaded batch to ``local_batch_size``
          RO rows. Loaded files have B_loaded ~hundreds-thousands; the trace
-         expects per-rank ``local_batch_size`` rows. The window rotates
-         across steps (``yielded % n_windows``) so each step sees different
-         rows of the loaded file rather than reusing rows 0..n-1.
+         expects per-rank ``local_batch_size`` rows. The window rotates by
+         global data position so each step sees different rows of the loaded
+         file rather than reusing rows 0..n-1.
       2. ``remap_batch_ids`` — modulo loaded KJT IDs into the model's hash
          space (the dump was preprocessed under a different ``hash_size_cap``).
 
@@ -438,27 +456,30 @@ def replay_batch_iter(
     ``truncate_ro_features`` (mot_preprocessor.py), so no pre-truncation
     is needed here.
 
-    Cycles through the pipe indefinitely; ``max_steps`` is the only
-    terminator.
+    Reads by global position ``pos = start_index + step`` and cycles through
+    the pipe via ``data_pipe.load_at`` (``pos % num_files``); ``max_steps`` is
+    the terminator. ``start_index`` (the checkpointed data pointer) lets a
+    resumed run continue the data stream from where the prior run stopped
+    instead of re-reading from position 0 (which would overlap the data the
+    prior run already consumed).
     """
-    yielded = 0
-    while True:
-        for batch in data_pipe:
-            if yielded >= max_steps:
-                return
-            B_loaded = batch.num_candidates.shape[0]
-            n_windows = max(1, B_loaded // local_batch_size)
-            window = yielded % n_windows
-            start = window * local_batch_size
-            batch = select_rows_slice(batch, start, local_batch_size)
-            batch = remap_batch_ids(batch, key_to_size)
-            nc = batch.num_candidates
-            real_total = int(nc.sum())
-            budget = nc.shape[0] * num_candidates
-            logger.info(
-                f"[Replay] step {yielded + 1}: sum(num_candidates)={real_total}, "
-                f"NRO budget={budget} (fill={real_total / budget:.2%}, "
-                f"max nc[i]={int(nc.max())}/{num_candidates})"
-            )
-            yield batch
-            yielded += 1
+    for step in range(max_steps):
+        pos = start_index + step
+        batch = data_pipe.load_at(pos)
+        B_loaded = batch.num_candidates.shape[0]
+        n_windows = max(1, B_loaded // local_batch_size)
+        # Rotate the row window by the GLOBAL position so a resumed run keeps
+        # advancing through the loaded file's rows rather than repeating them.
+        window = pos % n_windows
+        start = window * local_batch_size
+        batch = select_rows_slice(batch, start, local_batch_size)
+        batch = remap_batch_ids(batch, key_to_size)
+        nc = batch.num_candidates
+        real_total = int(nc.sum())
+        budget = nc.shape[0] * num_candidates
+        logger.info(
+            f"[Replay] step {step + 1} (pos {pos}): sum(num_candidates)={real_total}, "
+            f"NRO budget={budget} (fill={real_total / budget:.2%}, "
+            f"max nc[i]={int(nc.max())}/{num_candidates})"
+        )
+        yield batch
