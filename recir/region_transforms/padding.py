@@ -116,6 +116,28 @@ def runtime_num_local() -> int:
         return 1
 
 
+def trim_per_chip_to_size(
+    x: torch.Tensor,
+    target_size: int,
+    num_local: int,
+    dim: int = 0,
+) -> torch.Tensor:
+    """Remove trailing padding independently from each local-device block."""
+    current = x.shape[dim]
+    assert target_size <= current
+    if current == target_size:
+        return x
+    if current % num_local != 0 or target_size % num_local != 0:
+        return x.narrow(dim, 0, target_size)
+    current_per_chip = current // num_local
+    target_per_chip = target_size // num_local
+    return (
+        x.unflatten(dim, (num_local, current_per_chip))
+        .narrow(dim + 1, 0, target_per_chip)
+        .flatten(dim, dim + 1)
+    )
+
+
 @torch.library.custom_op("recir_padding::pad_to_static", mutates_args=())
 def pad_to_static(
     x: torch.Tensor,

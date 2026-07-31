@@ -50,6 +50,7 @@ from recir.region_transforms.padding import (
     pad_candidate_axis_to_static,
     pad_jagged_pair_to_static,
     runtime_num_local,
+    trim_per_chip_to_size,
 )
 from recir.torchax.amp import hammer_autocast_factory
 from torchrec import JaggedTensor, KeyedJaggedTensor
@@ -529,6 +530,21 @@ class PreprocessorDispatcher:
             for desc, v in input_nontensor_map.items():
                 bundle.set(desc, v, validate=False)
 
+            num_nro_candidates_padded = bundle.get_tensor(InputFeatures.NUM_CANDIDATES)
+            real_num_candidates: Optional[torch.Tensor] = None
+            if num_nro_candidates_padded is not None:
+                ro_stride = bundle.require_kjt(InputFeatures.UIH_ID_LIST).stride()
+                real_num_candidates = trim_per_chip_to_size(
+                    num_nro_candidates_padded,
+                    ro_stride,
+                    num_local_fit,
+                )
+                bundle.set(
+                    InputFeatures.LOCAL_NUM_CANDIDATES,
+                    real_num_candidates,
+                    validate=False,
+                )
+
             with torch.enable_grad():
                 output = real_stack(bundle)
 
@@ -544,28 +560,6 @@ class PreprocessorDispatcher:
                     out[0] = out[0] // num_processes_fit
                 return tuple(out)
 
-            num_nro_candidates_padded: Optional[torch.Tensor] = output.get_tensor(
-                InputFeatures.NUM_CANDIDATES
-            )
-            # Real per-sample candidate counts (summing to the REAL candidate
-            # total) used to split CANDIDATE-axis output KJTs per chip. The
-            # preprocessor only emits the PRT-PADDED num_candidates, so recover
-            # the real per-chip counts by dropping each chip's dummy sample slots,
-            real_num_candidates: Optional[torch.Tensor] = None
-            if num_nro_candidates_padded is not None:
-                ro_stride = bundle.require_kjt(InputFeatures.UIH_ID_LIST).stride()
-                if (
-                    num_local_fit > 1
-                    and num_nro_candidates_padded.shape[0] % num_local_fit == 0
-                    and ro_stride % num_local_fit == 0
-                ):
-                    padded_pb = num_nro_candidates_padded.shape[0] // num_local_fit
-                    real_pb = ro_stride // num_local_fit
-                    real_num_candidates = num_nro_candidates_padded.reshape(
-                        num_local_fit, padded_pb
-                    )[:, :real_pb].reshape(-1)
-                else:
-                    real_num_candidates = num_nro_candidates_padded[:ro_stride]
             seq_basis_lengths: Optional[torch.Tensor] = None
             flat_kjts: List[torch.Tensor] = []
             kjt_i = 0
