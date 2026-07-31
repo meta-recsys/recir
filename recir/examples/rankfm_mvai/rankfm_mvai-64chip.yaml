@@ -111,7 +111,7 @@ spec:
                 --l2_max_seq_len 512
                 --disable_seq_len_sampling
                 --seq_ro_per_sample_budget 3072
-                --embedding_backend cpu
+                --embedding_backend in_graph
                 --gcs_data_path /mnt/gcs-out/rankfm_1shard_data
                 --data_file_template "rank_0_batch_{i}.pt.zst"
                 --data_replicate_across_ranks
