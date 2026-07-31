@@ -623,3 +623,80 @@ def propagate_batch_input_meta(gm: fx.GraphModule) -> None:
         )
         for _name, _count in sorted(_missing.items(), key=lambda x: -x[1]):
             _logger.info("  %s -> %d nodes", _name, _count)
+
+
+def _output_fsdp_shard_dim_for(
+    target: Any, input_shard_dim: int, node: fx.Node
+) -> Optional[int]:
+    """Return the output FSDP shard axis for explicitly supported ops."""
+    aten = torch.ops.aten
+    if target in (aten.transpose.int, getattr(aten.transpose_copy, "int", None)):
+        dim0 = _normalize_dim(node, cast(int, node.args[1]))
+        dim1 = _normalize_dim(node, cast(int, node.args[2]))
+        if dim0 is None or dim1 is None:
+            return None
+        if input_shard_dim == dim0:
+            return dim1
+        if input_shard_dim == dim1:
+            return dim0
+        return input_shard_dim
+    if target in (aten.permute.default, aten.permute_copy.default):
+        perm = node.args[1]
+        if isinstance(perm, (list, tuple)) and input_shard_dim in perm:
+            return cast(List[int], perm).index(input_shard_dim)
+        return None
+    if target in (aten.sum.dim_IntList, aten.mean.dim):
+        return _reduce_passthrough(node, input_shard_dim)
+    axis_preserving = {
+        aten.add.Tensor,
+        aten.add.Scalar,
+        aten.add_.Tensor,
+        aten.add_.Scalar,
+        aten.sub.Tensor,
+        aten.sub.Scalar,
+        aten.sub_.Tensor,
+        aten.sub_.Scalar,
+        aten.mul.Tensor,
+        aten.mul.Scalar,
+        aten.mul_.Tensor,
+        aten.mul_.Scalar,
+        aten.div.Tensor,
+        aten.div.Scalar,
+        aten.div_.Tensor,
+        aten.div_.Scalar,
+        aten.neg.default,
+        aten.sqrt.default,
+        aten.rsqrt.default,
+        aten.lerp_.Scalar,
+        aten.addcmul_.default,
+        aten.addcdiv_.default,
+        aten.clone.default,
+        aten.detach.default,
+        aten._to_copy.default,
+    }
+    return input_shard_dim if target in axis_preserving else None
+
+
+def propagate_fsdp_sharded_meta(gm: fx.GraphModule) -> None:
+    """Propagate GSPMD FSDP metadata using explicit shard-axis rules."""
+    for node in gm.graph.nodes:
+        if node.op != "call_function":
+            continue
+        if node.meta.get("is_fsdp_sharded") or node.meta.get("is_batch_input"):
+            continue
+        output_shard_dim: Optional[int] = None
+        for arg in node.all_input_nodes:
+            if not arg.meta.get("is_fsdp_sharded") or arg.meta.get("is_batch_input"):
+                continue
+            input_shard_dim = arg.meta.get("fsdp_shard_dim", 0)
+            candidate = _output_fsdp_shard_dim_for(node.target, input_shard_dim, node)
+            if candidate is None:
+                output_shard_dim = None
+                break
+            if output_shard_dim is not None and output_shard_dim != candidate:
+                output_shard_dim = None
+                break
+            output_shard_dim = candidate
+        if output_shard_dim is not None:
+            node.meta["is_fsdp_sharded"] = True
+            node.meta["fsdp_shard_dim"] = output_shard_dim

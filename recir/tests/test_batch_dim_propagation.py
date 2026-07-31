@@ -27,7 +27,10 @@ intentional boundaries where the batch axis is reduced away:
 import unittest
 
 import torch
-from recir.batch_dim_propagation import propagate_batch_input_meta
+from recir.batch_dim_propagation import (
+    propagate_batch_input_meta,
+    propagate_fsdp_sharded_meta,
+)
 
 # Importing recir.ops.marker registers the `recir::mark_boundary` custom op,
 # which the tests below construct call_function nodes against. Without this
@@ -743,3 +746,68 @@ class IndexingScatterPropagationTest(unittest.TestCase):
                 f"is_batch_input not propagated through {node.target}",
             )
             self.assertEqual(node.meta.get("batch_dim"), 0)
+
+
+class PropagateFSDPShardedMetaTest(unittest.TestCase):
+    def _placeholder(
+        self, graph: fx.Graph, name: str, shape: tuple[int, ...], *, fsdp: bool = False
+    ) -> fx.Node:
+        node = graph.placeholder(name)
+        node.meta["val"] = torch.empty(shape)
+        if fsdp:
+            node.meta["is_fsdp_sharded"] = True
+        return node
+
+    def test_rowwise_optimizer_chain_preserves_fsdp_layout(self) -> None:
+        graph = fx.Graph()
+        grad = self._placeholder(graph, "grad", (10112, 128), fsdp=True)
+        state = self._placeholder(graph, "state", (10112, 1), fsdp=True)
+        rowwise = graph.call_function(
+            torch.ops.aten.sum.dim_IntList, args=(grad, [1], True)
+        )
+        rowwise.meta["val"] = torch.empty(10112, 1)
+        updated = graph.call_function(torch.ops.aten.add.Tensor, args=(state, rowwise))
+        updated.meta["val"] = torch.empty(10112, 1)
+        graph.output(updated)
+
+        propagate_fsdp_sharded_meta(fx.GraphModule(torch.nn.Module(), graph))
+
+        self.assertEqual(rowwise.meta.get("fsdp_shard_dim"), 0)
+        self.assertEqual(updated.meta.get("fsdp_shard_dim"), 0)
+
+    def test_reduction_of_fsdp_axis_drops_layout(self) -> None:
+        graph = fx.Graph()
+        state = self._placeholder(graph, "state", (10112, 1), fsdp=True)
+        reduced = graph.call_function(
+            torch.ops.aten.sum.dim_IntList, args=(state, [0], True)
+        )
+        reduced.meta["val"] = torch.empty(1, 1)
+        graph.output(reduced)
+
+        propagate_fsdp_sharded_meta(fx.GraphModule(torch.nn.Module(), graph))
+
+        self.assertFalse(reduced.meta.get("is_fsdp_sharded", False))
+
+    def test_transpose_moves_axis_when_shape_is_unchanged(self) -> None:
+        graph = fx.Graph()
+        state = self._placeholder(graph, "state", (128, 128), fsdp=True)
+        transposed = graph.call_function(
+            torch.ops.aten.transpose.int, args=(state, 0, 1)
+        )
+        transposed.meta["val"] = torch.empty(128, 128)
+        graph.output(transposed)
+
+        propagate_fsdp_sharded_meta(fx.GraphModule(torch.nn.Module(), graph))
+
+        self.assertEqual(transposed.meta.get("fsdp_shard_dim"), 1)
+
+    def test_unknown_same_shape_op_does_not_propagate_layout(self) -> None:
+        graph = fx.Graph()
+        state = self._placeholder(graph, "state", (128, 128), fsdp=True)
+        flipped = graph.call_function(torch.ops.aten.flip.default, args=(state, [0]))
+        flipped.meta["val"] = torch.empty(128, 128)
+        graph.output(flipped)
+
+        propagate_fsdp_sharded_meta(fx.GraphModule(torch.nn.Module(), graph))
+
+        self.assertFalse(flipped.meta.get("is_fsdp_sharded", False))
