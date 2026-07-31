@@ -169,6 +169,14 @@ def _current_device_rank(num_ranks: int, num_processes: int) -> int:
     return _current_process_rank(num_processes) * devices_per_process
 
 
+def _current_jax_process_index() -> int:
+    if _AOT_TOPOLOGY.get() is not None:
+        return 0
+    import jax  # @manual
+
+    return int(jax.process_index())
+
+
 def _create_fake_mesh(
     device_type: str,
     size: int,
@@ -560,7 +568,7 @@ class GSPMDParallel(ParallelMode):
                 "cpu",
                 self.num_processes,
                 "fake_gspmd_process_mesh",
-                rank=_current_process_rank(self.num_processes),
+                rank=_current_jax_process_index(),
             )
         return self._process_mesh
 

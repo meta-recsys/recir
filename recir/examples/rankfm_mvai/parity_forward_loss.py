@@ -67,7 +67,11 @@ from recir.examples.rankfm_mvai.model_family import (
     _udd_fm_v3_train_step,
     _udd_fm_v3_train_step_two_opt,
 )
-from recir.examples.rankfm_mvai.train_common import force_cpu_barrier, resolve_dist_env
+from recir.examples.rankfm_mvai.train_common import (
+    ensure_gloo_process_group,
+    force_cpu_barrier,
+    resolve_dist_env,
+)
 from recir.examples.rankfm_mvai.xsurface_helpers import (
     _resolve_nro_per_sample,
     make_padding_region_transforms,
@@ -1300,33 +1304,8 @@ def main() -> None:
     # MASTER_*) and route torch.distributed barriers to CPU. RecTrainer does this
     # before building the family; replicate it so nothing differs from the bench.
     resolve_dist_env()
+    ensure_gloo_process_group()
     force_cpu_barrier()
-    # Initialize a gloo PG so both cells' CPURankFMBackend.setup take the DMP+FUSED
-    # embedding path (dist.is_initialized() == True), reproducing the real e2e/prod
-    # regime (in-backward FUSED RowWiseAdagrad on both sides).
-    #
-    # MULTI-HOST (PARITY_DEVICE=tpu, num_processes>1): do NOT init a world=1 PG here
-    # -- that would make the DMP embedding sharding plan (built with
-    # world_size=num_processes in _compiled_step) assign tables to ranks the world=1
-    # PG lacks (tables_per_rank IndexError in torchrec tw_sharding). Leave it
-    # uninitialized so _compiled_step's `backend.init_pg()` builds the real cross-host
-    # gloo PG (world=num_processes via TPU_PROCESS_ADDRESSES + MASTER_ADDR).
-    # SINGLE-HOST/cpu-spoof: keep the world=1 PG (num_processes==1, plan matches).
-    if _PARITY_DEVICE != "tpu" and not (dist.is_available() and dist.is_initialized()):
-        os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
-        os.environ.setdefault("MASTER_PORT", "29500")
-        dist.init_process_group(
-            backend="gloo",
-            init_method="tcp://127.0.0.1:29500",
-            world_size=1,
-            rank=0,
-        )
-        logger.info("[PARITY] gloo PG (world=1) up -> DMP+FUSED embedding path")
-    elif _PARITY_DEVICE == "tpu":
-        logger.info(
-            "[PARITY] multi-host: deferring gloo PG to backend.init_pg() "
-            "(world=num_processes)"
-        )
     # Match the bench (train.py): do NOT force matmul precision unless explicit.
     # Exception: the fp32 disambiguation run (PARITY_BF16=0) forces highest so XLA
     # uses exact fp32 matmuls -- else tf32-like fast math would reintroduce the
