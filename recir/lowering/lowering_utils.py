@@ -38,6 +38,10 @@ def create_subgraph_module(
         subgraph_node = subgraph.node_copy(
             node, arg_transform=lambda x: node_to_subgraph_node[x]
         )
+        # Output placement resolved during compilation is a boundary contract.
+        # Share it with the parent node consumed by downstream subgraphs.
+        if node in outputs:
+            subgraph_node.meta = node.meta
         node_to_subgraph_node[node] = subgraph_node
 
     subgraph.output(result=tuple(node_to_subgraph_node[x] for x in outputs))
@@ -142,9 +146,15 @@ def lower_subgraph_nodes(
         for idx, output in enumerate(outputs)
         if any(u not in lowered and u.op != "output" for u in output.users)
     }
+    final_output_indices = {
+        idx
+        for idx, output in enumerate(outputs)
+        if any(u.op == "output" for u in output.users)
+    }
     subgraph_module = create_subgraph_module(inputs, body, outputs)
     readable_tag = dumper(str(subgraph_module.graph))
     module = module_factory(subgraph_module)
+    module.final_output_indices = final_output_indices  # pyre-ignore[16]
     if torch_output_indices:
         module.torch_output_indices = torch_output_indices  # pyre-ignore[16]
     # Register the lowered subgraph as a submodule attribute.

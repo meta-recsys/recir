@@ -19,7 +19,10 @@ import recir.torchax as torchax
 import torch
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from recir.backend import BackendType
-from recir.batch_dim_propagation import propagate_batch_input_meta
+from recir.batch_dim_propagation import (
+    propagate_batch_input_meta,
+    propagate_fsdp_sharded_meta,
+)
 from recir.distributed.sharding_spec import get_state_layout
 from recir.lowering.lowering_utils import segment_and_lower
 from recir.lowering.op_swap import OpSwapRegistry, swap_ops
@@ -211,6 +214,7 @@ class _XLAModule(torch.nn.Module):
         self.xla_hlo_text: Optional[str] = None
         self.keep_jax_output: bool = False
         self.torch_output_indices: Optional[set[int]] = None
+        self.final_output_indices: set[int] = set()
         self.safe_donate_indices: Optional[set[int]] = None
         # AOT (ahead-of-time) build state. Populated by ``_build_xla_executable``
         # whenever a backend produces a ``jax.stages.Compiled``, so an external
@@ -875,6 +879,37 @@ class _XLAModule(torch.nn.Module):
         return lowered, run
 
     @staticmethod
+    def _batch_boundary_output_sharding(
+        leaf: Any, mesh: Mesh
+    ) -> Optional[NamedSharding]:
+        if not isinstance(leaf, torch.fx.Node) or not leaf.meta.get(
+            "is_batch_input", False
+        ):
+            return None
+        val = leaf.meta.get("val")
+        ndim = val.ndim if hasattr(val, "ndim") else 0
+        batch_dim = leaf.meta.get("batch_dim", 0)
+        if not 0 <= batch_dim < ndim:
+            return None
+        partitions: List[Optional[str]] = [None] * ndim  # pyre-ignore
+        partitions[batch_dim] = "torch_dist"
+        return NamedSharding(mesh, P(*partitions))
+
+    @staticmethod
+    def _is_replicated_final_output(
+        index: int, leaf: Any, final_output_indices: set[int]
+    ) -> bool:
+        if index not in final_output_indices:
+            return False
+        return not (
+            isinstance(leaf, torch.fx.Node)
+            and (
+                leaf.meta.get("is_fsdp_sharded", False)
+                or leaf.meta.get("is_fsdp_sharded_output", False)
+            )
+        )
+
+    @staticmethod
     def _find_fsdp_source(
         node: torch.fx.Node,
         placeholder_indices: dict[torch.fx.Node, int],
@@ -936,10 +971,12 @@ class _XLAModule(torch.nn.Module):
         is_fsdp_meta: List[bool] = [
             n.meta.get("is_fsdp_sharded", False) for n in placeholders
         ]
+        per_input_fsdp_dim: List[int] = [
+            n.meta.get("fsdp_shard_dim", 0) if is_fsdp_meta[i] else 0
+            for i, n in enumerate(placeholders)
+        ]
         # Build per-input sharding specs and track which inputs are physically
-        # sharded. Batch metadata can survive on tensors whose rank no longer
-        # contains that axis after graph cuts; treat those as replicated instead
-        # of constructing an impossible sharding spec.
+        # sharded.
         in_shardings = []
         is_batch_sharded: List[bool] = []
         is_fsdp_sharded: List[bool] = []
@@ -961,8 +998,10 @@ class _XLAModule(torch.nn.Module):
                 is_fsdp_sharded.append(False)
             elif is_fsdp_meta[i] and i < len(args) and getattr(args[i], "ndim", 0) >= 1:
                 ndim = args[i].ndim
-                spec = P("torch_dist", *([None] * (ndim - 1)))
-                in_shardings.append(NamedSharding(mesh, spec))
+                shard_dim = per_input_fsdp_dim[i]
+                spec_parts = [None] * max(ndim, shard_dim + 1)
+                spec_parts[shard_dim] = "torch_dist"  # pyre-ignore
+                in_shardings.append(NamedSharding(mesh, P(*spec_parts)))
                 is_batch_sharded.append(False)
                 is_fsdp_sharded.append(True)
             else:
@@ -977,10 +1016,17 @@ class _XLAModule(torch.nn.Module):
         placeholder_indices = {n: i for i, n in enumerate(placeholders)}
         out_sharding_list = []
         for i in range(len(out_leaves)):
+            leaf = out_leaves[i]
             if i in torch_indices:
                 out_sharding_list.append(batch_sharded)
                 continue
-            leaf = out_leaves[i]
+            if self._is_replicated_final_output(i, leaf, self.final_output_indices):
+                out_sharding_list.append(replicated)
+                continue
+            batch_sharding = self._batch_boundary_output_sharding(leaf, mesh)
+            if batch_sharding is not None:
+                out_sharding_list.append(batch_sharding)
+                continue
             out_val = (
                 leaf.meta.get("val", None) if isinstance(leaf, torch.fx.Node) else None
             )
@@ -989,9 +1035,24 @@ class _XLAModule(torch.nn.Module):
                 if isinstance(leaf, torch.fx.Node)
                 else None
             )
-            if explicit_fsdp_output is not None:
+            if explicit_fsdp_output is False:
+                out_sharding_list.append(replicated)
+                continue
+            if isinstance(leaf, torch.fx.Node) and leaf.meta.get(
+                "is_fsdp_sharded", False
+            ):
                 ndim = out_val.ndim if hasattr(out_val, "ndim") else 0
-                if bool(explicit_fsdp_output) and ndim >= 1:
+                shard_dim = leaf.meta.get("fsdp_shard_dim", 0)
+                if ndim >= 1 and 0 <= shard_dim < ndim:
+                    partitions: list[Optional[str]] = [None] * ndim  # pyre-ignore
+                    partitions[shard_dim] = "torch_dist"
+                    out_sharding_list.append(NamedSharding(mesh, P(*partitions)))
+                else:
+                    out_sharding_list.append(replicated)
+                continue
+            if explicit_fsdp_output is True:
+                ndim = out_val.ndim if hasattr(out_val, "ndim") else 0
+                if ndim >= 1:
                     out_sharding_list.append(
                         NamedSharding(
                             mesh,
@@ -1014,6 +1075,8 @@ class _XLAModule(torch.nn.Module):
                 else None
             )
             if fsdp_src is not None:
+                leaf.meta["is_fsdp_sharded"] = True
+                leaf.meta.setdefault("fsdp_shard_dim", 0)
                 if out_val is not None and hasattr(out_val, "ndim"):
                     ndim = out_val.ndim
                 elif fsdp_src < len(args) and hasattr(args[fsdp_src], "ndim"):
@@ -1027,6 +1090,11 @@ class _XLAModule(torch.nn.Module):
                     out_sharding_list.append(replicated)
             else:
                 out_sharding_list.append(replicated)
+        if len(out_sharding_list) != len(out_leaves):
+            raise RuntimeError(
+                "GSPMD output sharding ABI must produce exactly one spec per leaf: "
+                f"leaves={len(out_leaves)} specs={len(out_sharding_list)}"
+            )
         out_shardings = out_treedef.unflatten(out_sharding_list)
         logger.info(
             "Compiling with GSPMD: %d placeholders, %d batch-sharded, %d weight-sharded, mesh=%s",
@@ -1258,7 +1326,12 @@ def _jax_to_torch(t: Any, device: torch.device) -> Any:
             # reconstruct the per-process tensor.
             sorted_shards = sorted(shards, key=lambda s: s.index)
             arrays = [_jax_to_numpy(s.data) for s in sorted_shards]
-            np_arr = np.concatenate(arrays, axis=0)
+            sharding_spec = getattr(getattr(t, "sharding", None), "spec", ())
+            sharded_axes = [
+                axis for axis, partition in enumerate(sharding_spec) if partition
+            ]
+            concat_axis = sharded_axes[0] if len(sharded_axes) == 1 else 0
+            np_arr = np.concatenate(arrays, axis=concat_axis)
         else:
             # Replicated: all shards identical, take one.
             np_arr = _jax_to_numpy(shards[0].data)
@@ -1407,6 +1480,7 @@ def partial_lower_xla(
     # ``propagate_batch_input_meta`` is idempotent (skips already-tagged
     # nodes) so re-running is free for the surgery-tagged callers.
     propagate_batch_input_meta(gm)
+    propagate_fsdp_sharded_meta(gm)
     lowered = segment_and_lower(
         gm,
         compatibility_fn=_is_xla_compatible,

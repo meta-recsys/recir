@@ -49,7 +49,7 @@ from typing import List
 
 import torch
 from recir.iter_graph_module import IterGraphModule
-from recir.lowering.lowering_utils import segment_and_lower
+from recir.lowering.lowering_utils import create_subgraph_module, segment_and_lower
 
 
 def _always_compatible(node: torch.fx.Node) -> tuple[bool, str]:
@@ -87,6 +87,22 @@ class _StubSubgraphModule(torch.nn.Module):
 
 
 class SegmentAndLowerAttributesTest(unittest.TestCase):
+    def test_subgraph_output_shares_boundary_metadata(self) -> None:
+        graph = torch.fx.Graph()
+        source = graph.placeholder("source")
+        output = graph.call_function(torch.ops.aten.relu.default, args=(source,))
+        output.meta["placement"] = "unresolved"
+        graph.output(output)
+
+        subgraph = create_subgraph_module([source], [output], [output])
+        copied_output = next(
+            node for node in subgraph.graph.nodes if node.op == "call_function"
+        )
+
+        self.assertIs(copied_output.meta, output.meta)
+        copied_output.meta["placement"] = "fsdp_shard_0"
+        self.assertEqual(output.meta["placement"], "fsdp_shard_0")
+
     def test_plain_graph_module_lint_passes(self) -> None:
         """Baseline: bare ``fx.GraphModule`` parent still works after the fix.
 
@@ -116,6 +132,7 @@ class SegmentAndLowerAttributesTest(unittest.TestCase):
         sub = getattr(lowered, "xla_subgraph_0", None)
         self.assertIsNotNone(sub, "xla_subgraph_0 attribute missing on parent gm")
         self.assertIsInstance(sub, _StubSubgraphModule)
+        self.assertEqual(sub.final_output_indices, {0})
 
         # And lint passes -- the regression we're guarding against.
         lowered.graph.lint()
