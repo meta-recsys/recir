@@ -502,7 +502,12 @@ class EagerCPUTrainPipeline(RankingSGDTrainPipeline):
         self._dense_opt.zero_grad(set_to_none=True)
         # Forward + backward eagerly. loss.backward() fires the DMP-FUSED
         # embedding Adagrad in-backward (matching the TPU run's host embeddings).
-        all_losses, named = self._raw_model(*flatten_batch(batch))
+
+        # This eager path has no cross-rank dense-gradient reduction, so its loss
+        # numerator is local. Use the local candidate count to match its scope.
+        flat_args = list(flatten_batch(batch))
+        flat_args[-1] = batch.num_candidates.sum()
+        all_losses, named = self._raw_model(*flat_args)
         loss = all_losses.sum()
         loss.backward()
         # Dense step: clip (matching TensorLRAdamW.step) then AdamW with the
