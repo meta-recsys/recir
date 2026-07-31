@@ -1527,18 +1527,24 @@ def compile_from_gm(  # noqa: C901 — orchestration: stages 4-8 of the pipeline
             "optimizer_state_only_sharded_keys",
             frozenset(),
         )
-        named_states = {}
+        rebuilt_named_states: Dict[str, Any] = {}
         _opts = ctx.opts
         if any(len(o.state) > 0 for o in _opts):
             # ``shard_params`` may have re-keyed each ``opt.state`` to the new
-            # (post-shard) Parameter identities; walk the live module to pick
-            # up the current binding across ALL optimizers (sparse + dense
-            # partition each own a disjoint subset of params).
+            # (post-shard) Parameter identities. Resolve the current FQN bindings,
+            # then restore the trace-time dict order: pytree flattening is
+            # positional, so module order would misalign state leaves with the
+            # graph placeholders when optimizer groups interleave in the module.
             for n, p in ctx.mod.named_parameters(remove_duplicate=False):
                 for o in _opts:
                     if p in o.state:
-                        named_states[n] = o.state[p]  # type: ignore[index]
+                        rebuilt_named_states[n] = o.state[p]  # type: ignore[index]
                         break
+            named_states = {
+                n: rebuilt_named_states[n]
+                for n in ctx.named_states
+                if n in rebuilt_named_states
+            }
             # Coverage check: ``shard_params`` may re-key params off the
             # module so the walk above misses entries that ``trace`` captured
             # in ``ctx.named_states``. Warn (rather than silently drop) so
