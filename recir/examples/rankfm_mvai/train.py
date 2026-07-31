@@ -13,8 +13,8 @@ orchestrated by the mvai_cloud training framework (RecTrainer + RecModelFamily +
 RecTrainPipeline).
 
 The TPU path is achieved WITHOUT editing mvai_cloud:
-  * ``jax.distributed.initialize()`` is called here, before RecTrainer is
-    constructed.
+  * For multi-host jobs, ``jax.distributed.initialize()`` is called here before
+    RecTrainer is constructed. Single-host jobs use JAX's local autodetection.
   * ``SystemConfig(use_gpu=False)`` makes RecTrainer take its CPU/gloo device
     branch (trainer.py:81-83); recir lowers the dense graph to TPU via
     ``jax.devices()`` regardless of the torch device being cpu.
@@ -103,14 +103,27 @@ def _init_gloo_pg() -> None:
 
 
 def main() -> None:
-    # Must be called before any JAX op. On GKE TPU the PJRT plugin reads the
-    # coordinator address + process index from TPU runtime metadata; without
-    # this each pod is jax.process_count()==1 and the SparseCore collective
-    # (which spans all chips) deadlocks.
-    jax.distributed.initialize()
     setup_logging()
+    resolve_dist_env()
+
+    # Multi-host (e.g. 128-chip): must call jax.distributed.initialize() before
+    # any JAX op so the PJRT plugin reads the coordinator address + process index
+    # from TPU runtime metadata; without it each pod is jax.process_count()==1 and
+    # the cross-pod GSPMD collective deadlocks.
+    #
+    # Single-host (1 pod, e.g. the 2x2x1 one-shard run): do NOT call it.
+    # jax.distributed.initialize() is for MULTI-process coordination; on a lone
+    # pod it mis-initializes the runtime in a way that makes the subsequent eager
+    # get_override CPU forward raise (a caught error -> "Sparse arch forward hook
+    # did not fire"). jax auto-detects the local chips without it (the CPU-eager
+    # entry, which never calls it, builds get_override cleanly -- the proof).
+    # WORLD_SIZE is preserved when provided, otherwise derived from the
+    # launcher-provided TPU process addresses.
+    single_host = int(os.environ.get("WORLD_SIZE", "1")) == 1
+    if not single_host:
+        jax.distributed.initialize()
     logger.info(
-        f"[DIST] jax.distributed.initialize() done: "
+        f"[DIST] JAX state: "
         f"process_count={jax.process_count()}, "
         f"device_count={jax.device_count()}, "
         f"local_device_count={jax.local_device_count()}, "
@@ -121,7 +134,6 @@ def main() -> None:
     logger.info(f"Trainer config: {trainer_cfg}")
     logger.info(f"Model args: {model_args}")
 
-    resolve_dist_env()
     # Create the process-wide gloo PG here (entrypoint-owned) before the trainer
     # / embedding backend need it -- see _init_gloo_pg.
     _init_gloo_pg()
