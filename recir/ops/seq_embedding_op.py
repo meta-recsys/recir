@@ -84,6 +84,14 @@ def _shard_batch0_meta(x: torch.Tensor) -> torch.Tensor:
     return torch.empty_like(x)
 
 
+# pyre-ignore
+def _shard_batch0_backward(ctx, grad_out: torch.Tensor) -> torch.Tensor:  # noqa
+    return grad_out
+
+
+torch.library.register_autograd("recir::shard_batch0", _shard_batch0_backward)
+
+
 def _fwd_fallback(
     ids: torch.Tensor,
     lengths: torch.Tensor,

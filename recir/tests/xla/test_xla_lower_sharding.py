@@ -37,8 +37,9 @@ import unittest
 
 import jax  # @manual
 import numpy as np
+import torch
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
-from recir.lowering.xla_lower import _XLAModule
+from recir.lowering.xla_lower import _jax_to_torch, _XLAModule
 
 
 def _mesh() -> Mesh:
@@ -53,6 +54,37 @@ class ToShardedJaxTest(unittest.TestCase):
         )
         self.mesh: Mesh = _mesh()
         self.replicated: NamedSharding = NamedSharding(self.mesh, P())
+
+    def test_batch_boundary_output_sharding_uses_batch_dim(self) -> None:
+        graph = torch.fx.Graph()
+        output = graph.placeholder("prediction")
+        output.meta["val"] = torch.empty(81, 12800)
+        output.meta["is_batch_input"] = True
+        output.meta["batch_dim"] = 1
+
+        sharding = _XLAModule._batch_boundary_output_sharding(output, self.mesh)
+
+        self.assertIsNotNone(sharding)
+        self.assertEqual(sharding.spec, P(None, "torch_dist"))
+
+    def test_dim_one_sharded_output_reconstructs_dim_one(self) -> None:
+        host = np.arange(24, dtype=np.float32).reshape(3, 8)
+        sharding = NamedSharding(self.mesh, P(None, "torch_dist"))
+        sharded = jax.device_put(host, sharding)
+
+        output = _jax_to_torch(sharded, torch.device("cpu"))
+
+        self.assertEqual(output.shape, torch.Size([3, 8]))
+        torch.testing.assert_close(output, torch.from_numpy(host))
+
+    def test_fsdp_state_is_not_replicated_as_final_user_output(self) -> None:
+        graph = torch.fx.Graph()
+        output = graph.placeholder("state")
+
+        self.assertTrue(_XLAModule._is_replicated_final_output(0, output, {0}))
+
+        output.meta["is_fsdp_sharded_output"] = True
+        self.assertFalse(_XLAModule._is_replicated_final_output(0, output, {0}))
 
     def test_single_device_array_resharded_to_replicated(self) -> None:
         # Mimics the cached device_state entry: a global-shaped array committed

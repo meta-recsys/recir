@@ -765,6 +765,7 @@ def _annotate_fsdp_state_input_sharding(
         )
     for node in tensor_placeholders:
         node.meta["is_fsdp_sharded"] = False
+        node.meta.pop("fsdp_shard_dim", None)
     for leaf, state_value, is_sharded in zip(
         state_placeholders,
         state_values,
@@ -778,6 +779,8 @@ def _annotate_fsdp_state_input_sharding(
             )
         leaf.meta["recir_state_input_identity"] = state_identity
         leaf.meta["is_fsdp_sharded"] = is_sharded
+        if is_sharded:
+            leaf.meta["fsdp_shard_dim"] = 0
 
 
 def _annotate_fsdp_state_output_sharding(
