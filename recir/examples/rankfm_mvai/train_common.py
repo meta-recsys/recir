@@ -22,6 +22,7 @@ incidental setup.
 
 from __future__ import annotations
 
+import datetime
 import logging
 import os
 from typing import Any, List, Optional, Tuple
@@ -135,6 +136,30 @@ def resolve_dist_env() -> None:
         os.environ["MASTER_PORT"],
         tpu_addrs,
     )
+
+
+def ensure_gloo_process_group() -> Tuple[int, int]:
+    """Initialize the default Gloo group from the resolved dist environment."""
+    if not dist.is_available():
+        raise RuntimeError("torch.distributed is unavailable")
+    if dist.is_initialized():
+        return dist.get_rank(), dist.get_world_size()
+
+    rank = int(os.environ["RANK"])
+    world_size = int(os.environ["WORLD_SIZE"])
+    logger.info(
+        "[DIST] initializing Gloo rank=%d world=%d via %s:%s",
+        rank,
+        world_size,
+        os.environ["MASTER_ADDR"],
+        os.environ["MASTER_PORT"],
+    )
+    dist.init_process_group(
+        backend="gloo",
+        init_method="env://",
+        timeout=datetime.timedelta(seconds=300),
+    )
+    return dist.get_rank(), dist.get_world_size()
 
 
 def force_cpu_barrier() -> None:
