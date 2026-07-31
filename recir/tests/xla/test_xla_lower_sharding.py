@@ -63,7 +63,7 @@ class ToShardedJaxTest(unittest.TestCase):
         self.assertIsInstance(arr.sharding, jax.sharding.SingleDeviceSharding)
 
         out = _XLAModule._to_sharded_jax(
-            arr, self.mesh, is_batch_input=False, is_fsdp_weight=False
+            arr, self.mesh, is_batch_input=False, is_fsdp_tensor=False
         )
 
         # Re-sharded onto the mesh as replicated, values + shape preserved.
@@ -77,7 +77,7 @@ class ToShardedJaxTest(unittest.TestCase):
         # returned unchanged -- the reshard is a no-op.
         arr = jax.device_put(np.ones((2, 4), dtype=np.float32), self.replicated)
         out = _XLAModule._to_sharded_jax(
-            arr, self.mesh, is_batch_input=False, is_fsdp_weight=False
+            arr, self.mesh, is_batch_input=False, is_fsdp_tensor=False
         )
         self.assertIs(out, arr)
 
@@ -85,7 +85,7 @@ class ToShardedJaxTest(unittest.TestCase):
         arr = jax.device_put(np.array(1.0, dtype=np.float32), jax.devices()[0])
         self.assertIsInstance(arr.sharding, jax.sharding.SingleDeviceSharding)
 
-        out = _XLAModule._to_sharded_jax(arr, self.mesh, is_fsdp_weight=True)
+        out = _XLAModule._to_sharded_jax(arr, self.mesh, is_fsdp_tensor=True)
 
         self.assertEqual(out.sharding, self.replicated)
         self.assertEqual(out.shape, ())
@@ -100,7 +100,7 @@ class ToShardedJaxTest(unittest.TestCase):
         arr = jax.device_put(host, jax.devices()[0])
         self.assertIsInstance(arr.sharding, jax.sharding.SingleDeviceSharding)
 
-        out = _XLAModule._to_sharded_jax(arr, self.mesh, is_fsdp_weight=True)
+        out = _XLAModule._to_sharded_jax(arr, self.mesh, is_fsdp_tensor=True)
 
         fsdp_sharding = NamedSharding(self.mesh, P("torch_dist", None))
         self.assertEqual(out.sharding, fsdp_sharding)
@@ -114,7 +114,7 @@ class ToShardedJaxTest(unittest.TestCase):
         arr = jax.device_put(
             np.arange(16, dtype=np.float32).reshape(4, 4), fsdp_sharding
         )
-        out = _XLAModule._to_sharded_jax(arr, self.mesh, is_fsdp_weight=True)
+        out = _XLAModule._to_sharded_jax(arr, self.mesh, is_fsdp_tensor=True)
         self.assertIs(out, arr)
 
 

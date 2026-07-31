@@ -972,7 +972,7 @@ class TestGSPMDShardParams(unittest.TestCase):
 
 
 class TestToShardedJaxFSDP(unittest.TestCase):
-    """Test _XLAModule._to_sharded_jax with is_fsdp_weight=True."""
+    """Test _XLAModule._to_sharded_jax with is_fsdp_tensor=True."""
 
     def setUp(self) -> None:
         self.devices = jax.devices()
@@ -989,7 +989,7 @@ class TestToShardedJaxFSDP(unittest.TestCase):
 
         mesh = Mesh(jax.devices(), axis_names=("torch_dist",))
         local_shard = torch.randn(self.num_local, 4)
-        jax_array = _XLAModule._to_sharded_jax(local_shard, mesh, is_fsdp_weight=True)
+        jax_array = _XLAModule._to_sharded_jax(local_shard, mesh, is_fsdp_tensor=True)
         expected_global_shape = (self.num_global, 4)
         self.assertEqual(jax_array.shape, expected_global_shape)
         sharding = jax_array.sharding
@@ -1006,7 +1006,7 @@ class TestToShardedJaxFSDP(unittest.TestCase):
         local_shard = torch.arange(self.num_local * 2, dtype=torch.float32).reshape(
             self.num_local, 2
         )
-        jax_array = _XLAModule._to_sharded_jax(local_shard, mesh, is_fsdp_weight=True)
+        jax_array = _XLAModule._to_sharded_jax(local_shard, mesh, is_fsdp_tensor=True)
         first_shard = jax_array[: self.num_local, :]
         expected = jnp.asarray(local_shard.numpy())
         torch.testing.assert_close(
@@ -1016,26 +1016,26 @@ class TestToShardedJaxFSDP(unittest.TestCase):
     def test_fsdp_weight_1d_tensor(self) -> None:
         mesh = Mesh(jax.devices(), axis_names=("torch_dist",))
         local_shard = torch.randn(self.num_local * 4)
-        jax_array = _XLAModule._to_sharded_jax(local_shard, mesh, is_fsdp_weight=True)
+        jax_array = _XLAModule._to_sharded_jax(local_shard, mesh, is_fsdp_tensor=True)
         expected_global_dim = self.num_local * 4 * self.num_global // self.num_local
         self.assertEqual(jax_array.shape, (expected_global_dim,))
 
     def test_fsdp_scalar_tensor_replicates(self) -> None:
         mesh = Mesh(jax.devices(), axis_names=("torch_dist",))
         scalar = torch.tensor(1.0)
-        jax_array = _XLAModule._to_sharded_jax(scalar, mesh, is_fsdp_weight=True)
+        jax_array = _XLAModule._to_sharded_jax(scalar, mesh, is_fsdp_tensor=True)
         self.assertEqual(jax_array.shape, ())
         self.assertEqual(float(jax.device_get(jax_array)), 1.0)
 
     def test_non_fsdp_weight_replicated(self) -> None:
-        """Without is_fsdp_weight, tensors should be replicated."""
+        """Without is_fsdp_tensor, tensors should be replicated."""
         import jax  # @manual  # pyre-ignore[21]
         from jax.sharding import Mesh  # @manual  # pyre-ignore[21]
         from recir.lowering.xla_lower import _XLAModule
 
         mesh = Mesh(jax.devices(), axis_names=("torch_dist",))
         t = torch.randn(4, 8)
-        jax_array = _XLAModule._to_sharded_jax(t, mesh, is_fsdp_weight=False)
+        jax_array = _XLAModule._to_sharded_jax(t, mesh, is_fsdp_tensor=False)
         self.assertEqual(jax_array.shape, (4, 8))
 
 
