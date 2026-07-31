@@ -60,7 +60,11 @@ from recir.examples.rankfm_mvai.embedding import build_embedding_backend
 from recir.examples.rankfm_mvai.embedding.in_graph_embedding_backend import (
     SHARDED_TABLE_PREFIX,
 )
-from recir.examples.rankfm_mvai.train_common import force_cpu_barrier, resolve_dist_env
+from recir.examples.rankfm_mvai.train_common import (
+    ensure_gloo_process_group,
+    force_cpu_barrier,
+    resolve_dist_env,
+)
 from recir.examples.rankfm_mvai.xsurface_helpers import (
     _resolve_nro_per_sample,
     make_padding_region_transforms,
@@ -586,6 +590,7 @@ def main() -> None:
     if _FWD_DEVICE == "tpu":
         jax.distributed.initialize()
     resolve_dist_env()
+    ensure_gloo_process_group()
     force_cpu_barrier()
 
     devices = jax.devices()
