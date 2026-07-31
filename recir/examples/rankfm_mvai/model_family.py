@@ -87,7 +87,7 @@ logger: logging.Logger = logging.getLogger(__name__)
 # mirroring them to host every step is O(table-size) waste (D2H copy + layout
 # transpose) that dominates the step at large hash sizes. Dense params / LR /
 # metric buffers don't match and still sync. Full sync (skip_fqns=None) is used
-# before checkpointing/inspecting the tables.
+# before checkpointing/inspecting the tables (flush_host_state(full=True)).
 _EMB_SYNC_SKIP_FQNS: Tuple[str, ...] = ("_sharded_tables", "_dp_tables")
 
 
@@ -367,11 +367,67 @@ class RecirXLACompiledModule(RecirCompiledModuleBase):
         )
         return result
 
-    def flush_host_state(self) -> None:
-        """Mirror device-resident state back to torch for host consumers."""
+    def flush_host_state(self, full: bool = False) -> None:
+        """Mirror device-resident state back to torch for host consumers (e.g.
+        before checkpointing).
+
+        By default the GB-scale embedding tables are skipped (kept resident on
+        device -- see _EMB_SYNC_SKIP_FQNS); pass full=True before checkpointing
+        to also mirror them (skip_fqns=None). The table host params must already
+        have real storage (see checkpointable.materialize_meta_params) or the
+        copy_ is a silent no-op.
+        """
         compiled_step = self._compiled_step
         if compiled_step is not None:
-            sync_device_state_to_torch(compiled_step, skip_fqns=_EMB_SYNC_SKIP_FQNS)
+            skip_fqns = None if full else _EMB_SYNC_SKIP_FQNS
+            sync_device_state_to_torch(compiled_step, skip_fqns=skip_fqns)
+
+    def prepare_for_restore(self) -> None:
+        """Ready the in_graph model to receive a checkpoint before dcp.load.
+
+        The embedding tables are on_device_init meta params of full shape [V, D]
+        until the first compile shape-shards them to [V/num_processes, D] (still
+        meta). dcp.load cannot write per-process shards into full-shape meta
+        params, so we force a compile-only pass on the trace batch (shape-shards
+        the tables; runs no fwd/bwd/opt.step, applies no update) and cache it, so
+        the first real forward reuses it (no recompile). Then give the sharded
+        table params real host storage so dcp.load lands.
+
+        NOTE: this force-compile MUST trace the FULL training graph with the
+        tables at their GLOBAL [V, D] shape -- shard_params row-shards them only
+        AFTER tracing, so the graph placeholders keep the global shape that
+        _to_sharded_jax feeds at runtime (it reconstructs global = local x
+        host_count). Sharding the params BEFORE this trace makes the placeholders
+        local [V/P, D] and mismatches the global array _to_sharded_jax provides.
+        That is why the (host-RAM-heavy) full compile can't simply be replaced by
+        a cheap standalone shard here; see the restore-memory follow-up.
+        """
+        if self._compiled_step is None:
+            self._compiled_step = self._build_compiled_step(self._trace_batch)
+        from .checkpointable import materialize_meta_params
+
+        materialize_meta_params(self, _EMB_SYNC_SKIP_FQNS)
+
+    def make_checkpointable(self) -> Any:
+        """Return a DCP Stateful view of this module (see checkpointable.py).
+
+        Duck-typed hook: mvai_cloud's CheckpointManager uses this if present, so
+        the recir/JAX-specific checkpoint logic stays out of the shared framework.
+        """
+        from .checkpointable import RecirCheckpointable
+        from .embedding.in_graph_embedding_backend import (
+            DP_TABLE_PREFIX,
+            SHARDED_TABLE_PREFIX,
+        )
+
+        return RecirCheckpointable(
+            self,
+            num_processes=self._num_processes,
+            sharded_prefixes=(SHARDED_TABLE_PREFIX,),
+            table_prefixes=(SHARDED_TABLE_PREFIX, DP_TABLE_PREFIX),
+            warmup=self._warmup,
+            optimizer=self._dense_opt,
+        )
 
     def _post_step(self) -> None:
         # Advance the dense warmup LR (writes the next iter's value into the 0-d
@@ -661,34 +717,61 @@ class _RankFMIterableDataset(IterableDataset):
         self._num_candidates = num_candidates
         self._data_pipe = data_pipe
         self._key_to_size = key_to_size
+        # Global data pointer (batches consumed so far), checkpointed via
+        # state_dict so a resumed run continues from the next batch.
+        self._batch_index = 0
 
     def __iter__(self) -> Any:
         trainer_cfg = self._trainer_cfg
         device = torch.device("cpu")
         if self._data_pipe is not None:
-            yield from replay_batch_iter(
-                self._data_pipe,
-                self._key_to_size or {},
-                max_steps=trainer_cfg.max_steps,
-                local_batch_size=trainer_cfg.local_batch_size,
-                num_candidates=self._num_candidates,
-            )
+            start = self._batch_index
+            for i, batch in enumerate(
+                replay_batch_iter(
+                    self._data_pipe,
+                    self._key_to_size or {},
+                    max_steps=trainer_cfg.max_steps,
+                    local_batch_size=trainer_cfg.local_batch_size,
+                    num_candidates=self._num_candidates,
+                    start_index=start,
+                )
+            ):
+                # Advance the checkpointable pointer as batches are consumed so
+                # a checkpoint saved mid-run records the exact data position.
+                self._batch_index = start + i + 1
+                yield batch
             return
 
         # Synthetic mode: same uniform batch unless padding (then fresh random).
+        start = self._batch_index
         torch.manual_seed(0)
         base_batch = _create_uniform_train_batch(
             self._feature_config,
             device,
             batch_size=trainer_cfg.local_batch_size,
         )
-        for step in range(1, trainer_cfg.max_steps + 1):
+        for i in range(trainer_cfg.max_steps):
+            pos = start + i
             if trainer_cfg.enable_padding and self._feature_config is not None:
-                torch.manual_seed(step)
-                yield _create_random_train_batch(
+                torch.manual_seed(pos + 1)
+                batch = _create_random_train_batch(
                     self._feature_config,
                     device,
                     batch_size=trainer_cfg.local_batch_size,
                 )
             else:
-                yield base_batch
+                batch = base_batch
+            self._batch_index = pos + 1
+            yield batch
+
+    def state_dict(self) -> Dict[str, Any]:
+        """DCP-checkpointed data-stream position (see __iter__). The
+        CheckpointManager saves this and restores it via load_state_dict on
+        resume so real-data runs continue from the next unread batch. Mirrors
+        mvai_cloud PreprocOutputReplayDataPipe.state_dict."""
+        logger.info(f"[Replay] checkpoint data cursor: batch_index={self._batch_index}")
+        return {"batch_index": self._batch_index}
+
+    def load_state_dict(self, state_dict: Dict[str, Any]) -> None:
+        self._batch_index = int(state_dict["batch_index"])
+        logger.info(f"[Replay] restored data cursor: batch_index={self._batch_index}")

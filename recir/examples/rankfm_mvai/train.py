@@ -69,6 +69,39 @@ from .xsurface_helpers import _is_jax_profiling_enabled
 logger: logging.Logger = logging.getLogger(__name__)
 
 
+def _init_gloo_pg() -> None:
+    """Create the process-wide gloo process group at the entrypoint.
+
+    Multi-host checkpointing (DCP) and the host-side metric collectives need a
+    torch gloo PG. Owning it here -- before the RecTrainer and the embedding
+    backend -- keeps the process-wide PG a cross-cutting entrypoint concern
+    rather than a side effect of a specific embedding backend, and makes it
+    independent of which backend (cpu/tpu/in_graph) is selected. Uses the env
+    populated by resolve_dist_env(). Single-host (world<=1) is a no-op.
+    Idempotent: RecTrainer's init_process_group and the backends' init_pg() both
+    defer when the PG already exists, so this stays the single creation site.
+    """
+    from datetime import timedelta
+
+    world = int(os.environ.get("WORLD_SIZE", "1"))
+    if world <= 1 or dist.is_initialized():
+        return
+    rank = int(os.environ.get("RANK", "0"))
+    coordinator = os.environ.get("MASTER_ADDR", "localhost")
+    port = int(os.environ.get("MASTER_PORT", "29500"))
+    logger.info(
+        f"[DIST] gloo PG init (entrypoint): rank={rank}, world={world}, "
+        f"coordinator={coordinator}:{port}"
+    )
+    dist.init_process_group(
+        backend="gloo",
+        init_method=f"tcp://{coordinator}:{port}",
+        world_size=world,
+        rank=rank,
+        timeout=timedelta(seconds=300),
+    )
+
+
 def main() -> None:
     # Must be called before any JAX op. On GKE TPU the PJRT plugin reads the
     # coordinator address + process index from TPU runtime metadata; without
@@ -89,6 +122,9 @@ def main() -> None:
     logger.info(f"Model args: {model_args}")
 
     resolve_dist_env()
+    # Create the process-wide gloo PG here (entrypoint-owned) before the trainer
+    # / embedding backend need it -- see _init_gloo_pg.
+    _init_gloo_pg()
     # Route torch.distributed.barrier onto CPU before any gloo collective runs
     # (the metric all-gather at report time). See train_common.force_cpu_barrier.
     force_cpu_barrier()

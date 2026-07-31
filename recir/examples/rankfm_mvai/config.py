@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import os
 from dataclasses import dataclass, field
 from typing import Any, Dict, Tuple
 
@@ -51,6 +52,7 @@ from minimal_viable_ai.core.model_family_api.optimizer_configs import (
     RecOptimizerConfig,
 )
 from minimal_viable_ai.core.trainer.trainer_config_def import (
+    CheckpointConfig,
     MetricsConfig,
     RecTrainerConfig,
     SystemConfig,
@@ -68,7 +70,6 @@ __all__ = [
     "build_model_family_config",
     "build_trainer_config",
 ]
-
 
 # ---------------------------------------------------------------------------
 # CLI config dataclasses
@@ -88,6 +89,13 @@ class RankFMTrainerConfig:
     # Training
     max_steps: int = 20
     embedding_lr: float = 0.1
+
+    # Checkpointing (DCP via mvai_cloud CheckpointManager). Periodic save every
+    # N steps (0 = disabled); keep_last_n bounds retained checkpoints. Paths come
+    # from the MVAI_JOB_NAME / MVAI_CHECKPOINT_SAVE_DIR / MVAI_CHECKPOINT_LOAD_DIR
+    # env vars (see CheckpointManager).
+    save_every_n_steps: int = 0
+    keep_last_n: int = 2
     dense_optimizer_config: OptimConfig = field(
         default_factory=lambda: OptimConfig(
             optim_type=OptimType.ADAMW,
@@ -466,10 +474,26 @@ def build_trainer_config(
         num_batches=trainer_cfg.max_steps,
     )
 
+    # A load path enables restore even when periodic saves are disabled. This
+    # supports a load-only continuation without uploading another checkpoint at
+    # the end of the run.
+    # At runtime CheckpointConfig is the OSS mvai_cloud replica (has
+    # save_every_n_steps / keep_last_n); pyre resolves the canonical
+    # //minimal_viable_ai variant which lacks those fields, hence the ignores.
+    checkpoint_config = (
+        CheckpointConfig(
+            save_every_n_steps=trainer_cfg.save_every_n_steps,  # pyre-ignore[28]
+            keep_last_n=trainer_cfg.keep_last_n,  # pyre-ignore[28]
+        )
+        if trainer_cfg.save_every_n_steps > 0
+        or bool(os.environ.get("MVAI_CHECKPOINT_LOAD_DIR"))
+        else None
+    )
+
     return RecTrainerConfig(
         data_source_config=data_source_config,
         system_config=SystemConfig(use_gpu=False, dist_backend="gloo"),
         metrics_config=MetricsConfig(report_interval=10, tensorboard_logger=True),
         model_config_module=("hammer.v3.models.udd_fm_v3.udd_fm_config"),
-        checkpoint_config=None,
+        checkpoint_config=checkpoint_config,
     )

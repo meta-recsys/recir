@@ -133,6 +133,15 @@ class CPURankFMBackend(EmbeddingBackend):
         gloo_rank = int(os.environ.get("JOB_COMPLETION_INDEX", "0"))
         gloo_world = len(addr_list)
         gloo_port = int(os.environ.get("MASTER_PORT", "29500"))
+        # Defer to an already-created PG (the entrypoint train.py::_init_gloo_pg
+        # now owns creation); only self-init for standalone entrypoints that
+        # don't. Avoids a double init_process_group.
+        if dist.is_initialized():
+            logger.info(
+                f"Gloo PG already initialized; reusing rank={gloo_rank}, "
+                f"world={gloo_world}"
+            )
+            return gloo_rank, gloo_world
         logger.info(
             f"Gloo init: rank={gloo_rank}, world={gloo_world}, "
             f"coordinator={coordinator}:{gloo_port}"
@@ -162,7 +171,14 @@ class CPURankFMBackend(EmbeddingBackend):
         if device.type != "cpu":
             raise ValueError(f"CPU backend requires a CPU device, got {device}.")
         if dist.is_initialized():
-            model = self._setup_dmp(model, table_configs, sparse_config, world_size)
+            dmp_world_size = dist.get_world_size()
+            if dmp_world_size != world_size:
+                logger.info(
+                    "CPU DMP uses process-group world size %d instead of %d JAX devices",
+                    dmp_world_size,
+                    world_size,
+                )
+            model = self._setup_dmp(model, table_configs, sparse_config, dmp_world_size)
         else:
             _attach_single_node_sparse_optimizers(model, sparse_config)
             logger.info("Single-node: using config-driven in-backward optimizers")
