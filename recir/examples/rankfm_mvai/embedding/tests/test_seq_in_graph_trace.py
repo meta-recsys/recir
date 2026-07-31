@@ -14,6 +14,7 @@ import unittest
 
 import torch
 from recir.examples.rankfm_mvai.embedding.in_graph_embedding_backend import (
+    _seed_in_graph_tables_from_ec,
     DP_TABLE_PREFIX,
     InGraphSparseArch,
     SHARDED_TABLE_PREFIX,
@@ -186,6 +187,26 @@ class SeqInGraphTraceTest(unittest.TestCase):
             )
             self.assertEqual(tuple(out.shape), (4, 4, 8))
             self.assertEqual(out.dtype, weight.dtype)
+
+    def test_seed_skips_meta_source_weights(self) -> None:
+        class OldEC(torch.nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.embeddings = torch.nn.ModuleDict()
+                for name, rows in (("big", 256), ("small", 16)):
+                    table = torch.nn.Module()
+                    table.register_parameter(
+                        "weight",
+                        torch.nn.Parameter(torch.empty(rows, 8, device="meta")),
+                    )
+                    self.embeddings[name] = table
+
+        module, _, _ = _build_module_and_kjt(on_device_init=False)
+
+        _seed_in_graph_tables_from_ec(OldEC(), module)
+
+        self.assertFalse(module._dp_tables["small"].is_meta)
+        self.assertFalse(module._sharded_tables["big"].is_meta)
 
     # ---- table-mode routing (ROWWISE / FSDP / DP) ----
 

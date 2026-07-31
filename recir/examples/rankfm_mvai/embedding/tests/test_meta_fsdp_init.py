@@ -20,6 +20,7 @@ import numpy as np
 import torch
 from jax.sharding import Mesh
 from recir.lowering.xla_lower import _XLAModule
+from recir.meta_tensor_init import mark_meta_uniform_init, mark_meta_zero_init
 
 
 class MetaFSDPInitTest(unittest.TestCase):
@@ -34,7 +35,7 @@ class MetaFSDPInitTest(unittest.TestCase):
         meta = torch.empty(vocab, dim, device="meta")
         self.assertTrue(meta.is_meta)
 
-        arr = _XLAModule._to_sharded_jax(meta, mesh, is_fsdp_weight=True)
+        arr = _XLAModule._to_sharded_jax(meta, mesh, is_fsdp_tensor=True)
 
         # Correct global shape, on-device, row-wise sharded across all devices.
         self.assertIsInstance(arr, jax.Array)
@@ -51,6 +52,36 @@ class MetaFSDPInitTest(unittest.TestCase):
         s0 = np.array(jax.device_get(arr.addressable_shards[0].data))
         s1 = np.array(jax.device_get(arr.addressable_shards[1].data))
         self.assertFalse(np.allclose(s0, s1), "per-device shards should differ")
+
+    def test_meta_optimizer_state_inits_to_zero(self) -> None:
+        devices = jax.devices()
+        world = len(devices)
+        vocab, dim = 8 * world, 1
+        mesh = Mesh(np.array(devices), ("torch_dist",))
+
+        meta_state = torch.empty(vocab, dim, device="meta")
+        mark_meta_zero_init(meta_state)
+
+        arr = _XLAModule._to_sharded_jax(meta_state, mesh, is_fsdp_tensor=True)
+
+        host = np.array(jax.device_get(arr))
+        self.assertEqual(tuple(host.shape), (vocab, dim))
+        self.assertTrue(np.all(host == 0.0))
+
+    def test_meta_weight_uses_explicit_uniform_bound(self) -> None:
+        devices = jax.devices()
+        world = len(devices)
+        vocab, dim = 8 * world, 16
+        mesh = Mesh(np.array(devices), ("torch_dist",))
+
+        meta = torch.empty(vocab, dim, device="meta")
+        mark_meta_uniform_init(meta, 0.01)
+
+        arr = _XLAModule._to_sharded_jax(meta, mesh, is_fsdp_tensor=True)
+
+        host = np.array(jax.device_get(arr))
+        self.assertGreater(float(host.std()), 0.0)
+        self.assertLessEqual(float(np.max(np.abs(host))), 0.01)
 
 
 if __name__ == "__main__":
