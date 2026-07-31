@@ -17,7 +17,7 @@ to report the SAME ranking metric set as the mvai_cloud udd_fm reference
 example_count, variable_step_qps).
 
   * ``RecirXLATrainPipeline`` subclasses mvai_cloud's
-    ``RankingSGDTrainPipeline`` to reuse its metric construction
+    ``RankingTrainPipeline`` to reuse its metric construction
     (``__init__``), its ``_update_ranking_metrics(ret)`` cls/reg slicing, and
     its ``.metrics`` property unchanged. ``progress`` is overridden to run the
     self-compiling model wrapper (instead of the eager fwd/bwd/opt.step), rebuild
@@ -25,7 +25,7 @@ example_count, variable_step_qps).
     and drive the JAX profiler trace over the configured step window (ported from
     the bespoke rankfm loop so run_tpu_bench.sh's xprof trace fetch keeps working).
   * ``RecirXLATrainPipelineProvider`` reuses mvai_cloud's
-    ``RankingSGDTrainPipelineProvider`` to construct the cls/reg/step metric
+    ``RankingTrainPipelineProvider`` to construct the cls/reg/step metric
     lists (including the ``is_variable_step`` swap) exactly as udd_fm/train.py
     does, then hands them to ``RecirXLATrainPipeline``.
 
@@ -55,15 +55,15 @@ from .xsurface_helpers import _log_hbm_memory
 # don't exist), so under the type checker we stub them as Any (runtime-only dep).
 if TYPE_CHECKING:
     RankingMetricDef = Any
-    RankingSGDTrainPipeline = Any
-    RankingSGDTrainPipelineProvider = Any
+    RankingTrainPipeline = Any
+    RankingTrainPipelineProvider = Any
 
     from .model_family import RecirXLACompiledModule
 else:
     from minimal_viable_ai.core.ranking_common.train_pipeline import (
         RankingMetricDef,
-        RankingSGDTrainPipeline,
-        RankingSGDTrainPipelineProvider,
+        RankingSGDTrainPipeline as RankingTrainPipeline,
+        RankingSGDTrainPipelineProvider as RankingTrainPipelineProvider,
     )
 
 logger: logging.Logger = logging.getLogger(__name__)
@@ -163,10 +163,10 @@ def _hstu_series(named: Dict[str, Any]) -> Dict[str, torch.Tensor]:
     return series
 
 
-class RecirXLATrainPipeline(RankingSGDTrainPipeline):
+class RecirXLATrainPipeline(RankingTrainPipeline):
     """Self-compiling-model pipeline + udd_fm-equivalent ranking metrics.
 
-    Reuses RankingSGDTrainPipeline's metric construction (``__init__``), its
+    Reuses RankingTrainPipeline's metric construction (``__init__``), its
     ``_update_ranking_metrics(ret)`` cls/reg slicing, and its ``.metrics``
     property. ``progress`` is overridden: it runs the self-compiling model
     wrapper (which does fwd -> backward -> dense opt.step -> sync internally and
@@ -194,7 +194,7 @@ class RecirXLATrainPipeline(RankingSGDTrainPipeline):
         profile_dir: str = "/tmp/tpu_profile",
         enable_memory_log: bool = False,
     ) -> None:
-        # pyre-ignore[19]: base RankingSGDTrainPipeline is a runtime-only import
+        # pyre-ignore[19]: base RankingTrainPipeline is a runtime-only import
         # stubbed as Any (see module-level TYPE_CHECKING block), so pyre resolves
         # super().__init__ to object.__init__; the real base takes these args.
         super().__init__(
@@ -275,7 +275,7 @@ class RecirXLATrainPipeline(RankingSGDTrainPipeline):
         if self._step % self._host_sync_every == 0:
             cast("RecirXLACompiledModule", self._model).flush_host_state()
 
-        # Rebuild the ret dict RankingSGDTrainPipeline._update_ranking_metrics
+        # Rebuild the ret dict RankingTrainPipeline._update_ranking_metrics
         # expects; the metrics were constructed on torch.device("cpu") to match
         # these host CPU tensors. weight=0 keeps padded rows out of NE/CTR/MSE;
         # num_real_candidates keeps variable-step x-axes and QPS padding-invariant.
@@ -320,7 +320,7 @@ class RecirXLATrainPipelineProvider(
 ):
     """Returns the self-compiling-model pipeline + udd_fm-equivalent metrics.
 
-    Reuses mvai_cloud's ``RankingSGDTrainPipelineProvider`` to construct the
+    Reuses mvai_cloud's ``RankingTrainPipelineProvider`` to construct the
     cls/reg/step metric lists (including the ``is_variable_step`` swap) exactly
     as udd_fm/train.py does; all compile work lives in the model wrapper. The
     profiling config is threaded into the pipeline so the JAX profiler trace is
@@ -351,10 +351,10 @@ class RecirXLATrainPipelineProvider(
         self._enable_memory_log = enable_memory_log
         # Delegate metric-list construction (and the variable-step swap) to the
         # mvai_cloud provider verbatim -- same args udd_fm/train.py passes.
-        # Annotated Any: RankingSGDTrainPipelineProvider is a runtime-only import
+        # Annotated Any: RankingTrainPipelineProvider is a runtime-only import
         # (stubbed Any for pyre -- see the module-level TYPE_CHECKING block).
         # pyrefly: ignore [bad-instantiation]
-        self._metrics_provider: Any = RankingSGDTrainPipelineProvider(
+        self._metrics_provider: Any = RankingTrainPipelineProvider(
             cls_metric_defs=cls_metric_defs,
             reg_metric_defs=reg_metric_defs,
             cls_task_indices=cls_task_indices,
@@ -397,7 +397,7 @@ class RecirXLATrainPipelineProvider(
         )
 
 
-class EagerCPUTrainPipeline(RankingSGDTrainPipeline):
+class EagerCPUTrainPipeline(RankingTrainPipeline):
     """CPU-eager counterpart of RecirXLATrainPipeline (same model, no compile).
 
     This is the matched-config reference for the TPU run: it drives the EXACT
@@ -555,7 +555,7 @@ class EagerCPUTrainPipelineProvider(
     """Returns the CPU-eager pipeline + the udd_fm-equivalent metric set.
 
     Identical wiring to RecirXLATrainPipelineProvider (same metric construction
-    via mvai_cloud's RankingSGDTrainPipelineProvider); only the pipeline class
+    via mvai_cloud's RankingTrainPipelineProvider); only the pipeline class
     differs (EagerCPUTrainPipeline runs the raw model eagerly, no recir compile).
     """
 
@@ -570,10 +570,10 @@ class EagerCPUTrainPipelineProvider(
     ) -> None:
         self._cls_task_indices = cls_task_indices
         self._reg_task_indices = reg_task_indices
-        # Annotated Any: RankingSGDTrainPipelineProvider is a runtime-only import
+        # Annotated Any: RankingTrainPipelineProvider is a runtime-only import
         # (stubbed Any for pyre -- see the module-level TYPE_CHECKING block).
         # pyrefly: ignore [bad-instantiation]
-        self._metrics_provider: Any = RankingSGDTrainPipelineProvider(
+        self._metrics_provider: Any = RankingTrainPipelineProvider(
             cls_metric_defs=cls_metric_defs,
             reg_metric_defs=reg_metric_defs,
             cls_task_indices=cls_task_indices,

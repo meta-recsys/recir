@@ -55,6 +55,7 @@ from hammer.v3.models.udd_fm_v3.recir_core.trace_sample import flatten_batch
 from hammer.v3.models.udd_fm_v3.udd_fm_config import BlueReelsVDDModuleConfig
 from hammer.v3.models.udd_fm_v3.udd_fm_family import BlueReelsVDDModelFamily
 from minimal_viable_ai.core.dataloader.dataloader_configs import DataSourceConfig
+from minimal_viable_ai.core.model_family_api.optimizer_configs import RecOptimizerConfig
 from recir.api import sync_device_state_to_torch
 from recir.backends import XLAGSPMDBackend
 from recir.distributed.parallel_mode import GSPMDParallel
@@ -64,7 +65,6 @@ from recir.tests.xla.xsurface_test_utils import (
     build_model_from_config,
 )
 from torch.utils.data import IterableDataset
-from torchrec.optim.keyed import KeyedOptimizerWrapper
 
 # Local recir backend factory + data pipe helpers + the static-NRO resolver and
 # the shared override/padding helpers. These are the exact same wiring the
@@ -198,7 +198,7 @@ class RecirXLACompiledModule(RecirCompiledModuleBase):
     builds the UNIFIED dense optimizer (``setup_dense_optimizer_and_warmup`` --
     the same ``TensorLRAdamW`` + 0-d LR buffer + ``WarmupController`` mechanism as
     the GPU cell), and -- for the in_graph backend -- a dedicated embedding
-    optimizer (SGD @ embedding_lr) over the in-graph table params, wires
+    optimizer (row-wise Adagrad) over the in-graph table params, wires
     ``set_recir_kjt_keys``, and builds the ``PaddingRegionTransform``. On the
     first forward it lazily compiles (``compile_gspmd_step`` for the single dense
     opt, or ``compile_step`` with (dense_opt, emb_opt) for the in_graph two-opt
@@ -214,6 +214,7 @@ class RecirXLACompiledModule(RecirCompiledModuleBase):
         backend: Any,
         trace_batch: Any,
         module_config: BlueReelsVDDModuleConfig,
+        optimizer_config: RecOptimizerConfig,
         trainer_cfg: RankFMTrainerConfig,
         num_ranks: int,
         num_processes: int,
@@ -262,52 +263,29 @@ class RecirXLACompiledModule(RecirCompiledModuleBase):
             num_processes,
         )
 
-        # Embedding storage (DMP for cpu / SparseCore for tpu / in-graph tables
-        # for in_graph). For cpu/tpu the sparse update is owned by the backend
-        # off-GM; for in_graph the tables are plain params trained by emb_opt
-        # (below) inside the compiled graph. The dense optimizer is built below.
-        model = backend.setup(
+        embedding_setup = backend.setup(
             model,
             table_configs,
-            trainer_cfg.embedding_lr,
-            num_processes,
+            optimizer_config.sparse.default,
+            device,
+            num_ranks,
         )
+        model = embedding_setup.model
         model.set_recir_kjt_keys(ro_kjt_keys, nro_kjt_keys, unary_kjt_keys)
 
-        # Unified dense optimizer: TensorLRAdamW + 0-d LR buffer + WarmupController,
-        # the SAME mechanism as the GPU (HDP) cell. recir_train_step rebinds the
-        # dense group['lr'] to LR_DENSE_BUFFER during the trace, the controller
-        # advances it each step.
-        dense_params = list(backend.dense_named_parameters(model).values())
+        sparse_runtime = embedding_setup.sparse_runtime
+        dense_params = list(embedding_setup.dense_named_parameters.values())
         dense_opt, warmup = setup_dense_optimizer_and_warmup(
-            model, dense_params, trainer_cfg.dense_optimizer_config, device
+            model,
+            dense_params,
+            trainer_cfg.dense_optimizer_config,
+            device,
+            sparse_cfg=(
+                sparse_runtime.config if sparse_runtime.lr_buffer is not None else None
+            ),
+            sparse_lr_buffer=sparse_runtime.lr_buffer,
         )
-
-        # in_graph backend only: the in-graph embedding tables are FSDP params
-        # looked up + grad'd inside the compiled graph, so give them their OWN
-        # optimizer (stateless SGD @ embedding_lr, separate from the dense LR --
-        # matching production where sparse embeddings train separately). SGD is
-        # used because it traces in-graph as-is; a stateful algorithm would need
-        # capturable mode + optimizer-state pre-materialization. For cpu / tpu
-        # backends embedding_named_parameters() is absent / empty, so emb_opt
-        # stays None and the single-optimizer path is taken.
-        emb_named_fn = getattr(backend, "embedding_named_parameters", None)
-        emb_params = emb_named_fn(model) if emb_named_fn is not None else {}
-        emb_opt: Optional[torch.optim.Optimizer] = None
-        if emb_params:
-            if dist.is_initialized():
-                emb_opt = KeyedOptimizerWrapper(
-                    dict(emb_params),
-                    lambda params: torch.optim.SGD(
-                        params, lr=trainer_cfg.embedding_lr, foreach=True
-                    ),
-                )
-            else:
-                emb_opt = torch.optim.SGD(
-                    list(emb_params.values()),
-                    lr=trainer_cfg.embedding_lr,
-                    foreach=True,
-                )
+        emb_opt = sparse_runtime.optimizer
 
         region_transforms: List[Any] = []
         if trainer_cfg.enable_padding:
@@ -621,6 +599,7 @@ class RankFMMvaiModelFamily(BlueReelsVDDModelFamily):
             backend=backend,
             trace_batch=batch,
             module_config=module_config,
+            optimizer_config=self.config.optimizer_config,
             trainer_cfg=trainer_cfg,
             num_ranks=num_ranks,
             num_processes=num_processes,
