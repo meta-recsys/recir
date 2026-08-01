@@ -12,7 +12,7 @@ Run locally:
       -- fbcode//recir/tests:test_nemotron_trace
 
 Run via RE (A100):
-  buck2 test @//mode/opt -c fbcode.nvcc_arch=a100 -c fbcode.platform010_cuda_version=12.4 \\
+  buck2 test @//mode/opt -c fbcode.nvcc_arch=a100 -m ovr_config//third-party/cuda/constraints:12.4 \\
       -c 'fbcode.enable_gpu_sections=true' -c 'hpc_comms.use_nccl=2.27' \\
       fbcode//recir/tests:test_nemotron_trace
 """
