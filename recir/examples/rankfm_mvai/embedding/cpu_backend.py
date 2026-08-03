@@ -30,13 +30,13 @@ from minimal_viable_ai.core.model_family_api.model_family import (
     optim_type_to_optim_class,
 )
 from minimal_viable_ai.core.model_family_api.optimizer_configs import OptimConfig
+from recir.examples.rankfm_mvai.rankfm_dispatchers import _build_overrides
 from recir.sparsecore.backend import (
     EmbeddingBackend,
     EmbeddingSetupResult,
     SparseOptimizerRuntime,
     SparseUpdatePlacement,
 )
-from recir.tests.xla.xsurface_test_utils import _build_overrides
 from torch.distributed.optim import (
     _apply_optimizer_in_backward as apply_optimizer_in_backward,
 )

@@ -59,11 +59,11 @@ from minimal_viable_ai.core.model_family_api.optimizer_configs import RecOptimiz
 from recir.api import sync_device_state_to_torch
 from recir.backends import XLAGSPMDBackend
 from recir.distributed.parallel_mode import GSPMDParallel
-from recir.tests.xla.xsurface_test_utils import (
-    _create_random_train_batch,
-    _create_uniform_train_batch,
-    build_model_from_config,
+from recir.examples.rankfm_mvai.rankfm_batch_utils import (
+    create_random_train_batch,
+    create_uniform_train_batch,
 )
+from recir.examples.rankfm_mvai.rankfm_model_utils import build_model_from_config
 from torch.utils.data import IterableDataset
 
 # Local recir backend factory + data pipe helpers + the static-NRO resolver and
@@ -616,7 +616,7 @@ class RankFMMvaiModelFamily(BlueReelsVDDModelFamily):
                 "override-build sample and FX trace"
             )
         else:
-            batch = _create_uniform_train_batch(
+            batch = create_uniform_train_batch(
                 feature_config,
                 device,
                 batch_size=trainer_cfg.local_batch_size,
@@ -630,7 +630,7 @@ class RankFMMvaiModelFamily(BlueReelsVDDModelFamily):
             and data_pipe is None
         ):
             torch.manual_seed(0)
-            batch = _create_random_train_batch(
+            batch = create_random_train_batch(
                 feature_config,
                 device,
                 batch_size=trainer_cfg.local_batch_size,
@@ -745,7 +745,7 @@ class _RankFMIterableDataset(IterableDataset):
         # Synthetic mode: same uniform batch unless padding (then fresh random).
         start = self._batch_index
         torch.manual_seed(0)
-        base_batch = _create_uniform_train_batch(
+        base_batch = create_uniform_train_batch(
             self._feature_config,
             device,
             batch_size=trainer_cfg.local_batch_size,
@@ -754,7 +754,7 @@ class _RankFMIterableDataset(IterableDataset):
             pos = start + i
             if trainer_cfg.enable_padding and self._feature_config is not None:
                 torch.manual_seed(pos + 1)
-                batch = _create_random_train_batch(
+                batch = create_random_train_batch(
                     self._feature_config,
                     device,
                     batch_size=trainer_cfg.local_batch_size,

@@ -37,6 +37,18 @@ from recir.api import _local_compile, compile, sync_device_state_to_torch
 from recir.backends import XLAGSPMDBackend
 from recir.decompositions import SPMD_DECOMP_TABLE
 from recir.distributed.parallel_mode import GSPMDParallel
+from recir.examples.rankfm_mvai.rankfm_batch_utils import (
+    create_uniform_train_batch,
+    resize_batch_inplace,
+)
+from recir.examples.rankfm_mvai.rankfm_dispatchers import (
+    _build_overrides,
+    DummyPreprocessorStack,
+    DummySparseArch,
+    TEST_BATCH_SIZE,
+    TEST_MAX_UIH_SEQ_LEN,
+    TEST_NUM_CANDIDATES,
+)
 from recir.lowering.fbgemm_fallback import _batched_complete_cumsum_impl
 from recir.lowering.xla_lower import _XLAModule
 from recir.region_transforms.padding import (
@@ -47,16 +59,8 @@ from recir.region_transforms.padding import (
 from recir.tests.xla.gspmd_test_utils import _iter_subgraphs, assert_hlo_has_collective
 from recir.tests.xla.xsurface_test_utils import (
     _build_full_model,
-    _build_overrides,
-    _create_uniform_train_batch,
     _make_sample_input,
     _verify_traced_graph,
-    DummyPreprocessorStack,
-    DummySparseArch,
-    resize_batch_inplace,
-    TEST_BATCH_SIZE,
-    TEST_MAX_UIH_SEQ_LEN,
-    TEST_NUM_CANDIDATES,
 )
 from torch._subclasses.fake_tensor import FakeTensorMode
 
@@ -106,7 +110,7 @@ class XSurfaceFakeTracingCompatTest(unittest.TestCase):
 
         feature_config.num_candidates_per_request = TEST_NUM_CANDIDATES
         feature_config.history_len = TEST_MAX_UIH_SEQ_LEN
-        batch = _create_uniform_train_batch(feature_config, device)
+        batch = create_uniform_train_batch(feature_config, device)
 
         # Decompose KJTs into plain tensors for _local_compile.
         ro_kjt = batch.ro_id_list_features
@@ -220,7 +224,7 @@ class TestXSurfaceXLACompile(unittest.TestCase):
         # ``recir/examples/rankfm_mvai/xsurface_helpers.py``.
         feature_config.num_candidates_per_request = TEST_NUM_CANDIDATES
         feature_config.history_len = TEST_MAX_UIH_SEQ_LEN
-        batch = _create_uniform_train_batch(
+        batch = create_uniform_train_batch(
             feature_config,
             device,
             batch_size=global_bs,

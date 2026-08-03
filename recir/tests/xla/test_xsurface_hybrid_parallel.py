@@ -17,6 +17,11 @@ from hammer.v3.modules.core.features.bundle import FeatureBundle
 from hammer.v3.modules.recblock import _inputs_to_feature_bundle
 from recir.api import compile, COMPILED_OBJECT_KEY, sync_device_state_to_torch
 from recir.distributed.parallel_mode import HybridParallel
+from recir.examples.rankfm_mvai.rankfm_batch_utils import create_random_train_batch
+from recir.examples.rankfm_mvai.rankfm_dispatchers import (
+    TEST_BATCH_SIZE,
+    TEST_MAX_UIH_SEQ_LEN,
+)
 from recir.ops.fake.kjt import patch_ec_for_tracing
 from recir.ops.fake.mot_preprocessor import patch_mot_preprocessor_for_tracing
 from recir.sharding_plan import EmbeddingShardingPlan, EmbeddingShardingType
@@ -24,12 +29,7 @@ from recir.sharding_plan import EmbeddingShardingPlan, EmbeddingShardingType
 # IMPORTANT: must run BEFORE any `import jax` so the cuda plugin path patch
 # is in effect when jax.devices() / jax.* first triggers plugin discovery.
 from recir.tests.xla import _jax_cuda_plugin_fix  # noqa: F401, I001
-from recir.tests.xla.xsurface_test_utils import (
-    _build_full_model,
-    _create_random_train_batch,
-    TEST_BATCH_SIZE,
-    TEST_MAX_UIH_SEQ_LEN,
-)
+from recir.tests.xla.xsurface_test_utils import _build_full_model
 from torch.distributed.distributed_c10d import _get_default_group, _world
 from torch.distributed.tensor import DeviceMesh
 from torch.testing._internal.common_distributed import skip_if_lt_x_gpu
@@ -181,7 +181,7 @@ class TestXSurfaceHybridParallelCompile(unittest.TestCase):
             if p.is_floating_point():
                 p.requires_grad_(True)
 
-        batch = _create_random_train_batch(
+        batch = create_random_train_batch(
             feature_config, device, batch_size=TEST_BATCH_SIZE
         )
 
@@ -455,7 +455,7 @@ class TestXSurfaceCompileMatchesEager(unittest.TestCase):
             if p.is_floating_point():
                 p.requires_grad_(True)
 
-        batch = _create_random_train_batch(
+        batch = create_random_train_batch(
             feature_config, device, batch_size=TEST_BATCH_SIZE
         )
 
@@ -612,7 +612,7 @@ class TestXSurfacePatchesPreserveNumerics(unittest.TestCase):
             if p.is_floating_point():
                 p.requires_grad_(True)
 
-        batch = _create_random_train_batch(
+        batch = create_random_train_batch(
             feature_config, device, batch_size=TEST_BATCH_SIZE
         )
 

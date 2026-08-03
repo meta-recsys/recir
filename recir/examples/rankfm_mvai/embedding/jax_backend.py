@@ -18,7 +18,7 @@ Architecture:
     ECSparseArch for DummySparseArch like the base. install_graph wires
     a graph-break fwd_fn that calls SparsecoreBackedEC directly with
     the runtime KJT.
-  - PreprocessorDispatcher (from xsurface_test_utils) is reused unchanged -
+  - PreprocessorDispatcher (from rankfm_dispatchers) is reused unchanged -
     preprocessing always runs on CPU.
   - Gradient hooks in SparsecoreBackedEC fire SparseCoreLookup.update_
     embeddings (on-chip Adagrad), so no PyTorch optimizer manages
@@ -43,6 +43,12 @@ import torch.nn as nn
 from hammer.v3.modules.mot.tokenizers.mot_sparse_arch import ECSparseArch
 from minimal_viable_ai.core.model_family_api.optimizer_configs import OptimConfig
 from recir.eager_dispatch import install_graph_break_dispatch
+from recir.examples.rankfm_mvai.rankfm_dispatchers import (
+    _disable_sampling,
+    _xsurface_sparse_prefix,
+    DummySparseArch,
+    PreprocessorDispatcher,
+)
 from recir.sparsecore.backend import (
     _num_sc_per_device,
     EmbeddingBackend,
@@ -51,12 +57,6 @@ from recir.sparsecore.backend import (
     SparsecoreBackedEC,
     SparseOptimizerRuntime,
     SparseUpdatePlacement,
-)
-from recir.tests.xla.xsurface_test_utils import (
-    _disable_sampling,
-    _xsurface_sparse_prefix,
-    DummySparseArch,
-    PreprocessorDispatcher,
 )
 from torchrec.modules.embedding_configs import EmbeddingConfig
 from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor
@@ -72,7 +72,7 @@ logger: logging.Logger = logging.getLogger(__name__)
 class JAXSparseArchDispatcher:
     """Standalone dispatcher that routes the embedding lookup to SparseCore.
 
-    Mirrors the structure of xsurface_test_utils.SparseArchDispatcher but
+    Mirrors the structure of rankfm_dispatchers.SparseArchDispatcher but
     calls into JAX/SparseCore (SparsecoreBackedEC) instead of the original
     torchrec ECSparseArch at runtime. install_eager swaps ECSparseArch for
     DummySparseArch the same way the base does; install_graph wires a
@@ -243,7 +243,7 @@ class JAXRankFMBackend(EmbeddingBackend):
         num_ranks: int,
         num_processes: int,
     ) -> List[Any]:
-        # The new xsurface_test_utils.SparseArchDispatcher does not expose
+        # The rankfm_dispatchers.SparseArchDispatcher does not expose
         # cached_input_kjt (only cached_output + input_kjt_keys). We still
         # need cached_input_kjt to derive per-feature SC FeatureSpec sizes,
         # so run the same eager preprocessor + tokenizer pass _build_overrides
