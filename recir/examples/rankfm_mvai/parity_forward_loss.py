@@ -67,6 +67,8 @@ from recir.examples.rankfm_mvai.model_family import (
     _udd_fm_v3_train_step,
     _udd_fm_v3_train_step_two_opt,
 )
+from recir.examples.rankfm_mvai.rankfm_batch_utils import resize_kjt_batch, tile_dim0
+from recir.examples.rankfm_mvai.rankfm_model_utils import build_model_from_config
 from recir.examples.rankfm_mvai.train_common import (
     ensure_gloo_process_group,
     force_cpu_barrier,
@@ -78,11 +80,6 @@ from recir.examples.rankfm_mvai.xsurface_helpers import (
     prepare_override_build_sample,
 )
 from recir.lowering.fbgemm_fallback import _batched_complete_cumsum_impl
-from recir.tests.xla.xsurface_test_utils import (
-    _tile_dim0,
-    build_model_from_config,
-    resize_kjt_b,
-)
 
 logger: logging.Logger = logging.getLogger(__name__)
 
@@ -419,11 +416,11 @@ def _compiled_step(
         g_ro = trace_batch.ro_float_features.shape[0] * num_processes
         g_nro = trace_batch.nro_float_features.shape[0] * num_processes
         batch_sample = _inputs_to_feature_bundle(
-            resize_kjt_b(trace_batch.ro_id_list_features, g_ro),
+            resize_kjt_batch(trace_batch.ro_id_list_features, g_ro),
             None,
-            resize_kjt_b(trace_batch.nro_id_list_features, g_nro),
-            _tile_dim0(trace_batch.num_candidates, g_ro),
-            {k: _tile_dim0(v, g_nro) for k, v in all_labels.items()},
+            resize_kjt_batch(trace_batch.nro_id_list_features, g_nro),
+            tile_dim0(trace_batch.num_candidates, g_ro),
+            {k: tile_dim0(v, g_nro) for k, v in all_labels.items()},
         )
         override_bs = global_bs
 

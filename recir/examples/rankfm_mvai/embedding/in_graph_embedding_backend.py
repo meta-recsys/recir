@@ -649,12 +649,9 @@ class InGraphEmbeddingBackend(EmbeddingBackend):
         num_ranks: int,
         num_processes: int,
     ) -> List[Any]:
-        # Lazy import: xsurface_test_utils pulls the hammer udd_fm_v3 batch_loader
-        # chain, which does a Configerator network call at import time -- that
-        # fails in the no-network unit-test sandbox. Keep it scoped to
-        # get_override (the only user) so importing this module stays cheap and
-        # network-free for the CPU trace tests.
-        from recir.tests.xla.xsurface_test_utils import (
+        # Keep this scoped to get_override so importing the backend stays cheap
+        # for CPU trace tests that do not exercise xsurface dispatch.
+        from recir.examples.rankfm_mvai.rankfm_dispatchers import (
             _disable_sampling,
             PreprocessorDispatcher,
         )

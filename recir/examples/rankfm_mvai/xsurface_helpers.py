@@ -43,15 +43,15 @@ from hammer.v3.modules.recblock import _inputs_to_feature_bundle
 from recir.backends import XLAGSPMDBackend
 from recir.decompositions import SPMD_DECOMP_TABLE
 from recir.distributed.parallel_mode import GSPMDParallel
+from recir.examples.rankfm_mvai.rankfm_batch_utils import (
+    resize_batch_inplace,
+    resize_kjt_per_key_lengths,
+)
 from recir.lowering.fbgemm_fallback import _batched_complete_cumsum_impl
 from recir.region_transforms.padding import (
     compute_padded_shape,
     JaggedPairConfig,
     PaddingRegionTransform,
-)
-from recir.tests.xla.xsurface_test_utils import (
-    resize_batch_inplace,
-    resize_kjt_per_key_lengths,
 )
 
 from .config import RankFMTrainerConfig

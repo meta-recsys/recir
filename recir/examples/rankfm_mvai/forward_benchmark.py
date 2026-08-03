@@ -60,6 +60,13 @@ from recir.examples.rankfm_mvai.embedding import build_embedding_backend
 from recir.examples.rankfm_mvai.embedding.in_graph_embedding_backend import (
     SHARDED_TABLE_PREFIX,
 )
+from recir.examples.rankfm_mvai.rankfm_batch_utils import (
+    create_random_train_batch,
+    resize_kjt_batch,
+    tile_dim0,
+    tile_last_dim,
+)
+from recir.examples.rankfm_mvai.rankfm_model_utils import build_model_from_config
 from recir.examples.rankfm_mvai.train_common import (
     ensure_gloo_process_group,
     force_cpu_barrier,
@@ -71,13 +78,6 @@ from recir.examples.rankfm_mvai.xsurface_helpers import (
     prepare_override_build_sample,
 )
 from recir.lowering.fbgemm_fallback import _batched_complete_cumsum_impl
-from recir.tests.xla.xsurface_test_utils import (
-    _create_random_train_batch,
-    _tile_dim0,
-    _tile_last_dim,
-    build_model_from_config,
-    resize_kjt_b,
-)
 
 logger: logging.Logger = logging.getLogger(__name__)
 
@@ -240,19 +240,19 @@ def _tile_batch_to_devices(batch: Any, num_ranks: int) -> Any:
         return batch
     g_ro = batch.ro_float_features.shape[0] * num_ranks
     g_nro = batch.nro_float_features.shape[0] * num_ranks
-    batch.ro_float_features = _tile_dim0(batch.ro_float_features, g_ro)
-    batch.ro_id_list_features = resize_kjt_b(batch.ro_id_list_features, g_ro)
-    batch.nro_float_features = _tile_dim0(batch.nro_float_features, g_nro)
-    batch.nro_id_list_features = resize_kjt_b(batch.nro_id_list_features, g_nro)
+    batch.ro_float_features = tile_dim0(batch.ro_float_features, g_ro)
+    batch.ro_id_list_features = resize_kjt_batch(batch.ro_id_list_features, g_ro)
+    batch.nro_float_features = tile_dim0(batch.nro_float_features, g_nro)
+    batch.nro_id_list_features = resize_kjt_batch(batch.nro_id_list_features, g_nro)
     if batch.unary_features is not None:
-        batch.unary_features = resize_kjt_b(batch.unary_features, g_nro)
-    batch.num_candidates = _tile_dim0(batch.num_candidates, g_ro)
-    batch.supervision_label = _tile_last_dim(batch.supervision_label, g_nro)
-    batch.supervision_weight = _tile_last_dim(batch.supervision_weight, g_nro)
+        batch.unary_features = resize_kjt_batch(batch.unary_features, g_nro)
+    batch.num_candidates = tile_dim0(batch.num_candidates, g_ro)
+    batch.supervision_label = tile_last_dim(batch.supervision_label, g_nro)
+    batch.supervision_weight = tile_last_dim(batch.supervision_weight, g_nro)
     all_labels = batch.all_labels
     if all_labels is not None:
         for k in list(all_labels.keys()):
-            all_labels[k] = _tile_dim0(all_labels[k], g_nro)
+            all_labels[k] = tile_dim0(all_labels[k], g_nro)
     return batch
 
 
@@ -290,7 +290,7 @@ def _build_model_and_batch(
     # local devices (num_ranks // num_processes). Single-host: num_local ==
     # num_ranks, so this is the global batch (unchanged).
     num_local = num_ranks // num_processes
-    batch = _create_random_train_batch(
+    batch = create_random_train_batch(
         feature_config,
         device,
         batch_size=_FWD_GLOBAL_BS // num_ranks,

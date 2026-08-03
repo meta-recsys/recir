@@ -69,10 +69,9 @@ RSYNC_EXCLUDES=(
 )
 
 # recir + setup.py
-# Keep recir/tests/xla/xsurface_test_utils.py (imported by train.py) and
-# recir/tests/stu_test.py (run by recir/tests/helpers.sh on TPU, which reuses
-# this build script), but exclude every other test file. Includes MUST precede
-# excludes -- rsync's first-match-wins evaluation order means a bare
+# Keep recir/tests/stu_test.py (run by recir/tests/helpers.sh on TPU, which
+# reuses this build script), but exclude every other test file. Includes MUST
+# precede excludes -- rsync's first-match-wins evaluation order means a bare
 # `--exclude=tests` would prune the whole tree before the includes are seen.
 rsync -a \
     --include='tests/' \
@@ -80,7 +79,6 @@ rsync -a \
     --include='tests/stu_test.py' \
     --include='tests/xla/' \
     --include='tests/xla/__init__.py' \
-    --include='tests/xla/xsurface_test_utils.py' \
     --include='tests/xla/dlrmv3_test_utils.py' \
     --include='tests/xla/gspmd_test_utils.py' \
     --exclude='tests/**' \
@@ -217,7 +215,7 @@ import minimal_viable_ai; print('minimal_viable_ai: OK')
 from minimal_viable_ai.core.trainer.trainer import RecTrainer  # noqa: F401
 print('minimal_viable_ai.RecTrainer: OK')
 from generative_recommenders.common import HammerKernel; print('generative_recommenders: OK')
-from recir.tests.xla.xsurface_test_utils import PreprocessorDispatcher, SparseArchDispatcher; print('recir.tests.xla: OK')
+from recir.examples.rankfm_mvai.rankfm_dispatchers import PreprocessorDispatcher, SparseArchDispatcher; print('rankfm_mvai dispatchers: OK')
 # Import the ACTUAL training entry module (not just config). This exercises the
 # full chain -- model_family -> hammer udd_fm_family, train_pipeline -> recir
 # compile -- so a missing staged module fails the BUILD here instead of only at
