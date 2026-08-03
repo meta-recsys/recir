@@ -3,9 +3,9 @@
 
 # pyre-strict
 
-"""Compare one CPU-eager and one TPU-compiled RankFM optimizer step.
+"""Compare consecutive CPU-eager and TPU-compiled RankFM optimizer steps.
 
-Both cells start from the same seeded model and consume the same real replay batch.
+Both cells start from the same seeded model and consume the same replay batches.
 The model shape, precision, embedding backend, optimizer configuration, and static
 shape settings match ``rankfm_mvai-64chip.yaml``; only execution differs.
 
@@ -14,7 +14,7 @@ Required environment:
     PARITY_GCS_DATA_PATH=gs://<bucket>/rankfm_1shard_data
 
 Optional overrides include ``PARITY_BF16``, ``PARITY_HASH_SIZE_CAP``, ``RANKFM_S``,
-replay file/index/batch settings, matmul precision, and comparison tolerances.
+replay file/index/batch/step settings, matmul precision, and comparison tolerances.
 """
 
 from __future__ import annotations
@@ -136,18 +136,17 @@ _PARITY_BF16: bool = os.environ.get("PARITY_BF16", "1").lower() not in (
 # ---------------------------------------------------------------------------
 
 
-def _load_e2e_batch(
+def _load_e2e_batches(
     model: BlueReelsVDDTrainV3,
     module_config: Any,
     gcs_data_path: str,
-) -> Any:
-    """Load the FIRST real batch from the e2e GCS dump, exactly as the trainer does.
+) -> List[Any]:
+    """Load consecutive real batches from the e2e dump, as the trainer does.
 
     Mirrors model_family.create_train_module_and_optimizer's trace-batch pull:
     compute_kjt_key_to_size (pre-DMP) -> BatchReplayPipe (single file, replicate)
-    -> replay_batch_iter(max_steps=1). So the parity consumes the SAME
-    MTMLROOTrainBatch the e2e trains on: the loader yields the REAL jagged batch
-    and returns the raw jagged batch consumed by both parity cells.
+    -> replay_batch_iter(max_steps=PARITY_STEPS). Both parity cells consume the
+    same real jagged batches in order.
     Knobs: PARITY_DATA_FILE_TEMPLATE (default
     rank_0_batch_{i}.pt.zst), PARITY_DATA_FILE_INDEX (default 1),
     PARITY_LOCAL_BATCH_SIZE (default 32, matching the 1shard yaml).
@@ -157,6 +156,9 @@ def _load_e2e_batch(
     file_tmpl = os.environ.get("PARITY_DATA_FILE_TEMPLATE", "rank_0_batch_{i}.pt.zst")
     file_idx = int(os.environ.get("PARITY_DATA_FILE_INDEX", "1"))
     local_bs = int(os.environ.get("PARITY_LOCAL_BATCH_SIZE", "32"))
+    steps = int(os.environ.get("PARITY_STEPS", "3"))
+    if steps <= 0:
+        raise ValueError(f"PARITY_STEPS must be positive, got {steps}")
     num_candidates_per_sample = _resolve_nro_per_sample(module_config, True)
     # MUST run before any backend.setup / DMP wrap: post-DMP the EC is wrapped and
     # embedding_configs() disappears. _compiled_step / _eager_step call
@@ -171,16 +173,18 @@ def _load_e2e_batch(
     )
     # Always pull the RAW jagged batch, mirroring the e2e trace-batch pull;
     # slice+remap only.
-    batch = next(
+    batches = list(
         replay_batch_iter(
             data_pipe,
             key_to_size,
-            max_steps=1,
+            max_steps=steps,
             local_batch_size=local_bs,
             num_candidates=num_candidates_per_sample,
         )
     )
-    return batch
+    if len(batches) != steps:
+        raise RuntimeError(f"Requested {steps} parity batches, loaded {len(batches)}")
+    return batches
 
 
 def _dense_params(backend: Any, model: torch.nn.Module) -> Dict[str, torch.Tensor]:
@@ -345,7 +349,7 @@ def _parity_train_step_two_opt_with_grads(
 
 def _compiled_step(
     model: BlueReelsVDDTrainV3,
-    batch: Any,
+    batches: List[Any],
     num_ranks: int,
     num_processes: int,
     global_bs: int,
@@ -354,21 +358,23 @@ def _compiled_step(
     emb_backend: str = _PARITY_EMB_BACKEND,
 ) -> Tuple[
     Dict[str, torch.Tensor],
-    float,
+    List[float],
     Dict[str, Any],
     Dict[str, torch.Tensor],
 ]:
-    """Run one compiled training step and return params, loss, exports, and grads.
+    """Run consecutive compiled training steps and return params, loss, exports, and grads.
 
     Mirrors RecirXLACompiledModule (rankfm_mvai/model_family.py): build the recir
     embedding backend, expand the override sample, build dispatchers, set up
     embedding storage, build the unified TensorLRAdamW dense optimizer, wire the
-    PaddingRegionTransform, then compile + run one step. DCN is included (the
+    PaddingRegionTransform, then compile once and run consecutive steps with
+    carried state. DCN is included (the
     model was built with use_inter_arch=True).
     """
     device = torch.device("cpu")
     model.train(True)
     module_config = model.module_config
+    trace_batch = batches[0]
     # global_bs is passed in (the GLOBAL batch); `batch` here is PER-HOST
     # (num_local identical device blocks), so it can no longer be derived from
     # batch.ro_float_features.shape[0].
@@ -393,7 +399,7 @@ def _compiled_step(
     # which would mismatch the jagged dense path -- the 5120-vs-2808 cat error).
     if padding:
         batch_sample, override_bs = prepare_override_build_sample(
-            batch,
+            trace_batch,
             module_config,
             global_bs,
             num_candidates_per_sample,
@@ -401,7 +407,7 @@ def _compiled_step(
             enable_padding=True,
         )
     else:
-        all_labels = batch.all_labels
+        all_labels = trace_batch.all_labels
         assert all_labels is not None
         # get_override derives each feature's per-chip token total as
         # (GLOBAL token total) / jax.device_count(), so the override-build sample
@@ -410,13 +416,13 @@ def _compiled_step(
         # the global sample -- preserving the ACTUAL jagged candidate counts
         # (unlike prepare_override_build_sample's rectangular NRO resize, which
         # mismatches the jagged dense path). num_processes == 1 -> no tiling.
-        g_ro = batch.ro_float_features.shape[0] * num_processes
-        g_nro = batch.nro_float_features.shape[0] * num_processes
+        g_ro = trace_batch.ro_float_features.shape[0] * num_processes
+        g_nro = trace_batch.nro_float_features.shape[0] * num_processes
         batch_sample = _inputs_to_feature_bundle(
-            resize_kjt_b(batch.ro_id_list_features, g_ro),
+            resize_kjt_b(trace_batch.ro_id_list_features, g_ro),
             None,
-            resize_kjt_b(batch.nro_id_list_features, g_nro),
-            _tile_dim0(batch.num_candidates, g_ro),
+            resize_kjt_b(trace_batch.nro_id_list_features, g_nro),
+            _tile_dim0(trace_batch.num_candidates, g_ro),
             {k: _tile_dim0(v, g_nro) for k, v in all_labels.items()},
         )
         override_bs = global_bs
@@ -440,11 +446,11 @@ def _compiled_step(
         num_ranks,
     )
     model = cast(BlueReelsVDDTrainV3, embedding_setup.model)
-    unary_kjt = batch.unary_features
+    unary_kjt = trace_batch.unary_features
     assert unary_kjt is not None
     model.set_recir_kjt_keys(
-        batch.ro_id_list_features.keys(),
-        batch.nro_id_list_features.keys(),
+        trace_batch.ro_id_list_features.keys(),
+        trace_batch.nro_id_list_features.keys(),
         unary_kjt.keys(),
     )
 
@@ -457,7 +463,7 @@ def _compiled_step(
         f"has_hstu_posw={any('_pos_weights' in n for n in dense_named)}"
     )
     sparse_runtime = embedding_setup.sparse_runtime
-    dense_opt, _warmup = setup_dense_optimizer_and_warmup(
+    dense_opt, warmup = setup_dense_optimizer_and_warmup(
         model,
         dense_params,
         trainer_cfg.dense_optimizer_config,
@@ -481,14 +487,14 @@ def _compiled_step(
         device=device,
         num_ranks=num_ranks,
         num_processes=num_processes,
-        loss_reduction="sum",
+        loss_reduction="mean",
         region_transforms=region_transforms,
     )
     if emb_opt is None:
         runner = compile_gspmd_step(
             model,
             dense_opt,
-            batch,
+            trace_batch,
             dispatchers,
             spec,
             train_step_fn=(
@@ -498,13 +504,16 @@ def _compiled_step(
             ),
         )
 
-        def _run_one() -> Tuple[torch.Tensor, Any]:
-            return run_step_and_sync(runner, model, dense_opt, batch)
+        def _run_one(run_batch: Any) -> Tuple[torch.Tensor, Any]:
+            return run_step_and_sync(runner, model, dense_opt, run_batch)
 
     else:
         parallel_mode = GSPMDParallel(
             "replicate",
-            loss_reduction=spec.loss_reduction,
+            # The global batch is sharded across the GSPMD mesh. The loss is
+            # already normalized by the global denominator, so replicated
+            # parameter gradients must be summed across ranks.
+            loss_reduction="mean",
             num_ranks=num_ranks,
             num_processes=num_processes,
             fsdp_table_substr=SHARDED_TABLE_PREFIX,
@@ -517,7 +526,7 @@ def _compiled_step(
             ),
             model,
             (dense_opt, emb_opt),
-            batch,
+            trace_batch,
             parallel_mode=parallel_mode,
             backend=XLAGSPMDBackend(),
             dispatchers=dispatchers,
@@ -525,86 +534,90 @@ def _compiled_step(
         )
 
         # pyre-ignore
-        def _run_one() -> Tuple[torch.Tensor, Any]:
-            result = runner(model, dense_opt, emb_opt, *flatten_batch(batch))
+        def _run_one(run_batch: Any) -> Tuple[torch.Tensor, Any]:
+            result = runner(model, dense_opt, emb_opt, *flatten_batch(run_batch))
             sync_device_state_to_torch(runner)
             return result
 
-    # Run one compiled optimizer step and capture its comparison outputs.
-    loss_value = 0.0
+    # Reuse the compiled runner so model and optimizer state carry across steps.
+    loss_values: List[float] = []
     exports: Dict[str, Any] = {}
     compiled_grads: Dict[str, torch.Tensor] = {}
     # Embeddings are trained by the in-backward DMP-FUSED RowWiseAdagrad (dist is
     # always initialized in main()), so there is nothing extra to step here.
-    for step in range(1):
-        losses, named = _run_one()
-        if step == 0:
-            loss_value = float(losses.detach().to(torch.float64).sum())
-            if isinstance(named, dict):
-                for k in (
-                    "loss",
-                    "loss_scale",
-                    "llw_weights",
-                    "num_candidates",
-                    "pre_llw_losses",
-                ):
-                    t = named.get(k)
-                    if isinstance(t, torch.Tensor):
-                        exports[k] = t.detach().to(torch.float64).cpu()
-                # Per-task reductions of the big per-sample tensors (weight_sum is
-                # the key masking check: weight-0 dummies match jagged).
-                w = named.get("weight")
-                lab = named.get("label")
-                pred = named.get("prediction")
-                if (
-                    isinstance(w, torch.Tensor)
-                    and isinstance(lab, torch.Tensor)
-                    and isinstance(pred, torch.Tensor)
-                ):
-                    wf = w.detach().to(torch.float64)
-                    labf = lab.detach().to(torch.float64)
-                    predf = pred.detach().to(torch.float64)
-                    # The in-graph weight/label/pred tensors are REPLICATED across
-                    # the num_processes host mesh axis; materializing to cpu sums
-                    # those replicas, so a raw sum(dim=-1) is num_processes x the
-                    # true global. Divide it out: the loss (numerator / global
-                    # world_candidate_sum) cancels this internally, but the
-                    # un-normalized raw exports do not -- leaving raw_ratio(tpu/cpu)
-                    # at num_processes^2 instead of the honest num_processes (eager
-                    # exports a single process's shard). Scale-free gates
-                    # (label_wmean/pred_wmean) are unaffected (both terms carry the
-                    # same factor).
-                    _p = float(num_processes)
-                    exports["weight_sum"] = wf.sum(dim=-1).cpu() / _p
-                    exports["label_wsum"] = (wf * labf).sum(dim=-1).cpu() / _p
-                    exports["pred_wsum"] = (wf * predf).sum(dim=-1).cpu() / _p
-                    exports["n_samples"] = torch.tensor([float(wf.shape[-1]) / _p])
-                if capture_grads:
-                    # Strip the 'grad/' tag + normalize names to align with eager.
-                    compiled_grads = {
-                        _norm_param_name(k[len("grad/") :]): v.detach()
-                        .to(torch.float64)
-                        .cpu()
-                        for k, v in named.items()
-                        if isinstance(k, str)
-                        and k.startswith("grad/")
-                        and isinstance(v, torch.Tensor)
-                    }
-    return _dense_params(backend, model), loss_value, exports, compiled_grads
+    for step, run_batch in enumerate(batches):
+        losses, named = _run_one(run_batch)
+        loss_value = float(losses.detach().to(torch.float64).sum())
+        loss_values.append(loss_value)
+        logger.info("[PARITY][COMPILED][step=%d] loss=%.6f", step + 1, loss_value)
+        warmup.step()
+        if isinstance(named, dict):
+            for k in (
+                "loss",
+                "loss_scale",
+                "llw_weights",
+                "num_candidates",
+                "pre_llw_losses",
+                "tb:user_export/user_embedding",
+                "tb:user_export/item_embedding",
+            ):
+                t = named.get(k)
+                if isinstance(t, torch.Tensor):
+                    exports[k] = t.detach().to(torch.float64).cpu()
+            # Per-task reductions of the big per-sample tensors (weight_sum is
+            # the key masking check: weight-0 dummies match jagged).
+            w = named.get("weight")
+            lab = named.get("label")
+            pred = named.get("prediction")
+            if (
+                isinstance(w, torch.Tensor)
+                and isinstance(lab, torch.Tensor)
+                and isinstance(pred, torch.Tensor)
+            ):
+                wf = w.detach().to(torch.float64)
+                labf = lab.detach().to(torch.float64)
+                predf = pred.detach().to(torch.float64)
+                # The in-graph weight/label/pred tensors are REPLICATED across
+                # the num_processes host mesh axis; materializing to cpu sums
+                # those replicas, so a raw sum(dim=-1) is num_processes x the
+                # true global. Divide it out: the loss (numerator / global
+                # world_candidate_sum) cancels this internally, but the
+                # un-normalized raw exports do not -- leaving raw_ratio(tpu/cpu)
+                # at num_processes^2 instead of the honest num_processes (eager
+                # exports a single process's shard). Scale-free gates
+                # (label_wmean/pred_wmean) are unaffected (both terms carry the
+                # same factor).
+                _p = float(num_processes)
+                exports["weight_sum"] = wf.sum(dim=-1).cpu() / _p
+                exports["label_wsum"] = (wf * labf).sum(dim=-1).cpu() / _p
+                exports["pred_wsum"] = (wf * predf).sum(dim=-1).cpu() / _p
+                exports["n_samples"] = torch.tensor([float(wf.shape[-1]) / _p])
+            if capture_grads:
+                # Strip the 'grad/' tag + normalize names to align with eager.
+                compiled_grads = {
+                    _norm_param_name(k[len("grad/") :]): v.detach()
+                    .to(torch.float64)
+                    .cpu()
+                    for k, v in named.items()
+                    if isinstance(k, str)
+                    and k.startswith("grad/")
+                    and isinstance(v, torch.Tensor)
+                }
+    return _dense_params(backend, model), loss_values, exports, compiled_grads
 
 
 def _eager_step(
     model: BlueReelsVDDTrainV3,
-    batch: Any,
+    batches: List[Any],
     num_processes: int,
     num_ranks: int = 1,
     exports_out: Optional[Dict[str, torch.Tensor]] = None,
 ) -> Tuple[
     Dict[str, torch.Tensor],
-    float,
+    List[float],
     Dict[str, torch.Tensor],
 ]:
-    """Eager ground-truth step: one fwd+bwd+opt in plain PyTorch, NO recir.
+    """Eager ground-truth: consecutive fwd+bwd+opt steps in plain PyTorch, NO recir.
 
     Runs the SAME train-step logic as the compiled path (``recir_train_step``,
     called DIRECTLY instead of traced/compiled) with NO override/dispatchers, NO
@@ -622,6 +635,7 @@ def _eager_step(
     """
     device = torch.device("cpu")
     model.train(True)
+    trace_batch = batches[0]
     trainer_cfg = RankFMTrainerConfig()
     # Eager embedding path = torchrec DMP; needs a gloo PG (reuse if already up).
     backend = build_embedding_backend("cpu")
@@ -638,11 +652,11 @@ def _eager_step(
         num_ranks,
     )
     model = cast(BlueReelsVDDTrainV3, embedding_setup.model)
-    unary_kjt = batch.unary_features
+    unary_kjt = trace_batch.unary_features
     assert unary_kjt is not None
     model.set_recir_kjt_keys(
-        batch.ro_id_list_features.keys(),
-        batch.nro_id_list_features.keys(),
+        trace_batch.ro_id_list_features.keys(),
+        trace_batch.nro_id_list_features.keys(),
         unary_kjt.keys(),
     )
     # Eager ALWAYS consumes the batch as ONE un-sharded global batch, so its loss
@@ -667,9 +681,10 @@ def _eager_step(
     # warmup-initialized LR), then rebuild as a PLAIN eager AdamW. The prod
     # TensorLRAdamW hardcodes capturable=True + a 0-d tensor LR for XLA graph
     # capture, which asserts on CPU ("capturable=True requires cuda/xla/..."); the
-    # eager-equivalent is capturable=False + scalar LR. The single-step LR still
-    # matches compiled because neither path steps the (discarded) warmup ctrl.
-    xla_opt, _warmup = setup_dense_optimizer_and_warmup(
+    # eager-equivalent is capturable=False + scalar LR. Each step copies the
+    # current tensor LR into eager AdamW and advances the same warmup controller
+    # as compiled.
+    xla_opt, warmup = setup_dense_optimizer_and_warmup(
         model, dense_params, trainer_cfg.dense_optimizer_config, device
     )
     g0 = xla_opt.param_groups[0]
@@ -697,10 +712,10 @@ def _eager_step(
     # is never stepped, matching compiled).
     prime_optimizer_state(dense_opt)
     max_grad = getattr(xla_opt, "_max_grad", None)
-    # Run one eager optimizer step with the same batch and learning rate.
-    loss_value = 0.0
+    # Reuse the eager model and optimizer so state carries across batches.
+    loss_values: List[float] = []
     eager_grads: Dict[str, torch.Tensor] = {}
-    for step in range(1):
+    for step, batch in enumerate(batches):
         dense_opt.zero_grad(set_to_none=True)
         # bf16: a bf16 model casts activations to bf16 but keeps fp32 master
         # weights, relying on autocast to cast Linear weights at matmul time.
@@ -728,10 +743,13 @@ def _eager_step(
             all_losses, _named = model(*_eager_args)
             loss = all_losses.sum()
         loss.backward()
-        if step == 0:
-            # Capture RAW grads BEFORE the DDP div + value-clip (compiled captures
-            # its grads at the divided value; the main-side compare scales this by
-            # /num_ranks). Names normalized to align with the compiled dict.
+        loss_value = float(all_losses.detach().to(torch.float64).sum())
+        loss_values.append(loss_value)
+        logger.info("[PARITY][EAGER][step=%d] loss=%.6f", step + 1, loss_value)
+        if step == len(batches) - 1:
+            # Capture raw grads before value clipping. With mean loss reduction,
+            # the compiled all-reduce SUM already produces this global-mean scale.
+            # Names are normalized to align with the compiled dict.
             eager_grads = {
                 _norm_param_name(n): p.grad.detach()  # pyre-ignore
                 .to(torch.float64)
@@ -741,8 +759,6 @@ def _eager_step(
             }
             grad_sq = sum(float(g.pow(2).sum()) for g in eager_grads.values())
             logger.info(f"[PARITY][EAGER] dense grad global norm={grad_sq**0.5:.6f}")
-            loss_value = float(all_losses.detach().to(torch.float64).sum())
-            logger.info(f"[PARITY][EAGER] loss={loss_value:.6f}")
             # Optional forward-export capture (mirrors _compiled_step's exports) so
             # callers can diff per-task weight_sum / label_wsum / pred_wsum against
             # the compiled cell. Non-capturing by default (exports_out=None).
@@ -753,6 +769,8 @@ def _eager_step(
                     "llw_weights",
                     "num_candidates",
                     "pre_llw_losses",
+                    "tb:user_export/user_embedding",
+                    "tb:user_export/item_embedding",
                 ):
                     _t = _named.get(_k)
                     if isinstance(_t, torch.Tensor):
@@ -772,22 +790,80 @@ def _eager_step(
                     exports_out["label_wsum"] = (_wf * _labf).sum(dim=-1).cpu()
                     exports_out["pred_wsum"] = (_wf * _predf).sum(dim=-1).cpu()
                     exports_out["n_samples"] = torch.tensor([float(_wf.shape[-1])])
-        # Mirror the compiled path's optimizer input EXACTLY so the AdamW moments
-        # (m, v) are comparable: DDP grad average (api.py ÷num_ranks) FIRST, then
-        # clip_grad_value (TensorLRAdamW.step does it post-div), then step. Feeding
-        # the SAME gradient is required -- v ∝ g^2, so a num_ranks mismatch would
-        # blow up the v comparison by num_ranks^2.
-        # DDP div + clip apply to DENSE only (its grads are DDP-averaged in the
-        # compiled path). Embedding grads are SUM (no /num_ranks) and unclipped --
-        # matching the off-graph embedding backward + Adagrad on the compiled side.
-        if num_ranks > 1:
-            for p in dense_only:
-                if p.grad is not None:
-                    p.grad.div_(num_ranks)
+        # Mean loss reduction selects SUM gradient reduction in the compiled path:
+        # backward has already normalized by global numel, so the all-reduce must
+        # not divide again. Apply only the same dense value clipping before AdamW.
         if max_grad is not None:
             torch.nn.utils.clip_grad_value_(dense_only, max_grad)
+        current_lr = float(xla_opt.param_groups[0]["lr"])
+        for group in dense_opt.param_groups:
+            group["lr"] = current_lr
         dense_opt.step()
-    return _dense_params(backend, model), loss_value, eager_grads
+        warmup.step()
+    return _dense_params(backend, model), loss_values, eager_grads
+
+
+def _unpad_candidate_embeddings(
+    value: torch.Tensor, eager_num_candidates: torch.Tensor
+) -> Optional[torch.Tensor]:
+    devices = jax.devices()
+    process_index = jax.process_index()
+    local_chip_indices = [
+        index
+        for index, device in enumerate(devices)
+        if device.process_index == process_index
+    ]
+    if (
+        value.ndim != 2
+        or not devices
+        or value.shape[0] % len(devices) != 0
+        or not local_chip_indices
+        or eager_num_candidates.numel() % len(local_chip_indices) != 0
+    ):
+        return None
+    candidates_per_chip = value.shape[0] // len(devices)
+    chip_grid = value.reshape(len(devices), candidates_per_chip, value.shape[1])
+    eager_counts_by_chip = eager_num_candidates.reshape(len(local_chip_indices), -1)
+    return torch.cat(
+        [
+            chip_grid[global_chip, : int(eager_counts_by_chip[local_chip].sum())]
+            for local_chip, global_chip in enumerate(local_chip_indices)
+        ]
+    )
+
+
+def _log_embedding_parity(
+    eager: Dict[str, torch.Tensor], compiled: Dict[str, Any]
+) -> None:
+    eager_counts = eager.get("num_candidates")
+    if not isinstance(eager_counts, torch.Tensor):
+        return
+    for label in ("user", "item"):
+        key = f"tb:user_export/{label}_embedding"
+        eager_value = eager.get(key)
+        compiled_value = compiled.get(key)
+        if not isinstance(eager_value, torch.Tensor) or not isinstance(
+            compiled_value, torch.Tensor
+        ):
+            logger.info("[PARITY][EMBEDDING-UNPAD][%s] missing", label)
+            continue
+        aligned = _unpad_candidate_embeddings(compiled_value, eager_counts)
+        if aligned is None or aligned.shape != eager_value.shape:
+            logger.info(
+                "[PARITY][EMBEDDING-UNPAD][%s] shape mismatch eager=%s compiled=%s",
+                label,
+                tuple(eager_value.shape),
+                tuple(compiled_value.shape),
+            )
+            continue
+        diff = (eager_value - aligned).abs()
+        logger.info(
+            "[PARITY][EMBEDDING-UNPAD][%s] shape=%s max_abs=%.6e mean_abs=%.6e",
+            label,
+            tuple(aligned.shape),
+            float(diff.max()),
+            float(diff.mean()),
+        )
 
 
 def _compare(
@@ -1133,7 +1209,7 @@ def _build_cpu_tpu_model(padding: bool) -> Tuple[BlueReelsVDDTrainV3, Any]:
     Distinct from ``_build_model_and_batch`` (the padded-vs-jagged flow): this uses
     the e2e 1shard dims and builds no synthetic batch.
     """
-    torch.manual_seed(42)
+    torch.manual_seed(0)
     device = torch.device("cpu")
     seq = int(os.environ.get("RANKFM_S", "3072"))
     model_args = RankFMModelArgs(
@@ -1156,10 +1232,12 @@ def _build_cpu_tpu_model(padding: bool) -> Tuple[BlueReelsVDDTrainV3, Any]:
     return model, module_config
 
 
-def _load_raw_jagged_batch(model: BlueReelsVDDTrainV3, module_config: Any) -> Any:
-    """Load the RAW JAGGED e2e batch that BOTH cpu_tpu cells consume.
+def _load_raw_jagged_batches(
+    model: BlueReelsVDDTrainV3, module_config: Any
+) -> List[Any]:
+    """Load the RAW JAGGED e2e batches that BOTH cpu_tpu cells consume.
 
-    ``_load_e2e_batch(..., padding=True)`` returns the real jagged batch (no
+    ``_load_e2e_batches(..., padding=True)`` returns the real jagged batch (no
     pad_batch_to_static): the compiled model PRTs it in-graph, the eager model
     (enable_padding=False, static_shape_mode off) consumes it natively -- matching
     the e2e, which also feeds eager real jagged input. MUST use the PADDING
@@ -1174,13 +1252,13 @@ def _load_raw_jagged_batch(model: BlueReelsVDDTrainV3, module_config: Any) -> An
             "CPU-vs-TPU parity requires real data: set PARITY_GCS_DATA_PATH "
             "(e.g. gs://cq-mrs-core-shared_mrs_tpu_y317h/rankfm_1shard_data)."
         )
-    return _load_e2e_batch(model, module_config, gcs)
+    return _load_e2e_batches(model, module_config, gcs)
 
 
 def _run_cpu_tpu_parity(rtol: float, atol: float) -> None:
-    """Focused CPU-eager vs TPU-compiled parity for RankFM on ONE real e2e file.
+    """Multi-step CPU-eager vs TPU-compiled parity on one real e2e file.
 
-    ONE training step, two ways, on the SAME real e2e data file:
+    Consecutive training steps, two ways, on the SAME real e2e data file:
       * TPU-compiled -- enable_padding=True (static_shape_mode + PRT), dense lowered
         to TPU via recir GSPMD, embeddings via the selected PARITY_EMB_BACKEND. = train.py.
       * CPU-eager    -- enable_padding=False, plain PyTorch fwd+bwd+opt, no recir.
@@ -1200,11 +1278,11 @@ def _run_cpu_tpu_parity(rtol: float, atol: float) -> None:
     #    backend, and gradient capture. The raw jagged batch is loaded via the
     #    padding config and reused by BOTH cells.
     model_c, mc_c = _build_cpu_tpu_model(padding=True)
-    batch = _load_raw_jagged_batch(model_c, mc_c)
-    global_bs = int(batch.ro_float_features.shape[0]) * num_processes
+    batches = _load_raw_jagged_batches(model_c, mc_c)
+    global_bs = int(batches[0].ro_float_features.shape[0]) * num_processes
     comp_params, comp_loss, comp_exp, comp_grads = _compiled_step(
         model_c,
-        batch,
+        batches,
         num_ranks,
         num_processes,
         global_bs,
@@ -1220,21 +1298,34 @@ def _run_cpu_tpu_parity(rtol: float, atol: float) -> None:
     eager_exp: Dict[str, torch.Tensor] = {}
     eager_params, eager_loss, eager_grads = _eager_step(
         model_e,
-        batch,
+        batches,
         num_processes,
         num_ranks=num_ranks,
         exports_out=eager_exp,
     )
 
-    # 3) Compare. Compiled grads are DDP-averaged (loss_reduction="sum" ->
-    #    grad_reduction="avg" -> /num_ranks in recir), so scale raw eager grads down
-    #    to the same convention before comparing.
-    logger.info(
-        "[PARITY] LOSS eager=%.6f tpu_compiled=%.6f abs=%.3e",
-        eager_loss,
-        comp_loss,
-        abs(eager_loss - comp_loss),
-    )
+    _log_embedding_parity(eager_exp, comp_exp)
+    # 3) Compare. Mean loss reduction selects SUM gradient reduction, so compiled
+    #    and raw eager gradients have the same global-mean scale.
+    loss_failures = 0
+    loss_abs_by_step: List[float] = []
+    for step, (eager_step_loss, comp_step_loss) in enumerate(
+        zip(eager_loss, comp_loss), start=1
+    ):
+        loss_abs = abs(eager_step_loss - comp_step_loss)
+        loss_abs_by_step.append(loss_abs)
+        if not math.isclose(
+            eager_step_loss, comp_step_loss, rel_tol=rtol, abs_tol=atol
+        ):
+            loss_failures += 1
+        logger.info(
+            "[PARITY] LOSS step=%d eager=%.6f tpu_compiled=%.6f abs=%.3e",
+            step,
+            eager_step_loss,
+            comp_step_loss,
+            loss_abs,
+        )
+    max_loss_abs = max(loss_abs_by_step, default=0.0)
     cmp_w = _compare(eager_params, comp_params, rtol, atol)
     logger.info(
         "[PARITY] WEIGHTS compared=%d failed=%d median_abs=%.2e max_abs=%.2e "
@@ -1259,29 +1350,30 @@ def _run_cpu_tpu_parity(rtol: float, atol: float) -> None:
     def _keep(name: str) -> bool:
         return not any(x in name for x in _grad_exclude)
 
-    eager_grads_ddp = {k: v / num_ranks for k, v in eager_grads.items() if _keep(k)}
+    eager_grads_f = {k: v for k, v in eager_grads.items() if _keep(k)}
     comp_grads_f = {k: v for k, v in comp_grads.items() if _keep(k)}
-    cmp_g = _compare(eager_grads_ddp, comp_grads_f, grad_rtol, grad_atol)
+    cmp_g = _compare(eager_grads_f, comp_grads_f, grad_rtol, grad_atol)
     logger.info(
-        "[PARITY] GRADS (eager/%d) compared=%d failed=%d median_abs=%.2e "
+        "[PARITY] GRADS compared=%d failed=%d median_abs=%.2e "
         "max_abs=%.2e max_rel=%.2e",
-        num_ranks,
         cmp_g["num_params_compared"],
         cmp_g["num_failed"],
         cmp_g["median_abs_diff"],
         cmp_g["max_abs_diff"],
         cmp_g["max_rel_diff"],
     )
-    _log_grad_fqn_breakdown(eager_grads_ddp, comp_grads_f, grad_rtol, grad_atol)
+    _log_grad_fqn_breakdown(eager_grads_f, comp_grads_f, grad_rtol, grad_atol)
     # Forward exports: cpu=eager(jagged), tpu=compiled(padded). Logs
     # loss / weight_sum / label_wsum / pred_wsum match/DIFF, normalized to the
     # eager per-host basis (compiled runs the num_processes-inflated global batch).
     _log_export_breakdown(eager_exp, comp_exp, rtol, num_processes=num_processes)
     logger.info(
-        "[PARITY] VERDICT weights_failed=%d grads_failed=%d loss_abs=%.3e",
+        "[PARITY] VERDICT weights_failed=%d grads_failed=%d "
+        "losses_failed=%d max_loss_abs=%.3e",
         cmp_w["num_failed"],
         cmp_g["num_failed"],
-        abs(eager_loss - comp_loss),
+        loss_failures,
+        max_loss_abs,
     )
 
 
