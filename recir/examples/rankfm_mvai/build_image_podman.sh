@@ -53,6 +53,10 @@ export PROXY_URL="${PROXY_URL:-http://fwdproxy:8080}"
 export HTTPS_PROXY="${PROXY_URL}"
 export HTTP_PROXY="${PROXY_URL}"
 export NO_PROXY=localhost,127.0.0.1,.fbcdn.net,.facebook.com,.tfbnw.net
+# apt only reads the lowercase spellings; pip/curl accept either.
+export https_proxy="${HTTPS_PROXY}"
+export http_proxy="${HTTP_PROXY}"
+export no_proxy="${NO_PROXY}"
 
 cleanup_staging() {
     rm -rf "$STAGING_DIR"
@@ -185,6 +189,9 @@ podman build \
     --build-arg HTTP_PROXY="$HTTP_PROXY" \
     --build-arg HTTPS_PROXY="$HTTPS_PROXY" \
     --build-arg NO_PROXY="$NO_PROXY" \
+    --build-arg http_proxy="$HTTP_PROXY" \
+    --build-arg https_proxy="$HTTPS_PROXY" \
+    --build-arg no_proxy="$NO_PROXY" \
     -v /var/facebook/x509_identities:/var/facebook/x509_identities \
     -v /var/facebook/credentials:/var/facebook/credentials \
     --build-context=credentials_dir=/var/facebook/credentials \
