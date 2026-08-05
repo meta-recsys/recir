@@ -99,9 +99,25 @@ COPY mrs /app/mrs
 COPY hpc /app/hpc
 
 # Native BarnFS wheel dependencies absent from python:3.12-slim.
-RUN apt-get update && \
+# apt ignores the uppercase HTTP_PROXY that pip honors, so on a devserver it
+# would try to resolve deb.debian.org directly and fail. Write the proxy into
+# apt.conf from the build arg instead of relying on env-var spelling.
+ARG HTTP_PROXY=
+RUN if [ -n "$HTTP_PROXY" ]; then \
+        printf 'Acquire::http::Proxy "%s";\nAcquire::https::Proxy "%s";\n' \
+            "$HTTP_PROXY" "$HTTP_PROXY" > /etc/apt/apt.conf.d/00proxy; \
+    fi && \
+    apt-get update && \
+# would try to resolve deb.debian.org directly and fail. Write the proxy into
+    rm -rf /var/lib/apt/lists/* /etc/apt/apt.conf.d/00proxy
+ARG HTTP_PROXY=
+RUN if [ -n "$HTTP_PROXY" ]; then \
+        printf 'Acquire::http::Proxy "%s";\nAcquire::https::Proxy "%s";\n' \
+            "$HTTP_PROXY" "$HTTP_PROXY" > /etc/apt/apt.conf.d/00proxy; \
+    fi && \
+    apt-get update && \
     apt-get install -y --no-install-recommends libatomic1 libtirpc3 && \
-    rm -rf /var/lib/apt/lists/*
+    rm -rf /var/lib/apt/lists/* /etc/apt/apt.conf.d/00proxy
 
 ENV PYTHONPATH="/app:/app/recir:${PYTHONPATH}"
 ENV CUDA_VISIBLE_DEVICES=-1
