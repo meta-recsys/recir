@@ -27,24 +27,25 @@
 # yaml env knob like RECIR_RINGSHIFT_RECV_CAPACITY or RANKFM_S):
 #   RANKFM_SKIP_BUILD=1 ./run_tpu_bench.sh rankfm_mvai-64chip-bench.yaml
 #
-# yaml defaults to recir/examples/rankfm_mvai/rankfm_mvai-4chip-bench.yaml.
+# yaml defaults to recir/examples/rankfm_mvai/manifests/rankfm_mvai-4chip-bench.yaml.
 # Set RANKFM_S in the yaml (env var) to sweep sequence length {512,1024,2048,3072};
-# the value is parsed into the log filename. Logs + trace are saved under
-# recir/examples/rankfm_mvai/bench_logs/ (in-repo, survives /tmp cleanup).
+# the value is parsed into the log filename. Logs are saved under
+# ~/rankfm_mvai_bench_logs/ (outside the repo, survives /tmp cleanup).
 
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-FBCODE_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
+PKG_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+FBCODE_ROOT="$(cd "${PKG_DIR}/../../.." && pwd)"
 # Resolve the yaml arg to an ABSOLUTE path: helpers (gke_iterate/submit) cd to
 # the image-build dir before `kubectl create -f`, so a relative arg would not be
 # found at submit time. Accept either a CWD-relative path or a bare name living
-# next to this script.
-YAML_ARG="${1:-${SCRIPT_DIR}/rankfm_mvai-4chip-bench.yaml}"
+# in the package's manifests/ dir.
+YAML_ARG="${1:-${PKG_DIR}/manifests/rankfm_mvai-4chip-bench.yaml}"
 if [ -f "${YAML_ARG}" ]; then
     YAML="$(cd "$(dirname "${YAML_ARG}")" && pwd)/$(basename "${YAML_ARG}")"
-elif [ -f "${SCRIPT_DIR}/${YAML_ARG}" ]; then
-    YAML="${SCRIPT_DIR}/${YAML_ARG}"
+elif [ -f "${PKG_DIR}/manifests/${YAML_ARG}" ]; then
+    YAML="${PKG_DIR}/manifests/${YAML_ARG}"
 else
     YAML="${YAML_ARG}"
 fi
@@ -55,10 +56,11 @@ S="$(awk '/name: RANKFM_S/{f=1; next} f && /value:/{v=$2; gsub(/"/,"",v); print 
 [ -z "${S}" ] && S="unknown"
 
 TS="$(date +%Y%m%d-%H%M%S)"
-# Persist logs inside the repo (recir/examples/rankfm_mvai/bench_logs) so they
-# survive /tmp cleanup. Override with RANKFM_BENCH_LOG_DIR. Traces are NOT saved
-# locally -- they stay in GCS and are pushed to Kernelhub (see below).
-LOG_DIR="${RANKFM_BENCH_LOG_DIR:-${SCRIPT_DIR}/bench_logs}"
+# Persist logs under $HOME so they survive /tmp cleanup without adding
+# hundreds of MB of build output to the repo. Override with
+# RANKFM_BENCH_LOG_DIR. Traces are NOT saved locally -- they stay in GCS and
+# are pushed to Kernelhub (see below).
+LOG_DIR="${RANKFM_BENCH_LOG_DIR:-${HOME}/rankfm_mvai_bench_logs}"
 mkdir -p "${LOG_DIR}"
 LOG="${LOG_DIR}/tpu-s${S}-${TS}.log"
 # Stable per-seqlen symlink for analysis to point at.

@@ -5,9 +5,7 @@
 
 # pyre-unsafe
 
-"""In-graph row-wise-sharding embedding backend for RankFM.
-
-Selected via ``RankFMConfig.embedding_backend == "in_graph"``.
+"""In-graph row-wise-sharding embedding backend.
 
 This module bundles the whole in-graph embedding path:
 
@@ -30,11 +28,12 @@ This module bundles the whole in-graph embedding path:
     on it at 64-chip) while doing the embedding lookup on TPU.
 
   * ``InGraphEmbeddingBackend`` -- the ``EmbeddingBackend`` entry point.
-    ``setup()`` swaps ``ECSparseArch._embedding_collection`` for
+    ``setup()`` swaps the model's sparse-arch ``_embedding_collection`` for
     ``InGraphSparseArch`` and builds the optimizer over all params (the table
-    is now a normal ``nn.Parameter``). ``get_override()`` captures the per-feature
-    per-chip token total from the eager KJT and returns the preprocessor +
-    sparse-input-break dispatchers.
+    is now a normal ``nn.Parameter``). The model binding locates that sparse
+    arch via the injected ``sparse_arch_getter`` and supplies the optimizer
+    factory via ``sparse_optimizer_builder``, keeping this module free of any
+    model-specific module path or import.
 
 Static-shape assumption: per-sample sequence lengths may VARY, but each feature's
 TOTAL token count per chip is static (``T_local``, the same on every chip). Since
@@ -50,7 +49,7 @@ from __future__ import annotations
 
 import enum
 import logging
-from typing import Any, Dict, List, Tuple
+from typing import Any, Callable, Dict, List, Tuple
 
 import jax
 import recir.ops.seq_embedding_op  # noqa: F401  (defines torch.ops.recir.ringshift_embedding)
@@ -72,13 +71,13 @@ from recir.eager_dispatch import (
     mark_input,
     mark_output_with_bwd,
 )
-from recir.meta_tensor_init import mark_meta_uniform_init
-from recir.sparsecore.backend import (
+from recir.embedding.backend import (
     EmbeddingBackend,
     EmbeddingSetupResult,
     SparseOptimizerRuntime,
     SparseUpdatePlacement,
 )
+from recir.meta_tensor_init import mark_meta_uniform_init
 from torchrec.modules.embedding_configs import EmbeddingConfig
 from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor
 
@@ -423,7 +422,7 @@ class SparseArchInputBreakDispatcher:
 
     def install_eager(self, model: nn.Module) -> None:
         # Enable graph-break-at-input mode on the InGraphSparseArch that setup()
-        # swapped into ECSparseArch._embedding_collection. No module swap -- just
+        # swapped into the sparse arch's _embedding_collection. No module swap -- just
         # flip a flag; the arch's own forward then marks the break (see
         # InGraphSparseArch.forward's input-break branch).
         archs = [
@@ -536,16 +535,40 @@ def _seed_in_graph_tables_from_ec(
 
 
 class InGraphEmbeddingBackend(EmbeddingBackend):
+    """In-graph ring-shift embedding backend.
+
+    ``sparse_arch_getter`` maps the model to the module that owns
+    ``_embedding_collection`` as a direct attribute (``setup()`` replaces it
+    with an :class:`InGraphSparseArch`). ``sparse_optimizer_builder`` builds
+    the LR-buffered optimizer over the resulting table params and returns
+    ``(optimizer, lr_buffer)``. Both are injected so this module stays free
+    of model-specific module paths and imports.
+
+    ``set_feature_seqlens()`` must run before ``setup()``.
+    """
+
     def __init__(
         self,
+        sparse_arch_getter: Callable[[nn.Module], nn.Module],
+        sparse_optimizer_builder: Callable[
+            [nn.Module, List[nn.Parameter], OptimConfig, torch.device],
+            Tuple[torch.optim.Optimizer, torch.Tensor],
+        ],
         ringshift_min_rows: int = 4096,
         fsdp_min_rows: int = -1,
         on_device_init: bool = True,
     ) -> None:
+        self._sparse_arch_getter = sparse_arch_getter
+        self._sparse_optimizer_builder = sparse_optimizer_builder
         self._feature_seqlens: Dict[str, int] = {}
         self._ringshift_min_rows: int = ringshift_min_rows
         self._fsdp_min_rows: int = fsdp_min_rows
         self._on_device_init: bool = on_device_init
+
+    def set_feature_seqlens(self, feature_seqlens: Dict[str, int]) -> None:
+        """Per-feature per-chip token total, consumed by setup()."""
+        self._feature_seqlens = feature_seqlens
+        logger.info(f"InGraphEmbeddingBackend: feature_chip_tokens={feature_seqlens}")
 
     def init_pg(self) -> Tuple[int, int]:
         rank = jax.process_index()
@@ -584,14 +607,12 @@ class InGraphEmbeddingBackend(EmbeddingBackend):
     ) -> EmbeddingSetupResult:
         if not self._feature_seqlens:
             raise RuntimeError(
-                "InGraphEmbeddingBackend.get_override() must run before setup()."
+                "InGraphEmbeddingBackend.set_feature_seqlens() must run before setup()."
             )
         if world_size <= 0:
             raise ValueError(f"world_size must be positive, got {world_size}.")
 
-        sparse_arch = (
-            model.recblock.tokenizer_stack.mot_sparse_arch._sparse_arch  # pyre-ignore[16]
-        )
+        sparse_arch = self._sparse_arch_getter(model)
         new_ec = InGraphSparseArch(
             table_configs=table_configs,
             feature_seqlens=self._feature_seqlens,
@@ -604,24 +625,18 @@ class InGraphEmbeddingBackend(EmbeddingBackend):
             f"InGraphEmbeddingBackend: on_device_init={self._on_device_init} "
             f"(meta param -> on-device HBM random init, no host alloc/H2D)"
         )
-        _seed_in_graph_tables_from_ec(sparse_arch._embedding_collection, new_ec)
+        # nn.Module.__getattr__ is typed Module | Tensor; this is the EC.
+        old_ec: Any = sparse_arch._embedding_collection
+        _seed_in_graph_tables_from_ec(old_ec, new_ec)
         sparse_arch._embedding_collection = new_ec
 
         embedding_params = self.embedding_named_parameters(model)
         if not embedding_params:
             raise RuntimeError("In-graph backend installed no embedding parameters.")
-        # Lazy imports preserve this backend's network-free module import. The
-        # recir_core package pulls the full UDD config chain at import time.
-        from hammer.v3.models.udd_fm_v3.recir_core.compile import LR_SPARSE_BUFFER
-        from hammer.v3.models.udd_fm_v3.recir_core.setup import (
-            _build_lr_buffered_optimizer,
-        )
-
-        sparse_optimizer, sparse_lr_buffer = _build_lr_buffered_optimizer(
+        sparse_optimizer, sparse_lr_buffer = self._sparse_optimizer_builder(
             model,
             list(embedding_params.values()),
             sparse_config,
-            LR_SPARSE_BUFFER,
             device,
         )
         logger.info(
@@ -639,76 +654,3 @@ class InGraphEmbeddingBackend(EmbeddingBackend):
                 lr_buffer=sparse_lr_buffer,
             ),
         )
-
-    def get_override(
-        self,
-        recblock: Any,
-        batch_sample: Any,
-        device: torch.device,
-        global_bs: int,
-        num_ranks: int,
-        num_processes: int,
-    ) -> List[Any]:
-        # Keep this scoped to get_override so importing the backend stays cheap
-        # for CPU trace tests that do not exercise xsurface dispatch.
-        from recir.examples.rankfm_mvai.rankfm_dispatchers import (
-            _disable_sampling,
-            PreprocessorDispatcher,
-        )
-
-        # Eagerly run preprocessor + tokenizer once to (a) capture the merged
-        # id-list KJT (for the per-feature per-chip token total) and (b) precompute
-        # the preprocessor output for the PreprocessorDispatcher. The sparse arch is
-        # NOT dispatched -- it is swapped in setup() and traced in-graph.
-        sparse_arch = recblock.tokenizer_stack.mot_sparse_arch._sparse_arch
-        input_captured: Dict[str, Any] = {}
-
-        def pre_hook(_m: nn.Module, input_args: Tuple[Any, ...]) -> None:
-            input_captured["kjt"] = input_args[0]
-
-        pre_handle = sparse_arch.register_forward_pre_hook(pre_hook)
-        with torch.no_grad(), _disable_sampling(recblock.preprocessor_stack):
-            preproc_output = recblock.preprocessor_stack(batch_sample)
-            try:
-                recblock.tokenizer_stack(preproc_output)
-            except (RuntimeError, AttributeError):
-                pass
-        pre_handle.remove()
-        assert "kjt" in input_captured, "Sparse arch pre-hook did not fire"
-
-        kjt: KeyedJaggedTensor = input_captured["kjt"]
-        keys: List[str] = kjt.keys()
-        lengths = kjt.lengths()
-        stride = len(lengths) // len(keys)  # = global batch B (eager run @ global_bs)
-        world_size = jax.device_count()  # = ring-shift W (per-chip shard count)
-        # Per-feature per-chip token total = (sum of that feature's lengths) / W.
-        # Per-sample lengths may vary; only this per-chip total is static (the
-        # data-pipeline invariant), so it is the shape we trace. Fail fast if a
-        # feature's total is not divisible by W (invariant violated -> downstream
-        # reshapes would silently mis-slice).
-        self._feature_seqlens = {}
-        for i, k in enumerate(keys):
-            total = int(lengths[i * stride : (i + 1) * stride].sum().item())
-            assert total % world_size == 0, (
-                f"feature {k!r} total tokens {total} not divisible by world_size "
-                f"{world_size}; per-chip token total is not static"
-            )
-            self._feature_seqlens[k] = total // world_size
-        logger.info(
-            f"InGraphEmbeddingBackend: feature_chip_tokens={self._feature_seqlens}"
-        )
-        preprocessor_dispatcher = PreprocessorDispatcher(
-            device,
-            override_id=0,
-            batch_size=global_bs,
-            sample_feature_bundle=batch_sample,
-            precomputed_output=preproc_output,
-            num_processes=num_processes,
-        )
-        sparse_input_break = SparseArchInputBreakDispatcher(
-            input_kjt_keys=keys,
-            override_id=1,
-            num_ranks=num_ranks,
-            feature_seqlens=self._feature_seqlens,
-        )
-        return [preprocessor_dispatcher, sparse_input_break]

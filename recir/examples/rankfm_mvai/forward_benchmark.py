@@ -50,15 +50,12 @@ from hammer.v3.models.udd_fm_v3.udd_fm_train_v3 import BlueReelsVDDTrainV3
 from recir.backends import XLAGSPMDBackend
 from recir.decompositions import SPMD_DECOMP_TABLE
 from recir.distributed.parallel_mode import GSPMDParallel
+from recir.embedding.in_graph import SHARDED_TABLE_PREFIX
 from recir.examples.rankfm_mvai.config import (
     build_module_config,
     build_optimizer_config,
     RankFMModelArgs,
     RankFMTrainerConfig,
-)
-from recir.examples.rankfm_mvai.embedding import build_embedding_backend
-from recir.examples.rankfm_mvai.embedding.in_graph_embedding_backend import (
-    SHARDED_TABLE_PREFIX,
 )
 from recir.examples.rankfm_mvai.rankfm_batch_utils import (
     create_random_train_batch,
@@ -66,6 +63,7 @@ from recir.examples.rankfm_mvai.rankfm_batch_utils import (
     tile_dim0,
     tile_last_dim,
 )
+from recir.examples.rankfm_mvai.rankfm_embedding_backends import build_embedding_backend
 from recir.examples.rankfm_mvai.rankfm_model_utils import build_model_from_config
 from recir.examples.rankfm_mvai.train_common import (
     ensure_gloo_process_group,

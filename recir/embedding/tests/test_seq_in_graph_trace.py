@@ -13,7 +13,7 @@ from __future__ import annotations
 import unittest
 
 import torch
-from recir.examples.rankfm_mvai.embedding.in_graph_embedding_backend import (
+from recir.embedding.in_graph import (
     _seed_in_graph_tables_from_ec,
     DP_TABLE_PREFIX,
     InGraphSparseArch,

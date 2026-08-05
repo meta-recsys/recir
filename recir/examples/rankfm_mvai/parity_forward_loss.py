@@ -52,22 +52,22 @@ from recir.api import sync_device_state_to_torch
 from recir.backends import XLAGSPMDBackend
 from recir.decompositions import SPMD_DECOMP_TABLE
 from recir.distributed.parallel_mode import GSPMDParallel
+from recir.embedding.in_graph import SHARDED_TABLE_PREFIX
 from recir.examples.rankfm_mvai.config import (
     build_module_config,
     build_optimizer_config,
     RankFMModelArgs,
     RankFMTrainerConfig,
 )
-from recir.examples.rankfm_mvai.embedding import build_embedding_backend
-from recir.examples.rankfm_mvai.embedding.cpu_backend import _EMBEDDING_PARAM_PREFIX
-from recir.examples.rankfm_mvai.embedding.in_graph_embedding_backend import (
-    SHARDED_TABLE_PREFIX,
-)
 from recir.examples.rankfm_mvai.model_family import (
     _udd_fm_v3_train_step,
     _udd_fm_v3_train_step_two_opt,
 )
 from recir.examples.rankfm_mvai.rankfm_batch_utils import resize_kjt_batch, tile_dim0
+from recir.examples.rankfm_mvai.rankfm_embedding_backends import (
+    build_embedding_backend,
+    RANKFM_EMBEDDING_PARAM_PREFIX,
+)
 from recir.examples.rankfm_mvai.rankfm_model_utils import build_model_from_config
 from recir.examples.rankfm_mvai.train_common import (
     ensure_gloo_process_group,
@@ -691,7 +691,9 @@ def _eager_step(
     # dense_named stepped embeddings with AdamW, which never matched the
     # compiled/prod RowWiseAdagrad embedding update.
     dense_only = [
-        p for n, p in dense_named.items() if not n.startswith(_EMBEDDING_PARAM_PREFIX)
+        p
+        for n, p in dense_named.items()
+        if not n.startswith(RANKFM_EMBEDDING_PARAM_PREFIX)
     ]
     dense_opt = torch.optim.AdamW(
         dense_only,

@@ -15,7 +15,7 @@ IMAGE_TAG="${IMAGE_TAG:-latest}"
 IMAGE_PATH="${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO}/${IMAGE_NAME}:${IMAGE_TAG}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-RECIR_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+RECIR_DIR="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 FBCODE_DIR="$(cd "${RECIR_DIR}/.." && pwd)"
 STAGING_DIR="$(mktemp -d)"
 
@@ -196,7 +196,7 @@ podman build \
     -v /var/facebook/credentials:/var/facebook/credentials \
     --build-context=credentials_dir=/var/facebook/credentials \
     --network=host \
-    -f recir/examples/rankfm_mvai/Dockerfile \
+    -f recir/examples/rankfm_mvai/scripts/Dockerfile \
     -t "${IMAGE_NAME}:${IMAGE_TAG}" .
 
 echo ""
@@ -222,7 +222,7 @@ import minimal_viable_ai; print('minimal_viable_ai: OK')
 from minimal_viable_ai.core.trainer.trainer import RecTrainer  # noqa: F401
 print('minimal_viable_ai.RecTrainer: OK')
 from generative_recommenders.common import HammerKernel; print('generative_recommenders: OK')
-from recir.examples.rankfm_mvai.rankfm_dispatchers import PreprocessorDispatcher, SparseArchDispatcher; print('rankfm_mvai dispatchers: OK')
+from recir.examples.rankfm_mvai.rankfm_dispatchers import PreprocessorDispatcher; from recir.embedding.cpu import SparseArchDispatcher; print('rankfm_mvai dispatchers: OK')
 # Import the ACTUAL training entry module (not just config). This exercises the
 # full chain -- model_family -> hammer udd_fm_family, train_pipeline -> recir
 # compile -- so a missing staged module fails the BUILD here instead of only at

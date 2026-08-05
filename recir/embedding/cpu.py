@@ -5,22 +5,24 @@
 
 # pyre-strict
 
-"""CPU/torchrec DMP embedding backend for RankFM.
+"""CPU/torchrec DMP embedding backend.
 
-Selected via ``RankFMConfig.embedding_backend == "cpu"`` through the
-factory in ``embedding.py``. Tables get TABLE_WISE sharding when small
-and ROW_WISE when large; gloo coordinates ranks via JobSet env vars.
+Tables get TABLE_WISE sharding when small and ROW_WISE when large; gloo
+coordinates ranks via JobSet env vars.
 
-Kept in its own module so ``embedding.py`` (the factory) and
-``jaxbackend.py`` don't pull in the heavy ``torchrec.distributed.*``
-import surface when only the JAX backend is used.
+Kept in its own module so the factory in ``__init__.py`` and the other
+backends don't pull in the heavy ``torchrec.distributed.*`` import surface
+when only the SparseCore or in-graph backend is used.
+
+Model-agnostic: the caller supplies ``embedding_param_prefix``, the FQN
+prefix under which its embedding parameters live.
 """
 
 from __future__ import annotations
 
 import logging
 import os
-from typing import Any, cast, Dict, List, Tuple
+from typing import Any, Callable, cast, Dict, List, Tuple
 
 import jax
 import torch
@@ -30,8 +32,13 @@ from minimal_viable_ai.core.model_family_api.model_family import (
     optim_type_to_optim_class,
 )
 from minimal_viable_ai.core.model_family_api.optimizer_configs import OptimConfig
-from recir.examples.rankfm_mvai.rankfm_dispatchers import _build_overrides
-from recir.sparsecore.backend import (
+from recir.eager_dispatch import install_graph_break_dispatch
+from recir.embedding._sparse_arch_stub import (
+    DummySparseArch,
+    sparse_arch_marker_prefix,
+    swap_sparse_arch,
+)
+from recir.embedding.backend import (
     EmbeddingBackend,
     EmbeddingSetupResult,
     SparseOptimizerRuntime,
@@ -49,6 +56,7 @@ from torchrec.distributed.types import ShardingEnv, ShardingType
 from torchrec.distributed.utils import optimizer_type_to_emb_opt_type
 from torchrec.modules.embedding_configs import EmbeddingConfig
 from torchrec.optim.optimizers import in_backward_optimizer_filter
+from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor
 
 logger: logging.Logger = logging.getLogger(__name__)
 
@@ -57,20 +65,15 @@ logger: logging.Logger = logging.getLogger(__name__)
 _ROW_WISE_MIN_ROWS_PER_RANK: int = 100
 
 
-# Embedding parameters all live under this submodule path in the bare model.
-_EMBEDDING_PARAM_PREFIX: str = (
-    "recblock.tokenizer_stack.mot_sparse_arch._sparse_arch._embedding_collection"
-)
-
-
 def _attach_single_node_sparse_optimizers(
     model: nn.Module,
     sparse_config: OptimConfig,
+    embedding_param_prefix: str,
 ) -> None:
     """Attach config-driven in-backward optimizers to bare EC parameters."""
     attached = 0
     for name, parameter in model.named_parameters():
-        if not parameter.requires_grad or not name.startswith(_EMBEDDING_PARAM_PREFIX):
+        if not parameter.requires_grad or not name.startswith(embedding_param_prefix):
             continue
         table_name = name.split(".")[-2]
         optimizer_class = optim_type_to_optim_class(sparse_config.optim_type)
@@ -110,8 +113,16 @@ class _ECSharder(EmbeddingCollectionSharder):
         return [self._kernel_type]
 
 
-class CPURankFMBackend(EmbeddingBackend):
-    """Original torchrec DMP ROW_WISE/TABLE_WISE on CPU via gloo."""
+class CPUEmbeddingBackend(EmbeddingBackend):
+    """torchrec DMP ROW_WISE/TABLE_WISE on CPU via gloo.
+
+    ``embedding_param_prefix`` is the FQN prefix under which the model keeps
+    its embedding collection parameters, used to find the tables to attach
+    in-backward optimizers to on the single-node path.
+    """
+
+    def __init__(self, embedding_param_prefix: str) -> None:
+        self._embedding_param_prefix = embedding_param_prefix
 
     def init_pg(self) -> Tuple[int, int]:
         jax_rank = jax.process_index()
@@ -180,7 +191,9 @@ class CPURankFMBackend(EmbeddingBackend):
                 )
             model = self._setup_dmp(model, table_configs, sparse_config, dmp_world_size)
         else:
-            _attach_single_node_sparse_optimizers(model, sparse_config)
+            _attach_single_node_sparse_optimizers(
+                model, sparse_config, self._embedding_param_prefix
+            )
             logger.info("Single-node: using config-driven in-backward optimizers")
 
         return EmbeddingSetupResult(
@@ -203,7 +216,7 @@ class CPURankFMBackend(EmbeddingBackend):
             optim_type_to_optim_class(config.optim_type)
         )
         logger.info(
-            "CPURankFMBackend: FUSED embedding optimizer=%s lr=%g eps=%g",
+            "CPUEmbeddingBackend: FUSED embedding optimizer=%s lr=%g eps=%g",
             emb_opt_type,
             config.lr,
             config.eps,
@@ -263,25 +276,98 @@ class CPURankFMBackend(EmbeddingBackend):
             device=torch.device("cpu"),
             init_data_parallel=False,
         )
-        logger.info("CPURankFMBackend: DMP initialized (world=%d)", world_size)
+        logger.info("CPUEmbeddingBackend: DMP initialized (world=%d)", world_size)
         return dmp.module
 
     def dense_named_parameters(self, model: nn.Module) -> Dict[str, nn.Parameter]:
         return dict(in_backward_optimizer_filter(model.named_parameters()))
 
-    def get_override(
+
+class SparseArchDispatcher:
+    """Graph-break dispatcher back to the real eager torchrec sparse arch.
+
+    ``install_eager`` swaps the arch located by ``sparse_arch_getter`` for a
+    :class:`DummySparseArch` so tracing sees stable shapes (the dummy plants
+    input + forward/backward markers). ``install_graph`` finds those markers
+    and installs a graph-break dispatch back to the captured real arch.
+    """
+
+    def __init__(
         self,
-        recblock: Any,
-        batch_sample: Any,
-        device: torch.device,
-        global_bs: int,
-        num_ranks: int,
-        num_processes: int,
-    ) -> List[Any]:
-        return _build_overrides(
-            recblock,
-            batch_sample,
-            device,
-            batch_size=global_bs,
-            num_processes=num_processes,
+        cached_output: Dict[str, JaggedTensor],
+        input_kjt_keys: List[str],
+        sparse_arch_getter: Callable[[nn.Module], nn.Module],
+        override_id: int = 1,
+        num_ranks: int = 1,
+    ) -> None:
+        self._cached_output = cached_output
+        self._input_kjt_keys = input_kjt_keys
+        self._sparse_arch_getter = sparse_arch_getter
+        self._override_id = override_id
+        self._num_ranks = num_ranks
+        self._orig_sparse_arch: nn.Module | None = None
+        self._dummy: DummySparseArch | None = None
+
+    def install_eager(self, model: nn.Module) -> None:
+        target = self._sparse_arch_getter(model)
+        self._orig_sparse_arch = target
+        self._dummy = DummySparseArch(
+            self._cached_output,
+            input_kjt_keys=self._input_kjt_keys,
+            override_id=self._override_id,
         )
+        swap_sparse_arch(model, target, self._dummy)
+
+    def install_graph(
+        self,
+        gm: torch.fx.GraphModule,
+        flat_state: List[torch.Tensor],
+    ) -> Tuple[torch.fx.GraphModule, List[torch.Tensor]]:
+        if self._orig_sparse_arch is None or self._dummy is None:
+            return gm, flat_state
+
+        real_arch: nn.Module = self._orig_sparse_arch
+        input_kjt_keys: List[str] = self._input_kjt_keys
+        feature_names: List[str] = self._dummy._feature_names
+        num_ranks: int = self._num_ranks
+
+        def fwd_fn(*input_tensors: torch.Tensor) -> Tuple[torch.Tensor, ...]:
+            # input_tensors == (values, lengths) thanks to mark_input markers
+            # in DummySparseArch.forward (kept alive through trace by the
+            # zero-valued anchor that depends on them).
+            values = input_tensors[0]
+            lengths = input_tensors[1]
+            total = int(lengths.sum().item())
+            if values.shape[0] < total:
+                pad_size = total - values.shape[0]
+                values = torch.nn.functional.pad(
+                    values, [0] * (2 * values.ndim - 1) + [pad_size]
+                )
+            elif values.shape[0] > total:
+                values = values.narrow(0, 0, total)
+            kjt = KeyedJaggedTensor(
+                keys=input_kjt_keys,
+                values=values,
+                lengths=lengths,
+            )
+            with torch.enable_grad():
+                output = real_arch(kjt)
+
+            flat: List[torch.Tensor] = []
+            for name in feature_names:
+                jt = output[name]
+                flat.append(jt.values())
+                flat.append(jt.lengths())
+            # Return raw (grad-preserving) tensors; the install helper wraps
+            # this callable with save-for-backward + detach.
+            return tuple(flat)
+
+        install_graph_break_dispatch(
+            gm,
+            sparse_arch_marker_prefix(self._override_id),
+            fwd_fn,
+            num_state_tensors=len(flat_state),
+            num_ranks=num_ranks,
+            disable_torchrec_gradient_division=True,
+        )
+        return gm, flat_state

@@ -16,7 +16,6 @@ from hammer.v3.modules.core.features.descriptor import FeatureDescriptor
 from hammer.v3.modules.core.features.input_features import InputFeatures
 from hammer.v3.modules.core.preprocessors.preprocessor_stack import PreprocessorStack
 from hammer.v3.modules.mot.preprocessors.mot_preprocessor import MoTPreprocessor
-from hammer.v3.modules.mot.tokenizers.mot_sparse_arch import ECSparseArch
 from hammer.v3.modules.recblock import _inputs_to_feature_bundle, RecBlock
 from recir.eager_dispatch import (
     install_graph_break_dispatch,
@@ -33,15 +32,10 @@ from torchrec import JaggedTensor, KeyedJaggedTensor
 
 
 XSURFACE_PREPROCESSOR_MARKER_PREFIX = "recir.examples.rankfm.preprocessor"
-XSURFACE_SPARSE_MARKER_PREFIX = "recir.examples.rankfm.sparse_arch"
 
 
 def _xsurface_preprocessor_prefix(override_id: int) -> str:
     return f"{XSURFACE_PREPROCESSOR_MARKER_PREFIX}::{override_id}"
-
-
-def _xsurface_sparse_prefix(override_id: int) -> str:
-    return f"{XSURFACE_SPARSE_MARKER_PREFIX}::{override_id}"
 
 
 # ---------------------------------------------------------------------------
@@ -303,72 +297,6 @@ class DummyPreprocessorStack(nn.Module):
         for desc, v in self._nontensor_map.items():
             bundle.set(desc, v, validate=False)
         return bundle
-
-
-class DummySparseArch(nn.Module):
-    """Replacement for ECSparseArch that returns cached embeddings.
-
-    Wraps input KJT components in :func:`recir.eager_dispatch.mark_input` and
-    outputs in :func:`mark_output_with_bwd` so the post-trace orchestrator can
-    find the markers and wire runtime dispatch to the real
-    :class:`ECSparseArch`.
-
-    A _grad_anchor parameter maintains autograd graph connectivity through
-    the dummy so that make_fx traces backward correctly. A _batch_dep term
-    adds data dependency on inputs so GSPMD can infer sharding.
-    """
-
-    def __init__(
-        self,
-        cached_output: Dict[str, JaggedTensor],
-        input_kjt_keys: List[str],
-        override_id: int = 1,
-    ) -> None:
-        super().__init__()
-        self._override_id: int = override_id
-        self._grad_anchor = nn.Parameter(torch.zeros(1))
-        self._feature_names: List[str] = list(cached_output.keys())
-        self._input_kjt_keys: List[str] = input_kjt_keys
-
-        for i, (_name, jt) in enumerate(cached_output.items()):
-            self.register_buffer(f"_jt_values_{i}", jt.values())
-            self.register_buffer(f"_jt_lengths_{i}", jt.lengths())
-
-    def forward(
-        self,
-        id_list_features: KeyedJaggedTensor,
-    ) -> Dict[str, JaggedTensor]:
-        oid = self._override_id
-        prefix = _xsurface_sparse_prefix(oid)
-
-        # Mark the input KJT components so SparseArchDispatcher.install_graph
-        # can rediscover them via the marker prefix and use them as dispatch
-        # inputs (instead of falling back to all batch placeholders).
-        m_v = mark_input(id_list_features.values(), prefix, 0)
-        m_l = mark_input(id_list_features.lengths(), prefix, 1)
-
-        # Zero-valued anchor wired into every output's computation so FX
-        # trace DCE keeps the m_v / m_l input markers alive end-to-end.
-        # The deps=[m_v, m_l] hint to mark_output_with_bwd alone is not
-        # enough; without a real torch-op dependency the markers get pruned
-        # and install_graph_break_dispatch falls back to passing all
-        # train_step placeholders to fwd_fn.
-        anchor = (m_v.to(torch.int64).sum() * 0) + (m_l.to(torch.int64).sum() * 0)
-
-        deps: List[torch.Tensor] = [m_v, m_l, self._grad_anchor]
-
-        out_idx = 0
-        result: Dict[str, JaggedTensor] = {}
-        for i, name in enumerate(self._feature_names):
-            vbuf = getattr(self, f"_jt_values_{i}")
-            lbuf = getattr(self, f"_jt_lengths_{i}")
-            v_z = torch.zeros_like(vbuf) + anchor.to(vbuf.dtype)
-            l_z = lbuf.clone() + anchor.to(lbuf.dtype)
-            v = mark_output_with_bwd(v_z, prefix, out_idx, deps=deps)
-            lengths = mark_output_with_bwd(l_z, prefix, out_idx + 1, deps=deps)
-            result[name] = JaggedTensor(values=v, lengths=lengths)
-            out_idx += 2
-        return result
 
 
 # ---------------------------------------------------------------------------
@@ -739,164 +667,47 @@ class PreprocessorDispatcher:
         return gm, flat_state
 
 
-class SparseArchDispatcher:
-    """Orchestrator-style replacement for the legacy ``SparseArchOverride``.
-
-    ``install_eager`` swaps :class:`ECSparseArch` for :class:`DummySparseArch`
-    so tracing sees stable shapes (the dummy plants input + forward/backward
-    markers).  ``install_graph`` finds those markers and installs a graph-
-    break dispatch back to the captured real :class:`ECSparseArch`.
-    """
-
-    def __init__(
-        self,
-        cached_output: Dict[str, JaggedTensor],
-        input_kjt_keys: List[str],
-        override_id: int = 1,
-        num_ranks: int = 1,
-    ) -> None:
-        self._cached_output = cached_output
-        self._input_kjt_keys = input_kjt_keys
-        self._override_id = override_id
-        self._num_ranks = num_ranks
-        self._orig_sparse_arch: nn.Module | None = None
-        self._dummy: DummySparseArch | None = None
-
-    def install_eager(self, model: nn.Module) -> None:
-        for fqn, mod in list(model.named_modules()):
-            if isinstance(mod, ECSparseArch):
-                self._orig_sparse_arch = mod
-                self._dummy = DummySparseArch(
-                    self._cached_output,
-                    input_kjt_keys=self._input_kjt_keys,
-                    override_id=self._override_id,
-                )
-                parent_fqn, leaf = fqn.rsplit(".", 1) if "." in fqn else ("", fqn)
-                parent = model.get_submodule(parent_fqn) if parent_fqn else model
-                setattr(parent, leaf, self._dummy)
-
-    def install_graph(
-        self,
-        gm: torch.fx.GraphModule,
-        flat_state: List[torch.Tensor],
-    ) -> Tuple[torch.fx.GraphModule, List[torch.Tensor]]:
-        if self._orig_sparse_arch is None or self._dummy is None:
-            return gm, flat_state
-
-        real_arch: nn.Module = self._orig_sparse_arch
-        input_kjt_keys: List[str] = self._input_kjt_keys
-        feature_names: List[str] = self._dummy._feature_names
-        num_ranks: int = self._num_ranks
-
-        def fwd_fn(*input_tensors: torch.Tensor) -> Tuple[torch.Tensor, ...]:
-            # input_tensors == (values, lengths) thanks to mark_input markers
-            # in DummySparseArch.forward (kept alive through trace by the
-            # zero-valued anchor that depends on them).
-            values = input_tensors[0]
-            lengths = input_tensors[1]
-            total = int(lengths.sum().item())
-            if values.shape[0] < total:
-                pad_size = total - values.shape[0]
-                values = torch.nn.functional.pad(
-                    values, [0] * (2 * values.ndim - 1) + [pad_size]
-                )
-            elif values.shape[0] > total:
-                values = values.narrow(0, 0, total)
-            kjt = KeyedJaggedTensor(
-                keys=input_kjt_keys,
-                values=values,
-                lengths=lengths,
-            )
-            with torch.enable_grad():
-                output = real_arch(kjt)
-
-            flat: List[torch.Tensor] = []
-            for name in feature_names:
-                jt = output[name]
-                flat.append(jt.values())
-                flat.append(jt.lengths())
-            # Return raw (grad-preserving) tensors; the install helper wraps
-            # this callable with save-for-backward + detach.
-            return tuple(flat)
-
-        install_graph_break_dispatch(
-            gm,
-            _xsurface_sparse_prefix(self._override_id),
-            fwd_fn,
-            num_state_tensors=len(flat_state),
-            num_ranks=num_ranks,
-            disable_torchrec_gradient_division=True,
-        )
-        return gm, flat_state
-
-
-def _build_overrides(
+def capture_sparse_arch_io(
     recblock: RecBlock,
     sample_input: FeatureBundle,
-    device: torch.device,
-    batch_size: int = TEST_BATCH_SIZE,
-    num_processes: int = 1,
-) -> List[Any]:
-    """Build dispatcher instances for tracing, capturing sparse arch I/O via hooks.
+    capture_output: bool = True,
+) -> Tuple[KeyedJaggedTensor, Dict[str, JaggedTensor] | None, Any]:
+    """Run preprocessor + tokenizer eagerly once, capturing sparse-arch I/O.
 
-    Runs the preprocessor + tokenizer eagerly once to capture the ECSparseArch
-    input (via forward pre-hook) and output (via forward hook), then returns
-    dispatcher instances (PreprocessorDispatcher + SparseArchDispatcher) for
-    both the preprocessor and the sparse arch.  Each dispatcher exposes
-    ``install_eager(model)`` and ``install_graph(gm, flat_state)``.
+    Returns ``(input_kjt, output_or_None, preprocessor_output)``. Downstream
+    tokenizer errors are expected and swallowed: the hooks have already fired by
+    then, and features disabled in the config produce e.g. 0-dim MLP reshapes.
     """
     # pyre-ignore[16]: dynamic attr from setattr in TokenizerStack
     sparse_arch = recblock.tokenizer_stack.mot_sparse_arch._sparse_arch
-    captured: Dict[str, Any] = {}
     input_captured: Dict[str, Any] = {}
+    captured: Dict[str, Any] = {}
 
-    def pre_hook(
-        _module: nn.Module,
-        input_args: Tuple[Any, ...],
-    ) -> None:
+    def pre_hook(_module: nn.Module, input_args: Tuple[Any, ...]) -> None:
         input_captured["kjt"] = input_args[0]
 
-    def hook(
-        _module: nn.Module,
-        _input: Any,
-        output: Dict[str, JaggedTensor],
-    ) -> None:
-        captured["output"] = output
+    handles = [sparse_arch.register_forward_pre_hook(pre_hook)]
+    if capture_output:
 
-    pre_handle = sparse_arch.register_forward_pre_hook(pre_hook)
-    handle = sparse_arch.register_forward_hook(hook)
+        def hook(
+            _module: nn.Module,
+            _input: Any,
+            output: Dict[str, JaggedTensor],
+        ) -> None:
+            captured["output"] = output
+
+        handles.append(sparse_arch.register_forward_hook(hook))
+
     with torch.no_grad(), _disable_sampling(recblock.preprocessor_stack):
         preproc_output = recblock.preprocessor_stack(sample_input)
         try:
             recblock.tokenizer_stack(preproc_output)
         except (RuntimeError, AttributeError):
-            # We only need the sparse arch I/O from the hooks.
-            # Downstream errors (e.g., 0-dim MLP reshape) are expected
-            # since some config features are disabled for testing.
             pass
-    pre_handle.remove()
-    handle.remove()
-    assert "output" in captured, "Sparse arch forward hook did not fire"
+    for handle in handles:
+        handle.remove()
+
     assert "kjt" in input_captured, "Sparse arch pre-hook did not fire"
-
-    input_kjt_keys: List[str] = input_captured["kjt"].keys()
-
-    # Pass the precomputed preprocessor output to the DummyPreprocessorStack
-    # so it uses the SAME output that was used to capture sparse arch I/O.
-    # Running the preprocessor twice can produce different outputs due to
-    # module state mutation (e.g., running stats).
-    return [
-        PreprocessorDispatcher(
-            device,
-            override_id=0,
-            batch_size=batch_size,
-            sample_feature_bundle=sample_input,
-            precomputed_output=preproc_output,
-            num_processes=num_processes,
-        ),
-        SparseArchDispatcher(
-            cached_output=captured["output"],
-            input_kjt_keys=input_kjt_keys,
-            override_id=1,
-        ),
-    ]
+    if capture_output:
+        assert "output" in captured, "Sparse arch forward hook did not fire"
+    return input_captured["kjt"], captured.get("output"), preproc_output

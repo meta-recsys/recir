@@ -37,18 +37,18 @@ from recir.api import _local_compile, compile, sync_device_state_to_torch
 from recir.backends import XLAGSPMDBackend
 from recir.decompositions import SPMD_DECOMP_TABLE
 from recir.distributed.parallel_mode import GSPMDParallel
+from recir.embedding._sparse_arch_stub import DummySparseArch
 from recir.examples.rankfm_mvai.rankfm_batch_utils import (
     create_uniform_train_batch,
     resize_batch_inplace,
 )
 from recir.examples.rankfm_mvai.rankfm_dispatchers import (
-    _build_overrides,
     DummyPreprocessorStack,
-    DummySparseArch,
     TEST_BATCH_SIZE,
     TEST_MAX_UIH_SEQ_LEN,
     TEST_NUM_CANDIDATES,
 )
+from recir.examples.rankfm_mvai.rankfm_embedding_backends import build_eager_overrides
 from recir.lowering.fbgemm_fallback import _batched_complete_cumsum_impl
 from recir.lowering.xla_lower import _XLAModule
 from recir.region_transforms.padding import (
@@ -106,7 +106,7 @@ class XSurfaceFakeTracingCompatTest(unittest.TestCase):
 
         # Build overrides for RecBlock's preprocessor + sparse arch.
         recblock_sample, _, _ = _make_sample_input(model.recblock, device)
-        overrides = _build_overrides(model.recblock, recblock_sample, device)
+        overrides = build_eager_overrides(model.recblock, recblock_sample, device)
 
         feature_config.num_candidates_per_request = TEST_NUM_CANDIDATES
         feature_config.history_len = TEST_MAX_UIH_SEQ_LEN
@@ -255,7 +255,7 @@ class TestXSurfaceXLACompile(unittest.TestCase):
             override_batch.num_candidates,
             override_all_labels,
         )
-        overrides = _build_overrides(
+        overrides = build_eager_overrides(
             model.recblock, batch_sample, device, batch_size=override_bs
         )
 

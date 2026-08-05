@@ -5,17 +5,17 @@
 
 # pyre-strict
 
-"""Shared SparseCore embedding primitives reusable across recir models.
+"""SparseCore compute primitives shared across recir models.
 
 Provides:
-  EmbeddingBackend      — ABC for init_pg / setup lifecycle.
   SparseCoreLookup      — jit-compiled tpu_sparse_dense_matmul wrapper.
   SparsecoreBackedEC    — drop-in torchrec EmbeddingCollection replacement.
   init_sc_embedding_variables — shared factory for JAX embedding init.
   _kjt_to_numpy / _lazy_jte / _num_sc_per_device / _swap_ec — helpers.
 
-Each model (dlrmv3, rankfm, ...) imports from here and adds its own
-model-specific Override subclass and EmbeddingBackend concrete class.
+This module owns the JAX + jax_tpu_embedding dependency. The hardware-agnostic
+backend interface lives in ``recir.embedding.backend``; import from there when
+you only need the ABC, so CPU-only callers do not pay for the JAX stack.
 
 Architecture:
   SparseCoreLookup wraps tpu_sparse_dense_matmul in jax.jit. Calling it
@@ -35,11 +35,8 @@ Batch-size constraint: local_batch_size must be a multiple of
 from __future__ import annotations
 
 import collections
-import enum
 import logging
-from abc import ABC, abstractmethod
 from contextlib import contextmanager
-from dataclasses import dataclass
 from typing import Any, Generator
 
 import jax
@@ -47,7 +44,6 @@ import jax.numpy as jnp
 import numpy as np
 import torch
 import torch.nn as nn
-from minimal_viable_ai.core.model_family_api.optimizer_configs import OptimConfig
 from torchrec.modules.embedding_configs import EmbeddingConfig
 from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor
 
@@ -57,48 +53,6 @@ logger: logging.Logger = logging.getLogger(__name__)
 # ValueError for device kinds it doesn't recognise yet (e.g. "TPU7x"). Fall back
 # to 4 — the value jte uses internally for TPU v5/v6/v7 chips.
 _NUM_SC_PER_DEVICE_FALLBACK: int = 4
-
-
-class SparseUpdatePlacement(enum.Enum):
-    """Where the sparse optimizer update executes."""
-
-    BACKEND_FUSED = "backend_fused"
-    COMPILED_OPTIMIZER = "compiled_optimizer"
-
-
-@dataclass
-class SparseOptimizerRuntime:
-    """Backend-independent description of sparse optimizer execution."""
-
-    placement: SparseUpdatePlacement
-    config: OptimConfig
-    optimizer: torch.optim.Optimizer | None = None
-    lr_buffer: torch.Tensor | None = None
-
-    def __post_init__(self) -> None:
-        if (
-            self.placement == SparseUpdatePlacement.COMPILED_OPTIMIZER
-            and self.optimizer is None
-        ):
-            raise ValueError("A compiled sparse runtime requires an optimizer.")
-        if (
-            self.placement == SparseUpdatePlacement.BACKEND_FUSED
-            and self.optimizer is not None
-        ):
-            raise ValueError("A backend-fused sparse runtime cannot own an optimizer.")
-        if self.config.lr_warmup_schedule and self.lr_buffer is None:
-            raise NotImplementedError(
-                "This backend cannot apply the configured sparse LR schedule."
-            )
-
-
-@dataclass
-class EmbeddingSetupResult:
-    """Artifacts returned by an optimizer-aware embedding backend setup."""
-
-    model: nn.Module
-    dense_named_parameters: dict[str, nn.Parameter]
-    sparse_runtime: SparseOptimizerRuntime
 
 
 def _lazy_jte() -> tuple[Any, Any, Any, Any]:
@@ -161,7 +115,7 @@ def _swap_ec(
     _embedding_collection as a direct attribute).
 
     DLRMv3 usage:  _swap_ec(orig_preprocess.model, jax_ec)
-    RankFM usage:  _swap_ec(real_sparse_arch, jax_ec)
+    xsurface usage: _swap_ec(real_sparse_arch, jax_ec)
     """
     orig_ec = ec_holder._embedding_collection  # pyre-ignore[16]
     # pyre-ignore[8,16]: Intentionally replacing EmbeddingCollection with Module
@@ -362,61 +316,6 @@ class SparsecoreBackedEC(nn.Module):
         self._pending.discard(key)
         if not self._pending:
             self._lookup.update_embeddings(self._grads)
-
-
-# ---------------------------------------------------------------------------
-# EmbeddingBackend ABC
-# ---------------------------------------------------------------------------
-
-
-class EmbeddingBackend(ABC):
-    """Backend-agnostic interface for embedding storage, lookup, and PG init.
-
-    Models add get_override() with model-specific signature since the
-    override type and arguments differ between model architectures.
-    """
-
-    @abstractmethod
-    def init_pg(self) -> tuple[int, int]:
-        """Initialize process group. Returns (rank, world_size)."""
-        ...
-
-    def setup(
-        self,
-        model: nn.Module,
-        table_configs: list[EmbeddingConfig],
-        sparse_config: OptimConfig,
-        device: torch.device,
-        world_size: int,
-    ) -> EmbeddingSetupResult:
-        """Set up storage and sparse optimizer ownership in one operation.
-
-        The result tells the caller whether sparse updates execute in a
-        backend-fused path or through a compiled torch optimizer.
-        """
-        raise NotImplementedError
-
-    @abstractmethod
-    def dense_named_parameters(self, model: nn.Module) -> dict[str, nn.Parameter]:
-        """Trainable DENSE params (those NOT owned/trained by the embedding
-        backend), as an FQN -> Parameter dict.
-
-        Backend-specific: the DMP backend uses ``in_backward_optimizer_filter``;
-        the SparseCore backend excludes the embedding collection.
-        """
-        ...
-
-    def sc_modulus(self) -> int:
-        """Per-host SparseCore CSR shard width this backend requires.
-
-        Default 1 means no extra alignment (PRT's existing num_devices
-        rounding is sufficient). JAX/SparseCore backends override to return
-        ``local_dev × num_sc_per_device`` so per-host per-key budgets
-        become multiples of SC's CSR shard width — required for
-        ``tpu_sparse_dense_matmul``. Callers that need a global modulus
-        multiply by ``num_processes``.
-        """
-        return 1
 
 
 # ---------------------------------------------------------------------------

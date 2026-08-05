@@ -35,14 +35,15 @@
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-FBCODE_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
+PKG_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+FBCODE_ROOT="$(cd "${PKG_DIR}/../../.." && pwd)"
 
 IMAGE_TAG="${IMAGE_TAG:-mlui-fwd}"
-YAML_ARG="${YAML:-${SCRIPT_DIR}/rankfm_mvai-4chip-fwd-bench.yaml}"
+YAML_ARG="${YAML:-${PKG_DIR}/manifests/rankfm_mvai-4chip-fwd-bench.yaml}"
 if [ -f "${YAML_ARG}" ]; then
     YAML="$(cd "$(dirname "${YAML_ARG}")" && pwd)/$(basename "${YAML_ARG}")"
-elif [ -f "${SCRIPT_DIR}/${YAML_ARG}" ]; then
-    YAML="${SCRIPT_DIR}/${YAML_ARG}"
+elif [ -f "${PKG_DIR}/manifests/${YAML_ARG}" ]; then
+    YAML="${PKG_DIR}/manifests/${YAML_ARG}"
 else
     echo "ERROR: yaml not found: ${YAML_ARG}" >&2
     exit 1

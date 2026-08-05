@@ -5,10 +5,10 @@
 
 # pyre-strict
 
-"""Custom embedding ops for the in-graph RankFM embedding path.
+"""Custom embedding ops for the in-graph embedding path.
 
 Defines the ``recir::*`` ops used by ``InGraphSparseArch``
-(``recir/examples/rankfm_mvai/embedding/in_graph_embedding_backend.py``):
+(``recir/embedding/in_graph.py``):
 
   * ``ringshift_embedding`` -- ROWWISE sequence lookup, lowered on the
     recir/torchax TPU path to the on-TensorCore ring-shift kernel (see
