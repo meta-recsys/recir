@@ -32,7 +32,7 @@ class HstuAttentionTest(unittest.TestCase):
         lengths = jnp.full((q.shape[0],), q.shape[2], dtype=jnp.int32)
         num_targets = jnp.zeros((q.shape[0],), dtype=jnp.int32)  # pure causal
         out = pallas_hstu_attention(
-            q, k, v, lengths, num_targets, block_k=8, interpret=True
+            q, k, v, lengths, num_targets, block_k=8, block_q=8, interpret=True
         )
         ref = hstu_attention_reference(q, k, v, lengths, num_targets, alpha, inv_n)
         np.testing.assert_allclose(
@@ -46,7 +46,7 @@ class HstuAttentionTest(unittest.TestCase):
         lengths = jnp.array([q.shape[2], 5], dtype=jnp.int32)
         num_targets = jnp.array([3, 2], dtype=jnp.int32)
         out = pallas_hstu_attention(
-            q, k, v, lengths, num_targets, block_k=8, interpret=True
+            q, k, v, lengths, num_targets, block_k=8, block_q=8, interpret=True
         )
         ref = hstu_attention_reference(q, k, v, lengths, num_targets, alpha, inv_n)
         np.testing.assert_allclose(
@@ -55,30 +55,30 @@ class HstuAttentionTest(unittest.TestCase):
         # padded query rows (>=5) of row 1 are exactly zero.
         self.assertTrue(bool(jnp.all(out[1, :, 5:, :] == 0.0)))
 
-    def test_tiling_nondivisible_block_matches_reference(self):
-        # block_k does NOT divide seq_len -> L is padded; padded KV/rows masked.
+    def test_nondivisible_query_and_kv_blocks_match_reference(self):
+        # Neither block divides seq_len; common-boundary padding stays masked.
         q, k, v = self._inputs(seed=5, seq_len=16, d=8)
         alpha, inv_n = self._scales(q)
         lengths = jnp.array([16, 11], dtype=jnp.int32)
         num_targets = jnp.array([2, 3], dtype=jnp.int32)
         out = pallas_hstu_attention(
-            q, k, v, lengths, num_targets, block_k=6, interpret=True
+            q, k, v, lengths, num_targets, block_k=6, block_q=10, interpret=True
         )
         ref = hstu_attention_reference(q, k, v, lengths, num_targets, alpha, inv_n)
         np.testing.assert_allclose(
             np.asarray(out), np.asarray(ref), rtol=1e-5, atol=1e-5
         )
 
-    def test_block_k_invariance(self):
-        # Tiling is exact (no softmax): every block_k gives the same result.
+    def test_query_and_kv_block_invariance(self):
+        # Tiling is exact (no softmax): query and KV block choices preserve results.
         q, k, v = self._inputs(seed=6, seq_len=24, d=8)
         alpha, inv_n = self._scales(q)
         lengths = jnp.array([24, 20], dtype=jnp.int32)
         num_targets = jnp.array([4, 2], dtype=jnp.int32)
         ref = hstu_attention_reference(q, k, v, lengths, num_targets, alpha, inv_n)
-        for bk in (4, 8, 24):
+        for bk, bq in ((4, 6), (8, 8), (24, 12)):
             out = pallas_hstu_attention(
-                q, k, v, lengths, num_targets, block_k=bk, interpret=True
+                q, k, v, lengths, num_targets, block_k=bk, block_q=bq, interpret=True
             )
             np.testing.assert_allclose(
                 np.asarray(out), np.asarray(ref), rtol=1e-5, atol=1e-5
@@ -92,7 +92,7 @@ class HstuAttentionTest(unittest.TestCase):
 
         def kernel_loss(q_, k_, v_):
             o = pallas_hstu_attention(
-                q_, k_, v_, lengths, num_targets, block_k=8, interpret=True
+                q_, k_, v_, lengths, num_targets, block_k=8, block_q=8, interpret=True
             )
             return jnp.sum(o.astype(jnp.float32) ** 2)
 
@@ -110,7 +110,9 @@ class HstuAttentionTest(unittest.TestCase):
     def test_output_shape_and_dtype(self):
         q, k, v = self._inputs(b=3, h=4, seq_len=8, d=16, seed=4)
         lengths = jnp.array([8, 3, 0], dtype=jnp.int32)
-        out = pallas_hstu_attention(q, k, v, lengths, block_k=8, interpret=True)
+        out = pallas_hstu_attention(
+            q, k, v, lengths, block_k=8, block_q=8, interpret=True
+        )
         self.assertEqual(out.shape, (3, 4, 8, 16))
         self.assertEqual(out.dtype, q.dtype)
         self.assertTrue(bool(jnp.all(out[2] == 0.0)))  # zero-length row -> zero
