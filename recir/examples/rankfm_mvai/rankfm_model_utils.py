@@ -6,6 +6,8 @@
 """RankFM model construction for eager and Recir-compiled execution."""
 
 import contextlib
+import logging
+import os
 from typing import Any, Callable, Generator
 
 import torch
@@ -18,6 +20,9 @@ from hammer.v3.models.udd_fm_v3.udd_fm_train_v3 import (
 )
 from hammer.v3.modules.mot.tokenizers.mot_sparse_arch import ECSparseArch
 from recir.torchax.amp import hammer_autocast_factory
+from torch.nn.modules.dropout import Dropout
+
+logger: logging.Logger = logging.getLogger(__name__)
 
 
 @contextlib.contextmanager
@@ -88,8 +93,24 @@ def build_model_from_config(
     # calling model.to(device) here would raise "Cannot copy out of meta tensor".
     # The in_graph backend materializes real on-device tables in setup().
 
+    # Install the RecIR operation behind Hammer's PyTorch attention seam.
+    if os.environ.get("RECIR_HSTU_PALLAS", "0") == "1":
+        import recir.torchax.ops.jhstu_attention  # noqa: F401
+        from recir.ops.hstu_attention_op import install_hstu_attention_swap
+
+        install_hstu_attention_swap()
     # Force pure PyTorch kernels (Triton kernels lack TPU support).
     model.recursive_setattr("_hammer_kernel", HammerKernel.PYTORCH)
+    resolved_hammer_kernels: set[str] = set()
+    for module in model.modules():
+        hammer_kernel = getattr(module, "hammer_kernel", None)
+        if callable(hammer_kernel):
+            resolved_hammer_kernels.add(str(hammer_kernel()))
+    logger.info(
+        "[HSTU_KERNEL_SELECT] RECIR_HSTU_PALLAS=%r; resolved hammer_kernel()=%r",
+        os.environ.get("RECIR_HSTU_PALLAS"),
+        sorted(resolved_hammer_kernels),
+    )
     # Route the shared hammer.autocast() call sites to torchax AMP on this
     # TPU/JAX build (torch.autocast("cuda", ...) is inert without CUDA tensors).
     # Installed unconditionally here; the per-site enabled gate (_bf16_training)
@@ -105,7 +126,7 @@ def build_model_from_config(
     model.recursive_setattr("_dropout_ratio", 0.0)
     model.recursive_setattr("_dropout_rate", 0.0)
     for m in model.modules():
-        if isinstance(m, torch.nn.Dropout):
+        if isinstance(m, Dropout):
             m.p = 0.0
 
     return model
