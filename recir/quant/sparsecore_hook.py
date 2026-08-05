@@ -10,7 +10,8 @@
 
 Split from ``recir/quant/eager_preproc.py`` so downstream targets that don't
 touch SparseCore embeddings do NOT transitively pull in
-``recir.sparsecore.backend`` (which drags in JAX, ~500 MiB of .par bloat).
+``recir.embedding.sparsecore_ops`` (which drags in JAX, ~500 MiB of .par
+bloat).
 
 ``install_qat`` in the core hook lazily imports :func:`wrap_sparsecore_forward`
 via ``try/except ImportError`` -- users who need the SC integration must
@@ -21,9 +22,9 @@ from typing import Any
 
 import torch
 import torch.nn as nn
+from recir.embedding.sparsecore_ops import SparsecoreBackedEC
 from recir.quant.config import QATConfig
 from recir.quant.fake_quant import _q_bounds, STEFakeQuant
-from recir.sparsecore.backend import SparsecoreBackedEC
 from torchrec.sparse.jagged_tensor import JaggedTensor
 
 

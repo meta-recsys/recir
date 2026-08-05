@@ -47,6 +47,8 @@ import time
 from typing import Dict, List, Optional, Tuple
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
+_MANIFESTS = os.path.join(_HERE, "manifests")
+_SCRIPTS = os.path.join(_HERE, "scripts")
 _NE_RE = re.compile(
     r"NE/global/window/([A-Za-z0-9_]+)/train at step (\d+): ([0-9.eE+-]+)"
 )
@@ -66,7 +68,7 @@ def sh(cmd: List[str], check: bool = True, quiet: bool = False) -> str:
 
 class Run:
     def __init__(self, yaml: str, label: str, ctx: str, ns: str) -> None:
-        self.yaml = yaml if os.path.isabs(yaml) else os.path.join(_HERE, yaml)
+        self.yaml = yaml if os.path.isabs(yaml) else os.path.join(_MANIFESTS, yaml)
         self.label = label
         self.ctx = ctx
         self.ns = ns
@@ -382,7 +384,7 @@ def main() -> int:
     )
     ap.add_argument(
         "--build-script",
-        default=os.path.join(_HERE, "build_image_podman.sh"),
+        default=os.path.join(_SCRIPTS, "build_image_podman.sh"),
         help="path to the image build+push script used by --build",
     )
     ap.add_argument(
@@ -431,8 +433,16 @@ def main() -> int:
     if args.build:
         build_image(args.build_script, args.image_tag)
 
-    ya = args.yaml_a if os.path.isabs(args.yaml_a) else os.path.join(_HERE, args.yaml_a)
-    yb = args.yaml_b if os.path.isabs(args.yaml_b) else os.path.join(_HERE, args.yaml_b)
+    ya = (
+        args.yaml_a
+        if os.path.isabs(args.yaml_a)
+        else os.path.join(_MANIFESTS, args.yaml_a)
+    )
+    yb = (
+        args.yaml_b
+        if os.path.isabs(args.yaml_b)
+        else os.path.join(_MANIFESTS, args.yaml_b)
+    )
     yaml_a = patch_yaml(ya, args.max_steps, args.image_tag)
     yaml_b = patch_yaml(yb, args.max_steps, args.image_tag)
     if (yaml_a, yaml_b) != (ya, yb):

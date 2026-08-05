@@ -86,7 +86,7 @@ View locally with `tensorboard --logdir <out-dir>/<tb-name>`.
 | flag | default | meaning |
 |---|---|---|
 | `--build` | off | build + push the image (`build_image_podman.sh`) before launching; aborts on build failure |
-| `--build-script` | `build_image_podman.sh` (sibling) | path to the build+push script for `--build` |
+| `--build-script` | `scripts/build_image_podman.sh` | path to the build+push script for `--build` |
 | `--image-tag` | `latest` | tag to build/launch; unique tag isolates from shared `:latest` (yaml image ref patched to match) |
 | `--yaml-a` / `--label-a` | `rankfm_mvai-1shard.yaml` / `tpu` | run A config + label |
 | `--yaml-b` / `--label-b` | `rankfm_mvai-eager-1shard.yaml` / `eager` | run B config + label |

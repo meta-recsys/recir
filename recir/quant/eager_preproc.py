@@ -253,7 +253,7 @@ def _wrap_sparsecore_forward_if_available(
     otherwise no-op.
 
     Kept as a lazy import + try/except so downstream targets that don't touch
-    SparseCore do NOT transitively pull in ``recir.sparsecore.backend`` (which
+    SparseCore do NOT transitively pull in ``recir.embedding.sparsecore_ops`` (which
     drags in JAX, ~500 MiB of .par bloat). Users who need SC-side QAT must
     explicitly add ``//recir/quant:sparsecore_hook`` to their BUCK deps.
     """

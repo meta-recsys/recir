@@ -71,7 +71,7 @@ from torch.utils.data import IterableDataset
 # recir-compiled paths and the parity check use.
 from .config import RankFMModelArgs, RankFMTrainerConfig
 from .data_pipe import BatchReplayPipe, compute_kjt_key_to_size, replay_batch_iter
-from .embedding import build_embedding_backend
+from .rankfm_embedding_backends import build_embedding_backend
 from .xsurface_helpers import (
     _resolve_nro_per_sample,
     make_padding_region_transforms,
@@ -331,7 +331,7 @@ class RecirXLACompiledModule(RecirCompiledModuleBase):
         # optimizer into the single GSPMD program. compile_gspmd_step hard-wires a
         # single optimizer, so use the shared multi-optimizer driver compile_step
         # directly, with a GSPMDParallel that knows the in-graph FSDP table prefix.
-        from .embedding.in_graph_embedding_backend import SHARDED_TABLE_PREFIX
+        from recir.embedding.in_graph import SHARDED_TABLE_PREFIX
 
         emb_opt = self._emb_opt
         assert emb_opt is not None
@@ -414,11 +414,9 @@ class RecirXLACompiledModule(RecirCompiledModuleBase):
         Duck-typed hook: mvai_cloud's CheckpointManager uses this if present, so
         the recir/JAX-specific checkpoint logic stays out of the shared framework.
         """
+        from recir.embedding.in_graph import DP_TABLE_PREFIX, SHARDED_TABLE_PREFIX
+
         from .checkpointable import RecirCheckpointable
-        from .embedding.in_graph_embedding_backend import (
-            DP_TABLE_PREFIX,
-            SHARDED_TABLE_PREFIX,
-        )
 
         return RecirCheckpointable(
             self,

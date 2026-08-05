@@ -61,8 +61,9 @@ def resize_kjt_batch(kjt: KeyedJaggedTensor, target_b: int) -> KeyedJaggedTensor
     Cyclically tiles each key's per-sample lengths and the corresponding
     per-sample value chunks.  Tiling (rather than zero-padding) keeps the
     synthesized batch "valid" enough to flow through the preprocessor
-    and tokenizer in :func:`rankfm_dispatchers._build_overrides` — zero-padded entries
-    short-circuit those paths and the sparse arch hook never fires.
+    and tokenizer in :func:`rankfm_embedding_backends.build_eager_overrides` --
+    zero-padded entries short-circuit those paths and the sparse arch hook
+    never fires.
     """
     keys = kjt.keys()
     K = len(keys)
@@ -242,7 +243,8 @@ def resize_batch_inplace(
     Strategy: cyclically tile each tensor / KJT to the target size so
     the synthesized batch contains real (repeated) samples — never zeros.
     Zero-padded entries (or a 0 in ``num_candidates``) short-circuit the
-    tokenizer's call to the sparse arch in :func:`rankfm_dispatchers._build_overrides`, and
+    tokenizer's call to the sparse arch in
+    :func:`rankfm_embedding_backends.build_eager_overrides`, and
     the forward hook then never fires, leaving the cached output empty.
 
     ``num_candidates`` is distributed as ``target_b_nro // target_b_ro``

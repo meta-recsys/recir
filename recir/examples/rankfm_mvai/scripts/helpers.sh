@@ -30,13 +30,14 @@
 # fbcode/mrs/public_cloud/tpu/users/README.md and the MRS Core Shared namespace.
 
 _RANKFM_MVAI_HELPERS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-_RANKFM_MVAI_FBCODE_ROOT="$(cd "${_RANKFM_MVAI_HELPERS_DIR}/../../.." && pwd)"
+_RANKFM_MVAI_PKG_DIR="$(cd "${_RANKFM_MVAI_HELPERS_DIR}/.." && pwd)"
+_RANKFM_MVAI_FBCODE_ROOT="$(cd "${_RANKFM_MVAI_PKG_DIR}/../../.." && pwd)"
 
 # Shared GKE TPU JobSet helpers (gke_* functions, CTX/NS resolution, proxy).
 # shellcheck source=/dev/null
 source "${_RANKFM_MVAI_FBCODE_ROOT}/recir/utils/gke_helpers.sh"
 
-_GKE_DEFAULT_YAML="${_RANKFM_MVAI_HELPERS_DIR}/rankfm_mvai-128chip.yaml"
+_GKE_DEFAULT_YAML="${_RANKFM_MVAI_PKG_DIR}/manifests/rankfm_mvai-128chip.yaml"
 _GKE_FBCODE_ROOT="$_RANKFM_MVAI_FBCODE_ROOT"
 _GKE_BUILD_SCRIPT="${_RANKFM_MVAI_HELPERS_DIR}/build_image_podman.sh"
 _GKE_LOG_DIR="/tmp/ranklogs"
