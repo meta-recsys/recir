@@ -158,6 +158,12 @@ spec:
                   --xla_dump_to=/tmp/xladump
                   --xla_dump_hlo_as_text
                   --xla_dump_hlo_module_re=jit_jax_fn
+              # Route HSTU attention to the recir Pallas HSTU attention kernel:
+              # build_model_from_config installs the RecIR operation behind
+              # Hammer's PYTORCH seam and imports its TorchAX lowering. Unset /
+              # "0" -> default materialized-XLA PYTORCH attention.
+              - name: RECIR_HSTU_PALLAS
+                value: "1"
               # Perf-debug knobs (off by default; flip on to debug XLA lowering).
               # RECIR_DUMP_GRAPHS=1: log each XLA subgraph's FX index/scatter ops +
               #   HLO collectives, and jagged<->dense lowering branch decisions.
