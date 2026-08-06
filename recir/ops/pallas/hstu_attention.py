@@ -2,18 +2,18 @@
 
 # pyre-unsafe
 
-"""Flash-style (KV-tiled) HSTU SiLU attention kernel for TPU via Pallas.
+"""Flash-style (query- and KV-tiled) HSTU SiLU attention kernel for TPU via Pallas.
 
 Reproduces the HSTU materialized-attention math (generative_recommenders
 ``pytorch_hstu_mha``) but WITHOUT ever materializing the full ``[L, L]`` score
-matrix: the KV sequence is tiled along ``L`` and the output is accumulated block
+matrix: the query and KV axes are tiled along ``L`` and output is accumulated block
 by block. Because HSTU uses **SiLU, not softmax**, there is no cross-key
 normalization (no online running-max/sum), so flash attention here is just a
 masked weighted sum accumulated over KV blocks:
 
     out[i] = sum over kv-blocks of ( silu(q @ k_blk^T * alpha) * inv_n * mask ) @ v_blk
 
-This keeps VMEM at ``O(L * block_k)`` instead of ``O(L^2)``, so it fits at
+This keeps score VMEM at ``O(block_q * block_k)`` instead of ``O(L^2)``, so it fits at
 S=4096 (the earlier fully-materialized kernel OOMed VMEM at ~65MB for one
 ``[L,L]`` f32 tile).
 
@@ -23,10 +23,10 @@ Math (matches pt_hstu_attention.py, causal + num_targets, no contextual / local)
     weights = where(valid_mask, weights, 0)    # causal + target + length
     out     = weights @ v
 
-Only the KV axis is tiled (grid stays ``(B, H)``); q/k/v stay whole in VMEM (they
-are ``O(L*D)``, not the bottleneck) and the per-block score tile is
-``[L, block_k]``. ``L`` is padded up to a multiple of ``block_k`` so the
-fixed-size KV blocks never read past the sequence; padded rows/cols are masked
+Query and KV axes are tiled. The grid is ``(ceil(L / block_q), H, B)``;
+q is loaded per query program while each program streams KV blocks. The score tile is
+``[block_q, block_k]``. ``L`` is padded to a common query/KV block
+boundary so fixed-size blocks never read past the sequence; padding is masked
 out (position >= length).
 
 Shapes:
@@ -69,20 +69,22 @@ def _fwd_kernel(
     alpha: float,
     inv_n: float,
     block_k: int,
+    block_q: int,
 ) -> None:
-    # One (batch, head) tile. seq_len here is the PADDED length (multiple of
-    # block_k); padded positions are masked out via ``length``.
-    b = pl.program_id(0)
-    q = q_ref[0, 0]  # [L, Dqk]
-    seq_len = q.shape[0]
+    # One (batch, head, query-block) tile. seq_len is the padded KV length.
+    q_block = pl.program_id(0)
+    b = pl.program_id(2)
+    q = q_ref[0, 0]  # [block_q, Dqk]
+    seq_len = k_ref.shape[2]
+    q_start = q_block * block_q
     dv = v_ref.shape[-1]
     # Per-row scalar metadata from SMEM (see module docstring).
     length = length_ref[b]
     num_targets = ntarget_ref[b]
 
-    q_pos = jnp.arange(seq_len)
+    q_pos = q_start + jnp.arange(block_q)
     max_id = length - num_targets  # history boundary; targets collapse to it
-    q_id = jnp.minimum(q_pos, max_id)  # [L]
+    q_id = jnp.minimum(q_pos, max_id)  # [block_q]
 
     def body(kv, out):
         start = kv * block_k
@@ -96,12 +98,12 @@ def _fwd_kernel(
             k_blk,
             dimension_numbers=(((1,), (1,)), ((), ())),
             preferred_element_type=jnp.float32,
-        )  # [L, block_k]
+        )  # [block_q, block_k]
         # HSTU: SiLU (not softmax) then the 1/N scale.
         weights = jax.nn.silu(scores * alpha) * inv_n
-        # Causal + num_targets mask for this [L, block_k] tile. Derive the length
+        # Causal + num_targets mask for this [block_q, block_k] tile. Derive the length
         # bounds from 2D int position views (q_pos[:, None] < length): reshaping a
-        # 1D BOOLEAN vector to [L, 1] miscompiles in Mosaic ("unsupported shape
+        # 1D BOOLEAN vector to [block_q, 1] miscompiles in Mosaic ("unsupported shape
         # cast"), whereas the int [:, None] reshape is supported (as used by the
         # TPU flash_attention kernel).
         causal = (q_id[:, None] - k_id[None, :]) > 0
@@ -115,14 +117,23 @@ def _fwd_kernel(
             preferred_element_type=jnp.float32,
         )
 
+    # No query can attend beyond its block end: history is causal and each
+    # target row adds only its own diagonal position. Skip wholly future KV
+    # blocks, and skip all work for query blocks beyond the row length.
+    q_end = jnp.minimum(q_start + block_q, length)
+    causal_upper = pl.cdiv(q_end, block_k)
+    causal_upper = jnp.where(q_start < length, causal_upper, 0)
     num_kv_blocks = seq_len // block_k
     out: Any = jax.lax.fori_loop(
-        0, num_kv_blocks, body, jnp.zeros((seq_len, dv), dtype=jnp.float32)
+        0,
+        jnp.minimum(num_kv_blocks, causal_upper),
+        body,
+        jnp.zeros((block_q, dv), dtype=jnp.float32),
     )
     # Zero the padded query rows so the output stays clean. Use the 2D int
     # position view (not a 1D boolean reshape) for the same Mosaic reason.
     masked_out: Any = jnp.where(q_pos[:, None] < length, out, 0.0)
-    o_ref[0, 0] = masked_out.astype(o_ref.dtype)
+    o_ref[0, 0] = jnp.asarray(masked_out, dtype=o_ref.dtype)
 
 
 def _pallas_fwd(
@@ -135,12 +146,13 @@ def _pallas_fwd(
     inv_n: float,
     interpret: bool,
     block_k: int,
+    block_q: int,
 ) -> jax.Array:
     b, h, seq_len, dqk = q.shape
     dv = v.shape[-1]
-    # Pad L up to a multiple of block_k so the fixed-size KV blocks never read
-    # past the sequence. Padded keys/queries are masked (position >= length).
-    pad = (-seq_len) % block_k
+    # Pad L to a common query/KV block boundary so every BlockSpec stays in bounds.
+    block_multiple = math.lcm(block_q, block_k)
+    pad = (-seq_len) % block_multiple
     if pad:
         cfg = ((0, 0), (0, 0), (0, pad), (0, 0))
         q = jnp.pad(q, cfg)
@@ -148,19 +160,25 @@ def _pallas_fwd(
         v = jnp.pad(v, cfg)
     seq_pad = seq_len + pad
 
-    kernel = functools.partial(_fwd_kernel, alpha=alpha, inv_n=inv_n, block_k=block_k)
+    kernel = functools.partial(
+        _fwd_kernel,
+        alpha=alpha,
+        inv_n=inv_n,
+        block_k=block_k,
+        block_q=block_q,
+    )
     out = pl.pallas_call(
         kernel,
         out_shape=jax.ShapeDtypeStruct((b, h, seq_pad, dv), q.dtype),
-        grid=(b, h),
+        grid=(seq_pad // block_q, h, b),
         in_specs=[
-            pl.BlockSpec((1, 1, seq_pad, dqk), lambda bi, hi: (bi, hi, 0, 0)),
-            pl.BlockSpec((1, 1, seq_pad, dqk), lambda bi, hi: (bi, hi, 0, 0)),
-            pl.BlockSpec((1, 1, seq_pad, dv), lambda bi, hi: (bi, hi, 0, 0)),
+            pl.BlockSpec((1, 1, block_q, dqk), lambda qi, hi, bi: (bi, hi, qi, 0)),
+            pl.BlockSpec((1, 1, seq_pad, dqk), lambda qi, hi, bi: (bi, hi, 0, 0)),
+            pl.BlockSpec((1, 1, seq_pad, dv), lambda qi, hi, bi: (bi, hi, 0, 0)),
             pl.BlockSpec(memory_space=pltpu.SMEM),
             pl.BlockSpec(memory_space=pltpu.SMEM),
         ],
-        out_specs=pl.BlockSpec((1, 1, seq_pad, dv), lambda bi, hi: (bi, hi, 0, 0)),
+        out_specs=pl.BlockSpec((1, 1, block_q, dv), lambda qi, hi, bi: (bi, hi, qi, 0)),
         interpret=interpret,
     )(q, k, v, lengths, num_targets)
     return out[:, :, :seq_len, :]
@@ -195,17 +213,25 @@ def hstu_attention_reference(
     return jnp.where(valid_pos[:, None, :, None], out, 0.0)
 
 
-@functools.partial(jax.custom_vjp, nondiff_argnums=(5, 6, 7, 8))
-def _attention(q, k, v, lengths, num_targets, alpha, inv_n, interpret, block_k):
-    return _pallas_fwd(q, k, v, lengths, num_targets, alpha, inv_n, interpret, block_k)
+@functools.partial(jax.custom_vjp, nondiff_argnums=(5, 6, 7, 8, 9))
+def _attention(
+    q, k, v, lengths, num_targets, alpha, inv_n, interpret, block_k, block_q
+):
+    return _pallas_fwd(
+        q, k, v, lengths, num_targets, alpha, inv_n, interpret, block_k, block_q
+    )
 
 
-def _attention_fwd(q, k, v, lengths, num_targets, alpha, inv_n, interpret, block_k):
-    out = _pallas_fwd(q, k, v, lengths, num_targets, alpha, inv_n, interpret, block_k)
+def _attention_fwd(
+    q, k, v, lengths, num_targets, alpha, inv_n, interpret, block_k, block_q
+):
+    out = _pallas_fwd(
+        q, k, v, lengths, num_targets, alpha, inv_n, interpret, block_k, block_q
+    )
     return out, (q, k, v, lengths, num_targets)
 
 
-def _attention_bwd(alpha, inv_n, interpret, block_k, residuals, g):
+def _attention_bwd(alpha, inv_n, interpret, block_k, block_q, residuals, g):
     q, k, v, lengths, num_targets = residuals
     # Reference (materialized JAX) backward; XLA handles its [L,L] in HBM, so it
     # is not VMEM-bound the way the tiled Pallas forward is.
@@ -234,8 +260,9 @@ def pallas_hstu_attention(
     inv_n: float | None = None,
     interpret: bool = False,
     block_k: int = 512,
+    block_q: int = 512,
 ) -> jax.Array:
-    """Flash-style (KV-tiled) HSTU SiLU attention over ``[B, H, L, D]``.
+    """Flash-style (query- and KV-tiled) HSTU SiLU attention over ``[B, H, L, D]``.
 
     Args:
         q, k: ``[B, H, L, Dqk]`` dense tensors.
@@ -246,9 +273,10 @@ def pallas_hstu_attention(
         scale: pre-SiLU score multiplier ``alpha``. Default ``1/sqrt(Dqk)``.
         inv_n: post-SiLU multiplier. Default ``1/L`` (HSTU ``1/max_seq_len``).
         interpret: run on CPU via the Pallas interpreter (for testing).
-        block_k: KV tile length along the sequence axis. Trades VMEM (score tile
-            is ``[L, block_k]``) vs. loop count. Should be a multiple of 128 on
-            TPU; ``L`` is padded up to a multiple of it.
+        block_k: KV tile length. Should be a multiple of 128 on TPU.
+        block_q: Query tile length. Controls each program's score and output
+            working set and the number of query programs. Should be a multiple
+            of 128 on TPU. ``L`` is padded to a common block boundary.
 
     Returns:
         ``[B, H, L, Dv]`` attention output; padded query rows are zero.
@@ -260,4 +288,15 @@ def pallas_hstu_attention(
         inv_n = 1.0 / seq_len
     if num_targets is None:
         num_targets = jnp.zeros((b,), dtype=lengths.dtype)
-    return _attention(q, k, v, lengths, num_targets, scale, inv_n, interpret, block_k)
+    return _attention(
+        q,
+        k,
+        v,
+        lengths,
+        num_targets,
+        scale,
+        inv_n,
+        interpret,
+        block_k,
+        block_q,
+    )
