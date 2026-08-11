@@ -7,6 +7,7 @@
 #   <context>/recir/                     (the recir package)
 #   <context>/hammer/                    (rsynced from fbsource/fbcode/hammer)
 #   <context>/minimal_viable_ai/         (rsynced from fbsource/fbcode/mvai_cloud/minimal_viable_ai)
+#   <context>/mvai_cloud/                 (TPU job runtime helpers)
 #   <context>/mrs/ + <context>/hpc/      (trimmed dense_sparse DCN subset)
 #
 # build_image_podman.sh stages this context for you.
@@ -91,6 +92,7 @@ RUN pip install -e "/app[xla,rec]"
 # hammer/v3 and minimal_viable_ai are not pip-installable; mount via PYTHONPATH.
 COPY hammer /app/hammer
 COPY minimal_viable_ai /app/minimal_viable_ai
+COPY mvai_cloud /app/mvai_cloud
 
 # mrs + hpc: trimmed, torchrec-only subset staged by build_image_podman.sh --
 # just the dense_sparse DCN files udd_fm_v3's inter_arch needs (use_inter_arch=

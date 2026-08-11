@@ -148,6 +148,10 @@ echo "  created ${init_created} __init__.py markers"
 # fbgemm.fb chains).
 rsync -a "${RSYNC_EXCLUDES[@]}" "${FBCODE_DIR}/mvai_cloud/minimal_viable_ai/" "${STAGING_DIR}/minimal_viable_ai/"
 
+# TPU job runtime helpers owned by mvai_cloud infrastructure.
+mkdir -p "${STAGING_DIR}/mvai_cloud/gke"
+rsync -a "${RSYNC_EXCLUDES[@]}" "${FBCODE_DIR}/mvai_cloud/gke/runtime/" "${STAGING_DIR}/mvai_cloud/gke/runtime/"
+
 # generative_recommenders (was a github clone in the Dockerfile before;
 # staged from fbsource so the build doesn't need outbound internet)
 rsync -a "${RSYNC_EXCLUDES[@]}" "${FBCODE_DIR}/generative_recommenders/" "${STAGING_DIR}/generative_recommenders/"
@@ -221,6 +225,7 @@ from torchrec.distributed.embedding import EmbeddingCollectionSharder  # noqa: F
 print('torchrec.distributed: OK')
 import hammer.v3; print('hammer.v3: OK')
 import minimal_viable_ai; print('minimal_viable_ai: OK')
+import mvai_cloud.gke.runtime.tensorboard_uploader; print('mvai_cloud runtime: OK')
 from minimal_viable_ai.core.trainer.trainer import RecTrainer  # noqa: F401
 print('minimal_viable_ai.RecTrainer: OK')
 from generative_recommenders.common import HammerKernel; print('generative_recommenders: OK')
