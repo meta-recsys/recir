@@ -20,11 +20,10 @@ from functorch import make_fx
 from recir.graph_utils import OP
 from recir.region_transforms import (
     _apply_region_transforms,
-    _discover_autograd_functions,
     _discover_called_modules,
     _extract_subgraph,
     _find_forward_roots,
-    _preserve_autograd_function_leaves,
+    _preserve_all_autograd_function_leaves,
     _replace_region,
     RecomputeTransform,
     RegatherTransform,
@@ -784,56 +783,7 @@ class ModelWithCustomAF(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Unit tests: _discover_autograd_functions
-# ---------------------------------------------------------------------------
-
-
-class TestDiscoverAutogradFunctions(unittest.TestCase):
-    def test_discovers_custom_function(self) -> None:
-        """ScaleAndShiftFunction should be discovered."""
-        model = ModelWithCustomAF()
-        fake_mode = _make_fake_mode()
-        x = torch.randn(4, 8)
-        discovered = _discover_autograd_functions(
-            model, fake_mode, lambda m, inp: m(inp), model, x
-        )
-
-        self.assertIn(ScaleAndShiftFunction, discovered)
-
-    def test_no_autograd_function_returns_empty(self) -> None:
-        """A model without custom autograd.Functions returns empty set."""
-        model = SimpleMLP()
-        fake_mode = _make_fake_mode()
-        x = torch.randn(4, 50)
-        discovered = _discover_autograd_functions(
-            model, fake_mode, lambda m, inp: m(inp), model, x
-        )
-
-        # SimpleMLP uses only standard nn.Module ops, no custom AF.
-        # (Note: some PyTorch internals may use autograd.Function, so
-        # we just check ScaleAndShiftFunction is NOT in the set.)
-        self.assertNotIn(ScaleAndShiftFunction, discovered)
-
-    def test_original_apply_restored(self) -> None:
-        """After discovery, the original apply classmethod is restored."""
-        model = ModelWithCustomAF()
-        fake_mode = _make_fake_mode()
-        x = torch.randn(4, 8)
-
-        # Verify the function still works correctly after discovery.
-        _discover_autograd_functions(model, fake_mode, lambda m, inp: m(inp), model, x)
-
-        # The classmethod descriptor creates a new bound method on each
-        # access, so we can't use assertIs.  Instead verify apply still
-        # works correctly by calling it.
-        inp = torch.randn(2, 4, requires_grad=True)
-        out = ScaleAndShiftFunction.apply(inp, 2.0, 0.5)
-        self.assertEqual(out.shape, inp.shape)
-        torch.testing.assert_close(out, inp * 2.0)
-
-
-# ---------------------------------------------------------------------------
-# Unit tests: _preserve_autograd_function_leaves
+# Unit tests: _preserve_all_autograd_function_leaves
 # ---------------------------------------------------------------------------
 
 
@@ -863,7 +813,7 @@ class TestPreserveAutogradFunctionLeaves(unittest.TestCase):
 
         # Trace WITH leaf preservation.
         fake_mode2 = _make_fake_mode()
-        with fake_mode2, _preserve_autograd_function_leaves({ScaleAndShiftFunction}):
+        with fake_mode2, _preserve_all_autograd_function_leaves():
             gm_preserved = make_fx(
                 model,
                 tracing_mode="fake",
@@ -905,7 +855,7 @@ class TestPreserveAutogradFunctionLeaves(unittest.TestCase):
         x = torch.randn(4, 8)
         expected = model(x)
 
-        with _preserve_autograd_function_leaves({ScaleAndShiftFunction}):
+        with _preserve_all_autograd_function_leaves():
             result = model(x)
 
         torch.testing.assert_close(result, expected)
@@ -931,7 +881,7 @@ class TestPreserveAutogradFunctionLeaves(unittest.TestCase):
         def fn(x: torch.Tensor) -> torch.Tensor:  # pyre-fixme[53]
             return ScaleAndShiftFunction.apply(x, scale, shift)
 
-        with fake_mode, _preserve_autograd_function_leaves({ScaleAndShiftFunction}):
+        with fake_mode, _preserve_all_autograd_function_leaves():
             gm = make_fx(
                 fn,
                 tracing_mode="fake",
@@ -952,14 +902,13 @@ class TestPreserveAutogradFunctionLeaves(unittest.TestCase):
         )
 
     def test_context_manager_restores_apply(self) -> None:
-        """After exiting the context, the original apply is restored."""
-        original_dict_entry = ScaleAndShiftFunction.__dict__.get("apply", None)
+        """After exiting the context, the base Function.apply is restored."""
+        original = torch.autograd.Function.__dict__["apply"]
 
-        with _preserve_autograd_function_leaves({ScaleAndShiftFunction}):
+        with _preserve_all_autograd_function_leaves():
             pass
 
-        restored_entry = ScaleAndShiftFunction.__dict__.get("apply", None)
-        self.assertEqual(restored_entry, original_dict_entry)
+        self.assertIs(torch.autograd.Function.__dict__["apply"], original)
 
 
 # ---------------------------------------------------------------------------
@@ -990,7 +939,7 @@ class TestLeafApplyWithSubmoduleCall(unittest.TestCase):
         def fn(x: torch.Tensor) -> torch.Tensor:
             return SubmoduleCallingFunction.apply(x)
 
-        with fake_mode, _preserve_autograd_function_leaves({SubmoduleCallingFunction}):
+        with fake_mode, _preserve_all_autograd_function_leaves():
             gm = make_fx(
                 fn,
                 tracing_mode="fake",
@@ -1039,7 +988,6 @@ class TestApplyRegionTransformsWithLeaves(unittest.TestCase):
                         called,
                         [IdentityTransform()],
                         fake_mode,
-                        _autograd_function_leaves={ScaleAndShiftFunction},
                         fake_kwargs=fake_kwargs,
                     )
                 )
