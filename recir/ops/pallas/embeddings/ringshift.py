@@ -135,6 +135,50 @@ def _use_dma_gather(v_local: int, embedding_dim: int, dtype) -> bool:
 _GATHER_DMA_BATCH: int = 128
 
 
+# Pooling (EBC) modes accepted by the public lookup entry points. ``"none"`` is
+# the original sequence / EC behavior: one output row per looked-up id.
+_POOLING_MODES: tuple[str, ...] = ("none", "sum", "mean")
+
+
+def _check_pooling(
+    pooling: str,
+    bag_lengths: jax.Array | np.ndarray | None,
+    looked_up_id_count: jax.Array | np.ndarray | None,
+) -> None:
+    """Validate the pooling mode and the two arguments coupled to it.
+
+    Both invariants are enforced *structurally* -- by which arguments are
+    present -- rather than by comparing values, because values are not
+    available to check:
+
+      * ``bag_lengths`` is required exactly when pooling is on. Bags without a
+        mode would silently return unpooled rows and surface much later as a
+        shape mismatch.
+      * ``looked_up_id_count`` must be OMITTED when pooling is on, because
+        ``bag_lengths.sum(-1)`` already determines it. Accepting both would
+        admit a ``sum(bag_lengths) != looked_up_id_count`` disagreement that no
+        assertion can catch: under ``jit`` both are tracers, so their values are
+        invisible at trace time. Such a disagreement fails silently -- ids past
+        the bag total are dropped into the trash segment when the sum is too
+        small, and the mean divisor counts padding rows when it is too large.
+    """
+    if pooling not in _POOLING_MODES:
+        raise ValueError(f"pooling must be one of {_POOLING_MODES}, got {pooling!r}")
+    if (pooling == "none") != (bag_lengths is None):
+        raise ValueError(
+            "bag_lengths must be supplied iff pooling != 'none'; got "
+            f"pooling={pooling!r}, bag_lengths="
+            f"{'None' if bag_lengths is None else 'set'}"
+        )
+    if pooling != "none" and looked_up_id_count is not None:
+        raise ValueError(
+            "looked_up_id_count must be None when pooling is enabled; it is "
+            "derived from bag_lengths.sum(-1) so the two cannot disagree"
+        )
+    if pooling == "none" and looked_up_id_count is None:
+        raise ValueError("looked_up_id_count is required when pooling == 'none'")
+
+
 # ---------------------------------------------------------------------------
 # A. Host-side input preparation (pure JAX, all static shapes)
 # ---------------------------------------------------------------------------
@@ -567,9 +611,11 @@ def ringshift_embedding_lookup_reference_jax(
 
 def ringshift_embedding_lookup_reference(
     looked_up_ids: np.ndarray,
-    looked_up_id_count: np.ndarray,
+    looked_up_id_count: np.ndarray | None,
     local_embedding_table: np.ndarray,
     world_size: int,
+    pooling: str = "none",
+    bag_lengths: np.ndarray | None = None,
 ) -> np.ndarray:
     """Reference numpy implementation that simulates the full distributed flow.
 
@@ -578,20 +624,35 @@ def ringshift_embedding_lookup_reference(
 
     Args:
         looked_up_ids: ``[world_size, max_local_ids]`` int32.
-        looked_up_id_count: ``[world_size]`` int32.
+        looked_up_id_count: ``[world_size]`` int32 -- required iff
+            ``pooling == "none"``; derived from ``bag_lengths`` otherwise.
         local_embedding_table: ``[world_size, V_local, D]`` float -- table
             shards stacked along the rank axis.
+        world_size: number of ranks.
+        pooling: ``"none"``, ``"sum"`` or ``"mean"`` -- mirrors
+            :func:`ringshift_embedding_lookup`.
+        bag_lengths: ``[world_size, num_bags]`` int32 -- required iff
+            ``pooling != "none"``.
 
     Returns:
-        ``[world_size, max_local_ids, D]`` float embeddings in input order;
-        invalid slots zeroed.
+        ``[world_size, max_local_ids, D]`` float embeddings in input order with
+        invalid slots zeroed when ``pooling == "none"``; otherwise
+        ``[world_size, num_bags, D]`` pooled vectors.
     """
     assert looked_up_ids.shape[0] == world_size
+    _check_pooling(pooling, bag_lengths, looked_up_id_count)
+    # _check_pooling has already established which of the two is present; the
+    # asserts restate that for the type checker, which cannot follow it.
+    if pooling == "none":
+        assert looked_up_id_count is not None
+    else:
+        assert bag_lengths is not None
+        looked_up_id_count = bag_lengths.sum(axis=1).astype(np.int32)
     max_local_ids = looked_up_ids.shape[1]
     embedding_dim = local_embedding_table.shape[2]
     dtype = local_embedding_table.dtype
 
-    out = np.zeros((world_size, max_local_ids, embedding_dim), dtype=dtype)
+    out_per_id = np.zeros((world_size, max_local_ids, embedding_dim), dtype=dtype)
 
     # For every (rank, valid id) pair, look up the embedding from the rank
     # that owns the row.
@@ -601,7 +662,22 @@ def ringshift_embedding_lookup_reference(
             global_id = int(looked_up_ids[r, i])
             owner_rank = global_id % world_size
             local_row = global_id // world_size
-            out[r, i, :] = local_embedding_table[owner_rank, local_row, :]
+            out_per_id[r, i, :] = local_embedding_table[owner_rank, local_row, :]
+
+    if pooling == "none":
+        return out_per_id
+
+    assert bag_lengths is not None  # narrowed by _check_pooling
+    num_bags = bag_lengths.shape[1]
+    out = np.zeros((world_size, num_bags, embedding_dim), dtype=dtype)
+    for r in range(world_size):
+        pos = 0
+        for b in range(num_bags):
+            n = int(bag_lengths[r, b])
+            if n > 0:
+                total = out_per_id[r, pos : pos + n, :].sum(axis=0)
+                out[r, b, :] = total / n if pooling == "mean" else total
+            pos += n
     return out
 
 
@@ -1302,6 +1378,127 @@ def _ringshift_embedding_lookup_local(
     # unchanged; only the over-ICI exchange ran in bf16.
     out = sorted_emb[reverse_perm].astype(dtype)
     return out
+
+
+# ---------------------------------------------------------------------------
+# F1. Pooling (EBC) -- segment-id construction and the per-bag reduction
+# ---------------------------------------------------------------------------
+#
+# torchrec's ``EmbeddingBagCollection`` groups ids into *bags* (one per
+# sample x feature) and reduces each bag to a single vector.
+#
+# This section holds the reduction primitives only. Nothing here is reachable
+# from the public API yet: *where* the reduction runs is the one real design
+# choice in pooled lookup, and it is deliberately not made here.
+#
+#   * Reduce after the ring-shift, in XLA, over the per-id output. Needs no
+#     extra ``custom_vjp`` -- ``segment_sum`` is differentiable and the per-id
+#     path already carries one, so ``jax.grad`` composes them.
+#   * Reduce inside the Pallas kernel, as each row lands. Drops two full-width
+#     gathers, but the kernel is opaque to autodiff, so it needs its own
+#     ``custom_vjp``.
+#
+# The two are built as separate branches off this one and measured against each
+# other; whichever wins, it consumes the functions below unchanged.
+#
+# What is settled here is that the reduction is CPU-testable in isolation:
+# ``pool_per_rank`` takes a plain per-id array, so forward, backward,
+# jagged/empty bags and padding are all pinned down on a devserver even though
+# one of the two candidate kernels is real-TPU only.
+
+
+def lengths_to_segment_ids(bag_lengths: jax.Array, max_local_ids: int) -> jax.Array:
+    """Map each id slot to the bag that owns it.
+
+    Padding slots (positions at or past ``sum(bag_lengths)``) map to
+    ``num_bags``, a "trash" segment the caller drops after the reduction. That
+    keeps the reduction independent of whether the kernel happens to zero its
+    padding rows.
+
+    Built as scatter-add + prefix sum rather than ``jnp.searchsorted`` for the
+    same reason as :func:`_peer_id_by_cumsum`: searchsorted lowers to a
+    serialized binary-search ``while`` loop on TPU. Duplicate offsets (empty
+    bags) accumulate, so an empty bag correctly claims zero slots; an offset
+    landing exactly at ``max_local_ids`` (no padding) is dropped as out of range.
+
+    Args:
+        bag_lengths: ``[num_bags]`` int32 -- per-bag id count.
+        max_local_ids: static padded id-buffer length.
+
+    Returns:
+        ``[max_local_ids]`` int32 in ``[0, num_bags]``, non-decreasing.
+
+    Example:
+        ``bag_lengths=[3, 0, 2]``, ``max_local_ids=8`` gives
+        ``[0, 0, 0, 2, 2, 3, 3, 3]`` -- bag 1 is empty, slots 5..7 are padding.
+    """
+    offsets = jnp.cumsum(bag_lengths).astype(jnp.int32)
+    delta = jnp.zeros((max_local_ids,), jnp.int32).at[offsets].add(1, mode="drop")
+    return jnp.cumsum(delta).astype(jnp.int32)
+
+
+def apply_pooling_divisor(
+    pooled_sum: jax.Array,
+    bag_lengths: jax.Array,
+    *,
+    pooling: str,
+) -> jax.Array:
+    """Turn a per-bag SUM into the requested pooling mode.
+
+    Both reduction paths -- the host-side :func:`pool_per_rank` and the fused
+    Phase 4 accumulator -- produce a per-bag sum and must then apply exactly
+    this divisor. Keeping it in one place is not tidiness: a path that forgets
+    it returns the right *shape* with the wrong *values*, which no shape or
+    trace-level assertion can catch.
+
+    The divisor is clamped to 1 so an empty bag yields ``0 / 1`` rather than a
+    NaN. That clamp matters twice over -- the unclamped form would also make
+    this division's own gradient non-finite at length 0.
+
+    Args:
+        pooled_sum: ``[num_bags, D]`` per-bag sums.
+        bag_lengths: ``[num_bags]`` int32.
+        pooling: ``"sum"`` or ``"mean"``.
+    """
+    if pooling == "mean":
+        return (
+            pooled_sum / jnp.maximum(bag_lengths, 1).astype(pooled_sum.dtype)[:, None]
+        )
+    return pooled_sum
+
+
+def pool_per_rank(
+    per_id_emb: jax.Array,
+    bag_lengths: jax.Array,
+    *,
+    pooling: str,
+) -> jax.Array:
+    """Reduce one rank's per-id embeddings into per-bag vectors.
+
+    Args:
+        per_id_emb: ``[max_local_ids, D]`` -- one row per looked-up id, in
+            caller order, padding rows included.
+        bag_lengths: ``[num_bags]`` int32.
+        pooling: ``"sum"`` or ``"mean"``.
+
+    Returns:
+        ``[num_bags, D]``. Empty bags come back as zero rows; for ``"mean"``
+        the divisor is clamped to 1 so an empty bag yields ``0 / 1`` rather
+        than a NaN.
+    """
+    num_bags = bag_lengths.shape[0]
+    segment_ids = lengths_to_segment_ids(bag_lengths, per_id_emb.shape[0])
+    # num_bags + 1 segments: the extra one absorbs padding, then is sliced off.
+    # segment_ids is non-decreasing by construction, which lets XLA emit the
+    # cheaper sorted-scatter form.
+    pooled = jax.ops.segment_sum(
+        per_id_emb,
+        segment_ids,
+        num_segments=num_bags + 1,
+        indices_are_sorted=True,
+    )[:num_bags]
+
+    return apply_pooling_divisor(pooled, bag_lengths, pooling=pooling)
 
 
 def ringshift_embedding_lookup(
