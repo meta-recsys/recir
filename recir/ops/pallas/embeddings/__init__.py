@@ -3,6 +3,8 @@
 # pyre-unsafe
 
 from recir.ops.pallas.embeddings.ringshift import (
+    lengths_to_segment_ids,
+    pool_per_rank,
     ringshift_embedding_lookup,
     ringshift_embedding_lookup_block,
     ringshift_embedding_lookup_reference,
@@ -10,6 +12,8 @@ from recir.ops.pallas.embeddings.ringshift import (
 )
 
 __all__ = [
+    "lengths_to_segment_ids",
+    "pool_per_rank",
     "ringshift_embedding_lookup",
     "ringshift_embedding_lookup_block",
     "ringshift_embedding_lookup_reference",
