@@ -1448,16 +1448,103 @@ def _build_chain_path(
     return None
 
 
+def default_embedding_init_bound(num_embeddings: int) -> float:
+    """Symmetric bound for the torchrec/DMP default embedding init.
+
+    ``Uniform(+/- sqrt(1/num_embeddings))`` over the GLOBAL row count -- the
+    torchrec ``BaseEmbeddingConfig`` default.
+    """
+    return (1.0 / max(int(num_embeddings), 1)) ** 0.5
+
+
+def materialize_embedding_weight(
+    shape: Sequence[int],
+    dtype: torch.dtype,
+    device: torch.device,
+    *,
+    location: str = "HBM",
+    init_fn: Optional[Callable[[torch.Tensor], object]] = None,
+    init_lo: Optional[float] = None,
+    init_hi: Optional[float] = None,
+) -> torch.Tensor:
+    """Allocate an embedding weight on ``device`` (location-aware) and init it.
+
+    * ``"HBM"`` (default): ``torch.empty`` on ``device`` (PyTorch caching
+      allocator).
+    * ``"UVM"`` / ``"UVM_CACHING"``: FBGEMM ``new_managed_tensor``
+      (``cudaMallocManaged`` with ``SetPreferredLocation=CPU`` -- data in host
+      RAM, GPU-mapped), falling back to a plain device tensor if FBGEMM is
+      unavailable.
+
+    Init (first match wins):
+
+    * ``init_fn`` -> ``init_fn(weight)`` (the table's custom initializer).
+    * ``init_lo`` and ``init_hi`` -> ``weight.uniform_(init_lo, init_hi)``,
+      matching the eager torchrec/DMP default ``Uniform(+/- sqrt(1/N))`` when
+      the caller passes the symmetric bound.
+    * neither -> ``weight.zero_()`` (finite, safe).
+    """
+    weight: Optional[torch.Tensor] = None
+    if location in ("UVM", "UVM_CACHING"):
+        try:
+            weight = torch.ops.fbgemm.new_managed_tensor(
+                torch.empty(0, dtype=dtype, device=device),
+                list(shape),
+            )
+        except (RuntimeError, AttributeError):
+            weight = None
+    if weight is None:
+        weight = torch.empty(tuple(shape), dtype=dtype, device=device)
+    if init_fn is not None:
+        init_fn(weight)
+    elif init_lo is not None and init_hi is not None:
+        weight.uniform_(init_lo, init_hi)
+    else:
+        weight.zero_()
+    return weight
+
+
+def _materialize_meta_shard(
+    meta_shard: torch.Tensor,
+    device: torch.device,
+    location: str = "HBM",
+    init_bound: Optional[float] = None,
+) -> torch.Tensor:
+    """Materialize + init a meta-device shard (thin wrapper over
+    ``materialize_embedding_weight``).
+
+    ``init_bound`` given -> ``uniform_(-init_bound, +init_bound)`` (the caller
+    passes the bound derived from the GLOBAL row count); None -> zero-init. Only
+    meta embedding params reach this path (dense params are non-meta), so uniform
+    init is always appropriate.
+    """
+    lo = -init_bound if init_bound is not None else None
+    hi = init_bound if init_bound is not None else None
+    return materialize_embedding_weight(
+        meta_shard.shape,
+        meta_shard.dtype,
+        device,
+        location=location,
+        init_lo=lo,
+        init_hi=hi,
+    )
+
+
 def _shard_param(
     model: nn.Module,
     params_buffers: Dict[str, torch.Tensor],
     key: str,
     shard_spec: DTensorSpec,
+    location: str = "HBM",
 ) -> None:
     """Shard a single parameter in-place and update the model attribute."""
     full_tensor = params_buffers[key]
     local_shard = partition_value(full_tensor, shard_spec)
     copy_meta_init_attrs(local_shard, full_tensor)
+    if isinstance(local_shard, torch.Tensor) and local_shard.device.type == "meta":
+        device = torch.device(f"cuda:{torch.cuda.current_device()}")
+        init_bound = default_embedding_init_bound(full_tensor.shape[0])
+        local_shard = _materialize_meta_shard(local_shard, device, location, init_bound)
     params_buffers[key] = local_shard
     atoms = key.split(".")
     parent = model
@@ -1528,6 +1615,7 @@ def shard_params_by_plan(
     mesh: DeviceMesh,
     dense_style: DataParallelStyle,
     embedding_param_fqns: Set[str],
+    embedding_location_map: Optional[Dict[str, str]] = None,
 ) -> Set[str]:
     """Shard parameters and optimizer states with per-param logic.
 
@@ -1536,6 +1624,11 @@ def shard_params_by_plan(
         on the vocabulary dimension, regardless of ``dense_style``.
       - Dense params: ``Shard(0)`` if ``dense_style`` is ``FULLY_SHARD``,
         otherwise left unsharded (replicated).
+
+    ``embedding_location_map`` (optional) maps embedding FQNs to their
+    storage location (``"HBM"`` or ``"UVM"``).  When a meta-device
+    embedding is materialized, UVM tables use FBGEMM's managed allocator
+    (host RAM + GPU direct access), matching DMP/TorchRec's placement.
 
     ``opt`` accepts None, a single Optimizer, or a Sequence of Optimizers
     (for sparse + dense multi-opt setups). For each opt passed, the
@@ -1546,17 +1639,15 @@ def shard_params_by_plan(
     opts = _normalize_opts(opt)
     sharded_keys: Set[str] = set()
     shard_spec = DTensorSpec(mesh=mesh, placements=(Shard(0),))
-    # Collect (old, new, spec) for every Parameter swapped in this pass
-    # so a single post-pass migration loop can update all opts together
-    # without re-running sharding per opt.
+    loc_map = embedding_location_map or {}
     old_to_new: List[Tuple[torch.Tensor, torch.Tensor, DTensorSpec]] = []
     for key in list(params_buffers.keys()):
         if key in embedding_param_fqns or dense_style == DataParallelStyle.FULLY_SHARD:
             sharded_keys.add(key)
             old_param = params_buffers[key]
-            _shard_param(model, params_buffers, key, shard_spec)
-            # Retrieve the nn.Parameter that _shard_param set on the model
-            # (params_buffers[key] is a plain tensor, not the Parameter).
+            _shard_param(
+                model, params_buffers, key, shard_spec, location=loc_map.get(key, "HBM")
+            )
             new_param: Any = model
             for atom in key.split("."):
                 new_param = getattr(new_param, atom)

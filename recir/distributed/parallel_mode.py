@@ -1203,6 +1203,7 @@ class HybridParallel(ParallelMode):
             self.mesh,
             self.dense_style,
             self.embedding_plan.param_fqns,
+            embedding_location_map=self.embedding_plan.location_map,
         )
 
     def apply_state_layout(
