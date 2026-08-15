@@ -14,7 +14,7 @@ from __future__ import annotations
 import logging
 import operator
 from collections import OrderedDict
-from contextlib import contextmanager, ExitStack
+from contextlib import contextmanager, ExitStack, nullcontext
 from typing import Any, Callable, Generator, Iterable
 
 import torch
@@ -22,16 +22,20 @@ import torch.fx as fx
 import torch.nn as nn
 import torch.utils._pytree as pytree
 from functorch import make_fx
+from recir.compile_utils import _enable_compile
 from recir.graph_utils import rebuild_graph
 from recir.region_transforms.base import RegionTransform
+from torch._guards import detect_fake_mode
 from torch._subclasses.fake_tensor import FakeTensorMode
 from torch.fx.experimental.proxy_tensor import (
     disable_proxy_modes_tracing,
+    fetch_sym_proxy,
     get_proxy_mode,
     get_proxy_slot,
     track_tensor_tree,
 )
 from torch.nn.utils import stateless
+from torch.types import py_sym_types
 
 logger: logging.Logger = logging.getLogger(__name__)
 
@@ -100,157 +104,85 @@ def _discover_called_modules(
     return called
 
 
-def _discover_autograd_functions(
-    mod: nn.Module,
-    fake_mode: FakeTensorMode,
-    func: Callable[..., Any],
-    *args: Any,
-    **kwargs: Any,
-) -> set[type]:  # pyre-fixme[24]  # pyre-ignore[11]
-    """Discover which ``torch.autograd.Function`` subclasses are invoked.
+def _build_leaf_apply(orig_fn: Any) -> Any:
+    """Build a replacement ``autograd.Function.apply`` classmethod that records a
+    single opaque ``call_function`` leaf during ``make_fx`` tracing.
 
-    Runs the train step under FakeTensorMode + no_grad with a temporary
-    monkey-patch on ``torch.autograd.Function.apply`` that records the
-    concrete subclass each time ``.apply()`` is called.
+    During ``make_fx``, ``autograd.Function.apply()`` is traced *through*: each
+    aten op inside ``forward()`` becomes a separate FX node and the custom
+    ``backward()`` is lost.  The returned classmethod instead, while tracing:
 
-    DTensor's internal AFs (``_ToTorchTensor``, ``_FromTorchTensor``,
-    ``Redistribute``) are always included in the returned set so their
-    custom backward (reduce_scatter, redistribute) survives the inner
-    ``make_fx`` trace even if they are not called during the unsharded
-    discovery forward (they only appear after FSDP parametrization).
-
-    Returns a set of ``autograd.Function`` subclass types.
+    1. Disables proxy tracing (``disable_proxy_modes_tracing``).
+    2. Runs the original ``apply()`` (``orig_fn``) to get real/fake outputs.
+    3. Creates a **single** ``call_function`` proxy node that re-invokes
+       ``.apply()`` (so its custom ``backward()`` survives).
+    4. Associates outputs with the proxy via ``track_tensor_tree``.
     """
-    from torch.distributed.tensor._api import _FromTorchTensor, _ToTorchTensor
-    from torch.distributed.tensor._redistribute import Redistribute
-
-    discovered: set[type] = set()  # pyre-fixme[24]  # pyre-ignore[11]
-    # Always include DTensor's internal AFs — they are not called during
-    # the unsharded discovery forward but must be preserved as opaque
-    # leaf ops during the inner make_fx trace (which runs post-sharding
-    # with DTensor parametrization).
-    discovered.update({_ToTorchTensor, _FromTorchTensor, Redistribute})
-    # Save the actual classmethod descriptor from __dict__, not the bound
-    # method produced by attribute access.
-    original_descriptor = torch.autograd.Function.__dict__["apply"]
-    original_fn: Any = torch.autograd.Function.apply.__func__  # type: ignore[attr-defined]
 
     @classmethod  # type: ignore[misc]
-    def _recording_apply(cls: type, *a: Any, **kw: Any) -> Any:  # pyre-fixme[24,53]
-        discovered.add(cls)
-        return original_fn(cls, *a, **kw)
+    def _leaf_apply(
+        klass: type,  # pyre-fixme[24]
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
+        proxy_mode = get_proxy_mode()
+        if proxy_mode is None:
+            return orig_fn(klass, *args, **kwargs)
 
-    torch.autograd.Function.apply = _recording_apply  # type: ignore[assignment]
-    try:
-        with fake_mode, torch.no_grad():
-            try:
-                func(*args, **kwargs)
-            except Exception:
-                # Errors from backward/optimizer are expected since we only
-                # need the forward pass.  Log at debug level for diagnostics.
-                logger.debug(
-                    "_discover_autograd_functions: suppressed exception during "
-                    "discovery forward (expected — only forward hooks needed)",
-                    exc_info=True,
-                )
-    finally:
-        torch.autograd.Function.apply = original_descriptor  # type: ignore[assignment]
+        tracer: Any = proxy_mode.tracer
+        # Trace apply as an opaque leaf. Ignore fresh symbols used only inside
+        # its forward; symbols exposed through outputs remain tracked.
+        fake_mode = detect_fake_mode()
+        shape_env = getattr(fake_mode, "shape_env", None)
+        ignore_ctx = (
+            shape_env.ignore_fresh_unbacked_symbols()
+            if shape_env is not None
+            else nullcontext()
+        )
+        with disable_proxy_modes_tracing(), ignore_ctx:
+            real_out = orig_fn(klass, *args, **kwargs)
 
-    return discovered
+        def _bound_apply(*a: Any, **kw: Any) -> Any:
+            return orig_fn(klass, *a, **kw)
+
+        # Tensor args unwrap to their tracked proxy; SymInt/SymFloat/SymBool
+        # args unwrap via fetch_sym_proxy (a raw symbolic SymInt has no constant
+        # and cannot be embedded by the tracer's create_arg); else pass through.
+        _sym_proxy: Callable[[Any], Any] = fetch_sym_proxy(tracer)
+
+        def _to_proxy(x: Any) -> Any:
+            if isinstance(x, torch.Tensor):
+                return get_proxy_slot(x, tracer, default=x, transform=lambda p: p.proxy)
+            if isinstance(x, py_sym_types):
+                return _sym_proxy(x)
+            return x
+
+        proxy_out = tracer.create_proxy(
+            "call_function",
+            _bound_apply,
+            pytree.tree_map(_to_proxy, args),
+            pytree.tree_map(_to_proxy, kwargs),
+        )
+        return track_tensor_tree(real_out, proxy_out, constant=None, tracer=tracer)
+
+    return _leaf_apply
 
 
 @contextmanager
-def _preserve_autograd_function_leaves(
-    af_classes: set[type],  # pyre-fixme[24]
-) -> Generator[None, None, None]:
-    """Make ``autograd.Function`` subclasses opaque to ``make_fx`` tracing.
+def _preserve_all_autograd_function_leaves() -> Generator[None, None, None]:
+    """Make EVERY ``autograd.Function`` opaque to the inner ``make_fx`` trace.
 
-    During ``make_fx``, ``autograd.Function.apply()`` is traced *through*:
-    each aten op inside ``forward()`` becomes a separate FX node, and the
-    custom ``backward()`` is lost.  This context manager patches each
-    discovered subclass's ``apply`` so that during tracing it:
-
-    1. Disables proxy tracing (``disable_proxy_modes_tracing``).
-    2. Runs the original ``apply()`` to get real/fake outputs.
-    3. Creates a **single** ``call_function`` proxy node for ``.apply()``.
-    4. Associates outputs with the proxy via ``track_tensor_tree``.
-
-    Outside ``make_fx`` (i.e. when ``get_proxy_mode()`` returns ``None``),
-    the original ``apply`` is called directly — no overhead.
+    Patches the base ``torch.autograd.Function.apply`` so that any subclass
+    invoked during the trace collapses to a single opaque leaf (see
+    :func:`_build_leaf_apply`).
     """
-    if not af_classes:
-        yield
-        return
-
-    original_applies: dict[type, Any] = {}  # pyre-fixme[24]
-
-    def _make_leaf_apply(
-        cls: type,  # pyre-fixme[24]
-        orig_apply: Any,
-    ) -> Any:
-        # Capture the original apply's underlying function so we can call
-        # it without going through the descriptor protocol again.
-        orig_fn: Any = orig_apply.__func__  # type: ignore[attr-defined]
-
-        # Build a wrapper callable that binds the class.  This avoids
-        # passing the class object (FunctionMeta) as an FX graph argument
-        # — FX's create_arg cannot serialise metaclass instances.
-        def _bound_apply(*args: Any, **kwargs: Any) -> Any:
-            return orig_fn(cls, *args, **kwargs)
-
-        @classmethod  # type: ignore[misc]
-        def _leaf_apply(
-            klass: type,  # pyre-fixme[24]
-            *args: Any,
-            **kwargs: Any,
-        ) -> Any:  # pyre-fixme[53]
-            proxy_mode = get_proxy_mode()
-            if proxy_mode is None:
-                return orig_fn(klass, *args, **kwargs)
-
-            tracer: Any = proxy_mode.tracer
-            # Run the real apply with proxy tracing disabled so the
-            # individual aten ops inside forward() are NOT recorded.
-            with disable_proxy_modes_tracing():
-                real_out = orig_fn(klass, *args, **kwargs)
-
-            # Build proxy args: for each tensor arg that the tracer
-            # tracks, unwrap its proxy; non-tensor args pass through.
-            def _to_proxy(x: Any) -> Any:
-                if isinstance(x, torch.Tensor):
-                    return get_proxy_slot(
-                        x, tracer, default=x, transform=lambda p: p.proxy
-                    )
-                return x
-
-            proxy_args = pytree.tree_map(_to_proxy, args)
-            proxy_kwargs = pytree.tree_map(_to_proxy, kwargs)
-            # Create a single opaque node for this .apply() call.
-            # Use _bound_apply (which binds cls) as the target so the
-            # class object does not appear as a graph argument.
-            proxy_out = tracer.create_proxy(
-                "call_function",
-                _bound_apply,
-                proxy_args,
-                proxy_kwargs,
-            )
-            # Associate the real outputs with the proxy node.
-            return track_tensor_tree(real_out, proxy_out, constant=None, tracer=tracer)
-
-        return _leaf_apply
-
-    for cls in af_classes:
-        original_applies[cls] = cls.__dict__.get("apply", None)
-        cls.apply = _make_leaf_apply(cls, cls.apply)  # type: ignore[assignment]
-
+    original_descriptor = torch.autograd.Function.__dict__["apply"]
+    orig_fn: Any = getattr(original_descriptor, "__func__", original_descriptor)
+    torch.autograd.Function.apply = _build_leaf_apply(orig_fn)  # type: ignore[assignment]
     try:
         yield
     finally:
-        for cls, orig in original_applies.items():
-            if orig is not None:
-                cls.apply = orig  # type: ignore[assignment]
-            elif "apply" in cls.__dict__:
-                delattr(cls, "apply")
+        torch.autograd.Function.apply = original_descriptor  # type: ignore[assignment]
 
 
 def _find_forward_roots(
@@ -494,7 +426,6 @@ def _apply_region_transforms(
     fake_mode: FakeTensorMode,
     _parametrize_cm_factories: list[Callable[[], Any]] | None = None,
     _grad_scale: float | None = None,
-    _autograd_function_leaves: set[type] | None = None,  # pyre-fixme[24]
     fake_kwargs: dict[str, Any] | None = None,
 ) -> Generator[None, None, None]:
     """
@@ -509,13 +440,11 @@ def _apply_region_transforms(
     constant to compensate for DTensor's ``Partial("avg")`` gradient placement
     being lost when ``to_local(grad_placements=...)`` is decomposed by make_fx.
 
-    When *_autograd_function_leaves* is supplied, the listed
-    ``torch.autograd.Function`` subclasses are treated as opaque leaf
-    operations during the inner ``make_fx`` trace — their ``forward()`` is
-    NOT decomposed into individual aten ops, preserving custom ``backward()``
-    behavior in the traced graph.  This replaces the ``_grad_scale``
-    workaround for specific cases like DTensor's ``to_local`` with
-    ``grad_placements``.
+    Every ``torch.autograd.Function`` invoked during the inner ``make_fx``
+    trace is treated as an opaque leaf (see
+    :func:`_preserve_all_autograd_function_leaves`) — its ``forward()`` is NOT
+    decomposed into individual aten ops, preserving its custom ``backward()`` in
+    the traced graph.
 
     When *fake_kwargs* is supplied, keyword arguments captured during
     discovery are flattened into positional args for ``make_fx`` tracing
@@ -594,7 +523,10 @@ def _apply_region_transforms(
     _stateless_forward._orig_mod = root_mod  # type: ignore[attr-defined]
     with (
         fake_mode,
-        _preserve_autograd_function_leaves(_autograd_function_leaves or set()),
+        _enable_compile(),
+        # Preserve ALL autograd.Functions as opaque leaves so the inner trace
+        # keeps their custom backward (decomposing would lose it).
+        _preserve_all_autograd_function_leaves(),
     ):
         _kwarg_leaves_refaked = tuple(
             torch.empty(v.shape, dtype=v.dtype, device=v.device)
