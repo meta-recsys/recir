@@ -37,6 +37,7 @@ class EmbeddingShardingPlan:
     """
 
     sharding_map: Dict[str, EmbeddingShardingType] = field(default_factory=dict)
+    location_map: Dict[str, str] = field(default_factory=dict)
 
     @property
     def param_fqns(self) -> Set[str]:
