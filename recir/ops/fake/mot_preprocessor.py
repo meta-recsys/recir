@@ -303,10 +303,40 @@ class TraceableMoTPreprocessor(nn.Module):
 
     def forward(self, features: FeatureBundle) -> FeatureBundle:
         input_tensors = self._decompose_input(features)
+        self._constrain_input_batch_shapes(input_tensors)
         output_tensors = torch.ops.recir_preproc.mot_preprocessor_forward(
             self._instance_id, input_tensors
         )
         return self._reassemble_output(features, output_tensors)
+
+    def _constrain_input_batch_shapes(self, input_tensors: List[torch.Tensor]) -> None:
+        """Tell ShapeEnv which independently dynamic input dimensions agree."""
+        ro_lengths = input_tensors[1]
+        nro_lengths = input_tensors[3]
+        num_candidates = input_tensors[4]
+        if self._ro_kjt_keys:
+            torch._check(
+                ro_lengths.shape[0] == len(self._ro_kjt_keys) * num_candidates.shape[0]
+            )
+
+        nro_batch = None
+        if self._all_label_keys:
+            nro_batch = input_tensors[7].shape[0]
+        elif self._has_supervision_weight:
+            nro_batch = input_tensors[6].shape[1]
+        if nro_batch is None:
+            return
+
+        if self._nro_kjt_keys:
+            torch._check(nro_lengths.shape[0] == len(self._nro_kjt_keys) * nro_batch)
+        for label in input_tensors[7:]:
+            torch._check(label.shape[0] == nro_batch)
+
+    def _nro_batch_size(self, input_tensors: List[torch.Tensor]) -> Any:
+        n_nro_keys = len(self._nro_kjt_keys)
+        if not n_nro_keys:
+            raise RuntimeError("Cannot infer NRO batch size without NRO KJT keys")
+        return input_tensors[3].shape[0] // n_nro_keys
 
     # ----- input decomposition (FeatureBundle -> List[Tensor]) -------------
 
@@ -374,17 +404,19 @@ class TraceableMoTPreprocessor(nn.Module):
             keys=self._ro_kjt_keys,
             values=ro_values,
             lengths=ro_lengths,
+            stride=num_candidates.shape[0],
         )
         nro_kjt = KeyedJaggedTensor(
             keys=self._nro_kjt_keys,
             values=nro_values,
             lengths=nro_lengths,
+            stride=self._nro_batch_size(input_tensors),
         )
 
         builder = FeatureBundleBuilder()
         builder.set(InputFeatures.UIH_ID_LIST, ro_kjt)
         builder.set(InputFeatures.CANDIDATE_ID_LIST, nro_kjt)
-        builder.set(InputFeatures.NUM_CANDIDATES, num_candidates)
+        builder.set(InputFeatures.NUM_CANDIDATES, num_candidates.to(torch.int32))
         if self._has_uih_float and ro_float.numel() > 0:
             builder.set(InputFeatures.UIH_FLOAT, ro_float)
         if self._has_supervision_weight and sup_weight.numel() > 0:
@@ -466,7 +498,12 @@ class TraceableMoTPreprocessor(nn.Module):
         if value.dtype != expected_dtype or not cls._tensor_shape_matches(
             kind, value, ro_batch, nro_batch
         ):
-            raise RuntimeError(f"MoT output {desc} changed its traced {kind} contract")
+            raise RuntimeError(
+                f"MoT output {desc} changed its traced {kind} contract: "
+                f"expected dtype {expected_dtype} with RO batch {ro_batch} and "
+                f"NRO batch {nro_batch}, got dtype {value.dtype} and shape "
+                f"{tuple(value.shape)}"
+            )
         return value.clone()
 
     @classmethod
@@ -628,25 +665,13 @@ class TraceableMoTPreprocessor(nn.Module):
         # Reference inputs for device/dtype inheritance.
         ro_values = input_tensors[0]
         ro_lengths = input_tensors[1]
-        # Per-user batch (== ro_kjt.stride()), derived from the LIVE ro_lengths
-        # input (shape K_ro * B) rather than baked from the trace sample. The
-        # ro-KJT inputs stay symbolic through the trace, so this makes batch a
-        # dynamic SymInt that follows the real runtime batch. Baking it (from
-        # the first-compile batch) left the seq_lengths / BATCH_SIZE outputs
-        # pinned to a static size; on any later batch smaller than the trace
-        # batch, Inductor allocated an oversized buffer whose tail stayed
-        # uninitialized, and the downstream timestamp/position kernel read that
-        # garbage OOB (CUDA illegal memory access). Mirrors the dynamic batch
-        # treatment already used for batch_dense_2d below.
-        n_ro_keys = len(self._ro_kjt_keys)
-        batch = ro_lengths.shape[0] // n_ro_keys if n_ro_keys else ro_lengths.shape[0]
-        # The NRO batch follows live candidate KJT lengths and drives
-        # NRO-shaped tensors and exports.
-        nro_lengths = input_tensors[3]
-        n_nro_keys = len(self._nro_kjt_keys)
-        nro_batch = (
-            nro_lengths.shape[0] // n_nro_keys if n_nro_keys else nro_lengths.shape[0]
-        )
+        # KJT lengths carry K_ro * B, which loses its affine equality to the
+        # canonical per-request input when partial lowering builds a fresh
+        # ShapeEnv. Keep every RO-shaped output on the num_candidates symbol.
+        batch = input_tensors[4].shape[0]
+        # Keep data-dependent NRO outputs unbacked during the top-level trace.
+        nro_batch = torch.library.get_ctx().new_dynamic_size()
+        torch._check_is_size(nro_batch)
         jagged_group_sizes: Dict[Any, Any] = {}
         for spec in self._output_spec:
             out.extend(
