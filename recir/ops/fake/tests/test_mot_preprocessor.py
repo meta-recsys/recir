@@ -167,23 +167,20 @@ class TraceableMoTPreprocessorTest(TestCase):
         self.assertEqual(patch_mot_preprocessor_for_tracing(model, sample), 1)
         wrapper = cast(TraceableMoTPreprocessor, model.preprocessor)
 
+        # Dynamic opcheck perturbs relational KJT tensors independently. The
+        # next test covers dynamic execution with valid batch relationships.
         result = torch.library.opcheck(
             torch.ops.recir_preproc.mot_preprocessor_forward.default,
             (wrapper._instance_id, wrapper._decompose_input(sample)),
             test_utils=(
                 "test_schema",
                 "test_faketensor",
-                "test_aot_dispatch_dynamic",
             ),
         )
 
         self.assertEqual(
             result,
-            {
-                "test_schema": "SUCCESS",
-                "test_faketensor": "SUCCESS",
-                "test_aot_dispatch_dynamic": "SUCCESS",
-            },
+            {"test_schema": "SUCCESS", "test_faketensor": "SUCCESS"},
         )
 
     def test_trace_does_not_confuse_equal_ro_and_nro_sample_batches(self) -> None:
@@ -217,6 +214,19 @@ class TraceableMoTPreprocessorTest(TestCase):
         )
 
         self.assertEqual(spec[0], "nro_dense_1d")
+
+    def test_num_targets_uses_batch_dense_policy(self) -> None:
+        desc = FeatureDescriptor(
+            name="hstu_v3.seq_0/num_targets",
+            feature_type=FeatureType.METADATA,
+            dtype=torch.int64,
+        )
+
+        spec = TraceableMoTPreprocessor._one_dim_output_spec(
+            desc, desc.name, torch.int64
+        )
+
+        self.assertEqual(spec[0], "batch_dense_1d")
 
     def test_high_dim_output_requires_explicit_policy(self) -> None:
         model = _Model(_StubMoTPreprocessor(emit_high_dim=True))

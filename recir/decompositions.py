@@ -21,6 +21,12 @@ from torch._decomp.decompositions import native_layer_norm_backward
 aten: torch._ops._OpNamespace = torch.ops.aten
 
 
+def _stack_decomp(tensors: List[torch.Tensor], dim: int = 0) -> torch.Tensor:
+    return aten.cat.default(
+        [aten.unsqueeze.default(tensor, dim) for tensor in tensors], dim
+    )
+
+
 def _foreach_add_decomp(
     self: List[torch.Tensor], other: List[torch.Tensor], alpha: float = 1
 ) -> None:
@@ -117,6 +123,7 @@ def _fused_adam_decomp(
 
 
 SPMD_DECOMP_TABLE: Dict[Any, Any] = {
+    aten.stack.default: _stack_decomp,
     aten._foreach_add_.List: _foreach_add_decomp,
     aten._foreach_add_.Scalar: partial(
         _foreach_binop_scalar_decomp, aten._foreach_add.Scalar
