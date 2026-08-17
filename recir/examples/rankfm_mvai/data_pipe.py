@@ -69,6 +69,44 @@ def _import_zstandard() -> Any:
         return None
 
 
+def _import_manifold_helpers() -> Any:
+    """Return MVAI's Manifold blob reader + path splitter, or None.
+
+    Only importable under buck on a devserver; the rankfm TPU image stages
+    mvai_cloud, not //mvai_infra, and GKE pods cannot reach Manifold anyway.
+    Kept off the buck deps so it does not enter every data_pipe consumer.
+    """
+    try:
+        # pyre-ignore[21]: resolved at runtime only; see docstring.
+        from mvai_infra.common.manifold import (  # @manual
+            download_buffer_from_manifold,
+            manifold_path_to_bucket_and_file_path,
+        )
+
+        return download_buffer_from_manifold, manifold_path_to_bucket_and_file_path
+    except ImportError:
+        return None
+
+
+# Dump-format version, mirroring minimal_viable_ai/core/dataloader/
+# preproc_output_dataloaders.py. An absent "version" key means the legacy flat
+# layout (rank_X_batch_Y.pt.zst); version 0 means the bucketed-subfolder layout
+# (rank_X/batch_Y/Z.pt.zst) that Manifold listing performance forced.
+_SUPPORTED_FORMAT_VERSION: int = 0
+# Files per batch_Y subfolder under each rank. Must match the writer's
+# _BATCHES_PER_SUBDIR or the synthesized paths address the wrong files.
+_BATCHES_PER_SUBDIR: int = 1000
+
+
+def _batch_file_name(dump_rank: int, batch_idx: int, version: Optional[int]) -> str:
+    """Address one batch file in whichever dump layout ``version`` denotes."""
+    if version is None:
+        return f"rank_{dump_rank}_batch_{batch_idx}.pt.zst"
+    subdir_idx = batch_idx // _BATCHES_PER_SUBDIR
+    file_idx = batch_idx % _BATCHES_PER_SUBDIR
+    return f"rank_{dump_rank}/batch_{subdir_idx}/{file_idx}.pt.zst"
+
+
 # ---------------------------------------------------------------------------
 # BatchReplayPipe — load preproc batches from GCS or local fs
 # ---------------------------------------------------------------------------
@@ -103,9 +141,27 @@ class BatchReplayPipe:
         self._rank = rank
         self._world_size = world_size
         self._replicate = replicate_across_ranks
+        # Read from metadata.json, by _discover_files or lazily by
+        # assert_supports_batch_size. Stays None for dumps predating the key.
+        self._dump_batch_size: Optional[int] = None
 
         self._is_gcs: bool = self._path.startswith("gs://")
-        if self._is_gcs:
+        self._is_manifold: bool = self._path.startswith("manifold://")
+        if self._is_manifold:
+            # Devserver-only path: lets a buck run read the same dump the MAST
+            # replay job reads, with no GCS mirror in between. GKE pods have no
+            # Manifold reachability, so in-image runs still go via gs:// or the
+            # BarnFS CSI mount.
+            helpers = _import_manifold_helpers()
+            if helpers is None:
+                raise ImportError(
+                    "manifold:// paths need //mvai_infra/common:manifold, which is "
+                    "only available under buck on a devserver."
+                )
+            self._manifold_download, split = helpers
+            self._bucket_name, self._prefix = split(self._path)
+            self._client = None
+        elif self._is_gcs:
             stripped = self._path[len("gs://") :]
             parts = stripped.split("/", 1)
             self._bucket_name: str = parts[0]
@@ -132,13 +188,11 @@ class BatchReplayPipe:
             # would take 58+ min). Each filename is opened on-demand inside
             # ``_load_batch``, which is sub-second on FUSE for known names.
             #
-            # For GCS the blob name must include the object prefix (the path after
-            # gs://bucket/), since _download_bytes addresses blobs from the bucket
-            # root. Local paths address files relative to _local_dir (which already
-            # includes that dir), so they need no prefix. _discover_files already
-            # prefixes its synthesized names; mirror that for explicit entries.
-            if self._is_gcs and self._prefix:
-                file_list = [f"{self._prefix}/{f}" for f in file_list]
+            # _discover_files already prefixes its synthesized names; mirror
+            # that for explicit entries.
+            prefix = self._name_prefix()
+            if prefix:
+                file_list = [f"{prefix}{f}" for f in file_list]
             if self._replicate:
                 self._file_list = list(file_list)
             else:
@@ -154,22 +208,42 @@ class BatchReplayPipe:
         else:
             self._discover_files()
 
+    def _name_prefix(self) -> str:
+        """Blob-name prefix for _download_bytes, which addresses from the bucket
+        root. Local paths resolve against _local_dir and so need none."""
+        if self._prefix and (self._is_gcs or self._is_manifold):
+            return f"{self._prefix}/"
+        return ""
+
     def _discover_files(self) -> None:
-        """Read ``metadata.json`` and synthesize the rank_*_batch_*.pt.zst
-        filename list. Avoids listing the parent directory, which can hold
-        100K+ files on a dataporter dump and takes minutes on FUSE.
+        """Read ``metadata.json`` and synthesize the batch filename list.
+
+        Avoids listing the parent directory, which can hold 100K+ files on a
+        dataporter dump and takes minutes on FUSE.
+
+        Handles both dump layouts. ``version`` was previously ignored, so a v0
+        dump silently produced legacy flat names and every read 404'd.
         """
-        prefix = f"{self._prefix}/" if (self._is_gcs and self._prefix) else ""
+        prefix = self._name_prefix()
         metadata = self._load_json(f"{prefix}metadata.json")
+        version: Optional[int] = metadata.get("version")
+        if version is not None and version != _SUPPORTED_FORMAT_VERSION:
+            raise RuntimeError(
+                f"Unsupported dump format version {version} at {self._path}; "
+                f"this reader understands the legacy flat layout (no version "
+                f"key) and version {_SUPPORTED_FORMAT_VERSION}."
+            )
+        self._dump_batch_size = metadata.get("batch_size")
         num_dump_ranks: int = metadata["num_ranks"]
         num_batches: int = metadata["num_batches"]
+        layout = "flat" if version is None else f"v{version} bucketed"
 
         if self._replicate:
-            for r in range(num_dump_ranks):
-                for b in range(num_batches):
-                    self._file_list.append(f"{prefix}rank_{r}_batch_{b}.pt.zst")
+            for b in range(num_batches):
+                for r in range(num_dump_ranks):
+                    self._file_list.append(f"{prefix}{_batch_file_name(r, b, version)}")
             logger.info(
-                f"[Replay] Dump (replicated): {num_dump_ranks} ranks x "
+                f"[Replay] Dump ({layout}, replicated): {num_dump_ranks} ranks x "
                 f"{num_batches} batches = {len(self._file_list)} files per rank."
             )
             return
@@ -186,13 +260,37 @@ class BatchReplayPipe:
             global_idx = self._rank + i * self._world_size
             dump_rank = global_idx % num_dump_ranks
             batch_idx = global_idx // num_dump_ranks
-            self._file_list.append(f"{prefix}rank_{dump_rank}_batch_{batch_idx}.pt.zst")
+            self._file_list.append(
+                f"{prefix}{_batch_file_name(dump_rank, batch_idx, version)}"
+            )
         logger.info(
-            f"[Replay] Dump: {num_dump_ranks} dump ranks x {num_batches} batches. "
-            f"Rank {self._rank} assigned {batches_per_rank} batches."
+            f"[Replay] Dump ({layout}): {num_dump_ranks} dump ranks x "
+            f"{num_batches} batches. Rank {self._rank} assigned "
+            f"{batches_per_rank} batches."
         )
 
+    def assert_supports_batch_size(self, local_batch_size: int) -> None:
+        """Fail early when the dump's rows cannot satisfy ``local_batch_size``.
+
+        Without this the mismatch surfaces deep inside ``select_rows_slice`` on
+        the first step, long after the model has been built and traced. In
+        explicit file-list mode nothing has read the manifest yet, so read it
+        here -- the file list still addresses the same dump root.
+        """
+        if self._dump_batch_size is None:
+            metadata = self._load_json(f"{self._name_prefix()}metadata.json")
+            self._dump_batch_size = metadata.get("batch_size")
+        dump_batch_size = self._dump_batch_size
+        if dump_batch_size is not None and local_batch_size > dump_batch_size:
+            raise ValueError(
+                f"--local_batch_size {local_batch_size} exceeds the dump's "
+                f"batch_size {dump_batch_size} ({self._path}); each dumped batch "
+                f"has only {dump_batch_size} rows to slice from."
+            )
+
     def _download_bytes(self, name: str) -> bytes:
+        if self._is_manifold:
+            return self._manifold_download(self._bucket_name, name).getvalue()
         if not self._is_gcs:
             with open(os.path.join(self._local_dir, name), "rb") as fh:
                 return fh.read()
