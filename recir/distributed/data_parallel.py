@@ -32,7 +32,13 @@ import torch.library
 import torch.nn as nn
 import torch.utils._pytree as pytree
 from recir.distributed.batch_dim_utils import BatchDimAnalyzer
-from recir.meta_tensor_init import copy_meta_init_attrs, mark_meta_zero_init
+from recir.meta_tensor_init import (
+    copy_meta_init_attrs,
+    default_embedding_init_bound,
+    get_meta_init_spec,
+    initialize_tensor_from_meta_init,
+    mark_meta_zero_init,
+)
 
 # v1's ``_rewrite_row_wise_embeddings`` (used by ``partition_data_parallel``
 # in the bundle_runtime path) reuses the row-wise embedding decomposition
@@ -1448,16 +1454,71 @@ def _build_chain_path(
     return None
 
 
+def materialize_embedding_weight(
+    shape: Sequence[int],
+    dtype: torch.dtype,
+    device: torch.device,
+    *,
+    location: str = "HBM",
+    init_kind: str = "zeros",
+    init_bound: float = 0.0,
+) -> torch.Tensor:
+    """Allocate and initialize an embedding weight on ``device``.
+
+    UVM locations use FBGEMM managed memory when available; otherwise the
+    regular PyTorch device allocator is used. Initialization follows the shared
+    recir meta-init specification.
+    """
+    weight: Optional[torch.Tensor] = None
+    if location in ("UVM", "UVM_CACHING"):
+        try:
+            weight = torch.ops.fbgemm.new_managed_tensor(
+                torch.empty(0, dtype=dtype, device=device),
+                list(shape),
+            )
+        except (RuntimeError, AttributeError):
+            weight = None
+    if weight is None:
+        weight = torch.empty(tuple(shape), dtype=dtype, device=device)
+    return initialize_tensor_from_meta_init(weight, init_kind, init_bound)
+
+
+def _materialize_meta_shard(
+    meta_shard: torch.Tensor,
+    source_tensor: torch.Tensor,
+    device: torch.device,
+    location: str = "HBM",
+) -> torch.Tensor:
+    init_kind, init_bound = get_meta_init_spec(
+        source_tensor,
+        default_embedding_init_bound(source_tensor.shape[0]),
+    )
+    return materialize_embedding_weight(
+        meta_shard.shape,
+        meta_shard.dtype,
+        device,
+        location=location,
+        init_kind=init_kind,
+        init_bound=init_bound,
+    )
+
+
 def _shard_param(
     model: nn.Module,
     params_buffers: Dict[str, torch.Tensor],
     key: str,
     shard_spec: DTensorSpec,
+    location: str = "HBM",
 ) -> None:
     """Shard a single parameter in-place and update the model attribute."""
     full_tensor = params_buffers[key]
     local_shard = partition_value(full_tensor, shard_spec)
     copy_meta_init_attrs(local_shard, full_tensor)
+    if isinstance(local_shard, torch.Tensor) and local_shard.device.type == "meta":
+        device = torch.device(f"cuda:{torch.cuda.current_device()}")
+        local_shard = _materialize_meta_shard(
+            local_shard, full_tensor, device, location
+        )
     params_buffers[key] = local_shard
     atoms = key.split(".")
     parent = model
@@ -1528,6 +1589,7 @@ def shard_params_by_plan(
     mesh: DeviceMesh,
     dense_style: DataParallelStyle,
     embedding_param_fqns: Set[str],
+    embedding_location_map: Optional[Dict[str, str]] = None,
 ) -> Set[str]:
     """Shard parameters and optimizer states with per-param logic.
 
@@ -1536,6 +1598,11 @@ def shard_params_by_plan(
         on the vocabulary dimension, regardless of ``dense_style``.
       - Dense params: ``Shard(0)`` if ``dense_style`` is ``FULLY_SHARD``,
         otherwise left unsharded (replicated).
+
+    ``embedding_location_map`` (optional) maps embedding FQNs to their
+    storage location (``"HBM"`` or ``"UVM"``).  When a meta-device
+    embedding is materialized, UVM tables use FBGEMM's managed allocator
+    (host RAM + GPU direct access), matching DMP/TorchRec's placement.
 
     ``opt`` accepts None, a single Optimizer, or a Sequence of Optimizers
     (for sparse + dense multi-opt setups). For each opt passed, the
@@ -1546,17 +1613,15 @@ def shard_params_by_plan(
     opts = _normalize_opts(opt)
     sharded_keys: Set[str] = set()
     shard_spec = DTensorSpec(mesh=mesh, placements=(Shard(0),))
-    # Collect (old, new, spec) for every Parameter swapped in this pass
-    # so a single post-pass migration loop can update all opts together
-    # without re-running sharding per opt.
+    loc_map = embedding_location_map or {}
     old_to_new: List[Tuple[torch.Tensor, torch.Tensor, DTensorSpec]] = []
     for key in list(params_buffers.keys()):
         if key in embedding_param_fqns or dense_style == DataParallelStyle.FULLY_SHARD:
             sharded_keys.add(key)
             old_param = params_buffers[key]
-            _shard_param(model, params_buffers, key, shard_spec)
-            # Retrieve the nn.Parameter that _shard_param set on the model
-            # (params_buffers[key] is a plain tensor, not the Parameter).
+            _shard_param(
+                model, params_buffers, key, shard_spec, location=loc_map.get(key, "HBM")
+            )
             new_param: Any = model
             for atom in key.split("."):
                 new_param = getattr(new_param, atom)

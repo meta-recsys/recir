@@ -77,7 +77,7 @@ from recir.embedding.backend import (
     SparseOptimizerRuntime,
     SparseUpdatePlacement,
 )
-from recir.meta_tensor_init import mark_meta_uniform_init
+from recir.meta_tensor_init import default_embedding_init_bound, mark_meta_uniform_init
 from torchrec.modules.embedding_configs import EmbeddingConfig
 from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor
 
@@ -168,7 +168,7 @@ class InGraphSparseArch(nn.Module):
                 self._feature_to_table[f] = tc.name
             self._table_mode[tc.name] = mode
             # Match the TorchRec EmbeddingCollection init scale
-            init_bound = 1.0 / (tc.num_embeddings**0.5)
+            init_bound = default_embedding_init_bound(tc.num_embeddings)
             if mode in (TableMode.ROWWISE, TableMode.FSDP):
                 # Both are dim-0 sharded -> pad rows to a multiple of the device
                 # count (the FSDP shard count; also the ring-shift block reshape

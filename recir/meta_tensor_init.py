@@ -8,10 +8,32 @@
 import logging
 from typing import Any
 
+import torch
+
 logger: logging.Logger = logging.getLogger(__name__)
 
 _META_INIT_KIND_ATTR: str = "_recir_meta_init_kind"
 _META_INIT_BOUND_ATTR: str = "_recir_meta_init_bound"
+
+
+def default_embedding_init_bound(num_embeddings: int) -> float:
+    """Return the default TorchRec uniform-init bound for an embedding table."""
+    return (1.0 / max(int(num_embeddings), 1)) ** 0.5
+
+
+def initialize_tensor_from_meta_init(
+    tensor: torch.Tensor,
+    kind: str,
+    bound: float,
+) -> torch.Tensor:
+    """Initialize a materialized tensor from a recir meta-init specification."""
+    if kind == "zeros":
+        tensor.zero_()
+    elif kind == "uniform":
+        tensor.uniform_(-bound, bound)
+    else:
+        raise ValueError(f"Unsupported recir meta init kind: {kind}")
+    return tensor
 
 
 def mark_meta_uniform_init(tensor: Any, bound: float) -> None:
