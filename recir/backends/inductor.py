@@ -13,12 +13,9 @@ from __future__ import annotations
 from typing import Any, Sequence, TYPE_CHECKING
 
 from recir.backends.base import Backend, GraphPatch
+from recir.iter_graph_module import IterGraphModule
 from recir.lowering.partial_lower import partial_lower
-from recir.passes import (
-    comm_fusion_with_concat,
-    remove_copy_from_optimizer,
-    schedule_comm_wait,
-)
+from recir.passes import remove_copy_from_optimizer
 from torch import fx, nn
 
 if TYPE_CHECKING:
@@ -28,10 +25,9 @@ if TYPE_CHECKING:
 class InductorBackend(Backend):
     """Lower CUDA-compatible subgraphs to Inductor (Triton kernels).
 
-    Defaults to a stable set of three IterGraph-based optimization passes:
-    communication fusion via concat, communication-wait scheduling, and the
-    optimizer copy-removal pass.  Pass an explicit ``optimize_passes=`` (e.g.
-    ``[]``) to replace this set wholesale.
+    The optimizer-copy removal pass operates on ``IterGraphModule``.
+    Communication scheduling is left to Inductor because pre-AOT graph edits
+    are discarded when ``compile_fx`` retraces the lowered subgraphs.
     """
 
     def __init__(self, **kwargs: Any) -> None:
@@ -39,17 +35,19 @@ class InductorBackend(Backend):
 
     @classmethod
     def default_optimize_passes(cls) -> Sequence[GraphPatch]:
-        return (
-            comm_fusion_with_concat,
-            schedule_comm_wait,
-            remove_copy_from_optimizer,
-        )
+        # Communication scheduling is configured inside Inductor lowering.
+        return (remove_copy_from_optimizer,)
 
     @property
     def uses_iter_graph(self) -> bool:
         return True
 
-    def dispatch(self, gm: fx.GraphModule) -> nn.Module:
+    def dispatch(self, gm: fx.GraphModule | IterGraphModule) -> nn.Module:
+        if isinstance(gm, IterGraphModule):
+            for sub_name in ("setup_gm", "main_gm", "cleanup_gm"):
+                sub_gm = getattr(gm, sub_name)
+                setattr(gm, sub_name, partial_lower(sub_gm))
+            return gm
         return partial_lower(gm)
 
     def validate_with(self, parallel_mode: "ParallelMode") -> None:

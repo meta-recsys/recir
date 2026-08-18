@@ -10,83 +10,208 @@
 
 # pyre-strict
 
-import logging
-from typing import Callable, List, Optional, Tuple
+from typing import Any, Callable, cast, List, Optional, Tuple
 
 import torch
-import torch.utils._pytree as pytree
-from functorch import make_fx
-from recir.lowering.lowering_utils import segment_and_lower
-from torch._inductor.compile_fx import compile_fx_inner
-from torch._inductor.decomposition import select_decomp_table
+from recir.lowering.lowering_utils import segment_and_lower, strip_profiler_nodes
 
 
-logger: logging.Logger = logging.getLogger(__name__)
+def _detach_tensor_args(
+    args: tuple,  # type: ignore[type-arg]
+) -> tuple:  # type: ignore[type-arg]
+    """Detach inputs so the pre-baked forward/backward/optimizer graph uses the
+    AOTAutograd inference path while preserving storage for parameter updates."""
+    return tuple(a.detach() if isinstance(a, torch.Tensor) else a for a in args)
+
+
+def _shape_env_for_subgraph(gm: torch.fx.GraphModule) -> Any:
+    from torch.fx.experimental.symbolic_shapes import ShapeEnv
+
+    shape_env = ShapeEnv()
+    next_unbacked = 0
+    next_unbacked_float = 0
+    for node in gm.graph.nodes:
+        value = node.meta.get("val")
+        if value is None:
+            continue
+        graph_mode = torch._guards.detect_fake_mode((value,))
+        graph_shape_env = (
+            graph_mode.shape_env
+            if graph_mode is not None and graph_mode.shape_env is not None
+            else None
+        )
+        if graph_shape_env is None and isinstance(
+            value,
+            (torch.SymInt, torch.SymFloat, torch.SymBool),
+        ):
+            graph_shape_env = value.node.shape_env
+        if graph_shape_env is None:
+            continue
+        next_unbacked = max(
+            next_unbacked,
+            graph_shape_env.unbacked_symint_counter,
+        )
+        next_unbacked_float = max(
+            next_unbacked_float,
+            graph_shape_env.unbacked_symfloat_counter,
+        )
+        for symbol in node.meta.get("unbacked_bindings", {}):
+            value_range = graph_shape_env.var_to_range.get(symbol)
+            if value_range is not None:
+                shape_env._update_var_to_range(symbol, value_range)
+            symbol_stack = graph_shape_env.var_to_stack.get(symbol)
+            if symbol_stack is not None:
+                shape_env.var_to_stack[symbol] = symbol_stack
+    shape_env.unbacked_symint_counter = next_unbacked
+    shape_env.unbacked_symfloat_counter = next_unbacked_float
+    return shape_env
+
+
+def _compile_fx_with_fresh_shape_env(
+    gm: torch.fx.GraphModule,
+    example_inputs: tuple,  # type: ignore[type-arg]
+) -> Callable[..., Any]:
+    """Compile with a ShapeEnv scoped to this lowered subgraph."""
+    from torch._dynamo.source import LocalSource
+    from torch._inductor.compile_fx import compile_fx
+    from torch._subclasses import FakeTensorMode
+    from torch.fx.experimental.symbolic_shapes import (
+        DimDynamic,
+        StatelessSymbolicContext,
+    )
+
+    fake_mode = FakeTensorMode(shape_env=_shape_env_for_subgraph(gm))
+    fake_inputs = []
+    placeholders = (node for node in gm.graph.nodes if node.op == "placeholder")
+    for index, (placeholder, example_input) in enumerate(
+        zip(placeholders, example_inputs)
+    ):
+        graph_input = placeholder.meta.get("val")
+        if not (
+            isinstance(graph_input, torch.Tensor)
+            and isinstance(example_input, torch.Tensor)
+        ):
+            fake_inputs.append(example_input)
+            continue
+        batch_dim_value = placeholder.meta.get("batch_dim")
+        batch_dim: Optional[int] = (
+            batch_dim_value
+            if placeholder.meta.get("is_batch_input")
+            and isinstance(batch_dim_value, int)
+            else None
+        )
+        symbolic_context = StatelessSymbolicContext(
+            dynamic_sizes=[
+                DimDynamic.DYNAMIC
+                if dimension == batch_dim
+                or isinstance(size, torch.SymInt)
+                and size.node.maybe_as_int() is None
+                else DimDynamic.STATIC
+                for dimension, size in enumerate(graph_input.shape)
+            ]
+        )
+        fake_inputs.append(
+            fake_mode.from_tensor(
+                example_input,
+                static_shapes=False,
+                source=LocalSource(f"partial_lower_input_{index}"),
+                symbolic_context=symbolic_context,
+            )
+        )
+
+    with torch._guards.tracing(torch._guards.TracingContext(fake_mode)):
+        return cast(
+            Callable[..., Any],
+            compile_fx(gm, tuple(fake_inputs), ignore_shape_env=True),
+        )
 
 
 class _InductorModule(torch.nn.Module):
     def __init__(self, gm: torch.fx.GraphModule) -> None:
         super().__init__()
         self.gm = gm
-        self.compiled: Optional[Callable[[List[torch.Tensor]], List[torch.Tensor]]] = (
-            None
-        )
+        self.compiled: Optional[Callable[..., Any]] = None
 
     def forward(self, *args: torch.Tensor, tag: str) -> List[torch.Tensor]:
-        # ``make_fx`` pytree-flattens ``*args`` to build ``decomp_gm``'s
-        # placeholders, so the inductor call must receive the flat leaves
-        # (not the raw ``args`` tuple) to keep the placeholder/input
-        # bijection.  ``list(args)`` mis-aligns when any arg is a non-tensor
-        # container (e.g. an empty list from ``_fused_adam[4]`` with
-        # ``amsgrad=False``).
-        flat_tensor_args: List[torch.Tensor] = [
-            x for x in pytree.tree_leaves(args) if isinstance(x, torch.Tensor)
-        ]
+        detached_args = _detach_tensor_args(args)
         if self.compiled is None:
-            inductor_decompositions = select_decomp_table()
-            # TODO: figure out why turning on cudagraphs cause exceptions.
-            decomp_gm = make_fx(self.gm, decomposition_table=inductor_decompositions)(
-                *args
+            has_collectives = any(
+                n.op == "call_function"
+                and hasattr(n.target, "__module__")
+                and "_c10d_functional" in str(n.target)
+                for n in self.gm.graph.nodes
             )
-            # Reset codegen: ``make_fx`` attaches ``_PyTreeCodeGen`` when
-            # ``args`` has any pytree structure, but inductor's
-            # ``GraphLowering.output`` returns ``None``, so the inherited
-            # ``out_spec`` makes ``process_outputs(None)`` blow up in
-            # ``tree_unflatten``.  Inductor manages its own output handling.
-            decomp_gm._graph._codegen = torch.fx.graph.CodeGen()  # pyre-ignore[16, 9]
-            decomp_gm.recompile()
-            logger.info("Lowering subgraph (%s) to Inductor...", tag)
-            self.compiled = compile_fx_inner(
-                decomp_gm,
-                flat_tensor_args,
-                cudagraphs=False,  # pyre-ignore
-            )
-            logger.info("Completed lowering subgraph (%s) to Inductor", tag)
+            if has_collectives:
+                from torch._inductor import config as _inductor_config
+
+                # AOTAutograd retracing discards RecIR's earlier comm fusion, so
+                # re-bucket dense-grad all-reduces inside Inductor.
+                _inductor_config.bucket_all_reduces_fx = "all"
+
+                # Jagged sizes produce rank-local estimates, so estimate-based
+                # scheduling can reorder NCCL calls differently across ranks.
+                _inductor_config.reorder_for_peak_memory = False
+                _ado = _inductor_config.aten_distributed_optimizations
+                _ado.enable_overlap_scheduling = False
+
+            # Replace aten.empty with aten.zeros to avoid uninitialized
+            # memory reads if Inductor reorders ops.
+            for n in self.gm.graph.nodes:
+                if n.op == "call_function" and n.target in (
+                    torch.ops.aten.empty.memory_format,
+                ):
+                    n.target = torch.ops.aten.zeros.default
+                    if "memory_format" in n.kwargs:
+                        n.kwargs = {
+                            k: v for k, v in n.kwargs.items() if k != "memory_format"
+                        }
+            self.gm.recompile()
+
+            self.compiled = _compile_fx_with_fresh_shape_env(self.gm, detached_args)
         with torch.profiler.record_function(tag):
-            assert self.compiled is not None
-            return self.compiled(flat_tensor_args)
+            compiled = self.compiled
+            assert compiled is not None
+            result = compiled(*detached_args)
+            if isinstance(result, (tuple, list)):
+                result = list(result)
+            else:
+                result = [result]
+            return result
+
+
+_INDUCTOR_INCOMPATIBLE_OPS: set[torch._ops.OpOverload] = {
+    torch.ops.aten._fused_adam_.default,
+    torch.ops.aten._fused_adam.default,
+    torch.ops.aten._foreach_add_.Scalar,
+    torch.ops.aten._foreach_add.Scalar,
+}
+
+_INDUCTOR_COMPATIBLE_OPS: set[torch._ops.OpOverload] = {
+    torch.ops.aten._local_scalar_dense.default,
+    torch.ops.aten.native_dropout.default,
+    torch.ops.aten.flatten.using_ints,
+    torch.ops.aten.full_like.default,
+    torch.ops.aten.rand_like.default,
+    torch.ops.aten.sym_size.int,
+    torch.ops.aten.sym_stride.int,
+    torch.ops.aten.select.int,
+    torch.ops.aten.view.default,
+    torch.ops.aten.lift_fresh_copy.default,
+}
 
 
 def _is_inductor_compatible(node: torch.fx.Node) -> Tuple[bool, str]:
-    # `has_tag` is not supported yet
-    # if has_tag(node, "non_lowerable"):
-
-    if node.target in (
-        torch.ops.aten._fused_adam_.default,
-        torch.ops.aten._fused_adam.default,
-        torch.ops.aten._foreach_add_.Scalar,
-        torch.ops.aten._foreach_add.Scalar,
-    ):
+    if node.target in _INDUCTOR_INCOMPATIBLE_OPS:
         return False, "fused adam is not supported yet"
 
-    # TODO(yifu): apparently having a meta kernel is not a necessary
-    # condition for Inductor compatiblity. We should refine the check.
-    # Sneaking this one in for now to support comm_fusion_with_cat.
-    if node.target == torch.ops.aten.flatten.using_ints:
+    if node.target in _INDUCTOR_COMPATIBLE_OPS:
         return True, ""
 
     if isinstance(node.target, torch._ops.OpOverload):
-        if not node.target.has_kernel_for_dispatch_key(torch._C.DispatchKey.Meta):
+        target = node.target
+        if "_c10d_functional" in target.name():
+            return True, ""
+        if not target.has_kernel_for_dispatch_key(torch._C.DispatchKey.Meta):
             return False, f"{node.target} doesn't have a meta kernel registered"
     return True, ""
 
@@ -111,6 +236,7 @@ def partial_lower(
             available in the subgraph call node in the parent graph, as well as the
             label of the profiler block for the subgraph.
     """
+    gm = strip_profiler_nodes(gm)
     return segment_and_lower(
         gm,
         compatibility_fn=_is_inductor_compatible,

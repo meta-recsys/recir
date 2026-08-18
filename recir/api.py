@@ -1634,6 +1634,14 @@ def compile_from_gm(  # noqa: C901 — orchestration: stages 4-8 of the pipeline
     for transform in region_transforms_list:
         transform.finalize_compiled_graph(gm)
 
+    # Stage 5.5: wrap before running passes that use IterGraph-only APIs.
+    if backend.uses_iter_graph:
+        # Local import to avoid pulling IterGraphModule into the
+        # module-import path for callers that don't use this path.
+        from recir.iter_graph_module import IterGraphModule
+
+        gm = cast(fx.GraphModule, IterGraphModule(gm))
+
     # Stage 6: backend-configured optimize passes.  Each pass may rewrite the
     # graph and/or update flat_state.  Some passes accept (gm,) and others
     # accept (gm, flat_state) — dispatch via signature inspection so a
@@ -1676,14 +1684,11 @@ def compile_from_gm(  # noqa: C901 — orchestration: stages 4-8 of the pipeline
         _annotate_fsdp_state_input_sharding(gm, flat_state, final_state_flags)
         _annotate_fsdp_state_output_sharding(gm, flat_state, final_state_flags)
 
-    # Stage 7: optionally wrap in IterGraphModule for cross-iteration passes
-    # and lazy-lowering hooks.
+    # Stage 7: freeze cross-iteration rewrites and initialize extra-output state.
     if backend.uses_iter_graph:
-        # Local import to avoid pulling IterGraphModule into the
-        # module-import path for callers that don't use this path.
         from recir.iter_graph_module import IterGraphModule
 
-        gm = cast(fx.GraphModule, IterGraphModule(gm))
+        cast(IterGraphModule, gm).finalize_setup()
 
     # Stage 8: dispatch (backend.dispatch returns an nn.Module — typically
     # the same gm rewritten as a partial-lowered module, but the contract

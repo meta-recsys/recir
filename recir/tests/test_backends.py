@@ -22,33 +22,18 @@ from recir.backends import (
     XLAShardMapBackend,
 )
 from recir.distributed.parallel_mode import DataParallel, GSPMDParallel
+from recir.iter_graph_module import IterGraphModule
 from recir.lowering.device_state import DeviceStateManager
 from recir.lowering.xla_device_state import XLADeviceStateManager
-from recir.passes import (
-    comm_fusion_with_concat,
-    remove_copy_from_optimizer,
-    schedule_comm_wait,
-)
+from recir.passes import remove_copy_from_optimizer
 
 
 class InductorBackendTest(unittest.TestCase):
     """InductorBackend defaults + customization + behavior."""
 
     def test_inductor_default_optimize_passes(self) -> None:
-        """default_optimize_passes returns the three baseline passes in order."""
-        passes = InductorBackend.default_optimize_passes()
-        self.assertEqual(
-            tuple(passes),
-            (comm_fusion_with_concat, schedule_comm_wait, remove_copy_from_optimizer),
-        )
-
-    def test_inductor_defaults_apply_when_no_kwarg(self) -> None:
-        """Constructing without optimize_passes uses the class defaults."""
         backend = InductorBackend()
-        self.assertEqual(
-            tuple(backend.optimize_passes),
-            (comm_fusion_with_concat, schedule_comm_wait, remove_copy_from_optimizer),
-        )
+        self.assertEqual((remove_copy_from_optimizer,), tuple(backend.optimize_passes))
 
     def test_inductor_custom_optimize_passes_replaces_defaults(self) -> None:
         """Passing optimize_passes= replaces the defaults wholesale (no append)."""
@@ -68,6 +53,32 @@ class InductorBackendTest(unittest.TestCase):
         """InductorBackend requires IterGraph wrapping."""
         backend = InductorBackend()
         self.assertTrue(backend.uses_iter_graph)
+
+    def test_inductor_dispatch_lowers_each_iter_subgraph(self) -> None:
+        iter_gm = IterGraphModule(torch.fx.symbolic_trace(torch.nn.Identity()))
+        original_subgraphs = [
+            iter_gm.setup_gm,
+            iter_gm.main_gm,
+            iter_gm.cleanup_gm,
+        ]
+        lowered_subgraphs = [
+            torch.fx.symbolic_trace(torch.nn.Identity()) for _ in range(3)
+        ]
+
+        with mock.patch(
+            "recir.backends.inductor.partial_lower",
+            side_effect=lowered_subgraphs,
+        ) as lower:
+            result = InductorBackend().dispatch(iter_gm)
+
+        self.assertIs(iter_gm, result)
+        self.assertEqual(
+            [mock.call(subgraph) for subgraph in original_subgraphs],
+            lower.call_args_list,
+        )
+        self.assertIs(lowered_subgraphs[0], iter_gm.setup_gm)
+        self.assertIs(lowered_subgraphs[1], iter_gm.main_gm)
+        self.assertIs(lowered_subgraphs[2], iter_gm.cleanup_gm)
 
     def test_inductor_device_state_manager_is_base(self) -> None:
         """InductorBackend uses the base DeviceStateManager (no XLA host-device transfer)."""
