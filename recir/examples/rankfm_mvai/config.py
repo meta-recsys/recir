@@ -36,10 +36,12 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import logging
 import os
 from dataclasses import dataclass, field
 from typing import Any, Dict, Tuple
 
+from hammer.v2.modules.configs import STUStackConfig
 from hammer.v3.models.udd_fm_v3.batch_loader import BlueReelsVDDFeatureConfig
 from hammer.v3.models.udd_fm_v3.udd_fm_config import (
     BlueReelsVDDModuleConfig,
@@ -70,6 +72,8 @@ __all__ = [
     "build_model_family_config",
     "build_trainer_config",
 ]
+
+logger: logging.Logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # CLI config dataclasses
@@ -117,6 +121,17 @@ class RankFMTrainerConfig:
         )
     )
 
+    # Mean over the padded candidate width instead of the local candidate sum,
+    # which is what light does (its forward omits loss_norm_denom, so the module
+    # falls back to torch.mean). Set this to make the eager loss directly
+    # comparable to a light run. Default False keeps the TPU leg's global-sum
+    # scope. Only meaningful with enable_padding=False.
+    light_loss_norm: bool = False
+
+    # Micro-batches accumulated per optimizer step, so the CPU leg matches a
+    # multi-rank GPU leg's GLOBAL batch without materializing it.
+    grad_accum_steps: int = 1
+
     # Precision. When True, run the dense tower (HSTU + composer + loss matmuls)
     # in bf16 on device via recir.torchax AMP autocast + the HSTU's
     # ``_bf16_training`` activation casts. fp32 master weights are kept (SGD over
@@ -134,6 +149,10 @@ class RankFMTrainerConfig:
     # prepare ahead so file load, decompression, slicing, and ID remapping overlap
     # the device train_step. 0 disables prefetch (synchronous load).
     data_prefetch_buffer: int = 2
+
+    # Initial weights from //hammer/v3/models/udd_fm_v3/parity:export_parity_checkpoint.
+    # Empty (default) = normal initialisation.
+    init_state_dict_path: str = ""
 
     # Embedding backend: "cpu" (torchrec DMP) | "tpu" (JAX/SparseCore).
     # Validated by ``build_embedding_backend`` in ``embedding/__init__.py``.
@@ -177,6 +196,12 @@ class RankFMTrainerConfig:
     # batch's metrics are dropped — only the host<->device sync cadence changes.
     # 1 = pull every step (no pipelining).
     pull_metrics_every: int = 10
+
+    # How often the metrics reporter emits NE/loss, in steps. Set to 1 to get a
+    # point per step, which a short converging run needs -- at the default 10 a
+    # 30-step run yields 3 points, which is not a curve. Must match the light
+    # leg's METRICS_REPORT_INTERVAL for the two curves to line up.
+    metrics_report_interval: int = 10
 
     # Profiling
     profile_start_step: int = -1
@@ -228,6 +253,10 @@ class RankFMModelArgs:
     # key takes 1.  Lower than ``max_uih_seq_len`` shrinks the HSTU dense buffer
     seq_ro_per_sample_budget: int = 24
 
+    # Build the model from the PROD xsurface provider rather than the standalone
+    # udd_fm defaults.
+    prod_faithful: bool = False
+
 
 # ---------------------------------------------------------------------------
 # Optimizer-config builder
@@ -235,7 +264,14 @@ class RankFMModelArgs:
 
 
 def build_optimizer_config() -> RecOptimizerConfig:
-    """Return the optimizer config carried by the canonical model-family config."""
+    from recir.examples.rankfm_mvai.prod_config_artifact import (
+        artifact_path,
+        load_prod_optimizer_config,
+    )
+
+    path = artifact_path()
+    if path is not None:
+        return load_prod_optimizer_config(path)
     return ConfigProvider().create_config().optimizer_config
 
 
@@ -244,22 +280,39 @@ def build_optimizer_config() -> RecOptimizerConfig:
 # ---------------------------------------------------------------------------
 
 
+def _load_prod_module_config() -> Tuple[
+    BlueReelsVDDModuleConfig, BlueReelsVDDFeatureConfig
+]:
+    from recir.examples.rankfm_mvai.prod_config_artifact import (
+        artifact_path,
+        build_prod_config_live,
+        load_prod_config,
+    )
+
+    path = artifact_path()
+    return load_prod_config(path) if path is not None else build_prod_config_live()
+
+
 def build_module_config(
     model_args: RankFMModelArgs,
     *,
     enable_padding: bool,
 ) -> Tuple[BlueReelsVDDModuleConfig, BlueReelsVDDFeatureConfig]:
     """CLI args -> fully configured (module_config, feature_config)."""
-    config: RecModelFamilyConfig = ConfigProvider().create_config()
-    module_config: BlueReelsVDDModuleConfig = config.module_config  # pyre-ignore[9]
-    feature_config: BlueReelsVDDFeatureConfig = config.feature_config  # pyre-ignore[9]
+    # Declared up front so both branches narrow to the same types; without this
+    # pyre unions the prod-faithful branch with RecModelFamilyConfig's loosely
+    # typed attributes and widens everything downstream to `object`.
+    module_config: BlueReelsVDDModuleConfig
+    feature_config: BlueReelsVDDFeatureConfig
+    if model_args.prod_faithful:
+        module_config, feature_config = _load_prod_module_config()
+    else:
+        config: RecModelFamilyConfig = ConfigProvider().create_config()
+        module_config = config.module_config  # pyre-ignore[9]
+        feature_config = config.feature_config  # pyre-ignore[9]
 
-    # Disable the DCN inter-arch for the OSS/TPU bench. Building it imports
-    # mrs.ranking.interaction.dense_sparse (the hpc.torchrec chain), which is NOT
-    # present in the OSS rankfm TPU image, so model construction crashes. None is
-    # the standalone path (raw [ue, ie, ue*ie] interaction; see
-    # udd_fm_train_v3._use_inter_arch) and is all the embedding-perf bench needs.
-    module_config.inter_arch_type = None
+    if not model_args.prod_faithful:
+        module_config.inter_arch_type = None
 
     # Cap embedding-table hash sizes (hash_size_cap <= 0 disables capping).
     if model_args.hash_size_cap > 0:
@@ -282,21 +335,29 @@ def build_module_config(
                 feature_hash_sizes[feat] = emb.num_embeddings
     feature_config.feature_hash_sizes = feature_hash_sizes
 
-    # STU stack trim.
-    if len(module_config.stu_stack_configs) >= 1:
-        module_config.stu_stack_configs[
-            0
-        ].stu_configs = module_config.stu_stack_configs[0].stu_configs[
-            : model_args.l1_num_layers
-        ]
-    if len(module_config.stu_stack_configs) >= 2:
-        module_config.stu_stack_configs[
-            1
-        ].stu_configs = module_config.stu_stack_configs[1].stu_configs[
-            : model_args.l2_num_layers
-        ]
+    if not model_args.prod_faithful:
+        _apply_bench_shape_overrides(module_config, feature_config, model_args)
+    if model_args.disable_seq_len_sampling:
+        module_config.hstu_seq_len_sampling_configs = None
 
-    # Sequence shapes.
+    # Static-shape mode (TPU/GSPMD path).
+    if enable_padding:
+        _apply_static_shape_mode(module_config, model_args)
+
+    return module_config, feature_config
+
+
+def _apply_bench_shape_overrides(
+    module_config: BlueReelsVDDModuleConfig,
+    feature_config: BlueReelsVDDFeatureConfig,
+    model_args: RankFMModelArgs,
+) -> None:
+    """Shrink the standalone config down to the CLI's bench shapes."""
+    if len(module_config.stu_stack_configs) >= 1:
+        _trim_stu_stack(module_config.stu_stack_configs[0], model_args.l1_num_layers)
+    if len(module_config.stu_stack_configs) >= 2:
+        _trim_stu_stack(module_config.stu_stack_configs[1], model_args.l2_num_layers)
+
     module_config.hstu_max_seq_len = model_args.max_uih_seq_len
     module_config.hstu_l2_max_seq_len = (
         model_args.l2_max_seq_len
@@ -304,24 +365,72 @@ def build_module_config(
         else max(1, model_args.max_uih_seq_len // 4)
     )
     module_config.hstu_max_output_len = model_args.num_candidates
-
-    if model_args.disable_seq_len_sampling:
-        module_config.hstu_seq_len_sampling_configs = None
-
-    # Static-shape mode (TPU/GSPMD path).
-    if enable_padding:
-        module_config.static_shape_mode = True
-        module_config.static_nro_per_sample_budget = model_args.num_candidates
-        module_config.static_ro_per_sample_budgets = _build_static_ro_budgets(
-            module_config, model_args.seq_ro_per_sample_budget
-        )
+    _sync_l2_max_seq_len(module_config)
 
     # Sync feature config with the test constants so randgen produces
     # shapes that match the padding budgets and override expectations.
     feature_config.history_len = model_args.max_uih_seq_len
     feature_config.num_candidates_per_request = model_args.num_candidates
 
-    return module_config, feature_config
+
+def _apply_static_shape_mode(
+    module_config: BlueReelsVDDModuleConfig,
+    model_args: RankFMModelArgs,
+) -> None:
+    """Pin the padding budgets the TPU/GSPMD path needs.
+
+    In prod-faithful mode the budgets follow the config's own sequence shapes;
+    otherwise they come from the CLI.
+    """
+    module_config.static_shape_mode = True
+    if model_args.prod_faithful:
+        nro_budget = module_config.hstu_max_output_len
+        ro_budget = module_config.hstu_max_seq_len
+    else:
+        nro_budget = model_args.num_candidates
+        ro_budget = model_args.seq_ro_per_sample_budget
+    module_config.static_nro_per_sample_budget = nro_budget
+    module_config.static_ro_per_sample_budgets = _build_static_ro_budgets(
+        module_config, ro_budget
+    )
+
+
+def _trim_stu_stack(stack: STUStackConfig, num_layers: int) -> None:
+    """Truncate a STU stack to ``num_layers``, complaining if it is shorter.
+
+    Asking for more layers than the base config defines used to silently yield
+    the shorter list, so a run requesting prod's 11 L2 layers actually trained
+    10 (``_build_default_stu_stack_configs`` builds 8 L1 / 10 L2). Warn instead
+    of raising: several manifests already pass 11 and have always run 10, so
+    raising would break them while changing no numerics.
+    """
+    available = len(stack.stu_configs)
+    if num_layers > available:
+        logger.warning(
+            "[config] STU stack %r has only %d layers but %d were requested; "
+            "running with %d. The standalone udd_fm config caps L1 at 8 and L2 "
+            "at 10 -- use --prod_faithful to get prod's real stack depths.",
+            stack.name,
+            available,
+            num_layers,
+            available,
+        )
+        return
+    stack.stu_configs = stack.stu_configs[:num_layers]
+
+
+def _sync_l2_max_seq_len(module_config: BlueReelsVDDModuleConfig) -> None:
+    """Mirror ``hstu_l2_max_seq_len`` into the L2 stack's constructor kwargs.
+
+    ``SingleSeqL2HSTU`` reads the value from ``additional_kwargs`` while
+    ``MoTPreprocessor`` reads it off the module config, so leaving the kwarg at
+    its hardcoded 512 makes the two disagree whenever the config field moves.
+    """
+    for stack in module_config.stu_stack_configs:
+        if "l2_max_seq_len" in stack.additional_kwargs:
+            stack.additional_kwargs["l2_max_seq_len"] = (
+                module_config.hstu_l2_max_seq_len
+            )
 
 
 def _build_static_ro_budgets(
@@ -455,19 +564,13 @@ def build_trainer_config(
 ) -> RecTrainerConfig:
     """CLI trainer knobs -> a RecTrainerConfig for the TPU/recir path.
 
-    Key choices:
-      * ``SystemConfig(use_gpu=False)`` forces ``RecTrainer.__init__`` onto its
-        CPU/gloo device branch (trainer.py:81-83). recir places dense compute
-        on TPU via ``jax.devices()`` regardless of the torch device being cpu
-        -- this matches the model built on torch.device("cpu") while recir/JAX
-        places compute on TPU.
-      * ``data_source_config`` is a ``RandomDataSourceConfig`` purely so the
-        QPS metric in RecTrainer._create_metrics_reporter has a positive
-        ``batch_size`` (= local_batch_size). The actual training data is
-        produced by RankFMMvaiModelFamily.create_train_datapipe, which reuses
-        the synthetic / barnfs-replay path.
-      * ``max_steps`` is enforced by the data pipe (RecTrainer loops until the
-        dataiter raises StopIteration); see model_family.create_train_datapipe.
+    Three choices worth knowing:
+      * ``use_gpu=False`` puts RecTrainer on its CPU/gloo branch; recir still
+        places dense compute on TPU through jax.devices().
+      * ``data_source_config`` is Random purely so the QPS metric has a positive
+        batch_size. Real data comes from ``create_train_datapipe``.
+      * ``max_steps`` is enforced by the data pipe, which stops the trainer by
+        raising StopIteration.
     """
     data_source_config = RandomDataSourceConfig(
         batch_size=trainer_cfg.local_batch_size,
@@ -493,7 +596,10 @@ def build_trainer_config(
     return RecTrainerConfig(
         data_source_config=data_source_config,
         system_config=SystemConfig(use_gpu=False, dist_backend="gloo"),
-        metrics_config=MetricsConfig(report_interval=10, tensorboard_logger=True),
+        metrics_config=MetricsConfig(
+            report_interval=trainer_cfg.metrics_report_interval,
+            tensorboard_logger=True,
+        ),
         model_config_module=("hammer.v3.models.udd_fm_v3.udd_fm_config"),
         checkpoint_config=checkpoint_config,
     )
