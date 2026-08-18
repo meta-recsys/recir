@@ -38,6 +38,7 @@ import torch.nn as nn
 import torch.utils._pytree as pytree
 from functorch import make_fx
 from recir.batch_dim_propagation import propagate_batch_input_meta
+from recir.compile_utils import _enable_compile
 from recir.decompositions import DEDUP_TARGETS, SPMD_DECOMP_TABLE
 from recir.distributed.data_parallel import (
     collectives_insertion,
@@ -54,7 +55,6 @@ from recir.distributed.parallel_mode import (
 from recir.lowering.device_state import DeviceStateManager
 from recir.region_transforms import (
     _apply_region_transforms,
-    _discover_autograd_functions,
     _discover_called_modules,
     _find_forward_roots,
     RegatherTransform,
@@ -214,29 +214,6 @@ def _rematerialize_optimizer(
 
 
 aten = torch.ops.aten  # pyre-ignore
-
-
-@contextmanager
-def _enable_compile() -> Generator[None, None, None]:
-    # The return value of torch._utils.is_compiling changes optimizer behavior.
-    # We need that function to return True to include optimizer in the graph.
-    # See: https://github.com/pytorch/pytorch/blob/a524123c91ab399c9dd6882c1189596dd77e7734/torch/optim/optimizer.py#L41
-    def f_true() -> bool:
-        return True
-
-    orig_is_compiling_code = torch._utils.is_compiling.__code__  # pyre-ignore[16]
-    torch._utils.is_compiling.__code__ = f_true.__code__  # pyre-ignore[16]
-    # PyTorch also checks torch.compiler.is_compiling() which
-    # reads _is_compiling_flag.  Setting this flag lets the optimizer skip
-    # device assertions for capturable mode and avoid .item() calls in
-    # _get_value() during tracing.
-    orig_compiling_flag = torch.compiler._is_compiling_flag  # pyre-ignore[16]
-    torch.compiler._is_compiling_flag = True  # pyre-ignore[16]
-    try:
-        yield
-    finally:
-        torch._utils.is_compiling.__code__ = orig_is_compiling_code  # pyre-ignore[16]
-        torch.compiler._is_compiling_flag = orig_compiling_flag  # pyre-ignore[16]
 
 
 def _dedup_collectives(gm: fx.GraphModule) -> fx.GraphModule:
@@ -872,12 +849,11 @@ def _finalize_graph(
 class _RegionDiscovery:
     """Result of `_discover_for_region_transforms`.
 
-    Holds the called-module map and the autograd-function leaves discovered
-    by running the train step under FakeTensorMode hooks.
+    Holds the called-module map (used to find forward roots) built by running
+    the train step under FakeTensorMode hooks.
     """
 
     called_modules: OrderedDict[str, Tuple[nn.Module, Tuple[Any, ...], Dict[str, Any]]]
-    autograd_function_leaves: set[type]  # pyre-fixme[24]
 
 
 def _discover_for_region_transforms(
@@ -888,7 +864,7 @@ def _discover_for_region_transforms(
     *,
     mod: Optional[nn.Module] = None,
 ) -> Optional[_RegionDiscovery]:
-    """Run `_discover_called_modules` and `_discover_autograd_functions`.
+    """Run `_discover_called_modules` to find the forward roots.
 
     Returns ``None`` (no-op) when ``transforms`` is empty.  When ``mod`` is
     not provided the first :class:`nn.Module` in ``args``/``kwargs`` is used.
@@ -903,22 +879,20 @@ def _discover_for_region_transforms(
         assert mod is not None, (
             "region_transforms requires an nn.Module in the arguments"
         )
-    return _RegionDiscovery(
-        called_modules=_discover_called_modules(
+    # Run discovery under the SAME conditions as the real trace: a ShapeEnv (so
+    # custom ops with data-dependent output shapes can mint SymInts via
+    # new_dynamic_size() instead of raising DynamicOutputShapeException) and the
+    # compile flag (so is_compiling()-gated asserts are skipped). The throwaway
+    # ShapeEnv keeps the real trace's ShapeEnv unpolluted.
+    with _enable_compile():
+        called_modules = _discover_called_modules(
             mod,
-            FakeTensorMode(allow_non_fake_inputs=True),
+            FakeTensorMode(allow_non_fake_inputs=True, shape_env=ShapeEnv()),
             func,
             *args,
             **kwargs,
-        ),
-        autograd_function_leaves=_discover_autograd_functions(
-            mod,
-            FakeTensorMode(allow_non_fake_inputs=True),
-            func,
-            *args,
-            **kwargs,
-        ),
-    )
+        )
+    return _RegionDiscovery(called_modules=called_modules)
 
 
 def _enter_region_transform_contexts(
@@ -954,7 +928,6 @@ def _enter_region_transform_contexts(
                 transforms,
                 fake_mode,
                 _parametrize_cm_factories=cm_factories,
-                _autograd_function_leaves=discovery.autograd_function_leaves,
                 fake_kwargs=root_fake_kwargs,
             )
         )
