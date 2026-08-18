@@ -26,7 +26,7 @@ from recir.batch_dim_propagation import (
 from recir.distributed.sharding_spec import get_state_layout
 from recir.lowering.lowering_utils import segment_and_lower
 from recir.lowering.op_swap import OpSwapRegistry, swap_ops
-from recir.meta_tensor_init import get_meta_init_spec
+from recir.meta_tensor_init import default_embedding_init_bound, get_meta_init_spec
 from recir.torchax.ops.mappings import t2j
 
 try:
@@ -157,7 +157,7 @@ def _materialize_meta_fsdp_tensor(tensor: Any, mesh: Any) -> Any:
         return jax.ShapeDtypeStruct(global_shape, jdtype, sharding=sharding)
     rows_per_device = global_shape[0] // num_global
     init_kind, bound = get_meta_init_spec(
-        tensor, 1.0 / float(global_shape[0] or 1) ** 0.5
+        tensor, default_embedding_init_bound(global_shape[0])
     )
 
     # Bind statics as default args (not closure captures) to satisfy
