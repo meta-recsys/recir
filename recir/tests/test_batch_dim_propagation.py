@@ -811,3 +811,101 @@ class PropagateFSDPShardedMetaTest(unittest.TestCase):
         propagate_fsdp_sharded_meta(fx.GraphModule(torch.nn.Module(), graph))
 
         self.assertFalse(flipped.meta.get("is_fsdp_sharded", False))
+
+
+class StackCatPropagationTest(unittest.TestCase):
+    """``stack`` inserts an axis; ``cat`` does not.
+
+    They shared one rule -- "batch_dim unchanged" -- which is right for cat and
+    wrong for stack. A per-task ``stack`` of [batch] vectors then claimed the
+    INSERTED task axis was the batch axis, and _jit_gspmd sharded the task count
+    across the mesh. In the udd_fm graph that surfaced as jax refusing to split
+    a 105-long axis 8 ways; with a task count that divides the mesh it would
+    instead have sharded tasks silently and computed the loss over a slice of
+    them on each device.
+    """
+
+    @staticmethod
+    def _run(graph: fx.Graph) -> None:
+        propagate_batch_input_meta(fx.GraphModule(torch.nn.Module(), graph))
+
+    def test_stack_at_dim0_pushes_batch_to_dim1(self) -> None:
+        """The failing shape, reduced: N vectors of [batch] -> [N, batch]."""
+        graph = fx.Graph()
+        a = _make_placeholder(graph, "a", torch.empty(10400), batch_dim=0)
+        b = _make_placeholder(graph, "b", torch.empty(10400), batch_dim=0)
+        stacked = graph.call_function(torch.ops.aten.stack.default, args=([a, b], 0))
+        stacked.meta["val"] = torch.empty(2, 10400)
+        graph.output(stacked)
+
+        self._run(graph)
+
+        self.assertTrue(stacked.meta["is_batch_input"])
+        self.assertEqual(stacked.meta["batch_dim"], 1)
+
+    def test_stack_after_the_batch_axis_leaves_it_alone(self) -> None:
+        graph = fx.Graph()
+        a = _make_placeholder(graph, "a", torch.empty(520, 8), batch_dim=0)
+        b = _make_placeholder(graph, "b", torch.empty(520, 8), batch_dim=0)
+        stacked = graph.call_function(torch.ops.aten.stack.default, args=([a, b], 1))
+        stacked.meta["val"] = torch.empty(520, 2, 8)
+        graph.output(stacked)
+
+        self._run(graph)
+
+        self.assertEqual(stacked.meta["batch_dim"], 0)
+
+    def test_stack_at_the_batch_axis_shifts_it(self) -> None:
+        """Inserting AT the batch axis pushes batch right, same as inserting
+        before it -- the new axis takes that position."""
+        graph = fx.Graph()
+        a = _make_placeholder(graph, "a", torch.empty(4, 520), batch_dim=1)
+        b = _make_placeholder(graph, "b", torch.empty(4, 520), batch_dim=1)
+        stacked = graph.call_function(torch.ops.aten.stack.default, args=([a, b], 1))
+        stacked.meta["val"] = torch.empty(4, 2, 520)
+        graph.output(stacked)
+
+        self._run(graph)
+
+        self.assertEqual(stacked.meta["batch_dim"], 2)
+
+    def test_stack_with_a_negative_dim_counts_from_the_output_rank(self) -> None:
+        """dim=-1 on 1-D inputs is the LAST axis of the 2-D output, i.e. 1 --
+        normalizing against the input rank instead would read it as 0 and move
+        the batch axis the wrong way."""
+        graph = fx.Graph()
+        a = _make_placeholder(graph, "a", torch.empty(520), batch_dim=0)
+        b = _make_placeholder(graph, "b", torch.empty(520), batch_dim=0)
+        stacked = graph.call_function(torch.ops.aten.stack.default, args=([a, b], -1))
+        stacked.meta["val"] = torch.empty(520, 2)
+        graph.output(stacked)
+
+        self._run(graph)
+
+        self.assertEqual(stacked.meta["batch_dim"], 0)
+
+    def test_stack_defaults_to_dim0(self) -> None:
+        graph = fx.Graph()
+        a = _make_placeholder(graph, "a", torch.empty(520), batch_dim=0)
+        stacked = graph.call_function(torch.ops.aten.stack.default, args=([a],))
+        stacked.meta["val"] = torch.empty(1, 520)
+        graph.output(stacked)
+
+        self._run(graph)
+
+        self.assertEqual(stacked.meta["batch_dim"], 1)
+
+    def test_cat_keeps_the_batch_axis_where_it_is(self) -> None:
+        """cat preserves rank, so the batch axis does not move -- including the
+        jagged paths that concatenate token blocks ALONG it, which stay tagged
+        on purpose rather than falling back to a replicated activation."""
+        graph = fx.Graph()
+        a = _make_placeholder(graph, "a", torch.empty(520, 8), batch_dim=0)
+        b = _make_placeholder(graph, "b", torch.empty(520, 8), batch_dim=0)
+        catted = graph.call_function(torch.ops.aten.cat.default, args=([a, b], 0))
+        catted.meta["val"] = torch.empty(1040, 8)
+        graph.output(catted)
+
+        self._run(graph)
+
+        self.assertEqual(catted.meta["batch_dim"], 0)
