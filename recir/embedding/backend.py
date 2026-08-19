@@ -28,6 +28,7 @@ import torch
 import torch.nn as nn
 from minimal_viable_ai.core.model_family_api.optimizer_configs import OptimConfig
 from torchrec.modules.embedding_configs import EmbeddingConfig
+from torchrec.optim.keyed import KeyedOptimizer
 
 
 class SparseUpdatePlacement(enum.Enum):
@@ -45,6 +46,18 @@ class SparseOptimizerRuntime:
     config: OptimConfig
     optimizer: torch.optim.Optimizer | None = None
     lr_buffer: torch.Tensor | None = None
+    # BACKEND_FUSED only: the CombinedOptimizer gathering the fused TBEs. It does
+    # NOT perform the update -- the backend does that inside backward. Kept
+    # separate from ``optimizer`` on purpose: a BACKEND_FUSED runtime must not
+    # own an update optimizer, but it can own the handle that drives the LR.
+    # This is the only handle to the TBEs' param_groups, and zero_grad()/step()
+    # are what push param_groups[0]["lr"] into FBGEMM, so a leg that wants a
+    # sparse LR schedule writes the rate here and then calls one of them BEFORE
+    # backward (see EagerCPUStep._push_sparse_lr); a rate pushed afterwards
+    # applies one step late. Carried because setup() returns dmp.module, not the
+    # DMP, and the CombinedOptimizer is assembled in DMP.__init__ -- nothing
+    # downstream could rebuild it.
+    fused_optimizer: KeyedOptimizer | None = None
 
     def __post_init__(self) -> None:
         if (
@@ -57,9 +70,15 @@ class SparseOptimizerRuntime:
             and self.optimizer is not None
         ):
             raise ValueError("A backend-fused sparse runtime cannot own an optimizer.")
-        if self.config.lr_warmup_schedule and self.lr_buffer is None:
+        if (
+            self.config.lr_warmup_schedule
+            and self.lr_buffer is None
+            and self.fused_optimizer is None
+        ):
             raise NotImplementedError(
-                "This backend cannot apply the configured sparse LR schedule."
+                "This backend cannot apply the configured sparse LR schedule: it "
+                "supplied neither an LR buffer (compiled-optimizer path) nor a "
+                "fused optimizer (backend-fused path)."
             )
 
 

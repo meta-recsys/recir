@@ -538,6 +538,10 @@ def build_model_family_config(
     the (reused) rankfm data path consumes.
     """
     base_config: RecModelFamilyConfig = ConfigProvider().create_config()
+    # Needs the CPU embedding backend's sparse-warmup support (cpu.py
+    # _build_sparse_warmup); without it SparseOptimizerRuntime rejects a
+    # schedule outright.
+    base_config.optimizer_config = build_optimizer_config()
 
     module_config: BlueReelsVDDModuleConfig
     feature_config: BlueReelsVDDFeatureConfig

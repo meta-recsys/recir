@@ -33,7 +33,6 @@ to be exactly those -- a new divergence fails rather than being tolerated.
 
 from __future__ import annotations
 
-import copy
 import dataclasses
 import io
 import os
@@ -101,7 +100,7 @@ from recir.examples.rankfm_mvai.config import (
     _load_prod_module_config,
     _sync_l2_max_seq_len,
     build_module_config,
-    ConfigProvider as StandaloneUddFmConfigProvider,
+    build_optimizer_config,
     RankFMModelArgs,
     RankFMTrainerConfig,
 )
@@ -120,8 +119,8 @@ from recir.examples.rankfm_mvai.rankfm_embedding_backends import build_embedding
 from recir.examples.rankfm_mvai.rankfm_model_utils import build_model_from_config
 from torchrec.distributed.train_pipeline import TrainPipelineBase
 from torchrec.modules.embedding_modules import EmbeddingCollection
-from torchrec.optim.keyed import KeyedOptimizerWrapper
-from torchrec.optim.warmup import _get_multiplier, _lr_stages
+from torchrec.optim.keyed import CombinedOptimizer, KeyedOptimizerWrapper
+from torchrec.optim.warmup import _get_multiplier, _lr_stages, WarmupOptimizer
 
 # export_prod_config reaches the fork with importlib, so autodeps cannot see it
 # and strips the deps on every run; without them the export raises "no
@@ -647,6 +646,11 @@ class ForwardParityTest(TestCase):
 # reason the test exists. bf16 is off on both legs here, so the honest bar is
 # fp32 accumulation-order noise, not the 3.9e-3 bf16 epsilon.
 _GRAD_L2_RTOL: float = float(os.environ.get("PARITY_GRAD_RTOL", "0.02"))
+# The two legs reach the fused tables through different code -- light through
+# torchrec's WarmupOptimizer, recir by copying the shared controller's buffer
+# into the same param_group -- so the rate agrees exactly and only float
+# accumulation order is left.
+_EMB_UPDATE_RTOL: float = 0.01
 
 # Which denominator the recir leg passes as world_candidate_sum. True mirrors
 # --light_loss_norm (None -> _candidate_axis_mean falls back to torch.mean,
@@ -687,25 +691,6 @@ def _embedding_collection(model: torch.nn.Module) -> Tuple[str, Any]:
     ]
     assert len(matches) == 1, f"expected one EmbeddingCollection, found {matches}"
     return matches[0]
-
-
-def _sparse_config_at(cfg: OptimConfig, lr: float) -> OptimConfig:
-    """``cfg`` with its LR replaced by the effective one, schedule dropped.
-
-    ``CPUEmbeddingBackend.setup`` reads the rate off the config, so each leg passes
-    its own effective rate rather than the test copying the setup logic. Prod warms
-    the light leg's sparse LR up from 0.1x while recir's carries no schedule, and
-    that difference is under test.
-
-    The schedule is cleared because this backend REFUSES one -- it raises whenever a
-    sparse ``lr_warmup_schedule`` is set with no LR buffer, and the CPU path never
-    has a buffer. Costless for one step: torchrec fixes the iteration-0 LR in the
-    constructor, so a baked-in ``lr * multiplier(0)`` is what prod would apply.
-    """
-    out = copy.copy(cfg)
-    out.lr = lr
-    out.lr_warmup_schedule = []
-    return out
 
 
 def _capture_param_grads(
@@ -807,7 +792,7 @@ def _build_light_leg(
     setup = build_embedding_backend("cpu").setup(
         model,
         _embedding_collection(model)[1].embedding_configs(),
-        _sparse_config_at(sparse_cfg, sparse_lr),
+        sparse_cfg,
         torch.device("cpu"),
         1,
     )
@@ -839,8 +824,30 @@ def _build_light_leg(
     opt = _apply_optimizer_wrappers(
         KeyedOptimizerWrapper(dense_named, factory), dense_cfg, DENSE_OPTIM_PREFIX
     )
+    # Combine dense + sparse warmup, which is the shape prod's RecOptimizer has
+    # (optimizer.py:1618-1786: a CombinedOptimizer over the warmup-wrapped fused
+    # embedding optimizers plus the dense one). It matters beyond tidiness:
+    # TrainPipelineBase steps whatever optimizer it is handed, and a sparse
+    # warmup nobody steps freezes at its iteration-0 LR instead of ramping.
+    fused = setup.sparse_runtime.fused_optimizer
+    sparse_cfg_here = setup.sparse_runtime.config
+    sparse_warmup = (
+        WarmupOptimizer(
+            fused,
+            list(sparse_cfg_here.lr_warmup_schedule),
+            lr=sparse_cfg_here.lr,
+            param_name="__sparse_warmup",
+        )
+        if fused is not None and sparse_cfg_here.lr_warmup_schedule
+        else None
+    )
+    stepped: Any = (
+        opt
+        if sparse_warmup is None
+        else CombinedOptimizer([("", opt), ("", sparse_warmup)])
+    )
     pipeline = _LossCapturingPipeline(
-        model=wrapper, optimizer=opt, device=torch.device("cpu")
+        model=wrapper, optimizer=stepped, device=torch.device("cpu")
     )
 
     def run() -> torch.Tensor:
@@ -869,13 +876,11 @@ def _build_recir_leg(model: torch.nn.Module, batch: Any) -> _Leg:
     pipeline class itself is unimportable here (it subclasses a fork-only base), but
     its numerics do not depend on that.
 
-    The sparse optimizer config is the standalone udd_fm provider's -- the one the
-    leg really uses, since ``build_model_family_config`` leaves it alone.
+    The sparse optimizer config comes from ``build_optimizer_config``, the same
+    call the leg makes, so the test cannot drift from what the leg gets.
     """
     trainer_cfg = RankFMTrainerConfig()
-    sparse_cfg: OptimConfig = (
-        StandaloneUddFmConfigProvider().create_config().optimizer_config.sparse.default
-    )
+    sparse_cfg: OptimConfig = build_optimizer_config().sparse.default
     backend = build_embedding_backend("cpu")
     setup = backend.setup(
         model,
@@ -886,16 +891,23 @@ def _build_recir_leg(model: torch.nn.Module, batch: Any) -> _Leg:
     )
     dense_named = dict(setup.dense_named_parameters)
 
+    # Same shape as the leg: ONE controller drives both LRs, and the fused side
+    # reads its rate off a plain buffer this copies into param_groups.
+    sparse_lr_buffer = torch.zeros((), dtype=torch.float32)
     tensor_lr_opt, warmup = setup_dense_optimizer_and_warmup(
         setup.model,
         list(dense_named.values()),
         trainer_cfg.dense_optimizer_config,
         torch.device("cpu"),
+        sparse_cfg=setup.sparse_runtime.config,
+        sparse_lr_buffer=sparse_lr_buffer,
     )
     step = EagerCPUStep.from_parts(
         setup.model,
         tensor_lr_opt,
         warmup,
+        fused_opt=setup.sparse_runtime.fused_optimizer,
+        sparse_lr_buffer=sparse_lr_buffer,
         light_loss_norm=_LIGHT_LOSS_NORM,
         # One dump batch, one rank: accumulation is out of scope here.
         grad_accum_steps=1,
@@ -907,11 +919,7 @@ def _build_recir_leg(model: torch.nn.Module, batch: Any) -> _Leg:
         run=lambda: step.run_step([batch])[0],
         param_names=set(dense_named),
         dense_lr=float(step.lr_buffer.item()),
-        # No warmup multiplier on this leg: the config carries no
-        # lr_warmup_schedule, and the CPU backend builds a DENSE-ONLY
-        # WarmupController (sparse_lr_buffer is None, model_family.py:351-355),
-        # so nothing scales it.
-        sparse_lr=sparse_cfg.lr,
+        sparse_lr=_warmup_lr(sparse_cfg),
     )
 
 
@@ -1137,23 +1145,12 @@ class TwoModelOneStepParityTest(TestCase):
         model_a = wrapper._impl
         self._prepare(model_a)
 
-        # Path B: built the way the recir CPU-eager leg builds it.
-        #
-        # Via the ARTIFACT, because that is the branch the cluster takes. Inside
-        # the TPU image the full //minimal_viable_ai chain is absent -- its buck
-        # closure is ~1.15M targets and it is rooted in the very file mvai_cloud
-        # forked -- so _load_prod_module_config reads a field-by-field
-        # translated .pt instead of building the config live
-        # (prod_config_artifact.py:1-42). Exercising that branch here also turns
+        # Path B: built the way the recir CPU-eager leg builds it, from the
+        # ARTIFACT -- setUp points PROD_CONFIG_ARTIFACT at one for the whole
+        # test, which is the branch the cluster takes. Exercising it also turns
         # the config comparison below into a real check: with both legs on the
         # live path it compared two objects the same code had just produced.
-        with tempfile.TemporaryDirectory() as tmp:
-            artifact = os.path.join(tmp, "prod_cfg.pt")
-            export_prod_config(artifact)
-            with unittest.mock.patch.dict(os.environ, {ARTIFACT_PATH_ENV: artifact}):
-                recir_module_config = _recir_module_config(
-                    disable_seq_len_sampling=True
-                )
+        recir_module_config = _recir_module_config(disable_seq_len_sampling=True)
         # The same two clamps as path A: without the seq-len one, path B builds
         # sequences from prod's full 3042-token history against path A's
         # truncated one and the comparison is meaningless (and does not finish).
@@ -1223,8 +1220,27 @@ class TwoModelOneStepParityTest(TestCase):
                 world_size=1,
                 rank=0,
             )
+        # Point the recir leg at a prod config ARTIFACT for the whole test,
+        # because that is what the cluster does: inside the TPU image the full
+        # //minimal_viable_ai chain is absent (~1.15M buck targets, rooted in
+        # the very file mvai_cloud forked), so _load_prod_module_config and
+        # build_optimizer_config both read a translated .pt instead of building
+        # live (prod_config_artifact.py:1-42).
+        #
+        # Set in setUp rather than around the config call: build_optimizer_config
+        # is consulted later, when the leg is assembled, and a narrower scope
+        # silently dropped it back to the standalone udd_fm provider -- which
+        # carries no sparse warmup schedule, so the very divergence under test
+        # disappeared from the recir side.
+        artifact = os.path.join(tempfile.mkdtemp(), "prod_cfg.pt")
+        export_prod_config(artifact)
+        self._artifact_env: Any = unittest.mock.patch.dict(
+            os.environ, {ARTIFACT_PATH_ENV: artifact}
+        )
+        self._artifact_env.start()
 
     def tearDown(self) -> None:
+        self._artifact_env.stop()
         if self._owns_pg and dist.is_initialized():
             dist.destroy_process_group()
 
@@ -1351,21 +1367,38 @@ class TwoModelOneStepParityTest(TestCase):
             f"recir={len(moved_b)} of {len(weights_a)}"
         )
         # The embedding tables specifically. They are the only parameters the
-        # two legs step with a different learning rate (light warms the sparse
-        # LR up from 0.1x, the recir leg's config carries no sparse schedule),
-        # so if they moved at all the updates MUST differ -- and if they did
-        # not move, every "identical" reading for them is vacuous because the
-        # in-backward optimizer never ran.
+        # How FAR the embedding tables moved, which is the only number here that
+        # depends on the sparse learning rate: gradients do not, so a leg
+        # stepping at 10x still matches on every gradient ratio above. That is
+        # exactly how a 10x sparse LR gap survived this test once, showing up
+        # only as 2.563e+00 against 2.563e+01 in a line nobody asserted on.
+        emb_moves: Dict[str, float] = {}
         for label, moved, delta in (
             ("light", moved_a, delta_a),
             ("recir", moved_b, delta_b),
         ):
             emb = sorted(n for n in delta if n.startswith(emb_prefix))
+            emb_moves[label] = sum(float(delta[n][0].norm()) for n in emb)
             print(
                 f"[1STEP] {label}: {sum(n in moved for n in emb)}/{len(emb)} "
-                f"embedding tables moved, total update l2="
-                f"{sum(float(delta[n][0].norm()) for n in emb):.6e}"
+                f"embedding tables moved, total update l2={emb_moves[label]:.6e}"
             )
+        self.assertGreater(
+            emb_moves["light"],
+            0.0,
+            "the embedding tables did not move, so the sparse rate is untested",
+        )
+        self.assertAlmostEqual(
+            emb_moves["recir"] / emb_moves["light"],
+            1.0,
+            delta=_EMB_UPDATE_RTOL,
+            msg=(
+                f"the legs moved their embedding tables by different amounts "
+                f"(light={emb_moves['light']:.6e} recir={emb_moves['recir']:.6e}); "
+                "with identical starting weights and matching gradients, that is "
+                "the sparse learning rate differing between them"
+            ),
+        )
         # Both legs must have trained the SAME parameters. A parameter that
         # moves on one leg only means an optimizer is wired up on one leg and
         # not the other -- and every "identical" reading for it is vacuous.
@@ -1422,6 +1455,36 @@ class LightShimConfigTest(TestCase):
         self.assertFalse(
             module_config.use_cuda_hstu_attention,
             "use_cuda_hstu_attention must be off; those kernels are Hopper+",
+        )
+
+    def test_tables_are_shrunk_to_the_configured_cap(self) -> None:
+        """Every table must end up at or under the cap, prod's are 3B/3B/1B.
+
+        Asserted on the tables the shim actually produces, not on the
+        ``get_*_hash_size`` getters: the shim deliberately does not override
+        those -- ``RecModelFamilyConfig.shrink`` clamps
+        ``embedding_tables[*].num_embeddings`` instead and never writes back to
+        the provider, so the getters keep reporting prod's numbers by design.
+        An earlier version of this test read them and could not pass.
+        """
+        config = LightConfigProvider().create_config()
+        cap = LightConfigProvider.MAX_HASH_SIZE
+        config.shrink(cap)  # what RecTrainer does before building the model
+        tables = config.embedding_tables  # pyre-ignore[16]
+        self.assertTrue(tables, "no embedding tables to check")
+        biggest = max(t.num_embeddings for t in tables.values())
+        self.assertLessEqual(
+            biggest,
+            cap,
+            f"largest table is {biggest} rows against a cap of {cap}",
+        )
+        self.assertGreater(
+            max(
+                t.num_embeddings
+                for t in LightConfigProvider().create_config().embedding_tables.values()
+            ),
+            cap,
+            "nothing was above the cap, so this proves nothing about shrinking",
         )
 
     def test_force_hbm_moves_uvm_tables(self) -> None:
