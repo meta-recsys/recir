@@ -8,28 +8,16 @@
 
 """recir XLA-GSPMD train pipeline for the mvai_cloud-driven RankFM TPU example.
 
-The self-compiling model wrapper (RecirXLACompiledModule in model_family.py)
-owns compile + fwd + backward + dense opt.step + device-state sync; calling it
-returns the detached ``(losses, named_tensors)`` that
-``recir_core.run_step_and_sync`` produces. This pipeline consumes that return
-to report the SAME ranking metric set as the mvai_cloud udd_fm reference
-(per-task NE + CTR for classification, MSE + RMSE for regression,
-example_count, variable_step_qps).
+The self-compiling model wrapper (``RecirXLACompiledModule``) owns compile,
+forward, backward, dense step and device sync; calling it returns detached
+``(losses, named_tensors)``. This pipeline consumes that and reports the SAME
+ranking metric set as the mvai_cloud udd_fm reference.
 
-  * ``RecirXLATrainPipeline`` subclasses mvai_cloud's
-    ``RankingTrainPipeline`` to reuse its metric construction
-    (``__init__``), its ``_update_ranking_metrics(ret)`` cls/reg slicing, and
-    its ``.metrics`` property unchanged. ``progress`` is overridden to run the
-    self-compiling model wrapper (instead of the eager fwd/bwd/opt.step), rebuild
-    the ``{prediction, label, weight}`` ``ret`` dict from the wrapper's return,
-    and drive the JAX profiler trace over the configured step window (ported from
-    the bespoke rankfm loop so run_tpu_bench.sh's xprof trace fetch keeps working).
-  * ``RecirXLATrainPipelineProvider`` reuses mvai_cloud's
-    ``RankingTrainPipelineProvider`` to construct the cls/reg/step metric
-    lists (including the ``is_variable_step`` swap) exactly as udd_fm/train.py
-    does, then hands them to ``RecirXLATrainPipeline``.
-
-Metrics are constructed on CPU because recir returns CPU torch tensors.
+``RecirXLATrainPipeline`` subclasses mvai_cloud's ``RankingTrainPipeline`` to
+reuse its metric construction and slicing unchanged, overriding only
+``progress`` to drive the wrapper instead of an eager fwd/bwd/step, rebuild the
+``ret`` dict from its return, and run the JAX profiler over the configured step
+window. Metrics are built on CPU because recir returns CPU tensors.
 """
 
 from __future__ import annotations
@@ -42,9 +30,10 @@ import jax
 import torch
 import torch.distributed as dist
 import torch.nn as nn
-from hammer.v3.models.udd_fm_v3.recir_core.trace_sample import flatten_batch
+from hammer.v3.models.udd_fm_v3.parity.step_probe import StepProbe
 from minimal_viable_ai.core.trainer.train_pipeline import RecTrainPipelineProvider
 
+from .eager_step import EagerCPUStep
 from .loss_metric import WindowLoss
 from .xsurface_helpers import _log_hbm_memory
 
@@ -400,31 +389,20 @@ class RecirXLATrainPipelineProvider(
 class EagerCPUTrainPipeline(RankingTrainPipeline):
     """CPU-eager counterpart of RecirXLATrainPipeline (same model, no compile).
 
-    This is the matched-config reference for the TPU run: it drives the EXACT
-    same self-compiling model wrapper that RecirXLATrainPipeline does, but never
-    calls ``wrapper(batch)`` (which would lazily compile the GSPMD GM). Instead it
-    runs the wrapper's underlying raw model eagerly on CPU, so the numerics line
-    up axis-for-axis with the TPU run:
+    The matched-config reference for the TPU run: it drives the EXACT same model
+    wrapper, but never calls ``wrapper(batch)`` (which would lazily compile the
+    GSPMD GM) and instead runs the underlying raw model eagerly, so the numerics
+    line up axis for axis.
 
-      * forward/backward: ``raw_model(*flatten_batch(batch))`` then
-        ``loss.backward()`` -- the same forward the compiled GM traces.
-      * embeddings: the DMP ``EmbeddingComputeKernel.FUSED`` Adagrad fires inside
-        ``loss.backward()`` (CPURankFMBackend.setup takes the DMP+FUSED path
-        because RecTrainer initializes a gloo PG). The TPU run uses the SAME
-        host DMP-FUSED Adagrad (--embedding_backend cpu), so embeddings match.
-      * dense params: a PLAIN ``torch.optim.AdamW`` (capturable=False) with the
-        SAME params/betas/eps/weight_decay as the wrapper's ``TensorLRAdamW``.
-        TensorLRAdamW needs ``capturable=True`` for its 0-d *tensor* LR, which
-        CPU rejects ("params must be on cuda/xla/..."); a tensor LR also can't run
-        under ``capturable=False`` (``addcdiv_`` needs a scalar). The Adam UPDATE
-        MATH is identical, so we snapshot the warmup LR buffer to a Python scalar
-        each step -> byte-equivalent dense update on CPU.
-      * LR warmup + grad clip: the warmup controller mutates the SAME 0-d LR
-        buffer in place each step; we read it for the scalar LR, and replicate
-        TensorLRAdamW.step's ``clip_grad_value_`` on the dense params.
+    Embeddings step inside ``loss.backward()`` under the same host DMP-FUSED
+    Adagrad the TPU run uses. Dense params go through a plain ``AdamW`` rather than
+    the wrapper's ``TensorLRAdamW``, whose 0-d tensor LR needs ``capturable=True``
+    and so cannot run on CPU -- the update MATH is identical, so the warmup LR
+    buffer is snapshotted to a scalar each step. Grad clipping replicates what
+    ``TensorLRAdamW.step`` does.
 
-    The metric path (``_update_ranking_metrics``) is reused verbatim, so the
-    reported per-task NE/CTR/MSE are the SAME torchrec metrics the TPU run emits.
+    The metric path is reused verbatim, so the reported NE/CTR/MSE are the same
+    torchrec metrics the TPU run emits.
     """
 
     def __init__(
@@ -437,6 +415,8 @@ class EagerCPUTrainPipeline(RankingTrainPipeline):
         step_metrics: Optional[List[Any]] = None,
         cls_task_indices: Optional[List[int]] = None,
         reg_task_indices: Optional[List[int]] = None,
+        light_loss_norm: bool = False,
+        grad_accum_steps: int = 1,
     ) -> None:
         # pyre-ignore[19]: see RecirXLATrainPipeline.__init__ -- runtime-only base.
         super().__init__(
@@ -452,43 +432,19 @@ class EagerCPUTrainPipeline(RankingTrainPipeline):
         # The wrapper compiles lazily on its first __call__; we deliberately never
         # call it. Reach through to the raw model + dense opt + warmup it built
         # (backend.setup/DMP already applied, dense AdamW + warmup already wired).
-        wrapper: Any = model
-        self._raw_model: nn.Module = wrapper._model
-        self._warmup: Any = wrapper._warmup
-
-        # Rebuild the dense optimizer as a plain CPU AdamW (capturable=False,
-        # scalar LR). See the class docstring for why TensorLRAdamW's tensor-LR
-        # capturable=True path can't run on CPU. Same params + hyperparameters ->
-        # identical Adam update.
-        tensor_lr_opt: Any = wrapper._dense_opt
-        self._dense_params: List[nn.Parameter] = [
-            p for group in tensor_lr_opt.param_groups for p in group["params"]
-        ]
-        defaults = tensor_lr_opt.defaults
-        self._dense_opt: torch.optim.Optimizer = torch.optim.AdamW(
-            self._dense_params,
-            lr=defaults["lr"],
-            betas=defaults["betas"],
-            eps=defaults["eps"],
-            weight_decay=defaults["weight_decay"],
-            amsgrad=defaults.get("amsgrad", False),
-            capturable=False,
-            # Citrine C2: multi-tensor AdamW. Same update math (parity preserved);
-            # the dense params are non-sparse (embeddings run DMP-FUSED Adagrad
-            # in-backward, handled separately).
-            foreach=True,
+        #
+        # The step itself lives in eager_step.py, which imports neither
+        # mvai_cloud nor jax, so the parity test can drive this exact code on a
+        # devserver instead of reproducing it.
+        self._step: EagerCPUStep = EagerCPUStep.from_wrapper(
+            model,
+            light_loss_norm=light_loss_norm,
+            grad_accum_steps=grad_accum_steps,
         )
-        # Reuse the pre-trace state already allocated for TensorLRAdamW. The
-        # wrapper is never compiled on this path, so transfer ownership to the
-        # CPU optimizer instead of retaining one copy and lazily creating another.
-        self._dense_opt.state.update(tensor_lr_opt.state)
-        tensor_lr_opt.state.clear()
-        # The warmup controller mutates this 0-d buffer in place (fill_) every
-        # step; it is the SAME tensor TensorLRAdamW bound as its tensor LR. Read
-        # it each step for the current scalar LR.
-        self._lr_buffer: torch.Tensor = tensor_lr_opt.param_groups[0]["lr"]
-        # Match TensorLRAdamW.step's optional grad-value clip on the dense params.
-        self._max_grad: Optional[float] = getattr(tensor_lr_opt, "_max_grad", None)
+        self._grad_accum_steps: int = self._step.grad_accum_steps
+        self._raw_model: nn.Module = self._step.raw_model
+        # Inert unless PARITY_EMIT_DIGEST is set, and latched after one step.
+        self._probe: StepProbe = StepProbe(self._raw_model)
         self._loss_metric: WindowLoss = _build_loss_metric(
             step_metrics, cls_metrics, reg_metrics
         )
@@ -498,39 +454,70 @@ class EagerCPUTrainPipeline(RankingTrainPipeline):
     def progress(
         self, dataloader_iter: Iterator[Any]
     ) -> Tuple[torch.Tensor, Dict[str, Any]]:
-        batch = next(dataloader_iter)
-        self._dense_opt.zero_grad(set_to_none=True)
-        # Forward + backward eagerly. loss.backward() fires the DMP-FUSED
-        # embedding Adagrad in-backward (matching the TPU run's host embeddings).
+        """One optimizer step, over ``self._grad_accum_steps`` micro-batches.
 
-        # This eager path has no cross-rank dense-gradient reduction, so its loss
-        # numerator is local. Use the local candidate count to match its scope.
-        flat_args = list(flatten_batch(batch))
-        flat_args[-1] = batch.num_candidates.sum()
-        all_losses, named = self._raw_model(*flat_args)
-        loss = all_losses.sum()
-        loss.backward()
-        # Dense step: clip (matching TensorLRAdamW.step) then AdamW with the
-        # CURRENT warmup LR as a scalar; then advance the warmup buffer for the
-        # next step (the wrapper's _post_step ordering: step uses current LR, then
-        # advance).
-        if self._max_grad is not None:
-            torch.nn.utils.clip_grad_value_(self._dense_params, self._max_grad)
-        lr_val = float(self._lr_buffer.item())
-        for group in self._dense_opt.param_groups:
-            group["lr"] = lr_val
-        self._dense_opt.step()
-        self._warmup.step()
+        Getting the loss scale right is the subtle part, and the two denominator
+        modes need different treatment.
 
-        ret: Dict[str, Any] = {
-            "prediction": named["prediction"].detach(),
-            "label": named["label"].detach(),
-            "weight": named["weight"].detach(),
-            # Real (pre-pad) per-host candidate count -> variable-step metrics
-            # x-axis stride (else PADDED labels.size(1)); from the raw batch.
-            "num_real_candidates": int(batch.num_candidates.sum()),
-        }
-        self._update_ranking_metrics(ret)
+        * ``light_loss_norm``: the denominator stays None, so
+          ``_candidate_axis_mean`` falls back to ``torch.mean`` and each
+          micro-batch arrives already normalized by its OWN candidate count.
+          The light leg runs those same per-rank means on K ranks and lets DDP
+          ALL-REDUCE-MEAN the gradients, giving ``(1/K) * sum_r grad(mean_r)``
+          -- every rank weighted equally regardless of how many candidates it
+          drew. So scale by ``1/K``, nothing else.
+
+          It is tempting to weight by ``n_i / n_total`` instead, on the reasoning
+          that the terms then telescope to ``sum_total / n_total``. They do --
+          but that is the gradient of ONE GLOBAL MEAN over the concatenated
+          batch, which is not what DDP computes. The two agree only when every
+          ``n_i`` is equal; on this dump adjacent batches differ by ~19%
+          (2254 vs 2681 candidates). The discrepancy compounds every step and
+          surfaces as slow monotonic NE divergence, invisible to any
+          single-forward check. This code shipped with that bug once.
+
+        * otherwise: pass ``n_total`` as the denominator, which already
+          normalizes every micro-batch by the group, so no extra weighting.
+
+        Both reduce to today's behaviour when ``grad_accum_steps == 1``.
+        Pinned by ``tests/test_grad_accum.py`` against an explicit DDP
+        all-reduce-mean reference.
+
+        The numerics of the step live in ``eager_step.EagerCPUStep``; what is
+        left here is the metric / digest instrumentation that needs the
+        mvai_cloud base class.
+        """
+        self._step.zero_grad()
+        self._probe.arm()
+        micro_batches: List[Any] = [
+            next(dataloader_iter) for _ in range(self._grad_accum_steps)
+        ]
+        ret: Dict[str, Any] = {}
+        self._probe.emit_weights_once()
+
+        def _before_forward(batch: Any) -> None:
+            self._probe.on_micro_batch(batch)
+
+        def _after_forward(all_losses: torch.Tensor) -> None:
+            self._probe.on_loss(all_losses)
+
+        def _after_backward(named: Dict[str, Any], n_i: int) -> None:
+            nonlocal ret
+            ret = {
+                "prediction": named["prediction"].detach(),
+                "label": named["label"].detach(),
+                "weight": named["weight"].detach(),
+                "num_real_candidates": n_i,
+            }
+            self._update_ranking_metrics(ret)
+
+        all_losses, named = self._step.run_step(
+            micro_batches,
+            before_forward=_before_forward,
+            after_forward=_after_forward,
+            after_backward=_after_backward,
+        )
+        self._probe.finish()
         # Log the training loss to TB (aggregate + per NE task + LLW s/weights + MT
         # mt_loss); parity with RecirXLATrainPipeline. all_losses is the per-task vector.
         _series: Dict[str, Any] = _loss_series(
@@ -539,7 +526,7 @@ class EagerCPUTrainPipeline(RankingTrainPipeline):
         _series.update(_llw_series(named, self._loss_task_names))
         _series.update(_hstu_series(named))
         self._loss_metric.update(values=_series)
-        return all_losses.detach(), ret
+        return all_losses, ret
 
     @property
     def metrics(self) -> List[Any]:
@@ -567,9 +554,13 @@ class EagerCPUTrainPipelineProvider(
         reg_task_indices: Optional[List[int]] = None,
         is_variable_step: bool = True,
         report_interval: int = 1,
+        light_loss_norm: bool = False,
+        grad_accum_steps: int = 1,
     ) -> None:
         self._cls_task_indices = cls_task_indices
         self._reg_task_indices = reg_task_indices
+        self._light_loss_norm = light_loss_norm
+        self._grad_accum_steps = grad_accum_steps
         # Annotated Any: RankingTrainPipelineProvider is a runtime-only import
         # (stubbed Any for pyre -- see the module-level TYPE_CHECKING block).
         # pyrefly: ignore [bad-instantiation]
@@ -603,4 +594,6 @@ class EagerCPUTrainPipelineProvider(
             step_metrics=base_pipeline._step_metrics,
             cls_task_indices=self._cls_task_indices,
             reg_task_indices=self._reg_task_indices,
+            light_loss_norm=self._light_loss_norm,
+            grad_accum_steps=self._grad_accum_steps,
         )
