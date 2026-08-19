@@ -14,7 +14,6 @@ sub-graphs.
 
 from __future__ import annotations
 
-import logging
 from functools import partial
 from typing import Callable, Dict, List, Optional, Set, Tuple
 
@@ -26,8 +25,6 @@ from functorch import make_fx
 from recir.region_transforms.base import RegionTransform
 from torch.distributed.tensor import DeviceMesh
 
-logger: logging.Logger = logging.getLogger(__name__)
-
 
 # Placeholder dim used for example inputs to ``make_fx(tracing_mode="symbolic")``
 # in the embedding rewrite path.  PyTorch specializes 0 and 1 (treated as
@@ -35,6 +32,16 @@ logger: logging.Logger = logging.getLogger(__name__)
 # subgraph uses real symbolic dims.  Picked small but non-power-of-two to
 # avoid any divisibility-based specialization elsewhere.
 _SYMBOLIC_TRACE_PLACEHOLDER_DIM: int = 3
+
+
+def _declare_split_invariants(
+    split_list: List[int], total: Optional[int] = None
+) -> None:
+    """Constrain the unbacked SymInts produced by ``Tensor.tolist()``."""
+    for s in split_list:
+        torch._check_is_size(s)
+    if total is not None:
+        torch._check(sum(split_list) == total)
 
 
 # ---------------------------------------------------------------------------
@@ -82,6 +89,7 @@ def decomposed_row_wise_embedding(
 
     split_sizes = torch.stack([(ranks == r).sum() for r in range(world_size)])
     input_split_list = split_sizes.tolist()
+    _declare_split_invariants(input_split_list, flat_indices.shape[0])
 
     # Step 2: Index AllToAll
     # Exchange split sizes (equal-split, each rank sends world_size ints)
@@ -90,6 +98,8 @@ def decomposed_row_wise_embedding(
     )
     output_splits_tensor = torch.ops._c10d_functional.wait_tensor(output_splits_tensor)
     output_split_list = output_splits_tensor.tolist()
+    # Peer counts: non-negative, but not relatable to any local size.
+    _declare_split_invariants(output_split_list, None)
 
     # Exchange indices
     received_indices = torch.ops._c10d_functional.all_to_all_single(
@@ -168,6 +178,7 @@ def decomposed_row_wise_embedding_backward(
 
     split_sizes = torch.stack([(ranks == r).sum() for r in range(world_size)])
     input_split_list = split_sizes.tolist()
+    _declare_split_invariants(input_split_list, flat_indices.shape[0])
 
     # Step 2: Size AllToAll
     output_splits_tensor = torch.ops._c10d_functional.all_to_all_single(
@@ -175,6 +186,8 @@ def decomposed_row_wise_embedding_backward(
     )
     output_splits_tensor = torch.ops._c10d_functional.wait_tensor(output_splits_tensor)
     output_split_list = output_splits_tensor.tolist()
+    # Peer counts: non-negative, but not relatable to any local size.
+    _declare_split_invariants(output_split_list, None)
 
     # Step 3: Index AllToAll
     received_indices = torch.ops._c10d_functional.all_to_all_single(
@@ -214,8 +227,15 @@ def _trace_and_inline_subgraph(
     placeholders = [n for n in subgraph_gm.graph.nodes if n.op == "placeholder"]
     val_map: Dict[fx.Node, fx.Node] = dict(zip(placeholders, input_nodes))
 
+    pre_existing = set(gm.graph.nodes)
     with gm.graph.inserting_before(target_node):
         output_value = gm.graph.graph_copy(subgraph_gm.graph, val_map=val_map)
+
+    # Discard bindings from the helper's ShapeEnv so the outer trace creates
+    # independent split symbols for each embedding site.
+    for node in gm.graph.nodes:
+        if node not in pre_existing:
+            node.meta.pop("unbacked_bindings", None)
 
     assert isinstance(output_value, fx.Node)
     target_node.replace_all_uses_with(output_value)

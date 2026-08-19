@@ -1627,6 +1627,17 @@ def shard_params_by_plan(
                 new_param = getattr(new_param, atom)
             old_to_new.append((old_param, new_param, shard_spec))
     _migrate_opt_after_param_swap(opts, old_to_new)
+
+    # DDP synchronizes replicated parameters and buffers from rank 0 during construction
+    if mesh.size() > 1 and torch.distributed.is_initialized():
+        process_group = mesh.get_group()
+        source_rank = int(mesh.mesh.flatten()[0].item())
+        with torch.no_grad():
+            for key, value in params_buffers.items():
+                if key not in sharded_keys:
+                    torch.distributed.broadcast(
+                        value, src=source_rank, group=process_group
+                    )
     return sharded_keys
 
 
