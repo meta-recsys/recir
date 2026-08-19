@@ -726,6 +726,30 @@ def _capture_param_grads(
     return handles
 
 
+def _embedding_optimizer_buckets(
+    model: torch.nn.Module, dense_names: Set[str], emb_prefix: str
+) -> Dict[str, str]:
+    """Which optimizer owns each embedding table on this leg.
+
+    ``dense`` means the table kept a real ``.grad`` and is stepped by the dense
+    optimizer -- what production's DATA_PARALLEL tables do. ``sparse`` means an
+    in-backward optimizer consumed the gradient, which is what its ROW_WISE
+    tables do. The two run at learning rates ~50x apart, so a table in the wrong
+    bucket trains at the wrong rate while every shape, key and state-dict entry
+    still matches.
+
+    Table name is the second-to-last FQN segment, the convention torchrec's
+    per-table parameter generators and ``_attach_single_node_sparse_optimizers``
+    both use.
+    """
+    buckets: Dict[str, str] = {}
+    for name, _ in model.named_parameters():
+        if not name.startswith(emb_prefix):
+            continue
+        buckets[name.split(".")[-2]] = "dense" if name in dense_names else "sparse"
+    return buckets
+
+
 @dataclasses.dataclass
 class _Leg:
     """One leg's native train step, reduced to "run it and hand back the loss"."""
@@ -763,7 +787,11 @@ class _LossCapturingPipeline(TrainPipelineBase):
 
 
 def _build_light_leg(
-    model: torch.nn.Module, wrapper: Any, batch: Any, opt_cfg: Any
+    model: torch.nn.Module,
+    wrapper: Any,
+    batch: Any,
+    opt_cfg: Any,
+    embedding_tables: Dict[str, Any],
 ) -> _Leg:
     """The light/MAST step: MVAI's optimizer stack driven by torchrec's pipeline.
 
@@ -776,9 +804,14 @@ def _build_light_leg(
 
     Two forced departures, neither numerical: AdamW runs unfused because prod's
     factory hardcodes the CUDA-only ``fused=True``, and prod's CUDA FBGEMM TBE does
-    not exist on CPU, so both legs use the CPU one. Holding the embedding MECHANISM
-    constant is deliberate -- what stays varying is the sparse optimizer CONFIG,
-    which is a real difference between the jobs.
+    not exist on CPU, so the sharded tables use the CPU one on both legs.
+
+    Per-table PLACEMENT is deliberately not held constant. This leg derives it
+    from prod's own ``EmbeddingTable.sharding`` while the recir leg derives it
+    from the exported artifact, so the two can disagree about which tables the
+    sparse optimizer owns -- an artifact that lost ``sharding`` once moved seven
+    tables to the wrong optimizer at 50x the learning rate, and this test could
+    not see it.
 
     The sparse LR is the warmed-up one: prod's ``WarmupOptimizer`` sets the
     iteration-0 LR before any step, so for a single step baking the multiplier into
@@ -789,7 +822,7 @@ def _build_light_leg(
     dense_cfg: OptimConfig = opt_cfg.dense.default
 
     sparse_lr = _warmup_lr(sparse_cfg)
-    setup = build_embedding_backend("cpu").setup(
+    setup = build_embedding_backend("cpu", embedding_tables=embedding_tables).setup(
         model,
         _embedding_collection(model)[1].embedding_configs(),
         sparse_cfg,
@@ -864,7 +897,9 @@ def _build_light_leg(
     )
 
 
-def _build_recir_leg(model: torch.nn.Module, batch: Any) -> _Leg:
+def _build_recir_leg(
+    model: torch.nn.Module, batch: Any, embedding_tables: Dict[str, Any]
+) -> _Leg:
     """The recir CPU-eager leg, assembled by the recir CPU-eager code.
 
     Mirrors ``RecirXLACompiledModule.__init__`` call for call: read the embedding
@@ -881,7 +916,13 @@ def _build_recir_leg(model: torch.nn.Module, batch: Any) -> _Leg:
     """
     trainer_cfg = RankFMTrainerConfig()
     sparse_cfg: OptimConfig = build_optimizer_config().sparse.default
-    backend = build_embedding_backend("cpu")
+    backend = build_embedding_backend(
+        "cpu",
+        # This leg's OWN tables, off the artifact -- not prod's live ones. The
+        # two sources are supposed to agree; letting each leg read its own is
+        # what makes the comparison able to say they do not.
+        embedding_tables=embedding_tables,
+    )
     setup = backend.setup(
         model,
         _embedding_collection(model)[1].embedding_configs(),
@@ -1098,9 +1139,27 @@ class TwoModelOneStepParityTest(TestCase):
     ====================  =============================  =========================
     forward entrypoint    ``wrapper(batch)``             ``model(*flatten_batch)``
     loss reduction        ``sum(losses, dim=0)``         ``losses.sum()``
+    table placement       from prod's live config        from the exported artifact
     embedding update      in-backward, warmed-up LR      in-backward, flat LR
     dense update          Warmup+Clip+AdamW wrappers     clip then AdamW, warmup
     ====================  =============================  =========================
+
+    **What is still shared, and what that costs.** Both legs build their
+    embeddings through ``CPUEmbeddingBackend``, because prod's embedding TBE is
+    the CUDA FBGEMM one and there is no CUDA here. The MECHANISM is therefore
+    held constant and this test cannot disagree about it.
+
+    What it CAN disagree about, and what an earlier version of this test could
+    not, is the per-table PLACEMENT: each leg reads its own source for
+    ``EmbeddingTable.sharding`` -- prod's live config on the light side, the
+    exported artifact on the recir side -- and placement decides the compute
+    kernel, which decides whether a table is trained by the sparse optimizer
+    inside backward or by the dense one at ``step()``, at learning rates ~50x
+    apart. While both legs shared one setup that difference was impossible by
+    construction, and a real artifact bug that moved seven of ten tables to the
+    wrong optimizer went unnoticed here and was only visible on the cluster.
+    ``test_one_full_step_matches_from_a_shared_checkpoint`` asserts the buckets
+    agree, and separately that they are not all the same bucket.
 
     Both legs single-rank on purpose: no DDP, no DMP, no accumulation, so a
     remaining disagreement is in the model or optimizer wiring rather than the
@@ -1122,16 +1181,17 @@ class TwoModelOneStepParityTest(TestCase):
             if isinstance(m, torch.nn.Dropout):
                 m.p = 0.0
 
-    def _build_models(self) -> Tuple[Any, Any, Any, Any]:
+    def _build_models(self) -> Tuple[Any, Any, Any, Any, Any]:
         """Both models, each built its own leg's way. Weights are NOT shared here.
 
         The shared checkpoint is copied by the caller, after both embedding
         backends have run -- ``backend.setup`` rebuilds the embedding
         collection, so anything loaded at this point is silently discarded.
 
-        Returns ``(wrapper, model_a, model_b, prod_config)``. The models are
-        typed Any because both carry hammer-v3 methods (``recursive_setattr``,
-        ``set_recir_kjt_keys``) that ``nn.Module.__getattr__`` types as Tensor.
+        Returns ``(wrapper, model_a, model_b, prod_config, recir_config)``. The
+        models are typed Any because both carry hammer-v3 methods
+        (``recursive_setattr``, ``set_recir_kjt_keys``) that
+        ``nn.Module.__getattr__`` types as Tensor.
         """
         prod_config = _prod_family_config(disable_seq_len_sampling=True)
 
@@ -1196,7 +1256,7 @@ class TwoModelOneStepParityTest(TestCase):
             recir_module_config, device=torch.device("cpu"), bf16_training=False
         )
         self._prepare(model_b)
-        return wrapper, model_a, model_b, prod_config
+        return wrapper, model_a, model_b, prod_config, recir_module_config
 
     def setUp(self) -> None:
         """Give the embedding backend the process group the real legs have.
@@ -1248,7 +1308,7 @@ class TwoModelOneStepParityTest(TestCase):
         if not os.path.exists(_DUMP_BATCH_PATH):
             self.skipTest(f"no dump batch at {_DUMP_BATCH_PATH}")
 
-        wrapper, model_a, model_b, prod_config = self._build_models()
+        wrapper, model_a, model_b, prod_config, recir_config = self._build_models()
 
         # Read off the UNSHARDED models: the embedding backend replaces the
         # EmbeddingCollection with a sharded one, and ``embedding_configs()``
@@ -1269,8 +1329,14 @@ class TwoModelOneStepParityTest(TestCase):
         batch = torch.load(io.BytesIO(raw), weights_only=False)
         batch = remap_batch_ids(batch, key_to_size)
 
-        light = _build_light_leg(model_a, wrapper, batch, prod_config.optimizer_config)
-        recir = _build_recir_leg(model_b, batch)
+        light = _build_light_leg(
+            model_a,
+            wrapper,
+            batch,
+            prod_config.optimizer_config,
+            prod_config.embedding_tables,
+        )
+        recir = _build_recir_leg(model_b, batch, recir_config.embedding_tables)
 
         # THE SHARED CHECKPOINT, copied AFTER both backends have run. Loading
         # before is the failure that cost a full day on the cluster:
@@ -1329,6 +1395,35 @@ class TwoModelOneStepParityTest(TestCase):
             (only_light, only_recir),
             ([], []),
             "the legs' dense optimizers own different parameters",
+        )
+
+        # Per-table optimizer bucketing, the thing this test was blind to for
+        # as long as both legs shared one embedding setup. Each leg now derives
+        # its placement from its OWN source -- prod's live config for light, the
+        # exported artifact for recir -- so a table can land in different
+        # buckets on the two legs, which is exactly the failure to catch.
+        buckets_a = _embedding_optimizer_buckets(model_a, light.param_names, emb_prefix)
+        buckets_b = _embedding_optimizer_buckets(model_b, recir.param_names, emb_prefix)
+        for table in sorted(set(buckets_a) | set(buckets_b)):
+            print(
+                f"[1STEP] table {table}: light={buckets_a.get(table, '-')} "
+                f"recir={buckets_b.get(table, '-')}"
+            )
+        self.assertEqual(
+            buckets_a,
+            buckets_b,
+            "the legs put the same embedding table in different optimizer "
+            "buckets; a sparse-bucket table trains at the sparse LR (~50x the "
+            "dense one) with no shape or key difference to show for it",
+        )
+        # Guard against a vacuous pass. If every table ends up in one bucket the
+        # comparison above holds trivially, which is what it did while both legs
+        # ran the same row-count heuristic and put all ten on the sparse path.
+        self.assertEqual(
+            sorted(set(buckets_a.values())),
+            ["dense", "sparse"],
+            "prod splits these tables across BOTH optimizers, so a run with "
+            f"only one bucket means the placement was lost: {buckets_a}",
         )
 
         with tempfile.TemporaryDirectory() as tmp:

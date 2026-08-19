@@ -575,11 +575,13 @@ class RankFMMvaiModelFamily(BlueReelsVDDModelFamily):
         # initialized" on multi-host cpu runs (e.g. the 128-chip yaml). The tpu /
         # in_graph backends and single-host cpu don't init a PG, so init_pg() is
         # the fallback when nothing has been set up yet.
+        module_config = self._module_config()
         backend = build_embedding_backend(
             trainer_cfg.embedding_backend,
             ringshift_min_rows=trainer_cfg.ringshift_min_rows,
             fsdp_min_rows=trainer_cfg.fsdp_min_rows,
             on_device_init=trainer_cfg.on_device_init,
+            embedding_tables=module_config.embedding_tables,
         )
         if dist.is_available() and dist.is_initialized():
             gloo_rank, gloo_world = dist.get_rank(), dist.get_world_size()
@@ -594,7 +596,6 @@ class RankFMMvaiModelFamily(BlueReelsVDDModelFamily):
         num_ranks = num_tpu_devices if num_tpu_devices > 1 else gloo_world
         num_processes = gloo_world
 
-        module_config = self._module_config()
         feature_config = self._feature_config()
         # Both dumps here, where both objects are in hand, so one grep of the
         # log has the whole config surface of this leg.

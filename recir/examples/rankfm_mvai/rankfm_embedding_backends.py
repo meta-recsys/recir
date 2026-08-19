@@ -24,7 +24,7 @@ Selected at runtime via ``RankFMConfig.embedding_backend``
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import jax
 import torch
@@ -267,6 +267,7 @@ def build_embedding_backend(
     ringshift_min_rows: int = 4096,
     fsdp_min_rows: int = -1,
     on_device_init: bool = True,
+    embedding_tables: Optional[Dict[str, Any]] = None,
 ) -> EmbeddingBackend:
     if embedding_backend == "cpu":
         # The cpu (torchrec DMP) backend's sequence-embedding all-to-all needs
@@ -276,7 +277,10 @@ def build_embedding_backend(
         from recir.embedding._torchrec_patches import apply_seq_a2a_int64_patch
 
         apply_seq_a2a_int64_patch()
-        return CPURankFMBackend(embedding_param_prefix=RANKFM_EMBEDDING_PARAM_PREFIX)
+        return CPURankFMBackend(
+            embedding_param_prefix=RANKFM_EMBEDDING_PARAM_PREFIX,
+            embedding_tables=embedding_tables,
+        )
     if embedding_backend == "tpu":
         return JAXRankFMBackend()
     if embedding_backend == "in_graph":

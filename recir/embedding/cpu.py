@@ -7,8 +7,13 @@
 
 """CPU/torchrec DMP embedding backend.
 
-Tables get TABLE_WISE sharding when small and ROW_WISE when large; gloo
-coordinates ranks via JobSet env vars.
+Tables production places ROW_WISE or TABLE_WISE are sharded under DMP and
+trained by a FUSED TBE inside backward. Tables it places DATA_PARALLEL are held
+out of the sharded collection entirely (see ``split_collection``) so they keep a
+real ``.grad`` and are trained by the DENSE optimizer, which is what
+DATA_PARALLEL amounts to at world size 1 and the only form of it a CPU leg can
+run. Among the shardable tables, row count picks ROW_WISE over TABLE_WISE.
+Gloo coordinates ranks via JobSet env vars.
 
 Kept in its own module so the factory in ``__init__.py`` and the other
 backends don't pull in the heavy ``torchrec.distributed.*`` import surface
@@ -23,7 +28,7 @@ from __future__ import annotations
 import logging
 import os
 import tempfile
-from typing import Any, Callable, cast, Dict, List, Tuple
+from typing import Any, Callable, cast, Dict, List, Optional, Tuple
 
 import jax
 import torch
@@ -44,6 +49,12 @@ from recir.embedding.backend import (
     EmbeddingSetupResult,
     SparseOptimizerRuntime,
     SparseUpdatePlacement,
+)
+from recir.embedding.split_collection import (
+    assert_replicated_half_is_unplanned,
+    partition_by_sharding,
+    split_embedding_collection,
+    SplitEmbeddingCollection,
 )
 from torchrec.distributed.embedding import EmbeddingCollectionSharder
 from torchrec.distributed.embedding_types import EmbeddingComputeKernel
@@ -107,8 +118,20 @@ class CPUEmbeddingBackend(EmbeddingBackend):
     its embedding collection parameters.
     """
 
-    def __init__(self, embedding_param_prefix: str) -> None:
+    def __init__(
+        self,
+        embedding_param_prefix: str,
+        embedding_tables: Optional[Dict[str, Any]] = None,
+    ) -> None:
         self._embedding_param_prefix = embedding_param_prefix
+        # The model's own table objects, read here ONLY for their ``sharding``
+        # field -- torchrec's ``EmbeddingConfig`` has no such field, so the
+        # per-table ROW_WISE/DATA_PARALLEL choice cannot ride along with
+        # ``table_configs``. Taken at construction rather than through the
+        # shared ``setup`` because only this backend can act on it: the
+        # placement describes a torchrec DMP layout, which the in-graph and
+        # SparseCore backends do not build.
+        self._embedding_tables: Optional[Dict[str, Any]] = embedding_tables
 
     def init_pg(self) -> Tuple[int, int]:
         jax_rank = jax.process_index()
@@ -194,6 +217,40 @@ class CPUEmbeddingBackend(EmbeddingBackend):
             ),
         )
 
+    def _split_out_replicated_tables(
+        self, model: nn.Module
+    ) -> Tuple[Optional[SplitEmbeddingCollection], List[str]]:
+        """Move prod's DATA_PARALLEL tables out of the collection the planner sees.
+
+        Returns the new split module (``None`` when no split was needed) and the
+        names of the tables that remain shardable.
+
+        Without ``embedding_tables`` there is nothing to read a placement from --
+        torchrec's ``EmbeddingConfig`` carries no ``sharding`` field -- so the
+        collection is left whole and every table stays on the FUSED/sparse path.
+        That is the pre-existing behaviour, and it is WRONG for any model whose
+        config asks for DATA_PARALLEL: those tables get RowWiseAdagrad at the
+        sparse LR instead of the dense optimizer's. Callers that have the tables
+        should always pass them.
+        """
+        embedding_tables = self._embedding_tables
+        if embedding_tables is None:
+            logger.warning(
+                "CPUEmbeddingBackend: no embedding_tables passed, so per-table "
+                "placement is unknown and every table will be sharded onto the "
+                "FUSED/sparse-optimizer path. Tables that production marks "
+                "DATA_PARALLEL will be trained by the wrong optimizer."
+            )
+            return None, []
+
+        sharded, replicated = partition_by_sharding(embedding_tables)
+        if not replicated:
+            return None, sharded
+
+        parent_path, _, attr = self._embedding_param_prefix.rpartition(".")
+        parent = model.get_submodule(parent_path) if parent_path else model
+        return split_embedding_collection(parent, attr, replicated), sharded
+
     def _setup_dmp(
         self,
         model: nn.Module,
@@ -210,6 +267,7 @@ class CPUEmbeddingBackend(EmbeddingBackend):
             config.lr,
             config.eps,
         )
+        split, shardable = self._split_out_replicated_tables(model)
 
         pg = dist.distributed_c10d._get_default_group()
         sharders = [
@@ -224,8 +282,11 @@ class CPUEmbeddingBackend(EmbeddingBackend):
         ]
 
         row_wise_min = world_size * _ROW_WISE_MIN_ROWS_PER_RANK
+        keep = set(shardable) if split is not None else None
         constraints: Dict[str, ParameterConstraints] = {}
         for table in table_configs:
+            if keep is not None and table.name not in keep:
+                continue
             sharding = (
                 ShardingType.ROW_WISE.value
                 if table.num_embeddings >= row_wise_min
@@ -246,6 +307,10 @@ class CPUEmbeddingBackend(EmbeddingBackend):
             constraints=constraints,
         )
         plan = planner.collective_plan(model, cast(Any, sharders), pg)
+        if split is not None:
+            assert_replicated_half_is_unplanned(
+                plan, split, self._embedding_param_prefix
+            )
         logger.info("DMP sharding plan:")
         for module_path, module_plan in plan.plan.items():
             for param_name, param_sharding in cast(Any, module_plan).items():
