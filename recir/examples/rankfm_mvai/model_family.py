@@ -40,6 +40,7 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 from hammer.v3.models.udd_fm_v3.batch_loader import BlueReelsVDDFeatureConfig
+from hammer.v3.models.udd_fm_v3.parity.config_dump import config_dump
 from hammer.v3.models.udd_fm_v3.recir_core import (
     compile_gspmd_step,
     recir_train_step,
@@ -496,6 +497,9 @@ class RankFMMvaiModelFamily(BlueReelsVDDModelFamily):
             replicate_across_ranks=trainer_cfg.data_replicate_across_ranks,
             file_list=explicit_files,
         )
+        # Fail here rather than on the first select_rows_slice, which happens
+        # after the model is built and traced.
+        data_pipe.assert_supports_batch_size(trainer_cfg.local_batch_size)
         logger.info(
             f"Replay pipe: {len(data_pipe)} batches for rank {gloo_rank} "
             f"(replicate={trainer_cfg.data_replicate_across_ranks})"
@@ -578,6 +582,10 @@ class RankFMMvaiModelFamily(BlueReelsVDDModelFamily):
 
         module_config = self._module_config()
         feature_config = self._feature_config()
+        # Both dumps here, where both objects are in hand, so one grep of the
+        # log has the whole config surface of this leg.
+        config_dump("module_config", module_config)
+        config_dump("feature_config", feature_config)
 
         # 2. Vanilla module (inherited builder -> BlueReelsVDDTrainV3).
         torch.manual_seed(0)
@@ -655,6 +663,23 @@ class RankFMMvaiModelFamily(BlueReelsVDDModelFamily):
             num_processes=num_processes,
             device=device,
         )
+        ckpt_path = trainer_cfg.init_state_dict_path
+        if ckpt_path:
+            # Shared-checkpoint parity: both legs must start from identical
+            # weights so a one-step comparison isolates the implementation from
+            # initialisation. Loaded HERE, after backend.setup has finalised the
+            # embedding collection -- loading before it silently lost every
+            # embedding table. load_init_checkpoint normalises target names, so
+            # a wrapped/sharded module matches the unsharded checkpoint keys.
+            from hammer.v3.models.udd_fm_v3.parity.checkpoint import (
+                content_hash,
+                load_init_checkpoint,
+            )
+
+            logger.info(f"[PARITY] loading init weights from {ckpt_path}")
+            logger.info(f"[PARITY] init ckpt sha256={content_hash(ckpt_path)}")
+            load_init_checkpoint(wrapper, ckpt_path)
+
         return wrapper, wrapper.dense_opt
 
     def create_train_datapipe(  # pyre-ignore[15]
