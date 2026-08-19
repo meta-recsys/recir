@@ -33,12 +33,16 @@ from __future__ import annotations
 
 import logging
 import math
-from typing import Any, cast, Dict, List, Optional, Tuple
+from typing import Any, cast, Dict, List, Optional, Tuple, TYPE_CHECKING
 
 import jax
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+
+if TYPE_CHECKING:
+    from recir.embedding.backend import SparseOptimizerRuntime
+
 from hammer.v3.models.udd_fm_v3.batch_loader import BlueReelsVDDFeatureConfig
 from hammer.v3.models.udd_fm_v3.parity.config_dump import config_dump
 from hammer.v3.models.udd_fm_v3.recir_core import (
@@ -272,15 +276,23 @@ class RecirXLACompiledModule(RecirCompiledModuleBase):
 
         sparse_runtime = embedding_setup.sparse_runtime
         dense_params = list(embedding_setup.dense_named_parameters.values())
+        # ONE warmup controller for both sides. The compiled path hands it the
+        # buffer its in-graph sparse optimizer already reads; the backend-fused
+        # path has no such buffer, so make a plain one here and let whoever runs
+        # the step copy it into the fused optimizer's param_group -- the same
+        # shape as what this leg already does for the dense LR.
+        sparse_lr_buffer = sparse_runtime.lr_buffer
+        if sparse_lr_buffer is None and sparse_runtime.fused_optimizer is not None:
+            sparse_lr_buffer = torch.zeros((), dtype=torch.float32, device=device)
         dense_opt, warmup = setup_dense_optimizer_and_warmup(
             model,
             dense_params,
             trainer_cfg.dense_optimizer_config,
             device,
             sparse_cfg=(
-                sparse_runtime.config if sparse_runtime.lr_buffer is not None else None
+                sparse_runtime.config if sparse_lr_buffer is not None else None
             ),
-            sparse_lr_buffer=sparse_runtime.lr_buffer,
+            sparse_lr_buffer=sparse_lr_buffer,
         )
         emb_opt = sparse_runtime.optimizer
 
@@ -294,6 +306,8 @@ class RecirXLACompiledModule(RecirCompiledModuleBase):
         self._dense_opt: torch.optim.Optimizer = dense_opt
         self._emb_opt: Optional[torch.optim.Optimizer] = emb_opt
         self._warmup: WarmupController = warmup
+        self._sparse_runtime: SparseOptimizerRuntime = sparse_runtime
+        self._sparse_lr_buffer: Optional[torch.Tensor] = sparse_lr_buffer
         self._dispatchers: List[Any] = dispatchers
         self._trace_batch = trace_batch
         self._num_ranks = num_ranks
