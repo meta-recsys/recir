@@ -24,6 +24,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import torch
 import torch.nn as nn
 from hammer.v3.models.udd_fm_v3.recir_core.trace_sample import flatten_batch
+from torchrec.optim.keyed import KeyedOptimizer
 
 logger: logging.Logger = logging.getLogger(__name__)
 
@@ -52,6 +53,10 @@ class EagerCPUStep:
     lr_buffer: torch.Tensor
     warmup: Any
     max_grad: Optional[float]
+    # The fused embedding TBEs' optimizer, and the 0-d buffer the shared
+    # WarmupController writes the sparse LR into. Both or neither.
+    fused_opt: Optional[KeyedOptimizer] = None
+    sparse_lr_buffer: Optional[torch.Tensor] = None
     light_loss_norm: bool = False
     grad_accum_steps: int = 1
 
@@ -62,6 +67,8 @@ class EagerCPUStep:
         tensor_lr_opt: Any,
         warmup: Any,
         *,
+        fused_opt: Optional[KeyedOptimizer] = None,
+        sparse_lr_buffer: Optional[torch.Tensor] = None,
         light_loss_norm: bool = False,
         grad_accum_steps: int = 1,
     ) -> EagerCPUStep:
@@ -99,6 +106,8 @@ class EagerCPUStep:
             lr_buffer=tensor_lr_opt.param_groups[0]["lr"],
             warmup=warmup,
             max_grad=getattr(tensor_lr_opt, "_max_grad", None),
+            fused_opt=fused_opt,
+            sparse_lr_buffer=sparse_lr_buffer,
             light_loss_norm=light_loss_norm,
             grad_accum_steps=grad_accum_steps,
         )
@@ -121,12 +130,36 @@ class EagerCPUStep:
             wrapper._model,
             wrapper._dense_opt,
             wrapper._warmup,
+            fused_opt=wrapper._sparse_runtime.fused_optimizer,
+            sparse_lr_buffer=wrapper._sparse_lr_buffer,
             light_loss_norm=light_loss_norm,
             grad_accum_steps=grad_accum_steps,
         )
 
     def zero_grad(self) -> None:
         self.dense_opt.zero_grad(set_to_none=True)
+        self._push_sparse_lr()
+
+    def _push_sparse_lr(self) -> None:
+        """Send the warmup's current sparse LR into the fused TBEs.
+
+        Before BACKWARD, not at step time: the fused embedding update runs
+        inside backward, so a rate pushed afterwards would apply one step late.
+        ``EmbeddingFusedOptimizer.zero_grad`` is the push -- its whole body is
+        ``set_learning_rate(param_groups[0]["lr"])``, same as its ``step()``.
+        Without it the tables keep the rate baked in at construction
+        (``fused_params["learning_rate"]``) and the schedule never reaches them.
+        """
+        if self.fused_opt is None or self.sparse_lr_buffer is None:
+            return
+        lr_val = float(self.sparse_lr_buffer.item())
+        for group in self.fused_opt.param_groups:
+            # KeyedOptimizer types param_groups read-only, but the dicts are the
+            # live ones the fused optimizer reads; torchrec's own WarmupOptimizer
+            # writes them the same way (warmup.py:146-148).
+            # pyre-ignore[16]
+            group["lr"] = lr_val
+        self.fused_opt.zero_grad()
 
     def forward(self, batch: Any, n_total: int) -> Tuple[torch.Tensor, Dict[str, Any]]:
         """One micro-batch through the raw-tensor entrypoint.
@@ -168,6 +201,10 @@ class EagerCPUStep:
 
         Mirrors ``RecirXLACompiledModule._post_step``. Once per optimizer step,
         not per micro-batch.
+
+        The sparse side is not touched here -- its rate reaches the tables
+        before BACKWARD, from :meth:`_push_sparse_lr`, because the fused update
+        runs inside backward rather than at step time.
         """
         if self.max_grad is not None:
             torch.nn.utils.clip_grad_value_(self.dense_params, self.max_grad)

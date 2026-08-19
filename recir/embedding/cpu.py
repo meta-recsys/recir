@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import logging
 import os
+import tempfile
 from typing import Any, Callable, cast, Dict, List, Tuple
 
 import jax
@@ -44,9 +45,6 @@ from recir.embedding.backend import (
     SparseOptimizerRuntime,
     SparseUpdatePlacement,
 )
-from torch.distributed.optim import (
-    _apply_optimizer_in_backward as apply_optimizer_in_backward,
-)
 from torchrec.distributed.embedding import EmbeddingCollectionSharder
 from torchrec.distributed.embedding_types import EmbeddingComputeKernel
 from torchrec.distributed.model_parallel import DistributedModelParallel
@@ -65,31 +63,20 @@ logger: logging.Logger = logging.getLogger(__name__)
 _ROW_WISE_MIN_ROWS_PER_RANK: int = 100
 
 
-def _attach_single_node_sparse_optimizers(
-    model: nn.Module,
-    sparse_config: OptimConfig,
-    embedding_param_prefix: str,
-) -> None:
-    """Attach config-driven in-backward optimizers to bare EC parameters."""
-    attached = 0
-    for name, parameter in model.named_parameters():
-        if not parameter.requires_grad or not name.startswith(embedding_param_prefix):
-            continue
-        table_name = name.split(".")[-2]
-        optimizer_class = optim_type_to_optim_class(sparse_config.optim_type)
-        apply_optimizer_in_backward(
-            optimizer_class,
-            [parameter],
-            {
-                "_batch_key": table_name,
-                "learning_rate": sparse_config.lr,
-                "eps": sparse_config.eps,
-            },
-        )
-        attached += 1
-    if attached == 0:
-        raise RuntimeError("CPU backend found no embedding parameters to optimize.")
-    logger.info("Attached in-backward sparse optimizers to %d CPU tables", attached)
+def _ensure_process_group() -> None:
+    """Make sure DMP has a process group, creating a single-rank one if not.
+
+    RecTrainer always initializes gloo on CPU, so a cluster run arrives with
+    one. Local callers -- benchmarks, tests -- often do not, and the branch
+    that used to serve them ran different optimizer code than the cluster.
+    """
+    if dist.is_initialized():
+        return
+    store = os.path.join(tempfile.mkdtemp(prefix="recir_cpu_pg_"), "store")
+    dist.init_process_group(
+        backend="gloo", init_method=f"file://{store}", world_size=1, rank=0
+    )
+    logger.info("CPU backend started a single-rank gloo process group")
 
 
 class _ECSharder(EmbeddingCollectionSharder):
@@ -117,8 +104,7 @@ class CPUEmbeddingBackend(EmbeddingBackend):
     """torchrec DMP ROW_WISE/TABLE_WISE on CPU via gloo.
 
     ``embedding_param_prefix`` is the FQN prefix under which the model keeps
-    its embedding collection parameters, used to find the tables to attach
-    in-backward optimizers to on the single-node path.
+    its embedding collection parameters.
     """
 
     def __init__(self, embedding_param_prefix: str) -> None:
@@ -181,20 +167,22 @@ class CPUEmbeddingBackend(EmbeddingBackend):
     ) -> EmbeddingSetupResult:
         if device.type != "cpu":
             raise ValueError(f"CPU backend requires a CPU device, got {device}.")
-        if dist.is_initialized():
-            dmp_world_size = dist.get_world_size()
-            if dmp_world_size != world_size:
-                logger.info(
-                    "CPU DMP uses process-group world size %d instead of %d JAX devices",
-                    dmp_world_size,
-                    world_size,
-                )
-            model = self._setup_dmp(model, table_configs, sparse_config, dmp_world_size)
-        else:
-            _attach_single_node_sparse_optimizers(
-                model, sparse_config, self._embedding_param_prefix
+        # One path, always DMP. Without a process group this used to attach
+        # in-backward optimizers instead -- a different optimizer, with no LR
+        # handle to drive the schedule from, and one that swallowed the
+        # configured rate through **unused and ran at torchrec's 1e-2 default.
+        # A single-rank group costs nothing and keeps every caller on the code
+        # the cluster runs.
+        _ensure_process_group()
+        dmp_world_size = dist.get_world_size()
+        if dmp_world_size != world_size:
+            logger.info(
+                "CPU DMP uses process-group world size %d instead of %d JAX devices",
+                dmp_world_size,
+                world_size,
             )
-            logger.info("Single-node: using config-driven in-backward optimizers")
+        dmp = self._setup_dmp(model, table_configs, sparse_config, dmp_world_size)
+        model = dmp.module
 
         return EmbeddingSetupResult(
             model=model,
@@ -202,6 +190,7 @@ class CPUEmbeddingBackend(EmbeddingBackend):
             sparse_runtime=SparseOptimizerRuntime(
                 placement=SparseUpdatePlacement.BACKEND_FUSED,
                 config=sparse_config,
+                fused_optimizer=dmp.fused_optimizer,
             ),
         )
 
@@ -211,7 +200,7 @@ class CPUEmbeddingBackend(EmbeddingBackend):
         table_configs: List[EmbeddingConfig],
         config: OptimConfig,
         world_size: int,
-    ) -> nn.Module:
+    ) -> DistributedModelParallel:
         emb_opt_type = optimizer_type_to_emb_opt_type(
             optim_type_to_optim_class(config.optim_type)
         )
@@ -277,7 +266,13 @@ class CPUEmbeddingBackend(EmbeddingBackend):
             init_data_parallel=False,
         )
         logger.info("CPUEmbeddingBackend: DMP initialized (world=%d)", world_size)
-        return dmp.module
+        # The DMP itself, not dmp.module: setup() needs dmp.fused_optimizer to
+        # drive the sparse LR schedule. The EmbeddingFusedOptimizer objects
+        # survive inside the sharded EC either way, but the CombinedOptimizer
+        # that gathers them is assembled in DMP.__init__ and is lost with the
+        # wrapper. Rebuilding it would mean reimplementing torchrec's
+        # _fused_optim_impl, including its module_id_cache dedupe.
+        return dmp
 
     def dense_named_parameters(self, model: nn.Module) -> Dict[str, nn.Parameter]:
         return dict(in_backward_optimizer_filter(model.named_parameters()))
