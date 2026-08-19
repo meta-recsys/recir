@@ -38,6 +38,7 @@ import torch.nn as nn
 from hammer.v3.modules.core.features.builder import FeatureBundleBuilder
 from hammer.v3.modules.core.features.bundle import FeatureBundle
 from hammer.v3.modules.core.features.input_features import InputFeatures
+from hammer.v3.modules.mot.features import MetadataFeatures
 from hammer.v3.modules.mot.preprocessors.mot_preprocessor import MoTPreprocessor
 from torch.nn.utils._named_member_accessor import NamedMemberAccessor
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
@@ -59,26 +60,19 @@ _op_registered: bool = False
 # ---------------------------------------------------------------------------
 #
 # Each entry in self._output_spec is one of:
-#   ("kjt", desc, kjt_keys: List[str], stride: int)
-#       -> 2 tensors in the output list: values, lengths
-#       -> reassembled as KJT with the given keys + stride from input
-#   ("jagged_1d", desc, dtype)
-#       -> 1 tensor with SymInt dim 0 (per-batch jagged total)
-#   ("batch_dense_2d", desc, B: int, dtype)
-#       -> 1 tensor with shape (B, SymInt)  (e.g. PAST_TIMESTAMPS)
-#   ("batch_dense_1d", desc, shape: Tuple[int, ...], dtype)
-#       -> 1D tensor with shape[0] == ro_kjt_stride (per-batch length tensor)
-#   ("high_dim_tensor", desc, shape: Tuple[int, ...], dtype)
-#       -> fallback for >=3D tensors; full concrete shape from sample
+#   ("kjt", desc, keys, values_dtype, lengths_dtype)
+#   ("jagged_1d", desc, dtype, group)
+#   ("batch_dense_2d", desc, dtype)
+#   ("batch_dense_1d", desc, dtype)
+#   ("nro_dense_1d", desc, dtype)
+#   ("scalar_tensor", desc, dtype)
 #   ("dynamic_int", desc)
-#       -> 1 entry encoded as int64 tensor whose shape[0] is a SymInt
-#       -> stored as nontensor int in FeatureBundle
-#   ("batch_int", desc, value: int)
-#       -> 1 entry encoded as int64 tensor whose shape[0] = stride
-#       -> only used for BATCH_SIZE (known to equal ro_kjt.stride())
-#   ("dict_jagged_1d", desc, dict_keys: List[str], dict_dtypes: List[dtype])
-#       -> N tensors (one per dict key), each jagged 1D
-#       -> reassembled as Dict[str, Tensor]
+#   ("batch_int", desc)
+#   ("nro_int", desc)
+#
+# Batch dimensions always come from live input KJT lengths. Jagged groups share
+# one unbacked SymInt. Exports use a separate explicit policy: scalar tensors
+# stay scalar, and `unsampled_inputs` is one-dimensional over the live NRO batch.
 # ---------------------------------------------------------------------------
 
 
@@ -158,8 +152,6 @@ class TraceableMoTPreprocessor(nn.Module):
 
         self._ro_kjt_keys: List[str] = ro_kjt.keys()
         self._nro_kjt_keys: List[str] = nro_kjt.keys()
-        self._ro_kjt_stride: int = ro_kjt.stride()
-        self._nro_kjt_stride: int = nro_kjt.stride()
         self._all_label_keys: List[str] = sorted(all_labels.keys())
 
         # Sample input also tells us if UIH_FLOAT / SUPERVISION_WEIGHT
@@ -171,9 +163,7 @@ class TraceableMoTPreprocessor(nn.Module):
             sample_input.get_tensor(InputFeatures.SUPERVISION_WEIGHT) is not None
         )
 
-        self._output_spec = self._build_output_spec(
-            sample_input, sample_output, self._ro_kjt_stride
-        )
+        self._output_spec = self._build_output_spec(sample_input, sample_output)
         self._export_spec = self._build_export_spec(sample_output)
 
         # Register in global registry.
@@ -181,13 +171,61 @@ class TraceableMoTPreprocessor(nn.Module):
         _INSTANCE_REGISTRY[self._instance_id] = self
 
     def __del__(self) -> None:
-        _INSTANCE_REGISTRY.pop(self._instance_id, None)
+        instance_id = getattr(self, "_instance_id", None)
+        registry = globals().get("_INSTANCE_REGISTRY")
+        if instance_id is not None and registry is not None:
+            registry.pop(instance_id, None)
+
+    @staticmethod
+    def _one_dim_output_spec(
+        desc: Any, desc_name: str, dtype: torch.dtype
+    ) -> Tuple[str, Any, ...]:
+        is_batch_dense = desc_name.endswith(
+            ("/seq_lengths", "/lengths_with_contextual", "/num_targets")
+        ) or ("/additional_emb_input/" in desc_name and desc_name.endswith("/lengths"))
+        if is_batch_dense:
+            return ("batch_dense_1d", desc, dtype)
+        if desc_name.endswith(("/query_time", ".nro_padding_mask")):
+            return ("nro_dense_1d", desc, dtype)
+        parallel_suffixes = (
+            "/past_weights",
+            "/past_watch_times",
+            "/past_vpvd_deltas",
+            "/past_comment_vpvd",
+            "/past_video_lengths",
+            "/past_timestamps_jagged",
+        )
+        if desc_name.endswith(parallel_suffixes):
+            return ("jagged_1d", desc, dtype, desc_name.rsplit("/", 1)[0])
+        if "/additional_emb_input/" in desc_name and desc_name.endswith("/values"):
+            return ("jagged_1d", desc, dtype, desc_name)
+        raise NotImplementedError(
+            f"MoT fake output {desc} has unsupported 1D policy; "
+            "add an explicit shape policy"
+        )
+
+    @staticmethod
+    def _tensor_output_spec(desc: Any, value: torch.Tensor) -> Tuple[str, Any, ...]:
+        desc_name = str(getattr(desc, "name", ""))
+        if value.dim() == 0 and desc_name.endswith(
+            ("/runtime_max_seq_len_t", "/l2_runtime_max_seq_len_t")
+        ):
+            return ("scalar_tensor", desc, value.dtype)
+        if value.dim() == 1:
+            return TraceableMoTPreprocessor._one_dim_output_spec(
+                desc, desc_name, value.dtype
+            )
+        if value.dim() == 2 and desc_name.endswith("/past_timestamps"):
+            return ("batch_dense_2d", desc, value.dtype)
+        raise NotImplementedError(
+            f"MoT fake output {desc} has unsupported shape {tuple(value.shape)}; "
+            "add an explicit shape policy"
+        )
 
     @staticmethod
     def _build_output_spec(
         sample_input: FeatureBundle,
         sample_output: FeatureBundle,
-        ro_kjt_stride: int,
     ) -> List[Tuple[str, Any, ...]]:
         """Introspect sample_output once to build the recipe used by
         _decompose_output, _fake_outputs, and _reassemble_output.
@@ -201,6 +239,11 @@ class TraceableMoTPreprocessor(nn.Module):
         round-trip through the custom op.
         """
         spec: List[Tuple[str, Any, ...]] = []
+        # Known parallel per-event arrays (PAST_WEIGHTS / PAST_WATCH_TIMES /
+        # PAST_VIDEO_LENGTHS / ...) get one group id, so the fake kernel can
+        # give the whole group a single unbacked SymInt. Sharing one symbol makes
+        # their elementwise broadcast provable at trace time. _decompose_output
+        # re-checks the descriptor policy on every batch.
         for desc in sample_output:
             val = sample_output.get(desc)
             if val is None:
@@ -208,63 +251,51 @@ class TraceableMoTPreprocessor(nn.Module):
             if desc in sample_input:
                 continue
             if isinstance(val, KeyedJaggedTensor):
-                spec.append(("kjt", desc, val.keys(), val.stride()))
+                spec.append(
+                    (
+                        "kjt",
+                        desc,
+                        val.keys(),
+                        val.values().dtype,
+                        val.lengths().dtype,
+                    )
+                )
             elif isinstance(val, torch.Tensor):
-                if val.dim() == 1:
-                    if val.shape[0] == ro_kjt_stride:
-                        # 1D per-batch length tensor (e.g. SEQ_LENGTHS).
-                        spec.append(
-                            ("batch_dense_1d", desc, tuple(val.shape), val.dtype)
-                        )
-                    else:
-                        # Jagged 1D (e.g. PAST_WEIGHTS, jagged timestamps).
-                        spec.append(("jagged_1d", desc, val.dtype))
-                elif val.dim() == 2:
-                    # (B, runtime_max_seq_len) - dim 1 dynamic, dim 0 = batch.
-                    spec.append(("batch_dense_2d", desc, val.shape[0], val.dtype))
-                else:
-                    # Fallback: assume fully fixed shape for >=3D tensors.
-                    spec.append(("high_dim_tensor", desc, tuple(val.shape), val.dtype))
+                spec.append(TraceableMoTPreprocessor._tensor_output_spec(desc, val))
             elif isinstance(val, int):
-                # BATCH_SIZE special case: known to equal ro_kjt.stride().
-                # All other int outputs are data-dependent at runtime.
-                if str(getattr(desc, "name", "")).endswith("BATCH_SIZE"):
-                    spec.append(("batch_int", desc, ro_kjt_stride))
+                desc_name = str(getattr(desc, "name", ""))
+                if desc_name.endswith(".batch_size"):
+                    spec.append(("batch_int", desc))
+                elif desc == MetadataFeatures.TOTAL_NUM_TARGETS:
+                    spec.append(("nro_int", desc))
                 else:
                     spec.append(("dynamic_int", desc))
-            elif isinstance(val, dict):
-                # Dict of tensors (e.g. additional embedding values keyed
-                # by feature name).  All entries assumed jagged 1D.
-                # Capture per-key dtypes so the fake kernel can emit
-                # placeholders with the correct dtype.
-                d_keys = sorted(val.keys())
-                d_dtypes = [val[k].dtype for k in d_keys]
-                spec.append(("dict_jagged_1d", desc, d_keys, d_dtypes))
             else:
-                logger.warning(
-                    "Skipping unknown output type %s for descriptor %s",
-                    type(val),
-                    desc,
+                raise NotImplementedError(
+                    f"MoT fake output {desc} has unsupported type {type(val)}; "
+                    "add an explicit output policy"
                 )
         return spec
 
     @staticmethod
     def _build_export_spec(
         sample_output: FeatureBundle,
-    ) -> List[Tuple[str, Tuple[int, ...], torch.dtype]]:
-        """Capture the bundle's _exports separately.  FeatureBundle.__iter__
-        does NOT yield string-keyed exports, so the descriptor-based
-        _output_spec loop misses them entirely.
-        """
-        spec: List[Tuple[str, Tuple[int, ...], torch.dtype]] = []
+    ) -> List[Tuple[str, str, torch.dtype]]:
+        """Build explicit shape policies for string-keyed exports."""
+        spec: List[Tuple[str, str, torch.dtype]] = []
         for export_key, export_val in sample_output.exports.items():
-            if isinstance(export_val, torch.Tensor):
-                spec.append((export_key, tuple(export_val.shape), export_val.dtype))
+            if not isinstance(export_val, torch.Tensor):
+                raise NotImplementedError(
+                    f"MoT export {export_key!r} has unsupported type {type(export_val)}"
+                )
+            if export_val.dim() == 0:
+                spec.append(("scalar", export_key, export_val.dtype))
+            elif export_key == "unsampled_inputs" and export_val.dim() == 1:
+                spec.append(("nro_1d", export_key, export_val.dtype))
             else:
-                logger.warning(
-                    "Skipping non-tensor export %s of type %s",
-                    export_key,
-                    type(export_val),
+                raise NotImplementedError(
+                    f"MoT export {export_key!r} has unsupported shape "
+                    f"{tuple(export_val.shape)}; add an explicit shape policy"
                 )
         return spec
 
@@ -353,7 +384,7 @@ class TraceableMoTPreprocessor(nn.Module):
         builder = FeatureBundleBuilder()
         builder.set(InputFeatures.UIH_ID_LIST, ro_kjt)
         builder.set(InputFeatures.CANDIDATE_ID_LIST, nro_kjt)
-        builder.set(InputFeatures.NUM_CANDIDATES, num_candidates.to(torch.int64))
+        builder.set(InputFeatures.NUM_CANDIDATES, num_candidates)
         if self._has_uih_float and ro_float.numel() > 0:
             builder.set(InputFeatures.UIH_FLOAT, ro_float)
         if self._has_supervision_weight and sup_weight.numel() > 0:
@@ -368,6 +399,112 @@ class TraceableMoTPreprocessor(nn.Module):
         bundle = self._reconstruct_input_bundle(input_tensors)
         out_bundle = self._real(bundle)
         return self._decompose_output(out_bundle, input_tensors[0])
+
+    @staticmethod
+    def _tensor_shape_matches(
+        kind: str, value: torch.Tensor, ro_batch: int, nro_batch: int
+    ) -> bool:
+        if kind == "scalar_tensor":
+            return value.dim() == 0
+        if kind == "jagged_1d":
+            return value.dim() == 1
+        if kind == "batch_dense_1d":
+            return tuple(value.shape) == (ro_batch,)
+        if kind == "nro_dense_1d":
+            return tuple(value.shape) == (nro_batch,)
+        return (
+            kind == "batch_dense_2d" and value.dim() == 2 and value.shape[0] == ro_batch
+        )
+
+    @staticmethod
+    def _validate_jagged_group(
+        spec: Tuple[str, Any, ...],
+        value: torch.Tensor,
+        seen_by_group: Dict[Any, Tuple[Any, int]],
+    ) -> None:
+        desc = spec[1]
+        group = spec[3]
+        length = int(value.shape[0])
+        seen = seen_by_group.get(group)
+        if seen is None:
+            seen_by_group[group] = (desc, length)
+            return
+        if seen[1] != length:
+            raise RuntimeError(
+                f"MoT preprocessor jagged group {group} is not parallel at "
+                f"runtime: {seen[0]} has length {seen[1]} but {desc} has "
+                f"length {length}. The descriptors share an explicit sequence "
+                f"group, and the traced graph uses one SymInt for that group."
+            )
+
+    @staticmethod
+    def _validate_kjt_output(
+        spec: Tuple[str, Any, ...], value: KeyedJaggedTensor, ro_batch: int
+    ) -> List[torch.Tensor]:
+        _, desc, keys, values_dtype, lengths_dtype = spec
+        if (
+            value.keys() != keys
+            or value.stride() != ro_batch
+            or value.values().dtype != values_dtype
+            or value.lengths().dtype != lengths_dtype
+        ):
+            raise RuntimeError(f"MoT output KJT {desc} changed its traced contract")
+        return [value.values().clone(), value.lengths().clone()]
+
+    @classmethod
+    def _validate_tensor_output(
+        cls,
+        spec: Tuple[str, Any, ...],
+        value: torch.Tensor,
+        ro_batch: int,
+        nro_batch: int,
+        seen_by_group: Dict[Any, Tuple[Any, int]],
+    ) -> torch.Tensor:
+        kind, desc, expected_dtype = spec[:3]
+        if kind == "jagged_1d":
+            cls._validate_jagged_group(spec, value, seen_by_group)
+        if value.dtype != expected_dtype or not cls._tensor_shape_matches(
+            kind, value, ro_batch, nro_batch
+        ):
+            raise RuntimeError(f"MoT output {desc} changed its traced {kind} contract")
+        return value.clone()
+
+    @classmethod
+    def _decompose_output_value(
+        cls,
+        spec: Tuple[str, Any, ...],
+        value: Any,
+        ref_tensor: torch.Tensor,
+        ro_batch: int,
+        nro_batch: int,
+        seen_by_group: Dict[Any, Tuple[Any, int]],
+    ) -> List[torch.Tensor]:
+        kind = spec[0]
+        if kind == "kjt":
+            assert isinstance(value, KeyedJaggedTensor)
+            return cls._validate_kjt_output(spec, value, ro_batch)
+        if kind in (
+            "jagged_1d",
+            "batch_dense_2d",
+            "nro_dense_1d",
+            "scalar_tensor",
+            "batch_dense_1d",
+        ):
+            assert isinstance(value, torch.Tensor)
+            return [
+                cls._validate_tensor_output(
+                    spec, value, ro_batch, nro_batch, seen_by_group
+                )
+            ]
+        if kind in ("dynamic_int", "batch_int", "nro_int"):
+            size = int(value)
+            if kind == "nro_int" and size != nro_batch:
+                raise RuntimeError(
+                    f"MoT output {spec[1]} must equal the NRO batch "
+                    f"{nro_batch}; got {size}"
+                )
+            return [torch.zeros(size, dtype=torch.int64, device=ref_tensor.device)]
+        raise RuntimeError(f"Unknown output kind: {kind}")
 
     def _decompose_output(
         self, bundle: FeatureBundle, ref_tensor: torch.Tensor
@@ -387,114 +524,148 @@ class TraceableMoTPreprocessor(nn.Module):
         tensor.  Cost is dominated by the preprocessor's own work.
         """
         out: List[torch.Tensor] = []
+        # The traced graph carries ONE symbol per jagged group, so members that
+        # diverge at runtime would contradict shapes Inductor already baked in.
+        # Check the descriptor policy here; this runs inside the opaque op and
+        # therefore adds no nodes to the traced graph.
+        ro_batch = bundle.require_kjt(InputFeatures.UIH_ID_LIST).stride()
+        nro_batch = bundle.require_kjt(InputFeatures.CANDIDATE_ID_LIST).stride()
+        jagged_group_seen: Dict[Any, Tuple[Any, int]] = {}
         for spec in self._output_spec:
-            kind = spec[0]
-            desc = spec[1]
-            val = bundle.get(desc)
-            if kind == "kjt":
-                assert isinstance(val, KeyedJaggedTensor)
-                out.append(val.values().clone())
-                out.append(val.lengths().clone())
-            elif kind in (
-                "jagged_1d",
-                "batch_dense_2d",
-                "batch_dense_1d",
-                "high_dim_tensor",
-            ):
-                assert isinstance(val, torch.Tensor)
-                out.append(val.clone())
-            elif kind in ("dynamic_int", "batch_int"):
-                # Encode the int as a 1D int64 tensor of size = the value.
-                # Wrapper extracts via t.shape[0] (concrete int at runtime).
-                int_val = int(val) if kind == "dynamic_int" else int(spec[2])
-                out.append(
-                    torch.empty(int_val, dtype=torch.int64, device=ref_tensor.device)
+            val = bundle.get(spec[1])
+            out.extend(
+                self._decompose_output_value(
+                    spec,
+                    val,
+                    ref_tensor,
+                    ro_batch,
+                    nro_batch,
+                    jagged_group_seen,
                 )
-            elif kind == "dict_jagged_1d":
-                d_keys = spec[2]
-                assert isinstance(val, dict)
-                for k in d_keys:
-                    out.append(val[k].clone())
-            else:
-                raise RuntimeError(f"Unknown output kind: {kind}")
+            )
         # Exports (string-keyed _exports dict, not iterated by the regular
         # _output_spec loop above).
-        for export_key, _shape, _dtype in self._export_spec:
+        for export_kind, export_key, dtype in self._export_spec:
             export_val = bundle.get_export(export_key)
-            assert isinstance(export_val, torch.Tensor), (
-                f"Export {export_key!r} missing or not a tensor at runtime"
-            )
+            if not isinstance(export_val, torch.Tensor):
+                raise RuntimeError(f"MoT export {export_key!r} is missing at runtime")
+            if export_val.dtype != dtype:
+                raise RuntimeError(
+                    f"MoT export {export_key!r} changed dtype from {dtype} "
+                    f"to {export_val.dtype}"
+                )
+            if export_kind == "scalar" and export_val.dim() != 0:
+                raise RuntimeError(f"MoT export {export_key!r} must remain scalar")
+            if export_kind == "nro_1d" and tuple(export_val.shape) != (nro_batch,):
+                raise RuntimeError(
+                    f"MoT export {export_key!r} must have NRO shape {(nro_batch,)}; "
+                    f"got {tuple(export_val.shape)}"
+                )
             out.append(export_val.clone())
         return out
 
     # ----- trace path (fake kernel emits SymInt-shaped placeholders) -------
 
+    @staticmethod
+    def _jagged_group_size(group: Any, cache: Dict[Any, Any]) -> Any:
+        """One unbacked SymInt shared by a jagged group (see _build_output_spec)."""
+        size = cache.get(group)
+        if size is None:
+            size = torch.library.get_ctx().new_dynamic_size()
+            torch._check_is_size(size)
+            cache[group] = size
+        return size
+
+    def _fake_output_for_spec(
+        self,
+        spec: Tuple[str, Any, ...],
+        ro_values: torch.Tensor,
+        ro_lengths: torch.Tensor,
+        batch: Any,
+        nro_batch: Any,
+        jagged_group_sizes: Dict[Any, Any],
+    ) -> List[torch.Tensor]:
+        kind = spec[0]
+        if kind == "kjt":
+            _, _, keys, values_dtype, lengths_dtype = spec
+            values_size = torch.library.get_ctx().new_dynamic_size()
+            torch._check_is_size(values_size)
+            return [
+                torch.empty(values_size, dtype=values_dtype, device=ro_values.device),
+                torch.empty(
+                    len(keys) * batch,
+                    dtype=lengths_dtype,
+                    device=ro_lengths.device,
+                ),
+            ]
+        if kind == "jagged_1d":
+            _, _, dtype, group = spec
+            size = self._jagged_group_size(group, jagged_group_sizes)
+            return [torch.empty(size, dtype=dtype, device=ro_values.device)]
+        if kind == "batch_dense_2d":
+            _, _, dtype = spec
+            width = torch.library.get_ctx().new_dynamic_size()
+            torch._check_is_size(width)
+            return [torch.empty(batch, width, dtype=dtype, device=ro_values.device)]
+        if kind == "scalar_tensor":
+            return [torch.empty((), dtype=spec[2], device=ro_values.device)]
+        if kind == "nro_dense_1d":
+            return [torch.empty(nro_batch, dtype=spec[2], device=ro_values.device)]
+        if kind == "batch_dense_1d":
+            return [torch.empty(batch, dtype=spec[2], device=ro_values.device)]
+        if kind == "dynamic_int":
+            size = torch.library.get_ctx().new_dynamic_size()
+            torch._check_is_size(size)
+            return [torch.empty(size, dtype=torch.int64, device=ro_values.device)]
+        if kind == "batch_int":
+            return [torch.empty(batch, dtype=torch.int64, device=ro_values.device)]
+        if kind == "nro_int":
+            return [torch.empty(nro_batch, dtype=torch.int64, device=ro_values.device)]
+        raise RuntimeError(f"Unknown output kind: {kind}")
+
     def _fake_outputs(self, input_tensors: List[torch.Tensor]) -> List[torch.Tensor]:
-        ctx = torch.library.get_ctx()
         out: List[torch.Tensor] = []
         # Reference inputs for device/dtype inheritance.
         ro_values = input_tensors[0]
         ro_lengths = input_tensors[1]
+        # Per-user batch (== ro_kjt.stride()), derived from the LIVE ro_lengths
+        # input (shape K_ro * B) rather than baked from the trace sample. The
+        # ro-KJT inputs stay symbolic through the trace, so this makes batch a
+        # dynamic SymInt that follows the real runtime batch. Baking it (from
+        # the first-compile batch) left the seq_lengths / BATCH_SIZE outputs
+        # pinned to a static size; on any later batch smaller than the trace
+        # batch, Inductor allocated an oversized buffer whose tail stayed
+        # uninitialized, and the downstream timestamp/position kernel read that
+        # garbage OOB (CUDA illegal memory access). Mirrors the dynamic batch
+        # treatment already used for batch_dense_2d below.
+        n_ro_keys = len(self._ro_kjt_keys)
+        batch = ro_lengths.shape[0] // n_ro_keys if n_ro_keys else ro_lengths.shape[0]
+        # The NRO batch follows live candidate KJT lengths and drives
+        # NRO-shaped tensors and exports.
+        nro_lengths = input_tensors[3]
+        n_nro_keys = len(self._nro_kjt_keys)
+        nro_batch = (
+            nro_lengths.shape[0] // n_nro_keys if n_nro_keys else nro_lengths.shape[0]
+        )
+        jagged_group_sizes: Dict[Any, Any] = {}
         for spec in self._output_spec:
-            kind = spec[0]
-            if kind == "kjt":
-                _, _, kjt_keys, kjt_stride = spec
-                K = len(kjt_keys)
-                # Per-feature jagged total -> SymInt.
-                values_size = ctx.new_dynamic_size()
-                torch._check_is_size(values_size)
-                out.append(ro_values.new_empty(values_size))
-                # Lengths shape is K * stride - fixed.
-                out.append(ro_lengths.new_empty(K * kjt_stride))
-            elif kind == "jagged_1d":
-                _, _, dtype = spec
-                sz = ctx.new_dynamic_size()
-                torch._check_is_size(sz)
-                out.append(torch.empty(sz, dtype=dtype, device=ro_values.device))
-            elif kind == "batch_dense_2d":
-                # Both dims SymInt. Previously dim 0 was baked from the
-                # sample's val.shape[0] as a concrete int. That worked for
-                # per-user-batch outputs (PAST_TIMESTAMPS, where dim 0 = B
-                # is constant across batches) but broke for per-candidate
-                # outputs (DENSE_TIMESTAMPS, where dim 0 = num_candidates.sum()
-                # varies per batch). The sample value would bake into
-                # downstream view/cat ops and assert at runtime on any batch
-                # with a different total candidate count.
-                # `dim0` is still in the spec tuple for backwards compat but
-                # ignored here.
-                _, _, _dim0, dtype = spec
-                sz0 = ctx.new_dynamic_size()
-                torch._check_is_size(sz0)
-                sz1 = ctx.new_dynamic_size()
-                torch._check_is_size(sz1)
-                out.append(torch.empty(sz0, sz1, dtype=dtype, device=ro_values.device))
-            elif kind in ("batch_dense_1d", "high_dim_tensor"):
-                # Both store full concrete shape from sample (1D per-batch
-                # vs >=3D fallback) -- same handling here.
-                _, _, shape, dtype = spec
-                out.append(torch.empty(shape, dtype=dtype, device=ro_values.device))
-            elif kind == "dynamic_int":
-                # Emit a 1D int64 tensor whose shape[0] is a SymInt.
-                # Wrapper extracts via t.shape[0] -> SymInt.
-                sz = ctx.new_dynamic_size()
-                torch._check_is_size(sz)
-                out.append(torch.empty(sz, dtype=torch.int64, device=ro_values.device))
-            elif kind == "batch_int":
-                _, _, value = spec
-                out.append(
-                    torch.empty(int(value), dtype=torch.int64, device=ro_values.device)
+            out.extend(
+                self._fake_output_for_spec(
+                    spec,
+                    ro_values,
+                    ro_lengths,
+                    batch,
+                    nro_batch,
+                    jagged_group_sizes,
                 )
-            elif kind == "dict_jagged_1d":
-                _, _, d_keys, d_dtypes = spec
-                for dtype in d_dtypes:
-                    sz = ctx.new_dynamic_size()
-                    torch._check_is_size(sz)
-                    out.append(torch.empty(sz, dtype=dtype, device=ro_values.device))
+            )
+        for export_kind, _key, dtype in self._export_spec:
+            if export_kind == "scalar":
+                out.append(torch.empty((), dtype=dtype, device=ro_values.device))
+            elif export_kind == "nro_1d":
+                out.append(torch.empty(nro_batch, dtype=dtype, device=ro_values.device))
             else:
-                raise RuntimeError(f"Unknown output kind: {kind}")
-        # Exports: assume fixed shape captured at __init__ time.
-        for _key, shape, dtype in self._export_spec:
-            out.append(torch.empty(shape, dtype=dtype, device=ro_values.device))
+                raise RuntimeError(f"Unknown MoT export kind: {export_kind}")
         return out
 
     # ----- output reassembly (List[Tensor] -> FeatureBundle) ---------------
@@ -518,7 +689,7 @@ class TraceableMoTPreprocessor(nn.Module):
             kind = spec[0]
             desc = spec[1]
             if kind == "kjt":
-                _, _, kjt_keys, _ = spec
+                _, _, kjt_keys, _values_dtype, _lengths_dtype = spec
                 values = output_tensors[t_idx]
                 t_idx += 1
                 lengths = output_tensors[t_idx]
@@ -528,28 +699,22 @@ class TraceableMoTPreprocessor(nn.Module):
             elif kind in (
                 "jagged_1d",
                 "batch_dense_2d",
+                "nro_dense_1d",
+                "scalar_tensor",
                 "batch_dense_1d",
-                "high_dim_tensor",
             ):
                 out.set(desc, output_tensors[t_idx], validate=False)
                 t_idx += 1
-            elif kind in ("dynamic_int", "batch_int"):
+            elif kind in ("dynamic_int", "batch_int", "nro_int"):
                 # Extract int value from tensor's shape[0] (SymInt at trace).
                 int_val = output_tensors[t_idx].shape[0]
                 t_idx += 1
                 out.set(desc, int_val, validate=False)
-            elif kind == "dict_jagged_1d":
-                d_keys = spec[2]
-                d: Dict[str, torch.Tensor] = {}
-                for k in d_keys:
-                    d[k] = output_tensors[t_idx]
-                    t_idx += 1
-                out.set(desc, d, validate=False)
             else:
                 raise RuntimeError(f"Unknown output kind: {kind}")
         # Exports go into the parallel _exports dict (not yielded by
         # FeatureBundle.__iter__ -- string-keyed).
-        for export_key, _shape, _dtype in self._export_spec:
+        for _kind, export_key, _dtype in self._export_spec:
             out.set_export(export_key, output_tensors[t_idx])
             t_idx += 1
         return out
