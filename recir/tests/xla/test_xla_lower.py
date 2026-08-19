@@ -402,14 +402,14 @@ class TestPartialLowerXLA(unittest.TestCase):
         )
 
     def test_strip_profiler_nodes(self) -> None:
-        """Verify _strip_profiler_nodes removes profiler ops from the graph.
+        """Verify strip_profiler_nodes removes profiler ops from the graph.
 
         Profiler ops like _record_function_enter_new return ScriptObject
-        handles that JAX cannot represent. _strip_profiler_nodes runs on
+        handles that JAX cannot represent. strip_profiler_nodes runs on
         the parent graph before segmentation so ScriptObject handles never
         become XLA subgraph inputs.
         """
-        from recir.lowering.xla_lower import _strip_profiler_nodes
+        from recir.lowering.lowering_utils import strip_profiler_nodes
 
         # Build a graph with profiler nodes interleaved with aten ops
         graph = torch.fx.Graph()
@@ -419,7 +419,7 @@ class TestPartialLowerXLA(unittest.TestCase):
             args=("## test_block ##",),
         )
         relu = graph.call_function(torch.ops.aten.relu.default, args=(x,))
-        record_exit = graph.call_function(
+        graph.call_function(
             torch.ops.profiler._record_function_exit.default,
             args=(record_fn,),
         )
@@ -437,7 +437,7 @@ class TestPartialLowerXLA(unittest.TestCase):
         self.assertGreater(len(profiler_nodes), 0)
 
         # Strip using module-level function (called by partial_lower_xla)
-        stripped = _strip_profiler_nodes(gm)
+        stripped = strip_profiler_nodes(gm)
 
         # After stripping: no profiler nodes remain
         profiler_nodes_after = [
@@ -468,8 +468,8 @@ class TestPartialLowerXLA(unittest.TestCase):
             )
 
     def test_strip_profiler_nodes_no_profiler(self) -> None:
-        """Verify _strip_profiler_nodes is a no-op on graphs without profiler ops."""
-        from recir.lowering.xla_lower import _strip_profiler_nodes
+        """Verify strip_profiler_nodes is a no-op on graphs without profiler ops."""
+        from recir.lowering.lowering_utils import strip_profiler_nodes
 
         graph = torch.fx.Graph()
         x = graph.placeholder("x")
@@ -478,19 +478,19 @@ class TestPartialLowerXLA(unittest.TestCase):
         gm = torch.fx.GraphModule(root={}, graph=graph)
 
         node_count_before = len(list(gm.graph.nodes))
-        stripped = _strip_profiler_nodes(gm)
+        stripped = strip_profiler_nodes(gm)
         node_count_after = len(list(stripped.graph.nodes))
         self.assertEqual(node_count_before, node_count_after)
 
     def test_strip_profiler_nodes_iter_graph_module(self) -> None:
-        """Regression: _strip_profiler_nodes must work on IterGraphModule.
+        """Regression: strip_profiler_nodes must work on IterGraphModule.
 
         v7.1's XLABackend sets ``default_uses_iter_graph=True`` so
         ``partial_lower_xla`` now receives an ``IterGraphModule``.
         ``IterGraphModule.erase_node`` cascades the erase to the
         mirrored setup/cleanup graphs without first calling
         ``replace_all_uses_with(None)`` on the mirror node. If
-        ``_strip_profiler_nodes`` erases ``_record_function_enter_new``
+        ``strip_profiler_nodes`` erases ``_record_function_enter_new``
         while its paired ``_record_function_exit`` mirror still
         references it, torch.fx raises:
 
@@ -503,7 +503,7 @@ class TestPartialLowerXLA(unittest.TestCase):
         ``_record_function_enter_new`` mirror in all three graphs.
         """
         from recir.iter_graph_module import IterGraphModule
-        from recir.lowering.xla_lower import _strip_profiler_nodes
+        from recir.lowering.lowering_utils import strip_profiler_nodes
 
         # Build a tiny graph with a paired enter/exit profiler block
         # wrapping an aten op (mirrors what the trace emits when user
@@ -530,7 +530,7 @@ class TestPartialLowerXLA(unittest.TestCase):
         # Before the fix this raised RuntimeError due to the cascade
         # erasing the setup-graph mirror of _record_function_enter_new
         # while its _record_function_exit mirror still referenced it.
-        stripped = _strip_profiler_nodes(iter_gm)
+        stripped = strip_profiler_nodes(iter_gm)
 
         # All three sub-graphs (main + setup + cleanup) should have
         # their profiler nodes removed.

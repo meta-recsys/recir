@@ -24,7 +24,7 @@ from recir.batch_dim_propagation import (
     propagate_fsdp_sharded_meta,
 )
 from recir.distributed.sharding_spec import get_state_layout
-from recir.lowering.lowering_utils import segment_and_lower
+from recir.lowering.lowering_utils import segment_and_lower, strip_profiler_nodes
 from recir.lowering.op_swap import OpSwapRegistry, swap_ops
 from recir.meta_tensor_init import default_embedding_init_bound, get_meta_init_spec
 from recir.torchax.ops.mappings import t2j
@@ -1366,62 +1366,6 @@ def _annotate_safe_donate_indices(gm: torch.fx.GraphModule) -> None:
         target.safe_donate_indices = safe
 
 
-def _strip_profiler_nodes(gm: torch.fx.GraphModule) -> torch.fx.GraphModule:
-    """Remove profiler ops from the graph.
-
-    Profiler ops like ``_record_function_enter_new`` and
-    ``_record_function_exit`` return ``torch.ScriptObject`` handles
-    that JAX cannot represent.  They are no-ops at execution time,
-    so stripping them is safe.
-
-    Must run on the parent graph *before* segmentation so that the
-    ScriptObject handles never become XLA subgraph inputs.
-
-    Implementation note: profiler nodes form ``enter -> exit`` pairs,
-    where ``_record_function_exit`` consumes the handle returned by
-    ``_record_function_enter_new``. We iterate in REVERSE topological
-    order so each ``_record_function_exit`` is erased before its
-    matching ``_record_function_enter_new``. For ``IterGraphModule``
-    this ensures both the main and the setup/cleanup mirror users are
-    cleared before their producer is erased.
-
-    A ``replace_all_uses_with(None)`` is still issued before
-    ``erase_node`` so that the main graph itself does not raise
-    ``RuntimeError: Tried to erase Node ... but it still had 1 users``
-    on the rare paths where DCE has not yet removed the consumer in
-    forward order. For the ``IterGraphModule`` cascade, the explicit
-    ``unsafe_drop_users=True`` opt-in tells the overridden
-    ``erase_node`` that ``None`` substitution on the mirror is safe
-    here: each user-mirror is itself about to be erased in the same
-    sweep (the reverse-topo order guarantees it), so the substituted
-    ``None`` never reaches the recompiled setup/cleanup forward.
-    """
-    # Lazy import to avoid a build-time circular BUCK dep cycle with
-    # ``recir/lowering:lowering_utils`` -> ``recir:iter_graph_module``
-    # -> (lazy) ``recir/lowering:xla_lower``. Marked ``# @manual`` so
-    # autodeps2 does not introduce the dep that would re-form the
-    # cycle. See ``IterGraphModule.named_xla_modules`` for the mirror
-    # pattern.
-    from recir.iter_graph_module import IterGraph  # @manual
-
-    changed = False
-    for node in reversed(list(gm.graph.nodes)):
-        if node.op == "call_function" and isinstance(
-            node.target, torch._ops.OpOverload
-        ):
-            if node.target.name().startswith("profiler::"):
-                node.replace_all_uses_with(None)  # type: ignore[arg-type]
-                if isinstance(gm.graph, IterGraph):
-                    gm.graph.erase_node(node, unsafe_drop_users=True)
-                else:
-                    gm.graph.erase_node(node)
-                changed = True
-    if changed:
-        gm.graph.eliminate_dead_code()
-        gm.recompile()
-    return gm
-
-
 def _strip_mark_boundary_nodes(gm: torch.fx.GraphModule) -> torch.fx.GraphModule:
     """Remove ``recir::mark_boundary`` identity ops before XLA segmentation.
 
@@ -1460,7 +1404,7 @@ def partial_lower_xla(
         gm = swap_ops(gm, op_swap_map)
     # Strip profiler ops before segmentation so their ScriptObject
     # handles never become XLA subgraph inputs.
-    gm = _strip_profiler_nodes(gm)
+    gm = strip_profiler_nodes(gm)
     gm = _strip_mark_boundary_nodes(gm)
     # Re-propagate is_batch_input/batch_dim. The first pass runs at trace
     # time in ``recir.api._finalize_graph`` / ``recir.trace`` before any

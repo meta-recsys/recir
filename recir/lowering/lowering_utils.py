@@ -17,6 +17,31 @@ MIN_ATEN_OPS_TO_LOWER = 10
 logger: logging.Logger = logging.getLogger(__name__)
 
 
+def strip_profiler_nodes(gm: torch.fx.GraphModule) -> torch.fx.GraphModule:
+    """Remove profiler ops before backend segmentation.
+
+    Their opaque handles cannot cross lowered subgraph boundaries.
+    """
+    from recir.iter_graph_module import IterGraph
+
+    changed = False
+    for node in reversed(list(gm.graph.nodes)):
+        if node.op == "call_function" and isinstance(
+            node.target, torch._ops.OpOverload
+        ):
+            if node.target.name().startswith("profiler::"):
+                node.replace_all_uses_with(None)  # type: ignore[arg-type]
+                if isinstance(gm.graph, IterGraph):
+                    gm.graph.erase_node(node, unsafe_drop_users=True)
+                else:
+                    gm.graph.erase_node(node)
+                changed = True
+    if changed:
+        gm.graph.eliminate_dead_code()
+        gm.recompile()
+    return gm
+
+
 def create_subgraph_module(
     inputs: List[torch.fx.Node],
     body: List[torch.fx.Node],
