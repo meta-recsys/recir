@@ -190,6 +190,7 @@ echo "============================================"
 
 cd "$STAGING_DIR"
 podman build \
+    ${PODMAN_PULL_POLICY:+--pull=$PODMAN_PULL_POLICY} \
     --build-arg HTTP_PROXY="$HTTP_PROXY" \
     --build-arg http_proxy="$HTTP_PROXY" \
     --build-arg HTTPS_PROXY="$HTTPS_PROXY" \

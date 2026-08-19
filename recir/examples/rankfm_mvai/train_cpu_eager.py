@@ -155,6 +155,8 @@ def main() -> None:
             reg_task_indices=reg_task_indices,
             is_variable_step=True,
             report_interval=report_interval,
+            light_loss_norm=trainer_cfg.light_loss_norm,
+            grad_accum_steps=trainer_cfg.grad_accum_steps,
         ),
         job_resolver=JobResolver(),
     ).train()
