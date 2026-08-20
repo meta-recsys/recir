@@ -1,6 +1,5 @@
 # (c) Meta Platforms, Inc. and affiliates. Confidential and proprietary.
 
-# pyre-unsafe
 
 """torchax JAX lowering of ``recir::hstu_attention`` to the Pallas HSTU kernel.
 

@@ -18,7 +18,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# pyre-strict
 
 """If you don't know which file a test should go, and don't want to make a new file
 for a small test. PUt it here

@@ -6,7 +6,6 @@
 
 # (c) Meta Platforms, Inc. and affiliates. Confidential and proprietary.
 
-# pyre-strict
 
 """Shared DLRMv3 model definitions and helpers for XLA and EC sharding tests."""
 

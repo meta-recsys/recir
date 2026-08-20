@@ -7,7 +7,6 @@
 
 # (c) Meta Platforms, Inc. and affiliates. Confidential and proprietary.
 
-# pyre-strict
 
 """Tests for DLRMv3 with DMP EmbeddingCollection row-wise sharding on CPU
 combined with XLA GSPMD compilation for the dense path.
