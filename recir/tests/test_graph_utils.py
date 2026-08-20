@@ -4,7 +4,6 @@
 # This source code is licensed under the BSD-3-Clause license found in the
 # LICENSE file in the root directory of this source tree.
 
-# pyre-strict
 import os
 
 from recir.graph_utils import dump_graphs_to_files

@@ -1,7 +1,6 @@
 #!/usr/bin/env fbpython
 # (c) Meta Platforms, Inc. and affiliates. Confidential and proprietary.
 
-# pyre-strict
 
 """Compare consecutive CPU-eager and TPU-compiled RankFM optimizer steps.
 

@@ -1,6 +1,5 @@
 # (c) Meta Platforms, Inc. and affiliates. Confidential and proprietary.
 
-# pyre-unsafe
 
 """Flash-style (query- and KV-tiled) HSTU SiLU attention kernel for TPU via Pallas.
 

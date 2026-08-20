@@ -4,7 +4,6 @@
 # This source code is licensed under the BSD-3-Clause license found in the
 # LICENSE file in the root directory of this source tree.
 
-# pyre-strict
 
 """``recir::dense_to_jagged``, ``recir::jagged_to_padded_dense``,
 ``recir::concat_2d_jagged``, and ``recir::split_2d_jagged`` custom ops.

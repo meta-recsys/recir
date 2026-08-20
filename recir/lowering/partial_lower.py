@@ -8,7 +8,6 @@
 # internal version. Once the internal version is fully mature, we should
 # upstream again and retire the internal version. @yifuwang
 
-# pyre-strict
 
 from typing import Any, Callable, cast, List, Optional, Tuple
 

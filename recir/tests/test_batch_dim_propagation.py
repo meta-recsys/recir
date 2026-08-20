@@ -4,7 +4,6 @@
 # This source code is licensed under the BSD-3-Clause license found in the
 # LICENSE file in the root directory of this source tree.
 
-# pyre-strict
 
 """Unit tests for `propagate_batch_input_meta`.
 

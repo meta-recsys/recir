@@ -4,7 +4,6 @@
 # This source code is licensed under the BSD-3-Clause license found in the
 # LICENSE file in the root directory of this source tree.
 
-# pyre-strict
 
 """The recir CPU-eager optimizer step, with no mvai_cloud / jax dependency.
 

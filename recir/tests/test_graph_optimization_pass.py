@@ -4,7 +4,6 @@
 # This source code is licensed under the BSD-3-Clause license found in the
 # LICENSE file in the root directory of this source tree.
 
-# pyre-strict
 
 """Tests for code that survives the v7.1 module_override / gm_transformation
 deletion in D106331621.

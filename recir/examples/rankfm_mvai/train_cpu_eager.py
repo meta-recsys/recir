@@ -4,7 +4,6 @@
 # This source code is licensed under the BSD-3-Clause license found in the
 # LICENSE file in the root directory of this source tree.
 
-# pyre-strict
 
 """RankFM (xsurface V3) CPU-EAGER training -- matched-config reference for the
 TPU run, driven by the SAME mvai_cloud RecTrainer.
