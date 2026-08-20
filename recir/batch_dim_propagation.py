@@ -251,8 +251,33 @@ def _output_batch_dim_for(
     # WHICH operand carries the batch tag (mat1 vs mat2) and which axis.
 
     # cat / stack on a non-batch axis preserve batch_dim.
-    if target in (aten.cat.default, aten.stack.default):
+    # cat(tensors, dim): rank is preserved, so the batch axis comes through.
+    #
+    # NOTE: this does not check the concat dim. Concatenating ALONG the batch
+    # axis is common on the jagged paths (RO and NRO token blocks), and leaving
+    # those untagged would replicate a [global_batch*seq, D] activation on every
+    # device -- the failure the ringshift note below describes. Keeping the tag
+    # is the deliberate choice; revisit only with a measurement.
+    if target is aten.cat.default:
         return input_batch_dim
+
+    # stack(tensors, dim) INSERTS a new axis, so it is NOT cat: every axis at or
+    # after ``dim`` shifts right by one, and the batch axis moves with them.
+    #
+    # Sharing cat's rule here (returning input_batch_dim unchanged) mislabels
+    # the INSERTED axis as the batch one. That is how a per-task stack of
+    # [batch] vectors -- stack([select_31, ...]) -> f32[15, 10400] in the udd_fm
+    # graph -- ends up claiming batch_dim=0 on its 15/90/105-long task axis. It
+    # then reaches a graph break, _jit_gspmd builds P('torch_dist', None) from
+    # the tag, and jax rejects it: "array axis 0 is partitioned 8 times, but the
+    # dimension size is 105". Worse when the task count HAPPENS to divide the
+    # mesh -- then it silently shards the task axis instead of the batch, and
+    # every device computes a slice of the tasks over the whole batch.
+    if target is aten.stack.default:
+        dim = _normalize_sequence_dim(node, rank_delta=1)
+        if dim is None:
+            return None
+        return input_batch_dim + 1 if dim <= input_batch_dim else input_batch_dim
 
     # embedding lookup: indices (batch_dim) -> (..., D), batch_dim preserved.
     if target == aten.embedding.default:
@@ -431,6 +456,31 @@ def _passthrough_if_rank_ok(node: fx.Node, input_batch_dim: int) -> Optional[int
     if input_batch_dim >= len(sizes):
         return None
     return input_batch_dim
+
+
+def _normalize_sequence_dim(node: fx.Node, rank_delta: int = 0) -> Optional[int]:
+    """Normalize ``dim`` for ops whose first arg is a LIST of tensors.
+
+    ``_normalize_dim`` reads the rank off ``node.args[0]``, which for cat/stack
+    is the tensor list rather than a tensor, so it cannot serve here.
+    ``rank_delta`` is 1 for ``stack``, whose output has one more axis than its
+    inputs -- a negative dim counts back from the OUTPUT rank.
+    """
+    dim = node.args[1] if len(node.args) > 1 else node.kwargs.get("dim", 0)
+    if not isinstance(dim, int):
+        return None
+    if dim >= 0:
+        return dim
+    seq = node.args[0] if node.args else None
+    if not isinstance(seq, (list, tuple)) or not seq:
+        return None
+    first = seq[0]
+    if not isinstance(first, fx.Node):
+        return None
+    ndim = getattr(first.meta.get("val"), "ndim", None)
+    if ndim is None:
+        return None
+    return dim + ndim + rank_delta
 
 
 def _normalize_dim(node: fx.Node, dim: int) -> Optional[int]:
