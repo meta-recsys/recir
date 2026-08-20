@@ -577,8 +577,6 @@ class RankFMMvaiModelFamily(BlueReelsVDDModelFamily):
         module_config = self._module_config()
         backend = build_embedding_backend(
             trainer_cfg.embedding_backend,
-            ringshift_min_rows=trainer_cfg.ringshift_min_rows,
-            fsdp_min_rows=trainer_cfg.fsdp_min_rows,
             on_device_init=trainer_cfg.on_device_init,
             embedding_tables=module_config.embedding_tables,
         )

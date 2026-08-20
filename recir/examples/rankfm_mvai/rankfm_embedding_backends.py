@@ -29,7 +29,7 @@ import jax
 import torch
 import torch.nn as nn
 from minimal_viable_ai.core.model_family_api.optimizer_configs import OptimConfig
-from recir.embedding.backend import EmbeddingBackend
+from recir.embedding.backend import EmbeddingBackend, table_plans_from_embedding_tables
 from recir.embedding.cpu import CPUEmbeddingBackend, SparseArchDispatcher
 from recir.embedding.in_graph import (
     InGraphEmbeddingBackend,
@@ -263,8 +263,6 @@ class InGraphRankFMBackend(InGraphEmbeddingBackend):
 def build_embedding_backend(
     embedding_backend: str,
     *,
-    ringshift_min_rows: int = 4096,
-    fsdp_min_rows: int = -1,
     on_device_init: bool = True,
     embedding_tables: Optional[Dict[str, Any]] = None,
 ) -> EmbeddingBackend:
@@ -283,11 +281,16 @@ def build_embedding_backend(
     if embedding_backend == "tpu":
         return JAXRankFMBackend()
     if embedding_backend == "in_graph":
+        if embedding_tables is None:
+            raise ValueError(
+                "the in_graph backend needs embedding_tables: each table's "
+                "sharding decides both its layout and which optimizer trains "
+                "it, and there is no default to fall back on."
+            )
         return InGraphRankFMBackend(
             sparse_arch_getter=rankfm_sparse_arch,
             sparse_optimizer_builder=rankfm_sparse_optimizer,
-            ringshift_min_rows=ringshift_min_rows,
-            fsdp_min_rows=fsdp_min_rows,
+            table_plans=table_plans_from_embedding_tables(embedding_tables),
             on_device_init=on_device_init,
         )
     raise ValueError(

@@ -83,12 +83,9 @@ spec:
               # Embedding backend under test: in_graph (default) | cpu | tpu.
               - name: PARITY_EMB_BACKEND
                 value: "in_graph"
-              # in_graph table-sharding knobs (ignored by cpu/tpu); uncomment to
-              # steer which tables use ROWWISE ring-shift / FSDP / DP by row count:
-              # - name: PARITY_RINGSHIFT_MIN_ROWS
-              #   value: "4096"
-              # - name: PARITY_FSDP_MIN_ROWS
-              #   value: "-1"
+              # Which tables are ROWWISE vs REPLICATED, and which optimizer
+              # trains each, comes from EmbeddingTable.sharding in the module
+              # config -- there is no env knob for it, by design.
               - name: PARITY_ON_DEVICE_INIT
                 value: "0"
               command:

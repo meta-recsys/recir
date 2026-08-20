@@ -104,11 +104,6 @@ SPMD_DECOMP_TABLE[torch.ops.gr.batched_complete_cumsum.default] = (
 # program as plain params, so it adds a dedicated embedding optimizer and uses
 # the two-optimizer compile path (mirrors model_family._build_compiled_step).
 _PARITY_EMB_BACKEND: str = os.environ.get("PARITY_EMB_BACKEND", "in_graph").lower()
-# in_graph table-sharding thresholds (per-table row counts); ignored by cpu/tpu.
-_PARITY_RINGSHIFT_MIN_ROWS: int = int(
-    os.environ.get("PARITY_RINGSHIFT_MIN_ROWS", "4096")
-)
-_PARITY_FSDP_MIN_ROWS: int = int(os.environ.get("PARITY_FSDP_MIN_ROWS", "-1"))
 _PARITY_ON_DEVICE_INIT: bool = os.environ.get(
     "PARITY_ON_DEVICE_INIT", "0"
 ).lower() not in ("0", "false", "no", "")
@@ -378,9 +373,8 @@ def _compiled_step(
     trainer_cfg = RankFMTrainerConfig()
     backend = build_embedding_backend(
         emb_backend,
-        ringshift_min_rows=_PARITY_RINGSHIFT_MIN_ROWS,
-        fsdp_min_rows=_PARITY_FSDP_MIN_ROWS,
         on_device_init=_PARITY_ON_DEVICE_INIT,
+        embedding_tables=module_config.embedding_tables,
     )
     # cpu/torchrec DMP needs a gloo PG; mirror the family (reuse if already init).
     if not (dist.is_available() and dist.is_initialized()):
