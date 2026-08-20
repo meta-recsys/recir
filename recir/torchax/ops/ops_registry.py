@@ -40,6 +40,15 @@ class Operator:
 all_aten_ops: dict[TorchCallable, Operator] = {}
 all_torch_functions: dict[TorchCallable, Operator] = {}
 
+# Every registry a lookup has to consult, in priority order. Environment reads
+# it twice -- once to seed its snapshot, once to fall back when the snapshot
+# misses -- and both must cover the same ground, so a new registry has to
+# appear here rather than at either call site.
+ALL_REGISTRIES: tuple[dict[TorchCallable, Operator], ...] = (
+    all_aten_ops,
+    all_torch_functions,
+)
+
 
 def register_torch_dispatch_op(
     aten_op: Any,

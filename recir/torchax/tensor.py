@@ -560,9 +560,7 @@ class Environment(contextlib.ContextDecorator):
             jtorchvision_nms,
         )
 
-        for k, v in itertools.chain(
-            ops_registry.all_aten_ops.items(), ops_registry.all_torch_functions.items()
-        ):
+        for k, v in itertools.chain(*(r.items() for r in ops_registry.ALL_REGISTRIES)):
             self._ops[k] = v
 
         from recir.torchax.decompositions import DECOMPOSITIONS, MUTABLE_DECOMPOSITION
@@ -588,6 +586,18 @@ class Environment(contextlib.ContextDecorator):
             return op
 
         op = _get_from_dict(self._ops, func)
+
+        if op is None:
+            # Registered AFTER this Environment was built. ``load_ops()``
+            # snapshots the registry into ``self._ops`` at construction, so an
+            # op registered later is invisible to it -- and lazily imported
+            # modules are the normal way to register one, precisely so that
+            # importing them is opt-in
+            for registry in ops_registry.ALL_REGISTRIES:
+                op = _get_from_dict(registry, func)
+                if op is not None:
+                    self._ops[func] = op
+                    break
 
         if op is None:
             # fallback to decompose
