@@ -7,9 +7,9 @@
 # TPU init timeouts, tolerations) mirrors the 64-chip bench.
 #
 # This is the slice where in_graph RING-SHIFT is actually measurable: at 64 chips
-# the 1M table shards to ~1M/128 ~8k rows/shard (~8MB) and fits VMEM, so
-# ringshift_min_rows=fsdp_min_rows=4096 routes the big table onto the ring-shift
-# kernel (unlike the 4-chip slice, where the shard OOMs VMEM -> DP fallback).
+# the 1M table shards to ~1M/128 ~8k rows/shard (~8MB) and fits VMEM, so its
+# ROW_WISE placement puts it on the ring-shift kernel (unlike the 4-chip slice,
+# where that shard would OOM VMEM and the table needs DATA_PARALLEL instead).
 #
 # forward_benchmark uses jax.process_count() for num_processes, so it runs
 # multi-host like train.py. Config via FWD_* env vars. Private image tag.
@@ -81,14 +81,11 @@ spec:
                   --xla_tpu_reduce_scatter_collective_matmul_mode=post_spmd
                   --xla_enable_async_all_gather=true
               # in_graph with ring-shift: the 1M table shards to ~8k rows/shard on
-              # 128 devices (fits VMEM) -> both thresholds 4096 route it to the
-              # ring-shift kernel (the real sharded large-table path).
+              # 128 devices (fits VMEM), so its ROW_WISE placement in the module
+              # config routes it onto the ring-shift kernel (the real sharded
+              # large-table path).
               - name: FWD_EMB_BACKEND
                 value: "cpu"
-              - name: FWD_RINGSHIFT_MIN_ROWS
-                value: "4096"
-              - name: FWD_FSDP_MIN_ROWS
-                value: "4096"
               # Real host init (not meta): the 1M tables fit host memory, so init
               # them ONCE + cache as jax arrays instead of re-materializing the
               # meta weights every forward step (forward-only doesn't persist them,

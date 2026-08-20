@@ -88,6 +88,8 @@ from minimal_viable_ai.models.blue_reels_vdd.model_configs import (
     BlueReelsVDDModuleConfig as ProdBlueReelsVDDModuleConfig,
 )
 from pyre_extensions import none_throws
+from recir.embedding.in_graph import InGraphEmbeddingBackend
+from recir.embedding.split_collection import partition_by_sharding
 from recir.examples.rankfm_mvai import prod_config_artifact as _artifact
 
 # Private, and imported anyway: this is the function the recir CPU backend uses
@@ -746,6 +748,26 @@ def _embedding_optimizer_buckets(
         if not name.startswith(emb_prefix):
             continue
         buckets[name.split(".")[-2]] = "dense" if name in dense_names else "sparse"
+    return buckets
+
+
+def _in_graph_table_buckets(
+    model: torch.nn.Module, dense_names: Set[str], emb_prefix: str
+) -> Dict[str, str]:
+    """``_embedding_optimizer_buckets`` for the in_graph backend's FQN layout.
+
+    in_graph keeps its tables in two ``nn.ParameterDict``s (``_sharded_tables``
+    / ``_dp_tables``), so a table's parameter is ``<prefix>._dp_tables.<table>``
+    and the name is the LAST segment -- not the second-to-last that torchrec's
+    ``embeddings.<table>.weight`` puts it in. Reusing the torchrec reader here
+    returns two entries keyed by the ParameterDict names and every table
+    disappears from the comparison.
+    """
+    buckets: Dict[str, str] = {}
+    for name, _ in model.named_parameters():
+        if not name.startswith(emb_prefix):
+            continue
+        buckets[name.split(".")[-1]] = "dense" if name in dense_names else "sparse"
     return buckets
 
 
@@ -1526,6 +1548,119 @@ class TwoModelOneStepParityTest(TestCase):
         )
 
 
+class InGraphTablePlacementTest(TestCase):
+    """Which optimizer the in_graph backend gives each embedding table.
+
+    Production places tables individually: ROW_WISE -> the sparse optimizer
+    (RowWiseAdagrad @ 0.002), DATA_PARALLEL -> the dense one (AdamW @ 4e-5).
+    ~50x apart, and a misplaced table keeps its shape, its key and its
+    state_dict entry -- it just trains at the wrong rate. udd_fm_v3 is three
+    ROW_WISE and seven DATA_PARALLEL.
+
+    The cluster check for this is the weight delta (a sparse-trained table moves
+    ~50x further in one step), which needs a pod, two legs and instrumentation.
+    This asks the same question off the parameter split alone, so the answer is
+    available before anything is submitted.
+
+    Placement is read off the ARTIFACT, not prod's live config, because that is
+    what the pod reads. It also puts ``partition_by_sharding``'s bare-string
+    guard on the real path: the artifact round-tripped ``sharding`` by NAME
+    once, which compares unequal to every ShardingType member while still being
+    non-None, so every reader saw "no placement" and said nothing.
+    """
+
+    # The parity leg's device count (rankfm_mvai-parity-4chip). Only reaches the
+    # row padding for dim-0-sharded tables, but a table's rows are padded up to
+    # a multiple of it, so it has to be the real one.
+    _WORLD_SIZE: int = 4
+
+    def setUp(self) -> None:
+        artifact = os.path.join(tempfile.mkdtemp(), "prod_cfg.pt")
+        export_prod_config(artifact)
+        self._artifact_env: Any = unittest.mock.patch.dict(
+            os.environ, {ARTIFACT_PATH_ENV: artifact}
+        )
+        self._artifact_env.start()
+
+    def tearDown(self) -> None:
+        self._artifact_env.stop()
+
+    def test_in_graph_places_tables_the_way_the_config_asks(self) -> None:
+        module_config = _recir_module_config(disable_seq_len_sampling=True)
+        _clamp_tables(module_config)
+        _cap_seq_len(module_config)
+        _sync_l2_max_seq_len(module_config)
+        torch.manual_seed(0)
+        model = build_model_from_config(
+            module_config, device=torch.device("cpu"), bf16_training=False
+        )
+        # Read the configs off the EC BEFORE setup() swaps it out.
+        emb_prefix, ec = _embedding_collection(model)
+        table_configs = ec.embedding_configs()
+
+        sharded, replicated = partition_by_sharding(
+            cast(Dict[str, object], module_config.embedding_tables)
+        )
+        expected = {
+            **dict.fromkeys(sharded, "sparse"),
+            **dict.fromkeys(replicated, "dense"),
+        }
+        self.assertEqual(
+            sorted(expected),
+            sorted(tc.name for tc in table_configs),
+            "the config's tables and the collection's tables are different sets, "
+            "so the comparison below would silently skip whichever is missing",
+        )
+        # Guard against a vacuous pass: if the source says every table is the
+        # same placement, the assertion at the end holds no matter what the
+        # backend does. Ten tables in one bucket IS the bug this exists for.
+        self.assertEqual(
+            sorted(set(expected.values())),
+            ["dense", "sparse"],
+            "prod splits these tables across BOTH optimizers, so a single "
+            f"bucket here means the placement never reached the config: {expected}",
+        )
+
+        backend = build_embedding_backend(
+            "in_graph",
+            embedding_tables=module_config.embedding_tables,
+            # Real params, not meta: the meta branch exists so huge tables can
+            # be generated straight into HBM by jax, and there is no HBM here.
+            on_device_init=False,
+        )
+        # setup() refuses to run without these. Placement does not depend on
+        # them -- InGraphSparseArch only stores them for the lookup path -- so
+        # one token per feature keeps the test off the data pipeline.
+        # build_embedding_backend is typed as the base EmbeddingBackend, which
+        # has no set_feature_seqlens; only the in_graph one does.
+        assert isinstance(backend, InGraphEmbeddingBackend)
+        backend.set_feature_seqlens(
+            {f: 1 for tc in table_configs for f in tc.feature_names}
+        )
+        setup = backend.setup(
+            model,
+            table_configs,
+            build_optimizer_config().sparse.default,
+            torch.device("cpu"),
+            self._WORLD_SIZE,
+        )
+
+        actual = _in_graph_table_buckets(
+            setup.model, set(setup.dense_named_parameters), emb_prefix
+        )
+        # The whole point of the failure is WHICH tables moved; the default
+        # 640-char truncation replaces exactly that with "[335 chars]".
+        self.maxDiff = None
+        self.assertEqual(
+            actual,
+            expected,
+            "the in_graph backend trains these tables with a different "
+            "optimizer than the config asks for; a table that should be dense "
+            "and lands in the sparse bucket runs at ~50x its intended learning "
+            "rate, with no shape, key or state_dict difference to show for it",
+        )
+
+
 class LightShimConfigTest(TestCase):
     """The light leg's A100 shim must actually override what it claims to.
 
@@ -1791,8 +1926,8 @@ class ProdConfigArtifactTest(TestCase):
         _mc, artifact_fc = load_prod_config(path)
         prod_fc = ProdXSurfaceConfigProvider().create_config().feature_config
 
-        def scalars(o: object) -> dict:
-            out: dict[str, object] = {}
+        def scalars(o: object) -> Dict[str, object]:
+            out: Dict[str, object] = {}
             for f in sorted(x for x in dir(o) if not x.startswith("_")):
                 try:
                     v = getattr(o, f)

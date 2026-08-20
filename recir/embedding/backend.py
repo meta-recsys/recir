@@ -20,14 +20,56 @@ subclassing to add a model-specific ``get_override``.
 from __future__ import annotations
 
 import enum
+import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+from typing import Dict
 
 import torch
 import torch.nn as nn
 from minimal_viable_ai.core.model_family_api.optimizer_configs import OptimConfig
+from torchrec.distributed.types import ShardingType
 from torchrec.modules.embedding_configs import EmbeddingConfig
 from torchrec.optim.keyed import KeyedOptimizer
+
+logger: logging.Logger = logging.getLogger(__name__)
+
+
+class TableSharding(enum.Enum):
+    """How one embedding table is laid out across devices, and how it is read.
+
+    Storage and lookup only. It says nothing about which optimizer trains the
+    table -- see :class:`TableOptimizer`.
+    """
+
+    # Dim-0 sharded; looked up via the ring-shift kernel.
+    ROWWISE = "rowwise"
+    # Dim-0 sharded; looked up via ``recir.fsdp_embedding`` (all-gather).
+    FSDP = "fsdp"
+    # Full copy on every device; looked up via ``F.embedding``.
+    REPLICATED = "replicated"
+
+
+class TableOptimizer(enum.Enum):
+    """Which optimizer trains one embedding table.
+
+    Orthogonal to :class:`TableSharding`: a sharded table can be stepped by the
+    dense optimizer (that is what FSDP does) and a replicated one by the sparse
+    optimizer. They are separate axes because they answer separate questions --
+    sharding is a memory decision, this is a training one, and the two rates are
+    ~50x apart.
+    """
+
+    SPARSE = "sparse"
+    DENSE = "dense"
+
+
+@dataclass(frozen=True)
+class TablePlan:
+    """The complete per-table decision: where it lives, and who trains it."""
+
+    sharding: TableSharding
+    optimizer: TableOptimizer
 
 
 class SparseUpdatePlacement(enum.Enum):
@@ -138,3 +180,77 @@ class EmbeddingBackend(ABC):
         multiply by ``num_processes``.
         """
         return 1
+
+
+def _sharding_value(name: str, table: object) -> str:
+    """``table.sharding``'s enum VALUE, rejecting the two silent failures.
+
+    A bare string means something deserialized the enum by NAME: it compares
+    unequal to every ShardingType member while still being non-None, so every
+    reader sees "no placement" and says nothing. ``None`` means the config never
+    expressed one, which used to fall through to a row-count heuristic and now
+    has nowhere to fall through to.
+    """
+    sharding = getattr(table, "sharding", None)
+    if isinstance(sharding, str):
+        raise TypeError(
+            f"table {name!r} has sharding={sharding!r} as a plain string "
+            "rather than a ShardingType member. Something deserialized the "
+            "enum by name; comparisons against ShardingType will all be "
+            "False and the placement would be silently lost."
+        )
+    if sharding is None:
+        raise ValueError(
+            f"table {name!r} has no sharding. Every table needs an explicit "
+            "placement: it decides both the layout and which optimizer trains "
+            "the table, and the two learning rates are ~50x apart."
+        )
+    value = getattr(sharding, "value", sharding)
+    return str(value)
+
+
+def table_plans_from_embedding_tables(
+    embedding_tables: Dict[str, object],
+) -> Dict[str, TablePlan]:
+    """Per-table layout + optimizer, from production's ``EmbeddingTable.sharding``.
+
+    ``sharding`` is one field that decides two things, because that is how
+    torchrec couples them: the sharding type picks the compute kernel, and the
+    kernel picks the optimizer (see this module's header table). The in-graph
+    backend has no such coupling -- it reads plain ``nn.Parameter``s -- so it
+    has to reproduce the pairing deliberately:
+
+    ==============  ==================  ====================
+                    ROW_WISE            DATA_PARALLEL
+    ==============  ==================  ====================
+    layout          dim-0 sharded       full replica
+    lookup          ring-shift          ``F.embedding``
+    optimizer       sparse              dense
+    ==============  ==================  ====================
+
+    ``TableSharding.FSDP`` is deliberately unreachable from here: no production
+    config asks for a sharded non-ring-shift table. It stays available to
+    callers that construct plans directly.
+
+    Raises on anything it cannot map, rather than defaulting. A table in the
+    wrong bucket keeps its shape, its key and its state_dict entry and only
+    trains at the wrong rate, so a silent fallback is not detectable downstream.
+    """
+    plans: Dict[str, TablePlan] = {}
+    for name in embedding_tables:
+        value = _sharding_value(name, embedding_tables[name])
+        if value == ShardingType.ROW_WISE.value:
+            plans[name] = TablePlan(TableSharding.ROWWISE, TableOptimizer.SPARSE)
+        elif value == ShardingType.DATA_PARALLEL.value:
+            plans[name] = TablePlan(TableSharding.REPLICATED, TableOptimizer.DENSE)
+        else:
+            raise ValueError(
+                f"table {name!r} asks for sharding={value!r}, which the in-graph "
+                "backend has no lookup for. It implements ROW_WISE and "
+                "DATA_PARALLEL only."
+            )
+    logger.info(
+        "table plans: %s",
+        {n: (p.sharding.value, p.optimizer.value) for n, p in plans.items()},
+    )
+    return plans

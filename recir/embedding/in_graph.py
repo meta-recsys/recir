@@ -9,15 +9,22 @@
 This module bundles the whole in-graph embedding path:
 
   * ``InGraphSparseArch`` -- an EC-shaped ``nn.Module`` that calls
-    ``torch.ops.recir.ringshift_embedding`` for the big sequence tables. The op is
+    ``torch.ops.recir.ringshift_embedding`` for the ROWWISE tables. The op is
     opaque + lowered to the ring-shift kernel INSIDE recir's single compiled
     GSPMD program (see ``recir/torchax/ops/jseq_embedding.py``), so the
     cross-host all-to-all is scheduled with the outer data-parallel collectives
     and does NOT deadlock.
-    Big tables (>= a row threshold) are ``nn.Parameter([vocab, D])`` looked up
-    via the op (row-wise / FSDP sharded); small tables stay dense + replicated
-    via ``F.embedding``. The ``_sharded_tables`` params are row-wise (FSDP) sharded
-    by ``GSPMDParallel(fsdp_table_substr=SHARDED_TABLE_PREFIX)`` (wired in train.py).
+    Every table is a plain ``nn.Parameter([vocab, D])``; its ``TablePlan`` says
+    how it is stored and read (ROWWISE -> ring-shift, FSDP ->
+    ``recir.fsdp_embedding``, REPLICATED -> ``F.embedding``) and which optimizer
+    trains it. The ``_sharded_tables`` params are row-wise (FSDP) sharded by
+    ``GSPMDParallel(fsdp_table_substr=SHARDED_TABLE_PREFIX)`` (wired in train.py).
+
+    The two halves of a plan are INDEPENDENT. Sharding is a memory decision;
+    the optimizer is a training one, and production's two rates are ~50x apart.
+    Nothing here derives either from the row count: a table the config places
+    wrongly matches on every shape, key and name, so the choice has to be made
+    where someone can read it.
 
   * ``SparseArchInputBreakDispatcher`` -- cuts a graph break at the sparse-arch
     *input ids* (not the arch): the preprocessor + merged-id-list build run eager
@@ -28,11 +35,11 @@ This module bundles the whole in-graph embedding path:
 
   * ``InGraphEmbeddingBackend`` -- the ``EmbeddingBackend`` entry point.
     ``setup()`` swaps the model's sparse-arch ``_embedding_collection`` for
-    ``InGraphSparseArch`` and builds the optimizer over all params (the table
-    is now a normal ``nn.Parameter``). The model binding locates that sparse
-    arch via the injected ``sparse_arch_getter`` and supplies the optimizer
-    factory via ``sparse_optimizer_builder``, keeping this module free of any
-    model-specific module path or import.
+    ``InGraphSparseArch`` and builds the sparse optimizer over the tables their
+    plan assigns to it (the table is now a normal ``nn.Parameter``). The model
+    binding locates that sparse arch via the injected ``sparse_arch_getter`` and
+    supplies the optimizer factory via ``sparse_optimizer_builder``, keeping
+    this module free of any model-specific module path or import.
 
 Static-shape assumption: per-sample sequence lengths may VARY, but each feature's
 TOTAL token count per chip is static (``T_local``, the same on every chip). Since
@@ -46,7 +53,6 @@ from the cached KJT).
 
 from __future__ import annotations
 
-import enum
 import logging
 from typing import Any, Callable, Dict, List, Tuple
 
@@ -75,6 +81,9 @@ from recir.embedding.backend import (
     EmbeddingSetupResult,
     SparseOptimizerRuntime,
     SparseUpdatePlacement,
+    TableOptimizer,
+    TablePlan,
+    TableSharding,
 )
 from recir.meta_tensor_init import default_embedding_init_bound, mark_meta_uniform_init
 from torchrec.modules.embedding_configs import EmbeddingConfig
@@ -85,20 +94,23 @@ logger: logging.Logger = logging.getLogger(__name__)
 _PREFIX: str = "seq_sparse_input_break"
 
 
-class TableMode(enum.Enum):
-    """How a sequence-embedding table is sharded + looked up.
-    Selected per table by row count (two thresholds): rows >= ringshift_min_rows
-    -> ROWWISE; fsdp_min_rows <= rows < ringshift_min_rows -> FSDP; else DP.
-    """
-
-    # Row-wise (dim-0) sharded; looked up via the ring-shift kernel
-    ROWWISE = "rowwise"
-    FSDP = "fsdp"
-    DP = "dp"
-
-
 SHARDED_TABLE_PREFIX: str = "_sharded_tables"
 DP_TABLE_PREFIX: str = "_dp_tables"
+
+
+def table_name_from_param(name: str) -> str | None:
+    """The table a parameter FQN belongs to, or None if it is not a table.
+
+    Both ParameterDicts name their entries ``<prefix>.<table>``, so the table is
+    the segment right after whichever prefix appears. Callers use this to answer
+    per-table questions (which optimizer trains it) about a flat
+    ``named_parameters()`` walk.
+    """
+    parts = name.split(".")
+    for i, part in enumerate(parts[:-1]):
+        if part in (SHARDED_TABLE_PREFIX, DP_TABLE_PREFIX):
+            return parts[i + 1]
+    return None
 
 
 def _round_up(x: int, m: int) -> int:
@@ -114,15 +126,13 @@ class InGraphSparseArch(nn.Module):
         feature_seqlens: per-chip token total per feature (= the feature's total
             ids / #chips). Per-sample lengths may vary; only this per-chip total
             is static. From the cached KJT.
-        world_size: number of devices (big-table rows are padded to a multiple so
-            the ring-shift block reshape ``vocab % W == 0`` holds).
-        ringshift_min_rows: ROWWISE threshold -- tables with >= this many rows
-            use the ring-shift kernel (row-wise sharded).
-        fsdp_min_rows: FSDP band lower bound -- a table with
-            fsdp_min_rows <= rows < ringshift_min_rows is FSDP-sharded + looked
-            up via F.embedding; rows < fsdp_min_rows is DP-replicated. None or a
-            negative value defaults it to ringshift_min_rows (empty FSDP band ->
-            everything below ROWWISE is DP).
+        world_size: number of devices (dim-0-sharded table rows are padded to a
+            multiple so the ring-shift block reshape ``vocab % W == 0`` holds).
+        table_plans: per table, how it is stored/looked up and which optimizer
+            trains it. Required for every table in ``table_configs`` -- there is
+            no default, because both halves of the plan are silent when wrong: a
+            misplaced table matches on every shape, key and name and simply
+            trains at the other optimizer's rate.
     """
 
     def __init__(
@@ -130,9 +140,8 @@ class InGraphSparseArch(nn.Module):
         table_configs: List[EmbeddingConfig],
         feature_seqlens: Dict[str, int],
         world_size: int,
-        ringshift_min_rows: int = 4096,
+        table_plans: Dict[str, TablePlan],
         on_device_init: bool = True,
-        fsdp_min_rows: int | None = None,
     ) -> None:
         super().__init__()
         self._on_device_init: bool = on_device_init
@@ -145,39 +154,40 @@ class InGraphSparseArch(nn.Module):
         self._break_override_id: int = 0
         self._break_input_kjt_keys: List[str] = []
         self._feature_to_table: Dict[str, str] = {}
-        self._table_mode: Dict[str, TableMode] = {}
+        self._table_sharding: Dict[str, TableSharding] = {}
         self._sharded_tables: nn.ParameterDict = nn.ParameterDict()
         self._dp_tables: nn.ParameterDict = nn.ParameterDict()
-        fsdp_min: int = (
-            ringshift_min_rows
-            if fsdp_min_rows is None or fsdp_min_rows < 0
-            else fsdp_min_rows
-        )
 
-        def _mode_for(rows: int) -> TableMode:
-            if rows >= ringshift_min_rows:
-                return TableMode.ROWWISE
-            if rows >= fsdp_min:
-                return TableMode.FSDP
-            return TableMode.DP
+        missing = sorted(tc.name for tc in table_configs if tc.name not in table_plans)
+        if missing:
+            raise ValueError(
+                f"no TablePlan for {missing}; every table needs an explicit "
+                "sharding + optimizer, since a wrong one is invisible in every "
+                "shape, key and state_dict entry"
+            )
 
         for tc in table_configs:
-            mode = _mode_for(tc.num_embeddings)
+            sharding = table_plans[tc.name].sharding
             for f in tc.feature_names:
                 self._feature_to_table[f] = tc.name
-            self._table_mode[tc.name] = mode
+            self._table_sharding[tc.name] = sharding
             # Match the TorchRec EmbeddingCollection init scale
             init_bound = default_embedding_init_bound(tc.num_embeddings)
-            if mode in (TableMode.ROWWISE, TableMode.FSDP):
-                # Both are dim-0 sharded -> pad rows to a multiple of the device
-                # count (the FSDP shard count; also the ring-shift block reshape
-                # needs vocab % W == 0).
+            if sharding is TableSharding.REPLICATED:
+                p = nn.Parameter(torch.empty(tc.num_embeddings, tc.embedding_dim))
+                nn.init.uniform_(p, -init_bound, init_bound)
+                self._dp_tables[tc.name] = p
+            else:
+                # ROWWISE and FSDP are both dim-0 sharded -> pad rows to a
+                # multiple of the device count (the FSDP shard count; also the
+                # ring-shift block reshape needs vocab % W == 0).
                 vocab = _round_up(tc.num_embeddings, world_size)
                 if self._on_device_init:
                     # Meta param: NO host storage. recir's FSDP materialization
                     # (_to_sharded_jax meta branch) generates each device's shard
                     # directly in HBM via jax.random -- avoids host alloc + H2D for
-                    # huge tables (e.g. 1T hash).
+                    # huge tables (e.g. 1T hash). It reads the param's dtype, so
+                    # a narrow table stays narrow there too.
                     p = nn.Parameter(
                         torch.empty(vocab, tc.embedding_dim, device="meta")
                     )
@@ -186,13 +196,10 @@ class InGraphSparseArch(nn.Module):
                     p = nn.Parameter(torch.empty(vocab, tc.embedding_dim))
                     nn.init.uniform_(p, -init_bound, init_bound)
                 self._sharded_tables[tc.name] = p
-            else:  # TableMode.DP
-                p = nn.Parameter(torch.empty(tc.num_embeddings, tc.embedding_dim))
-                nn.init.uniform_(p, -init_bound, init_bound)
-                self._dp_tables[tc.name] = p
             logger.info(
                 f"[in_graph] table '{tc.name}': rows={tc.num_embeddings} "
-                f"D={tc.embedding_dim} mode={mode.value} "
+                f"D={tc.embedding_dim} sharding={sharding.value} "
+                f"optimizer={table_plans[tc.name].optimizer.value} "
                 f"features={tc.feature_names}"
             )
 
@@ -266,19 +273,19 @@ class InGraphSparseArch(nn.Module):
             table_name = self._feature_to_table.get(key)
             if table_name is None:
                 continue
-            if self._table_mode[table_name] == TableMode.ROWWISE:
+            if self._table_sharding[table_name] is TableSharding.ROWWISE:
                 big_ids.setdefault(table_name, []).append(ids)
                 big_lengths.setdefault(table_name, []).append(k_lengths)
                 big_seqs.setdefault(table_name, []).append(seq)
                 big_feat_keys.setdefault(table_name, []).append(key)
             else:
-                # FSDP or DP table
+                # FSDP or REPLICATED table
                 flat_ids = ids.reshape(-1).long()
-                if self._table_mode[table_name] == TableMode.FSDP:
+                if self._table_sharding[table_name] is TableSharding.FSDP:
                     emb = torch.ops.recir.fsdp_embedding(
                         flat_ids, self._sharded_tables[table_name]
                     )
-                else:  # TableMode.DP
+                else:  # TableSharding.REPLICATED
                     emb = F.embedding(flat_ids, self._dp_tables[table_name])
                 # Pin the flat [B*S, dim] activation batch-sharded on axis 0
                 # (mirrors cpu's sharded embedding input) so HSTU consumes a
@@ -543,6 +550,12 @@ class InGraphEmbeddingBackend(EmbeddingBackend):
     ``(optimizer, lr_buffer)``. Both are injected so this module stays free
     of model-specific module paths and imports.
 
+    ``table_plans`` is a constructor argument rather than a ``setup()``
+    parameter because it is backend business: the other backends express the
+    same choice through torchrec's sharding plan and cannot act on this form of
+    it. Build it with
+    ``recir.embedding.split_collection.table_plans_from_embedding_tables``.
+
     ``set_feature_seqlens()`` must run before ``setup()``.
     """
 
@@ -553,15 +566,13 @@ class InGraphEmbeddingBackend(EmbeddingBackend):
             [nn.Module, List[nn.Parameter], OptimConfig, torch.device],
             Tuple[torch.optim.Optimizer, torch.Tensor],
         ],
-        ringshift_min_rows: int = 4096,
-        fsdp_min_rows: int = -1,
+        table_plans: Dict[str, TablePlan],
         on_device_init: bool = True,
     ) -> None:
         self._sparse_arch_getter = sparse_arch_getter
         self._sparse_optimizer_builder = sparse_optimizer_builder
+        self._table_plans: Dict[str, TablePlan] = dict(table_plans)
         self._feature_seqlens: Dict[str, int] = {}
-        self._ringshift_min_rows: int = ringshift_min_rows
-        self._fsdp_min_rows: int = fsdp_min_rows
         self._on_device_init: bool = on_device_init
 
     def set_feature_seqlens(self, feature_seqlens: Dict[str, int]) -> None:
@@ -577,24 +588,48 @@ class InGraphEmbeddingBackend(EmbeddingBackend):
         )
         return rank, world
 
+    def _params_by_optimizer(
+        self, model: nn.Module, want: TableOptimizer
+    ) -> Dict[str, nn.Parameter]:
+        """Table params whose plan assigns them to ``want``.
+
+        Keyed on the PLAN, not on which ParameterDict the table landed in.
+        Sharding and optimizer are independent choices here, so the storage
+        prefix cannot answer this: a dim-0-sharded table trained by the dense
+        optimizer is exactly what FSDP is.
+        """
+        out: Dict[str, nn.Parameter] = {}
+        for n, p in model.named_parameters():
+            table = table_name_from_param(n)
+            if table is None:
+                continue
+            plan = self._table_plans.get(table)
+            if plan is None:
+                raise RuntimeError(
+                    f"parameter {n!r} belongs to table {table!r}, which has no "
+                    "TablePlan; it would be trained by neither optimizer"
+                )
+            if plan.optimizer is want:
+                out[n] = p
+        return out
+
     def dense_named_parameters(self, model: nn.Module) -> Dict[str, nn.Parameter]:
-        emb_prefixes = (SHARDED_TABLE_PREFIX, DP_TABLE_PREFIX)
-        return {
+        # Everything that is not an embedding table, PLUS the tables whose plan
+        # puts them on the dense optimizer (production's DATA_PARALLEL ones).
+        dense = {
             n: p
             for n, p in model.named_parameters()
-            if not any(pre in n for pre in emb_prefixes)
+            if table_name_from_param(n) is None
         }
+        dense.update(self._params_by_optimizer(model, TableOptimizer.DENSE))
+        return dense
 
     def embedding_named_parameters(self, model: nn.Module) -> Dict[str, nn.Parameter]:
-        # The in-graph embedding table params (plain FSDP nn.Parameters looked up +
-        # grad'd inside the compiled graph). train.py builds a dedicated in-graph
-        # optimizer over these; see dense_named_parameters() for the split.
-        emb_prefixes = (SHARDED_TABLE_PREFIX, DP_TABLE_PREFIX)
-        return {
-            n: p
-            for n, p in model.named_parameters()
-            if any(pre in n for pre in emb_prefixes)
-        }
+        # The tables the dedicated in-graph sparse optimizer trains. Tables
+        # planned DENSE are deliberately absent -- they are in
+        # dense_named_parameters instead, and training them twice at rates ~50x
+        # apart is the failure this split exists to prevent.
+        return self._params_by_optimizer(model, TableOptimizer.SPARSE)
 
     def setup(
         self,
@@ -616,8 +651,7 @@ class InGraphEmbeddingBackend(EmbeddingBackend):
             table_configs=table_configs,
             feature_seqlens=self._feature_seqlens,
             world_size=world_size,
-            ringshift_min_rows=self._ringshift_min_rows,
-            fsdp_min_rows=self._fsdp_min_rows,
+            table_plans=self._table_plans,
             on_device_init=self._on_device_init,
         )
         logger.info(
@@ -631,17 +665,29 @@ class InGraphEmbeddingBackend(EmbeddingBackend):
 
         embedding_params = self.embedding_named_parameters(model)
         if not embedding_params:
-            raise RuntimeError("In-graph backend installed no embedding parameters.")
+            raise RuntimeError(
+                "No table is planned for the sparse optimizer, so there is "
+                "nothing for it to train. Every table's TablePlan says DENSE; "
+                "if that is really intended this backend needs a way to report "
+                "no sparse runtime at all."
+            )
         sparse_optimizer, sparse_lr_buffer = self._sparse_optimizer_builder(
             model,
             list(embedding_params.values()),
             sparse_config,
             device,
         )
+        dense_tables = sum(
+            1
+            for plan in self._table_plans.values()
+            if plan.optimizer is TableOptimizer.DENSE
+        )
         logger.info(
-            "InGraphEmbeddingBackend: installed %d table params with %s",
+            "InGraphEmbeddingBackend: %d table param(s) on %s, %d on the dense "
+            "optimizer",
             len(embedding_params),
             type(sparse_optimizer).__name__,
+            dense_tables,
         )
         return EmbeddingSetupResult(
             model=model,
