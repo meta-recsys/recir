@@ -1,6 +1,5 @@
 # (c) Meta Platforms, Inc. and affiliates. Confidential and proprietary.
 
-# pyre-unsafe
 
 """Correctness tests for the optimized Pallas FlashAttention kernel.
 

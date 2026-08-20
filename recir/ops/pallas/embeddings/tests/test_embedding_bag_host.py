@@ -1,6 +1,5 @@
 # (c) Meta Platforms, Inc. and affiliates. Confidential and proprietary.
 
-# pyre-unsafe
 
 """CPU-runnable tests for the per-bag reduction primitives (section F1).
 

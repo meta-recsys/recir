@@ -1,7 +1,6 @@
 #!/usr/bin/env fbpython
 # (c) Meta Platforms, Inc. and affiliates. Confidential and proprietary.
 
-# pyre-strict
 
 """RankFM batch synthesis and static-shape preparation helpers."""
 

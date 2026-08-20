@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 # (c) Meta Platforms, Inc. and affiliates. Confidential and proprietary.
 
-# pyre-strict
 
 """Tests for splitting an EmbeddingCollection by per-table placement.
 

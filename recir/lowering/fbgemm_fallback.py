@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# pyre-unsafe
 
 """Pure PyTorch fallbacks for fbgemm ops used by generative_recommenders.
 

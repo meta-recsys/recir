@@ -1,6 +1,5 @@
 # (c) Meta Platforms, Inc. and affiliates. Confidential and proprietary.
 
-# pyre-unsafe
 
 """Parity: recir::hstu_attention_varlen vs the production pytorch_hstu_mha.
 

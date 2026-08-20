@@ -1,6 +1,5 @@
 # (c) Meta Platforms, Inc. and affiliates. Confidential and proprietary.
 
-# pyre-unsafe
 
 from recir.ops.pallas.embeddings.ringshift import (
     lengths_to_segment_ids,

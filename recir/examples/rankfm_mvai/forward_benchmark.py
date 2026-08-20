@@ -1,7 +1,6 @@
 #!/usr/bin/env fbpython
 # (c) Meta Platforms, Inc. and affiliates. Confidential and proprietary.
 
-# pyre-strict
 
 """Forward-only latency/throughput benchmark for RankFM (udd_fm_v3).
 

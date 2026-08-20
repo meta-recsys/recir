@@ -4,7 +4,6 @@
 # This source code is licensed under the BSD-3-Clause license found in the
 # LICENSE file in the root directory of this source tree.
 
-# pyre-unsafe
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Dict, Set
