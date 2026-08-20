@@ -1875,25 +1875,53 @@ def _aten_native_layer_norm_backward(
     grad_out: Any,
     input: Any,
     normalized_shape: Any,
-    weight: Any,
-    bias: Any,
-    eps: Any = 1e-5,
+    mean: Any,
+    rstd: Any,
+    weight: Any = None,
+    bias: Any = None,
+    output_mask: Any = None,
 ) -> Any:
-    """Implements the backward pass of layer normalization in Jax as defined by `aten::native_layer_norm_backward`.
+    """aten::native_layer_norm_backward.
 
-    Args:
-      grad_out: The gradient of the output tensor.
-      input: The input tensor.
-      normalized_shape: A list of integer dimensions to be normalized over.
-      weight: Optional weight tensor for the affine transformation.
-      bias: Optional bias tensor for the affine transformation.
-      eps: A small epsilon value for numerical stability.
+    The previous signature took (grad_out, input, normalized_shape, weight,
+    bias, eps) -- six parameters against aten's eight -- so every call raised
+    TypeError before reaching the body, and had it not, ``mean`` and ``rstd``
+    would have been read as ``weight`` and ``bias``. It also called
+    ``jax.lax.native_layer_norm_backward``, which does not exist. The compiled
+    path decomposes this op and so never reached it; eager torchax does reach
+    it, and the forward had a test while the backward did not.
 
-    Returns:
-      A tuple of (grad_input, grad_weight, grad_bias).
+    Returns (grad_input, grad_weight, grad_bias), each None where
+    ``output_mask`` is False, matching aten.
     """
-    return jax.lax.native_layer_norm_backward(  # pyre-ignore[16]
-        grad_out, input, normalized_shape, weight, bias, eps
+    ndim = len(normalized_shape)
+    axes = tuple(range(input.ndim - ndim, input.ndim))
+    # mean and rstd arrive with the normalized axes already reduced away but
+    # still present as size-1 dims in aten's layout; reshape defensively so the
+    # broadcast is right for any leading-shape.
+    stat_shape = list(input.shape[: input.ndim - ndim]) + [1] * ndim
+    mean_b = jnp.reshape(mean, stat_shape)
+    rstd_b = jnp.reshape(rstd, stat_shape)
+
+    x_hat = (input - mean_b) * rstd_b
+    grad_x_hat = grad_out if weight is None else grad_out * weight
+
+    n = 1
+    for a in axes:
+        n *= input.shape[a]
+    mean_grad = jnp.mean(grad_x_hat, axis=axes, keepdims=True)
+    mean_grad_xhat = jnp.mean(grad_x_hat * x_hat, axis=axes, keepdims=True)
+    grad_input = rstd_b * (grad_x_hat - mean_grad - x_hat * mean_grad_xhat)
+
+    batch_axes = tuple(range(0, input.ndim - ndim))
+    grad_weight = None if weight is None else jnp.sum(grad_out * x_hat, axis=batch_axes)
+    grad_bias = None if bias is None else jnp.sum(grad_out, axis=batch_axes)
+
+    mask = (True, True, True) if output_mask is None else tuple(output_mask)
+    return (
+        grad_input if mask[0] else None,
+        grad_weight if len(mask) > 1 and mask[1] else None,
+        grad_bias if len(mask) > 2 and mask[2] else None,
     )
 
 

@@ -53,13 +53,13 @@ from typing import Any, Callable, Dict, List, Tuple
 import jax
 import recir.ops.seq_embedding_op  # noqa: F401  (defines torch.ops.recir.ringshift_embedding)
 
-# Register the torchax op lowering (recir::ringshift_embedding -> ring-shift) at MODULE
-# IMPORT time. The torchax Environment snapshots all_aten_ops into self._ops the
-# first time default_env() is created; if we imported this lazily inside setup()
-# it would run AFTER that snapshot and the lowering would be missing (-> the op
-# falls through to its CPU fallback and hits the "torchax Tensors ... environment"
-# assertion). Importing here (the backend module is loaded by the factory early,
-# before the first default_env()) mirrors how jhstu is registered.
+# Registers the torchax op lowering (recir::ringshift_embedding -> ring-shift).
+# Module level so it happens with the backend rather than on the first setup(),
+# but nothing depends on WHEN: Environment falls back to the live registry when
+# its snapshot misses, so an op registered after default_env() is still found.
+# It did once -- a lazily imported lowering was invisible to an Environment
+# built before it, and the op fell through to its CPU fallback and hit the
+# "torchax Tensors ... environment" assertion, which names nothing useful.
 import recir.torchax.ops.jseq_embedding  # noqa: F401
 import torch
 import torch.nn as nn
