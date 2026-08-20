@@ -6,7 +6,6 @@
 
 # (c) Meta Platforms, Inc. and affiliates. Confidential and proprietary.
 
-# pyre-strict
 
 """Tests for DLRMv3 model compilation through RecIR's XLA pipeline."""
 

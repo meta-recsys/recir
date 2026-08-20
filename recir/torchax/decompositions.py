@@ -18,7 +18,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# pyre-strict
 
 """This file contains some decompositons that are not available in torch stable.
 

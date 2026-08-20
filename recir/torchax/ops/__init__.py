@@ -18,8 +18,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# pyre-strict
-
 
 def all_aten_jax_ops() -> dict[object, object]:
     # to load the ops

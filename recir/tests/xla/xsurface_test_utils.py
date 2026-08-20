@@ -1,7 +1,6 @@
 #!/usr/bin/env fbpython
 # (c) Meta Platforms, Inc. and affiliates. Confidential and proprietary.
 
-# pyre-strict
 
 """Test-only fixtures for xsurface V3 tracing and XLA compilation."""
 

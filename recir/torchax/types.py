@@ -18,7 +18,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# pyre-strict
 
 from collections.abc import Callable
 from typing import Any, ParamSpec, TypeAlias, Union
