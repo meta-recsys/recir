@@ -157,16 +157,6 @@ class RankFMTrainerConfig:
     # Validated by ``build_embedding_backend`` in ``embedding/__init__.py``.
     embedding_backend: str = "cpu"
 
-    # In-graph embedding sharding thresholds (per-table row counts), used only by
-    # the "in_graph" backend. Each table's mode:
-    #   rows >= ringshift_min_rows                 -> ROWWISE (ring-shift)
-    #   fsdp_min_rows <= rows < ringshift_min_rows -> FSDP    (F.embedding)
-    #   rows < fsdp_min_rows                       -> DP       (replicated)
-    # fsdp_min_rows < 0 means "= ringshift_min_rows" (empty FSDP band -> below
-    # ring-shift is DP).
-    ringshift_min_rows: int = 4096
-    fsdp_min_rows: int = -1
-
     # Embedding table init for the "in_graph" backend. True = meta param +
     # on-device HBM random init (no host alloc/H2D; needed for huge/1T tables).
     # False = real host param (materialize + H2D; fine at ~1M rows).

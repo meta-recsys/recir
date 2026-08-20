@@ -108,10 +108,6 @@ _FWD_STEPS: int = int(os.environ.get("FWD_STEPS", "20"))
 _FWD_ALLOW_ID_DROPPING: bool = os.environ.get(
     "FWD_ALLOW_ID_DROPPING", "1"
 ).lower() not in ("0", "false", "no", "")
-# in_graph table-sharding (rows): >=ringshift -> ring-shift (VMEM cap ~65k/shard
-# at D=256); fsdp<=rows<ringshift -> FSDP; below -> DP. -1 => all DP.
-_FWD_RINGSHIFT_MIN_ROWS: int = int(os.environ.get("FWD_RINGSHIFT_MIN_ROWS", "4096"))
-_FWD_FSDP_MIN_ROWS: int = int(os.environ.get("FWD_FSDP_MIN_ROWS", "-1"))
 # in_graph on-device meta init (default True, matching the prod config). True:
 # sharded tables are meta params generated on-device via jax.random (each chip
 # makes its own shard) -- REQUIRED when the table is too big to host-allocate,
@@ -316,9 +312,8 @@ def _compile_forward_runner(
     if _FWD_EMB_BACKEND == "in_graph":
         backend = build_embedding_backend(
             _FWD_EMB_BACKEND,
-            ringshift_min_rows=_FWD_RINGSHIFT_MIN_ROWS,
-            fsdp_min_rows=_FWD_FSDP_MIN_ROWS,
             on_device_init=_FWD_ON_DEVICE_INIT,
+            embedding_tables=module_config.embedding_tables,
         )
     else:
         backend = build_embedding_backend(_FWD_EMB_BACKEND)

@@ -193,8 +193,6 @@ spec:
                 --disable_seq_len_sampling
                 --enable_padding
                 --embedding_backend in_graph
-                --ringshift_min_rows 4096
-                --fsdp_min_rows 4096
                 --bf16_training
                 --profile_start_step 30
                 --profile_end_step 35

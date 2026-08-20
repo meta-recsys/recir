@@ -51,13 +51,11 @@ spec:
                   --xla_enable_async_all_gather=true
               - name: FWD_EMB_BACKEND  # in_graph | cpu | tpu
                 value: "cpu"
-              # in_graph sharding: 1M table is too big for ring-shift on 8 devices
-              # (125k rows/shard > VMEM) -> keep off ring-shift -> DP F.embedding.
-              # (64-chip bench uses 4096/4096; there 1M/128 ~8k/shard fits VMEM.)
-              - name: FWD_RINGSHIFT_MIN_ROWS
-                value: "2000000"
-              - name: FWD_FSDP_MIN_ROWS
-                value: "-1"
+              # NOTE: switching this to in_graph at 4 chips needs a config
+              # change, not an env var. The 1M table is placed ROW_WISE, which
+              # at 8 jax devices is 125k rows/shard -- past the ~65k VMEM cap at
+              # D=256. Give that table DATA_PARALLEL in the module config for
+              # this slice. (The 64-chip slice is fine: 1M/128 ~8k rows/shard.)
               - name: FWD_ALLOW_ID_DROPPING  # tpu backend only; no-op here
                 value: "1"
               # --- model + batch shape ---

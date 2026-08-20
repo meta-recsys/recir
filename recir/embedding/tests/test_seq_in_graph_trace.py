@@ -4,37 +4,65 @@
 
 Answers (without TPU): does the in-graph module trace cleanly -- i.e. does the
 KeyedJaggedTensor flow through, and does the lookup appear as the expected node
-per table MODE -- ROWWISE -> opaque ``torch.ops.recir.ringshift_embedding`` (lowered
-via the ringshift path); FSDP / DP -> ``embedding`` (lowered via F.embedding).
+per table SHARDING -- ROWWISE -> opaque ``torch.ops.recir.ringshift_embedding``
+(lowered via the ringshift path); FSDP -> ``recir.fsdp_embedding``; REPLICATED
+-> ``embedding`` (lowered via F.embedding).
 """
 
 from __future__ import annotations
 
+import dataclasses
 import unittest
 
 import torch
+from recir.embedding.backend import (
+    table_plans_from_embedding_tables,
+    TableOptimizer,
+    TablePlan,
+    TableSharding,
+)
 from recir.embedding.in_graph import (
     _seed_in_graph_tables_from_ec,
     DP_TABLE_PREFIX,
     InGraphSparseArch,
     SHARDED_TABLE_PREFIX,
-    TableMode,
 )
 from torch.fx.experimental.proxy_tensor import make_fx
+from torchrec.distributed.types import ShardingType
 from torchrec.modules.embedding_configs import EmbeddingConfig
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
 
+@dataclasses.dataclass
+class _FakeTable:
+    """The one field ``table_plans_from_embedding_tables`` reads.
+
+    Not the real ``EmbeddingTable``: constructing that pulls the whole MVAI
+    config chain, and the mapping only ever touches ``.sharding`` -- including
+    the cases the real dataclass cannot express, like a bare string left behind
+    by a bad deserialization.
+    """
+
+    sharding: object
+
+
+_SPARSE_ROWWISE: TablePlan = TablePlan(TableSharding.ROWWISE, TableOptimizer.SPARSE)
+_SPARSE_FSDP: TablePlan = TablePlan(TableSharding.FSDP, TableOptimizer.SPARSE)
+_SPARSE_REPLICATED: TablePlan = TablePlan(
+    TableSharding.REPLICATED, TableOptimizer.SPARSE
+)
+
+
 def _build_module_and_kjt(
-    ringshift_min_rows: int = 128,
-    fsdp_min_rows: int | None = None,
+    big: TablePlan = _SPARSE_ROWWISE,
+    small: TablePlan = _SPARSE_REPLICATED,
     on_device_init: bool = False,
 ):
     """Build a 2-table module + a matching KJT.
 
-    big table = 256 rows (f0,f1, S=4), small table = 16 rows (c0, S=1). The two
-    thresholds select the big table's mode: rows>=ringshift_min_rows -> ROWWISE;
-    fsdp_min_rows<=rows<ringshift_min_rows -> FSDP; else DP.
+    big table = 256 rows (f0,f1, S=4), small table = 16 rows (c0, S=1). Each
+    table's plan is passed in: nothing is derived from the row counts, so the
+    two sizes here only exercise the padding, not the mode.
     """
     world_size = 4
     batch = 4
@@ -57,9 +85,8 @@ def _build_module_and_kjt(
         table_configs,
         feature_seqlens,
         world_size=world_size,
-        ringshift_min_rows=ringshift_min_rows,
+        table_plans={"big": big, "small": small},
         on_device_init=on_device_init,
-        fsdp_min_rows=fsdp_min_rows,
     )
     # KJT: keys [f0,f1,c0]; per-key value block = batch*S = 16, 16, 4 -> 36 values.
     # ids valid for both the big (256) and small (16) tables.
@@ -208,36 +235,71 @@ class SeqInGraphTraceTest(unittest.TestCase):
         self.assertFalse(module._dp_tables["small"].is_meta)
         self.assertFalse(module._sharded_tables["big"].is_meta)
 
-    # ---- table-mode routing (ROWWISE / FSDP / DP) ----
+    # ---- table sharding routing (ROWWISE / FSDP / REPLICATED) ----
 
-    def test_default_modes(self) -> None:
-        """Default thresholds: big(256) >= 128 -> ROWWISE; small(16) -> DP."""
+    def test_default_plans(self) -> None:
+        """The plan, not the row count, decides where a table is stored."""
         module, _, _ = _build_module_and_kjt()
-        self.assertEqual(module._table_mode["big"], TableMode.ROWWISE)
-        self.assertEqual(module._table_mode["small"], TableMode.DP)
+        self.assertEqual(module._table_sharding["big"], TableSharding.ROWWISE)
+        self.assertEqual(module._table_sharding["small"], TableSharding.REPLICATED)
         self.assertIn("big", module._sharded_tables)
         self.assertIn("small", module._dp_tables)
         names = [n for n, _ in module.named_parameters()]
         self.assertTrue(any(SHARDED_TABLE_PREFIX in n and "big" in n for n in names))
         self.assertTrue(any(DP_TABLE_PREFIX in n and "small" in n for n in names))
 
-    def test_dp_mode_routes_big(self) -> None:
-        """rows < fsdp_min -> DP: big table replicated + F.embedding, NOT sharded
-        (DP prefix, still embedding-lr; FSDP filter leaves it alone)."""
-        module, _, _ = _build_module_and_kjt(ringshift_min_rows=512, fsdp_min_rows=512)
-        self.assertEqual(module._table_mode["big"], TableMode.DP)
+    def test_row_count_does_not_decide_sharding(self) -> None:
+        """The 256-row table is REPLICATED and the 16-row one is ROWWISE purely
+        because the plans say so. This is the whole point of the explicit spec:
+        the old code derived both from two row thresholds, so a table could not
+        be placed against its size."""
+        module, _, _ = _build_module_and_kjt(
+            big=_SPARSE_REPLICATED, small=_SPARSE_ROWWISE
+        )
+        self.assertIn("big", module._dp_tables)
+        self.assertIn("small", module._sharded_tables)
+
+    def test_missing_plan_is_rejected(self) -> None:
+        """A table with no plan must fail loudly. Defaulting it would pick an
+        optimizer for it, and the wrong one is invisible in every shape and key."""
+        with self.assertRaisesRegex(ValueError, "no TablePlan for \\['small'\\]"):
+            InGraphSparseArch(
+                [
+                    EmbeddingConfig(
+                        name="big",
+                        num_embeddings=256,
+                        embedding_dim=8,
+                        feature_names=["f0"],
+                    ),
+                    EmbeddingConfig(
+                        name="small",
+                        num_embeddings=16,
+                        embedding_dim=8,
+                        feature_names=["c0"],
+                    ),
+                ],
+                {"f0": 4, "c0": 1},
+                world_size=4,
+                table_plans={"big": _SPARSE_ROWWISE},
+            )
+
+    def test_replicated_plan_routes_big(self) -> None:
+        """REPLICATED: big table replicated + F.embedding, NOT sharded (DP prefix,
+        so the FSDP filter leaves it alone)."""
+        module, _, _ = _build_module_and_kjt(big=_SPARSE_REPLICATED)
+        self.assertEqual(module._table_sharding["big"], TableSharding.REPLICATED)
         self.assertIn("big", module._dp_tables)
         self.assertNotIn("big", module._sharded_tables)
         names = [n for n, _ in module.named_parameters()]
         self.assertTrue(any(DP_TABLE_PREFIX in n and "big" in n for n in names))
         self.assertFalse(any(SHARDED_TABLE_PREFIX in n and "big" in n for n in names))
 
-    def test_fsdp_mode_routes_big(self) -> None:
-        """fsdp_min <= rows < rowwise_min -> FSDP: big table dim-0 sharded
-        (SHARDED_TABLE_PREFIX, so the FSDP filter shards it) but looked up via
-        F.embedding (not the ring-shift op)."""
-        module, _, _ = _build_module_and_kjt(ringshift_min_rows=512, fsdp_min_rows=128)
-        self.assertEqual(module._table_mode["big"], TableMode.FSDP)
+    def test_fsdp_plan_routes_big(self) -> None:
+        """FSDP: big table dim-0 sharded (SHARDED_TABLE_PREFIX, so the FSDP filter
+        shards it) but looked up via recir.fsdp_embedding, not the ring-shift
+        op."""
+        module, _, _ = _build_module_and_kjt(big=_SPARSE_FSDP)
+        self.assertEqual(module._table_sharding["big"], TableSharding.FSDP)
         self.assertIn("big", module._sharded_tables)
         self.assertNotIn("big", module._dp_tables)
         names = [n for n, _ in module.named_parameters()]
@@ -259,40 +321,32 @@ class SeqInGraphTraceTest(unittest.TestCase):
         self.assertEqual(
             len(seq_nodes),
             0,
-            f"FSDP/DP path must emit no ringshift_embedding: {targets}",
+            f"FSDP/REPLICATED path must emit no ringshift_embedding: {targets}",
         )
         # big table feature(s) -> the expected lookup op (no ring-shift).
         self.assertGreaterEqual(
             len(big_nodes), 1, f"expected a {op_suffix} node, got {targets}"
         )
 
-    def test_dp_fx_uses_aten_embedding(self) -> None:
-        module, kjt, _ = _build_module_and_kjt(
-            ringshift_min_rows=512, fsdp_min_rows=512
-        )
+    def test_replicated_fx_uses_aten_embedding(self) -> None:
+        module, kjt, _ = _build_module_and_kjt(big=_SPARSE_REPLICATED)
         self._assert_no_seq_op_uses_op(module, kjt, "aten.embedding.default")
 
     def test_fsdp_fx_uses_fsdp_embedding(self) -> None:
-        module, kjt, _ = _build_module_and_kjt(
-            ringshift_min_rows=512, fsdp_min_rows=128
-        )
+        module, kjt, _ = _build_module_and_kjt(big=_SPARSE_FSDP)
         self._assert_no_seq_op_uses_op(module, kjt, "fsdp_embedding.default")
 
-    def test_dp_matches_reference_embedding(self) -> None:
-        """DP big-table output equals a plain F.embedding of the same weight
-        (shard_batch0 is identity on CPU)."""
-        module, kjt, batch = _build_module_and_kjt(
-            ringshift_min_rows=512, fsdp_min_rows=512
-        )
+    def test_replicated_matches_reference_embedding(self) -> None:
+        """REPLICATED big-table output equals a plain F.embedding of the same
+        weight (shard_batch0 is identity on CPU)."""
+        module, kjt, batch = _build_module_and_kjt(big=_SPARSE_REPLICATED)
         for _key, got, ref in _big_feature_ref(module, kjt, batch):
             torch.testing.assert_close(got, ref)
 
     def test_fsdp_matches_reference_embedding(self) -> None:
         """FSDP big-table output equals a plain F.embedding of the same weight
         (on CPU there is no real sharding; this checks the lookup semantics)."""
-        module, kjt, batch = _build_module_and_kjt(
-            ringshift_min_rows=512, fsdp_min_rows=128
-        )
+        module, kjt, batch = _build_module_and_kjt(big=_SPARSE_FSDP)
         for _key, got, ref in _big_feature_ref(module, kjt, batch):
             torch.testing.assert_close(got, ref)
 
@@ -302,10 +356,8 @@ class SeqInGraphTraceTest(unittest.TestCase):
         ... meta, cpu' (job rankfm-64chip-bench-78zf7); routing the lookup through
         recir.fsdp_embedding (meta-tolerant fake) fixes it. The weight stays meta
         (on-device init preserved for FSDP)."""
-        module, kjt, _ = _build_module_and_kjt(
-            ringshift_min_rows=512, fsdp_min_rows=128, on_device_init=True
-        )
-        self.assertEqual(module._table_mode["big"], TableMode.FSDP)
+        module, kjt, _ = _build_module_and_kjt(big=_SPARSE_FSDP, on_device_init=True)
+        self.assertEqual(module._table_sharding["big"], TableSharding.FSDP)
         self.assertTrue(
             module._sharded_tables["big"].is_meta, "FSDP weight should be meta"
         )
@@ -367,6 +419,45 @@ class SeqInGraphTraceTest(unittest.TestCase):
             torch.ones(10, 4), ids, 16, -1, False
         )
         torch.testing.assert_close(weight.grad, ref)
+
+
+class TablePlansFromEmbeddingTablesTest(unittest.TestCase):
+    """The config -> plan mapping, including everything it refuses to guess."""
+
+    def test_row_wise_and_data_parallel_map_to_both_axes(self) -> None:
+        plans = table_plans_from_embedding_tables(
+            {
+                "big": _FakeTable(ShardingType.ROW_WISE),
+                "small": _FakeTable(ShardingType.DATA_PARALLEL),
+            }
+        )
+        self.assertEqual(
+            plans["big"], TablePlan(TableSharding.ROWWISE, TableOptimizer.SPARSE)
+        )
+        self.assertEqual(
+            plans["small"],
+            TablePlan(TableSharding.REPLICATED, TableOptimizer.DENSE),
+        )
+
+    def test_missing_sharding_raises(self) -> None:
+        """None used to fall through to a row-count heuristic. There is nowhere
+        left to fall through to, and guessing picks a learning rate."""
+        with self.assertRaisesRegex(ValueError, "table 'big' has no sharding"):
+            table_plans_from_embedding_tables({"big": _FakeTable(None)})
+
+    def test_bare_string_sharding_raises(self) -> None:
+        """The artifact round-tripped this enum by NAME once: non-None, unequal
+        to every member, so every reader saw 'no placement' and said nothing."""
+        with self.assertRaisesRegex(TypeError, "as a plain string"):
+            table_plans_from_embedding_tables({"big": _FakeTable("ROW_WISE")})
+
+    def test_unsupported_sharding_raises(self) -> None:
+        """in_graph implements ROW_WISE and DATA_PARALLEL only; anything else has
+        no lookup and must not be silently bucketed into one of them."""
+        with self.assertRaisesRegex(ValueError, "no lookup for"):
+            table_plans_from_embedding_tables(
+                {"big": _FakeTable(ShardingType.TABLE_WISE)}
+            )
 
 
 if __name__ == "__main__":
