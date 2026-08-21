@@ -29,7 +29,7 @@ from recir.embedding.in_graph import (
 )
 from torch.fx.experimental.proxy_tensor import make_fx
 from torchrec.distributed.types import ShardingType
-from torchrec.modules.embedding_configs import EmbeddingConfig
+from torchrec.modules.embedding_configs import DataType, EmbeddingConfig
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
 
@@ -462,3 +462,103 @@ class TablePlansFromEmbeddingTablesTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TableStorageDtypeTest(unittest.TestCase):
+    """``EmbeddingConfig.data_type`` is storage precision, and it is honoured.
+
+    This backend used to allocate every table float32 whatever the config said,
+    while TorchRec allocated them narrow. That is not a layout detail: for a
+    production udd_fm_v3 table stored FP16, the representable step at a weight
+    of 0.06 is 3.05e-5 and one optimizer step moves 2.98e-5, so the update does
+    not fit and round-to-nearest drops or doubles it. The eager leg's largest
+    single-step update on four such tables came back as exactly 2^-15
+    (3.051757812500e-05) -- the grid, not a value -- against this backend's
+    2.98e-5, and their weights diverged 20-30% after one step.
+
+    Compute stays float32: only the stored weight is narrow.
+    """
+
+    @staticmethod
+    def _module(data_type: DataType) -> InGraphSparseArch:
+        return InGraphSparseArch(
+            [
+                EmbeddingConfig(
+                    name="t",
+                    num_embeddings=16,
+                    embedding_dim=8,
+                    feature_names=["f"],
+                    data_type=data_type,
+                )
+            ],
+            {"f": 2},
+            world_size=2,
+            table_plans={"t": _SPARSE_REPLICATED},
+        )
+
+    def test_fp16_is_stored_narrow(self) -> None:
+        m = self._module(DataType.FP16)
+        self.assertEqual(m._dp_tables["t"].dtype, torch.float16)
+
+    def test_fp32_is_unchanged(self) -> None:
+        m = self._module(DataType.FP32)
+        self.assertEqual(m._dp_tables["t"].dtype, torch.float32)
+
+    def test_the_lookup_comes_back_float32(self) -> None:
+        """A narrow table must not push its dtype into HSTU and the loss --
+        that would be a different model, not a different layout."""
+        m = self._module(DataType.FP16)
+        kjt = KeyedJaggedTensor(
+            keys=["f"],
+            values=torch.randint(0, 16, (4,), dtype=torch.int64),
+            lengths=torch.tensor([2, 2], dtype=torch.int64),
+        )
+        out = m(kjt)
+        self.assertEqual(out["f"].values().dtype, torch.float32)
+
+
+class RowWiseKeepsFloat32Test(unittest.TestCase):
+    """Narrow storage is NOT applied to row-wise tables.
+
+    They go through the ring-shift Pallas kernel, which asserts a float32 table
+    (ops/pallas/embeddings/ringshift.py:2028): a narrow one does not degrade,
+    it takes the run down at the first lookup.
+
+    The exemption costs nothing numerically. Row-wise is where the sparse
+    optimizer lives, and its per-step update sits two orders of magnitude above
+    the FP16 grid -- all three such tables in udd_fm_v3 already matched the
+    eager leg at 1.000/1.000/0.994 while stored float32. The tables that need
+    narrow storage are the REPLICATED ones on the dense optimizer, whose update
+    lands at roughly one ULP.
+    """
+
+    @staticmethod
+    def _table(sharding: TablePlan) -> InGraphSparseArch:
+        return InGraphSparseArch(
+            [
+                EmbeddingConfig(
+                    name="t",
+                    num_embeddings=16,
+                    embedding_dim=8,
+                    feature_names=["f"],
+                    data_type=DataType.FP16,
+                )
+            ],
+            {"f": 2},
+            world_size=2,
+            table_plans={"t": sharding},
+        )
+
+    def test_row_wise_stays_float32(self) -> None:
+        m = self._table(_SPARSE_ROWWISE)
+        self.assertEqual(m._sharded_tables["t"].dtype, torch.float32)
+
+    def test_replicated_still_goes_narrow(self) -> None:
+        """The case the narrowing exists for must not be caught by the guard."""
+        m = self._table(_SPARSE_REPLICATED)
+        self.assertEqual(m._dp_tables["t"].dtype, torch.float16)
+
+    def test_fsdp_still_goes_narrow(self) -> None:
+        """FSDP uses recir.fsdp_embedding, not the ring-shift kernel."""
+        m = self._table(_SPARSE_FSDP)
+        self.assertEqual(m._sharded_tables["t"].dtype, torch.float16)

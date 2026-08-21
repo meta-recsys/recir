@@ -86,7 +86,7 @@ from recir.embedding.backend import (
     TableSharding,
 )
 from recir.meta_tensor_init import default_embedding_init_bound, mark_meta_uniform_init
-from torchrec.modules.embedding_configs import EmbeddingConfig
+from torchrec.modules.embedding_configs import data_type_to_dtype, EmbeddingConfig
 from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor
 
 logger: logging.Logger = logging.getLogger(__name__)
@@ -115,6 +115,17 @@ def table_name_from_param(name: str) -> str | None:
 
 def _round_up(x: int, m: int) -> int:
     return ((x + m - 1) // m) * m
+
+
+def _to_compute_dtype(x: torch.Tensor) -> torch.Tensor:
+    """Widen a narrow lookup result back to float32.
+
+    ``EmbeddingConfig.data_type`` is STORAGE precision. TorchRec stores the
+    table narrow and computes in float32, so this backend must too: leaving the
+    activation in float16 would push the narrow dtype through HSTU and the
+    loss, which is a different model, not a different layout.
+    """
+    return x.float() if x.dtype != torch.float32 else x
 
 
 class InGraphSparseArch(nn.Module):
@@ -171,10 +182,21 @@ class InGraphSparseArch(nn.Module):
             for f in tc.feature_names:
                 self._feature_to_table[f] = tc.name
             self._table_sharding[tc.name] = sharding
+            dtype = data_type_to_dtype(tc.data_type)
+            if sharding is TableSharding.ROWWISE and dtype != torch.float32:
+                logger.warning(
+                    "[in_graph] table '%s': data_type=%s ignored, storing "
+                    "float32 -- the ring-shift kernel requires it",
+                    tc.name,
+                    tc.data_type,
+                )
+                dtype = torch.float32
             # Match the TorchRec EmbeddingCollection init scale
             init_bound = default_embedding_init_bound(tc.num_embeddings)
             if sharding is TableSharding.REPLICATED:
-                p = nn.Parameter(torch.empty(tc.num_embeddings, tc.embedding_dim))
+                p = nn.Parameter(
+                    torch.empty(tc.num_embeddings, tc.embedding_dim, dtype=dtype)
+                )
                 nn.init.uniform_(p, -init_bound, init_bound)
                 self._dp_tables[tc.name] = p
             else:
@@ -189,16 +211,16 @@ class InGraphSparseArch(nn.Module):
                     # huge tables (e.g. 1T hash). It reads the param's dtype, so
                     # a narrow table stays narrow there too.
                     p = nn.Parameter(
-                        torch.empty(vocab, tc.embedding_dim, device="meta")
+                        torch.empty(vocab, tc.embedding_dim, device="meta", dtype=dtype)
                     )
                     mark_meta_uniform_init(p, init_bound)
                 else:
-                    p = nn.Parameter(torch.empty(vocab, tc.embedding_dim))
+                    p = nn.Parameter(torch.empty(vocab, tc.embedding_dim, dtype=dtype))
                     nn.init.uniform_(p, -init_bound, init_bound)
                 self._sharded_tables[tc.name] = p
             logger.info(
                 f"[in_graph] table '{tc.name}': rows={tc.num_embeddings} "
-                f"D={tc.embedding_dim} sharding={sharding.value} "
+                f"D={tc.embedding_dim} dtype={dtype} sharding={sharding.value} "
                 f"optimizer={table_plans[tc.name].optimizer.value} "
                 f"features={tc.feature_names}"
             )
@@ -287,6 +309,7 @@ class InGraphSparseArch(nn.Module):
                     )
                 else:  # TableSharding.REPLICATED
                     emb = F.embedding(flat_ids, self._dp_tables[table_name])
+                emb = _to_compute_dtype(emb)
                 # Pin the flat [B*S, dim] activation batch-sharded on axis 0
                 # (mirrors cpu's sharded embedding input) so HSTU consumes a
                 # batch-sharded tensor; see Pass 2 for the full rationale.
@@ -303,7 +326,9 @@ class InGraphSparseArch(nn.Module):
             # token is valid -- the per-chip total is exact) so it masks nothing.
             n_chips_cat, t_comb = ids_cat.shape[0], ids_cat.shape[1]
             comb_lengths = ids_cat.new_full((n_chips_cat,), t_comb)
-            act = torch.ops.recir.ringshift_embedding(ids_cat, comb_lengths, weight)
+            act = _to_compute_dtype(
+                torch.ops.recir.ringshift_embedding(ids_cat, comb_lengths, weight)
+            )
             # Split the [B, sum(S_f), D] activation back per feature.
             off = 0
             for key, seq, k_lengths in zip(
