@@ -158,6 +158,34 @@ class TestGSPMDShardParams(unittest.TestCase):
         torch.testing.assert_close(model.weight, original_weight, atol=0, rtol=0)
         self.assertEqual(1, mode.process_mesh.size())
 
+    def test_hybrid_fsdp_shards_state_across_hosts_in_each_group(self) -> None:
+        dim = 16
+        mode = GSPMDParallel(
+            "fully_shard",
+            num_ranks=8,
+            num_processes=4,
+            fsdp_axis_size=4,
+        )
+        model, optimizer = self._make_model_and_opt(dim=dim)
+        original_weight = model.weight.detach().clone()
+        params_and_buffers = dict(model.named_parameters())
+
+        with mock.patch(
+            "recir.distributed.parallel_mode._current_process_rank",
+            return_value=3,
+        ):
+            sharded_keys = mode.shard_params(model, params_and_buffers, optimizer)
+
+        self.assertIn("weight", sharded_keys)
+        self.assertEqual((dim // 2, dim), model.weight.shape)
+        torch.testing.assert_close(
+            model.weight,
+            original_weight[dim // 2 :, :],
+            atol=0,
+            rtol=0,
+        )
+        self.assertEqual(2, mode.process_mesh.size())
+
     def test_hybrid_fsdp_validates_axis_and_state_only_sharding(self) -> None:
         with self.assertRaisesRegex(ValueError, "divisible"):
             GSPMDParallel(

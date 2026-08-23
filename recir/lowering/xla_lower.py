@@ -136,9 +136,9 @@ def _gspmd_mesh(
     if fsdp_axis_size == len(devices):
         return Mesh(devices, axis_names=(_GSPMD_FSDP_AXIS,)), _GSPMD_FSDP_AXIS, False
     local_device_count = len(_get_local_devices())
-    if fsdp_axis_size != local_device_count:
+    if fsdp_axis_size % local_device_count != 0:
         raise ValueError(
-            "Hybrid GSPMD currently requires one host-local FSDP group; "
+            "The hybrid GSPMD FSDP axis must contain a whole number of hosts; "
             f"fsdp_axis_size={fsdp_axis_size}, local_devices={local_device_count}"
         )
     data_axis_size = len(devices) // fsdp_axis_size
@@ -176,14 +176,11 @@ def _materialize_meta_fsdp_tensor(tensor: Any, mesh: Any) -> Any:
     initialization. Optimizer state tensors are explicitly marked for zero init
     during state sharding and must not be randomized.
     """
-    num_global = len(_get_global_devices())
-    host_count = num_global // len(_get_local_devices())
+    local_device_count = len(_get_local_devices())
     fsdp_axis_size = int(mesh.shape[_GSPMD_FSDP_AXIS])
-    host_tensor_is_global = _GSPMD_DATA_AXIS in mesh.axis_names
+    fsdp_host_shard_count = fsdp_axis_size // local_device_count
     trailing = tuple(int(s) for s in tensor.shape[1:])
-    global_rows = int(tensor.shape[0])
-    if not host_tensor_is_global:
-        global_rows *= host_count
+    global_rows = int(tensor.shape[0]) * fsdp_host_shard_count
     global_shape = (global_rows, *trailing)
     jdtype = _TORCH_TO_JNP.get(tensor.dtype, jnp.float32)
     wspec = P(_GSPMD_FSDP_AXIS, *([None] * (tensor.ndim - 1)))
@@ -568,7 +565,7 @@ class _XLAModule(torch.nn.Module):
         is_fsdp_tensor: bool = False,
         batch_axis_resource: Any = "torch_dist",
         fsdp_axis_name: str = "torch_dist",
-        fsdp_host_tensor_is_global: bool = False,
+        fsdp_host_shard_count: int = 1,
     ) -> Any:
         """Convert a PyTorch tensor to a properly sharded JAX array.
 
@@ -712,8 +709,7 @@ class _XLAModule(torch.nn.Module):
             # local→global multiplier here must match the gm's baked
             # global shape (via _make_batch_transform's host_count).
             global_shape = list(nparray.shape)
-            if not fsdp_host_tensor_is_global:
-                global_shape[0] *= host_count
+            global_shape[0] *= fsdp_host_shard_count
             ndim = len(global_shape)
             spec = P(fsdp_axis_name, *([None] * (ndim - 1)))
             sharding = NamedSharding(mesh, spec)
@@ -1047,6 +1043,7 @@ class _XLAModule(torch.nn.Module):
             devices,
             fsdp_axis_size,
         )
+        fsdp_host_shard_count = fsdp_axis_size // len(_get_local_devices())
         replicated = NamedSharding(mesh, P())
         placeholders = [n for n in self.gm.graph.nodes if n.op == "placeholder"]
         is_batch: List[bool] = [
@@ -1264,7 +1261,7 @@ class _XLAModule(torch.nn.Module):
                     is_fsdp_tensor=is_fsdp_sharded[j],
                     batch_axis_resource=runtime_batch_axis_resource,
                     fsdp_axis_name=_GSPMD_FSDP_AXIS,
-                    fsdp_host_tensor_is_global=runtime_hybrid_fsdp,
+                    fsdp_host_shard_count=(fsdp_axis_size // len(_get_local_devices())),
                 )
                 for j, a in enumerate(run_args)
             )
@@ -1298,7 +1295,7 @@ class _XLAModule(torch.nn.Module):
                 is_fsdp_tensor=is_fsdp_sharded[j],
                 batch_axis_resource=batch_axis_resource,
                 fsdp_axis_name=_GSPMD_FSDP_AXIS,
-                fsdp_host_tensor_is_global=hybrid_fsdp,
+                fsdp_host_shard_count=fsdp_host_shard_count,
             )
             for j, a in enumerate(args)
         )

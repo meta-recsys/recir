@@ -469,8 +469,8 @@ class GSPMDParallel(ParallelMode):
             structured dimensions whose local shard shape is not a valid model
             shape during later traces.
         fsdp_axis_size: Number of devices in each FSDP group. The default uses
-            every device. A smaller value creates host-local FSDP groups and
-            replicates their state across the remaining data-parallel axis.
+            every device. A smaller value creates multi-host or host-local FSDP
+            groups and replicates their state across the remaining data axis.
     """
 
     def __init__(
@@ -599,12 +599,21 @@ class GSPMDParallel(ParallelMode):
         at runtime.
         """
         if self._process_mesh is None:
-            mesh_size = 1 if self.uses_hybrid_fsdp else self.num_processes
-            mesh_rank = (
-                0
-                if self.uses_hybrid_fsdp
-                else _current_process_rank(self.num_processes)
-            )
+            if self.num_ranks % self.num_processes != 0:
+                raise ValueError(
+                    "num_ranks must be divisible by num_processes; "
+                    f"got num_ranks={self.num_ranks}, "
+                    f"num_processes={self.num_processes}"
+                )
+            local_device_count = self.num_ranks // self.num_processes
+            if self.fsdp_axis_size % local_device_count != 0:
+                raise ValueError(
+                    "fsdp_axis_size must contain a whole number of processes; "
+                    f"got fsdp_axis_size={self.fsdp_axis_size}, "
+                    f"local_device_count={local_device_count}"
+                )
+            mesh_size = self.fsdp_axis_size // local_device_count
+            mesh_rank = _current_process_rank(self.num_processes) % mesh_size
             self._process_mesh = _create_fake_mesh(
                 "cpu",
                 mesh_size,
