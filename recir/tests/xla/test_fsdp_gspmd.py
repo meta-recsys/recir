@@ -137,6 +137,33 @@ class TestGSPMDShardParams(unittest.TestCase):
             model.weight, original_weight[:expected_dim0, :], atol=0, rtol=0
         )
 
+    def test_multihost_shards_own_compact_parameter_and_optimizer_storage(
+        self,
+    ) -> None:
+        dim = 32
+        mode = GSPMDParallel("fully_shard", num_ranks=4, num_processes=2)
+        model = nn.Linear(dim, dim, bias=False)
+        # Citrine C2: use foreach AdamW for multi-tensor optimizer execution.
+        optimizer = torch.optim.AdamW(model.parameters(), lr=0.01, foreach=True)
+        model(torch.randn(4, dim)).sum().backward()
+        optimizer.step()
+        optimizer.zero_grad()
+        params_and_buffers = dict(model.named_parameters())
+
+        mode.shard_params(model, params_and_buffers, optimizer)
+
+        self.assertIn(model.weight, optimizer.state)
+        self.assertEqual(
+            model.weight.numel() * model.weight.element_size(),
+            model.weight.untyped_storage().nbytes(),
+        )
+        for state_name in ("exp_avg", "exp_avg_sq"):
+            state = optimizer.state[model.weight][state_name]
+            self.assertEqual(
+                state.numel() * state.element_size(),
+                state.untyped_storage().nbytes(),
+            )
+
     def test_hybrid_fsdp_keeps_full_state_on_each_host(self) -> None:
         dim = 16
         mode = GSPMDParallel(

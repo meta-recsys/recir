@@ -2205,6 +2205,23 @@ class TestCoreAtenOps(unittest.TestCase):
         kwargs = {}
         run_export_and_compare(self, torch.ops.aten._log_softmax, args, kwargs)
 
+    def test_aten__log_softmax_bfloat16_preserves_dtype(self) -> None:
+        args = (
+            torch.randn((10, 10)).to(torch.bfloat16),
+            1,
+            False,
+        )
+        kwargs = {}
+        run_export_and_compare(
+            self,
+            torch.ops.aten._log_softmax,
+            args,
+            kwargs,
+            atol=0.02,
+            rtol=0.02,
+            check_dtype=True,
+        )
+
     def test_aten_logical_and_0(self) -> None:
         args = (
             torch.randn((10, 10)).to(torch.float32),

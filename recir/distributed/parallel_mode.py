@@ -660,6 +660,7 @@ class GSPMDParallel(ParallelMode):
                     self.process_mesh,
                     DataParallelStyle.FULLY_SHARD,
                     shard_filter=_is_table,
+                    copy_tensor=self.process_mesh.size() > 1,
                 )
 
         if self.parallel_style != "fully_shard":
@@ -686,6 +687,7 @@ class GSPMDParallel(ParallelMode):
             self.process_mesh,
             DataParallelStyle.FULLY_SHARD,
             shard_filter=_can_fsdp,
+            copy_tensor=self.process_mesh.size() > 1,
         )
         state_only_substrs = (
             self._fsdp_shard_optimizer_state_for_replicated_param_substrs
