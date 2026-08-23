@@ -7,7 +7,7 @@
 import logging
 import os
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from typing import Any, Callable, Dict, Optional, Sequence, Set, Tuple
 
 import torch
@@ -19,7 +19,6 @@ from recir.distributed.data_parallel import (
     DataParallelStyle,
     OptOrOpts,
     partition_data_parallel,
-    partition_value,
     shard_optimizer_states_for_replicated_params,
     shard_params_and_states,
     shard_params_by_plan,
@@ -31,8 +30,7 @@ from recir.lowering.xla_lower import (
     _get_local_devices,
 )
 from recir.sharding_plan import EmbeddingShardingPlan
-from torch.distributed.tensor import DeviceMesh, Shard
-from torch.distributed.tensor._dtensor_spec import DTensorSpec
+from torch.distributed.tensor import DeviceMesh
 from torch.fx import GraphModule
 
 logger: logging.Logger = logging.getLogger(__name__)
@@ -820,6 +818,7 @@ class DataParallel(ParallelMode):
 
         self._process_mesh: Optional[DeviceMesh] = None
         self._device_mesh: Optional[DeviceMesh] = None
+        self._local_device_mesh: Optional[DeviceMesh] = None
         # Trace-scoped FSDP state-layout plan: set fresh by ``shard_params`` and
         # consumed + cleared once by ``apply_state_layout``. None off the path.
         self._pending_state_layout: Optional[_StateLayoutPlan] = None
@@ -919,6 +918,19 @@ class DataParallel(ParallelMode):
                 )
         return self._device_mesh
 
+    @property
+    def local_device_mesh(self) -> DeviceMesh:
+        """Mesh for selecting rank zero's trace shard inside one process."""
+        if self._local_device_mesh is None:
+            devices_per_process = self.num_ranks // self.num_processes
+            self._local_device_mesh = _create_fake_mesh(
+                self._device_type,
+                devices_per_process,
+                "fake_local_fsdp_device_mesh",
+                rank=0,
+            )
+        return self._local_device_mesh
+
     def shard_params(
         self,
         model: torch.nn.Module,
@@ -936,40 +948,22 @@ class DataParallel(ParallelMode):
                 f"!= num_processes={self.num_processes}. Multi-device-per-process "
                 "(D>1) FSDP is only supported on the XLA shard_map path."
             )
-        # XLA path shards /N over device_mesh but capture_fsdp_process_store later
-        # snapshots the /P store via num_chunks=num_processes; both require
-        # num_ranks to be an exact multiple of num_processes (D devices/process),
-        # else the /P split produces silently unequal shards.
+        # XLA shard-map narrows full state to /P and then /P to /N, so N must
+        # contain an integral number of logical devices per process.
         if self._is_xla_backend and self.num_ranks % self.num_processes != 0:
             raise ValueError(
                 "XLA DataParallel requires num_ranks % num_processes == 0 "
                 f"(D devices/process); got num_ranks={self.num_ranks}, "
                 f"num_processes={self.num_processes}."
             )
-        # Which mesh to shard over depends on how collectives get inserted:
-        #   * Explicit-collective FSDP (shard_map) bakes an N-way all-gather over
-        #     device_mesh (size num_ranks=N), so it must shard over that SAME
-        #     mesh. Sharding over process_mesh (size num_processes=P) would trace
-        #     a /P weight the N-way all-gather over-expands to dim0/P*N when N>P
-        #     (TPU: D devices/proc).
-        #   * GSPMD XLA and non-XLA shard over process_mesh: neither bakes an
-        #     explicit N-way all-gather (GSPMD lets XLA's SPMD partitioner
-        #     auto-partition from the sharding annotation), so there is no
-        #     over-expansion. On GPU N==P, so the two meshes coincide anyway.
-        shard_mesh = (
-            self.device_mesh
-            if self._uses_explicit_collective_fsdp
-            else self.process_mesh
-        )
+        # GSPMD XLA and non-XLA physically shard over process_mesh. Explicit
+        # shard-map FSDP takes the two-stage /P then /N path below while its
+        # graph collectives continue to use device_mesh.
+        shard_mesh = self.process_mesh
 
-        # XLA FSDP (P!=N): capture the /P per-process weight + optimizer-state
-        # store from the FULL params BEFORE ``shard_params_and_states`` mutates
-        # them to the /N per-device trace shard, and stash a trace-scoped plan.
-        # The plan is consumed once by ``apply_state_layout`` (in
-        # ``compile_from_gm``), which substitutes the /P store into ``flat_state``
-        # and tags the sharded placeholders with the typed ``recir_state_layout``
-        # spec. ``capture_fsdp_process_store`` returns None off the XLA FULLY_SHARD
-        # path, so the plan stays None there and behavior is unchanged.
+        # Explicit XLA FSDP first creates an owned /P process shard, snapshots it
+        # for flat_state, and then exposes an aliased /N trace view. Other modes
+        # retain their existing single-stage physical sharding.
         replicated_buffer_keys = (
             set(dict(model.named_buffers(remove_duplicate=False)))
             if self._uses_explicit_collective_fsdp
@@ -987,38 +981,124 @@ class DataParallel(ParallelMode):
             if self.parallel_style == DataParallelStyle.FULLY_SHARD
             and should_shard(key, value)
         }
-        stores = self.capture_fsdp_process_store(
-            params_and_buffers,
-            opt,
-            sharded_keys=candidate_sharded_keys,
-        )
-        if stores is not None:
-            process_store, opt_process_store, opt_partitioned = stores
-            self._pending_state_layout = _StateLayoutPlan(
-                process_store=process_store,
-                opt_process_store=opt_process_store,
-                opt_partitioned=opt_partitioned,
-                sharded_keys=set(),
-                device_world_size=self.num_ranks,
-                process_world_size=self.num_processes,
+        if (
+            self._uses_explicit_collective_fsdp
+            and self.parallel_style == DataParallelStyle.FULLY_SHARD
+        ):
+            sharded_keys = self._shard_explicit_xla_fsdp_state(
+                model,
+                params_and_buffers,
+                opt,
+                should_shard,
+                candidate_sharded_keys,
             )
         else:
             self._pending_state_layout = None
+            sharded_keys = shard_params_and_states(
+                model,
+                params_and_buffers,
+                opt,
+                shard_mesh,
+                self.parallel_style,
+                shard_filter=should_shard,
+            )
+        self._active_fsdp_sharded_keys = set(sharded_keys)
+        return sharded_keys
 
+    def _shard_explicit_xla_fsdp_state(
+        self,
+        model: torch.nn.Module,
+        params_and_buffers: Dict[str, Any],
+        opt: OptOrOpts,
+        shard_filter: Callable[[str, torch.Tensor], bool],
+        candidate_sharded_keys: Set[str],
+    ) -> Set[str]:
+        self._validate_explicit_xla_optimizer_state(
+            params_and_buffers,
+            opt,
+            candidate_sharded_keys,
+        )
         sharded_keys = shard_params_and_states(
             model,
             params_and_buffers,
             opt,
-            shard_mesh,
+            self.process_mesh,
             self.parallel_style,
-            shard_filter=should_shard,
+            shard_filter=shard_filter,
+            copy_tensor=self.num_processes > 1,
         )
-        self._active_fsdp_sharded_keys = set(sharded_keys)
-        if self._pending_state_layout is not None:
-            self._pending_state_layout = replace(
-                self._pending_state_layout, sharded_keys=sharded_keys
+        current_parameters = dict(model.named_parameters(remove_duplicate=False))
+        missing_parameters = sharded_keys - set(current_parameters)
+        if missing_parameters:
+            raise RuntimeError(
+                "XLA shard-map sharded state is not bound to model parameters: "
+                f"{sorted(missing_parameters)!r}"
             )
+        for key in sharded_keys:
+            params_and_buffers[key] = current_parameters[key]
+
+        stores = self.capture_fsdp_process_store(
+            params_and_buffers,
+            opt,
+            sharded_keys=sharded_keys,
+        )
+        assert stores is not None
+        process_store, opt_process_store, opt_partitioned = stores
+        self._pending_state_layout = _StateLayoutPlan(
+            process_store=process_store,
+            opt_process_store=opt_process_store,
+            opt_partitioned=opt_partitioned,
+            sharded_keys=sharded_keys,
+            device_world_size=self.num_ranks,
+            process_world_size=self.num_processes,
+        )
+
+        if self.num_ranks != self.num_processes:
+            trace_sharded_keys = shard_params_and_states(
+                model,
+                params_and_buffers,
+                opt,
+                self.local_device_mesh,
+                self.parallel_style,
+                shard_filter=lambda key, _value: key in sharded_keys,
+            )
+            if trace_sharded_keys != sharded_keys:
+                raise RuntimeError(
+                    "XLA shard-map trace sharding changed the selected parameter set"
+                )
         return sharded_keys
+
+    def _validate_explicit_xla_optimizer_state(
+        self,
+        params_and_buffers: Dict[str, Any],
+        opt: OptOrOpts,
+        sharded_keys: Set[str],
+    ) -> None:
+        opts = [opt] if isinstance(opt, torch.optim.Optimizer) else list(opt or [])
+        for fqn in sharded_keys:
+            parameter = params_and_buffers[fqn]
+            if parameter.ndim < 1 or parameter.shape[0] % self.num_processes != 0:
+                raise RuntimeError(
+                    "XLA shard-map owned parameters require dim 0 to divide "
+                    "evenly across processes: "
+                    f"{fqn!r} has shape {tuple(parameter.shape)}, "
+                    f"num_processes={self.num_processes}"
+                )
+            for optimizer in opts:
+                if parameter not in optimizer.state:
+                    continue
+                for state_key, value in optimizer.state[parameter].items():
+                    if (
+                        isinstance(value, torch.Tensor)
+                        and value.ndim >= 1
+                        and value.shape != parameter.shape
+                    ):
+                        raise RuntimeError(
+                            "XLA shard-map owned optimizer shards require ranked "
+                            "state to match its parameter shape: "
+                            f"{fqn!r}/{state_key!r} has {tuple(value.shape)}, "
+                            f"parameter has {tuple(parameter.shape)}"
+                        )
 
     def capture_fsdp_process_store(
         self,
@@ -1029,38 +1109,24 @@ class DataParallel(ParallelMode):
     ) -> Optional[
         Tuple[Dict[str, Any], Dict[str, Dict[str, Any]], Dict[str, Set[str]]]
     ]:
-        """Snapshot the per-process (/P) FSDP shard of the FULL pre-shard params
-        and optimizer state.
+        """Snapshot owned /P state before it is narrowed to the /N trace view.
 
-        ``shard_params`` shards the module over ``device_mesh`` (size N) so
-        make_fx traces a /N per-device weight (the shape the baked N-way
-        all-gather consumes). But that store keeps only rank-0's /N slice,
-        dropping the other D-1 device shards; the runtime ``flat_state`` needs
-        the /P per-process shard instead (full when ``num_processes == 1``),
-        which ``_to_sharded_jax`` re-splits into D device buffers. Capture that
-        /P store here from the full params BEFORE ``shard_params`` mutates them;
-        :func:`compile_from_gm` overwrites ``flat_state`` with it. The optimizer
-        state is captured the same way (all tensor entries /P-sharded on dim 0,
-        mirroring ``_shard_state_dict``), keyed by owning-param fqn: ``opt.state``
-        is keyed by the pre-shard ``Parameter`` -- still identical to the
-        ``params_and_buffers`` value at this point -- and holds real tensors only
-        if the caller stepped the optimizer before tracing (the same precondition
-        under which ``named_states`` is non-empty), so an unstepped optimizer
-        yields an empty store and the downstream substitution / tagging no-op.
-        Returns None for non-XLA / non-FULLY_SHARD (where module==flat_state
-        store is fine).
+        The caller has already compacted full tensors over ``process_mesh``.
+        Parameter references and shallow optimizer-state copies keep those /P
+        allocations alive while the live module is rebound to /N views of the
+        same storage. Runtime state sync can therefore update both views without
+        retaining the original full tensors.
         """
         if not (
             self._uses_explicit_collective_fsdp
             and self.parallel_style == DataParallelStyle.FULLY_SHARD
         ):
             return None
-        spec = DTensorSpec(mesh=self.process_mesh, placements=(Shard(0),))
         keys_to_capture = (
             set(params_and_buffers) if sharded_keys is None else sharded_keys
         )
         process_store = {
-            key: partition_value(value, spec)
+            key: value
             for key, value in params_and_buffers.items()
             if key in keys_to_capture
         }
@@ -1073,22 +1139,12 @@ class DataParallel(ParallelMode):
                     continue
                 if param not in o.state:
                     continue
-                store: Dict[str, Any] = {}
-                partitioned: Set[str] = set()
-                for k, v in o.state[param].items():
-                    # /P-partition a tensor leaf only when dim 0 splits evenly
-                    # across processes; else keep it full. apply_state_layout
-                    # consults ``opt_partitioned`` so it never tags a full-kept
-                    # leaf as Shard(0).
-                    if (
-                        isinstance(v, torch.Tensor)
-                        and v.ndim >= 1
-                        and v.shape[0] % self.num_processes == 0
-                    ):
-                        store[k] = partition_value(v, spec)
-                        partitioned.add(k)
-                    else:
-                        store[k] = v
+                store = dict(o.state[param])
+                partitioned = {
+                    key
+                    for key, value in store.items()
+                    if isinstance(value, torch.Tensor) and value.ndim >= 1
+                }
                 opt_process_store[fqn] = store
                 opt_partitioned[fqn] = partitioned
         return process_store, opt_process_store, opt_partitioned
@@ -1144,6 +1200,7 @@ class DataParallel(ParallelMode):
         # in that flat order and tag the sharded leaves past the params+buffers
         # prefix (the prefix is tagged by fqn above).
         is_sharded = [key in plan.sharded_keys for key in params_and_buffers]
+        optimizer_metadata: list[tuple[str, Optional[str]]] = []
         for fqn, state in named_states.items():
             # Count TENSOR leaves only: a non-tensor state entry (e.g. a
             # Python-int step) is baked as a constant, not lifted as a
@@ -1151,6 +1208,7 @@ class DataParallel(ParallelMode):
             partitioned = plan.opt_partitioned.get(fqn, frozenset())
             for k, v in state.items():
                 if isinstance(v, torch.Tensor):
+                    optimizer_metadata.append((fqn, k if isinstance(k, str) else None))
                     # Sharded iff the owning param was sharded AND capture
                     # actually /P-partitioned this leaf (dim-0 divisible); a
                     # full-kept leaf stays untagged so its Shard(0) spec never
@@ -1175,7 +1233,20 @@ class DataParallel(ParallelMode):
                 and val.ndim >= 1
             ):
                 set_state_layout(node, spec)
+            if num_pb <= tensor_idx < num_pb + len(optimizer_metadata):
+                optimizer_idx = tensor_idx - num_pb
+                fqn, state_name = optimizer_metadata[optimizer_idx]
+                node.meta["recir_state_kind"] = "optimizer"
+                node.meta["recir_state_fqn"] = fqn
+                node.meta["recir_state_name"] = state_name
             tensor_idx += 1
+        optimizer_placeholder_count = max(0, tensor_idx - num_pb)
+        if optimizer_placeholder_count < len(optimizer_metadata):
+            raise RuntimeError(
+                "Optimizer placeholder count does not match canonical state metadata: "
+                f"placeholders={optimizer_placeholder_count}, "
+                f"entries={len(optimizer_metadata)}"
+            )
 
     def partition(
         self,

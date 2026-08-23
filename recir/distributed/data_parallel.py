@@ -1120,7 +1120,18 @@ def mark_data_parallel_shardings(
             node.meta["sharding"] = node_strategy.strategies[0]
 
 
-def partition_value(val: Any, spec: Union[DTensorSpec, Tuple[DTensorSpec]]) -> Any:
+def partition_value(
+    val: Any,
+    spec: Union[DTensorSpec, Tuple[DTensorSpec]],
+    *,
+    copy_tensor: bool = False,
+) -> Any:
+    """Return the local value selected by ``spec``.
+
+    ``copy_tensor`` gives persistent model and optimizer shards independent
+    storage. Without it, a small shard remains a view that pins the full source
+    tensor until the shard is released.
+    """
     if val is None or isinstance(val, (int, float, bool, str)):
         return val
     if isinstance(val, torch.Tensor):
@@ -1138,7 +1149,11 @@ def partition_value(val: Any, spec: Union[DTensorSpec, Tuple[DTensorSpec]]) -> A
                 local_shard = placement._split_tensor(
                     local_shard, num_chunks, with_padding=False, contiguous=False
                 )[0][my_coord_on_mesh_dim]
-        return local_shard
+        if not copy_tensor:
+            return local_shard
+        owned_shard = local_shard.detach().clone()
+        owned_shard.requires_grad_(local_shard.requires_grad)
+        return owned_shard
     elif isinstance(val, (tuple, list)):
         if not isinstance(val[0], torch.Tensor):
             # fused op (TupleStrategy), skip here
@@ -1146,10 +1161,15 @@ def partition_value(val: Any, spec: Union[DTensorSpec, Tuple[DTensorSpec]]) -> A
                 assert not isinstance(val[i], torch.Tensor)
             return val
         elif isinstance(spec, DTensorSpec):
-            return val.__class__(partition_value(v, spec) for v in val)
+            return val.__class__(
+                partition_value(v, spec, copy_tensor=copy_tensor) for v in val
+            )
         else:
             assert len(val) == len(spec)
-            return val.__class__(partition_value(v, s) for v, s in zip(val, spec))
+            return val.__class__(
+                partition_value(v, s, copy_tensor=copy_tensor)
+                for v, s in zip(val, spec)
+            )
     elif isinstance(val, torch.ScriptObject):
         return val  # ScriptObjects (e.g., profiler._RecordFunction) don't need partitioning
     else:
@@ -1347,9 +1367,15 @@ def _shard_parameter_aliases(
     aliases: Sequence[str],
     full_tensor: torch.Tensor,
     shard_spec: DTensorSpec,
+    *,
     location: str = "HBM",
+    copy_tensor: bool = False,
 ) -> nn.Parameter:
-    local_shard = partition_value(full_tensor, shard_spec)
+    local_shard = (
+        partition_value(full_tensor, shard_spec, copy_tensor=True)
+        if copy_tensor
+        else partition_value(full_tensor, shard_spec)
+    )
     copy_meta_init_attrs(local_shard, full_tensor)
     if local_shard.device.type == "meta":
         device = torch.device(f"cuda:{torch.cuda.current_device()}")
@@ -1378,6 +1404,8 @@ def shard_params_and_states(
     mesh: DeviceMesh,
     parallel_style: DataParallelStyle,
     shard_filter: Optional[Callable[[str, torch.Tensor], bool]] = None,
+    *,
+    copy_tensor: bool = False,
 ) -> Set[str]:
     """Shard model parameters and optimizer states for FULLY_SHARD mode.
 
@@ -1408,9 +1436,14 @@ def shard_params_and_states(
             aliases,
             old_param,
             shard_spec,
+            copy_tensor=copy_tensor,
         )
         old_to_new.append((old_param, new_param, shard_spec))
-    _migrate_opt_after_param_swap(opts, old_to_new)
+    _migrate_opt_after_param_swap(
+        opts,
+        old_to_new,
+        copy_tensor=copy_tensor,
+    )
     return sharded_keys
 
 
@@ -1750,12 +1783,18 @@ def _shard_param(
 def _shard_state_dict(
     state: Any,
     shard_spec: DTensorSpec,
+    *,
+    copy_tensor: bool = False,
 ) -> None:
     """Shard tensor values inside an optimizer state entry in-place."""
     if isinstance(state, dict):
         for key in state:
             if isinstance(state[key], torch.Tensor):
-                local_state = partition_value(state[key], shard_spec)
+                local_state = (
+                    partition_value(state[key], shard_spec, copy_tensor=True)
+                    if copy_tensor
+                    else partition_value(state[key], shard_spec)
+                )
                 mark_meta_zero_init(local_state)
                 state[key] = local_state
 
@@ -1774,6 +1813,8 @@ def _normalize_opts(
 def _migrate_opt_after_param_swap(
     opts: List[torch.optim.Optimizer],
     old_to_new: List[Tuple[torch.Tensor, torch.Tensor, DTensorSpec]],
+    *,
+    copy_tensor: bool = False,
 ) -> None:
     """For each opt, migrate state[old_param] -> state[new_param] (with
     state tensor sharding) AND rewrite every param_group's `params`
@@ -1788,7 +1829,11 @@ def _migrate_opt_after_param_swap(
         for old_param, new_param, shard_spec in old_to_new:
             if old_param in opt.state:
                 state = opt.state.pop(old_param)
-                _shard_state_dict(state, shard_spec)
+                _shard_state_dict(
+                    state,
+                    shard_spec,
+                    copy_tensor=copy_tensor,
+                )
                 opt.state[new_param] = state
         # param_groups rewrite is unconditional - even if a group's
         # params list doesn't contain any of the swapped params, the
