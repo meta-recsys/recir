@@ -21,10 +21,13 @@ import recir
 import torch
 import torch.nn as nn
 from recir.api import (
+    _build_compiled_process_state,
     add_state,
     COMPILED_OBJECT_KEY,
     extract_subgraph,
     find_markers,
+    FSDPWeightShardSpec,
+    get_compiled_process_state,
     invalidate_device_state,
     materialize_compiled_output,
     replace_region,
@@ -191,6 +194,79 @@ class InvalidateDeviceStateTest(unittest.TestCase):
         invalidate_device_state(compiled_function)
 
         self.assertIsNone(state_manager.device_state)
+
+
+class GetCompiledProcessStateTest(unittest.TestCase):
+    def test_returns_canonical_state_after_compilation(self) -> None:
+        model_tensor = torch.arange(8).reshape(4, 2)
+        optimizer_tensor = torch.arange(8, dtype=torch.float32).reshape(4, 2)
+        graph = fx.Graph()
+        model_placeholder = graph.placeholder("model_weight")
+        optimizer_placeholder = graph.placeholder("optimizer_exp_avg")
+        graph.output((model_placeholder, optimizer_placeholder))
+        spec = FSDPWeightShardSpec(
+            shard_dim=0,
+            device_world_size=4,
+            process_world_size=2,
+        )
+        for placeholder in (model_placeholder, optimizer_placeholder):
+            placeholder.meta["val"] = torch.empty(2, 2)
+            placeholder.meta["is_state_input"] = True
+            placeholder.meta["recir_state_layout"] = spec
+        model_placeholder.meta["fqn"] = "proj.weight"
+        optimizer_placeholder.meta["recir_state_kind"] = "optimizer"
+        optimizer_placeholder.meta["recir_state_fqn"] = "proj.weight"
+        optimizer_placeholder.meta["recir_state_name"] = "exp_avg"
+        process_state = _build_compiled_process_state(
+            fx.GraphModule(nn.Module(), graph),
+            {"proj.weight": model_tensor},
+            {"proj.weight": {"exp_avg": optimizer_tensor}},
+        )
+        assert process_state is not None
+
+        def compiled_function() -> None:
+            pass
+
+        self.assertIsNone(get_compiled_process_state(compiled_function))
+        compiled_function.__dict__[COMPILED_OBJECT_KEY] = SimpleNamespace(
+            process_state=process_state
+        )
+
+        result = get_compiled_process_state(compiled_function)
+
+        self.assertIs(result, process_state)
+        assert result is not None
+        self.assertIs(result.model["proj.weight"], model_tensor)
+        self.assertIs(result.optimizer["proj.weight"]["exp_avg"], optimizer_tensor)
+        self.assertEqual((8, 2), result.model_global_shapes["proj.weight"])
+        self.assertEqual(
+            (8, 2),
+            result.optimizer_global_shapes["proj.weight"]["exp_avg"],
+        )
+
+    def test_rejects_placeholder_owner_order_mismatch(self) -> None:
+        tensor = torch.arange(8).reshape(4, 2)
+        graph = fx.Graph()
+        placeholder = graph.placeholder("model_weight")
+        graph.output(placeholder)
+        placeholder.meta["val"] = torch.empty(2, 2)
+        placeholder.meta["is_state_input"] = True
+        placeholder.meta["fqn"] = "other.weight"
+        placeholder.meta["recir_state_layout"] = FSDPWeightShardSpec(
+            shard_dim=0,
+            device_world_size=4,
+            process_world_size=2,
+        )
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "placeholder metadata does not match",
+        ):
+            _build_compiled_process_state(
+                fx.GraphModule(nn.Module(), graph),
+                {"proj.weight": tensor},
+                {},
+            )
 
 
 class SetCompiledOutputDeferredTest(unittest.TestCase):
