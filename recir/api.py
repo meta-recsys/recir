@@ -2263,6 +2263,7 @@ def _compile_gspmd(
 # Note that the Python convention of __dict__ requires the key to be str.
 # TODO: ensure the key is unique.
 COMPILED_OBJECT_KEY = "_compiled_obj"
+PREPARE_COMPILED_ATTR = "_recir_prepare_compiled"
 
 
 def make_compiled_runner(compiled_obj: Any) -> Callable[..., Any]:
@@ -2521,53 +2522,52 @@ def compile(  # noqa: C901 — orchestration: stages 0-9 + legacy DP/GSPMD wirin
     """
 
     def inner(func: Callable[..., Any]) -> Callable[..., Any]:
+        def ensure_compiled(
+            args: Tuple[Any, ...], kwargs: Dict[str, Any]
+        ) -> _CompiledResult:
+            compiled_obj = wrapper.__dict__.get(COMPILED_OBJECT_KEY, None)
+            if compiled_obj is not None:
+                return compiled_obj
+            mode: ParallelMode = (
+                DataParallel() if parallel_mode is None else parallel_mode
+            )
+            if backend is not None:
+                compiled_obj = _compile_via_backend(
+                    func,
+                    mode,
+                    backend,
+                    eager_preproc=eager_preproc,
+                    region_transforms=region_transforms,
+                    _parametrize_fns=_parametrize_fns,
+                    args=args,
+                    kwargs=kwargs,
+                )
+            else:
+                if _parametrize_fns:
+                    raise ValueError(
+                        "recir.compile(_parametrize_fns=...) requires "
+                        "backend= to be set (the legacy partition-only "
+                        "path does not forward user parametrize fns)."
+                    )
+                if eager_preproc:
+                    for arg in pytree.arg_tree_leaves(*args, **kwargs):
+                        if isinstance(arg, nn.Module):
+                            for hook in eager_preproc:
+                                hook(arg)
+                compiled_obj = _compile_and_transform(
+                    func,
+                    mode,
+                    *args,
+                    region_transforms=region_transforms,
+                    **kwargs,
+                )
+            wrapper.__dict__[COMPILED_OBJECT_KEY] = compiled_obj
+            return compiled_obj
+
         @wraps(func)
         def wrapper(*args: Any, **kwargs: Any) -> Any:
             last_train_step = kwargs.pop("last_train_step", False) if kwargs else False
-            # Put the COMPILED_OBJECT_KEY in ``wrapper`` instead of ``func`` as
-            # ``wrapper`` is the one that users will get.
-            compiled_obj = wrapper.__dict__.get(COMPILED_OBJECT_KEY, None)
-            if compiled_obj is None:
-                mode: ParallelMode = (
-                    DataParallel() if parallel_mode is None else parallel_mode
-                )
-                if backend is not None:
-                    # New v7.1 path: trace + compile_from_gm.
-                    compiled_obj = _compile_via_backend(
-                        func,
-                        mode,
-                        backend,
-                        eager_preproc=eager_preproc,
-                        region_transforms=region_transforms,
-                        _parametrize_fns=_parametrize_fns,
-                        args=args,
-                        kwargs=kwargs,
-                    )
-                else:
-                    # Legacy partition-only path (no Backend supplied):
-                    # eager_preproc still applies pre-trace (against every
-                    # nn.Module argument so multi-module signatures all
-                    # benefit), then the gm is partitioned but skips backend
-                    # stages 6-10.
-                    if _parametrize_fns:
-                        raise ValueError(
-                            "recir.compile(_parametrize_fns=...) requires "
-                            "backend= to be set (the legacy partition-only "
-                            "path does not forward user parametrize fns)."
-                        )
-                    if eager_preproc:
-                        for arg in pytree.arg_tree_leaves(*args, **kwargs):
-                            if isinstance(arg, nn.Module):
-                                for hook in eager_preproc:
-                                    hook(arg)
-                    compiled_obj = _compile_and_transform(
-                        func,
-                        mode,
-                        *args,
-                        region_transforms=region_transforms,
-                        **kwargs,
-                    )
-                wrapper.__dict__[COMPILED_OBJECT_KEY] = compiled_obj
+            compiled_obj = ensure_compiled(args, kwargs)
 
             user_inps = pytree.arg_tree_leaves(*args, **kwargs)
             flat_inps = compiled_obj.state_manager.prepare_inputs(
@@ -2605,9 +2605,26 @@ def compile(  # noqa: C901 — orchestration: stages 0-9 + legacy DP/GSPMD wirin
 
                 return output
 
+        def prepare_compiled(*args: Any, **kwargs: Any) -> None:
+            if kwargs:
+                kwargs.pop("last_train_step", None)
+            ensure_compiled(args, kwargs)
+
+        wrapper.__dict__[PREPARE_COMPILED_ATTR] = prepare_compiled
         return wrapper
 
     return inner
+
+
+def prepare_compiled(
+    compiled_fn: Callable[..., Any], *args: Any, **kwargs: Any
+) -> bool:
+    """Compile and cache a RecIR callable without executing its graph."""
+    prepare = compiled_fn.__dict__.get(PREPARE_COMPILED_ATTR)
+    if not callable(prepare):
+        return False
+    prepare(*args, **kwargs)
+    return True
 
 
 def sync_device_state_to_torch(
