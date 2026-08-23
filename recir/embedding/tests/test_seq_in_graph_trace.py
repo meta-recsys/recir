@@ -117,6 +117,48 @@ def _big_feature_ref(module, kjt, batch):
 
 
 class SeqInGraphTraceTest(unittest.TestCase):
+    def test_ringshift_op_preserves_bf16_padding_gradient_semantics(self) -> None:
+        import recir.ops.seq_embedding_op  # noqa: F401
+
+        ids = torch.tensor([[0, 3, 0], [2, 3, 1]], dtype=torch.int64)
+        lengths = torch.full((2,), 3, dtype=torch.int32)
+        values = torch.arange(24, dtype=torch.float32).reshape(6, 4).to(torch.bfloat16)
+        actual_weight = values.clone().requires_grad_(True)
+        reference_weight = values.clone().requires_grad_(True)
+        output_gradient = torch.tensor(
+            [
+                [[1.0, 2.0, 3.0, 4.0], [0.5, 1.0, 1.5, 2.0], [3.0] * 4],
+                [[2.0] * 4, [4.0] * 4, [5.0] * 4],
+            ],
+            dtype=torch.bfloat16,
+        )
+
+        actual = torch.ops.recir.ringshift_embedding(
+            ids,
+            lengths,
+            actual_weight,
+            0,
+        )
+        reference = torch.nn.functional.embedding(
+            ids,
+            reference_weight,
+            padding_idx=0,
+        )
+        actual.backward(output_gradient)
+        reference.backward(output_gradient)
+
+        torch.testing.assert_close(actual, reference, atol=0, rtol=0)
+        actual_gradient = actual_weight.grad
+        self.assertIsNotNone(actual_gradient)
+        assert actual_gradient is not None
+        torch.testing.assert_close(
+            actual_gradient,
+            reference_weight.grad,
+            atol=0,
+            rtol=0,
+        )
+        self.assertEqual(0, int(torch.count_nonzero(actual_gradient[0])))
+
     def test_eager_shapes(self) -> None:
         module, kjt, batch = _build_module_and_kjt()
         out = module(kjt)

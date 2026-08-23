@@ -11,7 +11,9 @@ from recir.api import (  # noqa: F401
     extract_subgraph,
     find_markers,
     GraphPatch,
+    materialize_compiled_output,
     replace_region,
+    set_compiled_output_deferred,
     trace,
 )
 from recir.backend import BackendType  # noqa: F401

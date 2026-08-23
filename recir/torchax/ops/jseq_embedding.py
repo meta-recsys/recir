@@ -16,11 +16,10 @@ The DP (replicated) path uses plain ``aten.embedding`` (lowered to ``jnp.take`` 
 ``jaten.py``), not a custom op.
 
 The op (schema + CPU fallback + autograd) is defined in
-``recir.ops.seq_embedding_op``. Because the lowering wraps the ring-shift kernel
-(which carries its own ``shard_map`` over the ``"torch_dist"`` mesh) it composes
-into recir's single compiled GSPMD program -- the cross-host all-to-all is
-scheduled together with the outer data-parallel collectives, so it does NOT
-deadlock the way the graph-break embedding path did.
+``recir.ops.seq_embedding_op``. GSPMD uses the kernel's ``shard_map`` wrapper.
+The shard-map backend already binds ``"torch_dist"`` as a manual mesh axis, so
+this lowering calls the per-device driver directly rather than nesting another
+``shard_map``.
 
 Data layout:
   * ``ids`` reshapes to ``[W, max_local_ids]`` (leading axis = the mesh axis), so
@@ -31,7 +30,7 @@ Data layout:
 """
 
 import os
-from typing import Any, Tuple
+from typing import Any, cast, Tuple
 
 # Define torch.ops.recir.ringshift_embedding (schema + fallbacks) before registering.
 import jax
@@ -39,7 +38,11 @@ import jax.numpy as jnp
 import recir.ops.seq_embedding_op  # noqa: F401
 import torch
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
-from recir.ops.pallas.embeddings import ringshift_embedding_lookup_block
+from recir.ops.pallas.embeddings import (
+    ringshift_embedding_lookup_block,
+    ringshift_embedding_lookup_block_backward_local,
+    ringshift_embedding_lookup_block_local,
+)
 from recir.torchax.ops.decorators import op
 
 _AXIS = "torch_dist"
@@ -55,6 +58,18 @@ def _device_mesh() -> Any:
     # Matches recir's Mesh(_get_global_devices(), ("torch_dist",)); imported
     # directly from jax to avoid a recir.lowering import cycle.
     return Mesh(jax.devices(), (_AXIS,))
+
+
+def _manual_world_size() -> int | None:
+    current_mesh = jax.sharding.get_abstract_mesh()
+    if _AXIS not in current_mesh.manual_axes:
+        return None
+    if _AXIS not in current_mesh.shape:
+        raise ValueError(f"manual mesh axis {_AXIS!r} has no static size")
+    world_size = int(current_mesh.shape[_AXIS])
+    if world_size <= 0:
+        raise ValueError(f"manual mesh axis {_AXIS!r} has invalid size {world_size}")
+    return world_size
 
 
 def _prep(ids: Any, lengths: Any, weight: Any) -> Tuple[Any, Any, Any, int, int, int]:
@@ -93,19 +108,68 @@ def _prep(ids: Any, lengths: Any, weight: Any) -> Tuple[Any, Any, Any, int, int,
     return local_ids, count, weight3d, batch, seq, dim
 
 
+def _prep_local(
+    ids: Any, lengths: Any, weight: Any, world_size: int
+) -> Tuple[Any, Any, int, int, int]:
+    """Prepare one device's shards under an already-active manual mesh."""
+    batch, seq = ids.shape
+    v_local, dim = weight.shape
+    max_local_ids = batch * seq
+    global_vocab = v_local * world_size
+
+    pos = jnp.arange(seq, dtype=jnp.int32)[None, :]
+    is_pad = pos >= lengths.astype(jnp.int32)[:, None]
+    rank = jax.lax.axis_index(_AXIS)
+    flat_spread = (
+        rank * max_local_ids + jnp.arange(max_local_ids, dtype=jnp.int32)
+    ) % global_vocab
+    ids_dist = cast(
+        jax.Array,
+        jnp.where(
+            is_pad,
+            flat_spread.reshape(batch, seq),
+            ids.astype(jnp.int32),
+        ),
+    )
+    count = jnp.asarray(max_local_ids, dtype=jnp.int32)
+    return ids_dist.reshape(max_local_ids), count, batch, seq, dim
+
+
 @op(torch.ops.recir.ringshift_embedding)  # pyre-ignore[56]
-def _jringshift_embedding(ids: Any, lengths: Any, weight: Any) -> Any:
+def _jringshift_embedding(
+    ids: Any, lengths: Any, weight: Any, padding_idx: int = -1
+) -> Any:
+    del padding_idx  # Forward lookup returns the stored padding row, like F.embedding.
+    manual_world_size = _manual_world_size()
+    if manual_world_size is not None:
+        local_ids, count, batch, seq, dim = _prep_local(
+            ids, lengths, weight, manual_world_size
+        )
+        out = ringshift_embedding_lookup_block_local(
+            local_ids,
+            count,
+            weight.astype(jnp.float32),
+            axis_name=_AXIS,
+            world_size=manual_world_size,
+            recv_capacity=_RECV_CAPACITY,
+            exchange_bf16=_EXCHANGE_BF16,
+        )
+        return out.reshape(batch, seq, dim).astype(weight.dtype)
+
     local_ids, count, weight3d, batch, seq, dim = _prep(ids, lengths, weight)
+    # Citrine C3: keep the persistent table in its compact storage dtype while
+    # satisfying the Mosaic kernel's FP32 table contract only inside the op.
+    kernel_weight3d = weight3d.astype(jnp.float32)
     out = ringshift_embedding_lookup_block(
         local_ids,
         count,
-        weight3d,
+        kernel_weight3d,
         mesh=_device_mesh(),
         axis_name=_AXIS,
         recv_capacity=_RECV_CAPACITY,
         exchange_bf16=_EXCHANGE_BF16,
     )
-    out = out.reshape(batch, seq, dim)
+    out = out.reshape(batch, seq, dim).astype(weight.dtype)
     out = jax.lax.with_sharding_constraint(
         out, NamedSharding(_device_mesh(), P(_AXIS, None, None))
     )
@@ -114,9 +178,44 @@ def _jringshift_embedding(ids: Any, lengths: Any, weight: Any) -> Any:
 
 @op(torch.ops.recir.ringshift_embedding_backward)  # pyre-ignore[56]
 def _jringshift_embedding_backward(
-    grad_out: Any, ids: Any, lengths: Any, weight: Any
+    grad_out: Any,
+    ids: Any,
+    lengths: Any,
+    weight: Any,
+    padding_idx: int = -1,
 ) -> Any:
+    manual_world_size = _manual_world_size()
+    if manual_world_size is not None:
+        local_ids, count, _batch, _seq, dim = _prep_local(
+            ids, lengths, weight, manual_world_size
+        )
+        cotangent = cast(
+            jax.Array,
+            jnp.where(
+                ids[..., None] == padding_idx,
+                0,
+                grad_out.astype(jnp.float32),
+            ),
+        )
+        cotangent = cotangent.reshape(
+            local_ids.shape[0],
+            dim,
+        )
+        grad_weight = ringshift_embedding_lookup_block_backward_local(
+            cotangent,
+            local_ids,
+            count,
+            axis_name=_AXIS,
+            world_size=manual_world_size,
+            recv_capacity=_RECV_CAPACITY,
+            v_local=weight.shape[0],
+            embedding_dim=dim,
+            exchange_bf16=_EXCHANGE_BF16,
+        )
+        return grad_weight.astype(weight.dtype)
+
     local_ids, count, weight3d, _batch, _seq, dim = _prep(ids, lengths, weight)
+    kernel_weight3d = weight3d.astype(jnp.float32)
 
     def _fwd(w3: Any, local_ids: Any = local_ids, count: Any = count) -> Any:
         return ringshift_embedding_lookup_block(
@@ -129,10 +228,19 @@ def _jringshift_embedding_backward(
             exchange_bf16=_EXCHANGE_BF16,
         )
 
-    _, vjp_fn = jax.vjp(_fwd, weight3d)
-    cotangent = grad_out.reshape(local_ids.shape[0], local_ids.shape[1], dim)
+    _, vjp_fn = jax.vjp(_fwd, kernel_weight3d)
+    cotangent = grad_out.astype(jnp.float32)
+    # A sentinel of -1 cannot match a valid embedding ID, so this remains a
+    # traceable array expression whether TorchAX supplies a Python or JAX scalar.
+    masked_cotangent: Any = jnp.where(
+        ids[..., None] == padding_idx,
+        0,
+        cotangent,
+    )
+    cotangent = masked_cotangent
+    cotangent = cotangent.reshape(local_ids.shape[0], local_ids.shape[1], dim)
     (grad_weight3d,) = vjp_fn(cotangent)
-    return grad_weight3d.reshape(weight.shape[0], dim)
+    return grad_weight3d.reshape(weight.shape[0], dim).astype(weight.dtype)
 
 
 @op(torch.ops.recir.shard_batch0)  # pyre-ignore[56]
