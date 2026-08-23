@@ -14,6 +14,7 @@ ringshift kernel:
   * ``_derive_offsets``           -- send/recv offset matrices from traffic
   * ``_split_traffic_ringshift_globalpad`` -- ring-shift splitter
   * ``_ringshift_phase3_remote_offset``    -- per-wave remote dst offset
+  * ``_ring_device_id``           -- axis-scoped peer addressing on a mesh
 
 All assertions use small inputs hand-checked against numpy or pure-JAX
 references. No ``interpret=True`` is used because the Pallas kernel relies on
@@ -35,6 +36,7 @@ from recir.ops.pallas.embeddings.ringshift import (
     _derive_offsets,
     _pad_per_peer,
     _pad_per_peer_2d,
+    _ring_device_id,
     _ringshift_phase3_remote_offset,
     _round_up_tile,
     _split_traffic_ringshift_globalpad,
@@ -42,6 +44,18 @@ from recir.ops.pallas.embeddings.ringshift import (
     _unpad_per_peer,
     ringshift_embedding_lookup_reference,
 )
+
+
+class RingDeviceIdTest(unittest.TestCase):
+    def test_preserves_unspecified_mesh_axes(self) -> None:
+        rank = jnp.asarray(3, dtype=jnp.int32)
+
+        device_id = _ring_device_id("torch_dist", rank)
+
+        self.assertEqual({"torch_dist"}, set(device_id))
+        np.testing.assert_array_equal(
+            np.asarray(rank), np.asarray(device_id["torch_dist"])
+        )
 
 
 class BucketizeAndSortTest(unittest.TestCase):
