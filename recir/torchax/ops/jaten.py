@@ -2035,17 +2035,21 @@ def _aten_embedding_dense_backward(
                 gw = _scale(gw, counts)
             return gw
 
-        grad_weight = jax.shard_map(
-            _per_device,
-            mesh=mesh,
-            in_specs=(
-                spec(_DP_AXIS, *([None] * (grad_output.ndim - 1))),
-                spec(_DP_AXIS, *([None] * (indices.ndim - 1))),
-            ),
-            out_specs=spec(),  # replicated after psum
-            check_vma=False,
-            # pyrefly: ignore [bad-argument-count]
-        )(grad_output, indices)
+        current_mesh = jax.sharding.get_abstract_mesh()
+        if _DP_AXIS in current_mesh.manual_axes:
+            grad_weight = _per_device(grad_output, indices)
+        else:
+            grad_weight = jax.shard_map(
+                _per_device,
+                mesh=mesh,
+                in_specs=(
+                    spec(_DP_AXIS, *([None] * (grad_output.ndim - 1))),
+                    spec(_DP_AXIS, *([None] * (indices.ndim - 1))),
+                ),
+                out_specs=spec(),  # replicated after psum
+                check_vma=False,
+                # pyrefly: ignore [bad-argument-count]
+            )(grad_output, indices)
 
     if padding_idx is not None and int(padding_idx) >= 0:
         # pyrefly: ignore [missing-attribute]

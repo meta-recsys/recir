@@ -26,16 +26,19 @@ The DP (replicated) table path does NOT use a custom op -- it calls plain
 meta-tolerant custom op is needed.
 
 ``ringshift_embedding`` contract:
-  ringshift_embedding(ids, lengths, weight) -> activations
+  ringshift_embedding(ids, lengths, weight, padding_idx=-1) -> activations
     ids:     int32 [R, C]      ids reshaped to [W, max_local_ids] (leading axis =
                                mesh axis). The in-graph backend passes [W, T_local]
                                (one row per chip; T_local = per-chip token total).
     lengths: int32 [R]         valid count per row (entries past it are padding,
                                dropped from the ring-shift traffic). The in-graph
                                backend passes full counts (no padding).
-    weight:  f32   [vocab, D]  embedding table; row-wise (FSDP/block) sharded by
-                               recir's GSPMD lowering.
-    returns: f32   [R, C, D]   per-position embeddings.
+    weight:  [vocab, D]        embedding table; row-wise (FSDP/block) sharded by
+                               recir's GSPMD lowering. BF16 tables use FP32 inside
+                               the TPU kernel and cast the result/gradient back.
+    padding_idx: int           nonnegative row whose gradient is suppressed, or
+                               -1 for no padding row (matching ``F.embedding``).
+    returns: [R, C, D]         per-position embeddings in ``weight.dtype``.
 
 Only ``weight`` is differentiable; ``ids``/``lengths`` get ``None`` gradients.
 The CPU/GPU fallback is a plain ``F.embedding`` so the op is correct off-TPU and
@@ -53,10 +56,13 @@ import torch.nn.functional as F
 
 _LIB = torch.library.Library("recir", "FRAGMENT")
 
-_SCHEMA = "ringshift_embedding(Tensor ids, Tensor lengths, Tensor weight) -> Tensor"
+_SCHEMA = (
+    "ringshift_embedding(Tensor ids, Tensor lengths, Tensor weight, "
+    "int padding_idx=-1) -> Tensor"
+)
 _BWD_SCHEMA = (
     "ringshift_embedding_backward(Tensor grad_out, Tensor ids, Tensor lengths, "
-    "Tensor weight) -> Tensor"
+    "Tensor weight, int padding_idx=-1) -> Tensor"
 )
 
 _LIB.define(_SCHEMA)
@@ -95,8 +101,13 @@ def _fwd_fallback(
     ids: torch.Tensor,
     lengths: torch.Tensor,
     weight: torch.Tensor,
+    padding_idx: int = -1,
 ) -> torch.Tensor:
-    return F.embedding(ids.long(), weight)
+    return F.embedding(
+        ids.long(),
+        weight,
+        padding_idx=None if padding_idx < 0 else padding_idx,
+    )
 
 
 def _bwd_fallback(
@@ -104,10 +115,15 @@ def _bwd_fallback(
     ids: torch.Tensor,
     lengths: torch.Tensor,
     weight: torch.Tensor,
+    padding_idx: int = -1,
 ) -> torch.Tensor:
     wd = weight.detach().requires_grad_(True)
     with torch.enable_grad():
-        out = F.embedding(ids.long(), wd)
+        out = F.embedding(
+            ids.long(),
+            wd,
+            padding_idx=None if padding_idx < 0 else padding_idx,
+        )
         (grad_weight,) = torch.autograd.grad(out, (wd,), grad_out)
     return grad_weight
 
@@ -123,6 +139,7 @@ def _fwd_meta(
     ids: torch.Tensor,
     lengths: torch.Tensor,
     weight: torch.Tensor,
+    padding_idx: int = -1,
 ) -> torch.Tensor:
     d = weight.shape[1]
     return ids.new_empty((*ids.shape, d), dtype=weight.dtype)
@@ -134,23 +151,25 @@ def _bwd_meta(
     ids: torch.Tensor,
     lengths: torch.Tensor,
     weight: torch.Tensor,
+    padding_idx: int = -1,
 ) -> torch.Tensor:
     return torch.empty_like(weight)
 
 
 # pyre-ignore[2]: variadic ctx/inputs for torch autograd registration.
 def _setup_context(ctx, inputs, output) -> None:  # noqa
-    ids, lengths, weight = inputs
+    ids, lengths, weight, padding_idx = inputs
     ctx.save_for_backward(ids, lengths, weight)
+    ctx.padding_idx = padding_idx
 
 
 # pyre-ignore[2,3]
 def _backward(ctx, grad_out):  # noqa
     ids, lengths, weight = ctx.saved_tensors
     grad_weight = torch.ops.recir.ringshift_embedding_backward(
-        grad_out, ids, lengths, weight
+        grad_out, ids, lengths, weight, ctx.padding_idx
     )
-    return None, None, grad_weight
+    return None, None, grad_weight, None
 
 
 torch.library.register_autograd(

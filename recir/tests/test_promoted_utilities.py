@@ -15,6 +15,7 @@ the top-level ``recir`` package.
 import unittest
 from types import SimpleNamespace
 from typing import List
+from unittest.mock import MagicMock
 
 import recir
 import torch
@@ -25,7 +26,9 @@ from recir.api import (
     extract_subgraph,
     find_markers,
     invalidate_device_state,
+    materialize_compiled_output,
     replace_region,
+    set_compiled_output_deferred,
 )
 from torch import fx
 from torch.fx.experimental.proxy_tensor import make_fx
@@ -190,6 +193,59 @@ class InvalidateDeviceStateTest(unittest.TestCase):
         self.assertIsNone(state_manager.device_state)
 
 
+class SetCompiledOutputDeferredTest(unittest.TestCase):
+    def test_returns_false_before_compilation(self) -> None:
+        def compiled_function() -> None:
+            pass
+
+        self.assertFalse(set_compiled_output_deferred(compiled_function, True))
+
+    def test_updates_compiled_device_state_manager(self) -> None:
+        state_manager = SimpleNamespace(keep_output_jax=False)
+
+        def compiled_function() -> None:
+            pass
+
+        compiled_function.__dict__[COMPILED_OBJECT_KEY] = SimpleNamespace(
+            state_manager=state_manager
+        )
+
+        self.assertTrue(set_compiled_output_deferred(compiled_function, True))
+        self.assertTrue(state_manager.keep_output_jax)
+        self.assertFalse(set_compiled_output_deferred(compiled_function, False))
+        self.assertFalse(state_manager.keep_output_jax)
+
+
+class MaterializeCompiledOutputTest(unittest.TestCase):
+    def test_passes_through_before_compilation(self) -> None:
+        output = object()
+
+        def compiled_function() -> None:
+            pass
+
+        self.assertIs(output, materialize_compiled_output(compiled_function, output))
+
+    def test_delegates_to_device_state_manager(self) -> None:
+        output = object()
+        materialized = object()
+        state_manager = SimpleNamespace(
+            materialize_output=MagicMock(return_value=materialized)
+        )
+
+        def compiled_function() -> None:
+            pass
+
+        compiled_function.__dict__[COMPILED_OBJECT_KEY] = SimpleNamespace(
+            state_manager=state_manager
+        )
+
+        self.assertIs(
+            materialized,
+            materialize_compiled_output(compiled_function, output),
+        )
+        state_manager.materialize_output.assert_called_once_with(output)
+
+
 class TopLevelExportTest(unittest.TestCase):
     """All promoted utilities are reachable from the top-level ``recir`` package."""
 
@@ -204,3 +260,15 @@ class TopLevelExportTest(unittest.TestCase):
 
     def test_add_state_exported(self) -> None:
         self.assertIs(recir.add_state, add_state)
+
+    def test_set_compiled_output_deferred_exported(self) -> None:
+        self.assertIs(
+            recir.set_compiled_output_deferred,
+            set_compiled_output_deferred,
+        )
+
+    def test_materialize_compiled_output_exported(self) -> None:
+        self.assertIs(
+            recir.materialize_compiled_output,
+            materialize_compiled_output,
+        )

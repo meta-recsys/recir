@@ -34,12 +34,13 @@ if "xla_force_host_platform_device_count" not in _existing_xla_flags:
     ).strip()
 
 import unittest
+from unittest import mock
 
 import jax  # @manual
 import numpy as np
 import torch
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
-from recir.lowering.xla_lower import _jax_to_torch, _XLAModule
+from recir.lowering.xla_lower import _gspmd_mesh, _jax_to_torch, _XLAModule
 
 
 def _mesh() -> Mesh:
@@ -66,6 +67,73 @@ class ToShardedJaxTest(unittest.TestCase):
 
         self.assertIsNotNone(sharding)
         self.assertEqual(sharding.spec, P(None, "torch_dist"))
+
+    def test_hybrid_mesh_shards_batch_over_data_and_fsdp_axes(self) -> None:
+        devices = list(jax.devices())
+        with mock.patch(
+            "recir.lowering.xla_lower._get_local_devices",
+            return_value=devices[:1],
+        ):
+            mesh, batch_resource, hybrid = _gspmd_mesh(devices, fsdp_axis_size=1)
+
+        self.assertTrue(hybrid)
+        self.assertEqual(("gspmd_data", "torch_dist"), mesh.axis_names)
+        self.assertEqual(("gspmd_data", "torch_dist"), batch_resource)
+        self.assertEqual(2, mesh.shape["gspmd_data"])
+        self.assertEqual(1, mesh.shape["torch_dist"])
+
+        graph = torch.fx.Graph()
+        output = graph.placeholder("prediction")
+        output.meta["val"] = torch.empty(81, 12800)
+        output.meta["is_batch_input"] = True
+        output.meta["batch_dim"] = 0
+        sharding = _XLAModule._batch_boundary_output_sharding(
+            output,
+            mesh,
+            batch_resource,
+        )
+        self.assertIsNotNone(sharding)
+        self.assertEqual(sharding.spec, P(("gspmd_data", "torch_dist"), None))
+
+    def test_hybrid_lowering_uses_two_axis_batch_resource_for_examples(self) -> None:
+        graph = torch.fx.Graph()
+        batch = graph.placeholder("batch")
+        batch.meta["val"] = torch.empty(2, 4)
+        batch.meta["is_batch_input"] = True
+        batch.meta["batch_dim"] = 0
+        graph.output(batch)
+        gm = torch.fx.GraphModule({}, graph)
+        gm.meta["gspmd_fsdp_axis_size"] = 1
+        module = _XLAModule(gm)
+        fake_jitted = mock.Mock()
+        fake_jitted.lower.return_value = mock.sentinel.lowered
+
+        with (
+            mock.patch(
+                "recir.lowering.xla_lower._get_local_devices",
+                return_value=list(jax.devices())[:1],
+            ),
+            mock.patch("recir.lowering.xla_lower.jax.jit", return_value=fake_jitted),
+            mock.patch.object(
+                module,
+                "_to_sharded_jax",
+                return_value=mock.sentinel.example_arg,
+            ) as to_sharded,
+        ):
+            lowered, _ = module._jit_gspmd(
+                lambda value: value,
+                (torch.ones(2, 4),),
+                torch.device("cpu"),
+            )
+
+        self.assertIs(lowered, mock.sentinel.lowered)
+        to_sharded.assert_called_once()
+        self.assertEqual(
+            to_sharded.call_args.kwargs["batch_axis_resource"],
+            ("gspmd_data", "torch_dist"),
+        )
+        self.assertEqual(to_sharded.call_args.kwargs["fsdp_axis_name"], "torch_dist")
+        self.assertTrue(to_sharded.call_args.kwargs["fsdp_host_tensor_is_global"])
 
     def test_dim_one_sharded_output_reconstructs_dim_one(self) -> None:
         host = np.arange(24, dtype=np.float32).reshape(3, 8)

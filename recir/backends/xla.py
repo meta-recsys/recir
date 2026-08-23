@@ -63,6 +63,15 @@ class XLAGSPMDBackend(_XLABackendBase):
 
     _backend_type: ClassVar[BackendType] = BackendType.XLA_GSPMD
 
+    def __init__(self, *, dump_hlo: bool = False, **kwargs: Any) -> None:
+        super().__init__(dump_hlo=dump_hlo, **kwargs)
+        self._fsdp_axis_size: Optional[int] = None
+
+    def dispatch(self, gm: fx.GraphModule) -> nn.Module:
+        if self._fsdp_axis_size is not None:
+            gm.meta["gspmd_fsdp_axis_size"] = self._fsdp_axis_size
+        return super().dispatch(gm)
+
     def validate_with(self, parallel_mode: "ParallelMode") -> None:
         from recir.distributed.parallel_mode import GSPMDParallel
 
@@ -71,6 +80,7 @@ class XLAGSPMDBackend(_XLABackendBase):
                 f"XLAGSPMDBackend requires GSPMDParallel, got "
                 f"{type(parallel_mode).__name__}"
             )
+        self._fsdp_axis_size = parallel_mode.fsdp_axis_size
         if self.uses_iter_graph:
             raise ValueError(
                 "uses_iter_graph=True is incompatible with GSPMD parallel mode. "
