@@ -62,7 +62,7 @@ from __future__ import annotations
 import functools
 import logging
 import os
-from typing import Tuple
+from typing import Any, Tuple
 
 import jax
 import jax.numpy as jnp
@@ -176,6 +176,11 @@ def _check_pooling(
         )
     if pooling == "none" and looked_up_id_count is None:
         raise ValueError("looked_up_id_count is required when pooling == 'none'")
+
+
+def _ring_device_id(axis_name: str, rank: Any) -> dict[str, Any]:
+    """Address a ring peer while retaining coordinates on every other mesh axis."""
+    return {axis_name: rank}
 
 
 # ---------------------------------------------------------------------------
@@ -900,7 +905,7 @@ def _make_ringshift_single_wave_kernel(
             pl.semaphore_signal(
                 sem,
                 1,
-                device_id=(peer,),
+                device_id=_ring_device_id(axis_name, peer),
                 device_id_type=pl.DeviceIdType.MESH,
             )
         pl.semaphore_wait(sem, world_size)
@@ -945,7 +950,7 @@ def _make_ringshift_single_wave_kernel(
             dst_ref=recv_row_buf.at[pl.ds(remote_recv_start, p1_cnt)],
             send_sem=send_sem_id,
             recv_sem=recv_sem_id,
-            device_id=(my_dst,),
+            device_id=_ring_device_id(axis_name, my_dst),
             device_id_type=pl.DeviceIdType.MESH,
         )
         d_recv = pltpu.make_async_remote_copy(
@@ -953,7 +958,7 @@ def _make_ringshift_single_wave_kernel(
             dst_ref=recv_row_buf.at[pl.ds(0, p3_cnt)],
             send_sem=send_sem_id,
             recv_sem=recv_sem_id,
-            device_id=(my_src,),
+            device_id=_ring_device_id(axis_name, my_src),
             device_id_type=pl.DeviceIdType.MESH,
         )
 
@@ -1078,7 +1083,7 @@ def _make_ringshift_single_wave_kernel(
             dst_ref=out_ref.at[pl.ds(phase3_remote_start, p3_cnt), :],
             send_sem=send_sem_emb,
             recv_sem=recv_sem_emb,
-            device_id=(my_src,),  # send back to my source
+            device_id=_ring_device_id(axis_name, my_src),  # send back to my source
             device_id_type=pl.DeviceIdType.MESH,
         )
         d3_recv = pltpu.make_async_remote_copy(
@@ -1086,7 +1091,7 @@ def _make_ringshift_single_wave_kernel(
             dst_ref=out_ref.at[pl.ds(0, p1_cnt), :],
             send_sem=send_sem_emb,
             recv_sem=recv_sem_emb,
-            device_id=(my_dst,),  # peer who will send TO me
+            device_id=_ring_device_id(axis_name, my_dst),  # peer who sends TO me
             device_id_type=pl.DeviceIdType.MESH,
         )
 
@@ -1810,7 +1815,7 @@ def _make_ringshift_backward_single_wave_kernel(
             pl.semaphore_signal(
                 sem,
                 1,
-                device_id=(peer,),
+                device_id=_ring_device_id(axis_name, peer),
                 device_id_type=pl.DeviceIdType.MESH,
             )
         pl.semaphore_wait(sem, world_size)
@@ -1841,7 +1846,7 @@ def _make_ringshift_backward_single_wave_kernel(
             dst_ref=row_recv_buf.at[pl.ds(remote_recv_start, p1_cnt)],
             send_sem=send_sem_id,
             recv_sem=recv_sem_id,
-            device_id=(my_dst,),
+            device_id=_ring_device_id(axis_name, my_dst),
             device_id_type=pl.DeviceIdType.MESH,
         )
         d1a_recv = pltpu.make_async_remote_copy(
@@ -1849,7 +1854,7 @@ def _make_ringshift_backward_single_wave_kernel(
             dst_ref=row_recv_buf.at[pl.ds(0, p3_cnt)],
             send_sem=send_sem_id,
             recv_sem=recv_sem_id,
-            device_id=(my_src,),
+            device_id=_ring_device_id(axis_name, my_src),
             device_id_type=pl.DeviceIdType.MESH,
         )
 
@@ -1871,7 +1876,7 @@ def _make_ringshift_backward_single_wave_kernel(
             dst_ref=grad_recv_buf.at[pl.ds(remote_recv_start, p1_cnt), :],
             send_sem=send_sem_emb,
             recv_sem=recv_sem_emb,
-            device_id=(my_dst,),
+            device_id=_ring_device_id(axis_name, my_dst),
             device_id_type=pl.DeviceIdType.MESH,
         )
         d1b_recv = pltpu.make_async_remote_copy(
@@ -1879,7 +1884,7 @@ def _make_ringshift_backward_single_wave_kernel(
             dst_ref=grad_recv_buf.at[pl.ds(0, p3_cnt), :],
             send_sem=send_sem_emb,
             recv_sem=recv_sem_emb,
-            device_id=(my_src,),
+            device_id=_ring_device_id(axis_name, my_src),
             device_id_type=pl.DeviceIdType.MESH,
         )
 

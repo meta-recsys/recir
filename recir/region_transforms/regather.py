@@ -22,6 +22,18 @@ from recir.region_transforms.core import _extract_subgraph, _replace_region
 from recir.region_transforms.recompute import RecomputeTransform
 
 
+_RINGSHIFT_EMBEDDING_SCHEMA = "recir::ringshift_embedding"
+
+
+def _is_ringshift_embedding_region(region_nodes: set[fx.Node]) -> bool:
+    """Whether the region's compute is the owner-local ring embedding op."""
+    return any(
+        getattr(getattr(node.target, "_schema", None), "name", None)
+        == _RINGSHIFT_EMBEDDING_SCHEMA
+        for node in region_nodes
+    )
+
+
 def _collect_chain_regions(
     param_node: fx.Node,
 ) -> list[set[fx.Node]]:
@@ -152,6 +164,10 @@ class RegatherTransform(RegionTransform):
             if i in skip_indices:
                 continue
             for region_nodes in _collect_chain_regions(node):
+                # The registered backward saves only ids, lengths, and the local
+                # weight shard. Recomputing forward adds a second ring exchange.
+                if _is_ringshift_embedding_region(region_nodes):
+                    continue
                 unique = region_nodes - seen_nodes
                 if unique:
                     all_regions.append(unique)

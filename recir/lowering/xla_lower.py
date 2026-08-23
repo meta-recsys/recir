@@ -26,6 +26,7 @@ from recir.distributed.sharding_spec import get_state_layout
 from recir.lowering.lowering_utils import segment_and_lower, strip_profiler_nodes
 from recir.lowering.op_swap import OpSwapRegistry, swap_ops
 from recir.meta_tensor_init import default_embedding_init_bound, get_meta_init_spec
+from recir.torchax.gspmd_context import gspmd_mesh_context
 from recir.torchax.ops.mappings import t2j
 
 try:
@@ -1272,7 +1273,13 @@ class _XLAModule(torch.nn.Module):
             # subsequent calls bypass JAX's internal compile cache
             # lookup, which avoids a second compile during HLO capture).
             if self._jax_compiled is None:
-                self._jax_compiled = jitted.lower(*jax_args).compile()
+                with gspmd_mesh_context(
+                    runtime_mesh,
+                    runtime_batch_axis_resource,
+                    fsdp_axis_size,
+                    runtime_hybrid_fsdp,
+                ):
+                    self._jax_compiled = jitted.lower(*jax_args).compile()
                 self._log_compiled_memory_analysis()
             if not _hlo_captured[0]:
                 _hlo_captured[0] = True
@@ -1298,7 +1305,13 @@ class _XLAModule(torch.nn.Module):
         # Annotate to silence pyre [53] on the ``lowered`` capture in the
         # ``run`` closure above (late binding); ``jitted.lower`` returns
         # ``jax.stages.Lowered`` whose stubs are ``Any``.
-        lowered: Any = jitted.lower(*example_args)
+        with gspmd_mesh_context(
+            mesh,
+            batch_axis_resource,
+            fsdp_axis_size,
+            hybrid_fsdp,
+        ):
+            lowered: Any = jitted.lower(*example_args)
         return lowered, run
 
     def forward(self, *args: torch.Tensor, tag: str = "") -> List[torch.Tensor]:
