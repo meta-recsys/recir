@@ -124,6 +124,38 @@ class XLAGSPMDBackendTest(unittest.TestCase):
         backend = XLAGSPMDBackend()
         self.assertIsInstance(backend.device_state_manager(), XLADeviceStateManager)
 
+    def test_dump_hlo_is_forwarded_to_lowering(self) -> None:
+        gm = torch.fx.symbolic_trace(torch.nn.Identity())
+        lowered = torch.fx.symbolic_trace(torch.nn.Identity())
+
+        with mock.patch(
+            "recir.backends.xla.partial_lower_xla",
+            return_value=lowered,
+        ) as partial_lower:
+            result = XLAGSPMDBackend(dump_hlo=True).dispatch(gm)
+
+        self.assertIs(result, lowered)
+        partial_lower.assert_called_once_with(
+            gm,
+            backend_type=BackendType.XLA_GSPMD,
+            capture_hlo_text=True,
+        )
+
+    def test_hlo_capture_is_disabled_by_default(self) -> None:
+        gm = torch.fx.symbolic_trace(torch.nn.Identity())
+
+        with mock.patch(
+            "recir.backends.xla.partial_lower_xla",
+            return_value=gm,
+        ) as partial_lower:
+            XLAGSPMDBackend().dispatch(gm)
+
+        partial_lower.assert_called_once_with(
+            gm,
+            backend_type=BackendType.XLA_GSPMD,
+            capture_hlo_text=False,
+        )
+
     def test_validate_with_gspmd_parallel_passes(self) -> None:
         """validate_with(GSPMDParallel) does not raise."""
         backend = XLAGSPMDBackend()

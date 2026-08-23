@@ -282,6 +282,7 @@ class TestPartialLowerXLA(unittest.TestCase):
         lowered_gm = partial_lower_xla(
             copy.deepcopy(gm),
             backend_type=BackendType.XLA_SHARD_MAP,
+            capture_hlo_text=True,
         )
         lowered_gm(params, x)
         for mod in lowered_gm.modules():

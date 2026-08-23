@@ -90,7 +90,7 @@ class TestSingleProcessMultiDevice(unittest.TestCase):
                 num_ranks=num_ranks,
                 num_processes=1,
             ),
-            backend=XLAGSPMDBackend(),
+            backend=XLAGSPMDBackend(dump_hlo=True),
         )
         def train_step(
             mod: torch.nn.Module, opt: torch.optim.Optimizer, idx: torch.Tensor
@@ -155,7 +155,7 @@ class TestSingleProcessMultiDevice(unittest.TestCase):
                 num_ranks=self.num_ranks,
                 num_processes=1,
             ),
-            backend=XLAGSPMDBackend(),
+            backend=XLAGSPMDBackend(dump_hlo=True),
         )
         def train_step(mod, opt, x):
             reduce_fn(mod(x)).backward()
@@ -196,7 +196,7 @@ class TestSingleProcessMultiDevice(unittest.TestCase):
                 device_type="cpu",
                 backend=BackendType.XLA_SHARD_MAP,
             ),
-            backend=XLAShardMapBackend(),
+            backend=XLAShardMapBackend(dump_hlo=True),
         )
         def train_step(mod, opt, x):
             reduce_fn(mod(x)).backward()
@@ -247,7 +247,7 @@ class TestSingleProcessMultiDevice(unittest.TestCase):
                 device_type="cpu",
                 backend=BackendType.XLA_SHARD_MAP,
             ),
-            backend=XLAShardMapBackend(),
+            backend=XLAShardMapBackend(dump_hlo=True),
         )
         def train_step(
             mod: torch.nn.Module, opt: torch.optim.Optimizer, idx: torch.Tensor

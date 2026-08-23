@@ -288,7 +288,7 @@ class TestDLRMv3ECRWTest(DestroyPGMixin, DTensorTestBase):
                     num_ranks=num_ranks,
                     num_processes=world_size,
                 ),
-                backend=XLAGSPMDBackend(),
+                backend=XLAGSPMDBackend(dump_hlo=True),
             )
 
             for _ in range(num_iters):

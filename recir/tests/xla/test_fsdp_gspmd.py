@@ -1292,7 +1292,7 @@ class TestGSPMDFSDPSingleProcess(unittest.TestCase):
         )
         compiled_step = compile(
             parallel_mode=mode,
-            backend=XLAGSPMDBackend(),
+            backend=XLAGSPMDBackend(dump_hlo=True),
         )(train_step)
 
         for scale_value in (1.0, 2.0):
