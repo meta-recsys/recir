@@ -211,7 +211,7 @@ class TestRankingCompile(unittest.TestCase):
             self.skipTest("Need >= 2 JAX devices")
         self.num_ranks = len(self.devices)
 
-    def _compile_ranking_model(self):
+    def _compile_ranking_model(self, *, dump_hlo: bool = False):
         """Compile the ranking model through GSPMD and return compiled_obj."""
         from recir.distributed.parallel_mode import GSPMDParallel
 
@@ -228,7 +228,7 @@ class TestRankingCompile(unittest.TestCase):
                 num_ranks=self.num_ranks,
                 num_processes=1,
             ),
-            backend=XLAGSPMDBackend(),
+            backend=XLAGSPMDBackend(dump_hlo=dump_hlo),
         )
         def train_step(mod, opt, input_ids, attention_mask, labels, weights):
             loss = mod(input_ids, attention_mask, labels, weights)
@@ -272,7 +272,7 @@ class TestRankingCompile(unittest.TestCase):
 
     def test_hlo_has_collective(self):
         """GSPMD-compiled HLO must contain all-reduce for gradient averaging."""
-        compiled_obj = self._compile_ranking_model()
+        compiled_obj = self._compile_ranking_model(dump_hlo=True)
         assert_hlo_has_collective(self, compiled_obj, "all-reduce", "XLA_GSPMD")
 
     def test_training_runs_multiple_steps(self):

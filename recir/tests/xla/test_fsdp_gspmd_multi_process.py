@@ -110,7 +110,7 @@ class TestMultiProcessFSDP(DestroyPGMixin, DTensorTestBase):
                     num_ranks=num_ranks,
                     num_processes=self.world_size,
                 ),
-                backend=XLAGSPMDBackend(),
+                backend=XLAGSPMDBackend(dump_hlo=True),
             )
             def train_step(mod, opt, x):
                 torch.sum(mod(x)).backward()
@@ -173,7 +173,7 @@ class TestMultiProcessFSDP(DestroyPGMixin, DTensorTestBase):
                     num_ranks=num_ranks,
                     num_processes=self.world_size,
                 ),
-                backend=XLAGSPMDBackend(),
+                backend=XLAGSPMDBackend(dump_hlo=True),
             )
             def train_step_ds(mod, opt, x):
                 torch.sum(mod(x)).backward()

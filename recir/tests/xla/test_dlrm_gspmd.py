@@ -74,7 +74,7 @@ class TestDLRMSingleProcess(unittest.TestCase):
                 num_ranks=self.num_ranks,
                 num_processes=1,
             ),
-            backend=XLAGSPMDBackend(),
+            backend=XLAGSPMDBackend(dump_hlo=True),
         )
         def train_step(mod, opt, dense, sparse_indices, labels):
             logits = mod(dense, sparse_indices)
@@ -127,7 +127,7 @@ class TestDLRMSingleProcess(unittest.TestCase):
                 device_type="cpu",
                 backend=BackendType.XLA_SHARD_MAP,
             ),
-            backend=XLAShardMapBackend(),
+            backend=XLAShardMapBackend(dump_hlo=True),
         )
         def train_step(mod, opt, dense, sparse_indices, labels):
             logits = mod(dense, sparse_indices)

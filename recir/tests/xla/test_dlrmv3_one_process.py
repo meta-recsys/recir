@@ -45,7 +45,12 @@ class TestDLRMv3XLA(unittest.TestCase):
             self.skipTest("Need >= 2 JAX devices")
         self.num_ranks: int = len(self.devices)
 
-    def _build_compiled_train_step(self, num_steps: int = 1) -> Tuple[Any, nn.Module]:
+    def _build_compiled_train_step(
+        self,
+        num_steps: int = 1,
+        *,
+        dump_hlo: bool = False,
+    ) -> Tuple[Any, nn.Module]:
         """Build wrapper model, compile, and run num_steps. Return compiled_obj."""
         torch.manual_seed(42)
         global_bs = LOCAL_BS * self.num_ranks
@@ -87,7 +92,7 @@ class TestDLRMv3XLA(unittest.TestCase):
                 num_ranks=self.num_ranks,
                 num_processes=1,
             ),
-            backend=XLAGSPMDBackend(),
+            backend=XLAGSPMDBackend(dump_hlo=dump_hlo),
         )
 
         for _ in range(num_steps):
@@ -116,7 +121,7 @@ class TestDLRMv3XLA(unittest.TestCase):
             )
 
     def test_dlrmv3_hlo_has_collective(self) -> None:
-        compiled_obj, _ = self._build_compiled_train_step()
+        compiled_obj, _ = self._build_compiled_train_step(dump_hlo=True)
         assert_hlo_has_collective(self, compiled_obj, "all-reduce", "XLA_GSPMD")
 
     def test_dlrmv3_numerical_parity(self) -> None:

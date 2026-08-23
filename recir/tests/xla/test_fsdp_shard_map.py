@@ -30,6 +30,7 @@ test_fsdp_gspmd.py::TestGSPMDFSDPSingleProcess.
 
 import unittest
 from typing import Any, Dict, Optional, Tuple
+from unittest import mock
 from unittest.mock import patch
 
 import jax
@@ -204,6 +205,52 @@ class ShardMapFsdpSpecsTest(unittest.TestCase):
         second = run(first[0], torch.tensor([4.0, 5.0]))
 
         self.assertEqual(jax.device_get(second[0]).tolist(), [7.0, 10.0])
+
+    def test_fsdp_input_uses_process_count_for_global_shape(self) -> None:
+        graph = fx.Graph()
+        weight = graph.placeholder("weight")
+        set_state_layout(weight, self._fsdp_spec())
+        _set_val(weight, (8, 3))
+        graph.output((weight,))
+        gm = fx.GraphModule(torch.nn.Module(), graph)
+        module = _XLAModule(gm, backend_type=BackendType.XLA_SHARD_MAP)
+        fake_compiled = mock.Mock(return_value=())
+        fake_compiled.memory_analysis = None
+        fake_lowered = mock.Mock()
+        fake_lowered.compile.return_value = fake_compiled
+        fake_jitted = mock.Mock()
+        fake_jitted.lower.return_value = fake_lowered
+
+        with (
+            patch(
+                "recir.lowering.xla_lower._get_global_devices",
+                return_value=list(jax.devices()),
+            ),
+            patch(
+                "recir.lowering.xla_lower._get_local_devices",
+                return_value=list(jax.devices())[:1],
+            ),
+            patch("recir.lowering.xla_lower.shard_map", side_effect=lambda fn, **_: fn),
+            patch("recir.lowering.xla_lower.jax.jit", return_value=fake_jitted),
+            mock.patch.object(
+                module,
+                "_to_sharded_jax",
+                return_value=mock.sentinel.sharded_weight,
+            ) as to_sharded_jax,
+        ):
+            _, run = module._jit_shard_map(
+                lambda value: (value,),
+                (torch.ones(8, 3),),
+                torch.device("cpu"),
+            )
+            run(torch.ones(8, 3))
+
+        self.assertEqual(2, to_sharded_jax.call_count)
+        for call in to_sharded_jax.call_args_list:
+            self.assertEqual(
+                len(jax.devices()),
+                call.kwargs["fsdp_host_shard_count"],
+            )
 
     def test_fsdp_output_without_ndim_meta_raises(self) -> None:
         # An FSDP-derived (non-torch) output leaf with no usable ndim meta is a

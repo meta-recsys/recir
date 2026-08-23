@@ -121,7 +121,7 @@ class TestMultiProcessMultiDevice(DestroyPGMixin, DTensorTestBase):
                     num_ranks=num_ranks,
                     num_processes=self.world_size,
                 ),
-                backend=XLAGSPMDBackend(),
+                backend=XLAGSPMDBackend(dump_hlo=True),
             )
             def train_step(mod, opt, x):
                 reduce_fn(mod(x)).backward()
@@ -203,7 +203,7 @@ class TestMultiProcessMultiDevice(DestroyPGMixin, DTensorTestBase):
                     num_processes=self.world_size,
                     backend=BackendType.XLA_SHARD_MAP,
                 ),
-                backend=XLAShardMapBackend(),
+                backend=XLAShardMapBackend(dump_hlo=True),
             )
             def train_step(mod, opt, x):
                 reduce_fn(mod(x)).backward()
