@@ -119,6 +119,36 @@ def _get_local_devices() -> List[Any]:
     return p0 if p0 else devs
 
 
+_GSPMD_DATA_AXIS = "gspmd_data"
+_GSPMD_FSDP_AXIS = "torch_dist"
+
+
+def _gspmd_mesh(
+    devices: List[Any],
+    fsdp_axis_size: int,
+) -> tuple[Mesh, Any, bool]:
+    if fsdp_axis_size < 1 or len(devices) % fsdp_axis_size != 0:
+        raise ValueError(
+            "GSPMD device count must be divisible by the FSDP axis; "
+            f"devices={len(devices)}, fsdp_axis_size={fsdp_axis_size}"
+        )
+    if fsdp_axis_size == len(devices):
+        return Mesh(devices, axis_names=(_GSPMD_FSDP_AXIS,)), _GSPMD_FSDP_AXIS, False
+    local_device_count = len(_get_local_devices())
+    if fsdp_axis_size != local_device_count:
+        raise ValueError(
+            "Hybrid GSPMD currently requires one host-local FSDP group; "
+            f"fsdp_axis_size={fsdp_axis_size}, local_devices={local_device_count}"
+        )
+    data_axis_size = len(devices) // fsdp_axis_size
+    device_grid = np.asarray(devices, dtype=object).reshape(
+        data_axis_size,
+        fsdp_axis_size,
+    )
+    mesh = Mesh(device_grid, axis_names=(_GSPMD_DATA_AXIS, _GSPMD_FSDP_AXIS))
+    return mesh, (_GSPMD_DATA_AXIS, _GSPMD_FSDP_AXIS), True
+
+
 # torch -> jax.numpy dtype map for on-device (meta) tensor materialization,
 # where there is no host tensor to infer the dtype from via numpy.
 
@@ -147,14 +177,19 @@ def _materialize_meta_fsdp_tensor(tensor: Any, mesh: Any) -> Any:
     """
     num_global = len(_get_global_devices())
     host_count = num_global // len(_get_local_devices())
+    fsdp_axis_size = int(mesh.shape[_GSPMD_FSDP_AXIS])
+    host_tensor_is_global = _GSPMD_DATA_AXIS in mesh.axis_names
     trailing = tuple(int(s) for s in tensor.shape[1:])
-    global_shape = (int(tensor.shape[0]) * host_count, *trailing)
+    global_rows = int(tensor.shape[0])
+    if not host_tensor_is_global:
+        global_rows *= host_count
+    global_shape = (global_rows, *trailing)
     jdtype = _TORCH_TO_JNP.get(tensor.dtype, jnp.float32)
-    wspec = P("torch_dist", *([None] * (tensor.ndim - 1)))
+    wspec = P(_GSPMD_FSDP_AXIS, *([None] * (tensor.ndim - 1)))
     sharding = NamedSharding(mesh, wspec)
     if _AOT_TOPOLOGY.get() is not None:
         return jax.ShapeDtypeStruct(global_shape, jdtype, sharding=sharding)
-    rows_per_device = global_shape[0] // num_global
+    rows_per_device = global_shape[0] // fsdp_axis_size
     init_kind, bound = get_meta_init_spec(
         tensor, default_embedding_init_bound(global_shape[0])
     )
@@ -171,7 +206,7 @@ def _materialize_meta_fsdp_tensor(tensor: Any, mesh: Any) -> Any:
     ) -> Any:
         if _kind == "zeros":
             return jnp.zeros((_rpd, *_tr), dtype=_dt)
-        gi = jax.lax.axis_index("torch_dist")
+        gi = jax.lax.axis_index(_GSPMD_FSDP_AXIS)
         key = jax.random.fold_in(jax.random.PRNGKey(0), gi)
         shard = jax.random.uniform(key, (_rpd, *_tr), dtype=_dt, minval=-_b, maxval=_b)
         return shard.astype(_dt)
@@ -179,11 +214,11 @@ def _materialize_meta_fsdp_tensor(tensor: Any, mesh: Any) -> Any:
     return shard_map(  # pyre-fixme[28]
         _gen_shard,
         mesh=mesh,
-        in_specs=P("torch_dist"),
+        in_specs=P(_GSPMD_FSDP_AXIS),
         out_specs=wspec,
         # pyrefly: ignore [unexpected-keyword]
         check_vma=False,
-    )(jnp.arange(num_global, dtype=jnp.int32))
+    )(jnp.arange(fsdp_axis_size, dtype=jnp.int32))
 
 
 class _XLAModule(torch.nn.Module):
@@ -225,6 +260,30 @@ class _XLAModule(torch.nn.Module):
         self._jax_compiled: Optional[Any] = None
         # Guard so RECIR_DUMP_GRAPHS dumps each subgraph's FX + XLA graph once.
         self._dumped_graphs: bool = False
+        self._logged_memory_analysis: bool = False
+
+    def _log_compiled_memory_analysis(self) -> None:
+        if self._logged_memory_analysis or self._jax_compiled is None:
+            return
+        memory_analysis = getattr(self._jax_compiled, "memory_analysis", None)
+        if not callable(memory_analysis):
+            return
+        try:
+            stats = memory_analysis()
+        except Exception:  # noqa: BLE001 -- diagnostics must never break training
+            logger.warning("XLA compiled memory analysis failed", exc_info=True)
+            return
+        self._logged_memory_analysis = True
+        gib = float(1024**3)
+        logger.info(
+            "XLA compiled memory: arguments=%.3f GiB, outputs=%.3f GiB, "
+            "aliases=%.3f GiB, temporaries=%.3f GiB, code=%.3f GiB",
+            float(getattr(stats, "argument_size_in_bytes", 0) or 0) / gib,
+            float(getattr(stats, "output_size_in_bytes", 0) or 0) / gib,
+            float(getattr(stats, "alias_size_in_bytes", 0) or 0) / gib,
+            float(getattr(stats, "temp_size_in_bytes", 0) or 0) / gib,
+            float(getattr(stats, "generated_code_size_in_bytes", 0) or 0) / gib,
+        )
 
     def _maybe_dump_graphs(self, tag: str) -> None:  # noqa: C901
         """Diagnostic: when RECIR_DUMP_GRAPHS is set, log this subgraph's FX
@@ -506,6 +565,9 @@ class _XLAModule(torch.nn.Module):
         is_batch_input: bool = False,
         input_batch_dim: int = 0,
         is_fsdp_tensor: bool = False,
+        batch_axis_resource: Any = "torch_dist",
+        fsdp_axis_name: str = "torch_dist",
+        fsdp_host_tensor_is_global: bool = False,
     ) -> Any:
         """Convert a PyTorch tensor to a properly sharded JAX array.
 
@@ -542,10 +604,13 @@ class _XLAModule(torch.nn.Module):
             ndim = tensor.ndim
             if is_batch_input and 0 <= input_batch_dim < ndim:
                 _spec: List[Any] = [None] * max(ndim, input_batch_dim + 1)
-                _spec[input_batch_dim] = "torch_dist"
+                _spec[input_batch_dim] = batch_axis_resource
                 target = NamedSharding(mesh, P(*_spec))
             elif is_fsdp_tensor:
-                target = NamedSharding(mesh, P("torch_dist", *([None] * (ndim - 1))))
+                target = NamedSharding(
+                    mesh,
+                    P(fsdp_axis_name, *([None] * (ndim - 1))),
+                )
             else:
                 target = NamedSharding(mesh, P())
             # Fast path: already laid out correctly (e.g. device_state captured
@@ -627,7 +692,7 @@ class _XLAModule(torch.nn.Module):
             global_shape[input_batch_dim] *= host_count
             ndim = len(global_shape)
             spec_parts: List[Any] = [None] * max(ndim, input_batch_dim + 1)
-            spec_parts[input_batch_dim] = "torch_dist"
+            spec_parts[input_batch_dim] = batch_axis_resource
             sharding = NamedSharding(mesh, P(*spec_parts))
             if aot_active:
                 return jax.ShapeDtypeStruct(
@@ -646,9 +711,10 @@ class _XLAModule(torch.nn.Module):
             # local→global multiplier here must match the gm's baked
             # global shape (via _make_batch_transform's host_count).
             global_shape = list(nparray.shape)
-            global_shape[0] *= host_count
+            if not fsdp_host_tensor_is_global:
+                global_shape[0] *= host_count
             ndim = len(global_shape)
-            spec = P("torch_dist", *([None] * (ndim - 1)))
+            spec = P(fsdp_axis_name, *([None] * (ndim - 1)))
             sharding = NamedSharding(mesh, spec)
             if aot_active:
                 return jax.ShapeDtypeStruct(
@@ -786,7 +852,22 @@ class _XLAModule(torch.nn.Module):
         out_shardings = out_treedef.unflatten(
             [NamedSharding(mesh, spec) for spec in out_spec_list]
         )
-        jitted: Any = jax.jit(sharded_fn, out_shardings=out_shardings)
+        safe_donate = self.safe_donate_indices or set()
+        donate_argnums = tuple(
+            i
+            for i, batch_input in enumerate(is_batch)
+            if not batch_input and i in safe_donate
+        )
+        logger.info(
+            "shard_map: donating %d/%d input buffers (state) for in-place update",
+            len(donate_argnums),
+            len(placeholders),
+        )
+        jitted: Any = jax.jit(
+            sharded_fn,
+            out_shardings=out_shardings,
+            donate_argnums=donate_argnums,
+        )
         example_global_args = tuple(
             self._to_sharded_jax(
                 a, mesh, is_batch_input=is_batch[j], is_fsdp_tensor=is_fsdp[j]
@@ -805,6 +886,7 @@ class _XLAModule(torch.nn.Module):
             if _AOT_TOPOLOGY.get() is not None:
                 if self._jax_compiled is None:
                     self._jax_compiled = lowered.compile()
+                    self._log_compiled_memory_analysis()
                 return []
             global_args = tuple(
                 self._to_sharded_jax(
@@ -818,6 +900,7 @@ class _XLAModule(torch.nn.Module):
             # When nothing is cached, build on first invocation.
             if self._jax_compiled is None:
                 self._jax_compiled = jitted.lower(*global_args).compile()
+                self._log_compiled_memory_analysis()
             jax_out = self._jax_compiled(*global_args)
             return self._postprocess_jax_output(jax_out, input_device)
 
@@ -879,7 +962,9 @@ class _XLAModule(torch.nn.Module):
 
     @staticmethod
     def _batch_boundary_output_sharding(
-        leaf: Any, mesh: Mesh
+        leaf: Any,
+        mesh: Mesh,
+        batch_axis_resource: Any = "torch_dist",
     ) -> Optional[NamedSharding]:
         if not isinstance(leaf, torch.fx.Node) or not leaf.meta.get(
             "is_batch_input", False
@@ -890,8 +975,8 @@ class _XLAModule(torch.nn.Module):
         batch_dim = leaf.meta.get("batch_dim", 0)
         if not 0 <= batch_dim < ndim:
             return None
-        partitions: List[Optional[str]] = [None] * ndim  # pyre-ignore
-        partitions[batch_dim] = "torch_dist"
+        partitions: List[Any] = [None] * ndim
+        partitions[batch_dim] = batch_axis_resource
         return NamedSharding(mesh, P(*partitions))
 
     @staticmethod
@@ -954,7 +1039,13 @@ class _XLAModule(torch.nn.Module):
     ) -> Any:
         """jax.jit with GSPMD in_shardings/out_shardings."""
         devices = _get_global_devices()
-        mesh: Any = Mesh(devices, axis_names=("torch_dist",))
+        fsdp_axis_size = int(
+            getattr(self.gm, "meta", {}).get("gspmd_fsdp_axis_size", len(devices))
+        )
+        mesh, batch_axis_resource, hybrid_fsdp = _gspmd_mesh(
+            devices,
+            fsdp_axis_size,
+        )
         replicated = NamedSharding(mesh, P())
         placeholders = [n for n in self.gm.graph.nodes if n.op == "placeholder"]
         is_batch: List[bool] = [
@@ -988,7 +1079,7 @@ class _XLAModule(torch.nn.Module):
                 bd = per_input_batch_dim[i]
                 if 0 <= bd < ndim:
                     spec_parts: List[Any] = [None] * max(ndim, bd + 1)
-                    spec_parts[bd] = "torch_dist"
+                    spec_parts[bd] = batch_axis_resource
                     in_shardings.append(NamedSharding(mesh, P(*spec_parts)))
                     is_batch_sharded.append(True)
                 else:
@@ -999,7 +1090,7 @@ class _XLAModule(torch.nn.Module):
                 ndim = args[i].ndim
                 shard_dim = per_input_fsdp_dim[i]
                 spec_parts = [None] * max(ndim, shard_dim + 1)
-                spec_parts[shard_dim] = "torch_dist"  # pyre-ignore
+                spec_parts[shard_dim] = _GSPMD_FSDP_AXIS
                 in_shardings.append(NamedSharding(mesh, P(*spec_parts)))
                 is_batch_sharded.append(False)
                 is_fsdp_sharded.append(True)
@@ -1007,7 +1098,7 @@ class _XLAModule(torch.nn.Module):
                 in_shardings.append(replicated)
                 is_batch_sharded.append(False)
                 is_fsdp_sharded.append(False)
-        batch_sharded = NamedSharding(mesh, P("torch_dist"))
+        batch_sharded = NamedSharding(mesh, P(batch_axis_resource))
         out_node = next(n for n in self.gm.graph.nodes if n.op == "output")
         torch_indices: set[int] = self.torch_output_indices or set()
         out_leaves, out_treedef = jax.tree.flatten(out_node.args[0])
@@ -1022,7 +1113,11 @@ class _XLAModule(torch.nn.Module):
             if self._is_replicated_final_output(i, leaf, self.final_output_indices):
                 out_sharding_list.append(replicated)
                 continue
-            batch_sharding = self._batch_boundary_output_sharding(leaf, mesh)
+            batch_sharding = self._batch_boundary_output_sharding(
+                leaf,
+                mesh,
+                batch_axis_resource,
+            )
             if batch_sharding is not None:
                 out_sharding_list.append(batch_sharding)
                 continue
@@ -1044,7 +1139,7 @@ class _XLAModule(torch.nn.Module):
                 shard_dim = leaf.meta.get("fsdp_shard_dim", 0)
                 if ndim >= 1 and 0 <= shard_dim < ndim:
                     partitions: list[Optional[str]] = [None] * ndim  # pyre-ignore
-                    partitions[shard_dim] = "torch_dist"
+                    partitions[shard_dim] = _GSPMD_FSDP_AXIS
                     out_sharding_list.append(NamedSharding(mesh, P(*partitions)))
                 else:
                     out_sharding_list.append(replicated)
@@ -1055,7 +1150,7 @@ class _XLAModule(torch.nn.Module):
                     out_sharding_list.append(
                         NamedSharding(
                             mesh,
-                            P("torch_dist", *([None] * (ndim - 1))),
+                            P(_GSPMD_FSDP_AXIS, *([None] * (ndim - 1))),
                         )
                     )
                 else:
@@ -1083,7 +1178,7 @@ class _XLAModule(torch.nn.Module):
                 else:
                     ndim = 1
                 if ndim >= 1:
-                    spec = P("torch_dist", *([None] * (ndim - 1)))
+                    spec = P(_GSPMD_FSDP_AXIS, *([None] * (ndim - 1)))
                     out_sharding_list.append(NamedSharding(mesh, spec))
                 else:
                     out_sharding_list.append(replicated)
@@ -1096,11 +1191,14 @@ class _XLAModule(torch.nn.Module):
             )
         out_shardings = out_treedef.unflatten(out_sharding_list)
         logger.info(
-            "Compiling with GSPMD: %d placeholders, %d batch-sharded, %d weight-sharded, mesh=%s",
+            "Compiling with GSPMD: %d placeholders, %d batch-sharded, %d "
+            "weight-sharded, mesh=%s, fsdp_axis_size=%d, hybrid_fsdp=%s",
             len(placeholders),
             sum(is_batch_sharded),
             sum(is_fsdp_sharded),
             mesh.axis_names,
+            fsdp_axis_size,
+            hybrid_fsdp,
         )
         # Donate state inputs (weights, gradients, optimizer state) so XLA can
         # reuse their HBM buffers for the corresponding outputs (in-place
@@ -1134,6 +1232,7 @@ class _XLAModule(torch.nn.Module):
             if _AOT_TOPOLOGY.get() is not None:
                 if self._jax_compiled is None:
                     self._jax_compiled = lowered.compile()
+                    self._log_compiled_memory_analysis()
                 if not _hlo_captured[0]:
                     _hlo_captured[0] = True
                     run.hlo_text = self._jax_compiled.as_text()  # pyre-ignore[16]
@@ -1149,7 +1248,12 @@ class _XLAModule(torch.nn.Module):
             # builds NamedShardings against virtual devices that don't
             # correspond to any addressable real device, and JAX SIGSEGVs
             # silently on first call.
-            runtime_mesh = Mesh(_get_global_devices(), axis_names=("torch_dist",))
+            runtime_mesh, runtime_batch_axis_resource, runtime_hybrid_fsdp = (
+                _gspmd_mesh(
+                    _get_global_devices(),
+                    fsdp_axis_size,
+                )
+            )
             jax_args = tuple(
                 self._to_sharded_jax(
                     a,
@@ -1157,6 +1261,9 @@ class _XLAModule(torch.nn.Module):
                     is_batch[j],
                     per_input_batch_dim[j],
                     is_fsdp_tensor=is_fsdp_sharded[j],
+                    batch_axis_resource=runtime_batch_axis_resource,
+                    fsdp_axis_name=_GSPMD_FSDP_AXIS,
+                    fsdp_host_tensor_is_global=runtime_hybrid_fsdp,
                 )
                 for j, a in enumerate(run_args)
             )
@@ -1166,6 +1273,7 @@ class _XLAModule(torch.nn.Module):
             # lookup, which avoids a second compile during HLO capture).
             if self._jax_compiled is None:
                 self._jax_compiled = jitted.lower(*jax_args).compile()
+                self._log_compiled_memory_analysis()
             if not _hlo_captured[0]:
                 _hlo_captured[0] = True
                 run.hlo_text = self._jax_compiled.as_text()  # pyre-ignore[16]
@@ -1181,6 +1289,9 @@ class _XLAModule(torch.nn.Module):
                 is_batch[j],
                 per_input_batch_dim[j],
                 is_fsdp_tensor=is_fsdp_sharded[j],
+                batch_axis_resource=batch_axis_resource,
+                fsdp_axis_name=_GSPMD_FSDP_AXIS,
+                fsdp_host_tensor_is_global=hybrid_fsdp,
             )
             for j, a in enumerate(args)
         )
@@ -1424,10 +1535,17 @@ def partial_lower_xla(
     # nodes) so re-running is free for the surgery-tagged callers.
     propagate_batch_input_meta(gm)
     propagate_fsdp_sharded_meta(gm)
+    gspmd_fsdp_axis_size = getattr(gm, "meta", {}).get("gspmd_fsdp_axis_size")
+
+    def _module_factory(sub_gm: torch.fx.GraphModule) -> _XLAModule:
+        if gspmd_fsdp_axis_size is not None:
+            sub_gm.meta["gspmd_fsdp_axis_size"] = gspmd_fsdp_axis_size
+        return _XLAModule(sub_gm, backend_type)
+
     lowered = segment_and_lower(
         gm,
         compatibility_fn=_is_xla_compatible,
-        module_factory=lambda sub_gm: _XLAModule(sub_gm, backend_type),
+        module_factory=_module_factory,
         subgraph_prefix="xla_subgraph",
         node_predicate=node_predicate,
         subgraph_predicate=subgraph_predicate,

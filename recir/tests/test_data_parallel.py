@@ -29,7 +29,10 @@ from recir.distributed.data_parallel import (
     DataParallelStyle,
     mark_data_parallel_shardings,
     NodeType,
+    parametrize_params,
     partition_value,
+    partitioner,
+    shard_params_and_states,
     shard_params_by_plan,
 )
 from recir.distributed.parallel_mode import DataParallel, HybridParallel
@@ -65,6 +68,77 @@ class SimpleMLP(nn.Module):
     def reset_parameters(self, *args: Any, **kwargs: Any) -> None:
         self.net1.reset_parameters()
         self.net2.reset_parameters()
+
+
+class TestParametrizeParams(unittest.TestCase):
+    def test_include_param_fqns_only_parametrizes_selected_parameter(self) -> None:
+        model = nn.Sequential(
+            nn.Linear(4, 4, bias=False),
+            nn.Linear(4, 4, bias=False),
+        )
+        first_layer = cast(nn.Linear, model[0])
+        second_layer = cast(nn.Linear, model[1])
+        first_weight = first_layer.weight.detach().clone()
+        second_weight = second_layer.weight.detach().clone()
+
+        with parametrize_params(
+            model,
+            lambda value: value + 1,
+            include_param_fqns={"0.weight"},
+        ):
+            torch.testing.assert_close(first_layer.weight, first_weight + 1)
+            torch.testing.assert_close(second_layer.weight, second_weight)
+
+        torch.testing.assert_close(first_layer.weight, first_weight)
+        torch.testing.assert_close(second_layer.weight, second_weight)
+
+
+class SharedParameterAliasModel(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.primary = nn.Linear(4, 4, bias=False)
+        self.alias = nn.Linear(4, 4, bias=False)
+        self.alias.weight = self.primary.weight
+
+
+class TestShardParameterAliases(unittest.TestCase):
+    def test_shared_parameter_keeps_one_optimizer_state_owner(self) -> None:
+        model = SharedParameterAliasModel()
+        original_parameter = model.primary.weight
+        optimizer = torch.optim.AdamW([original_parameter], lr=0.01, foreach=True)
+        optimizer.state[original_parameter]["grad_accum_step"] = torch.zeros(())
+        params = cast(
+            dict[str, torch.Tensor],
+            OrderedDict(model.named_parameters(remove_duplicate=False)),
+        )
+        shard_spec = MagicMock(spec=DTensorSpec)
+
+        with (
+            unittest.mock.patch(
+                "recir.distributed.data_parallel.DTensorSpec",
+                return_value=shard_spec,
+            ),
+            unittest.mock.patch(
+                "recir.distributed.data_parallel.partition_value",
+                side_effect=lambda value, _spec: value.detach().clone(),
+            ),
+        ):
+            sharded = shard_params_and_states(
+                model,
+                params,
+                optimizer,
+                MagicMock(spec=DeviceMesh),
+                DataParallelStyle.FULLY_SHARD,
+            )
+
+        self.assertEqual(sharded, set(params))
+        self.assertIs(model.primary.weight, model.alias.weight)
+        self.assertIs(params["primary.weight"], params["alias.weight"])
+        optimizer_parameter = optimizer.param_groups[0]["params"][0]
+        self.assertIs(optimizer_parameter, model.primary.weight)
+        self.assertIn(optimizer_parameter, optimizer.state)
+        self.assertNotIn(original_parameter, optimizer.state)
+        self.assertIn("grad_accum_step", optimizer.state[optimizer_parameter])
 
 
 class LargeLinearModel(nn.Module):
@@ -809,6 +883,7 @@ class TestDataParallelNonXLAPrecondition(unittest.TestCase):
         # silently mis-shard, so shard_params must raise before doing any work.
         mode = DataParallel("fully_shard", num_ranks=4, num_processes=1)
         model = SimpleMLP()
+        # Citrine C2: use foreach for multi-tensor optimizer execution.
         opt = torch.optim.SGD(model.parameters(), lr=0.1, foreach=True)
         with self.assertRaisesRegex(ValueError, "num_ranks == num_processes"):
             mode.shard_params(model, dict(model.named_parameters()), opt)
@@ -826,6 +901,44 @@ class TestBuildDataParallelStrategies(unittest.TestCase):
         mesh.mesh = torch.arange(2)
         mesh._flatten.return_value = mesh
         return mesh
+
+    def test_mixed_replicated_param_and_state_indices(self) -> None:
+        graph = fx.Graph()
+        sharded_param = graph.placeholder("sharded_param")
+        replicated_param = graph.placeholder("replicated_param")
+        sharded_state = graph.placeholder("sharded_state")
+        replicated_state = graph.placeholder("replicated_state")
+        activation = graph.placeholder("activation")
+        for node in (
+            sharded_param,
+            replicated_param,
+            sharded_state,
+            replicated_state,
+            activation,
+        ):
+            node.meta["val"] = torch.zeros(4, 4)
+        graph.output((sharded_param, replicated_param))
+        gm = fx.GraphModule(nn.Module(), graph)
+
+        strategies = build_data_parallel_strategies(
+            gm,
+            num_params=2,
+            num_states=2,
+            mesh=self._create_mock_mesh(),
+            parallel_mode=DataParallelStyle.FULLY_SHARD,
+            replicated_param_state_indices={1, 3},
+        )
+
+        def placement(node: fx.Node) -> object:
+            strategy = cast(DataParallelStrategy, strategies[node])
+            output_specs = strategy.op_spec.output_specs
+            self.assertIsInstance(output_specs, tuple)
+            return output_specs[0].placements[0]  # pyre-ignore[16]
+
+        self.assertIsInstance(placement(sharded_param), Shard)
+        self.assertIsInstance(placement(sharded_state), Shard)
+        self.assertIsInstance(placement(replicated_param), Replicate)
+        self.assertIsInstance(placement(replicated_state), Replicate)
 
     def test_grad_and_param_inputs(self) -> None:
         """Test that an op with GRAD and PARAM inputs produces a PARAM output."""
@@ -2102,6 +2215,141 @@ class TestEmbeddingShardingPlan(unittest.TestCase):
         self.assertFalse(plan.is_embedding_param("linear.weight"))
 
 
+class TestRingshiftEmbeddingStrategies(unittest.TestCase):
+    def _create_mock_mesh(self) -> DeviceMesh:
+        mesh = MagicMock(spec=DeviceMesh)
+        mesh.ndim = 1
+        mesh.shape = (2,)
+        mesh.device_type = "cpu"
+        mesh.mesh = torch.arange(2)
+        mesh._flatten.return_value = mesh
+        mesh.size.return_value = 2
+        mesh.get_coordinate.return_value = (0,)
+        return mesh
+
+    def _build_graph(
+        self, *, detach_grad: bool = False
+    ) -> tuple[fx.GraphModule, fx.Node, fx.Node, fx.Node | None]:
+        import recir.ops.seq_embedding_op  # noqa: F401
+
+        graph = fx.Graph()
+        weight = graph.placeholder("weight")
+        weight.meta["val"] = torch.randn(16, 4)
+        ids = graph.placeholder("ids")
+        ids.meta["val"] = torch.randint(0, 16, (4, 3))
+        lengths = graph.placeholder("lengths")
+        lengths.meta["val"] = torch.full((4,), 3, dtype=torch.int32)
+        grad_out = graph.placeholder("grad_out")
+        grad_out.meta["val"] = torch.randn(4, 3, 4)
+        forward = graph.call_function(
+            torch.ops.recir.ringshift_embedding.default,
+            args=(ids, lengths, weight, -1),
+        )
+        forward.meta["val"] = torch.randn(4, 3, 4)
+        backward = graph.call_function(
+            torch.ops.recir.ringshift_embedding_backward.default,
+            args=(grad_out, ids, lengths, weight, -1),
+        )
+        backward.meta["val"] = torch.randn(16, 4)
+        grad_result = backward
+        detach = None
+        if detach_grad:
+            detach = graph.call_function(torch.ops.aten.detach.default, (backward,))
+            detach.meta["val"] = backward.meta["val"].detach()
+            grad_result = detach
+        tagged_grad = graph.call_function(
+            torch.ops._spmd.tag_grad.default, (grad_result,)
+        )
+        tagged_grad.meta["val"] = grad_result.meta["val"]
+        graph.output((forward, tagged_grad))
+        return fx.GraphModule(nn.Module(), graph), forward, backward, detach
+
+    def test_ringshift_keeps_weight_and_gradient_sharded_without_collectives(
+        self,
+    ) -> None:
+        gm, forward, backward, _detach = self._build_graph()
+        mesh = self._create_mock_mesh()
+        strategy_map = build_data_parallel_strategies(
+            gm,
+            num_params=1,
+            num_states=0,
+            mesh=mesh,
+            batch_dim=0,
+            parallel_mode=DataParallelStyle.FULLY_SHARD,
+            grad_reduction="sum",
+        )
+
+        forward_strategy = cast(DataParallelStrategy, strategy_map[forward])
+        backward_strategy = cast(DataParallelStrategy, strategy_map[backward])
+        forward_output_specs = cast(
+            list[DTensorSpec], forward_strategy.op_spec.output_specs
+        )
+        backward_output_specs = cast(
+            list[DTensorSpec], backward_strategy.op_spec.output_specs
+        )
+        self.assertEqual(NodeType.ACT, forward_strategy.node_type)
+        self.assertEqual(NodeType.GRAD, backward_strategy.node_type)
+        self.assertEqual(
+            (Shard(0),),
+            forward_output_specs[0].placements,
+        )
+        self.assertEqual(
+            (Shard(0),),
+            backward_output_specs[0].placements,
+        )
+        for strategy in (forward_strategy, backward_strategy):
+            self.assertIsNotNone(strategy.op_spec.input_specs)
+            for spec in cast(list[DTensorSpec], strategy.op_spec.input_specs):
+                self.assertEqual((Shard(0),), spec.placements)
+
+        mark_data_parallel_shardings(gm, strategy_map)
+        partitioned = partitioner(gm)
+        target_names = [
+            getattr(getattr(node.target, "_schema", None), "name", str(node.target))
+            for node in partitioned.graph.nodes
+            if node.op == "call_function"
+        ]
+        self.assertFalse(any("all_gather" in name for name in target_names))
+        self.assertFalse(any("reduce_scatter" in name for name in target_names))
+
+    def test_ringshift_sharded_gradient_survives_detach(self) -> None:
+        gm, _forward, _backward, detach = self._build_graph(detach_grad=True)
+        self.assertIsNotNone(detach)
+        strategy_map = build_data_parallel_strategies(
+            gm,
+            num_params=1,
+            num_states=0,
+            mesh=self._create_mock_mesh(),
+            batch_dim=0,
+            parallel_mode=DataParallelStyle.FULLY_SHARD,
+            grad_reduction="sum",
+        )
+        detach_strategy = cast(
+            DataParallelStrategy, strategy_map[cast(fx.Node, detach)]
+        )
+        detach_output_specs = cast(
+            list[DTensorSpec], detach_strategy.op_spec.output_specs
+        )
+        self.assertEqual(NodeType.GRAD, detach_strategy.node_type)
+        self.assertEqual(
+            (Shard(0),),
+            detach_output_specs[0].placements,
+        )
+
+    def test_ringshift_backward_rejects_average_gradient_reduction(self) -> None:
+        gm, _forward, _backward, _detach = self._build_graph()
+        with self.assertRaisesRegex(ValueError, "requires grad_reduction='sum'"):
+            build_data_parallel_strategies(
+                gm,
+                num_params=1,
+                num_states=0,
+                mesh=self._create_mock_mesh(),
+                batch_dim=0,
+                parallel_mode=DataParallelStyle.FULLY_SHARD,
+                grad_reduction="avg",
+            )
+
+
 class TestBuildStrategiesWithEmbedding(unittest.TestCase):
     """Unit tests for build_data_parallel_strategies with embedding_param_indices."""
 
@@ -2559,7 +2807,7 @@ class TestMultipleEmbeddingTables(DTensorTestBase):
     def test_multiple_embedding_tables(self) -> None:
         """Model with 2 nn.Embedding layers: both decomposed into AllToAll ops."""
         model = MultiEmbeddingMLP(num_emb1=16, num_emb2=32, emb_dim=8).cuda(self.rank)
-        opt = torch.optim.SGD(model.parameters(), lr=0.1)
+        opt = torch.optim.SGD(model.parameters(), lr=0.1, foreach=True)
         device = f"cuda:{self.rank}"
         train_batch = (
             torch.randint(0, 16, (8, 3), device=device),

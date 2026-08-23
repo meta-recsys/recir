@@ -21,6 +21,7 @@ them runnable in CI without TPU hardware.
 Test matrix row: num_processes=1, num_ranks=N (all local devices).
 """
 
+import copy
 import unittest
 
 import torch
@@ -212,6 +213,58 @@ class TestSingleProcessMultiDevice(unittest.TestCase):
                     baseline_param,
                     msg=f"Step {step}: XLA_SHARD_MAP vs single-rank mismatch for {name}",
                 )
+        compiled_obj = train_step.__dict__["_compiled_obj"]
+        assert_no_graph_breaks(self, compiled_obj)
+        assert_hlo_has_collective(self, compiled_obj, "all_reduce", "XLA_SHARD_MAP")
+
+    def test_shard_map_replicated_embedding_backward(self) -> None:
+        torch.manual_seed(0)
+        vocab, dim = 16, 4
+
+        class EmbModel(torch.nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.emb = torch.nn.Embedding(vocab, dim)
+
+            def forward(self, idx: torch.Tensor) -> torch.Tensor:
+                return self.emb(idx).sum()
+
+        model = EmbModel().cpu()
+        baseline = copy.deepcopy(model)
+        opt = torch.optim.SGD(model.parameters(), lr=0.01, foreach=False)
+        baseline_opt = torch.optim.SGD(baseline.parameters(), lr=0.01, foreach=False)
+        idx = torch.randint(0, vocab, (32 * self.num_ranks, 8))
+
+        baseline(idx).backward()
+        baseline_opt.step()
+
+        @compile(
+            parallel_mode=DataParallel(
+                "replicate",
+                loss_reduction="sum",
+                num_ranks=self.num_ranks,
+                num_processes=1,
+                device_type="cpu",
+                backend=BackendType.XLA_SHARD_MAP,
+            ),
+            backend=XLAShardMapBackend(),
+        )
+        def train_step(
+            mod: torch.nn.Module, opt: torch.optim.Optimizer, idx: torch.Tensor
+        ) -> None:
+            mod(idx).backward()
+            opt.step()
+
+        train_step(model, opt, idx)
+        for (name, param), (_, baseline_param) in zip(
+            model.named_parameters(), baseline.named_parameters()
+        ):
+            torch.testing.assert_close(
+                param,
+                baseline_param,
+                msg=f"XLA_SHARD_MAP embedding step mismatch for {name}",
+            )
+
         compiled_obj = train_step.__dict__["_compiled_obj"]
         assert_no_graph_breaks(self, compiled_obj)
         assert_hlo_has_collective(self, compiled_obj, "all_reduce", "XLA_SHARD_MAP")

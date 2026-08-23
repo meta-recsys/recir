@@ -31,6 +31,7 @@ import unittest
 from typing import Any, Dict, Optional, Tuple
 from unittest.mock import patch
 
+import jax
 import torch
 import torch.fx as fx
 from jax.sharding import PartitionSpec as P
@@ -140,6 +141,63 @@ class ShardMapFsdpSpecsTest(unittest.TestCase):
 
         self.assertEqual(in_specs, (P("torch_dist"),))
         self.assertEqual(out_specs, (P(),))
+
+    def test_dead_state_inputs_are_donated_but_batch_inputs_are_not(self) -> None:
+        graph = fx.Graph()
+        w = graph.placeholder("w")
+        set_state_layout(w, self._fsdp_spec())
+        _set_val(w, (self.N, 3))
+        x = graph.placeholder("x")
+        x.meta["is_batch_input"] = True
+        _set_val(x, (8, 3))
+        state = graph.placeholder("state")
+        _set_val(state, (3,))
+        graph.output((w, state))
+        gm = fx.GraphModule(torch.nn.Module(), graph)
+        module = _XLAModule(gm, backend_type=BackendType.XLA_SHARD_MAP)
+        module.safe_donate_indices = {0, 1, 2}
+        captured: Dict[str, Any] = {}
+
+        def _fake_shard_map(fn: Any, **kwargs: Any) -> Any:
+            return fn
+
+        def _fake_jit(fn: Any, **kwargs: Any) -> Any:
+            captured.update(kwargs)
+            raise _StopBeforeLowering()
+
+        with (
+            patch("recir.lowering.xla_lower.shard_map", _fake_shard_map),
+            patch("recir.lowering.xla_lower.jax.jit", _fake_jit),
+        ):
+            with self.assertRaises(_StopBeforeLowering):
+                module._jit_shard_map(lambda *a: a, (), torch.device("cpu"))
+
+        self.assertEqual(captured["donate_argnums"], (0, 2))
+
+    def test_donated_state_output_feeds_the_next_step(self) -> None:
+        graph = fx.Graph()
+        state = graph.placeholder("state")
+        _set_val(state, (2,))
+        batch = graph.placeholder("batch")
+        batch.meta["is_batch_input"] = True
+        _set_val(batch, (2,))
+        updated = graph.call_function(torch.ops.aten.add.Tensor, args=(state, batch))
+        _set_val(updated, (2,))
+        graph.output((updated,))
+        gm = fx.GraphModule(torch.nn.Module(), graph)
+        module = _XLAModule(gm, backend_type=BackendType.XLA_SHARD_MAP)
+        module.safe_donate_indices = {0}
+        module.keep_jax_output = True
+        _, run = module._jit_shard_map(
+            lambda state_value, batch_value: (state_value + batch_value,),
+            (torch.tensor([1.0, 2.0]), torch.tensor([2.0, 3.0])),
+            torch.device("cpu"),
+        )
+
+        first = run(torch.tensor([1.0, 2.0]), torch.tensor([2.0, 3.0]))
+        second = run(first[0], torch.tensor([4.0, 5.0]))
+
+        self.assertEqual(jax.device_get(second[0]).tolist(), [7.0, 10.0])
 
     def test_fsdp_output_without_ndim_meta_raises(self) -> None:
         # An FSDP-derived (non-torch) output leaf with no usable ndim meta is a

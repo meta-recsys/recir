@@ -1161,6 +1161,7 @@ def trace(  # noqa: C901 — orchestration: dispatches on parallel_mode flavor (
         # regather so that the post-trace row-wise embedding rewrite owns
         # them.
         dp_transforms: list[RegionTransform] = []
+        regather_transform: Optional[RegatherTransform] = None
         if dp_style == DataParallelStyle.FULLY_SHARD:
             # Per-op regather skips embedding params (owned by the row-wise
             # rewrite) and any param already covered by a RecomputeTransform;
@@ -1168,9 +1169,10 @@ def trace(  # noqa: C901 — orchestration: dispatches on parallel_mode flavor (
             regather_skip = RegatherTransform.skip_fqns_for_recompute(
                 _mod, region_transforms_list, base_skip=embedding_param_fqns
             )
-            dp_transforms.append(
-                RegatherTransform(skip_param_fqns=regather_skip or None)
+            regather_transform = RegatherTransform(
+                skip_param_fqns=regather_skip or None
             )
+            dp_transforms.append(regather_transform)
         if region_transforms_list:
             dp_transforms.extend(region_transforms_list)
 
@@ -1182,6 +1184,7 @@ def trace(  # noqa: C901 — orchestration: dispatches on parallel_mode flavor (
             **dict(_mod.named_parameters(remove_duplicate=False)),
             **dict(_mod.named_buffers(remove_duplicate=False)),
         }
+        parameter_fqns = set(dict(_mod.named_parameters(remove_duplicate=False)))
         if isinstance(parallel_mode, HybridParallel):
             embedding_param_indices = parallel_mode._compute_embedding_param_indices(
                 params_and_buffers
@@ -1217,7 +1220,17 @@ def trace(  # noqa: C901 — orchestration: dispatches on parallel_mode flavor (
         # Shard params on the module and optimizer states.  Mutates the dict
         # and the module in-place; also updates each ``opt.state`` so that
         # parameter -> state mappings remain valid post-shard.
-        parallel_mode.shard_params(_mod, params_and_buffers, opts)
+        sharded_keys = parallel_mode.shard_params(_mod, params_and_buffers, opts)
+        sharded_param_fqns: Optional[set[str]] = None
+        replicated_param_fqns: set[str] = set()
+        if (
+            isinstance(parallel_mode, DataParallel)
+            and dp_style == DataParallelStyle.FULLY_SHARD
+        ):
+            sharded_param_fqns = parameter_fqns & sharded_keys
+            replicated_param_fqns = parameter_fqns - sharded_keys
+            if regather_transform is not None:
+                regather_transform.skip_param_fqns.update(replicated_param_fqns)
 
         # Apply region transforms AFTER sharding, with parametrization.  The
         # traced forward includes allgather ops from ``collectives_insertion``
@@ -1226,7 +1239,9 @@ def trace(  # noqa: C901 — orchestration: dispatches on parallel_mode flavor (
         # — they use AllToAll inserted post-trace, not allgather.
         collectives_fn = collectives_insertion(dp_style, mesh)
         parametrize_kwargs: Dict[str, Any] = {}
-        if embedding_param_fqns:
+        if sharded_param_fqns is not None:
+            parametrize_kwargs["include_param_fqns"] = sharded_param_fqns
+        elif embedding_param_fqns:
             parametrize_kwargs["exclude_param_fqns"] = embedding_param_fqns
         with ExitStack() as region_stack:
             _enter_region_transform_contexts(
@@ -1267,6 +1282,14 @@ def trace(  # noqa: C901 — orchestration: dispatches on parallel_mode flavor (
                     *_outer_parametrize_fns,
                     *_parametrize_fns,
                 ]
+            if replicated_param_fqns:
+                region_stack.enter_context(
+                    parametrize_params(
+                        _mod,
+                        collectives_insertion(DataParallelStyle.REPLICATE, mesh),
+                        include_param_fqns=replicated_param_fqns,
+                    )
+                )
             local_result = _local_compile(
                 callable_,
                 *args,
@@ -1817,8 +1840,10 @@ def _compile_data_parallel_v2(
     #    region_transforms).  Embedding params are excluded from the regather
     #    so that the post-compile sparse-embedding rewrite owns them.
     transforms: list[RegionTransform] = []
+    regather_transform: Optional[RegatherTransform] = None
     if dp_style == DataParallelStyle.FULLY_SHARD:
-        transforms.append(RegatherTransform(skip_param_fqns=embedding_param_fqns))
+        regather_transform = RegatherTransform(skip_param_fqns=embedding_param_fqns)
+        transforms.append(regather_transform)
     sparse_emb_transform: Optional[SparseEmbeddingTransform] = None
     if embedding_param_fqns:
         # Pass ``_mod`` so the transform can resolve concrete sharded
@@ -1850,6 +1875,7 @@ def _compile_data_parallel_v2(
         **dict(_mod.named_parameters(remove_duplicate=False)),
         **dict(_mod.named_buffers(remove_duplicate=False)),
     }
+    parameter_fqns = set(dict(_mod.named_parameters(remove_duplicate=False)))
 
     # 5. Set up external fake mode for tracing.
     #    HybridParallel only: a ShapeEnv is attached so custom ops with
@@ -1883,7 +1909,17 @@ def _compile_data_parallel_v2(
     #    It also updates each opt's state + param_groups so that
     #    parameter -> state mappings remain valid after sparse Parameter
     #    identity swaps.
-    parallel_mode.shard_params(_mod, params_and_buffers, opts)
+    sharded_keys = parallel_mode.shard_params(_mod, params_and_buffers, opts)
+    sharded_param_fqns: Optional[set[str]] = None
+    replicated_param_fqns: set[str] = set()
+    if (
+        isinstance(parallel_mode, DataParallel)
+        and dp_style == DataParallelStyle.FULLY_SHARD
+    ):
+        sharded_param_fqns = parameter_fqns & sharded_keys
+        replicated_param_fqns = parameter_fqns - sharded_keys
+        if regather_transform is not None:
+            regather_transform.skip_param_fqns.update(replicated_param_fqns)
 
     # 7. Apply region transforms AFTER sharding, with parametrization.
     #    The traced forward includes allgather ops from collectives_insertion
@@ -1892,7 +1928,9 @@ def _compile_data_parallel_v2(
     #    AllToAll (inserted in step 9), not allgather.
     collectives_fn = collectives_insertion(dp_style, mesh)
     parametrize_kwargs: Dict[str, Any] = {}
-    if embedding_param_fqns:
+    if sharded_param_fqns is not None:
+        parametrize_kwargs["include_param_fqns"] = sharded_param_fqns
+    elif embedding_param_fqns:
         parametrize_kwargs["exclude_param_fqns"] = embedding_param_fqns
     with ExitStack() as region_stack:
         _enter_region_transform_contexts(
@@ -1929,6 +1967,14 @@ def _compile_data_parallel_v2(
         else:
             _outer_parametrize_fns = [collectives_fn]
             _outer_exclude_fqns = embedding_param_fqns
+        if replicated_param_fqns:
+            region_stack.enter_context(
+                parametrize_params(
+                    _mod,
+                    collectives_insertion(DataParallelStyle.REPLICATE, mesh),
+                    include_param_fqns=replicated_param_fqns,
+                )
+            )
         local_result = _local_compile(
             func,
             *args,
@@ -2050,6 +2096,7 @@ def _compile_gspmd(
         input_batch_dim=parallel_mode.input_batch_dim,
         dedup=False,
     )
+    result.gm.meta["gspmd_fsdp_axis_size"] = parallel_mode.fsdp_axis_size
     # Set is_fsdp_sharded on placeholder nodes so _jit_gspmd knows
     # which inputs are local shards.
     if sharded_keys or optimizer_state_only_sharded_keys:
@@ -2458,6 +2505,34 @@ def sync_device_state_to_torch(
     compiled_obj.state_manager.sync_to_torch(
         compiled_obj.flat_state, skip_fqns=skip_fqns
     )
+
+
+def set_compiled_output_deferred(
+    compiled_fn: Callable[..., Any], deferred: bool
+) -> bool:
+    """Choose whether an XLA compiled call returns device-resident outputs.
+
+    Returns ``False`` before the callable has compiled. Callers can use that
+    signal to process the first synchronous result normally, then defer later
+    results once the device-state manager exists.
+    """
+    compiled_obj = compiled_fn.__dict__.get(COMPILED_OBJECT_KEY, None)
+    if compiled_obj is None:
+        return False
+    compiled_obj.state_manager.keep_output_jax = deferred
+    return deferred
+
+
+def materialize_compiled_output(compiled_fn: Callable[..., Any], output: Any) -> Any:
+    """Materialize an output retained by ``set_compiled_output_deferred``.
+
+    Before the first compilation, or for a backend whose outputs are already
+    Torch tensors, this is a no-op.
+    """
+    compiled_obj = compiled_fn.__dict__.get(COMPILED_OBJECT_KEY, None)
+    if compiled_obj is None:
+        return output
+    return compiled_obj.state_manager.materialize_output(output)
 
 
 def invalidate_device_state(compiled_fn: Callable[..., Any]) -> None:

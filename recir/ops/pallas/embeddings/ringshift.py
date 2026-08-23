@@ -1646,6 +1646,65 @@ def ringshift_embedding_lookup_block(
     )
 
 
+def ringshift_embedding_lookup_block_local(
+    looked_up_ids: jax.Array,
+    looked_up_id_count: jax.Array,
+    local_embedding_table: jax.Array,
+    *,
+    axis_name: str,
+    world_size: int,
+    recv_capacity: int,
+    interpret: bool = False,
+    splitter: str = "globalpad",
+    exchange_bf16: bool = False,
+) -> jax.Array:
+    """Block-sharded lookup inside an already-bound manual ``shard_map`` axis."""
+    v_local = local_embedding_table.shape[0]
+    mod_ids = _block_to_mod_ids(looked_up_ids, world_size, v_local)
+    return _ringshift_embedding_lookup_local(
+        mod_ids,
+        looked_up_id_count,
+        local_embedding_table,
+        axis_name=axis_name,
+        world_size=world_size,
+        recv_capacity=recv_capacity,
+        interpret=interpret,
+        splitter=splitter,
+        exchange_bf16=exchange_bf16,
+    )
+
+
+def ringshift_embedding_lookup_block_backward_local(
+    grad_out: jax.Array,
+    looked_up_ids: jax.Array,
+    looked_up_id_count: jax.Array,
+    *,
+    axis_name: str,
+    world_size: int,
+    recv_capacity: int,
+    v_local: int,
+    embedding_dim: int,
+    interpret: bool = False,
+    splitter: str = "globalpad",
+    exchange_bf16: bool = False,
+) -> jax.Array:
+    """Block-sharded table gradient inside an active manual mesh axis."""
+    mod_ids = _block_to_mod_ids(looked_up_ids, world_size, v_local)
+    return _ringshift_embedding_lookup_backward_local(
+        grad_out,
+        mod_ids,
+        looked_up_id_count,
+        axis_name=axis_name,
+        world_size=world_size,
+        recv_capacity=recv_capacity,
+        splitter=splitter,
+        interpret=interpret,
+        v_local=v_local,
+        embedding_dim=embedding_dim,
+        exchange_bf16=exchange_bf16,
+    )
+
+
 # ---------------------------------------------------------------------------
 # F. Backward kernel (TC, single-wave) + driver + custom_vjp wiring
 # ---------------------------------------------------------------------------

@@ -13,6 +13,7 @@ from typing import Any, Callable, Dict, Optional, Sequence, Set, Tuple
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+import torch.utils._pytree as pytree
 from recir.backend import BackendType
 from recir.distributed.data_parallel import (
     DataParallelStyle,
@@ -469,6 +470,9 @@ class GSPMDParallel(ParallelMode):
             replicated even in ``parallel_style="fully_shard"``. This is for
             structured dimensions whose local shard shape is not a valid model
             shape during later traces.
+        fsdp_axis_size: Number of devices in each FSDP group. The default uses
+            every device. A smaller value creates host-local FSDP groups and
+            replicates their state across the remaining data-parallel axis.
     """
 
     def __init__(
@@ -485,6 +489,7 @@ class GSPMDParallel(ParallelMode):
             Sequence[str]
         ] = None,
         fsdp_sharded_optimizer_state_keys: Optional[Sequence[str]] = None,
+        fsdp_axis_size: Optional[int] = None,
     ) -> None:
         self.parallel_style = parallel_style
         self.input_batch_dim = input_batch_dim
@@ -499,6 +504,18 @@ class GSPMDParallel(ParallelMode):
         self._fsdp_sharded_optimizer_state_keys = frozenset(
             fsdp_sharded_optimizer_state_keys or ()
         )
+        self._fsdp_axis_size = fsdp_axis_size
+        if fsdp_axis_size is not None and fsdp_axis_size < 1:
+            raise ValueError("fsdp_axis_size must be positive")
+        if (
+            fsdp_axis_size is not None
+            and num_ranks is not None
+            and num_ranks % fsdp_axis_size != 0
+        ):
+            raise ValueError(
+                "num_ranks must be divisible by fsdp_axis_size; "
+                f"got num_ranks={num_ranks}, fsdp_axis_size={fsdp_axis_size}"
+            )
         if bool(self._fsdp_shard_optimizer_state_for_replicated_param_substrs) != bool(
             self._fsdp_sharded_optimizer_state_keys
         ):
@@ -511,6 +528,13 @@ class GSPMDParallel(ParallelMode):
             and parallel_style != "fully_shard"
         ):
             raise ValueError("State-only optimizer sharding requires fully_shard mode")
+        if (
+            self._fsdp_shard_optimizer_state_for_replicated_param_substrs
+            and self.uses_hybrid_fsdp
+        ):
+            raise ValueError(
+                "State-only optimizer sharding is not supported with hybrid FSDP"
+            )
         missing_replicate_substrs = set(
             self._fsdp_shard_optimizer_state_for_replicated_param_substrs
         ) - set(self._fsdp_replicate_param_substrs)
@@ -556,6 +580,20 @@ class GSPMDParallel(ParallelMode):
         return jax.process_count()
 
     @property
+    def fsdp_axis_size(self) -> int:
+        axis_size = self._fsdp_axis_size or self.num_ranks
+        if self.num_ranks % axis_size != 0:
+            raise ValueError(
+                "num_ranks must be divisible by fsdp_axis_size; "
+                f"got num_ranks={self.num_ranks}, fsdp_axis_size={axis_size}"
+            )
+        return axis_size
+
+    @property
+    def uses_hybrid_fsdp(self) -> bool:
+        return self.fsdp_axis_size < self.num_ranks
+
+    @property
     def process_mesh(self) -> DeviceMesh:
         """Mesh sized to ``num_processes`` for physical model/state sharding.
 
@@ -563,11 +601,17 @@ class GSPMDParallel(ParallelMode):
         at runtime.
         """
         if self._process_mesh is None:
+            mesh_size = 1 if self.uses_hybrid_fsdp else self.num_processes
+            mesh_rank = (
+                0
+                if self.uses_hybrid_fsdp
+                else _current_process_rank(self.num_processes)
+            )
             self._process_mesh = _create_fake_mesh(
                 "cpu",
-                self.num_processes,
+                mesh_size,
                 "fake_gspmd_process_mesh",
-                rank=_current_jax_process_index(),
+                rank=mesh_rank,
             )
         return self._process_mesh
 
@@ -623,9 +667,9 @@ class GSPMDParallel(ParallelMode):
                 key not in sharded
                 and not _should_replicate(key)
                 and t.ndim >= 1
-                and t.shape[0] >= self.num_ranks
-                and t.shape[0] % self.num_ranks == 0
-                and t.shape[0] % self.num_processes == 0
+                and t.shape[0] >= self.fsdp_axis_size
+                and t.shape[0] % self.fsdp_axis_size == 0
+                and (self.uses_hybrid_fsdp or t.shape[0] % self.num_processes == 0)
             )
 
         sharded |= shard_params_and_states(
@@ -724,6 +768,10 @@ class DataParallel(ParallelMode):
         custom_passes (Callable[[GraphModule], GraphModule], optional):
             A custom callable that overrides the default graph transformation
             and optimization passes.
+        fsdp_replicate_param_substrs: Parameter or buffer name substrings to
+            keep replicated in fully-sharded mode. The XLA shard_map path also
+            replicates all buffers and parameters whose leading dimension
+            cannot be split evenly over all logical devices.
     """
 
     parallel_style: DataParallelStyle
@@ -739,6 +787,7 @@ class DataParallel(ParallelMode):
         device_type: str = "cuda",
         backend: Optional[BackendType] = None,
         custom_passes: Optional[Callable[[GraphModule], GraphModule]] = None,
+        fsdp_replicate_param_substrs: Sequence[str] = (),
     ) -> None:
         if parallel_style == "replicate":
             self.parallel_style = DataParallelStyle.REPLICATE
@@ -761,6 +810,7 @@ class DataParallel(ParallelMode):
         self._num_processes = num_processes
         self._device_type = device_type
         self._backend = backend
+        self._fsdp_replicate_param_substrs = tuple(fsdp_replicate_param_substrs)
 
         if custom_passes is not None:
             self._gm_passes: Callable[[GraphModule], GraphModule] = custom_passes
@@ -773,6 +823,18 @@ class DataParallel(ParallelMode):
         # Trace-scoped FSDP state-layout plan: set fresh by ``shard_params`` and
         # consumed + cleared once by ``apply_state_layout``. None off the path.
         self._pending_state_layout: Optional[_StateLayoutPlan] = None
+        self._active_fsdp_sharded_keys: Optional[Set[str]] = None
+
+    def _should_fsdp_shard(self, key: str, value: torch.Tensor) -> bool:
+        if any(substring in key for substring in self._fsdp_replicate_param_substrs):
+            return False
+        if not self._uses_explicit_collective_fsdp:
+            return True
+        return (
+            value.ndim >= 1
+            and value.shape[0] >= self.num_ranks
+            and value.shape[0] % self.num_ranks == 0
+        )
 
     @property
     def num_ranks(self) -> int:
@@ -908,7 +970,28 @@ class DataParallel(ParallelMode):
         # and tags the sharded placeholders with the typed ``recir_state_layout``
         # spec. ``capture_fsdp_process_store`` returns None off the XLA FULLY_SHARD
         # path, so the plan stays None there and behavior is unchanged.
-        stores = self.capture_fsdp_process_store(params_and_buffers, opt)
+        replicated_buffer_keys = (
+            set(dict(model.named_buffers(remove_duplicate=False)))
+            if self._uses_explicit_collective_fsdp
+            else set()
+        )
+
+        def should_shard(key: str, value: torch.Tensor) -> bool:
+            return key not in replicated_buffer_keys and self._should_fsdp_shard(
+                key, value
+            )
+
+        candidate_sharded_keys = {
+            key
+            for key, value in params_and_buffers.items()
+            if self.parallel_style == DataParallelStyle.FULLY_SHARD
+            and should_shard(key, value)
+        }
+        stores = self.capture_fsdp_process_store(
+            params_and_buffers,
+            opt,
+            sharded_keys=candidate_sharded_keys,
+        )
         if stores is not None:
             process_store, opt_process_store, opt_partitioned = stores
             self._pending_state_layout = _StateLayoutPlan(
@@ -928,7 +1011,9 @@ class DataParallel(ParallelMode):
             opt,
             shard_mesh,
             self.parallel_style,
+            shard_filter=should_shard,
         )
+        self._active_fsdp_sharded_keys = set(sharded_keys)
         if self._pending_state_layout is not None:
             self._pending_state_layout = replace(
                 self._pending_state_layout, sharded_keys=sharded_keys
@@ -936,7 +1021,11 @@ class DataParallel(ParallelMode):
         return sharded_keys
 
     def capture_fsdp_process_store(
-        self, params_and_buffers: Dict[str, Any], opt: OptOrOpts
+        self,
+        params_and_buffers: Dict[str, Any],
+        opt: OptOrOpts,
+        *,
+        sharded_keys: Optional[Set[str]] = None,
     ) -> Optional[
         Tuple[Dict[str, Any], Dict[str, Dict[str, Any]], Dict[str, Set[str]]]
     ]:
@@ -967,14 +1056,21 @@ class DataParallel(ParallelMode):
         ):
             return None
         spec = DTensorSpec(mesh=self.process_mesh, placements=(Shard(0),))
+        keys_to_capture = (
+            set(params_and_buffers) if sharded_keys is None else sharded_keys
+        )
         process_store = {
-            k: partition_value(v, spec) for k, v in params_and_buffers.items()
+            key: partition_value(value, spec)
+            for key, value in params_and_buffers.items()
+            if key in keys_to_capture
         }
         opt_process_store: Dict[str, Dict[str, Any]] = {}
         opt_partitioned: Dict[str, Set[str]] = {}
         opts = [opt] if isinstance(opt, torch.optim.Optimizer) else list(opt or [])
         for o in opts:
             for fqn, param in params_and_buffers.items():
+                if fqn not in keys_to_capture:
+                    continue
                 if param not in o.state:
                     continue
                 store: Dict[str, Any] = {}
@@ -1089,6 +1185,25 @@ class DataParallel(ParallelMode):
         buffers: Dict[str, torch.Tensor],
         named_states: Dict[str, Dict[str, Any]],
     ) -> GraphModule:
+        replicated_param_state_indices: Optional[Set[int]] = None
+        if (
+            self.parallel_style == DataParallelStyle.FULLY_SHARD
+            and self._active_fsdp_sharded_keys is not None
+        ):
+            param_buffer_keys = [*params, *buffers]
+            replicated_param_state_indices = {
+                index
+                for index, key in enumerate(param_buffer_keys)
+                if key not in self._active_fsdp_sharded_keys
+            }
+            state_index = len(param_buffer_keys)
+            for fqn, state in named_states.items():
+                state_leaves = pytree.tree_leaves(state)
+                if fqn not in self._active_fsdp_sharded_keys:
+                    replicated_param_state_indices.update(
+                        range(state_index, state_index + len(state_leaves))
+                    )
+                state_index += len(state_leaves)
         gm = partition_data_parallel(
             gm,
             params=params,
@@ -1098,6 +1213,7 @@ class DataParallel(ParallelMode):
             parallel_style=self.parallel_style,
             input_batch_dim=self.input_batch_dim,
             grad_reduction=self.grad_reduction,
+            replicated_param_state_indices=replicated_param_state_indices,
         )
         return gm
 

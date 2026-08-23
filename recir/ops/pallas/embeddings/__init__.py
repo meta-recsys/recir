@@ -6,6 +6,8 @@ from recir.ops.pallas.embeddings.ringshift import (
     pool_per_rank,
     ringshift_embedding_lookup,
     ringshift_embedding_lookup_block,
+    ringshift_embedding_lookup_block_backward_local,
+    ringshift_embedding_lookup_block_local,
     ringshift_embedding_lookup_reference,
     ringshift_embedding_lookup_reference_jax,
 )
@@ -15,6 +17,8 @@ __all__ = [
     "pool_per_rank",
     "ringshift_embedding_lookup",
     "ringshift_embedding_lookup_block",
+    "ringshift_embedding_lookup_block_backward_local",
+    "ringshift_embedding_lookup_block_local",
     "ringshift_embedding_lookup_reference",
     "ringshift_embedding_lookup_reference_jax",
 ]

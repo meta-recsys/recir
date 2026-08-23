@@ -280,6 +280,7 @@ def _register_parametrization(
     parametrize_fn: Callable[..., torch.Tensor],
     recurse: bool = True,
     exclude_param_fqns: Optional[Set[str]] = None,
+    include_param_fqns: Optional[Set[str]] = None,
 ) -> None:
     """Register a parametrization on all parameters of *module*.
 
@@ -303,6 +304,8 @@ def _register_parametrization(
         exclude_param_fqns: Optional set of fully-qualified parameter names
             to exclude from parametrization (e.g., embedding params that
             use AllToAll instead of allgather).
+        include_param_fqns: Optional set of fully-qualified parameter names
+            to parametrize. Parameters outside this set are skipped.
     """
     modules = module.named_modules() if recurse else [("", module)]
     for _fqn, submod in modules:
@@ -313,7 +316,13 @@ def _register_parametrization(
         param_names = [
             pn
             for pn in all_param_names
-            if (f"{_fqn}.{pn}" if _fqn else pn) not in exclude_param_fqns
+            if (
+                (f"{_fqn}.{pn}" if _fqn else pn) not in exclude_param_fqns
+                and (
+                    include_param_fqns is None
+                    or (f"{_fqn}.{pn}" if _fqn else pn) in include_param_fqns
+                )
+            )
         ]
         if not param_names:
             continue
@@ -399,6 +408,7 @@ def parametrize_params(
     module: nn.Module,
     parametrize_fn: Callable[..., torch.Tensor],
     exclude_param_fqns: Optional[Set[str]] = None,
+    include_param_fqns: Optional[Set[str]] = None,
 ) -> Any:
     """Temporarily register *parametrize_fn* on *module*; remove on exit.
 
@@ -411,9 +421,14 @@ def parametrize_params(
     Args:
         exclude_param_fqns: Optional set of fully-qualified parameter names
             to exclude from parametrization.
+        include_param_fqns: Optional set of fully-qualified parameter names
+            to parametrize. Parameters outside this set are skipped.
     """
     _register_parametrization(
-        module, parametrize_fn, exclude_param_fqns=exclude_param_fqns
+        module,
+        parametrize_fn,
+        exclude_param_fqns=exclude_param_fqns,
+        include_param_fqns=include_param_fqns,
     )
     try:
         yield
@@ -548,6 +563,144 @@ def _propagate_param_non_compute_strategy(
     return DataParallelStrategy([node_type], _gen_replicate_spec(mesh))
 
 
+_RINGSHIFT_EMBEDDING_SCHEMA = "recir::ringshift_embedding"
+_RINGSHIFT_EMBEDDING_BACKWARD_SCHEMA = "recir::ringshift_embedding_backward"
+
+
+def _target_schema_name(target: Any) -> Optional[str]:
+    schema = getattr(target, "_schema", None)
+    name = getattr(schema, "name", None)
+    return name if isinstance(name, str) else None
+
+
+def _require_shard0_strategy(
+    node: fx.Node,
+    strategy: DataParallelStrategy,
+    *,
+    role: str,
+) -> None:
+    output_specs = strategy.op_spec.output_specs
+    if output_specs is None:
+        raise ValueError(f"{role} {node.name!r} has no output sharding spec")
+    spec = unique_spec(output_specs)
+    if spec.placements != (Shard(0),):
+        raise ValueError(
+            f"{role} {node.name!r} must be Shard(0) for ring-shift embedding; "
+            f"got {spec.placements}"
+        )
+
+
+def _propagate_ringshift_embedding_strategy(
+    node: fx.Node,
+    dp_strategy_map: Dict[fx.Node, StrategyType],
+    mesh: DeviceMesh,
+    grad_reduction: str,
+) -> bool:
+    """Keep ring-shift table state and gradients row-sharded end to end."""
+    schema_name = _target_schema_name(node.target)
+    if schema_name not in {
+        _RINGSHIFT_EMBEDDING_SCHEMA,
+        _RINGSHIFT_EMBEDDING_BACKWARD_SCHEMA,
+    }:
+        return False
+
+    input_nodes = node.all_input_nodes
+    is_backward = schema_name == _RINGSHIFT_EMBEDDING_BACKWARD_SCHEMA
+    expected_inputs = 4 if is_backward else 3
+    if len(input_nodes) != expected_inputs:
+        raise ValueError(
+            f"{schema_name} expected {expected_inputs} tensor inputs, "
+            f"got {len(input_nodes)}"
+        )
+
+    input_strategies = []
+    for input_node in input_nodes:
+        strategy = dp_strategy_map[input_node]
+        if not isinstance(strategy, DataParallelStrategy):
+            raise ValueError(
+                f"{schema_name} input {input_node.name!r} has unsupported "
+                f"strategy {strategy}"
+            )
+        input_strategies.append(strategy)
+
+    weight_node = input_nodes[-1]
+    weight_strategy = input_strategies[-1]
+    if weight_strategy.node_type not in (NodeType.PARAM, NodeType.EMBEDDING_PARAM):
+        raise ValueError(
+            f"{schema_name} weight must be a parameter, got {weight_strategy.node_type}"
+        )
+    _require_shard0_strategy(
+        weight_node,
+        weight_strategy,
+        role=f"{schema_name} weight",
+    )
+
+    for activation_node, strategy in zip(input_nodes[:-1], input_strategies[:-1]):
+        if strategy.node_type != NodeType.ACT:
+            raise ValueError(
+                f"{schema_name} activation {activation_node.name!r} must have "
+                f"ACT type, got {strategy.node_type}"
+            )
+        _require_shard0_strategy(
+            activation_node,
+            strategy,
+            role=f"{schema_name} activation",
+        )
+
+    if is_backward and grad_reduction != "sum":
+        raise ValueError(
+            "ring-shift embedding backward performs a global sum and requires "
+            f"grad_reduction='sum'; got {grad_reduction!r}"
+        )
+
+    input_specs = [DTensorSpec(mesh=mesh, placements=(Shard(0),)) for _ in input_nodes]
+    output_spec = _gen_shard_spec(mesh, shard_dim=0, input_specs=input_specs)
+    output_type = NodeType.GRAD if is_backward else NodeType.ACT
+    dp_strategy_map[node] = DataParallelStrategy([output_type], output_spec)
+    return True
+
+
+def _propagate_grad_non_compute_strategy(
+    node: fx.Node,
+    input_node: fx.Node,
+    arg_strategy: DataParallelStrategy,
+    mesh: DeviceMesh,
+    grad_reduction: str,
+) -> DataParallelStrategy:
+    """Preserve an already-reduced sharded gradient through layout-safe ops."""
+    input_specs = arg_strategy.op_spec.output_specs
+    if input_specs is not None:
+        input_spec = unique_spec(input_specs)
+        input_placement = input_spec.placements[0]
+        output_shard_dim: Optional[int] = None
+        if isinstance(input_placement, Shard):
+            if node.target in _SHARD_DIM_TRANSFORM:
+                output_shard_dim = _SHARD_DIM_TRANSFORM[node.target](
+                    input_placement.dim
+                )
+            elif node.target in (aten.reshape.default, aten.view.default):
+                input_val = input_node.meta.get("val")
+                output_val = node.meta.get("val")
+                if (
+                    hasattr(input_val, "shape")
+                    and hasattr(output_val, "shape")
+                    and tuple(input_val.shape) == tuple(output_val.shape)
+                ):
+                    output_shard_dim = input_placement.dim
+        if output_shard_dim is not None:
+            return DataParallelStrategy(
+                [NodeType.GRAD],
+                _gen_shard_spec(
+                    mesh,
+                    shard_dim=output_shard_dim,
+                    input_specs=[input_spec],
+                ),
+            )
+    return DataParallelStrategy(
+        [NodeType.GRAD], _gen_partial_strategy(mesh, grad_reduction)
+    )
+
+
 def _propagate_call_function_strategy(  # noqa: C901
     node: fx.Node,
     dp_strategy_map: Dict[fx.Node, StrategyType],
@@ -567,6 +720,11 @@ def _propagate_call_function_strategy(  # noqa: C901
          marking gradient outputs as GRAD.
     """
     input_nodes = node.all_input_nodes
+
+    if _propagate_ringshift_embedding_strategy(
+        node, dp_strategy_map, mesh, grad_reduction
+    ):
+        return
 
     # --- Category 1: non-compute ops (view, reshape, getitem, etc.) ---
     if node.target in non_compute_ops:
@@ -617,8 +775,12 @@ def _propagate_call_function_strategy(  # noqa: C901
                     node, arg_strategy, mesh, parallel_mode
                 )
             elif arg_node_type == NodeType.GRAD:
-                dp_strategy_map[node] = DataParallelStrategy(
-                    [NodeType.GRAD], _gen_partial_strategy(mesh, grad_reduction)
+                dp_strategy_map[node] = _propagate_grad_non_compute_strategy(
+                    node,
+                    input_nodes[0],
+                    arg_strategy,
+                    mesh,
+                    grad_reduction,
                 )
             elif arg_node_type in (NodeType.STATE, NodeType.NON_TENSOR):
                 # STATE / NON_TENSOR: inherit input's (replicated) strategy.
@@ -800,6 +962,7 @@ def build_data_parallel_strategies(  # noqa: C901
     parallel_mode: DataParallelStyle = DataParallelStyle.FULLY_SHARD,
     grad_reduction: str = "avg",
     embedding_param_indices: Optional[Set[int]] = None,
+    replicated_param_state_indices: Optional[Set[int]] = None,
 ) -> Dict[fx.Node, StrategyType]:
     activation_idx = num_params + num_states
     # Map each node to outputs with NodeType.GRAD type
@@ -875,6 +1038,18 @@ def build_data_parallel_strategies(  # noqa: C901
                     dp_strategy_map[node] = DataParallelStrategy(
                         [NodeType.EMBEDDING_PARAM],
                         _gen_shard_spec(mesh, shard_dim=0),
+                    )
+                elif (
+                    replicated_param_state_indices
+                    and placeholder_idx in replicated_param_state_indices
+                ):
+                    node_type = (
+                        NodeType.PARAM
+                        if placeholder_idx < num_params
+                        else NodeType.STATE
+                    )
+                    dp_strategy_map[node] = DataParallelStrategy.from_mesh(
+                        [node_type], mesh, DataParallelStyle.REPLICATE
                     )
                 elif placeholder_idx < num_params:
                     dp_strategy_map[node] = DataParallelStrategy.from_mesh(
@@ -1138,6 +1313,64 @@ def partitioner(graph: GraphModule) -> GraphModule:  # noqa: C901
     return graph
 
 
+def _group_tensor_aliases(
+    params_buffers: Dict[str, torch.Tensor],
+) -> List[Tuple[torch.Tensor, List[str]]]:
+    aliases_by_tensor: Dict[int, Tuple[torch.Tensor, List[str]]] = {}
+    for fqn, tensor in params_buffers.items():
+        tensor_id = id(tensor)
+        if tensor_id not in aliases_by_tensor:
+            aliases_by_tensor[tensor_id] = (tensor, [])
+        aliases_by_tensor[tensor_id][1].append(fqn)
+    return list(aliases_by_tensor.values())
+
+
+def _select_sharding_alias_group(
+    tensor: torch.Tensor,
+    aliases: Sequence[str],
+    shard_filter: Optional[Callable[[str, torch.Tensor], bool]],
+) -> bool:
+    if shard_filter is None:
+        return True
+    selections = {shard_filter(fqn, tensor) for fqn in aliases}
+    if len(selections) != 1:
+        raise RuntimeError(
+            "Parameter sharding must select every alias of a shared parameter "
+            f"consistently: aliases={aliases!r}"
+        )
+    return selections == {True}
+
+
+def _shard_parameter_aliases(
+    model: nn.Module,
+    params_buffers: Dict[str, torch.Tensor],
+    aliases: Sequence[str],
+    full_tensor: torch.Tensor,
+    shard_spec: DTensorSpec,
+    location: str = "HBM",
+) -> nn.Parameter:
+    local_shard = partition_value(full_tensor, shard_spec)
+    copy_meta_init_attrs(local_shard, full_tensor)
+    if local_shard.device.type == "meta":
+        device = torch.device(f"cuda:{torch.cuda.current_device()}")
+        local_shard = _materialize_meta_shard(
+            local_shard,
+            full_tensor,
+            device,
+            location,
+        )
+    new_param = nn.Parameter(local_shard, requires_grad=full_tensor.requires_grad)
+    copy_meta_init_attrs(new_param, full_tensor)
+    for fqn in aliases:
+        params_buffers[fqn] = local_shard
+        atoms = fqn.split(".")
+        parent = model
+        for atom in atoms[:-1]:
+            parent = getattr(parent, atom)
+        setattr(parent, atoms[-1], new_param)
+    return new_param
+
+
 def shard_params_and_states(
     model: nn.Module,
     params_buffers: Dict[str, torch.Tensor],
@@ -1165,24 +1398,17 @@ def shard_params_and_states(
     sharded_keys: Set[str] = set()
     shard_spec = DTensorSpec(mesh=mesh, placements=(Shard(0),))
     old_to_new: List[Tuple[torch.Tensor, torch.Tensor, DTensorSpec]] = []
-    for key in list(params_buffers.keys()):
-        old_param = params_buffers[key]
-        if shard_filter is not None and not shard_filter(key, old_param):
+    for old_param, aliases in _group_tensor_aliases(params_buffers):
+        if not _select_sharding_alias_group(old_param, aliases, shard_filter):
             continue
-        sharded_keys.add(key)
-        local_shard = partition_value(old_param, shard_spec)
-        copy_meta_init_attrs(local_shard, old_param)
-        params_buffers[key] = local_shard
-        atoms = key.split(".")
-        parent = model
-        for atom in atoms[:-1]:
-            parent = getattr(parent, atom)
-        new_param = nn.Parameter(
-            local_shard,
-            requires_grad=old_param.requires_grad,
+        sharded_keys.update(aliases)
+        new_param = _shard_parameter_aliases(
+            model,
+            params_buffers,
+            aliases,
+            old_param,
+            shard_spec,
         )
-        copy_meta_init_attrs(new_param, old_param)
-        setattr(parent, atoms[-1], new_param)
         old_to_new.append((old_param, new_param, shard_spec))
     _migrate_opt_after_param_swap(opts, old_to_new)
     return sharded_keys
@@ -1511,21 +1737,14 @@ def _shard_param(
 ) -> None:
     """Shard a single parameter in-place and update the model attribute."""
     full_tensor = params_buffers[key]
-    local_shard = partition_value(full_tensor, shard_spec)
-    copy_meta_init_attrs(local_shard, full_tensor)
-    if isinstance(local_shard, torch.Tensor) and local_shard.device.type == "meta":
-        device = torch.device(f"cuda:{torch.cuda.current_device()}")
-        local_shard = _materialize_meta_shard(
-            local_shard, full_tensor, device, location
-        )
-    params_buffers[key] = local_shard
-    atoms = key.split(".")
-    parent = model
-    for atom in atoms[:-1]:
-        parent = getattr(parent, atom)
-    new_param = nn.Parameter(local_shard, requires_grad=full_tensor.requires_grad)
-    copy_meta_init_attrs(new_param, full_tensor)
-    setattr(parent, atoms[-1], new_param)
+    _shard_parameter_aliases(
+        model,
+        params_buffers,
+        [key],
+        full_tensor,
+        shard_spec,
+        location=location,
+    )
 
 
 def _shard_state_dict(
@@ -1614,17 +1833,32 @@ def shard_params_by_plan(
     shard_spec = DTensorSpec(mesh=mesh, placements=(Shard(0),))
     loc_map = embedding_location_map or {}
     old_to_new: List[Tuple[torch.Tensor, torch.Tensor, DTensorSpec]] = []
-    for key in list(params_buffers.keys()):
-        if key in embedding_param_fqns or dense_style == DataParallelStyle.FULLY_SHARD:
-            sharded_keys.add(key)
-            old_param = params_buffers[key]
-            _shard_param(
-                model, params_buffers, key, shard_spec, location=loc_map.get(key, "HBM")
+
+    def should_shard(key: str, _tensor: torch.Tensor) -> bool:
+        return (
+            key in embedding_param_fqns or dense_style == DataParallelStyle.FULLY_SHARD
+        )
+
+    for old_param, aliases in _group_tensor_aliases(params_buffers):
+        if not _select_sharding_alias_group(old_param, aliases, should_shard):
+            continue
+        explicit_locations = {loc_map[alias] for alias in aliases if alias in loc_map}
+        if len(explicit_locations) > 1:
+            raise RuntimeError(
+                "Shared parameter aliases must use one embedding storage location: "
+                f"aliases={aliases!r}, locations={sorted(explicit_locations)!r}"
             )
-            new_param: Any = model
-            for atom in key.split("."):
-                new_param = getattr(new_param, atom)
-            old_to_new.append((old_param, new_param, shard_spec))
+        location = next(iter(explicit_locations), "HBM")
+        sharded_keys.update(aliases)
+        new_param = _shard_parameter_aliases(
+            model,
+            params_buffers,
+            aliases,
+            old_param,
+            shard_spec,
+            location=location,
+        )
+        old_to_new.append((old_param, new_param, shard_spec))
     _migrate_opt_after_param_swap(opts, old_to_new)
 
     # DDP synchronizes replicated parameters and buffers from rank 0 during construction
@@ -1744,6 +1978,7 @@ def partition_data_parallel(
     input_batch_dim: int,
     grad_reduction: str = "avg",
     embedding_param_indices: Optional[Set[int]] = None,
+    replicated_param_state_indices: Optional[Set[int]] = None,
 ) -> GraphModule:
     """Partition the graph into a data parallel graph.
 
@@ -1768,6 +2003,7 @@ def partition_data_parallel(
         parallel_mode=parallel_style,
         grad_reduction=grad_reduction,
         embedding_param_indices=embedding_param_indices,
+        replicated_param_state_indices=replicated_param_state_indices,
     )
     mark_data_parallel_shardings(graph, dp_strategy_map=strategy_map)
 
