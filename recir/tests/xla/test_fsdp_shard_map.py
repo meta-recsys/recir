@@ -15,8 +15,9 @@ the shard_map in/out ``PartitionSpec``s that D110785277 produced:
 
   * FSDP-weight and batch inputs -> ``P("torch_dist")`` (Shard(0)); everything
     else replicated ``P()``.
-  * FSDP-derived outputs (the updated /N shards) -> ``P("torch_dist", None...)``
-    (Shard(0)); user (torch) and replicated outputs -> ``P()``.
+  * FSDP-derived outputs (including user diagnostics that carry /N shards) ->
+    ``P("torch_dist", None...)`` (Shard(0)); other user and replicated outputs
+    -> ``P()``.
 
 These are STRUCTURAL: the specs are captured by patching ``shard_map`` to record
 them and short-circuit before JAX lowering, so the test is hermetic and does not
@@ -127,20 +128,25 @@ class ShardMapFsdpSpecsTest(unittest.TestCase):
         self.assertEqual(in_specs, (P(),))
         self.assertEqual(out_specs, (P(),))
 
-    def test_torch_output_index_is_replicated(self) -> None:
-        # A user (torch) output index stays replicated P() even when it traces
-        # to an FSDP weight -- only non-torch FSDP-derived outputs get Shard(0).
+    def test_fsdp_derived_torch_output_keeps_sharded_layout(self) -> None:
         graph = fx.Graph()
         w = graph.placeholder("w")
         set_state_layout(w, self._fsdp_spec())
         _set_val(w, (self.N, 3))
-        graph.output((w,))
+        diagnostic = graph.call_function(torch.ops.aten.clone.default, args=(w,))
+        _set_val(diagnostic, (self.N, 3))
+        scalar = graph.call_function(torch.ops.aten.sum.default, args=(w,))
+        _set_val(scalar, ())
+        graph.output((diagnostic, scalar))
         gm = fx.GraphModule(torch.nn.Module(), graph)
 
-        in_specs, out_specs = self._capture_specs(gm, torch_output_indices={0})
+        in_specs, out_specs = self._capture_specs(
+            gm,
+            torch_output_indices={0, 1},
+        )
 
         self.assertEqual(in_specs, (P("torch_dist"),))
-        self.assertEqual(out_specs, (P(),))
+        self.assertEqual(out_specs, (P("torch_dist", None), P()))
 
     def test_dead_state_inputs_are_donated_but_batch_inputs_are_not(self) -> None:
         graph = fx.Graph()
