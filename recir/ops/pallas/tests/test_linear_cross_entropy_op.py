@@ -226,12 +226,13 @@ class LinearCrossEntropyOpTest(unittest.TestCase):
         backward_hlo = backward_lowered.as_text()
         self.assertIn("while", forward_hlo)
         self.assertIn("while", backward_hlo)
+        self.assertIn("dynamic_update_slice", backward_hlo)
         self.assertIn(
             "while", jax.jit(loss_fn).lower(hidden_jax, weight_jax).compile().as_text()
         )
         self.assertIn("while", backward_lowered.compile().as_text())
 
-    def test_jax_bfloat16_scan_matches_reference_with_nonunit_gradient(self):
+    def test_jax_bfloat16_scan_uses_fp32_tile_logits_with_nonunit_gradient(self):
         hidden, labels, weight = self._inputs()
         hidden_jax = jnp.asarray(hidden.numpy(), dtype=jnp.bfloat16)
         labels_jax = jnp.asarray(labels.numpy())

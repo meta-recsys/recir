@@ -33,7 +33,7 @@ def _reference_loss(
     ignore_index: int,
     softcap: float,
 ) -> torch.Tensor:
-    logits = F.linear(hidden, weight)[..., :valid_vocab_size]
+    logits = F.linear(hidden, weight)[..., :valid_vocab_size].float()
     if softcap > 0.0:
         logits = torch.tanh(logits / softcap) * softcap
     flat_logits = logits.reshape(-1, logits.shape[-1])
