@@ -76,7 +76,7 @@ class TestGSPMDMultiDevice(DestroyPGMixin, DTensorTestBase):
                     loss_reduction=loss_reduction,
                     backend=BackendType.XLA_SHARD_MAP,
                 ),
-                backend=XLAShardMapBackend(),
+                backend=XLAShardMapBackend(dump_hlo=True),
             )
             def train_step_shard_map(mod, opt, x):
                 reduce_fn(mod(x)).backward()
@@ -117,7 +117,7 @@ class TestGSPMDMultiDevice(DestroyPGMixin, DTensorTestBase):
 
             @compile(
                 parallel_mode=GSPMDParallel("replicate", loss_reduction=loss_reduction),
-                backend=XLAGSPMDBackend(),
+                backend=XLAGSPMDBackend(dump_hlo=True),
             )
             def train_step_gspmd(mod, opt, x):
                 reduce_fn(mod(x)).backward()

@@ -201,6 +201,8 @@ class TestXSurfaceXLACompile(unittest.TestCase):
         self,
         num_steps: int = 1,
         use_padding: bool = False,
+        *,
+        dump_hlo: bool = False,
     ) -> Tuple[Any, BlueReelsVDDTrainV3, List[torch.Tensor]]:
         """Build the model, compile with XLA GSPMD, and run num_steps."""
         torch.manual_seed(42)
@@ -286,7 +288,7 @@ class TestXSurfaceXLACompile(unittest.TestCase):
                 loss_reduction="sum",
                 num_ranks=self.num_ranks,
             ),
-            "backend": XLAGSPMDBackend(),
+            "backend": XLAGSPMDBackend(dump_hlo=dump_hlo),
         }
 
         # Store KJT keys so the model's forward can construct KJTs
@@ -419,7 +421,7 @@ class TestXSurfaceXLACompile(unittest.TestCase):
 
     def test_xsurface_hlo_has_collective(self) -> None:
         """Verify the compiled HLO contains all-reduce for GSPMD."""
-        compiled_obj, _, _ = self._build_compiled_train_step()
+        compiled_obj, _, _ = self._build_compiled_train_step(dump_hlo=True)
         assert_hlo_has_collective(self, compiled_obj, "all-reduce", "XLA_GSPMD")
 
     def test_xsurface_compiles_with_padding(self) -> None:

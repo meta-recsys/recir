@@ -238,10 +238,18 @@ class _XLAModule(torch.nn.Module):
         self,
         gm: torch.fx.GraphModule,
         backend_type: BackendType = BackendType.XLA_SHARD_MAP,
+        capture_hlo_text: bool = False,
     ) -> None:
         super().__init__()
         self.gm = gm
         self.backend_type = backend_type
+        dump_graphs_mode = os.environ.get("RECIR_DUMP_GRAPHS", "")
+        self.capture_hlo_text = capture_hlo_text or dump_graphs_mode not in (
+            "",
+            "0",
+            "false",
+            "False",
+        )
         self.compiled: Optional[Callable[..., List[torch.Tensor]]] = None
         self.xla_hlo_text: Optional[str] = None
         self.keep_jax_output: bool = False
@@ -514,7 +522,7 @@ class _XLAModule(torch.nn.Module):
         # For shard_map, capture HLO from lowering (includes shard_map ops).
         # For GSPMD, HLO is captured lazily after compilation (run.hlo_text)
         # because GSPMD inserts collectives during XLA compilation, not lowering.
-        if self.backend_type != BackendType.XLA_GSPMD:
+        if self.capture_hlo_text and self.backend_type != BackendType.XLA_GSPMD:
             self.xla_hlo_text = lowered.as_text()
         logger.info(
             "XLA HLO compiled (backend=%s)",
@@ -756,6 +764,17 @@ class _XLAModule(torch.nn.Module):
         # is not exercised under a virtual-devices ``aot_topology``
         # context in practice.
         devices = _get_global_devices()
+        local_device_count = len(_get_local_devices())
+        if (
+            not devices
+            or local_device_count == 0
+            or len(devices) % local_device_count != 0
+        ):
+            raise RuntimeError(
+                "recir shard_map requires a non-empty local device set that "
+                "evenly divides the global device mesh"
+            )
+        fsdp_host_shard_count = len(devices) // local_device_count
         mesh: Any = Mesh(devices, axis_names=("torch_dist",))
         placeholders = [n for n in self.gm.graph.nodes if n.op == "placeholder"]
         is_batch: List[bool] = [
@@ -867,7 +886,11 @@ class _XLAModule(torch.nn.Module):
         )
         example_global_args = tuple(
             self._to_sharded_jax(
-                a, mesh, is_batch_input=is_batch[j], is_fsdp_tensor=is_fsdp[j]
+                a,
+                mesh,
+                is_batch_input=is_batch[j],
+                is_fsdp_tensor=is_fsdp[j],
+                fsdp_host_shard_count=fsdp_host_shard_count,
             )
             for j, a in enumerate(args)
         )
@@ -887,7 +910,11 @@ class _XLAModule(torch.nn.Module):
                 return []
             global_args = tuple(
                 self._to_sharded_jax(
-                    a, mesh, is_batch_input=is_batch[j], is_fsdp_tensor=is_fsdp[j]
+                    a,
+                    mesh,
+                    is_batch_input=is_batch[j],
+                    is_fsdp_tensor=is_fsdp[j],
+                    fsdp_host_shard_count=fsdp_host_shard_count,
                 )
                 for j, a in enumerate(run_args)
             )
@@ -1231,7 +1258,7 @@ class _XLAModule(torch.nn.Module):
                 if self._jax_compiled is None:
                     self._jax_compiled = lowered.compile()
                     self._log_compiled_memory_analysis()
-                if not _hlo_captured[0]:
+                if self.capture_hlo_text and not _hlo_captured[0]:
                     _hlo_captured[0] = True
                     run.hlo_text = self._jax_compiled.as_text()  # pyre-ignore[16]
                 return []
@@ -1278,7 +1305,7 @@ class _XLAModule(torch.nn.Module):
                 ):
                     self._jax_compiled = jitted.lower(*jax_args).compile()
                 self._log_compiled_memory_analysis()
-            if not _hlo_captured[0]:
+            if self.capture_hlo_text and not _hlo_captured[0]:
                 _hlo_captured[0] = True
                 run.hlo_text = self._jax_compiled.as_text()  # pyre-ignore[16]
             jax_out = self._jax_compiled(*jax_args)
@@ -1515,6 +1542,7 @@ def _strip_mark_boundary_nodes(gm: torch.fx.GraphModule) -> torch.fx.GraphModule
 def partial_lower_xla(
     gm: torch.fx.GraphModule,
     backend_type: BackendType = BackendType.XLA_SHARD_MAP,
+    capture_hlo_text: bool = False,
     node_predicate: Callable[[torch.fx.Node], bool] = lambda x: True,
     subgraph_predicate: Callable[[List[torch.fx.Node]], bool] = lambda x: True,
     dumper: Callable[[str], str] = lambda x: "subgraph",
@@ -1550,7 +1578,11 @@ def partial_lower_xla(
     def _module_factory(sub_gm: torch.fx.GraphModule) -> _XLAModule:
         if gspmd_fsdp_axis_size is not None:
             sub_gm.meta["gspmd_fsdp_axis_size"] = gspmd_fsdp_axis_size
-        return _XLAModule(sub_gm, backend_type)
+        return _XLAModule(
+            sub_gm,
+            backend_type,
+            capture_hlo_text=capture_hlo_text,
+        )
 
     lowered = segment_and_lower(
         gm,
