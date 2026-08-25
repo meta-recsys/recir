@@ -10,7 +10,7 @@ from __future__ import annotations
 import unittest
 from collections import OrderedDict
 from contextlib import ExitStack
-from typing import Any
+from typing import Any, cast
 
 import torch
 import torch.fx as fx
@@ -403,6 +403,68 @@ class TestRegatherTransformDetection(unittest.TestCase):
             and getattr(n.target, "__name__", None) == "_apply"
         ]
         self.assertEqual(len(wrapper_nodes), 2)
+
+    def test_skips_only_ringshift_owned_region(self) -> None:
+        class _Schema:
+            name: str = "recir::ringshift_embedding"
+
+        def fake_ringshift_embedding(
+            ids: torch.Tensor,
+            lengths: torch.Tensor,
+            weight: torch.Tensor,
+        ) -> torch.Tensor:
+            del lengths
+            return weight.index_select(0, ids.reshape(-1)).reshape(*ids.shape, -1)
+
+        cast(Any, fake_ringshift_embedding)._schema = _Schema()
+
+        class RingAndDenseModel(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.weight = nn.Parameter(torch.randn(8, 4))
+
+        model = RingAndDenseModel()
+        graph = fx.Graph()
+        weight = graph.placeholder("weight")
+        weight.meta["val"] = torch.randn(8, 4)
+        ids = graph.placeholder("ids")
+        ids.meta["val"] = torch.tensor([[0, 1]])
+        lengths = graph.placeholder("lengths")
+        lengths.meta["val"] = torch.tensor([2], dtype=torch.int32)
+        activation = graph.placeholder("activation")
+        activation.meta["val"] = torch.randn(2, 8)
+        ring = graph.call_function(
+            fake_ringshift_embedding,
+            args=(ids, lengths, weight),
+        )
+        ring.meta["val"] = torch.randn(1, 2, 4)
+        dense = graph.call_function(
+            torch.ops.aten.mm.default, args=(activation, weight)
+        )
+        dense.meta["val"] = torch.randn(2, 4)
+        graph.output((ring, dense))
+        gm = fx.GraphModule(model, graph)
+        called: OrderedDict[str, tuple[nn.Module, tuple[Any, ...], dict[str, Any]]] = (
+            OrderedDict({"": (model, (), {})})
+        )
+
+        RegatherTransform().transform_graph(gm, called)
+
+        wrapper_nodes = [
+            node
+            for node in gm.graph.nodes
+            if node.op == OP.CALL_FUNCTION
+            and getattr(node.target, "__name__", None) == "_apply"
+        ]
+        ring_nodes = [
+            node
+            for node in gm.graph.nodes
+            if node.op == OP.CALL_FUNCTION
+            and getattr(getattr(node.target, "_schema", None), "name", None)
+            == "recir::ringshift_embedding"
+        ]
+        self.assertEqual(len(wrapper_nodes), 1)
+        self.assertEqual(len(ring_nodes), 1)
 
 
 # ---------------------------------------------------------------------------

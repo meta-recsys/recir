@@ -33,6 +33,7 @@ if "xla_force_host_platform_device_count" not in _existing_xla_flags:
         _existing_xla_flags + " --xla_force_host_platform_device_count=2"
     ).strip()
 
+import contextlib
 import unittest
 from unittest import mock
 
@@ -106,7 +107,42 @@ class ToShardedJaxTest(unittest.TestCase):
         gm.meta["gspmd_fsdp_axis_size"] = 1
         module = _XLAModule(gm)
         fake_jitted = mock.Mock()
-        fake_jitted.lower.return_value = mock.sentinel.lowered
+        context_events: list[tuple[str, object, object, int, bool] | str] = []
+
+        @contextlib.contextmanager
+        def fake_mesh_context(
+            mesh: object,
+            batch_axis_resource: object,
+            fsdp_axis_size: int,
+            hybrid_fsdp: bool,
+        ):
+            context_events.append(
+                (
+                    "enter",
+                    mesh,
+                    batch_axis_resource,
+                    fsdp_axis_size,
+                    hybrid_fsdp,
+                )
+            )
+            try:
+                yield
+            finally:
+                context_events.append(
+                    (
+                        "exit",
+                        mesh,
+                        batch_axis_resource,
+                        fsdp_axis_size,
+                        hybrid_fsdp,
+                    )
+                )
+
+        def fake_lower(*_args: object) -> object:
+            context_events.append("lower")
+            return mock.sentinel.lowered
+
+        fake_jitted.lower.side_effect = fake_lower
 
         with (
             mock.patch(
@@ -114,6 +150,10 @@ class ToShardedJaxTest(unittest.TestCase):
                 return_value=list(jax.devices())[:1],
             ),
             mock.patch("recir.lowering.xla_lower.jax.jit", return_value=fake_jitted),
+            mock.patch(
+                "recir.lowering.xla_lower.gspmd_mesh_context",
+                side_effect=fake_mesh_context,
+            ),
             mock.patch.object(
                 module,
                 "_to_sharded_jax",
@@ -134,6 +174,16 @@ class ToShardedJaxTest(unittest.TestCase):
         )
         self.assertEqual(to_sharded.call_args.kwargs["fsdp_axis_name"], "torch_dist")
         self.assertTrue(to_sharded.call_args.kwargs["fsdp_host_tensor_is_global"])
+        self.assertEqual("enter", context_events[0][0])
+        self.assertEqual(
+            ("gspmd_data", "torch_dist"),
+            context_events[0][2],
+        )
+        self.assertEqual(1, context_events[0][3])
+        self.assertTrue(context_events[0][4])
+        self.assertEqual("lower", context_events[1])
+        self.assertEqual("exit", context_events[2][0])
+        self.assertIs(context_events[0][1], context_events[2][1])
 
     def test_dim_one_sharded_output_reconstructs_dim_one(self) -> None:
         host = np.arange(24, dtype=np.float32).reshape(3, 8)
