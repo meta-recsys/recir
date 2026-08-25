@@ -28,12 +28,29 @@ for cmd in buck2 podman rsync gcloud; do
 done
 
 echo "--- Building BarnFS wheel ---"
-BARNFS_WHEEL="$(
-    cd "$FBCODE_DIR"
-    buck2 build @//mode/opt \
-        //ai_infra/privacy_security/security/file_vault/python:barnfs.whl \
-        --show-full-simple-output
-)"
+# BARNFS_WHEEL=<path> skips the build and uses that wheel.
+#
+# The wheel only exists so DCP checkpoint writes are encrypted; a parity run
+# writes no checkpoint and never loads it. But the build is a hard prerequisite
+# here, so when its dependency chain is broken -- as
+# `access/lib/attribute:attribute_consts` currently is under
+# opt-linux-x86_64-clang21-no-san, on master AND on fbcode/stable, because
+# AgentVocab.h annotates a constant with clang's `_Nonnull` and that config
+# compiles it with GCC -- there is otherwise no way to build an image at all.
+if [ -n "${BARNFS_WHEEL:-}" ]; then
+    if [ ! -f "$BARNFS_WHEEL" ]; then
+        echo "ERROR: BARNFS_WHEEL=$BARNFS_WHEEL does not exist" >&2
+        exit 1
+    fi
+    echo "using the wheel from BARNFS_WHEEL: $BARNFS_WHEEL"
+else
+    BARNFS_WHEEL="$(
+        cd "$FBCODE_DIR"
+        buck2 build @//mode/opt \
+            //ai_infra/privacy_security/security/file_vault/python:barnfs.whl \
+            --show-full-simple-output
+    )"
+fi
 if [ ! -f "$BARNFS_WHEEL" ]; then
     echo "ERROR: BarnFS wheel not found at $BARNFS_WHEEL" >&2
     exit 1
@@ -202,8 +219,16 @@ echo "  Image:   ${IMAGE_PATH}"
 echo "============================================"
 
 cd "$STAGING_DIR"
+# --pull defaults to "missing", not to podman's bare default: the base image is
+# evicted from the local store periodically, and with no pull policy the next
+# build dies with `python:3.12-slim: image not known` before step 1. Override
+# with PODMAN_PULL_POLICY=always|never.
+#
+# The comment lives ABOVE the command on purpose. Inside a `\`-continued
+# command a comment line swallows the continuation, leaving `podman build`
+# with no arguments at all -- and `bash -n` still reports the file as valid.
 podman build \
-    ${PODMAN_PULL_POLICY:+--pull=$PODMAN_PULL_POLICY} \
+    --pull="${PODMAN_PULL_POLICY:-missing}" \
     ${NO_CACHE:+--no-cache} \
     --build-arg HTTP_PROXY="$HTTP_PROXY" \
     --build-arg http_proxy="$HTTP_PROXY" \
