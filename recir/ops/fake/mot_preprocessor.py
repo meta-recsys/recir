@@ -65,6 +65,7 @@ _op_registered: bool = False
 #   ("batch_dense_2d", desc, dtype)
 #   ("batch_dense_1d", desc, dtype)
 #   ("nro_dense_1d", desc, dtype)
+#   ("singleton_1d", desc, dtype)
 #   ("scalar_tensor", desc, dtype)
 #   ("dynamic_int", desc)
 #   ("batch_int", desc)
@@ -187,6 +188,10 @@ class TraceableMoTPreprocessor(nn.Module):
             return ("batch_dense_1d", desc, dtype)
         if desc_name.endswith(("/query_time", ".nro_padding_mask")):
             return ("nro_dense_1d", desc, dtype)
+        # A whole-batch reduction kept 1D by keepdim=True: one element, no
+        # matter the batch.
+        if desc == MetadataFeatures.MERGED_RUNTIME_MAX_SEQ_LEN:
+            return ("singleton_1d", desc, dtype)
         parallel_suffixes = (
             "/past_weights",
             "/past_watch_times",
@@ -208,7 +213,12 @@ class TraceableMoTPreprocessor(nn.Module):
     def _tensor_output_spec(desc: Any, value: torch.Tensor) -> Tuple[str, Any, ...]:
         desc_name = str(getattr(desc, "name", ""))
         if value.dim() == 0 and desc_name.endswith(
-            ("/runtime_max_seq_len_t", "/l2_runtime_max_seq_len_t")
+            (
+                "/runtime_max_seq_len_t",
+                "/l2_runtime_max_seq_len_t",
+                "/runtime_max_uih_len_t",
+                "/l2_runtime_max_uih_len_t",
+            )
         ):
             return ("scalar_tensor", desc, value.dtype)
         if value.dim() == 1:
@@ -444,6 +454,8 @@ class TraceableMoTPreprocessor(nn.Module):
             return tuple(value.shape) == (ro_batch,)
         if kind == "nro_dense_1d":
             return tuple(value.shape) == (nro_batch,)
+        if kind == "singleton_1d":
+            return tuple(value.shape) == (1,)
         return (
             kind == "batch_dense_2d" and value.dim() == 2 and value.shape[0] == ro_batch
         )
@@ -525,6 +537,7 @@ class TraceableMoTPreprocessor(nn.Module):
             "batch_dense_2d",
             "nro_dense_1d",
             "scalar_tensor",
+            "singleton_1d",
             "batch_dense_1d",
         ):
             assert isinstance(value, torch.Tensor)
@@ -648,6 +661,8 @@ class TraceableMoTPreprocessor(nn.Module):
             return [torch.empty((), dtype=spec[2], device=ro_values.device)]
         if kind == "nro_dense_1d":
             return [torch.empty(nro_batch, dtype=spec[2], device=ro_values.device)]
+        if kind == "singleton_1d":
+            return [torch.empty(1, dtype=spec[2], device=ro_values.device)]
         if kind == "batch_dense_1d":
             return [torch.empty(batch, dtype=spec[2], device=ro_values.device)]
         if kind == "dynamic_int":
@@ -726,6 +741,7 @@ class TraceableMoTPreprocessor(nn.Module):
                 "batch_dense_2d",
                 "nro_dense_1d",
                 "scalar_tensor",
+                "singleton_1d",
                 "batch_dense_1d",
             ):
                 out.set(desc, output_tensors[t_idx], validate=False)
