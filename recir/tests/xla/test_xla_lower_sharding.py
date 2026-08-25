@@ -30,7 +30,7 @@ os.environ["JAX_PLATFORMS"] = "cpu"
 _existing_xla_flags: str = os.environ.get("XLA_FLAGS", "")
 if "xla_force_host_platform_device_count" not in _existing_xla_flags:
     os.environ["XLA_FLAGS"] = (
-        _existing_xla_flags + " --xla_force_host_platform_device_count=2"
+        _existing_xla_flags + " --xla_force_host_platform_device_count=4"
     ).strip()
 
 import contextlib
@@ -80,7 +80,7 @@ class ToShardedJaxTest(unittest.TestCase):
         self.assertTrue(hybrid)
         self.assertEqual(("gspmd_data", "torch_dist"), mesh.axis_names)
         self.assertEqual(("gspmd_data", "torch_dist"), batch_resource)
-        self.assertEqual(2, mesh.shape["gspmd_data"])
+        self.assertEqual(len(devices), mesh.shape["gspmd_data"])
         self.assertEqual(1, mesh.shape["torch_dist"])
 
         graph = torch.fx.Graph()
@@ -96,6 +96,23 @@ class ToShardedJaxTest(unittest.TestCase):
         self.assertIsNotNone(sharding)
         self.assertEqual(sharding.spec, P(("gspmd_data", "torch_dist"), None))
 
+    def test_hybrid_mesh_supports_multi_host_fsdp_groups(self) -> None:
+        devices = list(jax.devices())
+        with mock.patch(
+            "recir.lowering.xla_lower._get_local_devices",
+            return_value=devices[:1],
+        ):
+            mesh, batch_resource, hybrid = _gspmd_mesh(
+                devices,
+                fsdp_axis_size=2,
+            )
+
+        self.assertTrue(hybrid)
+        self.assertEqual(("gspmd_data", "torch_dist"), mesh.axis_names)
+        self.assertEqual(("gspmd_data", "torch_dist"), batch_resource)
+        self.assertEqual(len(devices) // 2, mesh.shape["gspmd_data"])
+        self.assertEqual(2, mesh.shape["torch_dist"])
+
     def test_hybrid_lowering_uses_two_axis_batch_resource_for_examples(self) -> None:
         graph = torch.fx.Graph()
         batch = graph.placeholder("batch")
@@ -104,7 +121,7 @@ class ToShardedJaxTest(unittest.TestCase):
         batch.meta["batch_dim"] = 0
         graph.output(batch)
         gm = torch.fx.GraphModule({}, graph)
-        gm.meta["gspmd_fsdp_axis_size"] = 1
+        gm.meta["gspmd_fsdp_axis_size"] = 2
         module = _XLAModule(gm)
         fake_jitted = mock.Mock()
         context_events: list[tuple[str, object, object, int, bool] | str] = []
@@ -173,13 +190,13 @@ class ToShardedJaxTest(unittest.TestCase):
             ("gspmd_data", "torch_dist"),
         )
         self.assertEqual(to_sharded.call_args.kwargs["fsdp_axis_name"], "torch_dist")
-        self.assertTrue(to_sharded.call_args.kwargs["fsdp_host_tensor_is_global"])
+        self.assertEqual(to_sharded.call_args.kwargs["fsdp_host_shard_count"], 2)
         self.assertEqual("enter", context_events[0][0])
         self.assertEqual(
             ("gspmd_data", "torch_dist"),
             context_events[0][2],
         )
-        self.assertEqual(1, context_events[0][3])
+        self.assertEqual(2, context_events[0][3])
         self.assertTrue(context_events[0][4])
         self.assertEqual("lower", context_events[1])
         self.assertEqual("exit", context_events[2][0])
