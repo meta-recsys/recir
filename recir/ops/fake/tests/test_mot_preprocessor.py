@@ -59,6 +59,12 @@ class _StubMoTPreprocessor(MoTPreprocessor):
             validate=False,
         )
         output.set_nontensor(MetadataFeatures.TOTAL_NUM_TARGETS, nro_batch)
+        # A whole-batch reduction with keepdim=True: shape (1,) at every batch.
+        output.set_tensor(
+            MetadataFeatures.MERGED_RUNTIME_MAX_SEQ_LEN,
+            torch.ones(1, dtype=torch.int32),
+            validate=False,
+        )
         output.set_export("metric", torch.tensor(1.0))
         supervision_weight = features.require_tensor(InputFeatures.SUPERVISION_WEIGHT)
         output.set_export("unsampled_inputs", torch.ones_like(supervision_weight[0]))
@@ -97,6 +103,7 @@ class _RawAdapter(nn.Module):
         torch.Tensor,
         torch.Tensor,
         torch.Tensor,
+        torch.Tensor,
     ]:
         bundle = _inputs_to_feature_bundle(
             KeyedJaggedTensor(keys=["ro"], values=ro_values, lengths=ro_lengths),
@@ -119,6 +126,7 @@ class _RawAdapter(nn.Module):
             output.get_export("metric"),
             output.get_export("unsampled_inputs"),
             torch.stack((nro_mask, nro_mask.new_ones(total_nro))),
+            output.require_tensor(MetadataFeatures.MERGED_RUNTIME_MAX_SEQ_LEN),
         )
 
 
@@ -190,9 +198,15 @@ class TraceableMoTPreprocessorTest(TestCase):
         traced = make_fx(adapter, tracing_mode="symbolic")(*_raw_args(sample))
 
         runtime = _make_bundle(batch_size=3, nro_batch=6)
-        seq_lengths, nro_mask, query_time, metric, unsampled, aligned_nro = traced(
-            *_raw_args(runtime)
-        )
+        (
+            seq_lengths,
+            nro_mask,
+            query_time,
+            metric,
+            unsampled,
+            aligned_nro,
+            merged_max_seq_len,
+        ) = traced(*_raw_args(runtime))
 
         self.assertEqual(seq_lengths.shape, (3,))
         self.assertEqual(nro_mask.shape, (6,))
@@ -200,6 +214,9 @@ class TraceableMoTPreprocessorTest(TestCase):
         self.assertEqual(metric.shape, ())
         self.assertEqual(unsampled.shape, (6,))
         self.assertEqual(aligned_nro.shape, (2, 6))
+        # Traced at batch 2, run at batch 3: a batch-shaped policy would have
+        # baked (2,) in here.
+        self.assertEqual(merged_max_seq_len.shape, (1,))
 
     def test_query_time_uses_nro_dense_policy(self) -> None:
         desc = FeatureDescriptor(
@@ -226,6 +243,15 @@ class TraceableMoTPreprocessorTest(TestCase):
         )
 
         self.assertEqual(spec[0], "batch_dense_1d")
+
+    def test_merged_runtime_max_seq_len_uses_singleton_policy(self) -> None:
+        desc = MetadataFeatures.MERGED_RUNTIME_MAX_SEQ_LEN
+
+        spec = TraceableMoTPreprocessor._one_dim_output_spec(
+            desc, desc.name, torch.int32
+        )
+
+        self.assertEqual(spec[0], "singleton_1d")
 
     def test_high_dim_output_requires_explicit_policy(self) -> None:
         model = _Model(_StubMoTPreprocessor(emit_high_dim=True))
