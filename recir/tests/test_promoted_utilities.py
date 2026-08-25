@@ -15,7 +15,7 @@ the top-level ``recir`` package.
 import unittest
 from types import SimpleNamespace
 from typing import List
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import recir
 import torch
@@ -23,6 +23,7 @@ import torch.nn as nn
 from recir.api import (
     _build_compiled_process_state,
     add_state,
+    compile as recir_compile,
     COMPILED_OBJECT_KEY,
     extract_subgraph,
     find_markers,
@@ -30,6 +31,7 @@ from recir.api import (
     get_compiled_process_state,
     invalidate_device_state,
     materialize_compiled_output,
+    prepare_compiled,
     replace_region,
     set_compiled_output_deferred,
 )
@@ -194,6 +196,33 @@ class InvalidateDeviceStateTest(unittest.TestCase):
         invalidate_device_state(compiled_function)
 
         self.assertIsNone(state_manager.device_state)
+
+
+class PrepareCompiledTest(unittest.TestCase):
+    def test_compiles_once_without_executing_graph(self) -> None:
+        compiled_obj = SimpleNamespace()
+        backend = MagicMock()
+        parallel_mode = MagicMock()
+
+        with patch(
+            "recir.api._compile_via_backend", return_value=compiled_obj
+        ) as compile_backend:
+            compiled_function = recir_compile(
+                parallel_mode=parallel_mode,
+                backend=backend,
+            )(lambda value: value)
+
+            self.assertTrue(prepare_compiled(compiled_function, torch.ones(1)))
+            self.assertTrue(prepare_compiled(compiled_function, torch.zeros(1)))
+
+        compile_backend.assert_called_once()
+        self.assertIs(
+            compiled_obj,
+            compiled_function.__dict__[COMPILED_OBJECT_KEY],
+        )
+
+    def test_returns_false_for_plain_callable(self) -> None:
+        self.assertFalse(prepare_compiled(lambda: None))
 
 
 class GetCompiledProcessStateTest(unittest.TestCase):
