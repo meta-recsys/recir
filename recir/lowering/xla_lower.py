@@ -795,13 +795,6 @@ class _XLAModule(torch.nn.Module):
 
         out_spec_list: List[Any] = []
         for i, leaf in enumerate(out_leaves):
-            # User (torch) outputs keep the historical replicated spec — the
-            # only NEW behavior is Shard(0) for FSDP-weight outputs (the
-            # updated /N shards after the in-body reduce-scatter). This keeps
-            # the non-FSDP (replicate) path byte-identical to the old all-P().
-            if i in torch_indices:
-                out_spec_list.append(P())
-                continue
             ndim = _leaf_ndim(leaf)
             out_val = (
                 leaf.meta.get("val", None) if isinstance(leaf, torch.fx.Node) else None
@@ -816,6 +809,13 @@ class _XLAModule(torch.nn.Module):
                 if isinstance(leaf, torch.fx.Node)
                 else None
             )
+            # FSDP-derived user outputs, such as full-tensor diagnostics, still
+            # carry a /N value on each device. Shard the output so host
+            # materialization joins all addressable device shards into /P.
+            # Other user outputs preserve the historical replicated contract.
+            if i in torch_indices and fsdp_src is None:
+                out_spec_list.append(P())
+                continue
             if fsdp_src is not None and ndim >= 1:
                 out_spec_list.append(P("torch_dist", *([None] * (ndim - 1))))
             elif fsdp_src is not None:
