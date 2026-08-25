@@ -13,7 +13,9 @@ Required environment:
     PARITY_GCS_DATA_PATH=gs://<bucket>/rankfm_1shard_data
 
 Optional overrides include ``PARITY_BF16``, ``PARITY_HASH_SIZE_CAP``, ``RANKFM_S``,
-replay file/index/batch/step settings, matmul precision, and comparison tolerances.
+``PARITY_USE_HELION`` (run the compiled cell's HSTU attention on the recir Helion
+kernels), replay file/index/batch/step settings, matmul precision, and comparison
+tolerances.
 """
 
 from __future__ import annotations
@@ -118,6 +120,14 @@ _PARITY_BF16: bool = os.environ.get("PARITY_BF16", "1").lower() not in (
     "no",
     "",
 )
+# Run HSTU attention on the recir Helion kernels in the COMPILED cell (mirrors the
+# bench's RANKFM_MVAI_USE_HELION). The eager cell stays the aten reference:
+# install_helion_hstu_attention_swap() rebinds attention to an adapter whose op has
+# eager fwd/bwd deferring to the captured original pytorch_hstu_mha, so only the
+# XLA-lowered path changes and the PASS/FAIL verdict becomes a Helion numerics
+# check. Separate from RANKFM_MVAI_USE_HELION because parity builds and compiles
+# its own model instead of going through model_family.
+_PARITY_USE_HELION: bool = os.environ.get("PARITY_USE_HELION", "0") == "1"
 
 
 # ---------------------------------------------------------------------------
@@ -338,6 +348,40 @@ def _parity_train_step_two_opt_with_grads(
     )
 
 
+def _helion_pre_compile() -> None:
+    """Clear stale Helion attention shape sigs before the trace (no-op unless gated).
+
+    The compile runs recir's eager make_fx trace synchronously, during which the
+    HSTU fwd/bwd register_fake kernels record their attention shapes. Clear stale
+    sigs BEFORE the build; warm AFTER it, before the first (lazy) lower.
+    """
+    if not _PARITY_USE_HELION:
+        return
+    from recir.ops.helion.jagged_hstu_attention import clear_traced_sigs
+
+    clear_traced_sigs()
+
+
+def _helion_post_compile(real_bs: int, padded_bs: int) -> None:
+    """Latch the PRT pad-row count and warm the Helion kernels (no-op unless gated).
+
+    ``padded_bs`` is the override-build size (compute_padded_shape of the global RO
+    batch), the same quantity model_family passes as padded_ro_bs, so the derived
+    pad-row count matches what _drop_pad_rows slices off. len(jax.devices()) matches
+    the lowering's world_size (recir/torchax/ops/jhstu_attention.py).
+    """
+    if not _PARITY_USE_HELION:
+        return
+    from recir.ops.helion.jagged_hstu_attention import (
+        set_pad_seqs_per_device,
+        warm_traced_hstu_kernels,
+    )
+
+    world_size = len(jax.devices())
+    set_pad_seqs_per_device(real_bs=real_bs, padded_bs=padded_bs, world_size=world_size)
+    warm_traced_hstu_kernels(world_size=world_size)
+
+
 def _compiled_step(
     model: BlueReelsVDDTrainV3,
     batches: List[Any],
@@ -480,6 +524,7 @@ def _compiled_step(
         loss_reduction="mean",
         region_transforms=region_transforms,
     )
+    _helion_pre_compile()
     if emb_opt is None:
         runner = compile_gspmd_step(
             model,
@@ -528,6 +573,8 @@ def _compiled_step(
             result = runner(model, dense_opt, emb_opt, *flatten_batch(run_batch))
             sync_device_state_to_torch(runner)
             return result
+
+    _helion_post_compile(real_bs=global_bs, padded_bs=override_bs)
 
     # Reuse the compiled runner so model and optimizer state carry across steps.
     loss_values: List[float] = []
@@ -1217,7 +1264,12 @@ def _build_cpu_tpu_model(padding: bool) -> Tuple[BlueReelsVDDTrainV3, Any]:
     module_config, _feature_config = build_module_config(
         model_args, enable_padding=padding
     )
-    model = build_model_from_config(module_config, device, bf16_training=_PARITY_BF16)
+    model = build_model_from_config(
+        module_config,
+        device,
+        bf16_training=_PARITY_BF16,
+        use_helion=_PARITY_USE_HELION,
+    )
     for p in model.parameters():
         if p.is_floating_point():
             p.requires_grad_(True)

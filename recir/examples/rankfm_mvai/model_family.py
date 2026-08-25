@@ -32,9 +32,16 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 from typing import Any, cast, Dict, List, Optional, Tuple, TYPE_CHECKING
 
 import jax
+
+# Register the recir Helion HSTU attention op lowerings (torch.ops.recir.
+# helion_ragged_attention_{fwd,bwd}) at load, before any compile builds a torchax
+# Environment (all_aten_ops is snapshotted once). recir_core cannot import this
+# (visibility), so the rankfm family owns the registration for the Helion path.
+import recir.torchax.ops.jhstu_attention  # noqa: F401
 import torch
 import torch.distributed as dist
 import torch.nn as nn
@@ -68,6 +75,7 @@ from recir.examples.rankfm_mvai.rankfm_batch_utils import (
     create_uniform_train_batch,
 )
 from recir.examples.rankfm_mvai.rankfm_model_utils import build_model_from_config
+from recir.region_transforms.padding import compute_padded_shape
 from torch.utils.data import IterableDataset
 
 # Local recir backend factory + data pipe helpers + the static-NRO resolver and
@@ -93,6 +101,19 @@ logger: logging.Logger = logging.getLogger(__name__)
 # metric buffers don't match and still sync. Full sync (skip_fqns=None) is used
 # before checkpointing/inspecting the tables (flush_host_state(full=True)).
 _EMB_SYNC_SKIP_FQNS: Tuple[str, ...] = ("_sharded_tables", "_dp_tables")
+
+
+def _use_helion() -> bool:
+    """Whether to run HSTU attention on the recir Helion kernels (env-gated).
+
+    When ``RANKFM_MVAI_USE_HELION=1``, ``build_model_from_config(use_helion=True)``
+    rebinds the PYTORCH attention leaf to the recir Helion adapter (see
+    ``recir.ops.helion_hstu_attention_op``), so the STU traces attention as the
+    single ``recir::helion_ragged_attention_fwd`` node the torchax lowering runs on
+    the Helion kernels. When unset the rebind never happens and the run stays on
+    the eager baseline.
+    """
+    return os.environ.get("RANKFM_MVAI_USE_HELION", "0") == "1"
 
 
 def _udd_fm_v3_train_step(
@@ -228,6 +249,17 @@ class RecirXLACompiledModule(RecirCompiledModuleBase):
         padded_num_devices: int = math.lcm(
             num_ranks, backend.sc_modulus() * num_processes
         )
+        # Padded RO sample count the PRT will produce -- the SAME formula
+        # _discover uses (padding.py), which compute_padded_shape is documented to
+        # centralize for compile-time consumers. Feeds the jagged HSTU pad-row
+        # count; note padded_num_devices is the LCM modulus, NOT world_size: the
+        # SparseCore backend makes it world_size * num_sc, so the pad is num_sc
+        # rows per device rather than one.
+        padded_ro_bs: int = (
+            compute_padded_shape(global_bs, padded_num_devices)
+            if trainer_cfg.enable_padding
+            else global_bs
+        )
 
         # Expanded (global / padded) override-build sample from the trace batch.
         # get_override only inspects structure (keys + budget-set lengths), so
@@ -311,6 +343,8 @@ class RecirXLACompiledModule(RecirCompiledModuleBase):
         self._trace_batch = trace_batch
         self._num_ranks = num_ranks
         self._num_processes = num_processes
+        self._global_bs: int = global_bs
+        self._padded_ro_bs: int = padded_ro_bs
         self._spec = RecirCompileSpec(
             mode=RecirMode.GSPMD_TPU,
             device=device,
@@ -331,9 +365,21 @@ class RecirXLACompiledModule(RecirCompiledModuleBase):
         # Trace with the family-provided synthetic/replay batch, not the incoming
         # runtime batch. PaddingRegionTransform applies the configured static
         # shapes at trace entry when padding is enabled.
+        #
+        # The compile runs recir's eager make_fx trace synchronously (during which
+        # the HSTU ops' register_fake kernels record their attention shapes) but the
+        # first XLA lower is lazy, so stale sigs are cleared BEFORE the build and the
+        # kernels warmed AFTER it -- Helion compile cannot nest inside the lower's
+        # tracer.
+        use_helion = _use_helion()
+        if use_helion:
+            from recir.ops.helion.jagged_hstu_attention import clear_traced_sigs
+
+            clear_traced_sigs()
+
         if self._emb_opt is None:
             # Single dense optimizer (cpu / tpu backends).
-            return compile_gspmd_step(
+            compiled_step = compile_gspmd_step(
                 self._model,
                 self._dense_opt,
                 self._trace_batch,
@@ -341,31 +387,53 @@ class RecirXLACompiledModule(RecirCompiledModuleBase):
                 self._spec,
                 train_step_fn=_udd_fm_v3_train_step,
             )
-        # in_graph backend: trace the dense optimizer AND the dedicated embedding
-        # optimizer into the single GSPMD program. compile_gspmd_step hard-wires a
-        # single optimizer, so use the shared multi-optimizer driver compile_step
-        # directly, with a GSPMDParallel that knows the in-graph FSDP table prefix.
-        from recir.embedding.in_graph import SHARDED_TABLE_PREFIX
+        else:
+            # in_graph backend: trace the dense optimizer AND the dedicated
+            # embedding optimizer into the single GSPMD program. compile_gspmd_step
+            # hard-wires a single optimizer, so use the shared multi-optimizer
+            # driver compile_step directly, with a GSPMDParallel that knows the
+            # in-graph FSDP table prefix.
+            from recir.embedding.in_graph import SHARDED_TABLE_PREFIX
 
-        emb_opt = self._emb_opt
-        assert emb_opt is not None
-        parallel_mode = GSPMDParallel(
-            "replicate",
-            loss_reduction=self._spec.loss_reduction,
-            num_ranks=self._num_ranks,
-            num_processes=self._num_processes,
-            fsdp_table_substr=SHARDED_TABLE_PREFIX,
-        )
-        return compile_step(
-            _udd_fm_v3_train_step_two_opt,
-            self._model,
-            (self._dense_opt, emb_opt),
-            self._trace_batch,
-            parallel_mode=parallel_mode,
-            backend=XLAGSPMDBackend(),
-            dispatchers=self._dispatchers,
-            region_transforms=self._spec.region_transforms,
-        )
+            emb_opt = self._emb_opt
+            assert emb_opt is not None
+            parallel_mode = GSPMDParallel(
+                "replicate",
+                loss_reduction=self._spec.loss_reduction,
+                num_ranks=self._num_ranks,
+                num_processes=self._num_processes,
+                fsdp_table_substr=SHARDED_TABLE_PREFIX,
+            )
+            compiled_step = compile_step(
+                _udd_fm_v3_train_step_two_opt,
+                self._model,
+                (self._dense_opt, emb_opt),
+                self._trace_batch,
+                parallel_mode=parallel_mode,
+                backend=XLAGSPMDBackend(),
+                dispatchers=self._dispatchers,
+                region_transforms=self._spec.region_transforms,
+            )
+
+        if use_helion:
+            # Warm the fwd + bwd kernels for the per-device shapes the sample-sharded
+            # lowering will run, after the trace and before the first lower.
+            # set_pad_seqs_per_device must run first: a wrong pad-row count faults the
+            # TPU core or drops real sequences.
+            from recir.ops.helion.jagged_hstu_attention import (
+                set_pad_seqs_per_device,
+                warm_traced_hstu_kernels,
+            )
+
+            world_size = len(jax.devices())
+            set_pad_seqs_per_device(
+                real_bs=self._global_bs,
+                padded_bs=self._padded_ro_bs,
+                world_size=world_size,
+            )
+            warm_traced_hstu_kernels(world_size=world_size)
+
+        return compiled_step
 
     def _run_step(
         self, compiled_step: Any, batch: Any
@@ -550,6 +618,7 @@ class RankFMMvaiModelFamily(BlueReelsVDDModelFamily):
             torch.device("cpu"),
             bf16_training=self._trainer_cfg.bf16_training,
             embeddings_on_meta=embeddings_on_meta,
+            use_helion=_use_helion(),
         )
 
     def create_train_module_and_optimizer(

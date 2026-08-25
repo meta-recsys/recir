@@ -55,6 +55,16 @@ spec:
                 value: "1"
               - name: MASTER_PORT
                 value: "29500"
+              # Inject the Helion HSTU attention kernels into the compiled step:
+              # rebinds pytorch_hstu_mha to the recir Helion adapter, so attention
+              # traces as one recir::helion_ragged_attention_fwd node (plus its
+              # autograd bwd) that torchax lowers to the Helion Pallas -> Mosaic
+              # kernels (mirrors rankfm_mvai-helion-4chip).
+              - name: RANKFM_MVAI_USE_HELION
+                value: "1"
+              # The sample-sharded HSTU path assumes each chip's L//world_size token
+              # block is exactly its b_local whole sequences; the CPU unit tests
+              # assert that alignment at build time.
               # --- crash diagnostics (this run only) ---
               # PYTHONFAULTHANDLER: on a C-level fatal signal (SIGSEGV), dump
               # every thread's Python stack to stderr -> names the in-flight call
@@ -87,6 +97,7 @@ spec:
               # where the all-reduce spans the 4x4x4 ICI torus). NOTE: libtpu FATALs
               # on an unknown flag; if a pod dies at JAX init with "Unknown flag",
               # drop the offender.
+              # To avoid VMEM OOM for Helion export kernel, need to set xla_tpu_scoped_vmem_limit_kib = 49152
               - name: LIBTPU_INIT_ARGS
                 value: >-
                   --xla_tpu_megacore_fusion_allow_ags=false

@@ -93,6 +93,19 @@ rsync -a \
     "${RECIR_DIR}/" "${STAGING_DIR}/recir/"
 cp "${RECIR_DIR}/github/setup.py" "${STAGING_DIR}/setup.py"
 
+# helion (Pallas backend): recir's HSTU op imports helion + exports it via
+# Kernel.jax_fn. Stage the recir-pinned helion tree so the image installs it
+# (-e) instead of PyPI helion. Exclude tests/benchmarks/wheels to keep the
+# context small; the kernel + runtime + language packages are what we need.
+rsync -a \
+    --exclude='.git' \
+    --exclude='__pycache__' \
+    --exclude='*.pyc' \
+    --exclude='test/' \
+    --exclude='benchmarks/' \
+    --exclude='dist/' \
+    "${FBCODE_DIR}/helion/" "${STAGING_DIR}/helion/"
+
 # hammer: stage from the AST import-trace manifest (much smaller than
 # rsync -a hammer/v3/). The same trace_imports.py used by the OSS-import
 # devserver harness produces the manifest -- if a file isn't reachable from
@@ -191,6 +204,7 @@ echo "============================================"
 cd "$STAGING_DIR"
 podman build \
     ${PODMAN_PULL_POLICY:+--pull=$PODMAN_PULL_POLICY} \
+    ${NO_CACHE:+--no-cache} \
     --build-arg HTTP_PROXY="$HTTP_PROXY" \
     --build-arg http_proxy="$HTTP_PROXY" \
     --build-arg HTTPS_PROXY="$HTTPS_PROXY" \
@@ -220,6 +234,22 @@ assert dcp.load.__module__.endswith('dcp_filesystem_barnfs')
 print('BarnFS DCP hotpatch: OK')
 import jax; print(f'JAX: {jax.__version__}')
 import recir; print('recir: OK')
+import helion; print('helion: OK')
+from recir.ops.helion.jagged_hstu_attention import (  # noqa: F401
+    hstu_ragged_attention_bwd_jax_fn,
+    hstu_ragged_attention_fwd_jax_fn,
+)
+import recir.ops.helion_hstu_attention_op  # noqa: F401
+import recir.torchax.ops.jhstu_attention  # noqa: F401
+# Exercise the rebind itself, not just the import: a wrong target module here
+# means the swap never installs and attention silently decomposes into ~15 aten
+# ops (a perf cliff, not an error).
+from recir.ops.helion_hstu_attention_op import install_helion_hstu_attention_swap
+install_helion_hstu_attention_swap()
+import hammer.v2.ops.hstu_preprocess_and_attention as _hpa
+from recir.ops.helion_hstu_attention_op import _recir_pytorch_hstu_mha
+assert _hpa.pytorch_hstu_mha is _recir_pytorch_hstu_mha
+print('recir helion fwd/bwd ops + lowering + attention swap: OK')
 import torchrec; print('torchrec: OK')
 from torchrec.distributed.model_parallel import DistributedModelParallel  # noqa: F401
 from torchrec.distributed.embedding import EmbeddingCollectionSharder  # noqa: F401

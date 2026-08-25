@@ -9,7 +9,9 @@
 # Common overrides: IMAGE_TAG, PARITY_SKIP_BUILD, YAML, CTX, NS, DELETE_ON_EXIT,
 # PARITY_RTOL, PARITY_ATOL, PARITY_GRAD_RTOL, PARITY_GRAD_ATOL,
 # PARITY_PRECISION, PARITY_BF16, PARITY_ON_DEVICE_INIT, RANKFM_S, PARITY_HASH_SIZE_CAP,
-# PARITY_DATA_FILE_TEMPLATE, PARITY_DATA_FILE_INDEX, PARITY_LOCAL_BATCH_SIZE.
+# PARITY_DATA_FILE_TEMPLATE, PARITY_DATA_FILE_INDEX, PARITY_LOCAL_BATCH_SIZE,
+# PARITY_STEPS,
+# PARITY_USE_HELION.
 
 set -uo pipefail
 
@@ -17,7 +19,11 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PKG_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 FBCODE_ROOT="$(cd "${PKG_DIR}/../../.." && pwd)"
 
-IMAGE_TAG="${IMAGE_TAG:-plund-parity}"
+# Per-USER tag: the registry tag is mutable and the pods pull with
+# imagePullPolicy: Always, so a tag shared with another engineer (or with the bench,
+# which pushes `latest`) can swap the image out between this push and the pod start
+# -- silently running someone else's code and invalidating the run.
+IMAGE_TAG="${IMAGE_TAG:-${USER:-unknown}-parity}"
 YAML_ARG="${YAML:-${PKG_DIR}/manifests/rankfm_mvai-parity-4chip.yaml}"
 if [ -f "${YAML_ARG}" ]; then
     YAML="$(cd "$(dirname "${YAML_ARG}")" && pwd)/$(basename "${YAML_ARG}")"
@@ -73,9 +79,11 @@ sed -E "s|(rankfm_mvai_tpu):[A-Za-z0-9._-]+|\1:${IMAGE_TAG}|g" "${YAML}" > "${PA
 # Inject extra env entries after PARITY_DEVICE (14-space env indentation).
 # The literal "\n" is expanded to newlines by awk -v below.
 EXTRA_ENV=""
+INJECTED_NAMES=""
 _add_env() {  # $1=name $2=value; skips empty values
     if [ -n "$2" ]; then
         EXTRA_ENV+="              - name: $1\n                value: \"$2\"\n"
+        INJECTED_NAMES+="$1 "
         echo "  inject env: $1=$2" | tee -a "${LOG}"
     fi
 }
@@ -93,8 +101,25 @@ _add_env PARITY_GCS_DATA_PATH "${PARITY_GCS_DATA_PATH:-}"
 _add_env PARITY_DATA_FILE_TEMPLATE "${PARITY_DATA_FILE_TEMPLATE:-}"
 _add_env PARITY_DATA_FILE_INDEX "${PARITY_DATA_FILE_INDEX:-}"
 _add_env PARITY_LOCAL_BATCH_SIZE "${PARITY_LOCAL_BATCH_SIZE:-}"
+# Number of consecutive optimizer steps both cells run. PARITY_STEPS=1 is the clean
+# BACKWARD check: the grad diff is captured on the LAST step only, so with >1 step the
+# two cells enter it from already-diverged weights and a grad mismatch no longer
+# isolates the backward.
+_add_env PARITY_STEPS "${PARITY_STEPS:-}"
+# Run HSTU attention on the recir Helion kernels in the COMPILED cell only
+# (requires PARITY_EMB_BACKEND=in_graph; the eager cell stays the aten reference).
+# PARITY_USE_HELION=0 gives the aten-vs-aten baseline to diff a Helion run against.
+_add_env PARITY_USE_HELION "${PARITY_USE_HELION:-}"
 if [ -n "${EXTRA_ENV}" ]; then
-    awk -v extra="${EXTRA_ENV}" '
+    # Injected entries REPLACE the yaml's own. A duplicate env name resolves to the
+    # LAST entry in the list, so leaving the yaml default downstream of the
+    # injection point would silently ignore the command-line override.
+    awk -v extra="${EXTRA_ENV}" -v drop="${INJECTED_NAMES}" '
+        BEGIN { n = split(drop, names, " "); for (i = 1; i <= n; i++) kill[names[i]] = 1 }
+        # Continuation lines of a dropped entry (value:, valueFrom:, block scalars)
+        # are indented deeper than its "- name:" marker.
+        skipping { if (match($0, /^ +/) && RLENGTH >= 16) next; skipping = 0 }
+        /^ +- name: [A-Za-z0-9_]+$/ { if ($NF in kill) { skipping = 1; next } }
         /name: PARITY_DEVICE/ { print; getline; print; printf "%s", extra; next }
         { print }
     ' "${PATCHED}" > "${PATCHED}.tmp" && mv "${PATCHED}.tmp" "${PATCHED}"
