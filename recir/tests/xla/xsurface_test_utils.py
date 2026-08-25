@@ -25,6 +25,7 @@ from recir.examples.rankfm_mvai.rankfm_dispatchers import (
     TEST_NUM_CANDIDATES,
 )
 from recir.examples.rankfm_mvai.rankfm_model_utils import build_model_from_config
+
 # ---------------------------------------------------------------------------
 # Config provider
 # ---------------------------------------------------------------------------

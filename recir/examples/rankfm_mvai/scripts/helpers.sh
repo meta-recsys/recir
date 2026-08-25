@@ -70,7 +70,21 @@ _gke_summarize_line() {
     fi
 }
 
-rankfm_mvai_submit()    { gke_submit "$@"; }
+# Resolve a yaml arg: if it is a bare name (not an existing path), look for it
+# next to this helpers.sh (the rankfm_mvai dir, where the *.yaml live). This lets
+# callers pass just the filename, e.g. `rankfm_mvai_submit rankfm_mvai-helion-4chip.yaml`,
+# regardless of CWD. An empty arg or an existing path is passed through unchanged
+# (gke_submit/gke_iterate then apply the absolute _GKE_DEFAULT_YAML default).
+_rankfm_mvai_yaml() {
+    local y="$1"
+    if [ -n "$y" ] && [ ! -f "$y" ] && [ -f "${_RANKFM_MVAI_HELPERS_DIR}/${y}" ]; then
+        echo "${_RANKFM_MVAI_HELPERS_DIR}/${y}"
+    else
+        echo "$y"
+    fi
+}
+
+rankfm_mvai_submit()    { gke_submit "$(_rankfm_mvai_yaml "$1")"; }
 rankfm_mvai_status()    { gke_status; }
 rankfm_mvai_watch()     { gke_watch; }
 rankfm_mvai_logs()      { gke_logs; }
@@ -78,7 +92,7 @@ rankfm_mvai_logs_all()  { gke_logs_all; }
 rankfm_mvai_dump_logs() { gke_dump_logs; }
 rankfm_mvai_traceback() { gke_traceback "$@"; }
 rankfm_mvai_kill()      { gke_kill; }
-rankfm_mvai_iterate()   { gke_iterate "$@"; }
+rankfm_mvai_iterate()   { gke_iterate "$(_rankfm_mvai_yaml "$1")"; }
 
 # Copy a run's TensorBoard event files from GCS to Manifold so they can be
 # viewed with the internal `tensorboard` build or the on-demand TB service

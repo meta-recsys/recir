@@ -24,6 +24,7 @@ call_function node it can. Two rule tables drive the decision:
     batch axis depends on which operand carries it.
 """
 
+import operator
 from typing import Any, cast, List, Optional
 
 import torch
@@ -305,6 +306,29 @@ def _output_batch_dim_for(
     # the VOCAB, FSDP-sharded via _find_fsdp_source).
     if str(target) == "recir.fsdp_embedding.default":
         return input_batch_dim
+
+    # The Helion jagged HSTU attention ops: fwd(q[L,H,D], k, v, ...) -> out[L,H,D],
+    # and the functional bwd(...) -> (dq, dk, dv), each [L,H,D]. L (total tokens) is
+    # the batch axis (dim 0), preserved from q/k/v exactly like the eager attention
+    # subgraph they replace. WITHOUT these rules the opaque ops are left untagged ->
+    # _jit_gspmd defaults them to REPLICATED (per-process L) while the batch-sharded
+    # consumers use the global L -> aten.mul broadcast mismatch.
+    if str(target) in (
+        "recir.helion_ragged_attention_fwd.default",
+        "recir.helion_ragged_attention_bwd.default",
+    ):
+        return input_batch_dim
+
+    # getitem(recir.helion_ragged_attention_bwd(...), i) -> dq/dk/dv[L,H,D]:
+    # propagate the bwd op's batch_dim onto each extracted grad (getitem is not
+    # otherwise in the safe list).
+    if target is operator.getitem:
+        src = node.args[0]
+        if (
+            isinstance(src, fx.Node)
+            and str(src.target) == "recir.helion_ragged_attention_bwd.default"
+        ):
+            return input_batch_dim
 
     # convolution(input, weight, ...): input is [N, C, *spatial]; the conv
     # walks the spatial dims and emits [N, C_out, *spatial_out]. As long as

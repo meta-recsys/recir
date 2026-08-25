@@ -55,8 +55,15 @@ def build_model_from_config(
     device: torch.device,
     bf16_training: bool = False,
     embeddings_on_meta: bool = False,
+    use_helion: bool = False,
 ) -> BlueReelsVDDTrainV3:
     """Build the V3 xsurface model from a preconfigured ``module_config``.
+
+    When ``use_helion`` is True, the HSTU attention leaf is rebound to the recir
+    Helion adapter (``install_helion_hstu_attention_swap()``) so the STU traces
+    attention as the single ``recir::helion_ragged_attention_fwd`` node the torchax
+    lowering runs on the Helion kernels. Eager numerics are unchanged -- the op's
+    fallback is the captured original attention.
 
     ``embeddings_on_meta``: when True, the ``ECSparseArch`` embedding tables are
     built on the ``meta`` device (no host allocation / init) while the dense
@@ -110,6 +117,12 @@ def build_model_from_config(
         os.environ.get("RECIR_HSTU_PALLAS"),
         sorted(resolved_hammer_kernels),
     )
+    if use_helion:
+        from recir.ops.helion_hstu_attention_op import (
+            install_helion_hstu_attention_swap,
+        )
+
+        install_helion_hstu_attention_swap()
     # Route the shared hammer.autocast() call sites to torchax AMP on this
     # TPU/JAX build (torch.autocast("cuda", ...) is inert without CUDA tensors).
     # Installed unconditionally here; the per-site enabled gate (_bf16_training)

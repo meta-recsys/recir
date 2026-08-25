@@ -89,6 +89,13 @@ COPY recir /app/recir
 COPY setup.py /app/setup.py
 RUN pip install -e "/app[xla,rec]"
 
+# helion (Pallas backend): recir's HSTU op (recir/ops/helion/*) imports helion
+# and exports it via Kernel.jax_fn. Install -e from the staged recir-pinned tree
+# (NOT PyPI helion) so the kernel/jax_fn API matches recir. The staged context
+# has no .git, so pin the setuptools-scm version to avoid a git lookup.
+COPY helion /app/helion
+RUN SETUPTOOLS_SCM_PRETEND_VERSION=0.0.0 pip install -e /app/helion
+
 # hammer/v3 and minimal_viable_ai are not pip-installable; mount via PYTHONPATH.
 COPY hammer /app/hammer
 COPY minimal_viable_ai /app/minimal_viable_ai
@@ -124,6 +131,10 @@ RUN if [ -n "$HTTP_PROXY" ]; then \
 ENV PYTHONPATH="/app:/app/recir:${PYTHONPATH}"
 ENV CUDA_VISIBLE_DEVICES=-1
 ENV PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=python
+# Helion uses the Pallas (JAX/TPU Mosaic) backend for the HSTU kernel. On a real
+# TPU pod do NOT set HELION_PALLAS_INTERPRET or JAX_PLATFORMS=cpu (those force
+# CPU interpret); the pod uses real Mosaic.
+ENV HELION_BACKEND=pallas
 
 # Devserver smoke run (JAX falls back to CPU): tiny model, a few steps. Uses
 # explicit small flags rather than --preset (there is no --preset in parse_cli).
