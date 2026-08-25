@@ -137,6 +137,47 @@ class TestGSPMDShardParams(unittest.TestCase):
             model.weight, original_weight[:expected_dim0, :], atol=0, rtol=0
         )
 
+    def test_hybrid_fsdp_keeps_full_state_on_each_host(self) -> None:
+        dim = 16
+        mode = GSPMDParallel(
+            "fully_shard",
+            num_ranks=8,
+            num_processes=2,
+            fsdp_axis_size=4,
+        )
+        model, optimizer = self._make_model_and_opt(dim=dim)
+        original_weight = model.weight.detach().clone()
+        params_and_buffers = dict(model.named_parameters())
+
+        sharded_keys = mode.shard_params(model, params_and_buffers, optimizer)
+
+        self.assertTrue(mode.uses_hybrid_fsdp)
+        self.assertEqual(4, mode.fsdp_axis_size)
+        self.assertIn("weight", sharded_keys)
+        self.assertEqual(original_weight.shape, model.weight.shape)
+        torch.testing.assert_close(model.weight, original_weight, atol=0, rtol=0)
+        self.assertEqual(1, mode.process_mesh.size())
+
+    def test_hybrid_fsdp_validates_axis_and_state_only_sharding(self) -> None:
+        with self.assertRaisesRegex(ValueError, "divisible"):
+            GSPMDParallel(
+                "fully_shard",
+                num_ranks=8,
+                num_processes=2,
+                fsdp_axis_size=3,
+            )
+
+        with self.assertRaisesRegex(ValueError, "not supported with hybrid"):
+            GSPMDParallel(
+                "fully_shard",
+                num_ranks=8,
+                num_processes=2,
+                fsdp_replicate_param_substrs=("per_layer_",),
+                fsdp_shard_optimizer_state_for_replicated_param_substrs=("per_layer_",),
+                fsdp_sharded_optimizer_state_keys=("exp_avg",),
+                fsdp_axis_size=4,
+            )
+
     def test_shard_params_uses_current_process_rank(self) -> None:
         dim = 8
         num_procs = 2
@@ -345,6 +386,43 @@ class TestGSPMDShardParams(unittest.TestCase):
                 _ = mode.process_mesh
                 ranks.append(_FAKE_PG_KEEPALIVE["fake_recir_process_mesh"].rank())
         self.assertEqual([0, 1, 0], ranks)
+
+    def test_shard_map_fsdp_replicates_unsafe_geometry_and_substrings(self) -> None:
+        class MixedGeometryModel(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.dense = nn.Linear(8, 8, bias=False)
+                self.per_layer_projection = nn.Linear(8, 8, bias=False)
+                self.register_buffer("rotary", torch.ones(1, 8))
+                self.register_buffer("position_table", torch.ones(8, 8))
+
+        model = MixedGeometryModel()
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.01, foreach=True)
+        mode = DataParallel(
+            "fully_shard",
+            num_ranks=4,
+            num_processes=2,
+            device_type="cpu",
+            backend=BackendType.XLA_SHARD_MAP,
+            fsdp_replicate_param_substrs=("per_layer_",),
+        )
+        params_and_buffers = {
+            **dict(model.named_parameters()),
+            **dict(model.named_buffers()),
+        }
+
+        sharded_keys = mode.shard_params(model, params_and_buffers, optimizer)
+
+        self.assertEqual({"dense.weight"}, sharded_keys)
+        self.assertEqual((2, 8), tuple(model.dense.weight.shape))
+        self.assertEqual((8, 8), tuple(model.per_layer_projection.weight.shape))
+        self.assertEqual((1, 8), tuple(cast(torch.Tensor, model.rotary).shape))
+        self.assertEqual((8, 8), tuple(cast(torch.Tensor, model.position_table).shape))
+        plan = mode._pending_state_layout
+        self.assertIsNotNone(plan)
+        assert plan is not None
+        self.assertEqual({"dense.weight"}, set(plan.process_store))
+        self.assertEqual((4, 8), tuple(plan.process_store["dense.weight"].shape))
 
     def test_shard_params_replicates_matching_substrings(self) -> None:
         dim = 8
@@ -1088,6 +1166,18 @@ class TestGSPMDFSDPSingleProcess(unittest.TestCase):
         self.assertTrue(
             has_fsdp_meta, "Expected is_fsdp_sharded metadata on placeholders"
         )
+        xla_modules = [
+            module
+            for module in compiled_obj.gm.modules()
+            if isinstance(module, _XLAModule)
+        ]
+        self.assertTrue(xla_modules)
+        self.assertTrue(
+            all(
+                module.gm.meta["gspmd_fsdp_axis_size"] == self.num_ranks
+                for module in xla_modules
+            )
+        )
 
     def test_replicated_parameter_with_sharded_fp32_state_matches_two_updates(
         self,
@@ -1103,17 +1193,20 @@ class TestGSPMDFSDPSingleProcess(unittest.TestCase):
                 values = torch.linspace(-0.5, 0.5, dim * 2).reshape(dim, 2)
                 self.per_layer_weight = nn.Parameter(values.to(torch.bfloat16))
 
+            def logits(self, scale: torch.Tensor) -> torch.Tensor:
+                return self.per_layer_weight.float().sum(dim=0) * scale
+
             def forward(self, scale: torch.Tensor) -> torch.Tensor:
-                return self.per_layer_weight.float().sum() * scale
+                return self.logits(scale).sum()
 
         def make_optimizer(model: StructuredModel) -> torch.optim.SGD:
             optimizer = torch.optim.SGD(model.parameters(), lr=0.0, foreach=False)
             state = optimizer.state[model.per_layer_weight]
             state["step"] = torch.zeros((), dtype=torch.float32)
-            state["master"] = model.per_layer_weight.detach().float().clone()
-            state["exp_avg"] = torch.zeros_like(state["master"])
-            state["exp_avg_sq"] = torch.zeros_like(state["master"])
-            state["grad_accum"] = torch.zeros_like(state["master"])
+            state["fp32_master_param"] = model.per_layer_weight.detach().float().clone()
+            state["exp_avg"] = torch.zeros_like(state["fp32_master_param"])
+            state["exp_avg_sq"] = torch.zeros_like(state["fp32_master_param"])
+            state["grad_accum"] = torch.zeros_like(state["fp32_master_param"])
             return optimizer
 
         def train_step(
@@ -1137,12 +1230,14 @@ class TestGSPMDFSDPSingleProcess(unittest.TestCase):
                     grad_accum,
                     value=0.05,
                 )
-                state["master"].addcdiv_(
+                state["fp32_master_param"].addcdiv_(
                     state["exp_avg"],
                     state["exp_avg_sq"].sqrt().add_(1e-6),
                     value=-0.01,
                 )
-                model.per_layer_weight.copy_(state["master"].to(torch.bfloat16))
+                model.per_layer_weight.copy_(
+                    state["fp32_master_param"].to(torch.bfloat16)
+                )
                 grad.zero_()
                 grad_accum.zero_()
             return loss.detach()
@@ -1161,7 +1256,7 @@ class TestGSPMDFSDPSingleProcess(unittest.TestCase):
             fsdp_replicate_param_substrs=("per_layer_",),
             fsdp_shard_optimizer_state_for_replicated_param_substrs=("per_layer_",),
             fsdp_sharded_optimizer_state_keys=(
-                "master",
+                "fp32_master_param",
                 "exp_avg",
                 "exp_avg_sq",
                 "grad_accum",
@@ -1180,6 +1275,21 @@ class TestGSPMDFSDPSingleProcess(unittest.TestCase):
         compiled_obj = compiled_step.__dict__["_compiled_obj"]
         device_state = compiled_obj.state_manager.device_state
         self.assertIsNotNone(device_state)
+        all_gather_starts = [
+            line.strip()
+            for module in compiled_obj.gm.modules()
+            if isinstance(module, _XLAModule) and module.xla_hlo_text is not None
+            for line in module.xla_hlo_text.splitlines()
+            if " all-gather-start(" in line
+        ]
+        self.assertTrue(
+            any(f"bf16[{dim},2]" in line for line in all_gather_starts),
+            all_gather_starts,
+        )
+        self.assertFalse(
+            any(f"f32[{dim},2]" in line for line in all_gather_starts),
+            all_gather_starts,
+        )
         sync_device_state_to_torch(compiled_step)
 
         torch.testing.assert_close(
@@ -1188,11 +1298,16 @@ class TestGSPMDFSDPSingleProcess(unittest.TestCase):
             atol=0,
             rtol=0,
         )
+        evaluation_scale = torch.tensor(3.0)
+        actual_logits = model.logits(evaluation_scale)
+        expected_logits = reference.logits(evaluation_scale)
+        torch.testing.assert_close(actual_logits, expected_logits, atol=0, rtol=0)
+        self.assertTrue(torch.equal(actual_logits.argmax(), expected_logits.argmax()))
         actual_state = optimizer.state[model.per_layer_weight]
         expected_state = reference_optimizer.state[reference.per_layer_weight]
         torch.testing.assert_close(
-            actual_state["master"],
-            expected_state["master"],
+            actual_state["fp32_master_param"],
+            expected_state["fp32_master_param"],
             atol=1e-7,
             rtol=1e-6,
         )
@@ -1219,7 +1334,7 @@ class TestGSPMDFSDPSingleProcess(unittest.TestCase):
         master_index = next(
             index
             for index, value in enumerate(flat_state)
-            if value is actual_state["master"]
+            if value is actual_state["fp32_master_param"]
         )
         step_index = next(
             index
@@ -1247,9 +1362,13 @@ class TestGSPMDFSDPSingleProcess(unittest.TestCase):
             shard_arrays.append(np.asarray(jax.device_get(shard.data)))
         self.assertEqual(dim, expected_start)
         reconstructed = np.concatenate(shard_arrays, axis=0)
-        self.assertEqual(tuple(expected_state["master"].shape), reconstructed.shape)
         self.assertEqual(
-            hashlib.sha256(actual_state["master"].numpy().tobytes()).hexdigest(),
+            tuple(expected_state["fp32_master_param"].shape), reconstructed.shape
+        )
+        self.assertEqual(
+            hashlib.sha256(
+                actual_state["fp32_master_param"].numpy().tobytes()
+            ).hexdigest(),
             hashlib.sha256(reconstructed.tobytes()).hexdigest(),
         )
 

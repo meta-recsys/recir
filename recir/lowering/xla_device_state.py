@@ -143,10 +143,14 @@ class XLADeviceStateManager(DeviceStateManager):
             return None
         if isinstance(output, torch.Tensor):
             return output
-        if isinstance(output, (list, tuple)) and all(
-            isinstance(x, torch.Tensor) or x is None for x in output
-        ):
-            return output
+        if isinstance(output, list):
+            return [self.materialize_output(value) for value in output]
+        if isinstance(output, tuple):
+            return tuple(self.materialize_output(value) for value in output)
+        if isinstance(output, dict):
+            return {
+                key: self.materialize_output(value) for key, value in output.items()
+            }
         return _jax_to_torch(output, self.torch_device)
 
     def _sync_flat_state(

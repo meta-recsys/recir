@@ -201,6 +201,28 @@ class XLADynamoBridgeBackendTest(unittest.TestCase):
 
 
 class XLADeviceStateManagerTest(unittest.TestCase):
+    def test_materialize_output_preserves_nested_structure(self) -> None:
+        manager = XLADeviceStateManager()
+        first = object()
+        second = object()
+        first_tensor = torch.tensor(1.0)
+        second_tensor = torch.tensor(2.0)
+
+        with mock.patch(
+            "recir.lowering.xla_device_state._jax_to_torch",
+            side_effect=[first_tensor, second_tensor],
+        ) as jax_to_torch:
+            output = manager.materialize_output(((first,), [None, second]))
+
+        self.assertEqual(((first_tensor,), [None, second_tensor]), output)
+        self.assertEqual(
+            [
+                mock.call(first, manager.torch_device),
+                mock.call(second, manager.torch_device),
+            ],
+            jax_to_torch.call_args_list,
+        )
+
     def test_fast_path_keeps_host_stale_until_explicit_sync(self) -> None:
         manager = XLADeviceStateManager()
         flat_state = [torch.zeros(2)]
