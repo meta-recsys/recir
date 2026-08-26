@@ -6,6 +6,8 @@
 
 import contextlib
 import contextvars
+import ctypes
+import gc
 import logging
 import os
 from typing import Any, Callable, Generator, List, Optional, Tuple
@@ -35,6 +37,48 @@ except ImportError:
     from jax.experimental.shard_map import shard_map
 
 logger: logging.Logger = logging.getLogger(__name__)
+
+
+def _host_memory_status() -> dict[str, int]:
+    status: dict[str, int] = {}
+    try:
+        with open("/proc/self/status") as handle:
+            for line in handle:
+                key, _, value = line.partition(":")
+                if key in {"VmRSS", "VmHWM", "VmSize", "RssAnon", "RssFile"}:
+                    fields = value.strip().split()
+                    if fields and fields[0].isdigit():
+                        status[key] = int(fields[0])
+    except OSError as error:
+        status["error"] = -1
+        logger.warning("Failed to read /proc/self/status: %s", error)
+    return status
+
+
+def _trim_host_memory_after_compile() -> None:
+    if os.environ.get("RECIR_XLA_TRIM_HOST_MEMORY_AFTER_COMPILE") != "1":
+        return
+    before = _host_memory_status()
+    collected = gc.collect()
+    malloc_trim_result: int | None = None
+    malloc_trim_error: str | None = None
+    try:
+        libc = ctypes.CDLL("libc.so.6")
+        malloc_trim = libc.malloc_trim
+        malloc_trim.argtypes = [ctypes.c_size_t]
+        malloc_trim.restype = ctypes.c_int
+        malloc_trim_result = int(malloc_trim(0))
+    except (AttributeError, OSError) as error:
+        malloc_trim_error = f"{type(error).__name__}: {error}"
+    logger.info(
+        "Trimmed host memory after XLA compile: gc_collected=%d "
+        "malloc_trim_result=%s malloc_trim_error=%s before=%s after=%s",
+        collected,
+        malloc_trim_result,
+        malloc_trim_error,
+        before,
+        _host_memory_status(),
+    )
 
 
 # Cross-host AOT compile support. When set, the device-discovery helpers
@@ -906,6 +950,7 @@ class _XLAModule(torch.nn.Module):
             if _AOT_TOPOLOGY.get() is not None:
                 if self._jax_compiled is None:
                     self._jax_compiled = lowered.compile()
+                    _trim_host_memory_after_compile()
                     self._log_compiled_memory_analysis()
                 return []
             global_args = tuple(
@@ -924,6 +969,7 @@ class _XLAModule(torch.nn.Module):
             # When nothing is cached, build on first invocation.
             if self._jax_compiled is None:
                 self._jax_compiled = jitted.lower(*global_args).compile()
+                _trim_host_memory_after_compile()
                 self._log_compiled_memory_analysis()
             jax_out = self._jax_compiled(*global_args)
             return self._postprocess_jax_output(jax_out, input_device)
@@ -1257,6 +1303,7 @@ class _XLAModule(torch.nn.Module):
             if _AOT_TOPOLOGY.get() is not None:
                 if self._jax_compiled is None:
                     self._jax_compiled = lowered.compile()
+                    _trim_host_memory_after_compile()
                     self._log_compiled_memory_analysis()
                 if self.capture_hlo_text and not _hlo_captured[0]:
                     _hlo_captured[0] = True
@@ -1304,6 +1351,7 @@ class _XLAModule(torch.nn.Module):
                     runtime_hybrid_fsdp,
                 ):
                     self._jax_compiled = jitted.lower(*jax_args).compile()
+                _trim_host_memory_after_compile()
                 self._log_compiled_memory_analysis()
             if self.capture_hlo_text and not _hlo_captured[0]:
                 _hlo_captured[0] = True
