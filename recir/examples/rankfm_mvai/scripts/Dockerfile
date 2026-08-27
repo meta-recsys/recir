@@ -12,7 +12,12 @@
 #
 # build_image_podman.sh stages this context for you.
 
-FROM python:3.12-slim
+# Fully qualified on purpose. The short name `python:3.12-slim` fails to
+# resolve under this podman with `image not known` -- an unhelpful message that
+# reads like a network problem but is short-name resolution, and it bites
+# whenever the local store has been evicted. `--pull=missing` alone does not
+# fix it, because the name never resolves to something to pull.
+FROM docker.io/library/python:3.12-slim
 
 WORKDIR /app
 
