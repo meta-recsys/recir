@@ -6,7 +6,7 @@
 
 Usage:
     # devserver, under buck (needs the full //minimal_viable_ai):
-    HSTU_MAX_SEQ_LEN=512 buck2 run \\
+    buck2 run \\
         //recir/examples/rankfm_mvai:export_prod_config -- --out /tmp/prod_cfg.pt
 
     # in-image: set PROD_CONFIG_ARTIFACT=/app/prod_cfg.pt and pass
