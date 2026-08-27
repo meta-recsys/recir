@@ -22,13 +22,13 @@
 # touches the chips.
 #
 # Prerequisites:
-#   # 1. export the prod config (devserver, under buck) at the SAME seq len
-#   #    the light leg used:
-#   HSTU_MAX_SEQ_LEN=512 buck2 run //recir/examples/rankfm_mvai:export_prod_config \
-#       -- --out /tmp/prod_cfg_seq512.pt
+#   # 1. export the prod config (devserver, under buck). --parity picks the
+#   #    light-replay provider, which pins the seq len as a class constant:
+#   buck2 run //recir/examples/rankfm_mvai:export_prod_config \
+#       -- --out /tmp/prod_cfg_seq256.pt --parity
 #   # 2. publish it to the cluster (72KB, well under the 1MB ConfigMap limit):
 #   kubectl create configmap rankfm-prod-cfg -n ns-mrs-core-shared \
-#       --from-file=prod_cfg.pt=/tmp/prod_cfg_seq512.pt --dry-run=client -o yaml \
+#       --from-file=prod_cfg.pt=/tmp/prod_cfg_seq256.pt --dry-run=client -o yaml \
 #       | kubectl apply -f -
 #   # 3. build + push the image:
 #   IMAGE_TAG=linjianma-parity bash recir/examples/rankfm_mvai/scripts/build_image_podman.sh
