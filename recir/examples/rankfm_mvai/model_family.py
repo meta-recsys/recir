@@ -564,19 +564,12 @@ class RankFMMvaiModelFamily(BlueReelsVDDModelFamily):
         gloo_rank = getattr(self, "_gloo_rank", 0)
         gloo_world = getattr(self, "_gloo_world", 1)
 
-        explicit_files: Optional[List[str]] = None
-        if trainer_cfg.data_file_template:
-            explicit_files = [trainer_cfg.data_file_template.format(i=1)]
-            logger.info(
-                f"Direct-read mode: file_list={explicit_files} (template "
-                f"'{trainer_cfg.data_file_template}')"
-            )
         data_pipe = BatchReplayPipe(
             path=trainer_cfg.gcs_data_path,
             rank=gloo_rank,
             world_size=gloo_world,
             replicate_across_ranks=trainer_cfg.data_replicate_across_ranks,
-            file_list=explicit_files,
+            file_template=trainer_cfg.data_file_template or None,
         )
         # Fail here rather than on the first select_rows_slice, which happens
         # after the model is built and traced.
@@ -824,6 +817,12 @@ class _RankFMIterableDataset(IterableDataset):
         # Global data pointer (batches consumed so far), checkpointed via
         # state_dict so a resumed run continues from the next batch.
         self._batch_index = 0
+        self._replay_file_index: int | None = 0
+        self._replay_window_index = 0
+
+    def _advance_replay_cursor(self, file_index: int, window_index: int) -> None:
+        self._replay_file_index = file_index
+        self._replay_window_index = window_index
 
     def __iter__(self) -> Any:
         trainer_cfg = self._trainer_cfg
@@ -838,6 +837,9 @@ class _RankFMIterableDataset(IterableDataset):
                     local_batch_size=trainer_cfg.local_batch_size,
                     num_candidates=self._num_candidates,
                     start_index=start,
+                    start_file_index=self._replay_file_index,
+                    start_window_index=self._replay_window_index,
+                    on_advance=self._advance_replay_cursor,
                 )
             ):
                 # Advance the checkpointable pointer as batches are consumed so
@@ -873,9 +875,32 @@ class _RankFMIterableDataset(IterableDataset):
         CheckpointManager saves this and restores it via load_state_dict on
         resume so real-data runs continue from the next unread batch. Mirrors
         mvai_cloud PreprocOutputReplayDataPipe.state_dict."""
-        logger.info(f"[Replay] checkpoint data cursor: batch_index={self._batch_index}")
-        return {"batch_index": self._batch_index}
+        checkpoint_position: int | tuple[int, int, int] = self._batch_index
+        if self._data_pipe is not None and self._replay_file_index is not None:
+            checkpoint_position = (
+                self._batch_index,
+                self._replay_file_index,
+                self._replay_window_index,
+            )
+        state_dict = {"batch_index": checkpoint_position}
+        logger.info(f"[Replay] checkpoint data cursor: {state_dict}")
+        return state_dict
 
     def load_state_dict(self, state_dict: Dict[str, Any]) -> None:
-        self._batch_index = int(state_dict["batch_index"])
-        logger.info(f"[Replay] restored data cursor: batch_index={self._batch_index}")
+        checkpoint_position = state_dict["batch_index"]
+        if isinstance(checkpoint_position, tuple):
+            self._batch_index = int(checkpoint_position[0])
+            self._replay_file_index = int(checkpoint_position[1])
+            self._replay_window_index = int(checkpoint_position[2])
+        else:
+            # Old checkpoints only have a global batch index. Keep their
+            # nominal-size mapping while all new checkpoints use the exact
+            # file/window cursor.
+            self._batch_index = int(checkpoint_position)
+            self._replay_file_index = None
+            self._replay_window_index = 0
+        logger.info(
+            f"[Replay] restored data cursor: batch_index={self._batch_index}, "
+            f"file_index={self._replay_file_index}, "
+            f"window_index={self._replay_window_index}"
+        )

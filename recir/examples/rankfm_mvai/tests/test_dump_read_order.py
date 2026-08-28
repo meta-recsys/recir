@@ -32,10 +32,12 @@ import json
 import os
 import re
 import tempfile
-from typing import List
+from typing import Any, List
+from unittest.mock import patch
 
 from later.unittest import TestCase
 from pyre_extensions import none_throws
+from recir.examples.rankfm_mvai import data_pipe as data_pipe_module
 from recir.examples.rankfm_mvai.data_pipe import (
     _BATCHES_PER_SUBDIR,
     _SUPPORTED_FORMAT_VERSION,
@@ -72,7 +74,219 @@ def _write_metadata(root: str) -> None:
         )
 
 
+class _FakeCandidates:
+    def __init__(self, rows: int) -> None:
+        self.shape = (rows,)
+
+    def sum(self) -> int:
+        return self.shape[0]
+
+    def max(self) -> int:
+        return 1
+
+
+class _FakeBatch:
+    def __init__(self, rows: int, file_index: int = -1) -> None:
+        self.num_candidates = _FakeCandidates(rows)
+        self.file_index = file_index
+
+
+class _FakePipe:
+    def __init__(self, rows_per_file: list[int], dump_batch_size: int) -> None:
+        self.dump_batch_size = dump_batch_size
+        self._batches = [
+            _FakeBatch(rows, file_index)
+            for file_index, rows in enumerate(rows_per_file)
+        ]
+        self.loads: list[int] = []
+
+    def load_at(self, pos: int) -> _FakeBatch:
+        index = pos % len(self._batches)
+        self.loads.append(index)
+        return self._batches[index]
+
+    def __len__(self) -> int:
+        return len(self._batches)
+
+
 class DumpReadOrderTest(TestCase):
+    def test_unscoped_template_is_sharded_across_replay_ranks(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            _write_metadata(root)
+            batch_dir = os.path.join(root, "batch_0")
+            os.makedirs(batch_dir)
+            for i in range(6):
+                with open(os.path.join(batch_dir, f"{i}.pt.zst"), "w"):
+                    pass
+
+            pipe = BatchReplayPipe(
+                path=root,
+                rank=1,
+                world_size=2,
+                file_template="batch_0/{i}.pt.zst",
+            )
+
+            self.assertEqual(
+                pipe._file_list,
+                ["batch_0/1.pt.zst", "batch_0/3.pt.zst", "batch_0/5.pt.zst"],
+            )
+
+    def test_template_rejects_unsupported_dump_version(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            with open(os.path.join(root, "metadata.json"), "w") as fh:
+                json.dump({"version": 1, "num_ranks": 1, "num_batches": 1}, fh)
+            os.makedirs(os.path.join(root, "rank_0", "batch_0"))
+
+            with self.assertRaisesRegex(
+                RuntimeError, "Unsupported dump format version 1"
+            ):
+                BatchReplayPipe(
+                    path=root,
+                    file_template="rank_{rank}/batch_0/{i}.pt.zst",
+                )
+
+    def test_replay_tolerates_a_file_with_fewer_complete_windows(self) -> None:
+        pipe: Any = _FakePipe([8, 4, 8], dump_batch_size=8)
+
+        with (
+            patch.object(
+                data_pipe_module,
+                "select_rows_slice",
+                side_effect=lambda batch, _start, n: _FakeBatch(n),
+            ),
+            patch.object(
+                data_pipe_module,
+                "remap_batch_ids",
+                side_effect=lambda batch, _key_to_size: batch,
+            ),
+        ):
+            batches = list(
+                data_pipe_module.replay_batch_iter(
+                    pipe,
+                    {},
+                    max_steps=5,
+                    local_batch_size=4,
+                    num_candidates=1,
+                )
+            )
+
+        self.assertEqual(len(batches), 5)
+        self.assertEqual(pipe.loads, [0, 1, 2])
+
+    def test_resume_loads_the_needed_file_without_probing_file_zero(self) -> None:
+        pipe: Any = _FakePipe([8, 8, 8], dump_batch_size=8)
+
+        with (
+            patch.object(
+                data_pipe_module,
+                "select_rows_slice",
+                side_effect=lambda batch, _start, n: _FakeBatch(n),
+            ),
+            patch.object(
+                data_pipe_module,
+                "remap_batch_ids",
+                side_effect=lambda batch, _key_to_size: batch,
+            ),
+        ):
+            list(
+                data_pipe_module.replay_batch_iter(
+                    pipe,
+                    {},
+                    max_steps=1,
+                    local_batch_size=4,
+                    num_candidates=1,
+                    start_index=2,
+                )
+            )
+
+        self.assertEqual(pipe.loads, [1])
+
+    def test_exact_cursor_resumes_after_a_short_file(self) -> None:
+        full_pipe: Any = _FakePipe([8, 4, 8], dump_batch_size=8)
+        full_slices: list[tuple[int, int]] = []
+
+        def select_slice(batch: _FakeBatch, start: int, rows: int) -> _FakeBatch:
+            full_slices.append((batch.file_index, start))
+            return _FakeBatch(rows)
+
+        with (
+            patch.object(
+                data_pipe_module,
+                "select_rows_slice",
+                side_effect=select_slice,
+            ),
+            patch.object(
+                data_pipe_module,
+                "remap_batch_ids",
+                side_effect=lambda batch, _key_to_size: batch,
+            ),
+        ):
+            list(
+                data_pipe_module.replay_batch_iter(
+                    full_pipe,
+                    {},
+                    max_steps=5,
+                    local_batch_size=4,
+                    num_candidates=1,
+                )
+            )
+
+        resumed_pipe: Any = _FakePipe([8, 4, 8], dump_batch_size=8)
+        resumed_slices: list[tuple[int, int]] = []
+        cursor = (0, 0)
+
+        def select_resumed_slice(
+            batch: _FakeBatch, start: int, rows: int
+        ) -> _FakeBatch:
+            resumed_slices.append((batch.file_index, start))
+            return _FakeBatch(rows)
+
+        def save_cursor(file_index: int, window_index: int) -> None:
+            nonlocal cursor
+            cursor = (file_index, window_index)
+
+        with (
+            patch.object(
+                data_pipe_module,
+                "select_rows_slice",
+                side_effect=select_resumed_slice,
+            ),
+            patch.object(
+                data_pipe_module,
+                "remap_batch_ids",
+                side_effect=lambda batch, _key_to_size: batch,
+            ),
+        ):
+            list(
+                data_pipe_module.replay_batch_iter(
+                    resumed_pipe,
+                    {},
+                    max_steps=4,
+                    local_batch_size=4,
+                    num_candidates=1,
+                    on_advance=save_cursor,
+                )
+            )
+            list(
+                data_pipe_module.replay_batch_iter(
+                    resumed_pipe,
+                    {},
+                    max_steps=1,
+                    local_batch_size=4,
+                    num_candidates=1,
+                    start_index=4,
+                    start_file_index=cursor[0],
+                    start_window_index=cursor[1],
+                    on_advance=save_cursor,
+                )
+            )
+
+        self.assertEqual(
+            full_slices,
+            [(0, 0), (0, 4), (1, 0), (2, 0), (2, 4)],
+        )
+        self.assertEqual(resumed_slices, full_slices)
+
     def test_layout_constants_still_match_the_writer(self) -> None:
         """The dump layout is copied from the writer; catch it drifting.
 

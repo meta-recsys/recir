@@ -35,7 +35,8 @@ import logging
 import os
 import subprocess
 import tempfile
-from typing import Any, Dict, Iterator, List, Optional
+import time
+from typing import Any, Callable, Dict, Iterator, List, Optional
 
 import torch
 import torch.nn as nn
@@ -43,6 +44,10 @@ from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
 
 logger: logging.Logger = logging.getLogger(__name__)
+
+_FILE_INDEX_MARKER: str = "__RANKFM_FILE_INDEX__"
+_LIST_RETRY_ATTEMPTS: int = 60
+_LIST_RETRY_SLEEP_SECONDS: int = 5
 
 
 # ---------------------------------------------------------------------------
@@ -135,7 +140,10 @@ class BatchReplayPipe:
         world_size: int = 1,
         replicate_across_ranks: bool = False,
         file_list: Optional[List[str]] = None,
+        file_template: str | None = None,
     ) -> None:
+        if file_list is not None and file_template is not None:
+            raise ValueError("Specify either file_list or file_template, not both.")
         self._path: str = path.rstrip("/")
         self._rank = rank
         self._world_size = world_size
@@ -180,7 +188,9 @@ class BatchReplayPipe:
             self._client = None
 
         self._file_list: List[str] = []
-        if file_list is not None:
+        if file_template is not None:
+            self._discover_template_files(file_template)
+        elif file_list is not None:
             # Explicit-list mode: skip directory enumeration entirely. This
             # is required when ``path`` is a FUSE mount with many files (e.g.
             # /mnt/barnfs over a 100K-file dataporter dump where os.listdir
@@ -214,6 +224,119 @@ class BatchReplayPipe:
             return f"{self._prefix}/"
         return ""
 
+    @staticmethod
+    def _template_index(name: str, prefix: str, suffix: str) -> int | None:
+        if not name.startswith(prefix) or not name.endswith(suffix):
+            return None
+        end = len(name) - len(suffix) if suffix else len(name)
+        value = name[len(prefix) : end]
+        return int(value) if value.isdecimal() else None
+
+    @staticmethod
+    def _list_directory_with_retry(path: str) -> list[str]:
+        for attempt in range(_LIST_RETRY_ATTEMPTS):
+            try:
+                return os.listdir(path)
+            except FileNotFoundError:
+                if attempt == _LIST_RETRY_ATTEMPTS - 1:
+                    raise
+                logger.warning(f"[Replay] {path} is not visible yet; retrying.")
+                time.sleep(_LIST_RETRY_SLEEP_SECONDS)
+        return []
+
+    @staticmethod
+    def _template_parts(file_template: str, rank: int) -> tuple[str, str, str]:
+        rendered = file_template.format(rank=rank, i=_FILE_INDEX_MARKER)
+        directory, basename = os.path.split(rendered)
+        if _FILE_INDEX_MARKER not in basename:
+            raise ValueError("data_file_template must contain {i} in its filename.")
+        prefix, suffix = basename.split(_FILE_INDEX_MARKER, 1)
+        return directory, prefix, suffix
+
+    def _validated_dump_version(self, metadata: dict[str, Any]) -> int | None:
+        version: int | None = metadata.get("version")
+        if version is not None and version != _SUPPORTED_FORMAT_VERSION:
+            raise RuntimeError(
+                f"Unsupported dump format version {version} at {self._path}; "
+                f"this reader understands the legacy flat layout (no version "
+                f"key) and version {_SUPPORTED_FORMAT_VERSION}."
+            )
+        return version
+
+    def _gcs_template_files(
+        self, directory: str, prefix: str, suffix: str
+    ) -> list[tuple[int, str]]:
+        if self._client is None:
+            raise RuntimeError("GCS template discovery requires google-cloud-storage.")
+        root = "/".join(part for part in (self._prefix, directory) if part)
+        blob_prefix = f"{root}/{prefix}" if root else prefix
+        indexed_files: list[tuple[int, str]] = []
+        for blob in self._client.list_blobs(self._bucket_name, prefix=blob_prefix):
+            relative_name = blob.name[len(root) + 1 :] if root else blob.name
+            if "/" in relative_name:
+                continue
+            index = self._template_index(relative_name, prefix, suffix)
+            if index is not None:
+                indexed_files.append((index, blob.name))
+        return indexed_files
+
+    def _local_template_files(
+        self, directory: str, prefix: str, suffix: str
+    ) -> list[tuple[int, str]]:
+        full_directory = os.path.join(self._local_dir, directory)
+        indexed_files: list[tuple[int, str]] = []
+        for name in self._list_directory_with_retry(full_directory):
+            index = self._template_index(name, prefix, suffix)
+            if index is not None:
+                relative_path = os.path.join(directory, name) if directory else name
+                indexed_files.append((index, relative_path))
+        return indexed_files
+
+    def _discover_template_files(self, file_template: str) -> None:
+        rank_scoped = "{rank}" in file_template
+        directory, prefix, suffix = self._template_parts(file_template, self._rank)
+        metadata = self._load_json(f"{self._name_prefix()}metadata.json")
+        self._validated_dump_version(metadata)
+        self._dump_batch_size = metadata.get("batch_size")
+
+        if self._is_manifold:
+            indexed_files = [
+                (
+                    i,
+                    f"{self._name_prefix()}"
+                    f"{file_template.format(rank=self._rank, i=i)}",
+                )
+                for i in range(int(metadata["num_batches"]))
+            ]
+        elif self._is_gcs:
+            indexed_files = self._gcs_template_files(directory, prefix, suffix)
+        else:
+            indexed_files = self._local_template_files(directory, prefix, suffix)
+
+        indexed_files.sort()
+        if not rank_scoped and not self._replicate:
+            indexed_files = [
+                entry
+                for position, entry in enumerate(indexed_files)
+                if position % self._world_size == self._rank
+            ]
+        if indexed_files and indexed_files[0][0] == 0:
+            # Preserve the existing direct-read starting point at i=1 while
+            # still making a zero-indexed file available after the others.
+            indexed_files.append(indexed_files.pop(0))
+        self._file_list = [name for _, name in indexed_files]
+        if not self._file_list:
+            raise FileNotFoundError(
+                f"No files matched data_file_template={file_template!r} for rank "
+                f"{self._rank}."
+            )
+        logger.info(
+            f"[Replay] Template discovery: rank {self._rank} found "
+            f"{len(self._file_list)} files ({self._file_list[0]} .. "
+            f"{self._file_list[-1]}, rank_scoped={rank_scoped}, "
+            f"replicate={self._replicate})."
+        )
+
     def _discover_files(self) -> None:
         """Read ``metadata.json`` and synthesize the batch filename list.
 
@@ -225,13 +348,7 @@ class BatchReplayPipe:
         """
         prefix = self._name_prefix()
         metadata = self._load_json(f"{prefix}metadata.json")
-        version: Optional[int] = metadata.get("version")
-        if version is not None and version != _SUPPORTED_FORMAT_VERSION:
-            raise RuntimeError(
-                f"Unsupported dump format version {version} at {self._path}; "
-                f"this reader understands the legacy flat layout (no version "
-                f"key) and version {_SUPPORTED_FORMAT_VERSION}."
-            )
+        version = self._validated_dump_version(metadata)
         self._dump_batch_size = metadata.get("batch_size")
         num_dump_ranks: int = metadata["num_ranks"]
         num_batches: int = metadata["num_batches"]
@@ -286,6 +403,10 @@ class BatchReplayPipe:
                 f"batch_size {dump_batch_size} ({self._path}); each dumped batch "
                 f"has only {dump_batch_size} rows to slice from."
             )
+
+    @property
+    def dump_batch_size(self) -> int | None:
+        return self._dump_batch_size
 
     def _download_bytes(self, name: str) -> bytes:
         if self._is_manifold:
@@ -528,6 +649,39 @@ def select_rows_slice(batch: Any, start: int, n: int) -> Any:
 # ---------------------------------------------------------------------------
 
 
+def _initial_replay_cursor(
+    data_pipe: BatchReplayPipe,
+    local_batch_size: int,
+    start_index: int,
+    start_file_index: int | None,
+    start_window_index: int,
+) -> tuple[int, int, Any | None, int]:
+    probe_batch: Any | None = None
+    examples_per_file = data_pipe.dump_batch_size
+    if examples_per_file is None:
+        probe_batch = data_pipe.load_at(0)
+        examples_per_file = int(probe_batch.num_candidates.shape[0])
+    windows_per_file = examples_per_file // local_batch_size
+    if windows_per_file == 0:
+        raise ValueError(
+            f"Replay files contain {examples_per_file} rows, fewer than "
+            f"local_batch_size={local_batch_size}."
+        )
+    if start_file_index is None:
+        file_index = (start_index // windows_per_file) % len(data_pipe)
+        window = start_index % windows_per_file
+    else:
+        file_index = start_file_index % len(data_pipe)
+        window = start_window_index
+    loaded_batch = probe_batch if file_index == 0 else None
+    loaded_windows = 0
+    if loaded_batch is not None:
+        loaded_windows = int(loaded_batch.num_candidates.shape[0]) // local_batch_size
+    if loaded_batch is not None and loaded_windows <= window:
+        loaded_batch = None
+    return file_index, window, loaded_batch, loaded_windows
+
+
 def replay_batch_iter(
     data_pipe: BatchReplayPipe,
     key_to_size: Dict[str, int],
@@ -536,6 +690,9 @@ def replay_batch_iter(
     local_batch_size: int,
     num_candidates: int,
     start_index: int = 0,
+    start_file_index: int | None = None,
+    start_window_index: int = 0,
+    on_advance: Callable[[int, int], None] | None = None,
 ) -> Iterator[Any]:
     """Yield up to ``max_steps`` ready-to-train batches from ``data_pipe``.
 
@@ -553,21 +710,51 @@ def replay_batch_iter(
     ``truncate_ro_features`` (mot_preprocessor.py), so no pre-truncation
     is needed here.
 
-    Reads by global position ``pos = start_index + step`` and cycles through
-    the pipe via ``data_pipe.load_at`` (``pos % num_files``); ``max_steps`` is
-    the terminator. ``start_index`` (the checkpointed data pointer) lets a
-    resumed run continue the data stream from where the prior run stopped
-    instead of re-reading from position 0 (which would overlap the data the
-    prior run already consumed).
+    Exhausts every complete ``local_batch_size`` row window in a file before
+    loading the next file. New checkpoints resume from the exact
+    ``start_file_index`` and ``start_window_index`` cursor, while
+    ``start_index`` retains the nominal-size mapping for old checkpoints and
+    direct callers. ``on_advance`` receives the exact cursor for the next
+    batch. Incomplete trailing rows and undersized files are tolerated rather
+    than aborting a long-running job.
     """
+    file_index, window, loaded_batch, loaded_windows = _initial_replay_cursor(
+        data_pipe,
+        local_batch_size,
+        start_index,
+        start_file_index,
+        start_window_index,
+    )
+
     for step in range(max_steps):
         pos = start_index + step
-        batch = data_pipe.load_at(pos)
-        B_loaded = batch.num_candidates.shape[0]
-        n_windows = max(1, B_loaded // local_batch_size)
-        # Rotate the row window by the GLOBAL position so a resumed run keeps
-        # advancing through the loaded file's rows rather than repeating them.
-        window = pos % n_windows
+        skipped_files = 0
+        while loaded_batch is None:
+            loaded_batch = data_pipe.load_at(file_index)
+            loaded_rows = int(loaded_batch.num_candidates.shape[0])
+            loaded_windows = loaded_rows // local_batch_size
+            trailing_rows = loaded_rows % local_batch_size
+            if trailing_rows:
+                logger.warning(
+                    f"[Replay] file {file_index + 1}/{len(data_pipe)} has "
+                    f"{trailing_rows} trailing rows; ignoring them."
+                )
+            if loaded_windows > window:
+                break
+            logger.warning(
+                f"[Replay] file {file_index + 1}/{len(data_pipe)} has only "
+                f"{loaded_windows} complete windows; skipping it from window "
+                f"{window + 1}."
+            )
+            file_index = (file_index + 1) % len(data_pipe)
+            window = 0
+            loaded_batch = None
+            skipped_files += 1
+            if skipped_files == len(data_pipe):
+                raise ValueError(
+                    "No replay file contains a complete local-batch window."
+                )
+        batch = loaded_batch
         start = window * local_batch_size
         batch = select_rows_slice(batch, start, local_batch_size)
         batch = remap_batch_ids(batch, key_to_size)
@@ -575,8 +762,21 @@ def replay_batch_iter(
         real_total = int(nc.sum())
         budget = nc.shape[0] * num_candidates
         logger.info(
-            f"[Replay] step {step + 1} (pos {pos}): sum(num_candidates)={real_total}, "
+            f"[Replay] step {step + 1} (pos {pos}, file {file_index + 1}/"
+            f"{len(data_pipe)}, window {window + 1}/{loaded_windows}): "
+            f"sum(num_candidates)={real_total}, "
             f"NRO budget={budget} (fill={real_total / budget:.2%}, "
             f"max nc[i]={int(nc.max())}/{num_candidates})"
         )
+        next_file_index = file_index
+        next_window = window + 1
+        if next_window == loaded_windows:
+            next_window = 0
+            next_file_index = (file_index + 1) % len(data_pipe)
+        if on_advance is not None:
+            on_advance(next_file_index, next_window)
         yield batch
+        file_index = next_file_index
+        window = next_window
+        if window == 0:
+            loaded_batch = None

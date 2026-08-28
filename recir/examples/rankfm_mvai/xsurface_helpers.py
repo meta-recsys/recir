@@ -115,26 +115,19 @@ def _build_data_pipe(
 ) -> Optional[BatchReplayPipe]:
     """Construct the replay pipe iff ``--gcs_data_path`` was given.
 
-    Direct-read template path skips the 58-min ``ls /mnt/barnfs`` enumeration
-    when ``--data_file_template`` is set; one file per epoch is enough since
-    the rotating window in ``replay_batch_iter`` provides per-step diversity.
+    ``--data_file_template`` scopes discovery to one rank directory so the
+    replay iterator can consume every numbered file without enumerating the
+    full dataporter dump.
     """
     if not trainer_cfg.gcs_data_path:
         logger.info("Using synthetic data (no --gcs_data_path)")
         return None
-    explicit_files: Optional[List[str]] = None
-    if trainer_cfg.data_file_template:
-        explicit_files = [trainer_cfg.data_file_template.format(i=1)]
-        logger.info(
-            f"Direct-read mode: file_list={explicit_files} (template "
-            f"'{trainer_cfg.data_file_template}')"
-        )
     pipe = BatchReplayPipe(
         path=trainer_cfg.gcs_data_path,
         rank=gloo_rank,
         world_size=gloo_world,
         replicate_across_ranks=trainer_cfg.data_replicate_across_ranks,
-        file_list=explicit_files,
+        file_template=trainer_cfg.data_file_template or None,
     )
     logger.info(
         f"Replay pipe: {len(pipe)} batches for rank {gloo_rank} "
