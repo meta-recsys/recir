@@ -209,6 +209,17 @@ def _udd_fm_v3_train_step_two_opt(
     )
 
 
+def _load_parity_checkpoint(target: nn.Module, ckpt_path: str) -> None:
+    from hammer.v3.models.udd_fm_v3.parity.checkpoint import (
+        content_hash,
+        load_init_checkpoint,
+    )
+
+    logger.info(f"[PARITY] loading init weights from {ckpt_path}")
+    logger.info(f"[PARITY] init ckpt sha256={content_hash(ckpt_path)}")
+    load_init_checkpoint(target, ckpt_path)
+
+
 class RecirXLACompiledModule(RecirCompiledModuleBase):
     """Self-compiling GSPMD/TPU recir train module (built by RankFMMvaiModelFamily).
 
@@ -731,6 +742,21 @@ class RankFMMvaiModelFamily(BlueReelsVDDModelFamily):
         self._gcs_data_pipe: Optional[BatchReplayPipe] = data_pipe  # pyre-ignore[16]
         self._gcs_key_to_size: Dict[str, int] = key_to_size  # pyre-ignore[16]
 
+        ckpt_path = trainer_cfg.init_state_dict_path
+        seeds_tables_from_ec = trainer_cfg.embedding_backend == "in_graph"
+        if ckpt_path and seeds_tables_from_ec:
+            if trainer_cfg.on_device_init:
+                raise ValueError(
+                    "in_graph with --init_state_dict_path needs "
+                    "--no_on_device_init: the tables are seeded from the "
+                    "embedding collection by copying into them, and "
+                    "on_device_init leaves them as meta params with no storage "
+                    "to copy into. _seed_in_graph_tables_from_ec would skip "
+                    "every table and the run would train from random "
+                    "embeddings while reporting a successful checkpoint load."
+                )
+            _load_parity_checkpoint(model, ckpt_path)
+
         # 7. The module owns the recir construction (override, backend.setup,
         #    padding, compile). It exposes the dense opt we return to the trainer.
         wrapper = RecirXLACompiledModule(
@@ -744,22 +770,8 @@ class RankFMMvaiModelFamily(BlueReelsVDDModelFamily):
             num_processes=num_processes,
             device=device,
         )
-        ckpt_path = trainer_cfg.init_state_dict_path
-        if ckpt_path:
-            # Shared-checkpoint parity: both legs must start from identical
-            # weights so a one-step comparison isolates the implementation from
-            # initialisation. Loaded HERE, after backend.setup has finalised the
-            # embedding collection -- loading before it silently lost every
-            # embedding table. load_init_checkpoint normalises target names, so
-            # a wrapped/sharded module matches the unsharded checkpoint keys.
-            from hammer.v3.models.udd_fm_v3.parity.checkpoint import (
-                content_hash,
-                load_init_checkpoint,
-            )
-
-            logger.info(f"[PARITY] loading init weights from {ckpt_path}")
-            logger.info(f"[PARITY] init ckpt sha256={content_hash(ckpt_path)}")
-            load_init_checkpoint(wrapper, ckpt_path)
+        if ckpt_path and not seeds_tables_from_ec:
+            _load_parity_checkpoint(wrapper, ckpt_path)
 
         return wrapper, wrapper.dense_opt
 
