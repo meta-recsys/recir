@@ -35,10 +35,9 @@ importlib.import_module("fbgemm_gpu")  # force C++ op registration before fallba
 import jax  # @manual
 import torch
 import torch.distributed as dist
+from hammer.v3.models.udd_fm_v3.parity.step_digest import arm
 from hammer.v3.models.udd_fm_v3.recir_core import (
     compile_gspmd_step,
-    LR_DENSE_BUFFER,
-    LR_SPARSE_BUFFER,
     RecirCompileSpec,
     RecirMode,
     run_step_and_sync,
@@ -223,131 +222,6 @@ def _norm_param_name(name: str) -> str:
     return name
 
 
-def _run_step_capturing_grads(
-    mod: torch.nn.Module,
-    opts: List[torch.optim.Optimizer],
-    batch_args: Tuple[Any, ...],
-) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-    """``recir_train_step`` replicated so it ALSO exports post-backward /
-    pre-step param grads. Grads ride the returned ``named`` dict under
-    ``grad/<param>`` keys, so recir lowers them as graph outputs and
-    ``sync_device_state_to_torch`` brings them back for the eager-vs-compiled
-    backward diff. The LR rebind mirrors ``recir_train_step`` exactly so the
-    single-step LR is identical.
-    """
-    if opts and hasattr(mod, LR_DENSE_BUFFER):
-        lr_dense = getattr(mod, LR_DENSE_BUFFER)
-        for group in opts[0].param_groups:
-            group["lr"] = lr_dense
-        if len(opts) > 1 and hasattr(mod, LR_SPARSE_BUFFER):
-            lr_sparse = getattr(mod, LR_SPARSE_BUFFER)
-            for group in opts[1].param_groups:
-                group["lr"] = lr_sparse
-    all_losses, named_tensors = mod(*batch_args)
-    loss = all_losses.sum()
-    loss.backward()
-    # Capture grads AFTER backward, BEFORE opt.step -- the same point the eager
-    # reference snapshots them. MUST .clone(): opt.step() (TensorLRAdamW) runs
-    # clip_grad_value_ IN-PLACE on p.grad, and a bare ``p.grad`` reference (or a
-    # storage-sharing .detach()) would then read the POST-clip value, while the
-    # eager reference snapshots a pre-clip copy -- they would disagree exactly on
-    # the elements that get clipped (e.g. the large learnable_loss_weights.s
-    # grads). clone() freezes the true pre-clip gradient at this point.
-    grads = {
-        f"grad/{name}": p.grad.detach().clone()
-        for name, p in mod.named_parameters()
-        if p.grad is not None
-    }
-    for opt in opts:
-        opt.step()
-    merged = {**named_tensors, **grads}
-    return all_losses.detach(), {
-        k: (v.detach() if isinstance(v, torch.Tensor) else v) for k, v in merged.items()
-    }
-
-
-def _parity_train_step_with_grads(
-    mod: torch.nn.Module,
-    opt: torch.optim.Optimizer,
-    ro_float_features: torch.Tensor,
-    nro_float_features: torch.Tensor,
-    ro_id_list_values: torch.Tensor,
-    ro_id_list_lengths: torch.Tensor,
-    nro_id_list_values: torch.Tensor,
-    nro_id_list_lengths: torch.Tensor,
-    unary_values: torch.Tensor,
-    unary_lengths: torch.Tensor,
-    num_candidates: torch.Tensor,
-    supervision_label_t: torch.Tensor,
-    supervision_weight_t: torch.Tensor,
-    all_labels: Dict[str, torch.Tensor],
-    world_candidate_sum: torch.Tensor,
-) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-    """Grad-exporting drop-in for ``_udd_fm_v3_train_step`` (single opt). SAME
-    param NAMES so PRT ``bind_signature`` resolves identically to the prod step.
-    """
-    return _run_step_capturing_grads(
-        mod,
-        [opt],
-        (
-            ro_float_features,
-            nro_float_features,
-            ro_id_list_values,
-            ro_id_list_lengths,
-            nro_id_list_values,
-            nro_id_list_lengths,
-            unary_values,
-            unary_lengths,
-            num_candidates,
-            supervision_label_t,
-            supervision_weight_t,
-            all_labels,
-            world_candidate_sum,
-        ),
-    )
-
-
-def _parity_train_step_two_opt_with_grads(
-    mod: torch.nn.Module,
-    opt: torch.optim.Optimizer,
-    emb_opt: torch.optim.Optimizer,
-    ro_float_features: torch.Tensor,
-    nro_float_features: torch.Tensor,
-    ro_id_list_values: torch.Tensor,
-    ro_id_list_lengths: torch.Tensor,
-    nro_id_list_values: torch.Tensor,
-    nro_id_list_lengths: torch.Tensor,
-    unary_values: torch.Tensor,
-    unary_lengths: torch.Tensor,
-    num_candidates: torch.Tensor,
-    supervision_label_t: torch.Tensor,
-    supervision_weight_t: torch.Tensor,
-    all_labels: Dict[str, torch.Tensor],
-    world_candidate_sum: torch.Tensor,
-) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-    """Grad-exporting drop-in for ``_udd_fm_v3_train_step_two_opt`` (dense + emb
-    opt, the in_graph path)."""
-    return _run_step_capturing_grads(
-        mod,
-        [opt, emb_opt],
-        (
-            ro_float_features,
-            nro_float_features,
-            ro_id_list_values,
-            ro_id_list_lengths,
-            nro_id_list_values,
-            nro_id_list_lengths,
-            unary_values,
-            unary_lengths,
-            num_candidates,
-            supervision_label_t,
-            supervision_weight_t,
-            all_labels,
-            world_candidate_sum,
-        ),
-    )
-
-
 def _helion_pre_compile() -> None:
     """Clear stale Helion attention shape sigs before the trace (no-op unless gated).
 
@@ -389,7 +263,6 @@ def _compiled_step(
     num_processes: int,
     global_bs: int,
     padding: bool,
-    capture_grads: bool = False,
     emb_backend: str = _PARITY_EMB_BACKEND,
 ) -> Tuple[
     Dict[str, torch.Tensor],
@@ -532,11 +405,9 @@ def _compiled_step(
             trace_batch,
             dispatchers,
             spec,
-            train_step_fn=(
-                _parity_train_step_with_grads
-                if capture_grads
-                else _udd_fm_v3_train_step
-            ),
+            # Armed, so the step exports ``grad/<param>`` for the diff
+            # below. Inert unless PARITY_DIGEST_KINDS includes "grad".
+            train_step_fn=arm(_udd_fm_v3_train_step),
         )
 
         def _run_one(run_batch: Any) -> Tuple[torch.Tensor, Any]:
@@ -554,11 +425,7 @@ def _compiled_step(
             fsdp_table_substr=SHARDED_TABLE_PREFIX,
         )
         runner = compile_step(
-            (
-                _parity_train_step_two_opt_with_grads
-                if capture_grads
-                else _udd_fm_v3_train_step_two_opt
-            ),
+            arm(_udd_fm_v3_train_step_two_opt),
             model,
             (dense_opt, emb_opt),
             trace_batch,
@@ -629,17 +496,13 @@ def _compiled_step(
                 exports["label_wsum"] = (wf * labf).sum(dim=-1).cpu() / _p
                 exports["pred_wsum"] = (wf * predf).sum(dim=-1).cpu() / _p
                 exports["n_samples"] = torch.tensor([float(wf.shape[-1]) / _p])
-            if capture_grads:
-                # Strip the 'grad/' tag + normalize names to align with eager.
-                compiled_grads = {
-                    _norm_param_name(k[len("grad/") :]): v.detach()
-                    .to(torch.float64)
-                    .cpu()
-                    for k, v in named.items()
-                    if isinstance(k, str)
-                    and k.startswith("grad/")
-                    and isinstance(v, torch.Tensor)
-                }
+            compiled_grads = {
+                _norm_param_name(k[len("grad/") :]): v.detach().to(torch.float64).cpu()
+                for k, v in named.items()
+                if isinstance(k, str)
+                and k.startswith("grad/")
+                and isinstance(v, torch.Tensor)
+            }
     return _dense_params(backend, model), loss_values, exports, compiled_grads
 
 
@@ -790,9 +653,7 @@ def _eager_step(
             # the compiled all-reduce SUM already produces this global-mean scale.
             # Names are normalized to align with the compiled dict.
             eager_grads = {
-                _norm_param_name(n): p.grad.detach()  # pyre-ignore
-                .to(torch.float64)
-                .cpu()
+                _norm_param_name(n): p.grad.detach().to(torch.float64).cpu()
                 for n, p in dense_named.items()
                 if p.grad is not None
             }
@@ -1331,7 +1192,6 @@ def _run_cpu_tpu_parity(rtol: float, atol: float) -> None:
         num_processes,
         global_bs,
         padding=True,
-        capture_grads=True,
         emb_backend=_PARITY_EMB_BACKEND,
     )
 
