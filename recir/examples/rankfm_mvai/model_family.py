@@ -51,6 +51,11 @@ if TYPE_CHECKING:
 
 from hammer.v3.models.udd_fm_v3.batch_loader import BlueReelsVDDFeatureConfig
 from hammer.v3.models.udd_fm_v3.parity.config_dump import config_dump
+from hammer.v3.models.udd_fm_v3.parity.step_digest import (
+    arm,
+    compute_padding_spec,
+    watch_params,
+)
 from hammer.v3.models.udd_fm_v3.recir_core import (
     compile_gspmd_step,
     recir_train_step,
@@ -345,6 +350,18 @@ class RecirXLACompiledModule(RecirCompiledModuleBase):
             )
 
         self._model = model
+        # Padded sizes for the parity digest's activation trim, and the hooks
+        # that read the parameters either side of the step. Both inert unless
+        # PARITY_DIGEST_KINDS is set.
+        self._padding_spec: Tuple[int, int, int, int] = compute_padding_spec(
+            model,
+            global_bs,
+            padded_num_devices,
+            num_processes,
+            num_candidates_per_sample,
+            int(module_config.hstu_max_seq_len),
+        )
+        watch_params(self)
         self._dense_opt: torch.optim.Optimizer = dense_opt
         self._emb_opt: Optional[torch.optim.Optimizer] = emb_opt
         self._warmup: WarmupController = warmup
@@ -396,7 +413,7 @@ class RecirXLACompiledModule(RecirCompiledModuleBase):
                 self._trace_batch,
                 self._dispatchers,
                 self._spec,
-                train_step_fn=_udd_fm_v3_train_step,
+                train_step_fn=arm(_udd_fm_v3_train_step, self._padding_spec),
             )
         else:
             # in_graph backend: trace the dense optimizer AND the dedicated
@@ -416,7 +433,7 @@ class RecirXLACompiledModule(RecirCompiledModuleBase):
                 fsdp_table_substr=SHARDED_TABLE_PREFIX,
             )
             compiled_step = compile_step(
-                _udd_fm_v3_train_step_two_opt,
+                arm(_udd_fm_v3_train_step_two_opt, self._padding_spec),
                 self._model,
                 (self._dense_opt, emb_opt),
                 self._trace_batch,
