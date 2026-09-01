@@ -61,6 +61,7 @@ def tbe_forward(
     state_token: torch.Tensor,
     autograd_placeholder: torch.Tensor,
     tbe_state: list[torch.Tensor],
+    learning_rate: torch.Tensor,
     indices: torch.Tensor,
     offsets: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -80,6 +81,10 @@ def tbe_forward(
             f"expected {len(group._recir_tbe_state_names)}, got {len(tbe_state)}."
         )
     state = dict(zip(group._recir_tbe_state_names, tbe_state))
+    if learning_rate.device.type != "cpu":
+        raise RuntimeError("TBE learning-rate tensor must be on CPU.")
+    if learning_rate.dtype != torch.float32 or learning_rate.dim() != 0:
+        raise RuntimeError("TBE learning-rate tensor must be a float32 scalar.")
     iter_cpu = _TBE_ITER_CPU.get(handle)
     if iter_cpu is None:
         raise RuntimeError(
@@ -97,6 +102,7 @@ def tbe_forward(
         )
         with stateless._reparametrize_module(group.tbe, state):
             group.tbe.iter_cpu = iter_cpu
+            group.tbe.learning_rate_tensor = learning_rate
             output = group._forward_impl(indices, offsets)
     context_id = next(_NEXT_CONTEXT)
     _TBE_CONTEXTS[context_id] = (handle, output)
@@ -110,10 +116,11 @@ def _fake_tbe_forward(
     state_token: torch.Tensor,
     autograd_placeholder: torch.Tensor,
     tbe_state: list[torch.Tensor],
+    learning_rate: torch.Tensor,
     indices: torch.Tensor,
     offsets: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    del state_token, autograd_placeholder, tbe_state, offsets
+    del state_token, autograd_placeholder, tbe_state, learning_rate, offsets
     group = _get_tbe_group(handle)
     output = indices.new_empty(
         (indices.shape[0], group.embedding_dim), dtype=group.output_dtype
@@ -162,6 +169,7 @@ class TBEFunction(torch.autograd.Function):
         state_token: torch.Tensor,
         autograd_placeholder: torch.Tensor,
         tbe_state: list[torch.Tensor],
+        learning_rate: torch.Tensor,
         indices: torch.Tensor,
         offsets: torch.Tensor,
     ) -> torch.Tensor:
@@ -170,6 +178,7 @@ class TBEFunction(torch.autograd.Function):
             state_token,
             autograd_placeholder,
             tbe_state,
+            learning_rate,
             indices,
             offsets,
         )
@@ -190,4 +199,4 @@ class TBEFunction(torch.autograd.Function):
             context,
             grad_outputs[0].contiguous(),
         )
-        return None, None, None, None, None, None
+        return None, None, None, None, None, None, None
