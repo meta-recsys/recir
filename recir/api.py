@@ -981,6 +981,7 @@ def _discover_for_region_transforms(
     kwargs: Dict[str, Any],
     *,
     mod: Optional[nn.Module] = None,
+    fake_mode: Optional[FakeTensorMode] = None,
 ) -> Optional[_RegionDiscovery]:
     """Run `_discover_called_modules` to find the forward roots.
 
@@ -997,15 +998,22 @@ def _discover_for_region_transforms(
         assert mod is not None, (
             "region_transforms requires an nn.Module in the arguments"
         )
-    # Run discovery under the SAME conditions as the real trace: a ShapeEnv (so
-    # custom ops with data-dependent output shapes can mint SymInts via
-    # new_dynamic_size() instead of raising DynamicOutputShapeException) and the
-    # compile flag (so is_compiling()-gated asserts are skipped). The throwaway
-    # ShapeEnv keeps the real trace's ShapeEnv unpolluted.
-    with _enable_compile():
+    # Inputs may already be FakeTensors produced by the trace's batch
+    # transform. Reuse that mode when supplied; FakeTensorMode does not permit
+    # tensors allocated by a different active mode.
+    discovery_mode = fake_mode or FakeTensorMode(
+        allow_non_fake_inputs=True, shape_env=ShapeEnv()
+    )
+    shape_env = discovery_mode.shape_env
+    ignore_fresh_symbols = (
+        shape_env.ignore_fresh_unbacked_symbols()
+        if shape_env is not None
+        else nullcontext()
+    )
+    with _enable_compile(), ignore_fresh_symbols:
         called_modules = _discover_called_modules(
             mod,
-            FakeTensorMode(allow_non_fake_inputs=True, shape_env=ShapeEnv()),
+            discovery_mode,
             func,
             *args,
             **kwargs,
@@ -1030,9 +1038,29 @@ def _enter_region_transform_contexts(
     """
     if discovery is None or not transforms:
         return
-    for _fqn, root_mod, root_fake_args, root_fake_kwargs in _find_forward_roots(
-        discovery.called_modules
+    default_roots = {
+        fqn: (root_mod, root_fake_args, root_fake_kwargs)
+        for fqn, root_mod, root_fake_args, root_fake_kwargs in _find_forward_roots(
+            discovery.called_modules
+        )
+    }
+    transforms_by_root: OrderedDict[str, list[RegionTransform]] = OrderedDict()
+    root_data = dict(default_roots)
+    for transform in transforms:
+        selected = transform.select_forward_root_fqns(discovery.called_modules)
+        root_fqns = default_roots.keys() if selected is None else selected
+        for fqn in root_fqns:
+            if fqn not in discovery.called_modules:
+                raise ValueError(
+                    f"Region transform selected an uncalled module FQN: {fqn!r}."
+                )
+            root_data[fqn] = discovery.called_modules[fqn]
+            transforms_by_root.setdefault(fqn, []).append(transform)
+
+    for fqn in sorted(
+        transforms_by_root, key=lambda name: name.count("."), reverse=True
     ):
+        root_mod, root_fake_args, root_fake_kwargs = root_data[fqn]
         cm_factories = (
             [parametrize_cm_factory(root_mod)]
             if parametrize_cm_factory is not None
@@ -1043,7 +1071,7 @@ def _enter_region_transform_contexts(
                 root_mod,
                 root_fake_args,
                 discovery.called_modules,
-                transforms,
+                transforms_by_root[fqn],
                 fake_mode,
                 _parametrize_cm_factories=cm_factories,
                 fake_kwargs=root_fake_kwargs,
@@ -1135,6 +1163,47 @@ class _TraceContext:
     named_states: Dict[str, Any]
     input_batch_dim: int
     embedding_param_indices: Optional[set[int]] = None
+    internal_transforms: List[RegionTransform] = field(default_factory=list)
+
+
+def _make_hybrid_sparse_transform(
+    parallel_mode: HybridParallel,
+    embedding_param_fqns: set[str],
+    mod: nn.Module,
+) -> RegionTransform:
+    factory = parallel_mode.sparse_transform_factory
+    if factory is not None:
+        transform = factory(embedding_param_fqns, parallel_mode.mesh, mod)
+        if not isinstance(transform, RegionTransform):
+            raise TypeError(
+                "HybridParallel sparse_transform_factory must return a "
+                f"RegionTransform, got {type(transform).__name__}."
+            )
+        return transform
+    return SparseEmbeddingTransform(
+        embedding_param_fqns=embedding_param_fqns,
+        mesh=parallel_mode.mesh,
+        mod=mod,
+    )
+
+
+def _prepare_transforms_after_shard(
+    transforms: Sequence[RegionTransform],
+    mod: nn.Module,
+    opts: Sequence[torch.optim.Optimizer],
+) -> None:
+    for transform in transforms:
+        transform.prepare_after_shard(mod, opts)
+
+
+def _bind_transform_signatures(
+    transforms: Sequence[RegionTransform],
+    callable_: Callable[..., Any],
+) -> None:
+    for transform in transforms:
+        bind = getattr(transform, "bind_signature", None)
+        if bind is not None:
+            bind(callable_)
 
 
 def _set_trace_ctx(gm: fx.GraphModule, ctx: _TraceContext) -> None:
@@ -1231,13 +1300,6 @@ def trace(  # noqa: C901 — orchestration: dispatches on parallel_mode flavor (
     """
     region_transforms_list = list(region_transforms)
 
-    # Stage 2 prep: bind signatures so region transforms can resolve
-    # signature-dependent inputs (e.g. RecomputeTransform's selector).
-    for transform in region_transforms_list:
-        bind = getattr(transform, "bind_signature", None)
-        if bind is not None:
-            bind(callable_)
-
     # Pre-extract mod (and all opts for the DP/HybridParallel branch's
     # pre-trace ``shard_params`` call); ``_local_compile`` re-extracts both
     # itself. Multi-opt setups (sparse + dense partition) pass >1 Optimizer.
@@ -1253,6 +1315,7 @@ def trace(  # noqa: C901 — orchestration: dispatches on parallel_mode flavor (
 
     # Dispatch on parallel_mode flavor for the trace setup.
     embedding_param_indices: Optional[set[int]] = None
+    internal_transforms: list[RegionTransform] = []
     if isinstance(parallel_mode, (DataParallel, HybridParallel)):
         # DataParallel / HybridParallel v2: parametrization-based collective
         # insertion (no DTensor partitioner downstream).  Mirrors the body
@@ -1291,9 +1354,15 @@ def trace(  # noqa: C901 — orchestration: dispatches on parallel_mode flavor (
             regather_transform = RegatherTransform(
                 skip_param_fqns=regather_skip or None
             )
-            dp_transforms.append(regather_transform)
+            internal_transforms.append(regather_transform)
+        if isinstance(parallel_mode, HybridParallel) and embedding_param_fqns:
+            internal_transforms.append(
+                _make_hybrid_sparse_transform(parallel_mode, embedding_param_fqns, _mod)
+            )
+        dp_transforms.extend(internal_transforms)
         if region_transforms_list:
             dp_transforms.extend(region_transforms_list)
+        _bind_transform_signatures(dp_transforms, callable_)
 
         # Extract params_and_buffers BEFORE shard_params so the FQN order
         # matches the placeholder ordering ``_local_compile`` will emit.
@@ -1333,7 +1402,12 @@ def trace(  # noqa: C901 — orchestration: dispatches on parallel_mode flavor (
         args = pytree.tree_map_only(torch.Tensor, input_transform, args)
         kwargs = pytree.tree_map_only(torch.Tensor, input_transform, kwargs)
         discovery = _discover_for_region_transforms(
-            dp_transforms, callable_, args, kwargs, mod=_mod
+            dp_transforms,
+            callable_,
+            args,
+            kwargs,
+            mod=_mod,
+            fake_mode=fake_mode,
         )
 
         # Shard params on the module and optimizer states.  Mutates the dict
@@ -1350,6 +1424,7 @@ def trace(  # noqa: C901 — orchestration: dispatches on parallel_mode flavor (
             replicated_param_fqns = parameter_fqns - sharded_keys
             if regather_transform is not None:
                 regather_transform.skip_param_fqns.update(replicated_param_fqns)
+        _prepare_transforms_after_shard(dp_transforms, _mod, opts)
 
         # Apply region transforms AFTER sharding, with parametrization.  The
         # traced forward includes allgather ops from ``collectives_insertion``
@@ -1426,6 +1501,7 @@ def trace(  # noqa: C901 — orchestration: dispatches on parallel_mode flavor (
         # inflates placeholders to global shape post-trace but consumer
         # literals still reference the per-host shape -> JAX broadcast
         # mismatch.  Mirrors the pre-trace transform in :func:`_compile_gspmd`.
+        _bind_transform_signatures(region_transforms_list, callable_)
         fake_mode = FakeTensorMode(allow_non_fake_inputs=True)
         trace_batch_ratio = _resolve_trace_batch_ratio(parallel_mode)
         if trace_batch_ratio is not None and trace_batch_ratio != 1:
@@ -1438,7 +1514,12 @@ def trace(  # noqa: C901 — orchestration: dispatches on parallel_mode flavor (
             kwargs = pytree.tree_map_only(torch.Tensor, input_transform, kwargs)
 
         discovery = _discover_for_region_transforms(
-            region_transforms_list, callable_, args, kwargs, mod=_mod
+            region_transforms_list,
+            callable_,
+            args,
+            kwargs,
+            mod=_mod,
+            fake_mode=fake_mode,
         )
         with ExitStack() as region_stack:
             _enter_region_transform_contexts(
@@ -1492,6 +1573,7 @@ def trace(  # noqa: C901 — orchestration: dispatches on parallel_mode flavor (
         named_states=local_result.named_states,
         input_batch_dim=input_batch_dim,
         embedding_param_indices=embedding_param_indices,
+        internal_transforms=internal_transforms,
     )
     _set_trace_ctx(local_result.gm, ctx)
     return local_result.gm, flat_state
@@ -1623,21 +1705,12 @@ def compile_from_gm(  # noqa: C901 — orchestration: stages 4-8 of the pipeline
             named_states,
         )
 
-        # HybridParallel: pattern-match aten.embedding nodes on sharded
-        # embedding params and replace with decomposed AllToAll ops via
-        # secondary symbolic trace.  Identifies sharded weight
-        # placeholders by ``node.meta["fqn"]`` (set in
-        # ``_local_compile``) so the lookup is robust to leading-
-        # placeholder shifts introduced by ``Override.transform`` passes
-        # inside ``_finalize_graph``.
-        if isinstance(parallel_mode, HybridParallel):
-            fqns = parallel_mode.embedding_plan.param_fqns
-            if fqns:
-                SparseEmbeddingTransform(
-                    embedding_param_fqns=fqns,
-                    mesh=parallel_mode.mesh,
-                    mod=ctx.mod,
-                ).finalize_compiled_graph(gm)
+        # Finalize HybridParallel-internal semantic transforms before state is
+        # flattened and before IterGraph scheduling. The default sparse
+        # transform preserves the existing ATen embedding path; an alternate
+        # transform may materialize a TBE-backed sparse graph.
+        for transform in ctx.internal_transforms:
+            transform.finalize_compiled_graph(gm)
     else:
         # GSPMDParallel.  Mirror the legacy ``_compile_gspmd`` ordering:
         # shard_params first (updates ``opt.state`` and may re-key
@@ -1970,26 +2043,15 @@ def _compile_data_parallel_v2(
     if dp_style == DataParallelStyle.FULLY_SHARD:
         regather_transform = RegatherTransform(skip_param_fqns=embedding_param_fqns)
         transforms.append(regather_transform)
-    sparse_emb_transform: Optional[SparseEmbeddingTransform] = None
-    if embedding_param_fqns:
-        # Pass ``_mod`` so the transform can resolve concrete sharded
-        # tensors at finalize time (it reads ``mod.named_parameters`` /
-        # ``mod.named_buffers``, which return sharded views after
-        # ``shard_params`` mutates ``_mod`` in place below).  Concrete
-        # shapes are required for the inner ``make_fx`` trace under
-        # HybridParallel's ``ShapeEnv`` (symbolic ``meta["val"]`` shapes
-        # would otherwise be rejected by ``torch.randn`` /
-        # ``torch.randint``).
-        sparse_emb_transform = SparseEmbeddingTransform(
-            embedding_param_fqns=embedding_param_fqns,
-            mesh=mesh,
-            mod=_mod,
+    if isinstance(parallel_mode, HybridParallel) and embedding_param_fqns:
+        transforms.append(
+            _make_hybrid_sparse_transform(parallel_mode, embedding_param_fqns, _mod)
         )
-        transforms.append(sparse_emb_transform)
     # Internal transforms whose ``finalize_compiled_graph`` must be invoked
     # by this path (the caller-supplied ``region_transforms`` are finalized
     # by ``_compile_and_transform``).
     internal_transforms: list[RegionTransform] = list(transforms)
+    _bind_transform_signatures(internal_transforms, func)
     if region_transforms:
         transforms.extend(region_transforms)
 
@@ -2027,7 +2089,7 @@ def _compile_data_parallel_v2(
     args = pytree.tree_map_only(torch.Tensor, input_transform, args)
     kwargs = pytree.tree_map_only(torch.Tensor, input_transform, kwargs)
     discovery = _discover_for_region_transforms(
-        transforms, func, args, kwargs, mod=_mod
+        transforms, func, args, kwargs, mod=_mod, fake_mode=fake_mode
     )
 
     # 6. Shard params on the module and optimizer states.
@@ -2046,6 +2108,7 @@ def _compile_data_parallel_v2(
         replicated_param_fqns = parameter_fqns - sharded_keys
         if regather_transform is not None:
             regather_transform.skip_param_fqns.update(replicated_param_fqns)
+    _prepare_transforms_after_shard(transforms, _mod, opts)
 
     # 7. Apply region transforms AFTER sharding, with parametrization.
     #    The traced forward includes allgather ops from collectives_insertion
@@ -2156,7 +2219,9 @@ def _compile_gspmd(
     )
     args = pytree.tree_map_only(torch.Tensor, input_transform, args)
     kwargs = pytree.tree_map_only(torch.Tensor, input_transform, kwargs)
-    discovery = _discover_for_region_transforms(transforms, func, args, kwargs)
+    discovery = _discover_for_region_transforms(
+        transforms, func, args, kwargs, fake_mode=fake_mode
+    )
     with ExitStack() as region_stack:
         _enter_region_transform_contexts(region_stack, transforms, discovery, fake_mode)
         local_result = _local_compile(
