@@ -7,7 +7,7 @@
 
 """Public rank-local TBE API."""
 
-from recir.tbe.implementation import LocalTBEGroup, LocalTBETable
+from recir.tbe.implementation import LocalTBEGroup, LocalTBETable, nobag_tbe_offsets
 
 
-__all__ = ["LocalTBEGroup", "LocalTBETable"]
+__all__ = ["LocalTBEGroup", "LocalTBETable", "nobag_tbe_offsets"]

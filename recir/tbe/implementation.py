@@ -50,6 +50,28 @@ def _length_tensor(indices: torch.Tensor) -> torch.Tensor:
     )
 
 
+def nobag_tbe_offsets(
+    feature_lengths: torch.Tensor,
+    segments_per_feature: int,
+) -> torch.Tensor:
+    """Split each feature's flat IDs into balanced no-bag TBE work items."""
+    # Citrine C3: create segment boundaries directly on the feature device.
+    segment_boundaries = torch.arange(
+        segments_per_feature + 1,
+        dtype=torch.int64,
+        device=feature_lengths.device,
+    )
+    feature_boundaries = torch.div(
+        feature_lengths[:, None] * segment_boundaries,
+        segments_per_feature,
+        rounding_mode="floor",
+    )
+    segment_lengths = feature_boundaries[:, 1:] - feature_boundaries[:, :-1]
+    return torch.cat(
+        (feature_lengths.new_zeros((1,)), segment_lengths.reshape(-1))
+    ).cumsum(dim=0)
+
+
 def _embedding_location(location: str, device: torch.device) -> EmbeddingLocation:
     if device.type == "cpu":
         if location != "HBM":
@@ -96,8 +118,11 @@ class LocalTBEGroup(torch.nn.Module):
         learning_rate_tensor: torch.Tensor | None = None,
         eps: float,
         stochastic_rounding: bool = True,
+        segments_per_feature: int = 1,
     ) -> None:
         super().__init__()
+        if segments_per_feature <= 0:
+            raise ValueError("TBE segments per feature must be positive.")
         if not tables:
             raise ValueError("LocalTBEGroup requires at least one table.")
         if not feature_table_map:
@@ -132,6 +157,7 @@ class LocalTBEGroup(torch.nn.Module):
         self.output_dtype: torch.dtype = resolved_output_dtype
         self.table_names: tuple[str, ...] = tuple(table.name for table in tables)
         self.feature_table_map: tuple[int, ...] = tuple(feature_table_map)
+        self.segments_per_feature: int = segments_per_feature
         self.tbe: SplitTableBatchedEmbeddingBagsCodegen = (
             SplitTableBatchedEmbeddingBagsCodegen(
                 embedding_specs=[
@@ -198,12 +224,10 @@ class LocalTBEGroup(torch.nn.Module):
 
         feature_lengths = [indices.shape[0] for indices in feature_indices]
         flat_indices = torch.cat(tuple(feature_indices))
-        offsets = torch.cat(
-            (
-                flat_indices.new_zeros((1,)),
-                torch.stack(tuple(_length_tensor(x) for x in feature_indices)),
-            )
-        ).cumsum(dim=0)
+        offsets = nobag_tbe_offsets(
+            torch.stack(tuple(_length_tensor(x) for x in feature_indices)),
+            self.segments_per_feature,
+        )
         flat_output = self.forward_flat(flat_indices, offsets)
         return tuple(torch.split(flat_output, feature_lengths, dim=0))
 

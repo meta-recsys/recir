@@ -13,6 +13,7 @@ import itertools
 import weakref
 from typing import Any
 
+import fbgemm_gpu.sparse_ops  # noqa: F401 - registers sparse op implementations
 import torch
 from torch.nn.utils import stateless
 from torch.utils._python_dispatch import _disable_current_modes
@@ -39,6 +40,92 @@ _TBE_GROUPS: weakref.WeakValueDictionary[int, Any] = weakref.WeakValueDictionary
 _TBE_CONTEXTS: dict[int, tuple[int, torch.Tensor]] = {}
 _TBE_ITER_CPU: dict[int, _HostIterationCounter] = {}
 _NEXT_CONTEXT = itertools.count()
+
+
+@torch.library.custom_op("recir::bucketize_sparse_features", mutates_args=())
+def bucketize_sparse_features(
+    feature_lengths: torch.Tensor,
+    indices: torch.Tensor,
+    block_sizes: torch.Tensor,
+    world_size: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Bucketize grouped features by destination rank with FBGEMM."""
+    batch_size = feature_lengths.numel() // block_sizes.numel()
+    (
+        bucketized_lengths,
+        bucketized_indices,
+        _bucketized_weights,
+        _bucketized_positions,
+        unbucketize_permute,
+    ) = torch.ops.fbgemm.block_bucketize_sparse_features(
+        feature_lengths,
+        indices,
+        bucketize_pos=False,
+        sequence=True,
+        block_sizes=block_sizes,
+        my_size=world_size,
+        weights=None,
+        batch_size_per_feature=None,
+        max_B=batch_size,
+        keep_orig_idx=False,
+    )
+    if unbucketize_permute is None:
+        raise RuntimeError("Expected sequence bucketization to return a permutation.")
+    bucketize_permute = torch.ops.fbgemm.invert_permute(unbucketize_permute)
+    return (
+        bucketized_lengths,
+        bucketized_indices,
+        bucketize_permute,
+        unbucketize_permute,
+    )
+
+
+@bucketize_sparse_features.register_fake
+def _fake_bucketize_sparse_features(
+    feature_lengths: torch.Tensor,
+    indices: torch.Tensor,
+    block_sizes: torch.Tensor,
+    world_size: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    del block_sizes
+    bucketized_lengths = feature_lengths.new_empty(
+        (feature_lengths.shape[0] * world_size,)
+    )
+    return (
+        bucketized_lengths,
+        indices.new_empty(indices.shape),
+        indices.new_empty(indices.shape),
+        indices.new_empty(indices.shape),
+    )
+
+
+@torch.library.custom_op("recir::permute_sparse_data", mutates_args=())
+def permute_sparse_data(
+    permutation: torch.Tensor,
+    lengths: torch.Tensor,
+    values: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Permute variable-length segments with FBGEMM."""
+    permuted_lengths, permuted_values, _permuted_weights = (
+        torch.ops.fbgemm.permute_1D_sparse_data(
+            permutation,
+            lengths,
+            values,
+            None,
+            values.numel(),
+        )
+    )
+    return permuted_lengths, permuted_values
+
+
+@permute_sparse_data.register_fake
+def _fake_permute_sparse_data(
+    permutation: torch.Tensor,
+    lengths: torch.Tensor,
+    values: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    del permutation
+    return lengths.new_empty(lengths.shape), values.new_empty(values.shape)
 
 
 def register_tbe_group(group: Any) -> int:
