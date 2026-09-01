@@ -27,6 +27,25 @@ class _TwoTableModel(nn.Module):
         self.table_1 = nn.Embedding(6, 4)
 
 
+class _TestRowWiseAdagrad(torch.optim.Optimizer):
+    def __init__(
+        self, parameters: list[nn.Parameter], learning_rate: torch.Tensor
+    ) -> None:
+        super().__init__(
+            parameters,
+            {
+                "lr": learning_rate,
+                "eps": 1.0e-8,
+                "weight_decay": 0.0,
+                "stochastic_rounding": False,
+            },
+        )
+
+    def step(self, closure: Any = None) -> Any:
+        del closure
+        return None
+
+
 def _mock_mesh(world_size: int) -> DeviceMesh:
     mesh = MagicMock(spec=DeviceMesh)
     mesh.ndim = 1
@@ -70,10 +89,20 @@ class TBESparseEmbeddingTransformTest(unittest.TestCase):
             self.assertIn("Meta:", table, table)
 
     def _transform(
-        self, world_size: int
+        self,
+        world_size: int,
+        learning_rate_tensor: torch.Tensor | None = None,
     ) -> tuple[TBESparseEmbeddingTransform, _TwoTableModel, fx.GraphModule]:
         model = _TwoTableModel()
         gm = _embedding_graph(model)
+        optimizers: tuple[torch.optim.Optimizer, ...] = ()
+        if learning_rate_tensor is not None:
+            optimizers = (
+                _TestRowWiseAdagrad(
+                    list(model.parameters()),
+                    learning_rate_tensor,
+                ),
+            )
         transform = TBESparseEmbeddingTransform(
             {"table_0.weight", "table_1.weight"},
             _mock_mesh(world_size),
@@ -84,7 +113,7 @@ class TBESparseEmbeddingTransformTest(unittest.TestCase):
             },
             stochastic_rounding=False,
         )
-        transform.prepare_after_shard(model, ())
+        transform.prepare_after_shard(model, optimizers)
         called: OrderedDict[str, tuple[nn.Module, tuple[Any, ...], dict[str, Any]]] = (
             OrderedDict({"": (model, (torch.tensor([1]), torch.tensor([2])), {})})
         )
@@ -95,6 +124,17 @@ class TBESparseEmbeddingTransformTest(unittest.TestCase):
         ):
             transform.transform_graph(gm, called)
         return transform, model, gm
+
+    def test_inner_transform_reuses_optimizer_learning_rate_tensor(self) -> None:
+        learning_rate = torch.tensor(0.1, dtype=torch.float32, device="cpu")
+
+        _transform, _model, gm = self._transform(
+            world_size=1,
+            learning_rate_tensor=learning_rate,
+        )
+
+        group = gm.get_submodule("_recir_tbe_group_0")
+        self.assertIs(group.get_buffer("_recir_learning_rate"), learning_rate)
 
     def test_transform_inputs_materializes_kjt_offsets(self) -> None:
         transform = TBESparseEmbeddingTransform(set(), _mock_mesh(1))

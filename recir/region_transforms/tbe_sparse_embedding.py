@@ -538,6 +538,7 @@ class TBESparseEmbeddingTransform(RegionTransform):
                 device=first_state.parameter.device,
                 weight_dtype=first_state.parameter.dtype,
                 learning_rate=first_state.settings.learning_rate,
+                learning_rate_tensor=first_state.settings.learning_rate_tensor,
                 eps=first_state.settings.eps,
                 stochastic_rounding=first_state.settings.stochastic_rounding,
             )
@@ -662,8 +663,8 @@ class TBESparseEmbeddingTransform(RegionTransform):
         forward: fx.Node,
         group: _CompiledGroup,
     ) -> None:
-        packed_indices = forward.args[4]
-        packed_offsets = forward.args[5]
+        packed_indices = forward.args[5]
+        packed_offsets = forward.args[6]
         forward_output = next(
             (
                 user
@@ -738,8 +739,8 @@ class TBESparseEmbeddingTransform(RegionTransform):
                 ),
             )
         forward_args = list(forward.args)
-        forward_args[4] = received_indices
-        forward_args[5] = offsets
+        forward_args[5] = received_indices
+        forward_args[6] = offsets
         forward.args = tuple(forward_args)
         for node in gm.graph.nodes:
             if (

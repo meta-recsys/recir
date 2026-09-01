@@ -1913,9 +1913,17 @@ def shard_params_by_plan(
         with torch.no_grad():
             for key, value in params_buffers.items():
                 if key not in sharded_keys:
-                    torch.distributed.broadcast(
-                        value, src=source_rank, group=process_group
+                    # NCCL requires staging CPU buffers on the mesh device.
+                    broadcast_value = (
+                        value
+                        if value.device.type == mesh.device_type
+                        else value.to(mesh.device_type)
                     )
+                    torch.distributed.broadcast(
+                        broadcast_value, src=source_rank, group=process_group
+                    )
+                    if broadcast_value is not value:
+                        value.copy_(broadcast_value.to(value.device))
     return sharded_keys
 
 
