@@ -1441,6 +1441,130 @@ def lengths_to_segment_ids(bag_lengths: jax.Array, max_local_ids: int) -> jax.Ar
     return jnp.cumsum(delta).astype(jnp.int32)
 
 
+def sorted_padded_segment_ids(
+    bag_lengths: jax.Array,
+    sort_perm: jax.Array,
+    send_counts_real: jax.Array,
+    send_counts_padded: jax.Array,
+    *,
+    max_local_ids: int,
+    max_padded: int,
+    world_size: int,
+    slack: int = 0,
+) -> jax.Array:
+    """Return bag ids aligned with the kernel's sorted, per-peer padded rows.
+
+    The kernel pools rows after they have been grouped by destination rank and
+    padded to a tile boundary. This function applies the same layout changes to
+    their bag ids::
+
+        caller-order bag ids -> sort_perm -> per-peer padding -> optional slack
+
+    Real rows keep their original bag id. Padding and slack slots use
+    ``num_bags``, a trash segment that the caller drops. This lets the fused
+    path pool in kernel order without unpadding or restoring the ``[N, D]``
+    embedding rows to caller order.
+
+    Args:
+        bag_lengths: ``[num_bags]`` lengths of this source rank's bags in
+            caller order. Their sum is the number of real local ids; they are
+            not sorted by destination rank.
+        sort_perm: ``[max_local_ids]`` permutation from
+            :func:`_bucketize_and_sort`, where ``sort_perm[sorted_pos]`` is the
+            corresponding caller position. It groups id slots by destination
+            rank.
+        send_counts_real: ``[world_size]`` number of real ids this source rank
+            sends to each destination rank.
+        send_counts_padded: ``[world_size]`` corresponding per-destination
+            counts after rounding each bucket to a tile boundary.
+        max_local_ids: Static size of the caller-order id buffer, including id
+            padding.
+        max_padded: Static size after per-peer padding, before ``slack``.
+        world_size: Number of destination-rank buckets.
+        slack: Static number of trailing trash slots added for the kernel's
+            final fixed-width read. This is a slot count; their value is
+            ``num_bags``.
+
+    Returns:
+        ``[max_padded + slack]`` int32 in ``[0, num_bags]``.
+
+    Example with ``num_bags=3`` (so trash is ``3``)::
+
+        caller bag ids:      [0, 0, 1, 2, 2, 3]
+        sort_perm:           [1, 3, 0, 2, 4, 5]
+        sorted bag ids:      [0, 2 | 0, 1, 2, 3]
+        real/padded counts:  [2, 3] / [2, 4]
+        result:              [0, 2 | 0, 1, 2, 3 | 3, 3, 3, 3]
+    """
+    num_bags = bag_lengths.shape[0]
+    seg = lengths_to_segment_ids(bag_lengths, max_local_ids)
+    seg_sorted = seg[sort_perm]
+    seg_padded = _pad_per_peer(
+        seg_sorted,
+        send_counts_real,
+        send_counts_padded,
+        max_local_ids,
+        max_padded,
+        world_size,
+        pad_value=num_bags,
+    )
+    if slack:
+        seg_padded = jnp.pad(seg_padded, (0, slack), constant_values=num_bags)
+    return seg_padded
+
+
+def fan_out_pooled_grad(
+    grad_pooled: jax.Array,
+    bag_lengths: jax.Array,
+    *,
+    max_local_ids: int,
+    pooling: str,
+) -> jax.Array:
+    """Expand a ``[num_bags, D]`` gradient back to one row per id (caller order).
+
+    The VJP of the pooled forward. ``sum`` copies a bag's gradient to every
+    member; ``mean`` additionally scales by ``1 / len``. Padding slots point at
+    the trash bag, whose gradient row is zero, so they receive nothing.
+
+    Used at the top of the fused path's backward so the existing per-id backward
+    driver is reached unchanged (staged plan V1a). Pushing this fan-out further
+    down -- folding it into ``_dedup_grads_by_id`` / the ``sort_perm`` permute so
+    the ``[max_local_ids, D]`` array is never materialised -- is only worth doing
+    if measurement shows the backward is the bottleneck; XLA may already fuse the
+    two consecutive gathers.
+
+    Worked example (num_bags=3, bag_lengths=[2, 1, 0], max_local_ids=5, D=1)::
+
+        segment_ids  = [0, 0, 1, 3, 3]     bag 2 is empty so claims no slot;
+                                            slots 3,4 are padding -> trash (3)
+        grad_pooled  = [[10], [20], [30]]
+
+        grad_padded  = [[10], [20], [30], [0]]      trash row appended
+        grad_per_id  = grad_padded[segment_ids]
+                     = [[10], [10], [20], [0], [0]]     <- "sum"
+
+        "mean" additionally divides by the owning bag's length:
+            divisor              = [2, 1, 1, 1]     clamped, trash appended
+            divisor[segment_ids] = [2, 2, 1, 1, 1]
+            grad_per_id          = [[5], [5], [20], [0], [0]]
+
+    Three things this shows: a bag's gradient is copied to *every* member, an
+    empty bag hands its gradient to nobody (bag 2's 30 appears nowhere), and
+    padding slots receive exactly zero rather than bag 0's gradient.
+    """
+    num_bags, embedding_dim = grad_pooled.shape
+    segment_ids = lengths_to_segment_ids(bag_lengths, max_local_ids)
+    grad_padded = jnp.concatenate(
+        [grad_pooled, jnp.zeros((1, embedding_dim), grad_pooled.dtype)], axis=0
+    )
+    grad_per_id = grad_padded[segment_ids]
+    if pooling == "mean":
+        divisor = jnp.maximum(bag_lengths, 1).astype(grad_pooled.dtype)
+        divisor = jnp.concatenate([divisor, jnp.ones((1,), grad_pooled.dtype)])
+        grad_per_id = grad_per_id / divisor[segment_ids][:, None]
+    return grad_per_id
+
+
 def apply_pooling_divisor(
     pooled_sum: jax.Array,
     bag_lengths: jax.Array,
