@@ -1338,6 +1338,9 @@ class HybridParallel(ParallelMode):
         embedding_plan: Optional[EmbeddingShardingPlan] = None,
         input_batch_dim: int = 0,
         custom_passes: Optional[Callable[[GraphModule], GraphModule]] = None,
+        sparse_transform_factory: Optional[
+            Callable[[Set[str], DeviceMesh, nn.Module], Any]
+        ] = None,
     ) -> None:
         self.dense_style: DataParallelStyle
         if dense_style == "replicate":
@@ -1353,6 +1356,7 @@ class HybridParallel(ParallelMode):
             embedding_plan or EmbeddingShardingPlan()
         )
         self.input_batch_dim = input_batch_dim
+        self.sparse_transform_factory = sparse_transform_factory
 
         if custom_passes is not None:
             self._gm_passes: Callable[[GraphModule], GraphModule] = custom_passes

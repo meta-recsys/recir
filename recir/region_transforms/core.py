@@ -26,6 +26,7 @@ from recir.graph_utils import rebuild_graph
 from recir.region_transforms.base import RegionTransform
 from torch._guards import detect_fake_mode
 from torch._subclasses.fake_tensor import FakeTensorMode
+from torch.fx._pytree import tree_flatten_spec
 from torch.fx.experimental.proxy_tensor import (
     disable_proxy_modes_tracing,
     fetch_sym_proxy,
@@ -143,6 +144,8 @@ def _build_leaf_apply(orig_fn: Any) -> Any:
 
         def _bound_apply(*a: Any, **kw: Any) -> Any:
             return orig_fn(klass, *a, **kw)
+
+        _bound_apply._recir_preserved_autograd_leaf = True  # type: ignore[attr-defined]
 
         # Tensor args unwrap to their tracked proxy; SymInt/SymFloat/SymBool
         # args unwrap via fetch_sym_proxy (a raw symbolic SymInt has no constant
@@ -492,17 +495,23 @@ def _apply_region_transforms(
 
     params = dict(root_mod.named_parameters(remove_duplicate=False))
     buffers = dict(root_mod.named_buffers(remove_duplicate=False))
+    traced_state_names = (*params.keys(), *buffers.keys())
+    _padded_arg_leaves, _padded_arg_spec = pytree.tree_flatten(padded_fake_args)
     _padded_kwarg_leaves, _padded_kwarg_spec = pytree.tree_flatten(padded_fake_kwargs)
-    _n_pos_args: int = len(padded_fake_args)
+    _n_pos_arg_leaves: int = len(_padded_arg_leaves)
 
     # pyre-ignore
     def _stateless_forward(
         params_and_buffers: dict[str, Any],
         *all_args: Any,
     ) -> Any:
-        pos_args = all_args[:_n_pos_args]
+        pos_args = pytree.tree_unflatten(
+            list(all_args[:_n_pos_arg_leaves]), _padded_arg_spec
+        )
         kw_dict: dict[str, Any] = (
-            pytree.tree_unflatten(list(all_args[_n_pos_args:]), _padded_kwarg_spec)
+            pytree.tree_unflatten(
+                list(all_args[_n_pos_arg_leaves:]), _padded_kwarg_spec
+            )
             if _padded_kwarg_leaves
             else {}
         )
@@ -538,19 +547,32 @@ def _apply_region_transforms(
             tracing_mode="fake",
             _allow_non_fake_inputs=True,
             record_module_stack=True,
-        )({**params, **buffers}, *padded_fake_args, *_kwarg_leaves_refaked)
+        )({**params, **buffers}, *_padded_arg_leaves, *_kwarg_leaves_refaked)
+
+    state_placeholders = [
+        node for node in gm_fwd.graph.nodes if node.op == "placeholder"
+    ][: len(traced_state_names)]
+    if len(state_placeholders) != len(traced_state_names):
+        raise RuntimeError(
+            "Region trace did not preserve all parameter and buffer placeholders."
+        )
+    for node, fqn in zip(state_placeholders, traced_state_names):
+        node.meta["fqn"] = fqn
 
     for transform in transforms:
         transform.transform_graph(gm_fwd, called_modules)
 
     def _patched_forward(*args: Any, **kw: Any) -> Any:  # pyre-fixme[53]
         new_args, new_kw = _chain_inputs(args, kw)
-        params_and_buffers = {
+        current_state = {
             **dict(root_mod.named_parameters(remove_duplicate=False)),
             **dict(root_mod.named_buffers(remove_duplicate=False)),
         }
-        kw_leaves = pytree.tree_leaves(new_kw) if new_kw else []
-        return gm_fwd(params_and_buffers, *new_args, *kw_leaves)
+        params_and_buffers = {name: current_state[name] for name in traced_state_names}
+        arg_leaves = tree_flatten_spec(new_args, _padded_arg_spec)
+        kw_leaves = tree_flatten_spec(new_kw, _padded_kwarg_spec) if new_kw else []
+        result = gm_fwd(params_and_buffers, *arg_leaves, *kw_leaves)
+        return result
 
     root_mod.forward = _patched_forward  # type: ignore[method-assign]
     try:
