@@ -14,7 +14,7 @@ sub-graphs.
 from __future__ import annotations
 
 from functools import partial
-from typing import Callable, Dict, List, Optional, Set, Tuple
+from typing import Callable, cast, Dict, List, Optional, Set, Tuple
 
 import torch
 import torch.distributed._functional_collectives as funcol
@@ -480,8 +480,10 @@ class SparseEmbeddingTransform(RegionTransform):
             indices_node = bwd_node.args[1]
             assert isinstance(grad_output_node, fx.Node)
             assert isinstance(indices_node, fx.Node)
-            padding_idx = bwd_node.args[3] if len(bwd_node.args) > 3 else -1
-            scale_grad_by_freq = bwd_node.args[4] if len(bwd_node.args) > 4 else False
+            padding_idx = cast(int, bwd_node.args[3]) if len(bwd_node.args) > 3 else -1
+            scale_grad_by_freq = (
+                cast(bool, bwd_node.args[4]) if len(bwd_node.args) > 4 else False
+            )
             _local_V, num_embeddings, embedding_dim = forward_indices_meta[indices_node]
             grad_val = grad_output_node.meta["val"]
             indices_val = indices_node.meta["val"]
