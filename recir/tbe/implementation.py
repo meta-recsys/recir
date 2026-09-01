@@ -93,6 +93,7 @@ class LocalTBEGroup(torch.nn.Module):
         weight_dtype: torch.dtype,
         output_dtype: torch.dtype | None = None,
         learning_rate: float,
+        learning_rate_tensor: torch.Tensor | None = None,
         eps: float,
         stochastic_rounding: bool = True,
     ) -> None:
@@ -154,6 +155,24 @@ class LocalTBEGroup(torch.nn.Module):
                 table_names=list(self.table_names),
             )
         )
+        if learning_rate_tensor is not None:
+            if learning_rate_tensor.device.type != "cpu":
+                raise ValueError("TBE learning-rate tensor must be on CPU.")
+            if learning_rate_tensor.dtype != torch.float32:
+                raise ValueError("TBE learning-rate tensor must use torch.float32.")
+            if learning_rate_tensor.dim() != 0:
+                raise ValueError("TBE learning-rate tensor must be zero-dimensional.")
+        runtime_learning_rate = (
+            self.tbe.learning_rate_tensor
+            if learning_rate_tensor is None
+            else learning_rate_tensor
+        )
+        self.register_buffer(
+            "_recir_learning_rate",
+            runtime_learning_rate,
+            persistent=False,
+        )
+        self.tbe.learning_rate_tensor = runtime_learning_rate
         self.register_buffer(
             "_recir_state_token",
             torch.zeros((), dtype=torch.int64, device=device),
@@ -210,6 +229,7 @@ class LocalTBEGroup(torch.nn.Module):
             self._recir_state_token,
             self.tbe.placeholder_autograd_tensor,
             tbe_state,
+            self.get_buffer("_recir_learning_rate"),
             indices,
             offsets,
         )
@@ -253,4 +273,4 @@ class LocalTBEGroup(torch.nn.Module):
 
     def set_learning_rate(self, learning_rate: float) -> None:
         """Update the learning rate used by subsequent fused backward calls."""
-        self.tbe.set_learning_rate(learning_rate)
+        self.get_buffer("_recir_learning_rate").fill_(learning_rate)

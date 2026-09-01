@@ -2083,6 +2083,31 @@ class TestShardParamsByPlan(DTensorTestBase):
 
     @skip_if_lt_x_gpu(2)
     @with_comms
+    def test_replicated_cpu_buffer(self) -> None:
+        model = EmbeddingMLP().to(f"cuda:{self.rank}")
+        model.register_buffer("runtime_value", torch.tensor(float(self.rank)))
+        params_and_buffers = OrderedDict(
+            [
+                *model.named_parameters(),
+                *model.named_buffers(),
+            ]
+        )
+        mesh = DeviceMesh("cuda", torch.arange(self.world_size))
+
+        shard_params_by_plan(
+            model,
+            params_and_buffers,
+            None,
+            mesh,
+            DataParallelStyle.REPLICATE,
+            set(),
+        )
+
+        self.assertEqual(model.runtime_value.device.type, "cpu")
+        self.assertEqual(model.runtime_value, torch.tensor(0.0))
+
+    @skip_if_lt_x_gpu(2)
+    @with_comms
     def test_embedding_sharded_in_replicate_mode(self) -> None:
         """Embedding params are Shard(0) even with REPLICATE dense style."""
         model = EmbeddingMLP().cuda(self.rank)

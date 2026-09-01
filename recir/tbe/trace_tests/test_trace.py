@@ -29,7 +29,7 @@ class LocalTBETraceTest(unittest.TestCase):
                 stochastic_rounding=False,
             )
 
-    def test_fake_trace_contains_tbe_forward(self) -> None:
+    def test_fake_trace_contains_tbe_forward_boundary(self) -> None:
         group = self._group()
 
         def forward(indices: torch.Tensor, offsets: torch.Tensor) -> torch.Tensor:
@@ -44,10 +44,18 @@ class LocalTBETraceTest(unittest.TestCase):
             torch.tensor([0, 2], dtype=torch.int64),
         )
 
-        targets = {node.target for node in traced.graph.nodes}
-        self.assertIn(torch.ops.recir.tbe_forward.default, targets)
+        forwards = [
+            node
+            for node in traced.graph.nodes
+            if node.target == torch.ops.recir.tbe_forward.default
+        ]
+        self.assertEqual(len(forwards), 1)
+        learning_rate = forwards[0].args[4]
+        self.assertIsInstance(learning_rate, torch.fx.Node)
+        self.assertEqual(learning_rate.meta["val"].device.type, "cpu")
+        self.assertEqual(learning_rate.meta["val"].shape, torch.Size([]))
 
-    def test_fake_trace_contains_tbe_backward_update(self) -> None:
+    def test_fake_trace_contains_tbe_backward_update_boundary(self) -> None:
         group = self._group()
 
         def train_step(indices: torch.Tensor, offsets: torch.Tensor) -> torch.Tensor:
@@ -64,8 +72,12 @@ class LocalTBETraceTest(unittest.TestCase):
             torch.tensor([0, 2], dtype=torch.int64),
         )
 
-        targets = {node.target for node in traced.graph.nodes}
-        self.assertIn(torch.ops.recir.tbe_backward_update.default, targets)
+        updates = [
+            node
+            for node in traced.graph.nodes
+            if node.target == torch.ops.recir.tbe_backward_update.default
+        ]
+        self.assertEqual(len(updates), 1)
 
     def test_grouped_features_trace_to_one_tbe_forward(self) -> None:
         with patch(
