@@ -14,7 +14,9 @@ from recir.tbe.local import LocalTBEGroup, LocalTBETable
 
 class LocalTBEGroupTest(unittest.TestCase):
     def _make_group(
-        self, learning_rate_tensor: torch.Tensor | None = None
+        self,
+        learning_rate_tensor: torch.Tensor | None = None,
+        segments_per_feature: int = 1,
     ) -> LocalTBEGroup:
         with patch(
             "fbgemm_gpu.config.feature_list.FeatureGate.is_enabled",
@@ -32,6 +34,7 @@ class LocalTBEGroupTest(unittest.TestCase):
                 learning_rate_tensor=learning_rate_tensor,
                 eps=1.0e-8,
                 stochastic_rounding=False,
+                segments_per_feature=segments_per_feature,
             )
         group.load_table_weights(
             (
@@ -68,7 +71,7 @@ class LocalTBEGroupTest(unittest.TestCase):
         torch.testing.assert_close(before[1][0], after[1][0])
 
     def test_features_share_one_grouped_tbe_call(self) -> None:
-        group = self._make_group()
+        group = self._make_group(segments_per_feature=4)
         table_0_indices = torch.tensor([1, 3], dtype=torch.int64)
         table_1_indices = torch.tensor([0, 2, 5], dtype=torch.int64)
 
