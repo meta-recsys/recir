@@ -13,7 +13,9 @@ from recir.tbe.local import LocalTBEGroup, LocalTBETable
 
 
 class LocalTBEGroupTest(unittest.TestCase):
-    def _make_group(self) -> LocalTBEGroup:
+    def _make_group(
+        self, learning_rate_tensor: torch.Tensor | None = None
+    ) -> LocalTBEGroup:
         with patch(
             "fbgemm_gpu.config.feature_list.FeatureGate.is_enabled",
             return_value=False,
@@ -27,6 +29,7 @@ class LocalTBEGroupTest(unittest.TestCase):
                 device=torch.device("cpu"),
                 weight_dtype=torch.float32,
                 learning_rate=0.1,
+                learning_rate_tensor=learning_rate_tensor,
                 eps=1.0e-8,
                 stochastic_rounding=False,
             )
@@ -74,3 +77,34 @@ class LocalTBEGroupTest(unittest.TestCase):
 
         torch.testing.assert_close(actual_0, table_0[table_0_indices])
         torch.testing.assert_close(actual_1, table_1[table_1_indices])
+
+    def test_runtime_learning_rate_controls_fused_update(self) -> None:
+        learning_rate = torch.tensor(0.1, dtype=torch.float32)
+        dynamic_group = self._make_group(learning_rate)
+        constant_group = self._make_group()
+        indices = torch.tensor([1, 2], dtype=torch.int64)
+        offsets = torch.tensor([0, 1, 2], dtype=torch.int64)
+
+        dynamic_group.forward_flat(indices, offsets).sum().backward()
+        constant_group.forward_flat(indices, offsets).sum().backward()
+        dynamic_before = [
+            weight.clone() for weight in dynamic_group.split_embedding_weights()
+        ]
+        constant_before = [
+            weight.clone() for weight in constant_group.split_embedding_weights()
+        ]
+
+        learning_rate.fill_(0.2)
+        dynamic_group.forward_flat(indices, offsets).sum().backward()
+        constant_group.forward_flat(indices, offsets).sum().backward()
+
+        dynamic_after = dynamic_group.split_embedding_weights()
+        constant_after = constant_group.split_embedding_weights()
+        torch.testing.assert_close(
+            dynamic_before[0][1] - dynamic_after[0][1],
+            2 * (constant_before[0][1] - constant_after[0][1]),
+        )
+        torch.testing.assert_close(
+            dynamic_before[1][2] - dynamic_after[1][2],
+            2 * (constant_before[1][2] - constant_after[1][2]),
+        )
