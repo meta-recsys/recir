@@ -87,6 +87,7 @@ class TBESparseEmbeddingTransformTest(unittest.TestCase):
     def test_recir_tbe_ops_have_meta_kernels(self) -> None:
         for op_name in (
             "bucketize_sparse_features",
+            "dedup_sparse_features",
             "permute_sparse_data",
             "tbe_forward",
             "tbe_backward_update",
@@ -101,6 +102,7 @@ class TBESparseEmbeddingTransformTest(unittest.TestCase):
         rank: int = 0,
         model: _TwoTableModel | None = None,
         num_embeddings_map: dict[str, int] | None = None,
+        use_index_dedup: bool = False,
         learning_rate_tensor: torch.Tensor | None = None,
         meta_optimizer_state: bool = False,
     ) -> tuple[TBESparseEmbeddingTransform, _TwoTableModel, fx.GraphModule]:
@@ -136,6 +138,7 @@ class TBESparseEmbeddingTransformTest(unittest.TestCase):
             },
             stochastic_rounding=False,
             segments_per_feature=4,
+            use_index_dedup=use_index_dedup,
         )
         transform.prepare_after_shard(model, optimizers)
         called: OrderedDict[str, tuple[nn.Module, tuple[Any, ...], dict[str, Any]]] = (
@@ -192,6 +195,28 @@ class TBESparseEmbeddingTransformTest(unittest.TestCase):
         self.assertEqual(kwargs, {})
         torch.testing.assert_close(
             features.offsets(), torch.tensor([0, 1, 2], dtype=torch.int64)
+        )
+
+    def test_dedup_hash_metadata_covers_shared_table_features(self) -> None:
+        transform = TBESparseEmbeddingTransform(
+            {"table_0.weight", "table_1.weight"},
+            _mock_mesh(2),
+            num_embeddings_map={"table_0.weight": 16, "table_1.weight": 12},
+        )
+        node = fx.Graph().placeholder("feature")
+        sites = (
+            (node, node, "table_0.weight"),
+            (node, node, "table_0.weight"),
+            (node, node, "table_1.weight"),
+        )
+
+        self.assertEqual(
+            transform._dedup_hash_size_cumsum(sites),
+            (0, 0, 16, 28),
+        )
+        self.assertEqual(
+            transform._dedup_hash_size_offset(sites),
+            (0, 2, 2, 3),
         )
 
     def test_inner_transform_groups_local_lookups(self) -> None:
@@ -355,4 +380,57 @@ class TBESparseEmbeddingTransformTest(unittest.TestCase):
         self.assertFalse(any("aten.argsort" in target for target in targets))
         self.assertFalse(
             any("embedding_dense_backward" in target for target in targets)
+        )
+
+    def test_outer_transform_deduplicates_before_routing(self) -> None:
+        transform, model, gm = self._transform(world_size=2, use_index_dedup=True)
+
+        def train_step(
+            indices_0: torch.Tensor,
+            indices_1: torch.Tensor,
+        ) -> torch.Tensor:
+            output_0, output_1 = gm(
+                model.table_0.weight,
+                model.table_1.weight,
+                indices_0,
+                indices_1,
+            )
+            output = output_0.sum() + output_1.sum()
+            output.backward()
+            return output.detach()
+
+        with patch(
+            "fbgemm_gpu.config.feature_list.FeatureGate.is_enabled",
+            return_value=False,
+        ):
+            joint = make_fx(
+                train_step,
+                tracing_mode="fake",
+                _allow_non_fake_inputs=True,
+            )(
+                torch.tensor([1, 1], dtype=torch.int64),
+                torch.tensor([0, 2, 2], dtype=torch.int64),
+            )
+        transform.finalize_compiled_graph(joint)
+
+        targets = [str(node.target) for node in joint.graph.nodes]
+        self.assertEqual(
+            sum("recir.dedup_sparse_features" in target for target in targets), 1
+        )
+        index_select_nodes = [
+            node
+            for node in joint.graph.nodes
+            if node.target == torch.ops.aten.index_select.default
+        ]
+        self.assertEqual(len(index_select_nodes), 1)
+        reverse_indices = index_select_nodes[0].args[2]
+        if not isinstance(reverse_indices, fx.Node):
+            raise AssertionError(
+                f"Expected FX reverse-indices node, got {type(reverse_indices)}."
+            )
+        self.assertEqual(reverse_indices.target, torch.ops.aten.view.default)
+        self.assertEqual(sum("aten.index_add" in target for target in targets), 1)
+        self.assertEqual(
+            sum("_c10d_functional.all_to_all_single" in target for target in targets),
+            4,
         )
