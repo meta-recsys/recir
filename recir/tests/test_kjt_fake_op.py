@@ -85,7 +85,10 @@ class KjtSplitPerFeatureTest(unittest.TestCase):
             seed=42,
         )
         out = torch.ops.recir_torchrec.kjt_split_per_feature(
-            kjt.values(), kjt.offsets(), kjt.stride(), len(kjt.keys())
+            kjt.values(),
+            kjt.offsets(),
+            kjt.stride(),
+            len(kjt.keys()),
         )
         # Manual: per-key slices of values along key-major lengths layout.
         # f0: lengths [2, 3] -> values[0:5]

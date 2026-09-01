@@ -29,7 +29,7 @@ import torch.nn as nn
 from functorch import make_fx
 from recir.region_transforms.base import RegionTransform
 from recir.region_transforms.sparse_embedding import _declare_split_invariants
-from recir.tbe.local import LocalTBEGroup, LocalTBETable
+from recir.tbe.local import LocalTBEGroup, LocalTBETable, nobag_tbe_offsets
 from torch._subclasses.fake_tensor import unset_fake_temporarily
 from torch.distributed.tensor import DeviceMesh
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
@@ -133,6 +133,15 @@ def _split_lists(
     )
 
 
+def _row_wise_block_size(num_rows: int, world_size: int) -> int:
+    return (num_rows + world_size - 1) // world_size
+
+
+def _row_wise_local_rows(num_rows: int, world_size: int, rank: int) -> int:
+    block_size = _row_wise_block_size(num_rows, world_size)
+    return max(0, min(block_size, num_rows - rank * block_size))
+
+
 def route_row_wise_indices_grouped(
     *feature_indices: torch.Tensor,
     num_embeddings: tuple[int, ...],
@@ -146,109 +155,142 @@ def route_row_wise_indices_grouped(
     torch.Tensor,
     torch.Tensor,
     torch.Tensor,
+    torch.Tensor,
 ]:
     """Route a TBE feature group with one counts and one indices all-to-all."""
     feature_count = len(feature_indices)
     if feature_count != len(num_embeddings):
         raise ValueError("Feature and table cardinality counts must match.")
 
-    local_indices: list[torch.Tensor] = []
-    route_keys: list[torch.Tensor] = []
-    for feature, (indices, rows) in enumerate(zip(feature_indices, num_embeddings)):
-        flat_indices = indices.reshape(-1)
-        local_rows = rows // world_size
-        ranks = flat_indices // local_rows
-        local_indices.append(flat_indices % local_rows)
-        route_keys.append(ranks * feature_count + feature)
-
-    packed_local_indices = torch.cat(local_indices)
-    packed_route_keys = torch.cat(route_keys)
-    send_order = torch.argsort(packed_route_keys, stable=True)
-    restore_order = torch.argsort(send_order)
-    send_counts = torch.stack(
-        [
-            (packed_route_keys == segment).sum()
-            for segment in range(world_size * feature_count)
-        ]
+    packed_lengths = torch.stack(
+        tuple(
+            torch.scalar_tensor(
+                indices.shape[0],
+                dtype=torch.int64,
+                device=indices.device,
+            )
+            for indices in feature_indices
+        )
+    )
+    packed_indices = torch.cat(
+        tuple(indices.reshape(-1) for indices in feature_indices)
+    )
+    block_sizes = torch.stack(
+        tuple(
+            packed_indices.new_full((), _row_wise_block_size(rows, world_size))
+            for rows in num_embeddings
+        )
+    )
+    (
+        send_counts,
+        bucketized_indices,
+        bucketize_permute,
+        unbucketize_permute,
+    ) = torch.ops.recir.bucketize_sparse_features(
+        packed_lengths,
+        packed_indices,
+        block_sizes,
+        world_size,
     )
 
+    segments_per_rank = feature_count
     received_counts = torch.ops._c10d_functional.all_to_all_single(
         send_counts,
-        [feature_count] * world_size,
-        [feature_count] * world_size,
+        [segments_per_rank] * world_size,
+        [segments_per_rank] * world_size,
         group_name,
     )
     received_counts = torch.ops._c10d_functional.wait_tensor(received_counts)
-    input_splits = send_counts.reshape(world_size, feature_count).sum(dim=1)
-    output_splits = received_counts.reshape(world_size, feature_count).sum(dim=1)
+    input_splits = send_counts.reshape(world_size, segments_per_rank).sum(dim=1)
+    output_splits = received_counts.reshape(world_size, segments_per_rank).sum(dim=1)
     input_split_list, output_split_list, cpu_splits = _materialize_splits(
         input_splits, output_splits
     )
-    _declare_split_invariants(input_split_list, packed_local_indices.shape[0])
+    _declare_split_invariants(input_split_list, packed_indices.shape[0])
     _declare_split_invariants(output_split_list)
 
     received_indices = torch.ops._c10d_functional.all_to_all_single(
-        packed_local_indices[send_order],
+        bucketized_indices,
         output_split_list,
         input_split_list,
         group_name,
     )
     received_indices = torch.ops._c10d_functional.wait_tensor(received_indices)
 
-    source_feature_segments = torch.repeat_interleave(
+    receive_recat = (
         torch.arange(
             world_size * feature_count,
-            dtype=torch.int64,
+            dtype=torch.int32,
             device=received_counts.device,
-        ),
+        )
+        .reshape(world_size, feature_count)
+        .permute(1, 0)
+        .reshape(-1)
+    )
+    feature_major_counts, feature_major_indices = torch.ops.recir.permute_sparse_data(
+        receive_recat,
         received_counts,
-        output_size=received_indices.shape[0],
+        received_indices,
     )
-    receive_keys = (source_feature_segments % feature_count) * world_size + torch.div(
-        source_feature_segments, feature_count, rounding_mode="floor"
-    )
-    receive_order = torch.argsort(receive_keys, stable=True)
-    receive_restore_order = torch.argsort(receive_order)
-    feature_lengths = received_counts.reshape(world_size, feature_count).sum(dim=0)
+    received_feature_lengths = feature_major_counts.reshape(
+        feature_count, world_size
+    ).sum(dim=1)
     return (
-        received_indices[receive_order],
-        feature_lengths,
-        send_order,
-        restore_order,
-        receive_order,
-        receive_restore_order,
+        feature_major_indices,
+        received_feature_lengths,
+        bucketize_permute,
+        unbucketize_permute,
+        receive_recat,
+        received_counts,
+        feature_major_counts,
         cpu_splits,
     )
 
 
 def return_row_wise_embeddings_grouped(
     local_embeddings: torch.Tensor,
-    restore_order: torch.Tensor,
-    receive_restore_order: torch.Tensor,
+    unbucketize_permute: torch.Tensor,
+    feature_major_counts: torch.Tensor,
     cpu_splits: torch.Tensor,
     group_name: str,
     world_size: int,
 ) -> torch.Tensor:
     """Return one grouped TBE output and restore original feature order."""
     input_splits, output_splits = _split_lists(cpu_splits, world_size)
-    _declare_split_invariants(input_splits, restore_order.shape[0])
+    _declare_split_invariants(input_splits, unbucketize_permute.shape[0])
     _declare_split_invariants(output_splits, local_embeddings.shape[0])
     embedding_dim = local_embeddings.shape[1]
-    source_major_embeddings = local_embeddings[receive_restore_order]
+    feature_count = feature_major_counts.shape[0] // world_size
+    feature_to_source_recat = (
+        torch.arange(
+            world_size * feature_count,
+            dtype=torch.int32,
+            device=local_embeddings.device,
+        )
+        .reshape(feature_count, world_size)
+        .permute(1, 0)
+        .reshape(-1)
+    )
+    _, source_major_embeddings = torch.ops.recir.permute_sparse_data(
+        feature_to_source_recat,
+        feature_major_counts * embedding_dim,
+        local_embeddings.reshape(-1),
+    )
     returned = torch.ops._c10d_functional.all_to_all_single(
-        source_major_embeddings.reshape(-1),
+        source_major_embeddings,
         [size * embedding_dim for size in input_splits],
         [size * embedding_dim for size in output_splits],
         group_name,
     )
     returned = torch.ops._c10d_functional.wait_tensor(returned)
-    return returned.reshape(-1, embedding_dim)[restore_order]
+    return returned.reshape(-1, embedding_dim)[unbucketize_permute]
 
 
 def route_row_wise_gradients_grouped(
     gradients: torch.Tensor,
-    send_order: torch.Tensor,
-    receive_order: torch.Tensor,
+    bucketize_permute: torch.Tensor,
+    receive_recat: torch.Tensor,
+    received_counts: torch.Tensor,
     cpu_splits: torch.Tensor,
     group_name: str,
     world_size: int,
@@ -258,13 +300,18 @@ def route_row_wise_gradients_grouped(
     _declare_split_invariants(input_splits, gradients.shape[0])
     embedding_dim = gradients.shape[1]
     received = torch.ops._c10d_functional.all_to_all_single(
-        gradients[send_order].reshape(-1),
+        gradients[bucketize_permute].reshape(-1),
         [size * embedding_dim for size in output_splits],
         [size * embedding_dim for size in input_splits],
         group_name,
     )
     received = torch.ops._c10d_functional.wait_tensor(received)
-    return received.reshape(-1, embedding_dim)[receive_order]
+    _, feature_major_gradients = torch.ops.recir.permute_sparse_data(
+        receive_recat,
+        received_counts * embedding_dim,
+        received,
+    )
+    return feature_major_gradients.reshape(-1, embedding_dim)
 
 
 def _inline_before(
@@ -306,7 +353,10 @@ class TBESparseEmbeddingTransform(RegionTransform):
         learning_rate: float = 0.1,
         eps: float = 1.0e-8,
         stochastic_rounding: bool = True,
+        segments_per_feature: int = 128,
     ) -> None:
+        if segments_per_feature <= 0:
+            raise ValueError("TBE segments per feature must be positive.")
         self.embedding_param_fqns = embedding_param_fqns
         self._source_fqns = set(embedding_param_fqns)
         self.mesh = mesh
@@ -326,6 +376,7 @@ class TBESparseEmbeddingTransform(RegionTransform):
         self._optimizers: tuple[torch.optim.Optimizer, ...] = ()
         self._compiled_groups: list[_CompiledGroup] = []
         self._forward_root_fqn: str | None = None
+        self._segments_per_feature: int = segments_per_feature
 
     def select_forward_root_fqns(
         self,
@@ -376,11 +427,18 @@ class TBESparseEmbeddingTransform(RegionTransform):
         global_rows = self.num_embeddings_map.get(
             fqn, int(parameter.shape[0]) * self.world_size
         )
-        if global_rows != int(parameter.shape[0]) * self.world_size:
+        coordinate = self.mesh.get_coordinate()
+        if coordinate is None:
+            raise RuntimeError("Current rank is not part of the TBE device mesh.")
+        rank = coordinate[0]
+        local_rows = int(parameter.shape[0])
+        expected_local_rows = _row_wise_local_rows(global_rows, self.world_size, rank)
+        if local_rows != expected_local_rows:
             raise NotImplementedError(
-                "TBE sparse routing currently requires even row-wise shards; "
-                f"{fqn!r} has global_rows={global_rows}, "
-                f"local_rows={int(parameter.shape[0])}, world_size={self.world_size}."
+                "TBE sparse routing requires contiguous torch.chunk-style row-wise "
+                f"shards; {fqn!r} has global_rows={global_rows}, "
+                f"local_rows={local_rows}, expected_local_rows={expected_local_rows}, "
+                f"rank={rank}, world_size={self.world_size}."
             )
         found: list[tuple[torch.optim.Optimizer, dict[str, Any]]] = []
         for optimizer in self._optimizers:
@@ -541,6 +599,7 @@ class TBESparseEmbeddingTransform(RegionTransform):
                 learning_rate_tensor=first_state.settings.learning_rate_tensor,
                 eps=first_state.settings.eps,
                 stochastic_rounding=first_state.settings.stochastic_rounding,
+                segments_per_feature=self._segments_per_feature,
             )
             local_tbe.load_table_weights(
                 tuple(self._table_states[fqn].parameter for fqn in table_fqns)
@@ -603,7 +662,12 @@ class TBESparseEmbeddingTransform(RegionTransform):
                 source_sum = state.optimizer_state["sum"]
                 if isinstance(source_sum, torch.Tensor) and tbe_states[table_index]:
                     destination = tbe_states[table_index][0]
-                    destination.copy_(source_sum.reshape(destination.shape))
+                    reshaped_source = source_sum.reshape(destination.shape)
+                    if reshaped_source.is_meta:
+                        # Primed meta Adagrad state represents zero initialization.
+                        destination.zero_()
+                    else:
+                        destination.copy_(reshaped_source)
             if state.optimizer is not None and state.optimizer_group is not None:
                 state.optimizer_group["params"] = [
                     parameter
@@ -716,28 +780,31 @@ class TBESparseEmbeddingTransform(RegionTransform):
         )
         (
             received_indices,
-            received_feature_lengths,
-            send_order,
-            restore_order,
-            receive_order,
-            receive_restore_order,
+            received_lengths,
+            bucketize_permute,
+            unbucketize_permute,
+            receive_recat,
+            received_counts,
+            feature_major_counts,
             cpu_splits,
         ) = output
 
-        with gm.graph.inserting_before(forward):
-            zero = gm.graph.call_function(
-                torch.ops.aten.new_zeros.default, args=(received_feature_lengths, [1])
-            )
-            offsets = gm.graph.call_function(
-                torch.ops.aten.cumsum.default,
-                args=(
-                    gm.graph.call_function(
-                        torch.ops.aten.cat.default,
-                        args=([zero, received_feature_lengths],),
-                    ),
-                    0,
+        offsets, _ = _inline_before(
+            gm,
+            forward,
+            partial(
+                nobag_tbe_offsets,
+                segments_per_feature=self._segments_per_feature,
+            ),
+            (
+                torch.ones(
+                    (feature_count,),
+                    dtype=torch.int64,
+                    device=group.device,
                 ),
-            )
+            ),
+            (received_lengths,),
+        )
         forward_args = list(forward.args)
         forward_args[5] = received_indices
         forward_args[6] = offsets
@@ -789,10 +856,19 @@ class TBESparseEmbeddingTransform(RegionTransform):
                     device=group.device,
                 ),
                 torch.arange(feature_count * _PLACEHOLDER_SIZE, device=group.device),
-                torch.arange(feature_count * _PLACEHOLDER_SIZE, device=group.device),
+                torch.ones(
+                    (feature_count * self.world_size,),
+                    dtype=torch.int64,
+                    device=group.device,
+                ),
                 torch.ones((2 * self.world_size,), dtype=torch.int64),
             ),
-            (forward_output, restore_order, receive_restore_order, cpu_splits),
+            (
+                forward_output,
+                unbucketize_permute,
+                feature_major_counts,
+                cpu_splits,
+            ),
         )
         split_node.args = (returned_output, original_lengths)
 
@@ -800,8 +876,9 @@ class TBESparseEmbeddingTransform(RegionTransform):
             gm,
             forward,
             group,
-            send_order,
-            receive_order,
+            bucketize_permute,
+            receive_recat,
+            received_counts,
             cpu_splits,
         )
 
@@ -810,8 +887,9 @@ class TBESparseEmbeddingTransform(RegionTransform):
         gm: fx.GraphModule,
         forward: fx.Node,
         group: _CompiledGroup,
-        send_order: fx.Node,
-        receive_order: fx.Node,
+        bucketize_permute: fx.Node,
+        receive_recat: fx.Node,
+        received_counts: fx.Node,
         cpu_splits: fx.Node,
     ) -> None:
         backward = next(
@@ -844,10 +922,25 @@ class TBESparseEmbeddingTransform(RegionTransform):
                     device=group.device,
                 ),
                 torch.arange(len(group.sites) * _PLACEHOLDER_SIZE, device=group.device),
-                torch.arange(len(group.sites) * _PLACEHOLDER_SIZE, device=group.device),
+                torch.arange(
+                    len(group.sites) * self.world_size,
+                    dtype=torch.int32,
+                    device=group.device,
+                ),
+                torch.ones(
+                    (len(group.sites) * self.world_size,),
+                    dtype=torch.int64,
+                    device=group.device,
+                ),
                 torch.ones((2 * self.world_size,), dtype=torch.int64),
             ),
-            (grad_output, send_order, receive_order, cpu_splits),
+            (
+                grad_output,
+                bucketize_permute,
+                receive_recat,
+                received_counts,
+                cpu_splits,
+            ),
         )
         backward_args = list(backward.args)
         backward_args[4] = packed_grad

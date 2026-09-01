@@ -21,10 +21,10 @@ from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
 
 class _TwoTableModel(nn.Module):
-    def __init__(self) -> None:
+    def __init__(self, rows_0: int = 8, rows_1: int = 6) -> None:
         super().__init__()
-        self.table_0 = nn.Embedding(8, 4)
-        self.table_1 = nn.Embedding(6, 4)
+        self.table_0 = nn.Embedding(rows_0, 4)
+        self.table_1 = nn.Embedding(rows_1, 4)
 
 
 class _TestRowWiseAdagrad(torch.optim.Optimizer):
@@ -46,7 +46,7 @@ class _TestRowWiseAdagrad(torch.optim.Optimizer):
         return None
 
 
-def _mock_mesh(world_size: int) -> DeviceMesh:
+def _mock_mesh(world_size: int, rank: int = 0) -> DeviceMesh:
     mesh = MagicMock(spec=DeviceMesh)
     mesh.ndim = 1
     mesh.shape = (world_size,)
@@ -54,6 +54,7 @@ def _mock_mesh(world_size: int) -> DeviceMesh:
     mesh.mesh = torch.arange(world_size)
     mesh._flatten.return_value = mesh
     mesh.size.return_value = world_size
+    mesh.get_coordinate.return_value = [rank]
     mesh._dim_group_names = ["fake_tbe_sparse_test_group"]
     return mesh
 
@@ -84,16 +85,27 @@ def _embedding_graph(model: _TwoTableModel) -> fx.GraphModule:
 
 class TBESparseEmbeddingTransformTest(unittest.TestCase):
     def test_recir_tbe_ops_have_meta_kernels(self) -> None:
-        for op_name in ("tbe_forward", "tbe_backward_update"):
+        for op_name in (
+            "bucketize_sparse_features",
+            "permute_sparse_data",
+            "tbe_forward",
+            "tbe_backward_update",
+        ):
             table = torch._C._dispatch_dump_table(f"recir::{op_name}")
             self.assertIn("Meta:", table, table)
 
     def _transform(
         self,
         world_size: int,
+        *,
+        rank: int = 0,
+        model: _TwoTableModel | None = None,
+        num_embeddings_map: dict[str, int] | None = None,
         learning_rate_tensor: torch.Tensor | None = None,
+        meta_optimizer_state: bool = False,
     ) -> tuple[TBESparseEmbeddingTransform, _TwoTableModel, fx.GraphModule]:
-        model = _TwoTableModel()
+        if model is None:
+            model = _TwoTableModel()
         gm = _embedding_graph(model)
         optimizers: tuple[torch.optim.Optimizer, ...] = ()
         if learning_rate_tensor is not None:
@@ -103,15 +115,27 @@ class TBESparseEmbeddingTransformTest(unittest.TestCase):
                     learning_rate_tensor,
                 ),
             )
+        if meta_optimizer_state:
+            if not optimizers:
+                raise ValueError("Meta optimizer state requires an optimizer.")
+            optimizer = optimizers[0]
+            for parameter in model.parameters():
+                optimizer.state[parameter]["sum"] = torch.empty(
+                    (parameter.shape[0], 1),
+                    dtype=torch.float32,
+                    device="meta",
+                )
         transform = TBESparseEmbeddingTransform(
             {"table_0.weight", "table_1.weight"},
-            _mock_mesh(world_size),
+            _mock_mesh(world_size, rank),
             model,
-            num_embeddings_map={
+            num_embeddings_map=num_embeddings_map
+            or {
                 "table_0.weight": 8 * world_size,
                 "table_1.weight": 6 * world_size,
             },
             stochastic_rounding=False,
+            segments_per_feature=4,
         )
         transform.prepare_after_shard(model, optimizers)
         called: OrderedDict[str, tuple[nn.Module, tuple[Any, ...], dict[str, Any]]] = (
@@ -135,6 +159,23 @@ class TBESparseEmbeddingTransformTest(unittest.TestCase):
 
         group = gm.get_submodule("_recir_tbe_group_0")
         self.assertIs(group.get_buffer("_recir_learning_rate"), learning_rate)
+
+    def test_inner_transform_initializes_meta_optimizer_state(self) -> None:
+        _transform, _model, gm = self._transform(
+            world_size=1,
+            learning_rate_tensor=torch.tensor(0.1, dtype=torch.float32),
+            meta_optimizer_state=True,
+        )
+
+        group: Any = gm.get_submodule("_recir_tbe_group_0")
+        optimizer_states = group.split_optimizer_states()
+        self.assertEqual(len(optimizer_states), 2)
+        for table_states in optimizer_states:
+            self.assertEqual(len(table_states), 1)
+            torch.testing.assert_close(
+                table_states[0],
+                torch.zeros_like(table_states[0]),
+            )
 
     def test_transform_inputs_materializes_kjt_offsets(self) -> None:
         transform = TBESparseEmbeddingTransform(set(), _mock_mesh(1))
@@ -183,11 +224,54 @@ class TBESparseEmbeddingTransformTest(unittest.TestCase):
         self.assertFalse(torch.equal(model.table_0.weight, weight_0_before))
         self.assertFalse(torch.equal(model.table_1.weight, weight_1_before))
 
+    def test_inner_transform_accepts_short_final_shard(self) -> None:
+        local_model = _TwoTableModel(rows_0=7)
+        _transform, model, gm = self._transform(
+            world_size=2,
+            rank=1,
+            model=local_model,
+            num_embeddings_map={
+                "table_0.weight": 15,
+                "table_1.weight": 12,
+            },
+        )
+        indices_0 = torch.tensor([0, 6], dtype=torch.int64)
+        indices_1 = torch.tensor([0, 5], dtype=torch.int64)
+
+        actual_0, actual_1 = gm(
+            model.table_0.weight,
+            model.table_1.weight,
+            indices_0,
+            indices_1,
+        )
+
+        torch.testing.assert_close(actual_0, model.table_0.weight[indices_0])
+        torch.testing.assert_close(actual_1, model.table_1.weight[indices_1])
+
+    def test_inner_transform_rejects_non_chunk_shard(self) -> None:
+        with self.assertRaisesRegex(NotImplementedError, "expected_local_rows=7"):
+            self._transform(
+                world_size=2,
+                rank=1,
+                model=_TwoTableModel(rows_0=6),
+                num_embeddings_map={
+                    "table_0.weight": 15,
+                    "table_1.weight": 12,
+                },
+            )
+
     def test_outer_transform_keeps_collectives_and_fused_tbe(self) -> None:
-        transform, model, gm = self._transform(world_size=2)
+        transform, model, gm = self._transform(
+            world_size=2,
+            num_embeddings_map={
+                "table_0.weight": 15,
+                "table_1.weight": 11,
+            },
+        )
 
         def train_step(
-            indices_0: torch.Tensor, indices_1: torch.Tensor
+            indices_0: torch.Tensor,
+            indices_1: torch.Tensor,
         ) -> torch.Tensor:
             output_0, output_1 = gm(
                 model.table_0.weight,
@@ -212,9 +296,17 @@ class TBESparseEmbeddingTransformTest(unittest.TestCase):
                 torch.tensor([0, 2, 5], dtype=torch.int64),
             )
         transform.finalize_compiled_graph(joint)
-
         targets = [str(node.target) for node in joint.graph.nodes]
-        self.assertEqual(sum("recir.tbe_forward" in target for target in targets), 1)
+        forward_nodes = [
+            node
+            for node in joint.graph.nodes
+            if node.target == torch.ops.recir.tbe_forward.default
+        ]
+        self.assertEqual(len(forward_nodes), 1)
+        offsets = forward_nodes[0].args[6]
+        if not isinstance(offsets, fx.Node):
+            raise AssertionError(f"Expected FX offsets node, got {type(offsets)}.")
+        self.assertEqual(len(offsets.meta["val"].shape), 1)
         self.assertEqual(
             sum("recir.tbe_backward_update" in target for target in targets), 1
         )
@@ -222,6 +314,45 @@ class TBESparseEmbeddingTransformTest(unittest.TestCase):
             sum("_c10d_functional.all_to_all_single" in target for target in targets),
             4,
         )
+        bucketize_nodes = [
+            node
+            for node in joint.graph.nodes
+            if node.target == torch.ops.recir.bucketize_sparse_features.default
+        ]
+        self.assertEqual(len(bucketize_nodes), 1)
+        block_sizes = bucketize_nodes[0].args[2]
+        if not isinstance(block_sizes, fx.Node):
+            raise AssertionError(
+                f"Expected FX block-sizes node, got {type(block_sizes)}."
+            )
+        self.assertEqual(block_sizes.target, torch.ops.aten.stack.default)
+        block_size_parts = block_sizes.args[0]
+        if not isinstance(block_size_parts, (list, tuple)):
+            raise AssertionError("Expected one block size per routed feature.")
+        block_size_values: list[Any] = []
+        for part in block_size_parts:
+            if not isinstance(part, fx.Node):
+                raise AssertionError(f"Expected FX block-size node, got {type(part)}.")
+            block_size_values.append(part.args[2])
+        self.assertEqual(tuple(block_size_values), (8, 6))
+        packed_lengths = bucketize_nodes[0].args[0]
+        if not isinstance(packed_lengths, fx.Node):
+            raise AssertionError(
+                f"Expected FX packed-lengths node, got {type(packed_lengths)}."
+            )
+        self.assertEqual(packed_lengths.target, torch.ops.aten.stack.default)
+        length_parts = packed_lengths.args[0]
+        if not isinstance(length_parts, (list, tuple)):
+            raise AssertionError(
+                "Expected packed lengths to contain one scalar per feature."
+            )
+        self.assertEqual(len(length_parts), 2)
+        self.assertTrue(all(isinstance(part, fx.Node) for part in length_parts))
+        self.assertEqual(
+            sum("recir.permute_sparse_data" in target for target in targets),
+            3,
+        )
+        self.assertFalse(any("aten.argsort" in target for target in targets))
         self.assertFalse(
             any("embedding_dense_backward" in target for target in targets)
         )
