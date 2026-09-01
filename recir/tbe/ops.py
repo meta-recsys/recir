@@ -42,6 +42,59 @@ _TBE_ITER_CPU: dict[int, _HostIterationCounter] = {}
 _NEXT_CONTEXT = itertools.count()
 
 
+@torch.library.custom_op("recir::dedup_sparse_features", mutates_args=())
+def dedup_sparse_features(
+    feature_lengths: torch.Tensor,
+    indices: torch.Tensor,
+    hash_size_cumsum: list[int],
+    hash_size_offset: list[int],
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Deduplicate EC indices using TorchRec's FBGEMM primitive."""
+    if len(hash_size_cumsum) != len(hash_size_offset):
+        raise ValueError("Dedup hash metadata must have one entry per feature.")
+    if not hash_size_offset or hash_size_offset[-1] != len(hash_size_offset) - 1:
+        raise ValueError("Dedup hash offsets must cover every feature.")
+    offsets = torch.cat((feature_lengths.new_zeros((1,)), feature_lengths)).cumsum(
+        dim=0
+    )
+    hash_size_cumsum_tensor = torch.tensor(
+        hash_size_cumsum,
+        dtype=torch.int64,
+        device=indices.device,
+    )
+    hash_size_offset_tensor = torch.tensor(
+        hash_size_offset,
+        dtype=torch.int64,
+        device=indices.device,
+    )
+    dedup_lengths, _dedup_offsets, unique_indices, reverse_indices = (
+        torch.ops.fbgemm.jagged_unique_indices(
+            hash_size_cumsum_tensor,
+            hash_size_offset_tensor,
+            offsets.to(torch.int64),
+            indices.to(torch.int64),
+        )
+    )
+    return dedup_lengths, unique_indices, reverse_indices
+
+
+@dedup_sparse_features.register_fake
+def _fake_dedup_sparse_features(
+    feature_lengths: torch.Tensor,
+    indices: torch.Tensor,
+    hash_size_cumsum: list[int],
+    hash_size_offset: list[int],
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    del hash_size_cumsum, hash_size_offset
+    unique_count = torch.library.get_ctx().new_dynamic_size()
+    torch._check_is_size(unique_count)
+    return (
+        feature_lengths.new_empty(feature_lengths.shape),
+        indices.new_empty((unique_count,), dtype=torch.int64),
+        indices.new_empty(indices.shape, dtype=torch.int64),
+    )
+
+
 @torch.library.custom_op("recir::bucketize_sparse_features", mutates_args=())
 def bucketize_sparse_features(
     feature_lengths: torch.Tensor,

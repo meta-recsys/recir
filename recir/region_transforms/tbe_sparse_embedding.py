@@ -20,6 +20,7 @@ from collections import OrderedDict
 from collections.abc import Sequence
 from dataclasses import dataclass
 from functools import partial
+from itertools import accumulate
 from typing import Any, cast
 
 import torch
@@ -99,6 +100,8 @@ class _FeatureSite:
 class _CompiledGroup:
     sites: tuple[_FeatureSite, ...]
     device: torch.device
+    hash_size_cumsum: tuple[int, ...]
+    hash_size_offset: tuple[int, ...]
 
 
 def _as_float(value: object, name: str) -> float:
@@ -147,7 +150,11 @@ def route_row_wise_indices_grouped(
     num_embeddings: tuple[int, ...],
     group_name: str,
     world_size: int,
+    use_index_dedup: bool,
+    hash_size_cumsum: tuple[int, ...],
+    hash_size_offset: tuple[int, ...],
 ) -> tuple[
+    torch.Tensor,
     torch.Tensor,
     torch.Tensor,
     torch.Tensor,
@@ -175,6 +182,24 @@ def route_row_wise_indices_grouped(
     packed_indices = torch.cat(
         tuple(indices.reshape(-1) for indices in feature_indices)
     )
+    if use_index_dedup:
+        dedup_lengths, unique_indices, reverse_indices = (
+            torch.ops.recir.dedup_sparse_features(
+                packed_lengths,
+                packed_indices,
+                list(hash_size_cumsum),
+                list(hash_size_offset),
+            )
+        )
+        packed_lengths = dedup_lengths.reshape(packed_lengths.shape)
+        reverse_indices = reverse_indices.reshape(packed_indices.shape)
+        packed_indices = unique_indices
+    else:
+        reverse_indices = torch.arange(
+            packed_indices.shape[0],
+            dtype=torch.int64,
+            device=packed_indices.device,
+        )
     block_sizes = torch.stack(
         tuple(
             packed_indices.new_full((), _row_wise_block_size(rows, world_size))
@@ -244,6 +269,7 @@ def route_row_wise_indices_grouped(
         received_counts,
         feature_major_counts,
         cpu_splits,
+        reverse_indices,
     )
 
 
@@ -289,16 +315,28 @@ def return_row_wise_embeddings_grouped(
 def route_row_wise_gradients_grouped(
     gradients: torch.Tensor,
     bucketize_permute: torch.Tensor,
+    reverse_indices: torch.Tensor,
     receive_recat: torch.Tensor,
     received_counts: torch.Tensor,
     cpu_splits: torch.Tensor,
     group_name: str,
     world_size: int,
+    use_index_dedup: bool,
 ) -> torch.Tensor:
     """Route packed feature gradients using grouped forward metadata."""
     input_splits, output_splits = _split_lists(cpu_splits, world_size)
-    _declare_split_invariants(input_splits, gradients.shape[0])
     embedding_dim = gradients.shape[1]
+    if use_index_dedup:
+        unique_gradients = gradients.new_zeros(
+            (bucketize_permute.shape[0], embedding_dim)
+        )
+        gradients = torch.index_add(
+            unique_gradients,
+            0,
+            reverse_indices,
+            gradients,
+        )
+    _declare_split_invariants(input_splits, gradients.shape[0])
     received = torch.ops._c10d_functional.all_to_all_single(
         gradients[bucketize_permute].reshape(-1),
         [size * embedding_dim for size in output_splits],
@@ -354,6 +392,7 @@ class TBESparseEmbeddingTransform(RegionTransform):
         eps: float = 1.0e-8,
         stochastic_rounding: bool = True,
         segments_per_feature: int = 128,
+        use_index_dedup: bool = True,
     ) -> None:
         if segments_per_feature <= 0:
             raise ValueError("TBE segments per feature must be positive.")
@@ -377,6 +416,7 @@ class TBESparseEmbeddingTransform(RegionTransform):
         self._compiled_groups: list[_CompiledGroup] = []
         self._forward_root_fqn: str | None = None
         self._segments_per_feature: int = segments_per_feature
+        self._use_index_dedup: bool = use_index_dedup
 
     def select_forward_root_fqns(
         self,
@@ -568,7 +608,14 @@ class TBESparseEmbeddingTransform(RegionTransform):
         owner = nn.ModuleDict()
         module.add_module(_TBE_ROOT_NAME, owner)
         for group_index, group_sites in enumerate(grouped.values()):
-            self._rewrite_group(gm, owner, group_index, group_sites)
+            table_order = tuple(dict.fromkeys(fqn for _, _, fqn in group_sites))
+            ordered_sites = tuple(
+                site
+                for table_fqn in table_order
+                for site in group_sites
+                if site[2] == table_fqn
+            )
+            self._rewrite_group(gm, owner, group_index, ordered_sites)
 
     def _rewrite_group(
         self,
@@ -645,8 +692,32 @@ class TBESparseEmbeddingTransform(RegionTransform):
                     for _, _, fqn in sites
                 ),
                 first_state.parameter.device,
+                self._dedup_hash_size_cumsum(sites),
+                self._dedup_hash_size_offset(sites),
             )
         )
+
+    def _dedup_hash_size_cumsum(
+        self,
+        sites: Sequence[tuple[fx.Node, fx.Node, str]],
+    ) -> tuple[int, ...]:
+        feature_hash_sizes: list[int] = []
+        for table_fqn in dict.fromkeys(fqn for _, _, fqn in sites):
+            table_feature_count = sum(fqn == table_fqn for _, _, fqn in sites)
+            feature_hash_sizes.extend([0] * (table_feature_count - 1))
+            feature_hash_sizes.append(self.num_embeddings_map[table_fqn])
+        return (0, *accumulate(feature_hash_sizes))
+
+    @staticmethod
+    def _dedup_hash_size_offset(
+        sites: Sequence[tuple[fx.Node, fx.Node, str]],
+    ) -> tuple[int, ...]:
+        feature_hash_size_lengths: list[int] = []
+        for table_fqn in dict.fromkeys(fqn for _, _, fqn in sites):
+            table_feature_count = sum(fqn == table_fqn for _, _, fqn in sites)
+            feature_hash_size_lengths.append(table_feature_count)
+            feature_hash_size_lengths.extend([0] * (table_feature_count - 1))
+        return (0, *accumulate(feature_hash_size_lengths))
 
     @torch.no_grad()
     def _migrate_group_state(
@@ -774,6 +845,9 @@ class TBESparseEmbeddingTransform(RegionTransform):
                 num_embeddings=tuple(site.global_rows for site in group.sites),
                 group_name=self.group_name,
                 world_size=self.world_size,
+                use_index_dedup=self._use_index_dedup,
+                hash_size_cumsum=group.hash_size_cumsum,
+                hash_size_offset=group.hash_size_offset,
             ),
             example_features,
             feature_nodes,
@@ -787,6 +861,7 @@ class TBESparseEmbeddingTransform(RegionTransform):
             received_counts,
             feature_major_counts,
             cpu_splits,
+            reverse_indices,
         ) = output
 
         offsets, _ = _inline_before(
@@ -870,6 +945,12 @@ class TBESparseEmbeddingTransform(RegionTransform):
                 cpu_splits,
             ),
         )
+        if self._use_index_dedup:
+            with gm.graph.inserting_before(split_node):
+                returned_output = gm.graph.call_function(
+                    torch.ops.aten.index_select.default,
+                    args=(returned_output, 0, reverse_indices),
+                )
         split_node.args = (returned_output, original_lengths)
 
         self._route_group_backward(
@@ -877,6 +958,7 @@ class TBESparseEmbeddingTransform(RegionTransform):
             forward,
             group,
             bucketize_permute,
+            reverse_indices,
             receive_recat,
             received_counts,
             cpu_splits,
@@ -888,6 +970,7 @@ class TBESparseEmbeddingTransform(RegionTransform):
         forward: fx.Node,
         group: _CompiledGroup,
         bucketize_permute: fx.Node,
+        reverse_indices: fx.Node,
         receive_recat: fx.Node,
         received_counts: fx.Node,
         cpu_splits: fx.Node,
@@ -915,12 +998,14 @@ class TBESparseEmbeddingTransform(RegionTransform):
                 route_row_wise_gradients_grouped,
                 group_name=self.group_name,
                 world_size=self.world_size,
+                use_index_dedup=self._use_index_dedup,
             ),
             (
                 torch.randn(
                     (len(group.sites) * _PLACEHOLDER_SIZE, embedding_dim),
                     device=group.device,
                 ),
+                torch.arange(len(group.sites) * _PLACEHOLDER_SIZE, device=group.device),
                 torch.arange(len(group.sites) * _PLACEHOLDER_SIZE, device=group.device),
                 torch.arange(
                     len(group.sites) * self.world_size,
@@ -937,6 +1022,7 @@ class TBESparseEmbeddingTransform(RegionTransform):
             (
                 grad_output,
                 bucketize_permute,
+                reverse_indices,
                 receive_recat,
                 received_counts,
                 cpu_splits,
