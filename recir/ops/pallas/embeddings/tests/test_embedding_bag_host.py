@@ -26,10 +26,16 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from recir.ops.pallas.embeddings.ringshift import (
+    _bucketize_and_sort,
+    _pad_per_peer_2d,
+    _round_up_tile,
+    _TILE_INT32,
     apply_pooling_divisor,
+    fan_out_pooled_grad,
     lengths_to_segment_ids,
     pool_per_rank,
     ringshift_embedding_lookup_reference,
+    sorted_padded_segment_ids,
 )
 
 # per_id_emb[i] = [i + 1, -(i + 1)] -- distinct, sign-split, trivial to sum.
@@ -345,3 +351,227 @@ class ReferenceTest(unittest.TestCase):
                 self.ids, None, self.sharded, 2, "sum", self.bag_lengths
             ),
         )
+
+
+class SortedPaddedSegmentIdsTest(unittest.TestCase):
+    """The invariant that makes the fused path (Option A) correct.
+
+    Option A never restores caller order: it scatter-adds rows where they land,
+    in the kernel's sorted+padded layout. That is only sound because summation
+    is order-independent AND the bag labels are permuted the same way the rows
+    were. This class pins both halves down on CPU, which is the part of Option A
+    that does not need a TPU.
+    """
+
+    W = 4
+    MAX_LOCAL_IDS = 8
+    MAX_PADDED = MAX_LOCAL_IDS + W * _TILE_INT32
+
+    def test_matches_the_docstring_example(self) -> None:
+        """The worked example in the docstring, asserted so it cannot drift."""
+        seg = sorted_padded_segment_ids(
+            jnp.array([2, 1, 2], jnp.int32),  # bag_lengths
+            jnp.array([1, 3, 0, 2, 4, 5], jnp.int32),  # sort_perm
+            jnp.array([2, 3], jnp.int32),  # send_counts_real
+            jnp.array([2, 4], jnp.int32),  # send_counts_padded
+            max_local_ids=6,
+            max_padded=10,
+            world_size=2,
+        )
+        self.assertEqual(list(np.array(seg)), [0, 2, 0, 1, 2, 3, 3, 3, 3, 3])
+
+    def setUp(self) -> None:
+        # ids chosen so the destination buckets are uneven: 5->1, 2->2, 7->3,
+        # 12->0, 3->3. Bags [2, 1, 2] over 5 valid ids, slots 5..7 padding.
+        self.ids = jnp.array([5, 2, 7, 12, 3, 0, 0, 0], jnp.int32)
+        self.bag_lengths = jnp.array([2, 1, 2], jnp.int32)
+        self.id_count = jnp.sum(self.bag_lengths)
+        (
+            self.sorted_row,
+            self.send_counts_real,
+            self.sort_perm,
+            self.reverse_perm,
+        ) = _bucketize_and_sort(self.ids, self.id_count, self.MAX_LOCAL_IDS, self.W)
+        self.send_counts_padded = _round_up_tile(self.send_counts_real, _TILE_INT32)
+
+    def _seg_sorted_padded(self, slack: int = 0) -> jax.Array:
+        return sorted_padded_segment_ids(
+            self.bag_lengths,
+            self.sort_perm,
+            self.send_counts_real,
+            self.send_counts_padded,
+            max_local_ids=self.MAX_LOCAL_IDS,
+            max_padded=self.MAX_PADDED,
+            world_size=self.W,
+            slack=slack,
+        )
+
+    def test_shape_and_range(self) -> None:
+        seg = np.array(self._seg_sorted_padded())
+        self.assertEqual(seg.shape, (self.MAX_PADDED,))
+        num_bags = int(self.bag_lengths.shape[0])
+        self.assertTrue(((seg >= 0) & (seg <= num_bags)).all())
+
+    def test_slack_slots_are_all_trash(self) -> None:
+        num_bags = int(self.bag_lengths.shape[0])
+        seg = np.array(self._seg_sorted_padded(slack=_TILE_INT32))
+        self.assertEqual(seg.shape, (self.MAX_PADDED + _TILE_INT32,))
+        np.testing.assert_array_equal(
+            seg[self.MAX_PADDED :], np.full(_TILE_INT32, num_bags)
+        )
+
+    def test_every_real_slot_keeps_its_bag(self) -> None:
+        """A row's label must follow the row through sort + per-peer padding."""
+        seg_caller = np.array(
+            lengths_to_segment_ids(self.bag_lengths, self.MAX_LOCAL_IDS)
+        )
+        seg_sorted_padded = np.array(self._seg_sorted_padded())
+        sort_perm = np.array(self.sort_perm)
+        real = np.array(self.send_counts_real)
+        padded = np.array(self.send_counts_padded)
+
+        real_off = np.cumsum(real) - real
+        padded_off = np.cumsum(padded) - padded
+        for peer in range(self.W):
+            for k in range(int(real[peer])):
+                sorted_pos = int(real_off[peer]) + k  # position in sorted order
+                padded_pos = int(padded_off[peer]) + k  # where the kernel puts it
+                caller_pos = int(sort_perm[sorted_pos])
+                self.assertEqual(
+                    seg_sorted_padded[padded_pos],
+                    seg_caller[caller_pos],
+                    f"peer {peer} slot {k}",
+                )
+
+    def test_pooling_in_sorted_order_equals_pooling_in_caller_order(self) -> None:
+        """**The Option A premise**, checked end to end on CPU.
+
+        Pool the kernel-layout rows with kernel-layout labels, and compare
+        against pooling caller-order rows with caller-order labels. Equal means
+        the fused path may skip ``_unpad_per_peer`` and ``reverse_perm``.
+        """
+        rng = np.random.default_rng(0)
+        dim = 3
+        per_id_caller = jnp.array(
+            rng.standard_normal((self.MAX_LOCAL_IDS, dim)).astype(np.float32)
+        )
+        # Zero the padding rows, matching what the kernel returns.
+        valid = jnp.arange(self.MAX_LOCAL_IDS) < self.id_count
+        per_id_caller = jnp.where(valid[:, None], per_id_caller, 0.0)
+
+        # What the kernel actually holds: sorted, then per-peer tile padded.
+        rows_kernel_layout = _pad_per_peer_2d(
+            per_id_caller[self.sort_perm],
+            self.send_counts_real,
+            self.send_counts_padded,
+            self.MAX_LOCAL_IDS,
+            self.MAX_PADDED,
+            self.W,
+        )
+        num_bags = int(self.bag_lengths.shape[0])
+        fused = jax.ops.segment_sum(
+            rows_kernel_layout,
+            self._seg_sorted_padded(),
+            num_segments=num_bags + 1,
+        )[:num_bags]
+
+        np.testing.assert_allclose(
+            np.array(fused),
+            np.array(pool_per_rank(per_id_caller, self.bag_lengths, pooling="sum")),
+            atol=1e-6,
+            rtol=1e-6,
+        )
+
+
+class FanOutPooledGradTest(unittest.TestCase):
+    """The fused path's backward, before it reaches the existing per-id driver."""
+
+    MAX_LOCAL_IDS = 8
+    BAG_LENGTHS = jnp.array([3, 0, 2], jnp.int32)
+
+    def test_matches_the_docstring_example(self) -> None:
+        """The worked example in the docstring, asserted so it cannot drift."""
+        lengths = jnp.array([2, 1, 0], jnp.int32)
+        grad_pooled = jnp.array([[10.0], [20.0], [30.0]])
+        for pooling, want in (
+            ("sum", [[10.0], [10.0], [20.0], [0.0], [0.0]]),
+            ("mean", [[5.0], [5.0], [20.0], [0.0], [0.0]]),
+        ):
+            got = fan_out_pooled_grad(
+                grad_pooled, lengths, max_local_ids=5, pooling=pooling
+            )
+            np.testing.assert_allclose(np.array(got), np.array(want), err_msg=pooling)
+
+    def test_sum_copies_the_bag_gradient_to_each_member(self) -> None:
+        grad_pooled = jnp.array(
+            [[1.0, 2.0], [9.0, 9.0], [3.0, 4.0]], jnp.float32
+        )  # bag1 is empty; its row must reach nobody
+        out = np.array(
+            fan_out_pooled_grad(
+                grad_pooled,
+                self.BAG_LENGTHS,
+                max_local_ids=self.MAX_LOCAL_IDS,
+                pooling="sum",
+            )
+        )
+        expected = np.zeros((self.MAX_LOCAL_IDS, 2), np.float32)
+        expected[0:3] = [1.0, 2.0]
+        expected[3:5] = [3.0, 4.0]
+        np.testing.assert_allclose(out, expected)
+
+    def test_mean_scales_by_bag_length(self) -> None:
+        grad_pooled = jnp.array([[3.0, 3.0], [9.0, 9.0], [4.0, 4.0]], jnp.float32)
+        out = np.array(
+            fan_out_pooled_grad(
+                grad_pooled,
+                self.BAG_LENGTHS,
+                max_local_ids=self.MAX_LOCAL_IDS,
+                pooling="mean",
+            )
+        )
+        expected = np.zeros((self.MAX_LOCAL_IDS, 2), np.float32)
+        expected[0:3] = 1.0  # 3 / 3
+        expected[3:5] = 2.0  # 4 / 2
+        np.testing.assert_allclose(out, expected)
+
+    def test_padding_slots_get_zero(self) -> None:
+        grad_pooled = jnp.ones((3, 2), jnp.float32)
+        for pooling in ("sum", "mean"):
+            out = np.array(
+                fan_out_pooled_grad(
+                    grad_pooled,
+                    self.BAG_LENGTHS,
+                    max_local_ids=self.MAX_LOCAL_IDS,
+                    pooling=pooling,
+                )
+            )
+            np.testing.assert_allclose(out[5:], np.zeros((3, 2), np.float32))
+
+    def test_matches_jax_grad_of_the_reference_pooling(self) -> None:
+        """Hand-written VJP vs the one autodiff derives for ``pool_per_rank``."""
+        rng = np.random.default_rng(1)
+        per_id = jnp.array(
+            rng.standard_normal((self.MAX_LOCAL_IDS, 3)).astype(np.float32)
+        )
+        seed = jnp.array(rng.standard_normal((3, 3)).astype(np.float32))
+        for pooling in ("sum", "mean"):
+
+            def loss(e: jax.Array, pooling: str = pooling) -> jax.Array:
+                return jnp.sum(
+                    pool_per_rank(e, self.BAG_LENGTHS, pooling=pooling) * seed
+                )
+
+            np.testing.assert_allclose(
+                np.array(
+                    fan_out_pooled_grad(
+                        seed,
+                        self.BAG_LENGTHS,
+                        max_local_ids=self.MAX_LOCAL_IDS,
+                        pooling=pooling,
+                    )
+                ),
+                np.array(jax.grad(loss)(per_id)),
+                atol=1e-6,
+                rtol=1e-6,
+                err_msg=pooling,
+            )
