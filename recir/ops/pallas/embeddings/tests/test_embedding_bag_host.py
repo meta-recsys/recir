@@ -1,18 +1,14 @@
 # (c) Meta Platforms, Inc. and affiliates. Confidential and proprietary.
 
 
-"""CPU-runnable tests for the per-bag reduction primitives (section F1).
+"""CPU-runnable tests for the pooled (EBC) layer over the ringshift EC kernel.
 
-These cover the pieces both pooled-lookup options share, and nothing else: the
-reduction itself, the segment-id construction it consumes, the argument
-validation, and the numpy oracle both options are checked against. Where the
-reduction ultimately runs is not decided at this layer, so nothing here goes
-through ``ringshift_embedding_lookup``.
-
-``pool_per_rank`` takes a plain per-id array, so the whole surface -- forward,
-backward, jagged/empty bags, padding, argument validation -- is testable
-without a TPU. That is what lets both candidate kernels start from a reference
-that is already known good.
+Pooling is exposed as a ``pooling`` mode on the existing lookup entry points
+rather than as a parallel set of functions, and it is a pure-JAX post-pass over
+the kernel's per-id output (see section F1 of ``ringshift``). That makes its
+entire surface -- forward, backward, jagged/empty bags, padding, argument
+validation -- testable here without a TPU. Only the fused Pallas kernel itself
+is real-TPU only.
 
 Expected values are hand-computed inline rather than derived from a second
 implementation, so a bug in the reference cannot hide a bug in the code.
@@ -34,6 +30,7 @@ from recir.ops.pallas.embeddings.ringshift import (
     fan_out_pooled_grad,
     lengths_to_segment_ids,
     pool_per_rank,
+    ringshift_embedding_lookup,
     ringshift_embedding_lookup_reference,
     sorted_padded_segment_ids,
 )
@@ -575,3 +572,82 @@ class FanOutPooledGradTest(unittest.TestCase):
                 rtol=1e-6,
                 err_msg=pooling,
             )
+
+
+class PooledCustomVjpPlumbingTest(unittest.TestCase):
+    """Trace ``jax.grad`` through the pooled op without running the kernel.
+
+    The three edits that move together when ``bag_lengths`` enters the
+    ``custom_vjp`` signature -- the ``nondiff_argnums`` shift, the extra
+    residual, and the backward tuple arity -- all fail at TRACE time, not at
+    run time. ``jax.eval_shape`` therefore catches them on CPU, which matters
+    because they are otherwise the silent-failure risk of the fused path: the
+    fused kernel itself is real-TPU only.
+    """
+
+    W = 1  # single CPU device; the kernel is never executed, only traced
+    MAX_LOCAL_IDS = 4
+    V_LOCAL = 4
+    DIM = 2
+    NUM_BAGS = 2
+
+    def _mesh(self) -> jax.sharding.Mesh:
+        return jax.sharding.Mesh(np.array(jax.devices()[: self.W]), ("rank",))
+
+    def _inputs(self):
+        ids = jnp.zeros((self.W, self.MAX_LOCAL_IDS), jnp.int32)
+        table = jnp.zeros((self.W, self.V_LOCAL, self.DIM), jnp.float32)
+        bag_lengths = jnp.ones((self.W, self.NUM_BAGS), jnp.int32)
+        return ids, table, bag_lengths
+
+    def _grad_shape(self, pooling: str):
+        ids, table, bag_lengths = self._inputs()
+        mesh = self._mesh()
+
+        def loss(t: jax.Array) -> jax.Array:
+            out = ringshift_embedding_lookup(
+                ids,
+                None if pooling != "none" else jnp.full((self.W,), 2, jnp.int32),
+                t,
+                mesh=mesh,
+                axis_name="rank",
+                recv_capacity=_TILE_INT32,
+                pooling=pooling,
+                bag_lengths=bag_lengths if pooling != "none" else None,
+            )
+            return jnp.sum(out)
+
+        return jax.eval_shape(jax.grad(loss), table)
+
+    def test_sum_grad_traces_and_keeps_the_table_shape(self) -> None:
+        out = self._grad_shape("sum")
+        self.assertEqual(out.shape, (self.W, self.V_LOCAL, self.DIM))
+        self.assertEqual(out.dtype, jnp.float32)
+
+    def test_mean_grad_traces(self) -> None:
+        out = self._grad_shape("mean")
+        self.assertEqual(out.shape, (self.W, self.V_LOCAL, self.DIM))
+
+    def test_unpooled_grad_still_traces(self) -> None:
+        """The EC path must be unaffected by the signature change."""
+        out = self._grad_shape("none")
+        self.assertEqual(out.shape, (self.W, self.V_LOCAL, self.DIM))
+
+    def test_pooled_forward_shape_is_per_bag(self) -> None:
+        """Pooling now happens inside the custom_vjp op, so its output is [W, B, D]."""
+        ids, table, bag_lengths = self._inputs()
+        mesh = self._mesh()
+        out = jax.eval_shape(
+            lambda t: ringshift_embedding_lookup(
+                ids,
+                None,
+                t,
+                mesh=mesh,
+                axis_name="rank",
+                recv_capacity=_TILE_INT32,
+                pooling="sum",
+                bag_lengths=bag_lengths,
+            ),
+            table,
+        )
+        self.assertEqual(out.shape, (self.W, self.NUM_BAGS, self.DIM))

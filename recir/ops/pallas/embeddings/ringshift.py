@@ -334,6 +334,11 @@ def _dedup_grads_by_id(
     return compact_row, compact_grad, send_counts
 
 
+def _round_up_tile_static(x: int, tile: int) -> int:
+    """Compile-time tile rounding, for sizing static kernel windows."""
+    return ((x + tile - 1) // tile) * tile
+
+
 def _round_up_tile(x: jax.Array, tile: int) -> jax.Array:
     """Round each element of ``x`` UP to the next multiple of ``tile``."""
     return ((x + tile - 1) // tile * tile).astype(jnp.int32)
@@ -816,6 +821,89 @@ def _split_traffic_ringshift_globalpad(
 # ---------------------------------------------------------------------------
 
 
+def _ringshift_phase4_pool(
+    *,
+    out_ref,  # pyre-ignore[2]
+    seg_ref,  # pyre-ignore[2]
+    pooled_ref,  # pyre-ignore[2]
+    pool_acc_vmem,  # pyre-ignore[2]
+    idx_smem,  # pyre-ignore[2]
+    emb_xfer_vmem,  # pyre-ignore[2]
+    zero_emb_vmem,  # pyre-ignore[2]
+    send_start: jax.Array,
+    p1_cnt: jax.Array,
+    pool_num_chunks: int,
+    pool_tile: int,
+) -> None:
+    """Reduce this wave's freshly-landed rows into their bags, in place.
+
+    Runs at the tail of a wave, right after Phase 3 has drained.
+    :func:`_ringshift_phase3_remote_offset` guarantees the peer writes the
+    answers back to the slot the question came from, so they sit at
+    ``out_ref[send_start : send_start + p1_cnt]`` -- and their bag ids sit at
+    the matching offsets of ``seg_ref``. That correspondence is the whole
+    reason this can run here instead of after the wave loop.
+
+    Rows are consumed where they landed, in sorted order, and never restored
+    to caller order: summation is order-independent, so the labels were
+    permuted instead of the rows (:func:`sorted_padded_segment_ids`). That is
+    what lets the pooled path skip ``_unpad_per_peer`` and the ``reverse_perm``
+    gather entirely.
+
+    Scratch is reused, not added: Phase 2 is done with ``idx_smem``,
+    ``emb_xfer_vmem`` and ``zero_emb_vmem`` by the time Phase 3 has drained,
+    so the pooled tiles cost no extra VMEM.
+
+    ``pool_tile`` is deliberately NOT ``recv_capacity``. Pallas needs a static
+    slice length, so each chunk moves and casts a whole tile whatever the real
+    row count is -- and ``recv_capacity`` is sized for a whole rank's payload
+    while this only ever handles one wave's share of it, i.e. 1/W of it. At
+    W=32 that was a 40x over-copy and cost ~137 us, measured: sweeping the tile
+    from 8320 to 2048 moved this arm from 1.66 to 1.53 ms while the arm without
+    Phase 4 did not move. The scratch stays ``recv_capacity``-sized and shared
+    with Phase 2; only the touched prefix shrinks.
+    """
+    pltpu.sync_copy(pooled_ref, pool_acc_vmem)
+
+    for c_pool in range(pool_num_chunks):
+        pool_base = c_pool * pool_tile  # static
+        pool_len = jnp.clip(p1_cnt - pool_base, 0, pool_tile)
+
+        @pl.when(pool_len > 0)
+        def _pool_chunk(pool_base=pool_base, pool_len=pool_len):
+            # Runtime start, static extent -- the window can run past
+            # ``max_padded`` on the last chunk, which is what the caller's
+            # ``pool_slack`` rows are reserved for.
+            src = send_start + pool_base
+            pltpu.sync_copy(
+                seg_ref.at[pl.ds(src, pool_tile)], idx_smem.at[pl.ds(0, pool_tile)]
+            )
+            pltpu.sync_copy(
+                out_ref.at[pl.ds(src, pool_tile), :],
+                emb_xfer_vmem.at[pl.ds(0, pool_tile), :],
+            )
+            # Tile-aligned cast up to f32; identity when the exchange dtype is
+            # already f32. Accumulating in bf16 would lose small contributions
+            # on hot bags. Only the touched prefix, not the whole scratch.
+            zero_emb_vmem[pl.ds(0, pool_tile), :] = emb_xfer_vmem[
+                pl.ds(0, pool_tile), :
+            ].astype(zero_emb_vmem.dtype)
+
+            def _accumulate(i, _):
+                # Serial, NOT a batched parallel scatter: unlike the backward
+                # path there is no send-side dedup here, and several ids of one
+                # bag routinely land in one chunk.
+                bag = idx_smem[i]
+                pool_acc_vmem[pl.ds(bag, 1), :] = (
+                    pool_acc_vmem[pl.ds(bag, 1), :] + zero_emb_vmem[pl.ds(i, 1), :]
+                )
+                return None
+
+            lax.fori_loop(0, pool_len, _accumulate, None)
+
+    pltpu.sync_copy(pool_acc_vmem, pooled_ref)
+
+
 def _make_ringshift_single_wave_kernel(
     *,
     world_size: int,
@@ -825,6 +913,10 @@ def _make_ringshift_single_wave_kernel(
     axis_name: str,
     num_chunks: int,
     use_dma_gather: bool = False,
+    pooling: str = "none",
+    num_bags: int = 0,
+    pool_tile: int = 0,
+    pool_num_chunks: int = 0,
 ):
     """Single-wave all-TC fused f32 ring-shift kernel.
 
@@ -861,7 +953,9 @@ def _make_ringshift_single_wave_kernel(
     DMAs and semaphores are unchanged -- they target the full-size HBM buffers).
     """
 
-    def kernel(
+    pooled = pooling != "none"
+
+    def _body(
         sorted_row_ref,
         table_ref,
         wave_idx_ref,  # SMEM (1,) int32 -- this wave's index w
@@ -870,7 +964,6 @@ def _make_ringshift_single_wave_kernel(
         send_off_ref,  # SMEM (1,) int32 -- this wave's send_off
         recv_off_ref,  # SMEM (1,) int32 -- this wave's recv_off
         phase3_remote_off_ref,  # SMEM (1,) int32 -- this wave's phase3_remote_off
-        out_init_ref,  # input HBM, aliased to out_ref (accumulator)
         out_ref,  # output HBM, alias of out_init_ref
         recv_row_buf,
         looked_up_buf,
@@ -884,8 +977,10 @@ def _make_ringshift_single_wave_kernel(
         send_sem_emb,
         recv_sem_emb,
         gather_sems,
+        seg_ref=None,  # input HBM [max_padded + slack] int32 -- bag id per slot
+        pooled_ref=None,  # output HBM [num_bags+1, D], alias of pooled_init_ref
+        pool_acc_vmem=None,  # VMEM staging for the pooled accumulator
     ):
-        del out_init_ref  # aliased to out_ref via input_output_aliases
         my_rank = lax.axis_index(axis_name)
         wave_idx = wave_idx_ref[0]  # traced scalar int32
 
@@ -1106,6 +1201,109 @@ def _make_ringshift_single_wave_kernel(
             if not _SKIP_DMA:
                 d3_recv.wait_recv()  # drains recv_sem_emb by p1_cnt rows x D
 
+        # ----- Phase 4: per-bag reduction (pooled path) -----
+        if pooled:
+            _ringshift_phase4_pool(
+                out_ref=out_ref,
+                seg_ref=seg_ref,
+                pooled_ref=pooled_ref,
+                pool_acc_vmem=pool_acc_vmem,
+                idx_smem=idx_smem,
+                emb_xfer_vmem=emb_xfer_vmem,
+                zero_emb_vmem=zero_emb_vmem,
+                send_start=send_start,
+                p1_cnt=p1_cnt,
+                pool_num_chunks=pool_num_chunks,
+                pool_tile=pool_tile,
+            )
+
+    # Two signatures rather than one with placeholder refs: Pallas binds kernel
+    # parameters positionally from in_specs -> out_specs -> scratch, so the
+    # pooled refs cannot simply be appended. Branching keeps the EC path's
+    # ``pallas_call`` byte-for-byte what it was.
+    if not pooled:
+
+        def kernel(
+            sorted_row_ref,
+            table_ref,
+            wave_idx_ref,
+            p1_cnt_ref,
+            p3_cnt_ref,
+            send_off_ref,
+            recv_off_ref,
+            phase3_remote_off_ref,
+            out_init_ref,
+            out_ref,
+            recv_row_buf,
+            looked_up_buf,
+            *scratch,
+        ):
+            del out_init_ref  # aliased to out_ref via input_output_aliases
+            _body(
+                sorted_row_ref,
+                table_ref,
+                wave_idx_ref,
+                p1_cnt_ref,
+                p3_cnt_ref,
+                send_off_ref,
+                recv_off_ref,
+                phase3_remote_off_ref,
+                out_ref,
+                recv_row_buf,
+                looked_up_buf,
+                *scratch,
+            )
+
+    else:
+
+        def kernel(
+            sorted_row_ref,
+            table_ref,
+            wave_idx_ref,
+            p1_cnt_ref,
+            p3_cnt_ref,
+            send_off_ref,
+            recv_off_ref,
+            phase3_remote_off_ref,
+            out_init_ref,
+            seg_ref,  # input HBM [max_padded + slack] int32 -- unread until Phase 4
+            pooled_init_ref,  # input HBM, aliased to pooled_ref
+            out_ref,
+            recv_row_buf,
+            looked_up_buf,
+            pooled_ref,
+            zero_int_vmem,
+            zero_emb_vmem,
+            emb_xfer_vmem,
+            table_vmem,
+            idx_smem,
+            pool_acc_vmem,
+            *sems,
+        ):
+            del out_init_ref, pooled_init_ref  # aliased via input_output_aliases
+            _body(
+                sorted_row_ref,
+                table_ref,
+                wave_idx_ref,
+                p1_cnt_ref,
+                p3_cnt_ref,
+                send_off_ref,
+                recv_off_ref,
+                phase3_remote_off_ref,
+                out_ref,
+                recv_row_buf,
+                looked_up_buf,
+                zero_int_vmem,
+                zero_emb_vmem,
+                emb_xfer_vmem,
+                table_vmem,
+                idx_smem,
+                *sems,
+                seg_ref=seg_ref,
+                pooled_ref=pooled_ref,
+                pool_acc_vmem=pool_acc_vmem,
+            )
+
     return kernel
 
 
@@ -1125,6 +1323,8 @@ def _ringshift_embedding_lookup_local(
     interpret: bool,
     splitter: str,
     exchange_bf16: bool = False,
+    pooling: str = "none",
+    bag_lengths: jax.Array | None = None,
 ) -> jax.Array:
     """Per-device ring-shift fused kernel.
 
@@ -1150,7 +1350,7 @@ def _ringshift_embedding_lookup_local(
     emb_dtype = jnp.bfloat16 if exchange_bf16 else dtype
     max_waves = world_size
 
-    sorted_row_real, send_counts_real, _sort_perm, reverse_perm = _bucketize_and_sort(
+    sorted_row_real, send_counts_real, sort_perm, reverse_perm = _bucketize_and_sort(
         looked_up_ids, looked_up_id_count, max_local_ids, world_size
     )
     send_counts_padded = _round_up_tile(send_counts_real, _TILE_INT32)
@@ -1248,6 +1448,49 @@ def _ringshift_embedding_lookup_local(
         _TABLE_VMEM_BUDGET_BYTES,
     )
 
+    # Pooled path: per-slot bag ids in the kernel's own sorted/padded layout,
+    # plus the accumulator Phase 4 will scatter into. The slack mirrors the
+    # fixed-width window Phase 4 reads from a runtime offset, which can overrun
+    # ``max_padded`` on the last chunk.
+    pooled = pooling != "none"
+    num_bags = 0 if bag_lengths is None else bag_lengths.shape[0]
+    # Phase 4 handles ONE wave's rows, i.e. ~1/W of a rank's payload, so it
+    # must not inherit ``recv_capacity`` (sized for the whole rank). A static
+    # slice length means every chunk moves and casts a full tile regardless of
+    # the real row count, so an oversized tile is paid in full every wave.
+    #
+    # The floor is empirical: sweeping the tile at W=32 put the optimum near
+    # 1-2K, with smaller tiles giving the saving back as chunk-loop overhead.
+    # Skew is handled by the chunk loop, not by the tile -- a hot peer simply
+    # uses more chunks, and chunks past the data are skipped by ``pl.when``.
+    pool_tile = (
+        min(
+            recv_capacity,
+            max(1024, _round_up_tile_static(max_padded // world_size, _TILE_INT32)),
+        )
+        if pooled
+        else 0
+    )
+    pool_num_chunks = -(-max_padded // pool_tile) if pooled else 0
+    pool_slack = pool_tile if pooled else 0
+    # Bound unconditionally so the EC path's control flow stays analysable; they
+    # are only ever read under ``if pooled``.
+    seg_sorted_padded = None
+    pooled_acc = None
+    if pooled:
+        assert bag_lengths is not None  # narrowed by _check_pooling
+        seg_sorted_padded = sorted_padded_segment_ids(
+            bag_lengths,
+            sort_perm,
+            send_counts_real,
+            send_counts_padded,
+            max_local_ids=max_local_ids,
+            max_padded=max_padded,
+            world_size=world_size,
+            slack=pool_slack,
+        )
+        pooled_acc = jnp.zeros((num_bags + 1, embedding_dim), dtype)
+
     single_wave_kernel = _make_ringshift_single_wave_kernel(
         world_size=world_size,
         recv_capacity=recv_capacity,
@@ -1256,6 +1499,10 @@ def _ringshift_embedding_lookup_local(
         axis_name=axis_name,
         num_chunks=num_chunks,
         use_dma_gather=use_dma_gather,
+        pooling=pooling,
+        num_bags=num_bags,
+        pool_tile=pool_tile,
+        pool_num_chunks=pool_num_chunks,
     )
 
     # JAX-level Python wave loop. Each pallas_call gets a UNIQUE
@@ -1273,7 +1520,9 @@ def _ringshift_embedding_lookup_local(
     # output, then bind that scalar into the next wave's accumulator via
     # ``optimization_barrier`` (XLA can't statically simplify it away). This
     # forces every rank to finish wave w-1 before any rank launches wave w.
-    sorted_emb_padded = jnp.zeros((max_padded, embedding_dim), dtype=emb_dtype)
+    sorted_emb_padded = jnp.zeros(
+        (max_padded + pool_slack, embedding_dim), dtype=emb_dtype
+    )
     sync_dep = jnp.float32(0.0)  # initial -- no dep yet
 
     for w_py in range(max_waves):
@@ -1293,17 +1542,53 @@ def _ringshift_embedding_lookup_local(
         # For w_py>=1, sync_dep carries the cross-rank psum from the previous
         # wave -- the kernel for wave w cannot launch on any rank until every
         # rank has finished wave w-1.
-        sorted_emb_padded_dep, _ = jax.lax.optimization_barrier(
-            (sorted_emb_padded, sync_dep)
-        )
+        # The pooled accumulator joins the SAME optimization_barrier tuple, not
+        # a separate one: that is what ties its cross-wave carry to the epoch
+        # barrier. Left out, XLA is free to reorder its updates relative to the
+        # waves, and the resulting race only shows at large W.
+        pooled_acc_dep = None
+        if pooled:
+            sorted_emb_padded_dep, pooled_acc_dep, _ = jax.lax.optimization_barrier(
+                (sorted_emb_padded, pooled_acc, sync_dep)
+            )
+        else:
+            sorted_emb_padded_dep, _ = jax.lax.optimization_barrier(
+                (sorted_emb_padded, sync_dep)
+            )
 
-        sorted_emb_padded, _recv_row_dummy, _looked_up_dummy = pl.pallas_call(
+        pool_out_shape = (
+            [jax.ShapeDtypeStruct((num_bags + 1, embedding_dim), dtype)]
+            if pooled
+            else []
+        )
+        pool_in_specs = (
+            [
+                pl.BlockSpec(memory_space=HBM),  # seg
+                pl.BlockSpec(memory_space=HBM),  # pooled_init (alias)
+            ]
+            if pooled
+            else []
+        )
+        pool_out_specs = (
+            [pl.BlockSpec(memory_space=HBM)] if pooled else []  # pooled
+        )
+        pool_scratch = (
+            (pltpu.VMEM((num_bags + 1, embedding_dim), dtype),) if pooled else ()
+        )
+        pool_operands = (seg_sorted_padded, pooled_acc_dep) if pooled else ()
+        # out_init (idx 8) -> out (idx 0); pooled_init (idx 10) -> pooled (idx 3)
+        aliases = {8: 0, 10: 3} if pooled else {8: 0}
+
+        results = pl.pallas_call(
             single_wave_kernel,
             out_shape=[
-                jax.ShapeDtypeStruct((max_padded, embedding_dim), emb_dtype),
+                jax.ShapeDtypeStruct(
+                    (max_padded + pool_slack, embedding_dim), emb_dtype
+                ),
                 jax.ShapeDtypeStruct((staging_capacity,), jnp.int32),
                 jax.ShapeDtypeStruct((staging_capacity, embedding_dim), emb_dtype),
-            ],
+            ]
+            + pool_out_shape,
             grid_spec=pltpu.PrefetchScalarGridSpec(
                 num_scalar_prefetch=0,
                 in_specs=[
@@ -1316,12 +1601,14 @@ def _ringshift_embedding_lookup_local(
                     pl.BlockSpec(memory_space=SMEM),  # recv_off
                     pl.BlockSpec(memory_space=SMEM),  # phase3_remote_off
                     pl.BlockSpec(memory_space=HBM),  # out_init (alias)
-                ],
+                ]
+                + pool_in_specs,
                 out_specs=[
                     pl.BlockSpec(memory_space=HBM),  # out (= aliased out_init)
                     pl.BlockSpec(memory_space=HBM),  # recv_row_buf (HBM scratch)
                     pl.BlockSpec(memory_space=HBM),  # looked_up_buf (HBM scratch)
-                ],
+                ]
+                + pool_out_specs,
                 scratch_shapes=(
                     pltpu.VMEM((recv_capacity,), jnp.int32),
                     # zero_emb_vmem: f32 gather tile (row-at-a-time dynamic store
@@ -1334,6 +1621,9 @@ def _ringshift_embedding_lookup_local(
                     # (rows gathered directly from the HBM table shard instead).
                     pltpu.VMEM((table_vmem_rows, embedding_dim), dtype),
                     SMEM((recv_capacity,), jnp.int32),
+                )
+                + pool_scratch
+                + (
                     # NO REGULAR barrier sem -- kernel uses
                     # ``pltpu.get_barrier_semaphore()`` (custom barrier),
                     # required by Mosaic when ``collective_id`` is set
@@ -1347,7 +1637,7 @@ def _ringshift_embedding_lookup_local(
                     pltpu.SemaphoreType.DMA((_GATHER_DMA_BATCH,)),
                 ),
             ),
-            input_output_aliases={8: 0},  # out_init (input idx 8) -> out (output idx 0)
+            input_output_aliases=aliases,
             compiler_params=pltpu.CompilerParams(collective_id=w_py),
             interpret=interpret,
         )(
@@ -1360,8 +1650,11 @@ def _ringshift_embedding_lookup_local(
             recv_off_w,
             phase3_remote_off_w,
             sorted_emb_padded_dep,
+            *pool_operands,
         )
-        del _recv_row_dummy, _looked_up_dummy
+        sorted_emb_padded = results[0]
+        if pooled:
+            pooled_acc = results[3]
 
         # Cross-rank epoch barrier: psum a real value derived from this
         # wave's output (so XLA can't statically simplify). One scalar
@@ -1369,6 +1662,21 @@ def _ringshift_embedding_lookup_local(
         # shard_map. Cast to f32 so the sync token dtype is stable across
         # waves regardless of the (possibly bf16) exchange dtype.
         sync_dep = jax.lax.psum(sorted_emb_padded[0, 0].astype(jnp.float32), axis_name)
+
+    if pooled:
+        # The pooled path is already DONE: Phase 4 reduced every row as it
+        # landed, in the kernel's own sorted order. Neither the un-pad nor the
+        # reverse permutation below is reachable from here -- dropping those two
+        # full-width [max_local_ids, D] gathers is the payoff of fusing.
+        #
+        # Phase 4 accumulates SUMS: the divisor cannot be applied per wave,
+        # since a bag's ids arrive across several of them. Row ``num_bags`` is
+        # the trash bag (per-peer padding) and is sliced off here.
+        assert pooled_acc is not None
+        assert bag_lengths is not None  # narrowed by _check_pooling
+        return apply_pooling_divisor(
+            pooled_acc[:num_bags], bag_lengths, pooling=pooling
+        )
 
     sorted_emb = _unpad_per_peer(
         sorted_emb_padded,
@@ -1380,35 +1688,38 @@ def _ringshift_embedding_lookup_local(
     )
     # Cast back to the table dtype (f32) so the public output contract is
     # unchanged; only the over-ICI exchange ran in bf16.
-    out = sorted_emb[reverse_perm].astype(dtype)
-    return out
+    return sorted_emb[reverse_perm].astype(dtype)
 
 
 # ---------------------------------------------------------------------------
-# F1. Pooling (EBC) -- segment-id construction and the per-bag reduction
+# F1. Pooling (EBC) -- segment-id construction and the pure-JAX reduction
 # ---------------------------------------------------------------------------
 #
 # torchrec's ``EmbeddingBagCollection`` groups ids into *bags* (one per
 # sample x feature) and reduces each bag to a single vector.
 #
-# This section holds the reduction primitives only. Nothing here is reachable
-# from the public API yet: *where* the reduction runs is the one real design
-# choice in pooled lookup, and it is deliberately not made here.
+# Where that reduction actually happens has moved. It began as a host-side
+# post-pass over the kernel's per-id output, on the reasoning that a bag's ids
+# are scattered across all ranks and the owner gathers a row without ever
+# learning which bag it came from. ``sorted_padded_segment_ids`` removed that
+# obstacle by permuting the bag *labels* into the kernel's own sorted/padded
+# layout, so Phase 4 now reduces each row where it lands and the pooled path
+# never materializes the per-id array at all.
 #
-#   * Reduce after the ring-shift, in XLA, over the per-id output. Needs no
-#     extra ``custom_vjp`` -- ``segment_sum`` is differentiable and the per-id
-#     path already carries one, so ``jax.grad`` composes them.
-#   * Reduce inside the Pallas kernel, as each row lands. Drops two full-width
-#     gathers, but the kernel is opaque to autodiff, so it needs its own
-#     ``custom_vjp``.
+# What lives here after that move:
+#   * ``lengths_to_segment_ids`` -- the KJT-lengths to per-slot-label primitive,
+#     used by ``sorted_padded_segment_ids`` and ``fan_out_pooled_grad`` as well.
+#   * ``apply_pooling_divisor`` -- the ``mean`` step, shared by both reduction
+#     paths so they cannot disagree about it.
+#   * ``pool_per_rank`` -- the pure-JAX reduction. No longer on the production
+#     path; it is the CPU oracle the interpret-mode and torchrec-parity tests
+#     compare the fused result against, and it stays because the fused kernel is
+#     real-TPU only and therefore cannot serve as its own reference.
 #
-# The two are built as separate branches off this one and measured against each
-# other; whichever wins, it consumes the functions below unchanged.
-#
-# What is settled here is that the reduction is CPU-testable in isolation:
-# ``pool_per_rank`` takes a plain per-id array, so forward, backward,
-# jagged/empty bags and padding are all pinned down on a devserver even though
-# one of the two candidate kernels is real-TPU only.
+# Note that pooling is *inside* the ``jax.custom_vjp`` boundary (the op's
+# cotangent is per-bag), so ``segment_sum``'s own VJP is no longer what makes
+# the backward work -- ``fan_out_pooled_grad`` is, in the backward section
+# below.
 
 
 def lengths_to_segment_ids(bag_lengths: jax.Array, max_local_ids: int) -> jax.Array:
@@ -1631,7 +1942,7 @@ def pool_per_rank(
 
 def ringshift_embedding_lookup(
     looked_up_ids: jax.Array,
-    looked_up_id_count: jax.Array,
+    looked_up_id_count: jax.Array | None,
     local_embedding_table: jax.Array,
     *,
     mesh: jax.sharding.Mesh,
@@ -1640,6 +1951,8 @@ def ringshift_embedding_lookup(
     interpret: bool = False,
     splitter: str = "globalpad",
     exchange_bf16: bool = False,
+    pooling: str = "none",
+    bag_lengths: jax.Array | None = None,
 ) -> jax.Array:
     """Ring-shift fused all-TC f32 jagged a2a + sharded embedding lookup.
 
@@ -1663,6 +1976,10 @@ def ringshift_embedding_lookup(
     Args:
         looked_up_ids: ``[world_size, max_local_ids]`` int32.
         looked_up_id_count: ``[world_size]`` int32 -- valid count per rank.
+            Required when ``pooling == "none"``; must be ``None`` otherwise,
+            since ``bag_lengths.sum(-1)`` already determines it. See
+            :func:`_check_pooling` for why the redundancy is rejected rather
+            than checked.
         local_embedding_table: ``[world_size, V_local, D]`` f32 -- table
             shards stacked along the leading rank axis.
         mesh: 1D JAX mesh whose only axis is ``axis_name``.
@@ -1688,27 +2005,54 @@ def ringshift_embedding_lookup(
             S=4096 bottleneck). The table stays f32, the table-grad accumulation
             stays f32, and the public inputs/outputs stay f32 -- only the over-ICI
             transfer + staging are bf16. Default False (exact f32 behavior).
+        pooling: ``"none"`` (default -- sequence / EC behavior, one row per id),
+            ``"sum"`` or ``"mean"`` (EBC behavior, one row per bag). The
+            reduction is fused into the wave kernel (Phase 4), so the pooled
+            path never materializes the ``[max_local_ids, D]`` per-id array.
+        bag_lengths: ``[world_size, num_bags]`` int32 -- required iff
+            ``pooling != "none"``, rejected otherwise. Ids must be laid out
+            bag-major within each rank (the standard KJT jagged layout: bag 0's
+            ids first, then bag 1's, ...), and ``bag_lengths.sum(axis=1)`` must
+            equal ``looked_up_id_count``.
 
     Returns:
-        ``[world_size, max_local_ids, D]`` f32 embeddings in caller order.
+        ``[world_size, max_local_ids, D]`` f32 embeddings in caller order when
+        ``pooling == "none"``; ``[world_size, num_bags, D]`` f32 pooled vectors
+        otherwise.
 
     Differentiability: this function is a thin wrapper around an internal
     :func:`jax.custom_vjp`-registered helper (:func:`_ringshift_with_grad`)
     so ``jax.grad`` / ``jax.value_and_grad`` / ``optax`` compose correctly.
     The backward pass uses the dedicated
-    :func:`_ringshift_embedding_lookup_backward_local` driver. The public
-    API signature is unchanged.
+    :func:`_ringshift_embedding_lookup_backward_local` driver. Pooling adds no
+    ``custom_vjp`` of its own -- ``segment_sum``'s built-in VJP composes with
+    the per-id one.
     """
+    _check_pooling(pooling, bag_lengths, looked_up_id_count)
+    if pooling == "none":
+        assert looked_up_id_count is not None  # narrowed by _check_pooling
+    else:
+        # Single source of truth: bag_lengths fully determines the valid id
+        # count, so deriving it here makes a mismatch structurally impossible.
+        assert bag_lengths is not None  # narrowed by _check_pooling
+        looked_up_id_count = jnp.sum(bag_lengths, axis=-1).astype(jnp.int32)
+    # Pooling now happens INSIDE the custom_vjp boundary, so the op's cotangent
+    # is per bag and `_bwd` owns the fan-out. Previously it sat outside and
+    # autodiff composed the two VJPs for free; moving it in is what the fused
+    # path requires, and doing it while the reduction is still the known-good
+    # host-side one isolates the plumbing change from any kernel change.
     return _ringshift_with_grad(  # pyre-ignore[29]
         looked_up_ids,
         looked_up_id_count,
         local_embedding_table,
+        bag_lengths,
         mesh,
         axis_name,
         recv_capacity,
         interpret,
         splitter,
         exchange_bf16,
+        pooling,
     )
 
 
@@ -1729,7 +2073,7 @@ def _block_to_mod_ids(
 
 def ringshift_embedding_lookup_block(
     looked_up_ids: jax.Array,
-    looked_up_id_count: jax.Array,
+    looked_up_id_count: jax.Array | None,
     local_embedding_table: jax.Array,
     *,
     mesh: jax.sharding.Mesh,
@@ -1738,6 +2082,8 @@ def ringshift_embedding_lookup_block(
     interpret: bool = False,
     splitter: str = "globalpad",
     exchange_bf16: bool = False,
+    pooling: str = "none",
+    bag_lengths: jax.Array | None = None,
 ) -> jax.Array:
     """Block-sharded variant of :func:`ringshift_embedding_lookup`.
 
@@ -1754,6 +2100,10 @@ def ringshift_embedding_lookup_block(
     edits). The remap is on the non-differentiable ids, so gradients flow to the
     table unchanged and the table gradient lands in the same block
     ``[W, V_local, D]`` layout as the parameter.
+
+    ``pooling`` / ``bag_lengths`` need no special handling here: the remap is
+    per-id and order-preserving, so bag membership is unaffected and the pooled
+    post-pass runs identically on the MOD path.
 
     Args/Returns: identical to :func:`ringshift_embedding_lookup`, except
     ``local_embedding_table`` is interpreted as block-sharded (FSDP), the layout
@@ -1772,6 +2122,8 @@ def ringshift_embedding_lookup_block(
         interpret=interpret,
         splitter=splitter,
         exchange_bf16=exchange_bf16,
+        pooling=pooling,
+        bag_lengths=bag_lengths,
     )
 
 
@@ -2402,6 +2754,8 @@ def _ringshift_forward_impl(
     interpret: bool,
     splitter: str,
     exchange_bf16: bool,
+    pooling: str,
+    bag_lengths: jax.Array | None,
 ) -> jax.Array:
     """Internal: forward-only impl of the ringshift kernel (no custom_vjp).
 
@@ -2413,7 +2767,7 @@ def _ringshift_forward_impl(
     world_size = mesh.shape[axis_name]
     P = jax.sharding.PartitionSpec
 
-    def per_device(ids, count, table):
+    def per_device(ids, count, table, bags):
         out = _ringshift_embedding_lookup_local(
             ids[0],
             count[0],
@@ -2424,18 +2778,23 @@ def _ringshift_forward_impl(
             interpret=interpret,
             splitter=splitter,
             exchange_bf16=exchange_bf16,
+            pooling=pooling,
+            bag_lengths=None if bags is None else bags[0],
         )
         return out[None, ...]
 
     sharded = jax.shard_map(
         per_device,
         mesh=mesh,
-        in_specs=(P(axis_name), P(axis_name), P(axis_name)),
+        in_specs=(P(axis_name),) * 4,
         out_specs=P(axis_name),
         check_vma=False,
     )
+    # Bound to a tuple so the whole call fits on the suppressed line: the
+    # pyrefly directive only covers the line immediately after it.
+    args = (looked_up_ids, looked_up_id_count, local_embedding_table, bag_lengths)
     # pyrefly: ignore [bad-argument-count, bad-return]
-    return sharded(looked_up_ids, looked_up_id_count, local_embedding_table)
+    return sharded(*args)
 
 
 def _ringshift_backward_impl(
@@ -2498,17 +2857,25 @@ def _ringshift_backward_impl(
 # API :func:`ringshift_embedding_lookup` preserves the existing keyword-only
 # signature; this inner function exists only because custom_vjp can't take
 # static kwargs directly.
-@functools.partial(jax.custom_vjp, nondiff_argnums=(3, 4, 5, 6, 7, 8))
+# ``bag_lengths`` sits in a DIFFERENTIABLE position (index 3) even though it is
+# int32 and receives a ``None`` gradient: it is a traced array, so it cannot be
+# a ``nondiff_argnum``. Adding it therefore shifts every static argument right
+# by one, and ``_bwd`` must return a 4-tuple. Those two edits plus ``pooling``
+# in ``_bwd``'s parameter list have to move together -- getting any one of them
+# wrong fails silently rather than raising.
+@functools.partial(jax.custom_vjp, nondiff_argnums=(4, 5, 6, 7, 8, 9, 10))
 def _ringshift_with_grad(
     looked_up_ids: jax.Array,
     looked_up_id_count: jax.Array,
     local_embedding_table: jax.Array,
+    bag_lengths: jax.Array | None,
     mesh: jax.sharding.Mesh,
     axis_name: str,
     recv_capacity: int,
     interpret: bool,
     splitter: str,
     exchange_bf16: bool,
+    pooling: str,
 ) -> jax.Array:
     return _ringshift_forward_impl(
         looked_up_ids,
@@ -2520,6 +2887,8 @@ def _ringshift_with_grad(
         interpret=interpret,
         splitter=splitter,
         exchange_bf16=exchange_bf16,
+        pooling=pooling,
+        bag_lengths=bag_lengths,
     )
 
 
@@ -2527,12 +2896,14 @@ def _ringshift_with_grad_fwd(
     looked_up_ids,
     looked_up_id_count,
     local_embedding_table,
+    bag_lengths,
     mesh,
     axis_name,
     recv_capacity,
     interpret,
     splitter,
     exchange_bf16,
+    pooling,
 ):
     """Forward + save residuals for backward.
 
@@ -2558,6 +2929,8 @@ def _ringshift_with_grad_fwd(
         interpret=interpret,
         splitter=splitter,
         exchange_bf16=exchange_bf16,
+        pooling=pooling,
+        bag_lengths=bag_lengths,
     )
     # local_embedding_table.shape is the user-facing 3-tuple
     # (world_size, v_local, D); strip the rank axis for the per-device
@@ -2569,7 +2942,15 @@ def _ringshift_with_grad_fwd(
             f"[world_size, v_local, D], got shape {full_shape}"
         )
     per_device_shape = (int(full_shape[1]), int(full_shape[2]))
-    residuals = (looked_up_ids, looked_up_id_count, per_device_shape)
+    # ``bag_lengths`` joins the residuals because the pooled backward has to
+    # fan the per-bag gradient back out to one row per id before the existing
+    # per-id driver can consume it.
+    residuals = (
+        looked_up_ids,
+        looked_up_id_count,
+        bag_lengths,
+        per_device_shape,
+    )
     return out, residuals
 
 
@@ -2580,16 +2961,38 @@ def _ringshift_with_grad_bwd(
     interpret,
     splitter,
     exchange_bf16,
+    pooling,
     residuals,
     grad_out,
 ):
     """Backward: compute grad_local_embedding_table.
 
     Returns gradients matching the differentiable input signature
-    (looked_up_ids, looked_up_id_count, local_embedding_table). The two int32
-    inputs (looked_up_ids, looked_up_id_count) get None gradients.
+    (looked_up_ids, looked_up_id_count, local_embedding_table, bag_lengths).
+    The three int32 inputs get None gradients; only the table is differentiated.
+
+    Note the parameter order: ``jax.custom_vjp`` passes the ``nondiff_argnums``
+    first, in their declared order, then the residuals, then the cotangent. So
+    ``pooling`` -- the last static argument -- lands just before ``residuals``.
     """
-    looked_up_ids, looked_up_id_count, table_shape = residuals
+    looked_up_ids, looked_up_id_count, bag_lengths, table_shape = residuals
+
+    if pooling != "none":
+        # The op now returns [W, num_bags, D], so the cotangent arrives per bag.
+        # Expand it to one row per id, in caller order, which is what the
+        # existing per-id backward driver expects -- it is then reached
+        # completely unchanged (staged plan V1a).
+        assert bag_lengths is not None  # narrowed by _check_pooling
+        max_local_ids = looked_up_ids.shape[-1]
+        grad_out = jax.vmap(
+            functools.partial(
+                fan_out_pooled_grad,
+                max_local_ids=max_local_ids,
+                pooling=pooling,
+            )
+        )(grad_out, bag_lengths)
+        looked_up_id_count = jnp.sum(bag_lengths, axis=-1).astype(jnp.int32)
+
     grad_table = _ringshift_backward_impl(
         grad_out,
         looked_up_ids,
@@ -2602,7 +3005,8 @@ def _ringshift_with_grad_bwd(
         splitter=splitter,
         exchange_bf16=exchange_bf16,
     )
-    return (None, None, grad_table)
+    # One entry per differentiable input; the arity must match exactly.
+    return (None, None, grad_table, None)
 
 
 _ringshift_with_grad.defvjp(_ringshift_with_grad_fwd, _ringshift_with_grad_bwd)
