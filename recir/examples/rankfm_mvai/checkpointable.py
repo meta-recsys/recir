@@ -16,6 +16,7 @@ entries as ``DTensor``s so DCP saves/loads each host's shard; all other
 (replicated) entries pass through unchanged and DCP dedups them correctly.
 """
 
+import copy
 from typing import Any, cast, Dict, Sequence
 
 import torch
@@ -59,6 +60,30 @@ def _to_plain_host_tensor(value: Any) -> Any:
     with torch.no_grad():
         out.copy_(value.detach())
     return out
+
+
+def _freeze_checkpoint_value(value: Any) -> Any:
+    value = _to_plain_host_tensor(value)
+    if isinstance(value, torch.Tensor):
+        return value.clone()
+    return copy.deepcopy(value)
+
+
+class _RecirAsyncStager:
+    """Use the snapshot already prepared by ``RecirCheckpointable``."""
+
+    @property
+    def should_synchronize_after_execute(self) -> bool:
+        return True
+
+    def stage(self, state_dict: Dict[str, Any]) -> Dict[str, Any]:
+        return state_dict
+
+    def synchronize_staging(self) -> None:
+        pass
+
+    def close(self) -> None:
+        pass
 
 
 def reseed_warmup(warmup: Any, iteration: int) -> None:
@@ -193,19 +218,29 @@ class RecirCheckpointable(Stateful):
         self._wrapper.flush_host_state(full=True)
         # Sanitize every value to a plain host tensor (drops any torchax
         # jax.Array/env refs that torch.save/DCP can't pickle).
-        sd: Dict[str, Any] = pytree.tree_map(
-            _to_plain_host_tensor, dict(self._wrapper.state_dict())
-        )
+        sd: Dict[str, Any] = {}
+        for key, value in dict(self._wrapper.state_dict()).items():
+            if _is_sharded_table_key(key, self._table_prefixes):
+                # Per-step host sync skips table prefixes, so this large host
+                # mirror remains immutable until the next checkpoint. The
+                # manager permits only one in-flight save before another flush.
+                sd[key] = _to_plain_host_tensor(value)
+            else:
+                sd[key] = pytree.tree_map(_freeze_checkpoint_value, value)
         # Single host: tables are not row-sharded, so plain tensors are correct
         # (and a DTensor mesh would need a process group we don't init).
         if self._num_processes > 1:
             sd = wrap_sharded_for_save(sd, self._sharded_prefixes, self._mesh())
         if self._optimizer is not None:
             sd[OPTIMIZER_STATE_KEY] = pytree.tree_map(
-                _to_plain_host_tensor, self._optimizer.state_dict()
+                _freeze_checkpoint_value, self._optimizer.state_dict()
             )
         sd[WARMUP_ITER_KEY] = int(self._warmup.iter)
         return sd
+
+    def make_async_stager(self) -> Any:
+        """Avoid DCP's full CPU deepcopy after ``state_dict`` has frozen state."""
+        return _RecirAsyncStager()
 
     def load_state_dict(self, state_dict: Dict[str, Any]) -> None:
         warmup_iter = int(state_dict.get(WARMUP_ITER_KEY, 0))
