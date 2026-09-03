@@ -99,6 +99,9 @@ class RankFMTrainerConfig:
     # env vars (see CheckpointManager).
     save_every_n_steps: int = 0
     keep_last_n: int = 2
+    # Stage a consistent host snapshot at the checkpoint boundary, then overlap
+    # the distributed storage write with subsequent train steps.
+    async_checkpoint: bool = False
     dense_optimizer_config: OptimConfig = field(
         default_factory=lambda: OptimConfig(
             optim_type=OptimType.ADAMW,
@@ -580,6 +583,7 @@ def build_trainer_config(
         CheckpointConfig(
             save_every_n_steps=trainer_cfg.save_every_n_steps,  # pyre-ignore[28]
             keep_last_n=trainer_cfg.keep_last_n,  # pyre-ignore[28]
+            async_save=trainer_cfg.async_checkpoint,  # pyre-ignore[28]
         )
         if trainer_cfg.save_every_n_steps > 0
         or bool(os.environ.get("MVAI_CHECKPOINT_LOAD_DIR"))
