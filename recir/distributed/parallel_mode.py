@@ -568,7 +568,7 @@ class GSPMDParallel(ParallelMode):
         # targeting a TPU pod), `jax.process_count()` still reports the
         # host's process count (=1 on the prebuild box) while the
         # topology models the deployment with N processes. The trace-
-        # time `_make_batch_transform` (which uses this property) must
+        # time `_make_trace_input_transform` (which uses this property) must
         # match the runtime `_to_sharded_jax` local→global multiplier,
         # so use the topology-aware ratio when one is active.
         if _AOT_TOPOLOGY.get() is not None:

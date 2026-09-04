@@ -62,9 +62,14 @@ from recir.region_transforms import (
     SparseEmbeddingTransform,
 )
 from torch import fx
+from torch._dynamo.source import LocalSource
 from torch._subclasses.fake_tensor import FakeTensorMode
 from torch.export.unflatten import _assign_attr, _AttrKind
-from torch.fx.experimental.symbolic_shapes import ShapeEnv
+from torch.fx.experimental.symbolic_shapes import (
+    DimDynamic,
+    ShapeEnv,
+    StatelessSymbolicContext,
+)
 from torch.fx.graph import _PyTreeCodeGen, _PyTreeInfo, CodeGen
 from torch.fx.graph_module import _del_attr, _get_attr
 from torch.nn.utils import stateless
@@ -597,20 +602,45 @@ def _local_compile(
     return _LocalCompiledResult(gm, mod, opts, params, buffers, named_states, constants)
 
 
-def _make_batch_transform(
+def _make_trace_input_transform(
     input_batch_dim: int,
     ratio: float,
     fake_mode: FakeTensorMode,
+    dynamic_batch_dim: bool = False,
 ) -> Callable[[torch.Tensor], torch.Tensor]:
-    """Create an input transform that expands or shrinks mini-batch tensors.
+    """Create a transform that fakeifies inputs and optionally resizes a dimension.
 
+    Every tensor is converted with ``fake_mode``. When ``dynamic_batch_dim``
+    is set, ``input_batch_dim`` remains symbolic even when no resize is needed.
     For ratio > 1 (e.g., GSPMD: local → global batch), ``repeat`` expands.
     For ratio < 1 (e.g., v2 XLA path: multi-device local → per-device batch),
-    ``narrow`` shrinks.  For ratio == 1 the tensor is unchanged.
+    ``narrow`` shrinks. For ratio == 1 only the FakeTensor conversion occurs.
     """
 
+    input_index = 0
+
+    def _to_fake(arg: torch.Tensor) -> torch.Tensor:
+        nonlocal input_index
+        if not dynamic_batch_dim or arg.ndim <= input_batch_dim:
+            return fake_mode.from_tensor(arg)
+        symbolic_context = StatelessSymbolicContext(
+            dynamic_sizes=[
+                DimDynamic.DYNAMIC
+                if dimension == input_batch_dim
+                else DimDynamic.STATIC
+                for dimension in range(arg.ndim)
+            ]
+        )
+        source = LocalSource(f"recir_batch_input_{input_index}")
+        input_index += 1
+        return fake_mode.from_tensor(
+            arg,
+            static_shapes=False,
+            source=source,
+            symbolic_context=symbolic_context,
+        )
+
     def _get_full_batch_arg(arg: torch.Tensor) -> torch.Tensor:
-        fake_arg = fake_mode.from_tensor(arg)
         # Return the fake input untouched in two no-op cases:
         #   * No mini-batch dim to expand/shrink: 0-d scalar tensors (or any
         #     tensor whose rank is <= input_batch_dim). Indexing the missing
@@ -620,13 +650,13 @@ def _make_batch_transform(
         #     ratio)`` would emit an equality guard that specializes the batch
         #     SymInt to its trace-time value, silently freezing the per-batch
         #     (candidate) dimension on the single-device-per-process path.
-        if fake_arg.ndim <= input_batch_dim or ratio == 1:
-            return fake_arg
-        curr_batch = fake_arg.shape[input_batch_dim]
+        if arg.ndim <= input_batch_dim or ratio == 1:
+            return _to_fake(arg)
         # Integer expand (ratio > 1 and integer-valued).
         if isinstance(ratio, int) or (
             isinstance(ratio, float) and ratio > 1.0 and ratio.is_integer()
         ):
+            fake_arg = _to_fake(arg)
             n = int(ratio)
             repeat_dims = [1] * arg.ndim
             repeat_dims[input_batch_dim] = n
@@ -636,7 +666,8 @@ def _make_batch_transform(
             inv = 1.0 / ratio
             if inv.is_integer():
                 n = int(inv)
-                target_batch = curr_batch // n  # SymInt // int -> SymInt
+                fake_arg = _to_fake(arg)
+                target_batch = fake_arg.shape[input_batch_dim] // n
                 return fake_arg.narrow(input_batch_dim, 0, target_batch)
         # Any other ratio (non-integer and non-1/N) could only be applied via
         # ``int(curr_batch * ratio)``, which specializes the batch SymInt and
@@ -644,7 +675,7 @@ def _make_batch_transform(
         # ratio (HDP/DP -> 1/N; GSPMD -> integer num_processes), so reject it
         # instead of specializing behind the caller's back.
         raise AssertionError(
-            f"_make_batch_transform: unsupported batch ratio {ratio!r}; "
+            f"_make_trace_input_transform: unsupported batch ratio {ratio!r}; "
             "expected 1, a positive integer, or 1/N for integer N >= 2."
         )
 
@@ -1389,15 +1420,15 @@ def trace(  # noqa: C901 — orchestration: dispatches on parallel_mode flavor (
             shape_env=ShapeEnv() if isinstance(parallel_mode, HybridParallel) else None,
         )
 
-        # Apply the per-process -> per-device batch transform up front, so
-        # discovery, region-transform inner trace, and the outer trace all
-        # see the same (per-device) input shape.  Otherwise the region's
-        # ``gm_fwd`` would bake per-process shapes that conflict with the
-        # outer trace's narrowed inputs.
-        input_transform = _make_batch_transform(
+        # Convert every input through the shared FakeTensorMode and resize it
+        # when one process owns multiple devices. HybridParallel currently has
+        # one process per GPU, so its ratio is 1: no resize occurs, but this
+        # call still keeps input_batch_dim symbolic for candidate/jagged inputs.
+        input_transform = _make_trace_input_transform(
             parallel_mode.input_batch_dim,
             ratio=1 / (world_size // parallel_mode.num_processes),
             fake_mode=fake_mode,
+            dynamic_batch_dim=isinstance(parallel_mode, HybridParallel),
         )
         args = pytree.tree_map_only(torch.Tensor, input_transform, args)
         kwargs = pytree.tree_map_only(torch.Tensor, input_transform, kwargs)
@@ -1505,7 +1536,7 @@ def trace(  # noqa: C901 — orchestration: dispatches on parallel_mode flavor (
         fake_mode = FakeTensorMode(allow_non_fake_inputs=True)
         trace_batch_ratio = _resolve_trace_batch_ratio(parallel_mode)
         if trace_batch_ratio is not None and trace_batch_ratio != 1:
-            input_transform = _make_batch_transform(
+            input_transform = _make_trace_input_transform(
                 input_batch_dim,
                 ratio=trace_batch_ratio,
                 fake_mode=fake_mode,
@@ -2076,15 +2107,15 @@ def _compile_data_parallel_v2(
         shape_env=ShapeEnv() if isinstance(parallel_mode, HybridParallel) else None,
     )
 
-    # Apply the per-process → per-device batch transform up front, so
-    # discovery, region-transform inner trace, and the outer trace all
-    # see the same (per-device) input shape.  Otherwise the region's
-    # ``gm_fwd`` would bake per-process shapes that conflict with the
-    # outer trace's narrowed inputs.
-    input_transform = _make_batch_transform(
+    # Convert every input through the shared FakeTensorMode and resize it when
+    # one process owns multiple devices. HybridParallel currently has one
+    # process per GPU, so its ratio is 1: no resize occurs, but this call still
+    # keeps input_batch_dim symbolic for candidate/jagged inputs.
+    input_transform = _make_trace_input_transform(
         parallel_mode.input_batch_dim,
         ratio=1 / (world_size // parallel_mode.num_processes),
         fake_mode=fake_mode,
+        dynamic_batch_dim=isinstance(parallel_mode, HybridParallel),
     )
     args = pytree.tree_map_only(torch.Tensor, input_transform, args)
     kwargs = pytree.tree_map_only(torch.Tensor, input_transform, kwargs)
@@ -2212,7 +2243,7 @@ def _compile_gspmd(
     # all see the same (global) input shape.  Otherwise the region's
     # ``gm_fwd`` would bake per-process shapes (e.g. ``aten.view`` target
     # lists) that conflict with the outer trace's expanded inputs.
-    input_transform = _make_batch_transform(
+    input_transform = _make_trace_input_transform(
         parallel_mode.input_batch_dim,
         ratio=parallel_mode.num_processes,
         fake_mode=fake_mode,
@@ -2441,9 +2472,9 @@ def compile(  # noqa: C901 — orchestration: stages 0-9 + legacy DP/GSPMD wirin
     * **Stage 1 -- trace.** :func:`functorch.make_fx` capture (Python -> FX)
       via :func:`trace` and its inner :func:`_local_compile`.  Produces the
       initial :class:`fx.GraphModule` plus a ``flat_state`` list whose
-      entries map 1:1 to the leading placeholders.  Multi-process modes
-      (DP / HybridParallel / GSPMD) inflate the input batch dim from
-      per-host to global before tracing via ``_make_batch_transform``.
+      entries map 1:1 to the leading placeholders. Parallel modes normalize
+      trace inputs via ``_make_trace_input_transform``; depending on the mode,
+      this may resize the batch dimension or only fakeify and symbolize it.
     * **Stage 2 -- post-trace meta tagging.** :func:`_tag_batch_inputs` plus
       :func:`propagate_batch_input_meta` walk the gm and tag every
       placeholder with ``is_batch_input`` / ``is_weight`` / ``batch_dim``
