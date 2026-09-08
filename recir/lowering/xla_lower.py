@@ -733,7 +733,7 @@ class _XLAModule(torch.nn.Module):
         #     CPU host is 1, so using THAT would compile for a different
         #     global shape than the runtime executes against and the
         #     AOT-loaded executable would TypeError on the first call.
-        # `_make_batch_transform` in recir.api._compile_gspmd must use
+        # `_make_trace_input_transform` in recir.api._compile_gspmd must use
         # the same multiplier (see GSPMDParallel.num_processes for the
         # matching property).
         host_count = num_global // num_local
@@ -759,7 +759,7 @@ class _XLAModule(torch.nn.Module):
             # FSDP: input is a local shard (after shard_params). Same
             # rationale as the is_batch_input branch above -- the
             # local→global multiplier here must match the gm's baked
-            # global shape (via _make_batch_transform's host_count).
+            # global shape (via _make_trace_input_transform's host_count).
             global_shape = list(nparray.shape)
             global_shape[0] *= fsdp_host_shard_count
             ndim = len(global_shape)
