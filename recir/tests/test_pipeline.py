@@ -6,11 +6,14 @@
 
 import operator
 import unittest
+from types import SimpleNamespace
 from typing import Sequence
 from unittest import mock
 
 import torch
 import torch.fx as fx
+from recir.api import make_compiled_runner
+from recir.lowering.device_state import DeviceStateManager
 from recir.pipeline import (
     build_pipeline,
     is_pipeline_pending,
@@ -34,6 +37,12 @@ class _TwoStageModule(torch.nn.Module):
     def forward(self, value: torch.Tensor) -> torch.Tensor:
         distributed = value + 1
         return distributed * 2
+
+
+class _RunnerModule(torch.nn.Module):
+    def forward(self, value: torch.Tensor) -> tuple[torch.Tensor]:
+        distributed = value + 1
+        return (distributed * 2,)
 
 
 class _InterleavedModule(torch.nn.Module):
@@ -391,6 +400,26 @@ class PipelineTest(unittest.TestCase):
         first = pipeline(torch.tensor(1))
         second = pipeline(torch.tensor(2))
         final = pipeline(last_iter=True)
+
+        self.assertTrue(is_pipeline_pending(first))
+        self.assertEqual(second, torch.tensor(4))
+        self.assertEqual(final, torch.tensor(6))
+
+    def test_compiled_runner_handles_pipeline_pending_and_drain(self) -> None:
+        pipeline = build_pipeline(
+            _mark_add(fx.symbolic_trace(_RunnerModule())),
+            _two_stage_config(),
+        )
+        compiled_obj = SimpleNamespace(
+            gm=pipeline,
+            flat_state=[],
+            state_manager=DeviceStateManager(),
+        )
+        runner = make_compiled_runner(compiled_obj)
+
+        first = runner(torch.tensor(1), input_ready_event=object())
+        second = runner(torch.tensor(2))
+        final = runner(last_train_step=True)
 
         self.assertTrue(is_pipeline_pending(first))
         self.assertEqual(second, torch.tensor(4))
