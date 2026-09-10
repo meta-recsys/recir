@@ -46,31 +46,19 @@ _NEXT_CONTEXT = itertools.count()
 def dedup_sparse_features(
     feature_lengths: torch.Tensor,
     indices: torch.Tensor,
-    hash_size_cumsum: list[int],
-    hash_size_offset: list[int],
+    hash_size_cumsum: torch.Tensor,
+    hash_size_offset: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Deduplicate EC indices using TorchRec's FBGEMM primitive."""
-    if len(hash_size_cumsum) != len(hash_size_offset):
+    if hash_size_cumsum.numel() != hash_size_offset.numel():
         raise ValueError("Dedup hash metadata must have one entry per feature.")
-    if not hash_size_offset or hash_size_offset[-1] != len(hash_size_offset) - 1:
-        raise ValueError("Dedup hash offsets must cover every feature.")
     offsets = torch.cat((feature_lengths.new_zeros((1,)), feature_lengths)).cumsum(
         dim=0
     )
-    hash_size_cumsum_tensor = torch.tensor(
-        hash_size_cumsum,
-        dtype=torch.int64,
-        device=indices.device,
-    )
-    hash_size_offset_tensor = torch.tensor(
-        hash_size_offset,
-        dtype=torch.int64,
-        device=indices.device,
-    )
     dedup_lengths, _dedup_offsets, unique_indices, reverse_indices = (
         torch.ops.fbgemm.jagged_unique_indices(
-            hash_size_cumsum_tensor,
-            hash_size_offset_tensor,
+            hash_size_cumsum,
+            hash_size_offset,
             offsets.to(torch.int64),
             indices.to(torch.int64),
         )
@@ -82,8 +70,8 @@ def dedup_sparse_features(
 def _fake_dedup_sparse_features(
     feature_lengths: torch.Tensor,
     indices: torch.Tensor,
-    hash_size_cumsum: list[int],
-    hash_size_offset: list[int],
+    hash_size_cumsum: torch.Tensor,
+    hash_size_offset: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     del hash_size_cumsum, hash_size_offset
     unique_count = torch.library.get_ctx().new_dynamic_size()
@@ -140,7 +128,6 @@ def _fake_bucketize_sparse_features(
     block_sizes: torch.Tensor,
     world_size: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    del block_sizes
     bucketized_lengths = feature_lengths.new_empty(
         (feature_lengths.shape[0] * world_size,)
     )
@@ -152,15 +139,15 @@ def _fake_bucketize_sparse_features(
     )
 
 
-@torch.library.custom_op("recir::permute_sparse_data", mutates_args=())
-def permute_sparse_data(
+@torch.library.custom_op("recir::permute_sparse_data_2d", mutates_args=())
+def permute_sparse_data_2d(
     permutation: torch.Tensor,
     lengths: torch.Tensor,
     values: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Permute variable-length segments with FBGEMM."""
+    """Permute fixed-width groups of variable-length segments with FBGEMM."""
     permuted_lengths, permuted_values, _permuted_weights = (
-        torch.ops.fbgemm.permute_1D_sparse_data(
+        torch.ops.fbgemm.permute_2D_sparse_data(
             permutation,
             lengths,
             values,
@@ -171,8 +158,8 @@ def permute_sparse_data(
     return permuted_lengths, permuted_values
 
 
-@permute_sparse_data.register_fake
-def _fake_permute_sparse_data(
+@permute_sparse_data_2d.register_fake
+def _fake_permute_sparse_data_2d(
     permutation: torch.Tensor,
     lengths: torch.Tensor,
     values: torch.Tensor,

@@ -91,12 +91,27 @@ class TBESparseEmbeddingTransformTest(unittest.TestCase):
         for op_name in (
             "bucketize_sparse_features",
             "dedup_sparse_features",
-            "permute_sparse_data",
+            "permute_sparse_data_2d",
             "tbe_forward",
             "tbe_backward_update",
         ):
             table = torch._C._dispatch_dump_table(f"recir::{op_name}")
             self.assertIn("Meta:", table, table)
+
+    def test_permute_sparse_data_2d_preserves_inner_segments(self) -> None:
+        lengths = torch.tensor([[1, 2], [2, 0]], dtype=torch.int64)
+        values = torch.tensor([10, 11, 12, 20, 21], dtype=torch.int64)
+        permutation = torch.tensor([1, 0], dtype=torch.int32)
+
+        actual_lengths, actual_values = torch.ops.recir.permute_sparse_data_2d(
+            permutation, lengths, values
+        )
+
+        torch.testing.assert_close(
+            actual_lengths,
+            torch.tensor([[2, 0], [1, 2]], dtype=torch.int64),
+        )
+        torch.testing.assert_close(actual_values, torch.tensor([20, 21, 10, 11, 12]))
 
     def _transform(
         self,
@@ -340,7 +355,7 @@ class TBESparseEmbeddingTransformTest(unittest.TestCase):
         offsets = forward_nodes[0].args[6]
         if not isinstance(offsets, fx.Node):
             raise AssertionError(f"Expected FX offsets node, got {type(offsets)}.")
-        self.assertEqual(len(offsets.meta["val"].shape), 1)
+        self.assertEqual(offsets.meta["val"].shape, (17,))
         self.assertEqual(
             sum("recir.tbe_backward_update" in target for target in targets), 1
         )
@@ -430,18 +445,19 @@ class TBESparseEmbeddingTransformTest(unittest.TestCase):
             raise AssertionError(
                 f"Expected FX packed-lengths node, got {type(packed_lengths)}."
             )
-        self.assertEqual(packed_lengths.target, torch.ops.aten.stack.default)
-        length_parts = packed_lengths.args[0]
-        if not isinstance(length_parts, (list, tuple)):
-            raise AssertionError(
-                "Expected packed lengths to contain one scalar per feature."
-            )
-        self.assertEqual(len(length_parts), 2)
-        self.assertTrue(all(isinstance(part, fx.Node) for part in length_parts))
-        self.assertEqual(
-            sum("recir.permute_sparse_data" in target for target in targets),
-            3,
-        )
+        self.assertEqual(packed_lengths.meta["val"].shape, (8,))
+        permute_nodes = [
+            node
+            for node in joint.graph.nodes
+            if node.target == torch.ops.recir.permute_sparse_data_2d.default
+        ]
+        self.assertEqual(len(permute_nodes), 3)
+        for node in permute_nodes:
+            lengths = node.args[1]
+            if not isinstance(lengths, fx.Node):
+                raise AssertionError(f"Expected FX lengths node, got {type(lengths)}.")
+            self.assertEqual(len(lengths.meta["val"].shape), 2)
+            self.assertEqual(lengths.meta["val"].shape[1], 4)
         self.assertFalse(any("aten.argsort" in target for target in targets))
         self.assertFalse(
             any("embedding_dense_backward" in target for target in targets)
@@ -482,6 +498,17 @@ class TBESparseEmbeddingTransformTest(unittest.TestCase):
         self.assertEqual(
             sum("recir.dedup_sparse_features" in target for target in targets), 1
         )
+        dedup_node = next(
+            node
+            for node in joint.graph.nodes
+            if node.target == torch.ops.recir.dedup_sparse_features.default
+        )
+        for metadata_node in dedup_node.args[2:]:
+            if not isinstance(metadata_node, fx.Node):
+                raise AssertionError(
+                    f"Expected FX hash metadata node, got {type(metadata_node)}."
+                )
+            self.assertEqual(metadata_node.op, "get_attr")
         index_select_nodes = [
             node
             for node in joint.graph.nodes
