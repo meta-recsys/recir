@@ -149,22 +149,27 @@ def _row_wise_local_rows(num_rows: int, world_size: int, rank: int) -> int:
 
 
 def route_row_wise_indices_grouped(
-    *feature_indices: torch.Tensor,
+    *route_inputs: torch.Tensor,
+    feature_count: int,
     num_embeddings: tuple[int, ...],
     group_name: str,
     world_size: int,
     use_index_dedup: bool,
-    hash_size_cumsum: tuple[int, ...],
-    hash_size_offset: tuple[int, ...],
+    segments_per_feature: int,
 ) -> tuple[
     tuple[torch.Tensor, ...], tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]
 ]:
     """Route a TBE feature group with one counts and one indices all-to-all."""
-    feature_count = len(feature_indices)
+    expected_input_count = feature_count + (2 if use_index_dedup else 0)
+    if len(route_inputs) != expected_input_count:
+        raise ValueError(
+            "Sparse routing inputs do not match features and hash metadata."
+        )
+    feature_indices = route_inputs[:feature_count]
     if feature_count != len(num_embeddings):
         raise ValueError("Feature and table cardinality counts must match.")
 
-    packed_lengths = torch.stack(
+    feature_lengths = torch.stack(
         tuple(
             torch.scalar_tensor(
                 indices.shape[0],
@@ -174,16 +179,20 @@ def route_row_wise_indices_grouped(
             for indices in feature_indices
         )
     )
+    segment_offsets = nobag_tbe_offsets(feature_lengths, segments_per_feature)
+    packed_lengths = segment_offsets[1:] - segment_offsets[:-1]
     packed_indices = torch.cat(
         tuple(indices.reshape(-1) for indices in feature_indices)
     )
     if use_index_dedup:
+        hash_size_cumsum = route_inputs[feature_count]
+        hash_size_offset = route_inputs[feature_count + 1]
         dedup_lengths, unique_indices, reverse_indices = (
             torch.ops.recir.dedup_sparse_features(
                 packed_lengths,
                 packed_indices,
-                list(hash_size_cumsum),
-                list(hash_size_offset),
+                hash_size_cumsum,
+                hash_size_offset,
             )
         )
         packed_lengths = dedup_lengths.reshape(packed_lengths.shape)
@@ -202,7 +211,7 @@ def route_row_wise_indices_grouped(
         )
     )
     (
-        send_counts,
+        bucketized_lengths,
         bucketized_indices,
         bucketize_permute,
         unbucketize_permute,
@@ -213,16 +222,18 @@ def route_row_wise_indices_grouped(
         world_size,
     )
 
-    segments_per_rank = feature_count
-    pending_received_counts = torch.ops._c10d_functional.all_to_all_single(
-        send_counts,
+    segments_per_rank = feature_count * segments_per_feature
+    pending_received_lengths = torch.ops._c10d_functional.all_to_all_single(
+        bucketized_lengths,
         [segments_per_rank] * world_size,
         [segments_per_rank] * world_size,
         group_name,
     )
-    received_counts = torch.ops._c10d_functional.wait_tensor(pending_received_counts)
-    input_splits = send_counts.reshape(world_size, segments_per_rank).sum(dim=1)
-    output_splits = received_counts.reshape(world_size, segments_per_rank).sum(dim=1)
+    received_lengths = torch.ops._c10d_functional.wait_tensor(
+        pending_received_lengths
+    ).reshape(world_size * feature_count, segments_per_feature)
+    input_splits = bucketized_lengths.reshape(world_size, -1).sum(dim=1)
+    output_splits = received_lengths.reshape(world_size, -1).sum(dim=1)
     input_split_list, output_split_list, cpu_splits = _materialize_splits(
         input_splits, output_splits
     )
@@ -241,35 +252,40 @@ def route_row_wise_indices_grouped(
         torch.arange(
             world_size * feature_count,
             dtype=torch.int32,
-            device=received_counts.device,
+            device=received_lengths.device,
         )
         .reshape(world_size, feature_count)
         .permute(1, 0)
         .reshape(-1)
     )
-    feature_major_counts, feature_major_indices = torch.ops.recir.permute_sparse_data(
-        receive_recat,
-        received_counts,
-        received_indices,
+    feature_major_lengths, feature_major_indices = (
+        torch.ops.recir.permute_sparse_data_2d(
+            receive_recat,
+            received_lengths,
+            received_indices,
+        )
     )
-    received_feature_lengths = feature_major_counts.reshape(
-        feature_count, world_size
-    ).sum(dim=1)
+    offsets = torch.cat(
+        (
+            feature_major_lengths.new_zeros((1,)),
+            feature_major_lengths.reshape(-1),
+        )
+    ).cumsum(dim=0)
     return (
         (
             feature_major_indices,
-            received_feature_lengths,
+            offsets,
             bucketize_permute,
             unbucketize_permute,
             receive_recat,
-            received_counts,
-            feature_major_counts,
+            received_lengths,
+            feature_major_lengths,
             cpu_splits,
             reverse_indices,
         ),
         (
-            send_counts,
-            pending_received_counts,
+            bucketized_lengths,
+            pending_received_lengths,
             bucketized_indices,
             bucketize_permute,
             unbucketize_permute,
@@ -277,7 +293,7 @@ def route_row_wise_indices_grouped(
         ),
         (
             pending_received_indices,
-            received_counts,
+            received_lengths,
             cpu_splits,
         ),
     )
@@ -300,7 +316,7 @@ def _dependency_closure(
 def return_row_wise_embeddings_grouped(
     local_embeddings: torch.Tensor,
     unbucketize_permute: torch.Tensor,
-    feature_major_counts: torch.Tensor,
+    feature_major_lengths: torch.Tensor,
     cpu_splits: torch.Tensor,
     group_name: str,
     world_size: int,
@@ -310,7 +326,7 @@ def return_row_wise_embeddings_grouped(
     _declare_split_invariants(input_splits, unbucketize_permute.shape[0])
     _declare_split_invariants(output_splits, local_embeddings.shape[0])
     embedding_dim = local_embeddings.shape[1]
-    feature_count = feature_major_counts.shape[0] // world_size
+    feature_count = feature_major_lengths.shape[0] // world_size
     feature_to_source_recat = (
         torch.arange(
             world_size * feature_count,
@@ -321,9 +337,9 @@ def return_row_wise_embeddings_grouped(
         .permute(1, 0)
         .reshape(-1)
     )
-    _, source_major_embeddings = torch.ops.recir.permute_sparse_data(
+    _, source_major_embeddings = torch.ops.recir.permute_sparse_data_2d(
         feature_to_source_recat,
-        feature_major_counts * embedding_dim,
+        feature_major_lengths * embedding_dim,
         local_embeddings.reshape(-1),
     )
     returned = torch.ops._c10d_functional.all_to_all_single(
@@ -341,7 +357,7 @@ def route_row_wise_gradients_grouped(
     bucketize_permute: torch.Tensor,
     reverse_indices: torch.Tensor,
     receive_recat: torch.Tensor,
-    received_counts: torch.Tensor,
+    received_lengths: torch.Tensor,
     cpu_splits: torch.Tensor,
     group_name: str,
     world_size: int,
@@ -368,9 +384,9 @@ def route_row_wise_gradients_grouped(
         group_name,
     )
     received = torch.ops._c10d_functional.wait_tensor(received)
-    _, feature_major_gradients = torch.ops.recir.permute_sparse_data(
+    _, feature_major_gradients = torch.ops.recir.permute_sparse_data_2d(
         receive_recat,
-        received_counts * embedding_dim,
+        received_lengths * embedding_dim,
         received,
     )
     return feature_major_gradients.reshape(-1, embedding_dim)
@@ -819,8 +835,10 @@ class TBESparseEmbeddingTransform(RegionTransform):
                 "TBE forward count changed between inner and outer traces: "
                 f"expected {len(self._compiled_groups)}, found {len(forwards)}."
             )
-        for forward, group in zip(forwards, self._compiled_groups):
-            self._route_group(gm, forward, group)
+        for group_index, (forward, group) in enumerate(
+            zip(forwards, self._compiled_groups)
+        ):
+            self._route_group(gm, forward, group, group_index)
         gm.graph.lint()
         gm.recompile()
 
@@ -829,6 +847,7 @@ class TBESparseEmbeddingTransform(RegionTransform):
         gm: fx.GraphModule,
         forward: fx.Node,
         group: _CompiledGroup,
+        group_index: int,
     ) -> None:
         packed_indices = forward.args[5]
         packed_offsets = forward.args[6]
@@ -869,20 +888,61 @@ class TBESparseEmbeddingTransform(RegionTransform):
             )
             for site in group.sites
         )
+        route_example_inputs = example_features
+        route_input_nodes = feature_nodes
+        if self._use_index_dedup:
+            # Citrine C3: materialize static metadata directly on its runtime device.
+            hash_size_cumsum = torch.tensor(
+                group.hash_size_cumsum,
+                dtype=torch.int64,
+                device=group.device,
+            )
+            hash_size_offset = torch.tensor(
+                group.hash_size_offset,
+                dtype=torch.int64,
+                device=group.device,
+            )
+            hash_size_cumsum_name = f"_recir_dedup_hash_size_cumsum_{group_index}"
+            hash_size_offset_name = f"_recir_dedup_hash_size_offset_{group_index}"
+            gm.register_buffer(
+                hash_size_cumsum_name,
+                hash_size_cumsum,
+                persistent=False,
+            )
+            gm.register_buffer(
+                hash_size_offset_name,
+                hash_size_offset,
+                persistent=False,
+            )
+            with gm.graph.inserting_before(forward):
+                hash_size_cumsum_node = gm.graph.get_attr(hash_size_cumsum_name)
+                hash_size_offset_node = gm.graph.get_attr(hash_size_offset_name)
+            hash_size_cumsum_node.meta["val"] = hash_size_cumsum
+            hash_size_offset_node.meta["val"] = hash_size_offset
+            route_example_inputs = (
+                *route_example_inputs,
+                hash_size_cumsum,
+                hash_size_offset,
+            )
+            route_input_nodes = (
+                *route_input_nodes,
+                hash_size_cumsum_node,
+                hash_size_offset_node,
+            )
         route_output, route_nodes = _inline_before(
             gm,
             forward,
             partial(
                 route_row_wise_indices_grouped,
+                feature_count=feature_count,
                 num_embeddings=tuple(site.global_rows for site in group.sites),
                 group_name=self.group_name,
                 world_size=self.world_size,
                 use_index_dedup=self._use_index_dedup,
-                hash_size_cumsum=group.hash_size_cumsum,
-                hash_size_offset=group.hash_size_offset,
+                segments_per_feature=self._segments_per_feature,
             ),
-            example_features,
-            feature_nodes,
+            route_example_inputs,
+            route_input_nodes,
         )
         output, start_boundary, continue_boundary = route_output
         start_nodes = _dependency_closure(start_boundary, route_nodes)
@@ -900,32 +960,16 @@ class TBESparseEmbeddingTransform(RegionTransform):
         mark_pipeline_region(continue_nodes, PipelineRegion.ROUTE_CONTINUE)
         (
             received_indices,
-            received_lengths,
+            offsets,
             bucketize_permute,
             unbucketize_permute,
             receive_recat,
-            received_counts,
-            feature_major_counts,
+            received_lengths,
+            feature_major_lengths,
             cpu_splits,
             reverse_indices,
         ) = output
 
-        offsets, _ = _inline_before(
-            gm,
-            forward,
-            partial(
-                nobag_tbe_offsets,
-                segments_per_feature=self._segments_per_feature,
-            ),
-            (
-                torch.ones(
-                    (feature_count,),
-                    dtype=torch.int64,
-                    device=group.device,
-                ),
-            ),
-            (received_lengths,),
-        )
         forward_args = list(forward.args)
         forward_args[5] = received_indices
         forward_args[6] = offsets
@@ -980,7 +1024,10 @@ class TBESparseEmbeddingTransform(RegionTransform):
                 ),
                 torch.arange(feature_count * _PLACEHOLDER_SIZE, device=group.device),
                 torch.ones(
-                    (feature_count * self.world_size,),
+                    (
+                        feature_count * self.world_size,
+                        self._segments_per_feature,
+                    ),
                     dtype=torch.int64,
                     device=group.device,
                 ),
@@ -989,7 +1036,7 @@ class TBESparseEmbeddingTransform(RegionTransform):
             (
                 forward_output,
                 unbucketize_permute,
-                feature_major_counts,
+                feature_major_lengths,
                 cpu_splits,
             ),
         )
@@ -1012,7 +1059,7 @@ class TBESparseEmbeddingTransform(RegionTransform):
             bucketize_permute,
             reverse_indices,
             receive_recat,
-            received_counts,
+            received_lengths,
             cpu_splits,
         )
 
@@ -1024,7 +1071,7 @@ class TBESparseEmbeddingTransform(RegionTransform):
         bucketize_permute: fx.Node,
         reverse_indices: fx.Node,
         receive_recat: fx.Node,
-        received_counts: fx.Node,
+        received_lengths: fx.Node,
         cpu_splits: fx.Node,
     ) -> None:
         backward = next(
@@ -1065,7 +1112,10 @@ class TBESparseEmbeddingTransform(RegionTransform):
                     device=group.device,
                 ),
                 torch.ones(
-                    (len(group.sites) * self.world_size,),
+                    (
+                        len(group.sites) * self.world_size,
+                        self._segments_per_feature,
+                    ),
                     dtype=torch.int64,
                     device=group.device,
                 ),
@@ -1076,7 +1126,7 @@ class TBESparseEmbeddingTransform(RegionTransform):
                 bucketize_permute,
                 reverse_indices,
                 receive_recat,
-                received_counts,
+                received_lengths,
                 cpu_splits,
             ),
         )
