@@ -28,6 +28,8 @@ import torch.distributed._functional_collectives as funcol
 import torch.fx as fx
 import torch.nn as nn
 from functorch import make_fx
+from recir.pipeline import mark_pipeline_region
+from recir.pipeline_strategies import PipelineRegion
 from recir.region_transforms.base import RegionTransform
 from recir.region_transforms.sparse_embedding import _declare_split_invariants
 from recir.tbe.local import LocalTBEGroup, LocalTBETable, nobag_tbe_offsets
@@ -154,15 +156,7 @@ def route_row_wise_indices_grouped(
     hash_size_cumsum: tuple[int, ...],
     hash_size_offset: tuple[int, ...],
 ) -> tuple[
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
+    tuple[torch.Tensor, ...], tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]
 ]:
     """Route a TBE feature group with one counts and one indices all-to-all."""
     feature_count = len(feature_indices)
@@ -219,13 +213,13 @@ def route_row_wise_indices_grouped(
     )
 
     segments_per_rank = feature_count
-    received_counts = torch.ops._c10d_functional.all_to_all_single(
+    pending_received_counts = torch.ops._c10d_functional.all_to_all_single(
         send_counts,
         [segments_per_rank] * world_size,
         [segments_per_rank] * world_size,
         group_name,
     )
-    received_counts = torch.ops._c10d_functional.wait_tensor(received_counts)
+    received_counts = torch.ops._c10d_functional.wait_tensor(pending_received_counts)
     input_splits = send_counts.reshape(world_size, segments_per_rank).sum(dim=1)
     output_splits = received_counts.reshape(world_size, segments_per_rank).sum(dim=1)
     input_split_list, output_split_list, cpu_splits = _materialize_splits(
@@ -234,13 +228,13 @@ def route_row_wise_indices_grouped(
     _declare_split_invariants(input_split_list, packed_indices.shape[0])
     _declare_split_invariants(output_split_list)
 
-    received_indices = torch.ops._c10d_functional.all_to_all_single(
+    pending_received_indices = torch.ops._c10d_functional.all_to_all_single(
         bucketized_indices,
         output_split_list,
         input_split_list,
         group_name,
     )
-    received_indices = torch.ops._c10d_functional.wait_tensor(received_indices)
+    received_indices = torch.ops._c10d_functional.wait_tensor(pending_received_indices)
 
     receive_recat = (
         torch.arange(
@@ -261,16 +255,45 @@ def route_row_wise_indices_grouped(
         feature_count, world_size
     ).sum(dim=1)
     return (
-        feature_major_indices,
-        received_feature_lengths,
-        bucketize_permute,
-        unbucketize_permute,
-        receive_recat,
-        received_counts,
-        feature_major_counts,
-        cpu_splits,
-        reverse_indices,
+        (
+            feature_major_indices,
+            received_feature_lengths,
+            bucketize_permute,
+            unbucketize_permute,
+            receive_recat,
+            received_counts,
+            feature_major_counts,
+            cpu_splits,
+            reverse_indices,
+        ),
+        (
+            send_counts,
+            pending_received_counts,
+            bucketized_indices,
+            bucketize_permute,
+            unbucketize_permute,
+            reverse_indices,
+        ),
+        (
+            pending_received_indices,
+            received_counts,
+            cpu_splits,
+        ),
     )
+
+
+def _dependency_closure(
+    outputs: Sequence[fx.Node], candidates: set[fx.Node]
+) -> set[fx.Node]:
+    closure: set[fx.Node] = set()
+    pending = list(outputs)
+    while pending:
+        node = pending.pop()
+        if node in closure or node not in candidates:
+            continue
+        closure.add(node)
+        pending.extend(node.all_input_nodes)
+    return closure
 
 
 def return_row_wise_embeddings_grouped(
@@ -837,7 +860,7 @@ class TBESparseEmbeddingTransform(RegionTransform):
             )
             for site in group.sites
         )
-        output, _ = _inline_before(
+        route_output, route_nodes = _inline_before(
             gm,
             forward,
             partial(
@@ -852,6 +875,20 @@ class TBESparseEmbeddingTransform(RegionTransform):
             example_features,
             feature_nodes,
         )
+        output, start_boundary, continue_boundary = route_output
+        start_nodes = _dependency_closure(start_boundary, route_nodes)
+        continue_nodes = (
+            _dependency_closure(continue_boundary, route_nodes) - start_nodes
+        )
+        graph_nodes = set(gm.graph.nodes)
+        preprocess_nodes = {
+            node
+            for node in _dependency_closure(feature_nodes, graph_nodes - route_nodes)
+            if node.op not in ("placeholder", "get_attr")
+        }
+        mark_pipeline_region(preprocess_nodes, PipelineRegion.PREPROCESS)
+        mark_pipeline_region(start_nodes, PipelineRegion.ROUTE_START)
+        mark_pipeline_region(continue_nodes, PipelineRegion.ROUTE_CONTINUE)
         (
             received_indices,
             received_lengths,
@@ -884,6 +921,7 @@ class TBESparseEmbeddingTransform(RegionTransform):
         forward_args[5] = received_indices
         forward_args[6] = offsets
         forward.args = tuple(forward_args)
+        lookup_nodes = {forward}
         for node in gm.graph.nodes:
             if (
                 node.op == "call_function"
@@ -897,6 +935,7 @@ class TBESparseEmbeddingTransform(RegionTransform):
                 bounds_args[2] = offsets
                 node.args = tuple(bounds_args)
                 forward.prepend(node)
+                lookup_nodes.add(node)
 
         split_node = next(
             (
@@ -917,7 +956,7 @@ class TBESparseEmbeddingTransform(RegionTransform):
                         torch.ops.aten.sym_size.int, args=(feature, 0)
                     )
                 )
-        returned_output, _ = _inline_before(
+        returned_output, returned_nodes = _inline_before(
             gm,
             split_node,
             partial(
@@ -945,13 +984,17 @@ class TBESparseEmbeddingTransform(RegionTransform):
                 cpu_splits,
             ),
         )
+        lookup_nodes.update(returned_nodes)
         if self._use_index_dedup:
             with gm.graph.inserting_before(split_node):
                 returned_output = gm.graph.call_function(
                     torch.ops.aten.index_select.default,
                     args=(returned_output, 0, reverse_indices),
                 )
+            lookup_nodes.add(returned_output)
         split_node.args = (returned_output, original_lengths)
+        lookup_nodes.add(split_node)
+        mark_pipeline_region(lookup_nodes, PipelineRegion.EMBEDDING_LOOKUP)
 
         self._route_group_backward(
             gm,
