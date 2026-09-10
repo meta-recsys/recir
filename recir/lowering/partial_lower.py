@@ -125,6 +125,13 @@ def _compile_fx_with_fresh_shape_env(
         )
 
 
+_ALL_REDUCE_BUCKET_CAP_MB = 600.0  # TODO: make this configurable
+
+
+def _fixed_bucket_cap_mb(_bucket_index: int) -> float:
+    return _ALL_REDUCE_BUCKET_CAP_MB
+
+
 class _InductorModule(torch.nn.Module):
     def __init__(self, gm: torch.fx.GraphModule) -> None:
         super().__init__()
@@ -140,19 +147,6 @@ class _InductorModule(torch.nn.Module):
                 and "_c10d_functional" in str(n.target)
                 for n in self.gm.graph.nodes
             )
-            if has_collectives:
-                from torch._inductor import config as _inductor_config
-
-                # AOTAutograd retracing discards RecIR's earlier comm fusion, so
-                # re-bucket dense-grad all-reduces inside Inductor.
-                _inductor_config.bucket_all_reduces_fx = "all"
-
-                # Jagged sizes produce rank-local estimates, so estimate-based
-                # scheduling can reorder NCCL calls differently across ranks.
-                _inductor_config.reorder_for_peak_memory = False
-                _ado = _inductor_config.aten_distributed_optimizations
-                _ado.enable_overlap_scheduling = False
-
             # Replace aten.empty with aten.zeros to avoid uninitialized
             # memory reads if Inductor reorders ops.
             for n in self.gm.graph.nodes:
@@ -166,7 +160,45 @@ class _InductorModule(torch.nn.Module):
                         }
             self.gm.recompile()
 
-            self.compiled = _compile_fx_with_fresh_shape_env(self.gm, detached_args)
+            if has_collectives:
+                from torch._inductor import (
+                    config as _inductor_config,
+                    config_comms as _inductor_config_comms,
+                )
+
+                # RecIR GPU graphs use all-to-all with rank-local jagged work. Use
+                # fixed-order scheduler-IR passes for every collective subgraph so
+                # all ranks preserve collective order.
+                # The main config selects FX and scheduler-IR passes; config_comms
+                # constrains the selected communication passes' internal behavior.
+                overlap_config: dict[str, Any] = {
+                    "bucket_all_reduces_fx": "all",
+                    "bucket_all_reduces_fx_bucket_size_determinator": _fixed_bucket_cap_mb,
+                    "reorder_for_peak_memory": False,
+                    "reorder_for_compute_comm_overlap": True,
+                    "reorder_for_compute_comm_overlap_passes": [
+                        "reorder_communication_preserving_peak_memory",
+                        "sink_waits_iterative",
+                        "reorder_communication_preserving_peak_memory",
+                    ],
+                    "aten_distributed_optimizations.enable_simple_overlap": False,
+                    "aten_distributed_optimizations.enable_overlap_scheduling": False,
+                }
+                fixed_order_config = {
+                    "reorder_iterative_unsafe_collectives_reorder": False,
+                    "sink_waits_iterative_unsafe_collectives_reorder": False,
+                    "reorder_iterative_peak_memory_budget": 0.0,
+                    "sink_iterative_peak_memory_budget": 0.0,
+                }
+                with (
+                    _inductor_config.patch(overlap_config),
+                    cast(Any, _inductor_config_comms).patch(fixed_order_config),
+                ):
+                    self.compiled = _compile_fx_with_fresh_shape_env(
+                        self.gm, detached_args
+                    )
+            else:
+                self.compiled = _compile_fx_with_fresh_shape_env(self.gm, detached_args)
         with torch.profiler.record_function(tag):
             compiled = self.compiled
             assert compiled is not None
