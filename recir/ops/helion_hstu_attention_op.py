@@ -21,16 +21,17 @@ attention leaf must be a real opaque custom op with a ``register_fake``.
 
 ``install_helion_hstu_attention_swap()`` rebinds the hammer module's
 ``pytorch_hstu_mha`` name to :func:`_recir_pytorch_hstu_mha`, a plain Python
-adapter that keeps hammer's exact 16-parameter signature, validates the 8 args the
-Helion kernels do not implement, normalizes ``num_targets``/``attn_scale``, and
-calls the clean 8-arg op. The traced op is therefore already the lowered op -- no
-seam op and no ``op_swap_map`` rewrite are involved.
+adapter that keeps hammer's exact 16-parameter signature, validates unsupported
+arguments and attention-window combinations, normalizes
+``num_targets``/``attn_scale``, and calls the clean recir op. The traced op is
+therefore already the lowered op -- no seam op and no ``op_swap_map`` rewrite are
+involved.
 
 Autograd
 --------
 The forward carries ``register_autograd``, so recir's traced ``loss.backward()``
 emits a single ``recir::helion_ragged_attention_bwd`` node that the same torchax
-module lowers to the three Helion backward kernels.
+module lowers to the selected causal or semi-local backward kernels.
 
 Eager numerics are byte-identical to production
 -----------------------------------------------
@@ -62,6 +63,7 @@ from hammer.ops.pytorch.ragged_hstu_attention import (
 from recir.ops.helion.jagged_hstu_attention import (
     record_traced_bwd_sig,
     record_traced_fwd_sig,
+    use_semilocal_attention,
 )
 
 # The only mask regime the target-aware-causal SiLU kernels implement. hammer maps
@@ -75,13 +77,13 @@ _LIB = torch.library.Library("recir", "FRAGMENT")
 # ``attn_scale`` stays a Tensor rather than collapsing to a ``float inv_n``:
 # AttnScaleType.MAX_UIH_LEN (what prod sets, see udd_fm_v3's
 # train_module_wrapper.py) is 1/max(uih_lengths), which is data-dependent and
-# unrelated to N. ``N`` is load-bearing, not vestigial: it is the 5th element of
-# the warm-up signature ``(L, H, D, B, N, dtype)`` and ``register_fake`` cannot
-# record what is not in the schema.
+# unrelated to N. ``N`` and the two attention-window integers are load-bearing:
+# the meta kernel records them in the warm-up signature so causal L2 and semi-local
+# L1 compile their respective kernels before the first XLA lower.
 _FWD_SCHEMA = (
     "helion_ragged_attention_fwd(Tensor q, Tensor k, Tensor v, "
     "Tensor seq_offsets, Tensor num_targets, Tensor attn_scale, "
-    "float alpha, int N) -> Tensor"
+    "float alpha, int N, int max_attn_len, int full_attn_size) -> Tensor"
 )
 _LIB.define(_FWD_SCHEMA)
 
@@ -95,9 +97,11 @@ def _fwd_fallback(
     attn_scale: torch.Tensor,
     alpha: float,
     N: int,
+    max_attn_len: int,
+    full_attn_size: int,
 ) -> torch.Tensor:
     # Verbatim production numerics: defer to the captured original impl. The
-    # dropped args are pinned to the trivial values the adapter enforces.
+    # unsupported args are pinned to the trivial values the adapter enforces.
     return _ORIG_PYTORCH_HSTU_MHA(
         q,
         k,
@@ -111,9 +115,9 @@ def _fwd_fallback(
         num_targets,
         None,
         attn_scale,
+        max_attn_len,
         0,
-        0,
-        0,
+        full_attn_size,
         0,
     )
 
@@ -133,6 +137,8 @@ def _fwd_meta(
     attn_scale: torch.Tensor,
     alpha: float,
     N: int,
+    max_attn_len: int,
+    full_attn_size: int,
 ) -> torch.Tensor:
     # HSTU self-attention: out is [L, H, V] (q is [L, H, D], v is [L, H, V]).
     L, H, _ = q.shape
@@ -148,6 +154,8 @@ def _fwd_meta(
             int(q.shape[2]),
             int(seq_offsets.shape[0]) - 1,
             int(N),
+            int(max_attn_len),
+            int(full_attn_size),
             q.dtype,
         )
     )
@@ -158,7 +166,7 @@ def _fwd_meta(
 _BWD_SCHEMA = (
     "helion_ragged_attention_bwd(Tensor grad_out, Tensor q, Tensor k, Tensor v, "
     "Tensor seq_offsets, Tensor num_targets, Tensor attn_scale, float alpha, "
-    "int N) -> (Tensor, Tensor, Tensor)"
+    "int N, int max_attn_len, int full_attn_size) -> (Tensor, Tensor, Tensor)"
 )
 _LIB.define(_BWD_SCHEMA)
 
@@ -173,6 +181,8 @@ def _bwd_fallback(
     attn_scale: torch.Tensor,
     alpha: float,
     N: int,
+    max_attn_len: int,
+    full_attn_size: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     # Bulletproof eager match: differentiate the exact captured original forward,
     # so the eager bwd == autograd(eager fwd) for any args.
@@ -193,9 +203,9 @@ def _bwd_fallback(
             num_targets,
             None,
             attn_scale,
+            max_attn_len,
             0,
-            0,
-            0,
+            full_attn_size,
             0,
         )
         dq, dk, dv = torch.autograd.grad(out, (q_, k_, v_), grad_out)
@@ -216,6 +226,8 @@ def _bwd_meta(
     attn_scale: torch.Tensor,
     alpha: float,
     N: int,
+    max_attn_len: int,
+    full_attn_size: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     # Record the traced bwd shape so the model path can warm the three Helion
     # backward kernels for it before the first lower (see the fwd meta kernel).
@@ -226,6 +238,8 @@ def _bwd_meta(
             int(q.shape[2]),
             int(seq_offsets.shape[0]) - 1,
             int(N),
+            int(max_attn_len),
+            int(full_attn_size),
             q.dtype,
         )
     )
@@ -234,10 +248,23 @@ def _bwd_meta(
 
 # pyre-ignore[2]: variadic ctx/inputs for torch autograd registration.
 def _setup_context(ctx, inputs, output) -> None:  # noqa
-    q, k, v, seq_offsets, num_targets, attn_scale, alpha, N = inputs
+    (
+        q,
+        k,
+        v,
+        seq_offsets,
+        num_targets,
+        attn_scale,
+        alpha,
+        N,
+        max_attn_len,
+        full_attn_size,
+    ) = inputs
     ctx.save_for_backward(q, k, v, seq_offsets, num_targets, attn_scale)
     ctx.alpha = alpha
     ctx.N = N
+    ctx.max_attn_len = max_attn_len
+    ctx.full_attn_size = full_attn_size
 
 
 # pyre-ignore[2,3]
@@ -253,10 +280,12 @@ def _backward(ctx, grad_out):  # noqa
         attn_scale,
         ctx.alpha,
         ctx.N,
+        ctx.max_attn_len,
+        ctx.full_attn_size,
     )
-    # Grads aligned to the 8 fwd inputs: dq/dk/dv for q/k/v; None for
-    # seq_offsets, num_targets, attn_scale, alpha, N.
-    return dq, dk, dv, None, None, None, None, None
+    # Grads aligned to the 10 fwd inputs: dq/dk/dv for q/k/v; None for the
+    # offsets, targets, scale, alpha, N, and static attention-window integers.
+    return dq, dk, dv, None, None, None, None, None, None, None
 
 
 torch.library.register_autograd(
@@ -285,8 +314,9 @@ def _recir_pytorch_hstu_mha(
     """Drop-in ``pytorch_hstu_mha`` replacement that calls the clean recir op.
 
     Keeps hammer's exact parameter names and order so the STU call site's kwargs
-    bind unchanged after the rebind. Validates the args the Helion kernels do not
-    implement, then normalizes the two optionals the op requires as real tensors:
+    bind unchanged after the rebind. Validates unsupported arguments and accepts
+    either causal attention or RankFM's 256-local/256-full-tail mode, then
+    normalizes the two optionals the op requires as real tensors:
 
     - ``num_targets=None`` -> zeros[B], which makes the target-aware mask reduce to
       plain causal (``cap == seq_len``).
@@ -311,18 +341,13 @@ def _recir_pytorch_hstu_mha(
         raise ValueError(
             f"helion HSTU attention: dropout_pr must be 0, got {dropout_pr}"
         )
-    if max_attn_len != 0:
-        raise ValueError(
-            f"helion HSTU attention: max_attn_len must be 0, got {max_attn_len}"
-        )
+    # Validate the public window pair here; the JAX wrapper uses the same pair
+    # later to select the causal or semi-local kernel family.
+    use_semilocal_attention(max_attn_len, full_attn_size)
     if contextual_seq_len != 0:
         raise ValueError(
             "helion HSTU attention: contextual_seq_len must be 0, got "
             f"{contextual_seq_len}"
-        )
-    if full_attn_size != 0:
-        raise ValueError(
-            f"helion HSTU attention: full_attn_size must be 0, got {full_attn_size}"
         )
     if num_softmax_heads != 0:
         raise ValueError(
@@ -337,7 +362,16 @@ def _recir_pytorch_hstu_mha(
     )
     sc = v.new_ones(()) if attn_scale is None else attn_scale
     return torch.ops.recir.helion_ragged_attention_fwd(
-        q, k, v, seq_offsets, nt, sc, alpha, N
+        q,
+        k,
+        v,
+        seq_offsets,
+        nt,
+        sc,
+        alpha,
+        N,
+        max_attn_len,
+        full_attn_size,
     )
 
 

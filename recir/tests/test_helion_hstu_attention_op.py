@@ -7,20 +7,24 @@
 
 """CPU tests for the recir Helion HSTU attention ops and their hammer adapter.
 
-Covers the four things that can break silently:
+Covers the integration points that can break silently:
 
-1. The ``register_fake`` kernels still record the ``(L, H, D, B, N, dtype)`` warm-up
-   signatures. This is the ONLY automated guard against the multi-chip failure
-   mode: an empty warm set means Helion compiles lazily inside the jax lower tracer
-   and dies with "SymIntArrayRef expected to contain only concrete integers" -- on
-   TPU only, while every CPU test still passes.
+1. The ``register_fake`` kernels still record the
+   ``(L, H, D, B, N, max_attn_len, full_attn_size, dtype)`` warm-up signatures.
+   This is the ONLY automated guard against the multi-chip failure mode: an empty
+   warm set means Helion compiles lazily inside the jax lower tracer and dies with
+   "SymIntArrayRef expected to contain only concrete integers" -- on TPU only,
+   while every CPU test still passes.
 2. A recir-style ``make_fx`` trace through the adapter collapses attention to
    exactly one fwd node plus one autograd-produced bwd node (no aten decomposition).
 3. ``install_helion_hstu_attention_swap()`` rebinds the module attribute the v2 STU
    actually resolves. The wrong module is a silent perf cliff, not an error.
-4. Eager numerics still go through the captured original ``pytorch_hstu_mha``
+4. The adapter's Python signature stays identical to Hammer's public function.
+5. Eager numerics still go through the captured original ``pytorch_hstu_mha``
    byte-for-byte, so ``parity_forward_loss``'s eager cell stays a valid reference.
 """
+
+import inspect
 
 import hammer.v2.ops.hstu_preprocess_and_attention as hpa
 import recir.ops.helion_hstu_attention_op as hop
@@ -93,8 +97,10 @@ def _original(
     seq_offsets: torch.Tensor,
     num_targets: torch.Tensor | None,
     attn_scale: torch.Tensor | None,
+    max_attn_len: int = 0,
+    full_attn_size: int = 0,
 ) -> torch.Tensor:
-    """The captured original at the trivial-arg values the adapter enforces."""
+    """The captured original at the argument values the adapter supports."""
     return hop._ORIG_PYTORCH_HSTU_MHA(
         q=q,
         k=k,
@@ -108,6 +114,8 @@ def _original(
         num_targets=num_targets,
         attn_bias=None,
         attn_scale=attn_scale,
+        max_attn_len=max_attn_len,
+        full_attn_size=full_attn_size,
     )
 
 
@@ -119,7 +127,7 @@ class HelionHstuAttentionOpTest(TestCase):
 
     # --- 1. traced warm-up signatures ------------------------------------
     def test_register_fake_records_the_fwd_and_bwd_warmup_sigs(self) -> None:
-        """The fake kernels must record (L, H, D, B, N, dtype) for both directions.
+        """The fake kernels must record shape and attention mode for both directions.
 
         ``N`` is in the schema precisely so it can be recorded here: it is the 5th
         element of the warm-up key, and dropping it as "vestigial" changes the key,
@@ -137,7 +145,30 @@ class HelionHstuAttentionOpTest(TestCase):
         # Mirrors recir's own trace (recir/api.py): fake tensors, static shapes.
         make_fx(fn, tracing_mode="fake")(q, k, v, seq_offsets)
 
-        expected = {(_L, _H, _D, _B, _N, torch.float32)}
+        expected = {(_L, _H, _D, _B, _N, 0, 0, torch.float32)}
+        self.assertEqual(get_traced_fwd_sigs(), expected)
+        self.assertEqual(get_traced_bwd_sigs(), expected)
+
+    def test_register_fake_records_semilocal_warmup_sigs(self) -> None:
+        q, k, v = _qkv(requires_grad=True)
+        seq_offsets = _seq_offsets()
+
+        def fn(
+            q_: torch.Tensor, k_: torch.Tensor, v_: torch.Tensor, so_: torch.Tensor
+        ) -> tuple[torch.Tensor, ...]:
+            out = _adapter(
+                q_,
+                k_,
+                v_,
+                so_,
+                max_attn_len=256,
+                full_attn_size=256,
+            )
+            return torch.autograd.grad(out.sum(), (q_, k_, v_))
+
+        make_fx(fn, tracing_mode="fake")(q, k, v, seq_offsets)
+
+        expected = {(_L, _H, _D, _B, _N, 256, 256, torch.float32)}
         self.assertEqual(get_traced_fwd_sigs(), expected)
         self.assertEqual(get_traced_bwd_sigs(), expected)
 
@@ -203,6 +234,12 @@ class HelionHstuAttentionOpTest(TestCase):
         hop.install_helion_hstu_attention_swap()
         self.assertIs(hpa.pytorch_hstu_mha, hop._recir_pytorch_hstu_mha)
 
+    def test_adapter_signature_matches_hammer_pytorch_source(self) -> None:
+        self.assertEqual(
+            inspect.signature(hop._recir_pytorch_hstu_mha),
+            inspect.signature(hop._ORIG_PYTORCH_HSTU_MHA),
+        )
+
     # --- 4. adapter validation -------------------------------------------
     def test_adapter_rejects_every_arg_the_kernels_do_not_implement(self) -> None:
         q, k, v = _qkv()
@@ -212,9 +249,15 @@ class HelionHstuAttentionOpTest(TestCase):
             ({"invalid_attn_mask_type": "none"}, "invalid_attn_mask_type"),
             ({"attn_bias": torch.zeros(_B, 1, _N, _N)}, "attn_bias"),
             ({"dropout_pr": 0.1}, "dropout_pr"),
-            ({"max_attn_len": 3}, "max_attn_len"),
+            (
+                {"max_attn_len": 3, "full_attn_size": 256},
+                "max_attn_len=3",
+            ),
             ({"contextual_seq_len": 2}, "contextual_seq_len"),
-            ({"full_attn_size": 8}, "full_attn_size"),
+            (
+                {"max_attn_len": 256, "full_attn_size": 8},
+                "full_attn_size=8",
+            ),
             ({"num_softmax_heads": 1}, "num_softmax_heads"),
         ):
             with self.subTest(override=override):
@@ -234,6 +277,18 @@ class HelionHstuAttentionOpTest(TestCase):
         )
         self.assertEqual(out.shape, (_L, _H, _D))
 
+    def test_adapter_accepts_rankfm_semilocal_configuration(self) -> None:
+        q, k, v = _qkv()
+        out = _adapter(
+            q,
+            k,
+            v,
+            _seq_offsets(),
+            max_attn_len=256,
+            full_attn_size=256,
+        )
+        self.assertEqual(out.shape, (_L, _H, _D))
+
     # --- 5. eager numerics ------------------------------------------------
     def test_eager_forward_is_byte_identical_to_the_captured_original(self) -> None:
         q, k, v = _qkv()
@@ -241,9 +296,29 @@ class HelionHstuAttentionOpTest(TestCase):
         num_targets = torch.tensor([1, 0, 2], dtype=torch.int64)
         attn_scale = torch.tensor(0.25)
 
-        got = _adapter(q, k, v, so, num_targets=num_targets, attn_scale=attn_scale)
-        want = _original(q, k, v, so, num_targets, attn_scale)
-        self.assertTrue(torch.equal(got, want), f"{got}\n!=\n{want}")
+        for max_attn_len, full_attn_size in ((0, 0), (256, 256)):
+            with self.subTest(max_attn_len=max_attn_len, full_attn_size=full_attn_size):
+                got = _adapter(
+                    q,
+                    k,
+                    v,
+                    so,
+                    num_targets=num_targets,
+                    attn_scale=attn_scale,
+                    max_attn_len=max_attn_len,
+                    full_attn_size=full_attn_size,
+                )
+                want = _original(
+                    q,
+                    k,
+                    v,
+                    so,
+                    num_targets,
+                    attn_scale,
+                    max_attn_len,
+                    full_attn_size,
+                )
+                self.assertTrue(torch.equal(got, want), f"{got}\n!=\n{want}")
 
     def test_eager_backward_is_byte_identical_to_the_captured_original(self) -> None:
         q, k, v = _qkv(requires_grad=True)
@@ -251,16 +326,36 @@ class HelionHstuAttentionOpTest(TestCase):
         num_targets = torch.tensor([1, 0, 2], dtype=torch.int64)
         attn_scale = torch.tensor(0.25)
 
-        got = torch.autograd.grad(
-            _adapter(q, k, v, so, num_targets=num_targets, attn_scale=attn_scale).sum(),
-            (q, k, v),
-        )
-        want = torch.autograd.grad(
-            _original(q, k, v, so, num_targets, attn_scale).sum(),
-            (q, k, v),
-        )
-        for name, g, w in zip("qkv", got, want):
-            self.assertTrue(torch.equal(g, w), f"d{name}: {g}\n!=\n{w}")
+        for max_attn_len, full_attn_size in ((0, 0), (256, 256)):
+            with self.subTest(max_attn_len=max_attn_len, full_attn_size=full_attn_size):
+                got = torch.autograd.grad(
+                    _adapter(
+                        q,
+                        k,
+                        v,
+                        so,
+                        num_targets=num_targets,
+                        attn_scale=attn_scale,
+                        max_attn_len=max_attn_len,
+                        full_attn_size=full_attn_size,
+                    ).sum(),
+                    (q, k, v),
+                )
+                want = torch.autograd.grad(
+                    _original(
+                        q,
+                        k,
+                        v,
+                        so,
+                        num_targets,
+                        attn_scale,
+                        max_attn_len,
+                        full_attn_size,
+                    ).sum(),
+                    (q, k, v),
+                )
+                for name, g, w in zip("qkv", got, want):
+                    self.assertTrue(torch.equal(g, w), f"d{name}: {g}\n!=\n{w}")
 
     def test_none_optionals_normalize_to_zeros_and_ones(self) -> None:
         """``attn_scale=None`` means 1.0 here, NOT hammer's 1/N.

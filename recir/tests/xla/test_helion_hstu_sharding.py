@@ -219,7 +219,7 @@ class HelionHstuShardingTest(TestCase):
         self.assertEqual(out[:2].sum().astype(jnp.float32), 2 * _H * _D)
         self.assertEqual(out[2:].sum().astype(jnp.float32), 0)
 
-    def test_warm_precompiles_the_shapes_the_shard_map_passes(self) -> None:
+    def test_warm_precompiles_the_shapes_and_attention_modes(self) -> None:
         # static_shapes=True keys the compiled kernel on shape, so the warm must hand
         # the kernel the POST-drop seq_offsets/num_targets shapes. Drift here is a
         # cache miss at runtime -> Helion recompiles nested inside the jax lower
@@ -227,20 +227,29 @@ class HelionHstuShardingTest(TestCase):
         # The warm drives the SAME sharded wrapper the step does, so this asserts at
         # the kernel boundary in both paths: patch the wrapper's default runner and
         # compare what it receives from the warm vs from a runtime call.
-        warmed: List[Tuple[int, int]] = []
+        warmed: List[Tuple[int, int, int, int]] = []
 
-        def fwd_runner(q_: Any, k_: Any, v_: Any, so_: Any, nt_: Any, sc_: Any) -> Any:
-            warmed.append((so_.shape[0], nt_.shape[0]))
-            return jnp.zeros_like(q_), jnp.zeros((1,), jnp.float32)
-
-        def bwd_runner(
-            do_: Any, q_: Any, k_: Any, v_: Any, so_: Any, nt_: Any, sc_: Any
+        def fwd_fn(
+            N: Any,
+            alpha: Any,
+            q_: Any,
+            k_: Any,
+            v_: Any,
+            so_: Any,
+            nt_: Any,
+            sc_: Any,
+            max_attn_len: Any,
+            full_attn_size: Any,
         ) -> Any:
-            warmed.append((so_.shape[0], nt_.shape[0]))
-            return jnp.zeros_like(q_), jnp.zeros_like(q_), jnp.zeros_like(q_)
-
-        def fwd_fn(N: Any, alpha: Any, q_: Any, k_: Any, v_: Any, *rest: Any) -> Any:
-            return fwd_runner(q_, k_, v_, *rest)
+            warmed.append(
+                (
+                    so_.shape[0],
+                    nt_.shape[0],
+                    int(max_attn_len),
+                    int(full_attn_size),
+                )
+            )
+            return jnp.zeros_like(q_), jnp.zeros((1,), jnp.float32)
 
         def bwd_fn(
             do_: Any,
@@ -252,8 +261,18 @@ class HelionHstuShardingTest(TestCase):
             sc_: Any,
             N: Any,
             alpha: Any,
+            max_attn_len: Any,
+            full_attn_size: Any,
         ) -> Any:
-            return bwd_runner(do_, q_, k_, v_, so_, nt_, sc_)
+            warmed.append(
+                (
+                    so_.shape[0],
+                    nt_.shape[0],
+                    int(max_attn_len),
+                    int(full_attn_size),
+                )
+            )
+            return jnp.zeros_like(q_), jnp.zeros_like(q_), jnp.zeros_like(q_)
 
         sig = {
             (
@@ -262,8 +281,20 @@ class HelionHstuShardingTest(TestCase):
                 _D,
                 _B_LOCAL * _WORLD_SIZE,
                 5,
+                0,
+                0,
                 torch.float32,
-            )
+            ),
+            (
+                _L_LOCAL * _WORLD_SIZE,
+                _H,
+                _D,
+                _B_LOCAL * _WORLD_SIZE,
+                5,
+                256,
+                256,
+                torch.float32,
+            ),
         }
         with (
             mock.patch.object(jhstu, "hstu_ragged_attention_fwd_jax_fn", fwd_fn),
@@ -291,8 +322,16 @@ class HelionHstuShardingTest(TestCase):
             run_kernel=runner,
         )
 
-        runtime = (
+        runtime_shape = (
             self.captured["seq_offsets"][0],
             self.captured["num_targets"][0],
         )
-        self.assertEqual(warmed, [runtime, runtime])
+        self.assertEqual(
+            warmed,
+            [
+                (*runtime_shape, 0, 0),
+                (*runtime_shape, 256, 256),
+                (*runtime_shape, 0, 0),
+                (*runtime_shape, 256, 256),
+            ],
+        )

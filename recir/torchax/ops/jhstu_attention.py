@@ -22,13 +22,13 @@ registration runs, and must itself be imported before any torchax Environment is
 built (``load_ops`` snapshots ``all_aten_ops`` once). Mirrors
 ``recir/torchax/ops/jseq_embedding.py``.
 
-The args the target-aware-causal SiLU kernels do not implement (``attn_bias``,
-``dropout_pr``, ``max_attn_len``, ``contextual_seq_len``, ``full_attn_size``,
-``num_softmax_heads``, and any non-causal ``invalid_attn_mask_type``) are not in
-the op schema at all: ``_recir_pytorch_hstu_mha`` rejects them at the call site,
-so a bad config fails at the first forward instead of deep inside the XLA lower.
-That adapter also guarantees ``num_targets``/``attn_scale`` arrive as real
-tensors, so there is nothing to normalize here.
+The args the SiLU kernels do not implement (``attn_bias``, ``dropout_pr``,
+``contextual_seq_len``, ``num_softmax_heads``, and any non-causal
+``invalid_attn_mask_type``) are not in the op schema at all. ``max_attn_len`` and
+``full_attn_size`` are present so the lowering can select either the causal
+specialization or RankFM's fixed 256-local/256-full-tail specialization. The
+adapter validates that pair at the call site and guarantees
+``num_targets``/``attn_scale`` arrive as real tensors.
 
 Both lowerings run the kernel inside a **clean tensor env** (``no_dispatch()`` +
 ``unset_fake_temporarily()``) so Helion's ``Kernel.jax_fn`` -- which drives its
@@ -173,6 +173,8 @@ def _jhelion_ragged_attention_fwd(
     attn_scale: Any,
     alpha: float,
     N: int,
+    max_attn_len: int,
+    full_attn_size: int,
 ) -> Any:
     batch = int(seq_offsets.shape[0]) - 1
 
@@ -181,7 +183,16 @@ def _jhelion_ragged_attention_fwd(
         # Inputs are jagged ``[L, H, D]`` + ``[B+1]`` seq_offsets.
         with unset_fake_temporarily(), mode_utils.no_dispatch():
             out, _m = hstu_ragged_attention_fwd_jax_fn(
-                N, alpha, q_, k_, v_, so_, nt_, sc_
+                N,
+                alpha,
+                q_,
+                k_,
+                v_,
+                so_,
+                nt_,
+                sc_,
+                max_attn_len,
+                full_attn_size,
             )
             return out
 
@@ -209,6 +220,8 @@ def _jhelion_ragged_attention_fwd(
             attn_scale,
             world_size,
             mesh,
+            max_attn_len=max_attn_len,
+            full_attn_size=full_attn_size,
             run_kernel=_run_fwd,
         )
         # `out` is already L-sharded by the shard_map's out_specs; re-pin the same
@@ -240,6 +253,8 @@ def _jhelion_ragged_attention_bwd(
     attn_scale: Any,
     alpha: float,
     N: int,
+    max_attn_len: int,
+    full_attn_size: int,
 ) -> tuple[Any, Any, Any]:
     batch = int(seq_offsets.shape[0]) - 1
 
@@ -250,7 +265,17 @@ def _jhelion_ragged_attention_bwd(
         # Inputs are jagged ``[L, H, D]`` + ``[B+1]`` seq_offsets.
         with unset_fake_temporarily(), mode_utils.no_dispatch():
             return hstu_ragged_attention_bwd_jax_fn(
-                do_, q_, k_, v_, so_, nt_, sc_, N, alpha
+                do_,
+                q_,
+                k_,
+                v_,
+                so_,
+                nt_,
+                sc_,
+                N,
+                alpha,
+                max_attn_len,
+                full_attn_size,
             )
 
     world_size = len(jax.devices())
@@ -278,6 +303,8 @@ def _jhelion_ragged_attention_bwd(
             alpha,
             world_size,
             mesh,
+            max_attn_len=max_attn_len,
+            full_attn_size=full_attn_size,
             run_kernel=_run_bwd,
         )
         # Same re-pin as the forward: the grads are already L-sharded by out_specs.
