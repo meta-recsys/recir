@@ -15,6 +15,7 @@ from recir.backends.base import Backend, GraphPatch
 from recir.iter_graph_module import IterGraphModule
 from recir.lowering.partial_lower import partial_lower
 from recir.passes import remove_copy_from_optimizer
+from recir.pipeline import PipelinedGraphModule
 from torch import fx, nn
 
 if TYPE_CHECKING:
@@ -41,7 +42,12 @@ class InductorBackend(Backend):
     def uses_iter_graph(self) -> bool:
         return True
 
-    def dispatch(self, gm: fx.GraphModule | IterGraphModule) -> nn.Module:
+    def dispatch(
+        self,
+        gm: fx.GraphModule | IterGraphModule | PipelinedGraphModule,
+    ) -> nn.Module:
+        if isinstance(gm, PipelinedGraphModule):
+            return gm.lower_stages(partial_lower)
         if isinstance(gm, IterGraphModule):
             for sub_name in ("setup_gm", "main_gm", "cleanup_gm"):
                 sub_gm = getattr(gm, sub_name)

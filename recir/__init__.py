@@ -37,7 +37,13 @@ from recir.pipeline import (  # noqa: F401
     PipelineSchedule,
     PipelineStageSpec,
 )
-from recir.pipeline_strategies import PipelineRegion  # noqa: F401
+from recir.pipeline_strategies import (  # noqa: F401
+    PipelineRegion,
+    sdd_pipeline_config,
+    sdd_pipeline_plan,
+    semi_sync_pipeline_config,
+    semi_sync_pipeline_plan,
+)
 from recir.sharding_plan import (  # noqa: F401
     EmbeddingShardingPlan,
     EmbeddingShardingType,
