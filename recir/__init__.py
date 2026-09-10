@@ -30,6 +30,14 @@ from recir.distributed.parallel_mode import (  # noqa: F401
     ParallelMode,
 )
 from recir.ops.marker import attach_markers, mark_boundary  # noqa: F401
+from recir.pipeline import (  # noqa: F401
+    PipelineAction,
+    PipelineConfig,
+    PipelinePlan,
+    PipelineSchedule,
+    PipelineStageSpec,
+)
+from recir.pipeline_strategies import PipelineRegion  # noqa: F401
 from recir.sharding_plan import (  # noqa: F401
     EmbeddingShardingPlan,
     EmbeddingShardingType,
