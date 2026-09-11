@@ -334,7 +334,7 @@ class RecirXLACompiledModule(RecirCompiledModuleBase):
         dense_opt, warmup = setup_dense_optimizer_and_warmup(
             model,
             dense_params,
-            trainer_cfg.dense_optimizer_config,
+            optimizer_config.dense.default,
             device,
             sparse_cfg=(
                 sparse_runtime.config if sparse_lr_buffer is not None else None
