@@ -660,7 +660,7 @@ class GSPMDParallel(ParallelMode):
                     self.process_mesh,
                     DataParallelStyle.FULLY_SHARD,
                     shard_filter=_is_table,
-                    copy_tensor=self.process_mesh.size() > 1,
+                    own_storage=True,
                 )
 
         if self.parallel_style != "fully_shard":
@@ -687,7 +687,7 @@ class GSPMDParallel(ParallelMode):
             self.process_mesh,
             DataParallelStyle.FULLY_SHARD,
             shard_filter=_can_fsdp,
-            copy_tensor=self.process_mesh.size() > 1,
+            own_storage=True,
         )
         state_only_substrs = (
             self._fsdp_shard_optimizer_state_for_replicated_param_substrs
@@ -1036,7 +1036,7 @@ class DataParallel(ParallelMode):
             self.process_mesh,
             self.parallel_style,
             shard_filter=shard_filter,
-            copy_tensor=self.num_processes > 1,
+            own_storage=True,
         )
         current_parameters = dict(model.named_parameters(remove_duplicate=False))
         missing_parameters = sharded_keys - set(current_parameters)
