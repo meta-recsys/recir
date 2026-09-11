@@ -55,7 +55,7 @@ class TestXLAShardMapOwnedState(unittest.TestCase):
         spec = DTensorSpec(mesh=self._mesh(2, 0), placements=(Shard(0),))
 
         view = partition_value(source, spec)
-        owned = partition_value(source, spec, copy_tensor=True)
+        owned = partition_value(source, spec, own_storage=True)
 
         torch.testing.assert_close(view, source[:3], atol=0, rtol=0)
         torch.testing.assert_close(owned, source[:3], atol=0, rtol=0)
@@ -73,6 +73,26 @@ class TestXLAShardMapOwnedState(unittest.TestCase):
         )
         self.assertTrue(owned.requires_grad)
         self.assertIsNone(owned.grad_fn)
+
+    def test_own_storage_is_a_noop_when_nothing_is_split(self) -> None:
+        """A size-1 mesh splits into one chunk, so the "shard" IS the source.
+
+        Cloning there would double the footprint to save nothing, which is why
+        callers used to gate `own_storage` on a topology predicate of their own
+        (`process_mesh.size() > 1` in one class, `num_processes > 1` in
+        another -- and those stopped agreeing once hybrid FSDP made the two
+        numbers differ). The decision belongs here, where the mesh is known, so
+        callers can state intent unconditionally.
+        """
+        source = torch.arange(24, dtype=torch.float32).reshape(6, 4)
+        spec = DTensorSpec(mesh=self._mesh(1, 0), placements=(Shard(0),))
+
+        owned = partition_value(source, spec, own_storage=True)
+
+        self.assertEqual(
+            source.untyped_storage().data_ptr(),
+            owned.untyped_storage().data_ptr(),
+        )
 
     def test_process_store_owns_live_trace_storage(self) -> None:
         for process_rank in (0, 1):
