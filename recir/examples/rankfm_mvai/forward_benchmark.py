@@ -54,7 +54,6 @@ from recir.examples.rankfm_mvai.config import (
     build_module_config,
     build_optimizer_config,
     RankFMModelArgs,
-    RankFMTrainerConfig,
 )
 from recir.examples.rankfm_mvai.rankfm_batch_utils import (
     create_random_train_batch,
@@ -308,7 +307,6 @@ def _compile_forward_runner(
     # override + padding transform must be sized at global, like the trainer.
     global_bs = _FWD_GLOBAL_BS
 
-    trainer_cfg = RankFMTrainerConfig()
     if _FWD_EMB_BACKEND == "in_graph":
         backend = build_embedding_backend(
             _FWD_EMB_BACKEND,
@@ -372,7 +370,7 @@ def _compile_forward_runner(
     # Dense opt is required by the compile but never stepped (forward-only).
     dense_params = list(embedding_setup.dense_named_parameters.values())
     dense_opt, _warmup = setup_dense_optimizer_and_warmup(
-        model, dense_params, trainer_cfg.dense_optimizer_config, device
+        model, dense_params, build_optimizer_config().dense.default, device
     )
 
     region_transforms = make_padding_region_transforms(

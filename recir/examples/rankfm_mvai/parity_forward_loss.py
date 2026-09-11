@@ -57,7 +57,6 @@ from recir.examples.rankfm_mvai.config import (
     build_module_config,
     build_optimizer_config,
     RankFMModelArgs,
-    RankFMTrainerConfig,
 )
 from recir.examples.rankfm_mvai.model_family import (
     _udd_fm_v3_train_step,
@@ -287,7 +286,6 @@ def _compiled_step(
     # (num_local identical device blocks), so it can no longer be derived from
     # batch.ro_float_features.shape[0].
 
-    trainer_cfg = RankFMTrainerConfig()
     backend = build_embedding_backend(
         emb_backend,
         on_device_init=_PARITY_ON_DEVICE_INIT,
@@ -373,7 +371,7 @@ def _compiled_step(
     dense_opt, warmup = setup_dense_optimizer_and_warmup(
         model,
         dense_params,
-        trainer_cfg.dense_optimizer_config,
+        build_optimizer_config().dense.default,
         device,
         sparse_cfg=(
             sparse_runtime.config if sparse_runtime.lr_buffer is not None else None
@@ -536,7 +534,6 @@ def _eager_step(
     device = torch.device("cpu")
     model.train(True)
     trace_batch = batches[0]
-    trainer_cfg = RankFMTrainerConfig()
     # Eager embedding path = torchrec DMP; needs a gloo PG (reuse if already up).
     backend = build_embedding_backend("cpu")
     if not (dist.is_available() and dist.is_initialized()):
@@ -585,14 +582,14 @@ def _eager_step(
     # current tensor LR into eager AdamW and advances the same warmup controller
     # as compiled.
     xla_opt, warmup = setup_dense_optimizer_and_warmup(
-        model, dense_params, trainer_cfg.dense_optimizer_config, device
+        model, dense_params, build_optimizer_config().dense.default, device
     )
     g0 = xla_opt.param_groups[0]
     # Split the optimizer to MATCH the compiled path: dense -> AdamW (in-graph
-    # TensorLRAdamW on the compiled side), embeddings -> DMP-FUSED RowWiseAdagrad @
-    # embedding_lr (in-backward on both sides). The old single AdamW over ALL of
-    # dense_named stepped embeddings with AdamW, which never matched the
-    # compiled/prod RowWiseAdagrad embedding update.
+    # TensorLRAdamW on the compiled side), embeddings -> DMP-FUSED RowWiseAdagrad
+    # at the SPARSE optimizer's LR (in-backward on both sides). The old single
+    # AdamW over ALL of dense_named stepped embeddings with AdamW, which never
+    # matched the compiled/prod RowWiseAdagrad embedding update.
     dense_only = [
         p
         for n, p in dense_named.items()

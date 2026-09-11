@@ -103,7 +103,6 @@ from recir.examples.rankfm_mvai.config import (
     build_module_config,
     build_optimizer_config,
     RankFMModelArgs,
-    RankFMTrainerConfig,
 )
 from recir.examples.rankfm_mvai.data_pipe import (
     compute_kjt_key_to_size,
@@ -932,11 +931,11 @@ def _build_recir_leg(
     pipeline class itself is unimportable here (it subclasses a fork-only base), but
     its numerics do not depend on that.
 
-    The sparse optimizer config comes from ``build_optimizer_config``, the same
-    call the leg makes, so the test cannot drift from what the leg gets.
+    Both optimizer configs come from ``build_optimizer_config``, the same call
+    the leg makes, so the test cannot drift from what the leg gets.
     """
-    trainer_cfg = RankFMTrainerConfig()
-    sparse_cfg: OptimConfig = build_optimizer_config().sparse.default
+    optimizer_config = build_optimizer_config()
+    sparse_cfg: OptimConfig = optimizer_config.sparse.default
     backend = build_embedding_backend(
         "cpu",
         # This leg's OWN tables, off the artifact -- not prod's live ones. The
@@ -959,7 +958,7 @@ def _build_recir_leg(
     tensor_lr_opt, warmup = setup_dense_optimizer_and_warmup(
         setup.model,
         list(dense_named.values()),
-        trainer_cfg.dense_optimizer_config,
+        optimizer_config.dense.default,
         torch.device("cpu"),
         sparse_cfg=setup.sparse_runtime.config,
         sparse_lr_buffer=sparse_lr_buffer,

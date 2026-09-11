@@ -37,7 +37,7 @@ import argparse
 import dataclasses
 import logging
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Dict, Tuple
 
 from hammer.v2.modules.configs import STUStackConfig
@@ -48,19 +48,13 @@ from hammer.v3.models.udd_fm_v3.udd_fm_config import (
 )
 from minimal_viable_ai.core.dataloader.dataloader_configs import RandomDataSourceConfig
 from minimal_viable_ai.core.model_family_api.configs import RecModelFamilyConfig
-from minimal_viable_ai.core.model_family_api.optimizer_configs import (
-    OptimConfig,
-    RecOptimizerConfig,
-)
+from minimal_viable_ai.core.model_family_api.optimizer_configs import RecOptimizerConfig
 from minimal_viable_ai.core.trainer.trainer_config_def import (
     CheckpointConfig,
     MetricsConfig,
     RecTrainerConfig,
     SystemConfig,
 )
-from torchrec.distributed.embedding_types import OptimType
-from torchrec.optim.clipping import GradientClipping
-from torchrec.optim.warmup import WarmupPolicy, WarmupStage
 
 __all__ = [
     "RankFMTrainerConfig",
@@ -91,7 +85,6 @@ class RankFMTrainerConfig:
 
     # Training
     max_steps: int = 20
-    embedding_lr: float = 0.1
 
     # Checkpointing (DCP via mvai_cloud CheckpointManager). Periodic save every
     # N steps (0 = disabled); keep_last_n bounds retained checkpoints. Paths come
@@ -102,26 +95,6 @@ class RankFMTrainerConfig:
     # Stage a consistent host snapshot at the checkpoint boundary, then overlap
     # the distributed storage write with subsequent train steps.
     async_checkpoint: bool = False
-    dense_optimizer_config: OptimConfig = field(
-        default_factory=lambda: OptimConfig(
-            optim_type=OptimType.ADAMW,
-            lr=0.0004,
-            eps=0.00001,
-            beta1=0.9,
-            beta2=0.998,
-            weight_decay=0.0001,
-            max_gradient=1.0,
-            gradient_clipping=GradientClipping.VALUE,
-            lr_warmup_schedule=[
-                WarmupStage(
-                    policy=WarmupPolicy.LINEAR,
-                    max_iters=37500,
-                    value=0.1,
-                    lr_scale=1.0,
-                )
-            ],
-        )
-    )
 
     # Mean over the padded candidate width instead of the local candidate sum,
     # which is what light does (its forward omits loss_norm_denom, so the module
@@ -262,9 +235,20 @@ def build_optimizer_config() -> RecOptimizerConfig:
     )
 
     path = artifact_path()
-    if path is not None:
-        return load_prod_optimizer_config(path)
-    return ConfigProvider().create_config().optimizer_config
+    config = (
+        load_prod_optimizer_config(path)
+        if path is not None
+        else ConfigProvider().create_config().optimizer_config
+    )
+    logger.info(
+        "[optimizer] source=%s dense=%s lr=%g sparse=%s lr=%g",
+        "prod config artifact" if path is not None else "standalone udd_fm",
+        config.dense.default.optim_type,
+        config.dense.default.lr,
+        config.sparse.default.optim_type,
+        config.sparse.default.lr,
+    )
+    return config
 
 
 # ---------------------------------------------------------------------------
@@ -456,18 +440,13 @@ def _build_static_ro_budgets(
 def _add_dataclass_args(
     parser: argparse.ArgumentParser,
     cls: Any,
-    skip: frozenset[str] = frozenset(),
 ) -> None:
     """Register `--<field>` CLI args for each primitive field of *cls*.
 
     Booleans get a paired ``--<field>`` / ``--no_<field>`` toggle so launchers
-    can flip either direction regardless of the dataclass default. Fields named
-    in ``skip`` are not CLI-exposed (e.g. optimizer LR knobs that live only in
-    the dataclass / config objects).
+    can flip either direction regardless of the dataclass default.
     """
     for f in dataclasses.fields(cls):
-        if f.name in skip:
-            continue
         default = f.default
         flag = f"--{f.name}"
         if f.type == "bool":
@@ -487,9 +466,7 @@ def _add_dataclass_args(
 def parse_cli() -> Tuple[RankFMTrainerConfig, RankFMModelArgs]:
     """Parse argv, returning dataclass instances with any --flag overrides applied."""
     parser = argparse.ArgumentParser()
-    # Optimizer LR knobs are config-only (dense_optimizer_config / embedding_lr),
-    # not CLI-exposed.
-    _add_dataclass_args(parser, RankFMTrainerConfig, skip=frozenset({"embedding_lr"}))
+    _add_dataclass_args(parser, RankFMTrainerConfig)
     _add_dataclass_args(parser, RankFMModelArgs)
     args = parser.parse_args()
     trainer_cfg = RankFMTrainerConfig(
