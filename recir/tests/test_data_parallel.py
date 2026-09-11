@@ -120,7 +120,9 @@ class TestShardParameterAliases(unittest.TestCase):
             ),
             unittest.mock.patch(
                 "recir.distributed.data_parallel.partition_value",
-                side_effect=lambda value, _spec: value.detach().clone(),
+                side_effect=lambda value,
+                _spec,
+                own_storage=False: value.detach().clone(),
             ),
         ):
             sharded = shard_params_and_states(
@@ -139,6 +141,50 @@ class TestShardParameterAliases(unittest.TestCase):
         self.assertIn(optimizer_parameter, optimizer.state)
         self.assertNotIn(original_parameter, optimizer.state)
         self.assertIn("grad_accum_step", optimizer.state[optimizer_parameter])
+
+    def test_meta_params_stay_on_meta(self) -> None:
+        """XLA/GSPMD has no CUDA context to materialize a meta shard into.
+
+        `shard_params_by_plan` (DMP/GPU) materializes meta shards onto
+        `cuda:current_device`; folding both entry points onto one helper once
+        put that call on this path too, and every TPU run died in
+        `torch.cuda.current_device()` with "Torch not compiled with CUDA
+        enabled". Assert on the resulting device, not on the absence of a call:
+        on a CUDA host the wrong branch succeeds silently and materializes the
+        whole table on the GPU, defeating `on_device_init`.
+        """
+        with torch.device("meta"):
+            model = SharedParameterAliasModel()
+        params = cast(
+            dict[str, torch.Tensor],
+            OrderedDict(model.named_parameters(remove_duplicate=False)),
+        )
+        shard_spec = MagicMock(spec=DTensorSpec)
+
+        with (
+            unittest.mock.patch(
+                "recir.distributed.data_parallel.DTensorSpec",
+                return_value=shard_spec,
+            ),
+            unittest.mock.patch(
+                "recir.distributed.data_parallel.partition_value",
+                side_effect=lambda value,
+                _spec,
+                own_storage=False: value.detach().clone(),
+            ),
+        ):
+            sharded = shard_params_and_states(
+                model,
+                params,
+                None,
+                MagicMock(spec=DeviceMesh),
+                DataParallelStyle.FULLY_SHARD,
+            )
+
+        self.assertEqual(sharded, set(params))
+        self.assertEqual(model.primary.weight.device.type, "meta")
+        self.assertEqual(params["primary.weight"].device.type, "meta")
+        self.assertIs(model.primary.weight, model.alias.weight)
 
 
 class LargeLinearModel(nn.Module):
@@ -2801,7 +2847,7 @@ class TestShardStateDict(unittest.TestCase):
         }
         spec = MagicMock(spec=DTensorSpec)
         _shard_state_dict(state, spec)
-        mock_partition.assert_called_once_with(momentum, spec)
+        mock_partition.assert_called_once_with(momentum, spec, own_storage=False)
         self.assertIs(state["momentum"], sharded_momentum)
         # Non-tensor should be untouched
         self.assertEqual(state["step"], 42)

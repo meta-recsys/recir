@@ -1124,13 +1124,11 @@ def partition_value(
     val: Any,
     spec: Union[DTensorSpec, Tuple[DTensorSpec]],
     *,
-    copy_tensor: bool = False,
+    own_storage: bool = False,
 ) -> Any:
     """Return the local value selected by ``spec``.
 
-    ``copy_tensor`` gives persistent model and optimizer shards independent
-    storage. Without it, a small shard remains a view that pins the full source
-    tensor until the shard is released.
+    ``own_storage`` gives the shard its own memory instead of a view into ``val``.
     """
     if val is None or isinstance(val, (int, float, bool, str)):
         return val
@@ -1139,6 +1137,7 @@ def partition_value(
         local_shard = val
         if val.ndim == 0:
             return local_shard
+        was_split = False
         for idx, placement in enumerate(spec.placements):
             if placement.is_shard():
                 placement = cast(Shard, placement)
@@ -1149,7 +1148,8 @@ def partition_value(
                 local_shard = placement._split_tensor(
                     local_shard, num_chunks, with_padding=False, contiguous=False
                 )[0][my_coord_on_mesh_dim]
-        if not copy_tensor:
+                was_split = was_split or num_chunks > 1
+        if not own_storage or not was_split:
             return local_shard
         owned_shard = local_shard.detach().clone()
         owned_shard.requires_grad_(local_shard.requires_grad)
@@ -1162,12 +1162,12 @@ def partition_value(
             return val
         elif isinstance(spec, DTensorSpec):
             return val.__class__(
-                partition_value(v, spec, copy_tensor=copy_tensor) for v in val
+                partition_value(v, spec, own_storage=own_storage) for v in val
             )
         else:
             assert len(val) == len(spec)
             return val.__class__(
-                partition_value(v, s, copy_tensor=copy_tensor)
+                partition_value(v, s, own_storage=own_storage)
                 for v, s in zip(val, spec)
             )
     elif isinstance(val, torch.ScriptObject):
@@ -1333,61 +1333,59 @@ def partitioner(graph: GraphModule) -> GraphModule:  # noqa: C901
     return graph
 
 
-def _group_tensor_aliases(
+def _group_shared_parameters(
     params_buffers: Dict[str, torch.Tensor],
 ) -> List[Tuple[torch.Tensor, List[str]]]:
-    aliases_by_tensor: Dict[int, Tuple[torch.Tensor, List[str]]] = {}
+    """Group the FQNs that name the same tensor object (weight tying)."""
+    fqns_by_tensor: Dict[int, Tuple[torch.Tensor, List[str]]] = {}
     for fqn, tensor in params_buffers.items():
         tensor_id = id(tensor)
-        if tensor_id not in aliases_by_tensor:
-            aliases_by_tensor[tensor_id] = (tensor, [])
-        aliases_by_tensor[tensor_id][1].append(fqn)
-    return list(aliases_by_tensor.values())
+        if tensor_id not in fqns_by_tensor:
+            fqns_by_tensor[tensor_id] = (tensor, [])
+        fqns_by_tensor[tensor_id][1].append(fqn)
+    return list(fqns_by_tensor.values())
 
 
-def _select_sharding_alias_group(
+def _select_shared_parameter_group(
     tensor: torch.Tensor,
-    aliases: Sequence[str],
+    fqns: Sequence[str],
     shard_filter: Optional[Callable[[str, torch.Tensor], bool]],
 ) -> bool:
     if shard_filter is None:
         return True
-    selections = {shard_filter(fqn, tensor) for fqn in aliases}
+    selections = {shard_filter(fqn, tensor) for fqn in fqns}
     if len(selections) != 1:
         raise RuntimeError(
-            "Parameter sharding must select every alias of a shared parameter "
-            f"consistently: aliases={aliases!r}"
+            "Parameter sharding must select every name of a shared parameter "
+            f"consistently: fqns={fqns!r}"
         )
     return selections == {True}
 
 
-def _shard_parameter_aliases(
+def _shard_shared_parameter(
     model: nn.Module,
     params_buffers: Dict[str, torch.Tensor],
-    aliases: Sequence[str],
+    fqns: Sequence[str],
     full_tensor: torch.Tensor,
     shard_spec: DTensorSpec,
     *,
+    materialize_meta_on_cuda: bool,
     location: str = "HBM",
-    copy_tensor: bool = False,
+    own_storage: bool = False,
 ) -> nn.Parameter:
-    local_shard = (
-        partition_value(full_tensor, shard_spec, copy_tensor=True)
-        if copy_tensor
-        else partition_value(full_tensor, shard_spec)
-    )
+    """Shard one tensor and rebind every FQN that names it."""
+    local_shard = partition_value(full_tensor, shard_spec, own_storage=own_storage)
     copy_meta_init_attrs(local_shard, full_tensor)
-    if local_shard.device.type == "meta":
-        device = torch.device(f"cuda:{torch.cuda.current_device()}")
+    if materialize_meta_on_cuda and local_shard.device.type == "meta":
         local_shard = _materialize_meta_shard(
             local_shard,
             full_tensor,
-            device,
+            torch.device(f"cuda:{torch.cuda.current_device()}"),
             location,
         )
     new_param = nn.Parameter(local_shard, requires_grad=full_tensor.requires_grad)
     copy_meta_init_attrs(new_param, full_tensor)
-    for fqn in aliases:
+    for fqn in fqns:
         params_buffers[fqn] = local_shard
         atoms = fqn.split(".")
         parent = model
@@ -1405,7 +1403,7 @@ def shard_params_and_states(
     parallel_style: DataParallelStyle,
     shard_filter: Optional[Callable[[str, torch.Tensor], bool]] = None,
     *,
-    copy_tensor: bool = False,
+    own_storage: bool = False,
 ) -> Set[str]:
     """Shard model parameters and optimizer states for FULLY_SHARD mode.
 
@@ -1426,23 +1424,24 @@ def shard_params_and_states(
     sharded_keys: Set[str] = set()
     shard_spec = DTensorSpec(mesh=mesh, placements=(Shard(0),))
     old_to_new: List[Tuple[torch.Tensor, torch.Tensor, DTensorSpec]] = []
-    for old_param, aliases in _group_tensor_aliases(params_buffers):
-        if not _select_sharding_alias_group(old_param, aliases, shard_filter):
+    for old_param, fqns in _group_shared_parameters(params_buffers):
+        if not _select_shared_parameter_group(old_param, fqns, shard_filter):
             continue
-        sharded_keys.update(aliases)
-        new_param = _shard_parameter_aliases(
+        sharded_keys.update(fqns)
+        new_param = _shard_shared_parameter(
             model,
             params_buffers,
-            aliases,
+            fqns,
             old_param,
             shard_spec,
-            copy_tensor=copy_tensor,
+            materialize_meta_on_cuda=False,
+            own_storage=own_storage,
         )
         old_to_new.append((old_param, new_param, shard_spec))
     _migrate_opt_after_param_swap(
         opts,
         old_to_new,
-        copy_tensor=copy_tensor,
+        own_storage=own_storage,
     )
     return sharded_keys
 
@@ -1761,39 +1760,18 @@ def _materialize_meta_shard(
     )
 
 
-def _shard_param(
-    model: nn.Module,
-    params_buffers: Dict[str, torch.Tensor],
-    key: str,
-    shard_spec: DTensorSpec,
-    location: str = "HBM",
-) -> None:
-    """Shard a single parameter in-place and update the model attribute."""
-    full_tensor = params_buffers[key]
-    _shard_parameter_aliases(
-        model,
-        params_buffers,
-        [key],
-        full_tensor,
-        shard_spec,
-        location=location,
-    )
-
-
 def _shard_state_dict(
     state: Any,
     shard_spec: DTensorSpec,
     *,
-    copy_tensor: bool = False,
+    own_storage: bool = False,
 ) -> None:
     """Shard tensor values inside an optimizer state entry in-place."""
     if isinstance(state, dict):
         for key in state:
             if isinstance(state[key], torch.Tensor):
-                local_state = (
-                    partition_value(state[key], shard_spec, copy_tensor=True)
-                    if copy_tensor
-                    else partition_value(state[key], shard_spec)
+                local_state = partition_value(
+                    state[key], shard_spec, own_storage=own_storage
                 )
                 mark_meta_zero_init(local_state)
                 state[key] = local_state
@@ -1814,7 +1792,7 @@ def _migrate_opt_after_param_swap(
     opts: List[torch.optim.Optimizer],
     old_to_new: List[Tuple[torch.Tensor, torch.Tensor, DTensorSpec]],
     *,
-    copy_tensor: bool = False,
+    own_storage: bool = False,
 ) -> None:
     """For each opt, migrate state[old_param] -> state[new_param] (with
     state tensor sharding) AND rewrite every param_group's `params`
@@ -1832,7 +1810,7 @@ def _migrate_opt_after_param_swap(
                 _shard_state_dict(
                     state,
                     shard_spec,
-                    copy_tensor=copy_tensor,
+                    own_storage=own_storage,
                 )
                 opt.state[new_param] = state
         # param_groups rewrite is unconditional - even if a group's
@@ -1884,23 +1862,24 @@ def shard_params_by_plan(
             key in embedding_param_fqns or dense_style == DataParallelStyle.FULLY_SHARD
         )
 
-    for old_param, aliases in _group_tensor_aliases(params_buffers):
-        if not _select_sharding_alias_group(old_param, aliases, should_shard):
+    for old_param, fqns in _group_shared_parameters(params_buffers):
+        if not _select_shared_parameter_group(old_param, fqns, should_shard):
             continue
-        explicit_locations = {loc_map[alias] for alias in aliases if alias in loc_map}
+        explicit_locations = {loc_map[fqn] for fqn in fqns if fqn in loc_map}
         if len(explicit_locations) > 1:
             raise RuntimeError(
-                "Shared parameter aliases must use one embedding storage location: "
-                f"aliases={aliases!r}, locations={sorted(explicit_locations)!r}"
+                "A shared parameter must use one embedding storage location: "
+                f"fqns={fqns!r}, locations={sorted(explicit_locations)!r}"
             )
         location = next(iter(explicit_locations), "HBM")
-        sharded_keys.update(aliases)
-        new_param = _shard_parameter_aliases(
+        sharded_keys.update(fqns)
+        new_param = _shard_shared_parameter(
             model,
             params_buffers,
-            aliases,
+            fqns,
             old_param,
             shard_spec,
+            materialize_meta_on_cuda=True,
             location=location,
         )
         old_to_new.append((old_param, new_param, shard_spec))
