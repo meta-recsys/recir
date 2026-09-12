@@ -199,6 +199,12 @@ class RankFMModelArgs:
     l1_num_layers: int = 3
     l2_num_layers: int = 11
 
+    # This is the only way to shorten sequences under --prod_faithful:
+    # ``max_uih_seq_len`` reaches the config through
+    # ``_apply_bench_shape_overrides``, which prod-faithful skips, and the prod
+    # provider hardcodes its length with no env override.
+    seq_len_cap: int = 0
+
     # Sequence shapes (architectural maxes)
     max_uih_seq_len: int = 32
     num_candidates: int = 8
@@ -221,6 +227,10 @@ class RankFMModelArgs:
     # Build the model from the PROD xsurface provider rather than the standalone
     # udd_fm defaults.
     prod_faithful: bool = False
+
+    # DIAGNOSTIC: drop prod's feature-interaction DCN even under
+    # --prod_faithful.
+    disable_inter_arch: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -287,7 +297,14 @@ def build_module_config(
         module_config = config.module_config  # pyre-ignore[9]
         feature_config = config.feature_config  # pyre-ignore[9]
 
-    if not model_args.prod_faithful:
+    if not model_args.prod_faithful or model_args.disable_inter_arch:
+        if model_args.disable_inter_arch and model_args.prod_faithful:
+            logger.warning(
+                "[config] DIAGNOSTIC: dropping prod's inter_arch DCN "
+                "(inter_arch_type=%r -> None). The model is no longer "
+                "prod-faithful.",
+                module_config.inter_arch_type,
+            )
         module_config.inter_arch_type = None
 
     # Cap embedding-table hash sizes (hash_size_cap <= 0 disables capping).
@@ -313,6 +330,7 @@ def build_module_config(
 
     if not model_args.prod_faithful:
         _apply_bench_shape_overrides(module_config, feature_config, model_args)
+    _apply_seq_len_cap(module_config, model_args.seq_len_cap)
     if model_args.disable_seq_len_sampling:
         module_config.hstu_seq_len_sampling_configs = None
 
@@ -321,6 +339,33 @@ def build_module_config(
         _apply_static_shape_mode(module_config, model_args)
 
     return module_config, feature_config
+
+
+def _apply_seq_len_cap(
+    module_config: BlueReelsVDDModuleConfig,
+    cap: int,
+) -> None:
+    """Cap both HSTU stacks' sequence lengths. ``cap <= 0`` is a no-op."""
+    if cap <= 0:
+        return
+    if module_config.hstu_l2_max_seq_len >= cap:
+        raise ValueError(
+            f"seq_len_cap={cap} is not above hstu_l2_max_seq_len="
+            f"{module_config.hstu_l2_max_seq_len}: the L2 window would cover "
+            f"every row's history, minus_k would be 0 everywhere and the L1 "
+            f"stack would see empty sequences. Raise the cap above the L2 "
+            f"window, or lower hstu_l2_max_seq_len deliberately."
+        )
+    logger.info(
+        "[config] sequence-length cap %d: hstu_max_seq_len %d -> %d "
+        "(hstu_l2_max_seq_len %d unchanged)",
+        cap,
+        module_config.hstu_max_seq_len,
+        min(module_config.hstu_max_seq_len, cap),
+        module_config.hstu_l2_max_seq_len,
+    )
+    module_config.hstu_max_seq_len = min(module_config.hstu_max_seq_len, cap)
+    _sync_l2_max_seq_len(module_config)
 
 
 def _apply_bench_shape_overrides(
