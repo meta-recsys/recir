@@ -19,7 +19,6 @@ from hammer.v3.models.udd_fm_v3.udd_fm_train_v3 import (
 )
 from hammer.v3.modules.mot.tokenizers.mot_sparse_arch import ECSparseArch
 from recir.torchax.amp import hammer_autocast_factory
-from torch.nn.modules.dropout import Dropout
 
 logger: logging.Logger = logging.getLogger(__name__)
 
@@ -153,14 +152,4 @@ def build_model_from_config(
     # HSTU L1/L2 blocks + composer + loss run bf16 (the explicit activation casts
     # plus hammer.autocast -> torchax AMP at the same sites the GPU uses).
     model.recursive_setattr("_bf16_training", bf16_training)
-    # Zero out all remaining dropout. torchax's aten.bernoulli uses a PRNG
-    # key stored in the Environment as mutable state; on the second jit call
-    # the leaked tracer reference causes UnexpectedTracerError.
-    # TODO: need to fix later
-    model.recursive_setattr("_dropout_ratio", 0.0)
-    model.recursive_setattr("_dropout_rate", 0.0)
-    for m in model.modules():
-        if isinstance(m, Dropout):
-            m.p = 0.0
-
     return model
