@@ -21,6 +21,7 @@ from recir.region_transforms.core import (
     extract_subgraph,
     replace_region,
 )
+from recir.region_transforms.dropout_prng import DropoutPRNGTransform
 from recir.region_transforms.inference_swap import (
     apply_inference_swaps,
     deterministic_argmax,
@@ -43,6 +44,7 @@ __all__ = [
     "RegatherTransform",
     "RecomputeTransform",
     "SparseEmbeddingTransform",
+    "DropoutPRNGTransform",
     "InferenceSwapTransform",
     "apply_inference_swaps",
     "deterministic_argmax",

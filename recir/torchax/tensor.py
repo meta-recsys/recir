@@ -555,6 +555,7 @@ class Environment(contextlib.ContextDecorator):
             jagged_ops,
             jaten,
             jc10d,
+            jrandom,
             jtorch,
             jtorchvision_nms,
         )
@@ -902,7 +903,13 @@ class Environment(contextlib.ContextDecorator):
 
     @contextlib.contextmanager
     def override_property(self, **kwargs: Any) -> Iterator[None]:
+        # try/finally, not a bare yield: an exception raised while the override
+        # is live must still pop it. Under a jax trace the override holds
+        # tracers, and a stranded one turns every LATER step into an
+        # UnexpectedTracerError raised from an unrelated call site.
         new_prop = self.param.override(**kwargs)
         self._property.content.append(new_prop)  # pyre-ignore[16]
-        yield
-        self._property.content.pop()  # pyre-ignore[16]
+        try:
+            yield
+        finally:
+            self._property.content.pop()  # pyre-ignore[16]

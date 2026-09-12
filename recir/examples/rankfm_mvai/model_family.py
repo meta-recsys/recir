@@ -58,6 +58,7 @@ from hammer.v3.models.udd_fm_v3.parity.step_digest import (
 )
 from hammer.v3.models.udd_fm_v3.recir_core import (
     compile_gspmd_step,
+    LR_ITER_BUFFER,
     recir_train_step,
     RecirCompiledModuleBase,
     RecirCompileSpec,
@@ -80,6 +81,7 @@ from recir.examples.rankfm_mvai.rankfm_batch_utils import (
     create_uniform_train_batch,
 )
 from recir.examples.rankfm_mvai.rankfm_model_utils import build_model_from_config
+from recir.region_transforms.dropout_prng import DropoutPRNGTransform
 from recir.region_transforms.padding import compute_padded_shape
 from torch.utils.data import IterableDataset
 
@@ -348,6 +350,10 @@ class RecirXLACompiledModule(RecirCompiledModuleBase):
             region_transforms = make_padding_region_transforms(
                 num_candidates_per_sample, padded_num_devices, num_processes
             )
+        # Dropout's Bernoulli draw keys off the LR warmup counter, which is a
+        # registered buffer and therefore real graph state. Unconditional: it is
+        # a no-op when the traced graph has no dropout
+        region_transforms.append(DropoutPRNGTransform(counter_fqn=LR_ITER_BUFFER))
 
         self._model = model
         # Padded sizes for the parity digest's activation trim, and the hooks
@@ -619,7 +625,7 @@ class RankFMMvaiModelFamily(BlueReelsVDDModelFamily):
         same BlueReelsVDDTrainV3 from module_config, but WITHOUT the TPU-required
         kernel/device settings that the recir lowering path depends on
         (use_cuda_attention=False, custom_kernel=False, _hammer_kernel=PYTORCH,
-        dropout zeroed, model on the build device). build_model_from_config does
+        model on the build device). build_model_from_config does
         exactly these mutations, so we delegate to it here to stay byte-identical
         on the model that actually traces+lowers on TPU. bf16_training is threaded
         through so the bench's --bf16_training recipe applies. The architecture
