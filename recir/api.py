@@ -146,6 +146,8 @@ def _rematerialize_optimizer(
     params: Dict[str, nn.Parameter],
     mod: Optional[nn.Module] = None,
     real_id_to_fqn: Optional[Dict[int, str]] = None,
+    buffers: Optional[Dict[str, torch.Tensor]] = None,
+    real_buf_id_to_fqn: Optional[Dict[int, str]] = None,
 ) -> Generator[None, None, None]:
     """Temporarily point ``opt``'s state and param_groups at the proxy
     (FakeTensor) params used during make_fx tracing, restoring on exit.
@@ -210,12 +212,90 @@ def _rematerialize_optimizer(
         for group in opt.param_groups:
             group["params"] = proxy_param_values
 
+    # Hyperparameters can be TENSORS held by reference -- a 0-d LR buffer driven
+    # by a schedule is the case that motivated this. Those entries point at the
+    # pre-reparametrize object, so without rewiring them the optimizer reads a
+    # concrete value (baked into the graph as a constant) while the schedule
+    # writes the proxy, and the two silently disconnect. Same id -> proxy
+    # mapping as params, applied to every non-"params" tensor entry so no
+    # single hyperparameter is special-cased.
+    orig_hypers: List[Tuple[Any, str, Any]] = []
+    if buffers and real_buf_id_to_fqn:
+        for group in opt.param_groups:
+            for key, val in list(group.items()):
+                if key == "params" or not isinstance(val, torch.Tensor):
+                    continue
+                fqn = real_buf_id_to_fqn.get(id(val))
+                if fqn is not None and fqn in buffers:
+                    orig_hypers.append((group, key, val))
+                    group[key] = buffers[fqn]
+
     try:
         yield
     finally:
+        for group, key, orig_val in orig_hypers:
+            group[key] = orig_val
         for group, orig in zip(opt.param_groups, orig_params_per_group):
             group["params"] = orig
         opt.state = orig_states
+
+
+@contextmanager
+def _rematerialize_tensor_attrs(
+    holders: Sequence[Any],
+    lifted: Dict[str, Any],
+    real_id_to_fqn: Dict[int, str],
+) -> Generator[None, None, None]:
+    """Point captured tensor ATTRIBUTES at the lifted proxies, and restore.
+
+    The object-attribute counterpart of the ``param_groups`` hyperparameter
+    rewiring in :func:`_rematerialize_optimizer`, and it exists for the same
+    reason: an optimizer is reachable because it is passed into the traced
+    step, but an object merely attached to the module is not, so nothing was
+    rewiring it.
+
+    ``holders`` is supplied by the caller -- the objects it declares are
+    mutating module state from inside the traced step. Nothing is discovered:
+    an object reached only through a list, a nested attribute or ``__slots__``
+    is not something this can find, and guessing would make the mechanism fire
+    or not fire for reasons the caller cannot see.
+
+    Within a holder, only attributes whose CURRENT value is, by identity, one
+    of the module's real parameters or buffers are touched, so a holder that
+    also carries unrelated tensors is safe to declare.
+    """
+    saved: List[Tuple[Any, str, Any]] = []
+    for holder in holders:
+        for attr, value in list(vars(holder).items()):
+            if not isinstance(value, torch.Tensor):
+                continue
+            fqn = real_id_to_fqn.get(id(value))
+            if fqn is None or fqn not in lifted:
+                continue
+            saved.append((holder, attr, value))
+            setattr(holder, attr, lifted[fqn])
+    if holders and not saved:
+        # Declaring a holder whose tensors are not module state is the silent
+        # failure this rewiring exists to prevent: the writes would land on
+        # pre-trace tensors, the graph would echo the buffers it was handed,
+        # and the state would freeze at its seed value with nothing to see.
+        raise AssertionError(
+            f"none of the {len(holders)} declared tensor-attribute holder(s) "
+            f"({[type(h).__name__ for h in holders]}) hold a tensor that is, "
+            f"by identity, one of the module's parameters or buffers, so "
+            f"nothing was rewired into the graph. Register the tensors they "
+            f"write on the module (register_buffer), or drop the holder."
+        )
+    logger.debug(
+        "rematerialized %d captured tensor attribute(s): %s",
+        len(saved),
+        [(type(h).__name__, a) for h, a, _ in saved],
+    )
+    try:
+        yield
+    finally:
+        for holder, attr, orig in saved:
+            setattr(holder, attr, orig)
 
 
 aten = torch.ops.aten  # pyre-ignore
@@ -399,6 +479,7 @@ def _local_compile(
     _parametrize_fns: Optional[List[Callable[..., torch.Tensor]]] = None,
     _exclude_param_fqns: Optional[set[str]] = None,
     _stateless_func_wrapper: Optional[Callable[..., Any]] = None,
+    _tensor_attr_holders: Sequence[Any] = (),
     **kwargs: Any,
 ) -> _LocalCompiledResult:
     """Trace a train_step into a local FX graph.
@@ -424,6 +505,11 @@ def _local_compile(
             traced function execution (e.g., gradients_tagging for the GSPMD
             DataParallel path).  Receives the ``params`` dict and returns a
             context manager.  If None, no additional wrapping is applied.
+        _tensor_attr_holders: Objects attached to the module that mutate module
+            state from inside the traced step (e.g. an LR schedule controller
+            holding the 0-d LR buffers).  ``_reparametrize_module`` swaps the
+            module's own attributes and cannot reach these, so the caller has
+            to name them; see :func:`_rematerialize_tensor_attrs`.
         **kwargs: Keyword arguments to the train_step function.
     """
     # 1. Extract nn.Module and Optimizer(s) from args and kwargs
@@ -455,6 +541,7 @@ def _local_compile(
     # match the real Params in `opt.param_groups`, so the lookup MUST
     # be done out here to correctly identify each opt's owned params.
     real_id_to_fqn: Dict[int, str] = {id(p): n for n, p in params.items()}
+    real_buf_id_to_fqn: Dict[int, str] = {id(b): n for n, b in buffers.items()}
 
     # Collect per-param optimizer state across ALL opts into one
     # FQN-keyed dict. Each Parameter must belong to at most one opt
@@ -487,6 +574,18 @@ def _local_compile(
             opt_stack.enter_context(
                 stateless._reparametrize_module(_mod, {**params, **buffers})
             )
+            # Same treatment for tensors captured on objects ATTACHED to the
+            # module (schedulers, controllers). _reparametrize_module swaps the
+            # module's own attributes and cannot reach these, so without this
+            # their in-place writes land on pre-trace tensors and never make it
+            # into the graph.
+            opt_stack.enter_context(
+                _rematerialize_tensor_attrs(
+                    _tensor_attr_holders,
+                    {**params, **buffers},
+                    {**real_id_to_fqn, **real_buf_id_to_fqn},
+                )
+            )
             # Per-opt rematerialize so each opt's state + param_groups
             # are rewritten to point at the proxy params, scoped to
             # the FQNs that opt actually owns. Pass the pre-built
@@ -501,6 +600,8 @@ def _local_compile(
                         named_states,
                         params,
                         real_id_to_fqn=real_id_to_fqn,
+                        buffers=buffers,
+                        real_buf_id_to_fqn=real_buf_id_to_fqn,
                     )
                 )
             with ExitStack() as stack:
@@ -1115,6 +1216,7 @@ def _compile_and_transform(
     parallel_mode: ParallelMode,
     *args: Any,
     region_transforms: Optional[List[RegionTransform]] = None,
+    _tensor_attr_holders: Sequence[Any] = (),
     **kwargs: Any,
 ) -> _CompiledResult:
     if region_transforms:
@@ -1129,6 +1231,7 @@ def _compile_and_transform(
             parallel_mode,
             *args,
             region_transforms=region_transforms,
+            _tensor_attr_holders=_tensor_attr_holders,
             **kwargs,
         )
     elif isinstance(parallel_mode, (DataParallel, HybridParallel)):
@@ -1137,6 +1240,7 @@ def _compile_and_transform(
             parallel_mode,
             *args,
             region_transforms=region_transforms,
+            _tensor_attr_holders=_tensor_attr_holders,
             **kwargs,
         )
     else:
@@ -1266,6 +1370,7 @@ def trace(  # noqa: C901 — orchestration: dispatches on parallel_mode flavor (
     input_batch_dim: int = 0,
     parallel_mode: Optional[ParallelMode] = None,
     _parametrize_fns: Optional[Sequence[Callable[..., torch.Tensor]]] = None,
+    _tensor_attr_holders: Sequence[Any] = (),
     **kwargs: Any,
 ) -> Tuple[fx.GraphModule, List[torch.Tensor]]:
     """Stage 2 standalone: trace ``callable_`` into an FX graph module.
@@ -1324,6 +1429,10 @@ def trace(  # noqa: C901 — orchestration: dispatches on parallel_mode flavor (
                 :func:`compile_from_gm`'s GSPMD branch.
               * ``None``: trace as-is (legacy behavior for callers that
                 don't request a parallelism strategy).
+        _tensor_attr_holders: objects attached to the module that mutate module
+            state from inside the traced step (e.g. an LR schedule controller
+            holding the 0-d LR buffers).  See
+            :func:`_rematerialize_tensor_attrs`.
         **kwargs: keyword arguments to ``callable_``.
 
     Returns:
@@ -1521,6 +1630,7 @@ def trace(  # noqa: C901 — orchestration: dispatches on parallel_mode flavor (
                 fake_mode=fake_mode,
                 _parametrize_fns=_outer_parametrize_fns,
                 _exclude_param_fqns=_outer_exclude_fqns,
+                _tensor_attr_holders=_tensor_attr_holders,
                 **kwargs,
             )
     else:
@@ -1572,6 +1682,7 @@ def trace(  # noqa: C901 — orchestration: dispatches on parallel_mode flavor (
                 fake_mode=fake_mode,
                 _stateless_func_wrapper=gradients_tagging,
                 _parametrize_fns=list(_parametrize_fns) if _parametrize_fns else None,
+                _tensor_attr_holders=_tensor_attr_holders,
                 **kwargs,
             )
 
@@ -2025,6 +2136,7 @@ def _compile_data_parallel_v2(
     parallel_mode: Union[DataParallel, HybridParallel],
     *args: Any,
     region_transforms: Optional[List[RegionTransform]] = None,
+    _tensor_attr_holders: Sequence[Any] = (),
     **kwargs: Any,
 ) -> _CompiledResult:
     """Compile with autograd-based collective insertion (no DTensor partition).
@@ -2201,6 +2313,7 @@ def _compile_data_parallel_v2(
             fake_mode=fake_mode,
             _parametrize_fns=_outer_parametrize_fns,
             _exclude_param_fqns=_outer_exclude_fqns,
+            _tensor_attr_holders=_tensor_attr_holders,
             **kwargs,
         )
 
@@ -2222,6 +2335,7 @@ def _compile_gspmd(
     parallel_mode: GSPMDParallel,
     *args: Any,
     region_transforms: Optional[List[RegionTransform]] = None,
+    _tensor_attr_holders: Sequence[Any] = (),
     **kwargs: Any,
 ) -> _CompiledResult:
     """Compile a train step with GSPMD auto-parallelism.
@@ -2260,6 +2374,7 @@ def _compile_gspmd(
             *args,
             fake_mode=fake_mode,
             _stateless_func_wrapper=gradients_tagging,
+            _tensor_attr_holders=_tensor_attr_holders,
             **kwargs,
         )
     gm = local_result.gm

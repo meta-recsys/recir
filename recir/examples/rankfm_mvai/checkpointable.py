@@ -101,9 +101,7 @@ def reseed_warmup(warmup: Any, iteration: int) -> None:
     """
     if iteration < 0:
         raise ValueError(f"iteration must be non-negative, got {iteration}")
-    warmup.apply()
-    for _ in range(iteration):
-        warmup.step()
+    warmup.set_iter(iteration)
 
 
 def _is_sharded_table_key(key: str, sharded_prefixes: Sequence[str]) -> bool:

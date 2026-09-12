@@ -537,11 +537,6 @@ class RecirXLACompiledModule(RecirCompiledModuleBase):
             optimizer=self._dense_opt,
         )
 
-    def _post_step(self) -> None:
-        # Advance the dense warmup LR (writes the next iter's value into the 0-d
-        # LR buffer in place; no-op multiplier until a schedule is configured).
-        self._warmup.step()
-
 
 class RankFMMvaiModelFamily(BlueReelsVDDModelFamily):
     """RecModelFamily that swaps GPU DMP for the recir embedding backend.
