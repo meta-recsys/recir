@@ -562,7 +562,11 @@ def ringshift_embedding_lookup_reference_jax(
         traffic = lax.all_gather(send_counts, axis_name)  # [W, W]
         send_offsets, recv_offsets = _derive_offsets(traffic)
 
-        my_rank = lax.axis_index(axis_name)
+        # int32: Pallas semaphore_signal rejects int64 device_ids, and
+        # lax.axis_index widens to int64 when jax_enable_x64 is on (which
+        # prod needs for the 3e9-row table ids). Narrowed here because
+        # every device_id below is derived from it.
+        my_rank = lax.axis_index(axis_name).astype(jnp.int32)
         # Each device sends one slice per peer (so K = W). For ``output_offsets``,
         # entry t = "where my slice lands on peer t" = ``recv_offsets[t, my_rank]``;
         # vectorised over t this is ``recv_offsets[:, my_rank]``.
@@ -981,7 +985,7 @@ def _make_ringshift_single_wave_kernel(
         pooled_ref=None,  # output HBM [num_bags+1, D], alias of pooled_init_ref
         pool_acc_vmem=None,  # VMEM staging for the pooled accumulator
     ):
-        my_rank = lax.axis_index(axis_name)
+        my_rank = lax.axis_index(axis_name).astype(jnp.int32)
         wave_idx = wave_idx_ref[0]  # traced scalar int32
 
         # All-peer broadcast pre-barrier FIRST. Issuing init ops (sync_copy of
@@ -1000,7 +1004,7 @@ def _make_ringshift_single_wave_kernel(
             pl.semaphore_signal(
                 sem,
                 1,
-                device_id=_ring_device_id(axis_name, peer),
+                device_id=_ring_device_id(axis_name, jnp.int32(peer)),
                 device_id_type=pl.DeviceIdType.MESH,
             )
         pl.semaphore_wait(sem, world_size)
@@ -2278,7 +2282,7 @@ def _make_ringshift_backward_single_wave_kernel(
         del (
             grad_table_acc_init_ref
         )  # aliased to grad_table_acc_ref via input_output_aliases
-        my_rank = lax.axis_index(axis_name)
+        my_rank = lax.axis_index(axis_name).astype(jnp.int32)
         wave_idx = wave_idx_ref[0]
 
         # All-peer broadcast pre-barrier FIRST. Same ordering as the forward
@@ -2291,7 +2295,7 @@ def _make_ringshift_backward_single_wave_kernel(
             pl.semaphore_signal(
                 sem,
                 1,
-                device_id=_ring_device_id(axis_name, peer),
+                device_id=_ring_device_id(axis_name, jnp.int32(peer)),
                 device_id_type=pl.DeviceIdType.MESH,
             )
         pl.semaphore_wait(sem, world_size)

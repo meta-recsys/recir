@@ -97,6 +97,8 @@ spec:
               # off by default.
               - name: TPU_STDERR_LOG_LEVEL
                 value: "3"
+              - name: JAX_ENABLE_X64
+                value: "1"
               # Which op builds the 82.52GiB f32[65,332800,128,8]? The XLA memory
               # report gives shapes but no op names, and that single tensor is
               # 87% of the budget -- 65 = b_local (padded global batch 16640 /
@@ -170,26 +172,6 @@ spec:
               # rate-limits (HTTP 429) and drags the whole synchronized loop"
               # problem actually was. 60s is far below the per-object write rate
               # limit for a file this size.
-              # --hash_size_cap 2e9 is a DEVIATION FROM PROD, forced by an int32
-              # limit in the ring-shift kernel. Prod's nonpooled_post_id is 3e9
-              # rows; jseq_embedding._prep takes `% vocab` against a Python int
-              # (:86) and builds its ids as int32 (`ids.astype(jnp.int32)`, :87),
-              # and 3e9 does not fit in int32's 2147483647. The modulo overflows
-              # loudly at XLA lowering -- "OverflowError: ... argument path is
-              # x2. Got <class 'int'> with value 3000000000" -- and the astype on
-              # the next line would wrap real ids NEGATIVE without saying
-              # anything, which is the worse half.
-              #
-              # 2e9 < 2147483647, and it divides evenly by the 256-device world
-              # size so _round_up does not push it back over. Only one table is
-              # affected: config.py caps with min(num_embeddings, cap) and the
-              # next largest is viewer_rid at 1e9.
-              #
-              # The cost is not cosmetic. remap_batch_ids folds ids by the table
-              # size, so a cap changes the MODULUS -- ids land on different rows
-              # than production put them on. This is a probe to see how much
-              # further the run gets, not a configuration to draw conclusions
-              # from. See C8 in docs/PROD_CONFIG_OVERRIDES.md.
               - >-
                 RANK=${JOB_COMPLETION_INDEX:-0} ;
                 FIRST_FILE=rank_${RANK}/batch_0/0.pt.zst ;
@@ -215,7 +197,6 @@ spec:
                 --local_batch_size 512
                 --prod_faithful
                 --bf16_training
-                --hash_size_cap 2000000000
                 --embedding_backend in_graph
                 --gcs_data_path /mnt/barnfs
                 --metrics_report_interval 100
