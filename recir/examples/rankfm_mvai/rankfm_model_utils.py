@@ -80,6 +80,27 @@ def build_model_from_config(
                 use_cuda_attention=False
             )
 
+    # Sequence-length sampling off, unconditionally. NOT a choice -- the recir
+    # trace does not survive it, so it does not belong on the CLI where it reads
+    # like one. Prod turns the L1 sampler on and derives
+    # output_segments=["unsampled_inputs"] from it as a matched pair
+    # (..._xsurface_config.py:1664-1665), but mot_preprocessor derives its flags
+    # PER HSTU STACK (:800-807) against a single global output_segments, and
+    # prod's L2 sampler is None. The L2 stack therefore wants the segment while
+    # nothing produces it, its `elif supervision_weight is not None` fallback
+    # (:987-997) does not fire, and the FX trace dies in
+    # udd_fm_train_v3._post_processing with KeyError('unsampled_inputs').
+    #
+    # BOTH fields, together: clearing only the sampler leaves the segment
+    # requested with no producer, which is the same crash.
+    #
+    # Mutated here rather than in config.build_module_config because it has to
+    # be true for every caller that traces -- and because it belongs next to the
+    # dropout zeroing below, as the other thing the compiled path cannot do yet.
+    # TODO: need to fix later
+    module_config.hstu_seq_len_sampling_configs = None
+    module_config.output_segments = None
+
     ec_device = torch.device("meta") if embeddings_on_meta else device
     with _ec_sparse_arch_on(ec_device):
         recblock = build_recblock_from_xsurface_config(
@@ -135,6 +156,7 @@ def build_model_from_config(
     # Zero out all remaining dropout. torchax's aten.bernoulli uses a PRNG
     # key stored in the Environment as mutable state; on the second jit call
     # the leaked tracer reference causes UnexpectedTracerError.
+    # TODO: need to fix later
     model.recursive_setattr("_dropout_ratio", 0.0)
     model.recursive_setattr("_dropout_rate", 0.0)
     for m in model.modules():

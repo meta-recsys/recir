@@ -3,9 +3,10 @@
 # driven by the mvai_cloud RecTrainer framework instead of rankfm's bespoke loop.
 # Uses dynamic auto-slice scheduling (tpuxpack) — ICI is wired at runtime via Slice CR.
 # Pulls training batches from a barnfs dataporter dump mounted via the
-# barnfs.csi.meta.com CSI driver (cluster-level creds — no per-pod cert); the
-# trainer reads on-demand using --data_file_template so we avoid the
-# multi-minute `ls /mnt/barnfs` FUSE enumeration tax.
+# barnfs.csi.meta.com CSI driver (cluster-level creds — no per-pod cert). The
+# dump is the v0 bucketed layout (rank_R/batch_S/F.pt.zst); data_pipe reads its
+# metadata.json and computes the filenames arithmetically, so there is no
+# `ls /mnt/barnfs` enumeration to avoid.
 apiVersion: jobset.x-k8s.io/v1alpha2
 kind: JobSet
 metadata:
@@ -66,55 +67,168 @@ spec:
                 valueFrom:
                   fieldRef:
                     fieldPath: metadata.labels['jobset.sigs.k8s.io/jobset-name']
+              # Lets --prod_faithful work without //minimal_viable_ai, which is
+              # not staged into this image: config._load_prod_module_config
+              # reads the exported artifact instead. See prod_config_artifact.py
+              # and the runbook in docs/RUNBOOK_128CHIP_PROD_CONFIG.md for how
+              # the ConfigMap is produced.
+              - name: PROD_CONFIG_ARTIFACT
+                value: /mnt/prodcfg/prod_cfg.pt
+              # How often rank 0 copies the TensorBoard events file out to GCS
+              # during the run. Raise it if the copy ever shows up as gcsfuse
+              # pressure; it costs nothing but staleness in the dashboard.
+              - name: TB_SYNC_SECS
+                value: "60"
+              # libtpu's stderr logging is OFF by default in this image, which
+              # swallows the one thing needed to diagnose an HBM OOM: the
+              # compiler prints its "Largest program allocations in hbm"
+              # breakdown at INFO, so without this the failure reports only a
+              # total ("HLO temporaries (143.42G) exceeds available HBM
+              # (94.75G)") and never says which buffers.
+              #
+              # stderr is the only reliable channel here. Per
+              # rankfm_mvai-64chip-bench.yaml:150-153, the XLA dumper cannot
+              # write to GCS in this environment and the pod filesystem is lost
+              # when the process dies, so --xla_dump_to is not an option.
+              #
+              # Set to "0" to get it back: that breakdown is what identified
+              # the 82.5GiB FusedMMoE fan-out, and it is the only way to see
+              # which buffers an HBM OOM is actually made of. Very verbose, so
+              # off by default.
+              - name: TPU_STDERR_LOG_LEVEL
+                value: "3"
+              # Which op builds the 82.52GiB f32[65,332800,128,8]? The XLA memory
+              # report gives shapes but no op names, and that single tensor is
+              # 87% of the budget -- 65 = b_local (padded global batch 16640 /
+              # 256 devices), 332800 = 16640 x num_candidates 20. A
+              # [local_batch, GLOBAL rows, ...] buffer is the shape of an
+              # all-to-all or a jagged->dense pad that materialized densely.
+              #
+              # "1" logs embedding/index/scatter/collective ops and the
+              # jagged<->dense lowering branch decisions -- enough to name the
+              # producer if it is one of those. "full" dumps the entire FX graph
+              # plus HLO (xla_lower.py:237-238); escalate to it only if "1" does
+              # not identify the op, because the output is very large.
+              # "1" logs embedding/index/scatter/collective ops and the
+              # jagged<->dense lowering decisions; "full" adds the entire FX
+              # graph plus HLO (xla_lower.py:237-238). "1" was enough to name
+              # the op behind the 82.5GiB tensor. ~30k log lines, so off here.
+              - name: RECIR_DUMP_GRAPHS
+                value: "0"
               command:
               - sh
               - -c
-              # NOTE: the dataporter dump has ~100K files; `ls /mnt/barnfs`
-              # takes 58+ min on FUSE due to full directory enumeration. We
-              # avoid that entirely by passing --data_file_template to the
-              # trainer, so BatchReplayPipe builds the filename list itself
-              # (no listdir) and reads on-demand via FUSE's lazy lookup
-              # (sub-second per known filename).
+              # Data addressing: NO --data_file_template. That flag resolves to
+              # exactly ONE file (model_family.py:564,
+              # `[template.format(i=1)]`) which replay_batch_iter then recycles
+              # via its rotating row window, making the run a throughput
+              # benchmark rather than training -- an NE/CTR curve off such a run
+              # is meaningless. Without it, data_pipe._discover_files reads
+              # metadata.json and synthesizes the v0 names arithmetically; it
+              # never lists the directory, so there is no FUSE enumeration cost.
               #
-              # Per-pod data: $RANK (= JOB_COMPLETION_INDEX) is baked into
-              # the template so pod K reads ``rank_K_batch_1.pt.zst`` from
-              # the dump's K-th shard. With 32 pods that's 32 distinct files
-              # per step → real data parallelism (vs all-ranks-same when the
-              # template was hardcoded to rank_0). Requires the dump to have
-              # >= 32 dump-ranks; verified for this dataporter snapshot.
-              # PaddingRegionTransform pads each loaded batch to fixed
-              # post-pad shapes (per-trace pair_padded_bs = local_batch_size
-              # * num_candidates), so ROW_WISE A2A still works across ranks.
+              # NO --data_replicate_across_ranks either: replicate makes all 32
+              # pods read the same file every step. Sharded (the default), pod K
+              # takes global_idx = K + step*32 over the dump's 480 ranks, so the
+              # 32 pods see 32 distinct shards per step -- real data
+              # parallelism. PaddingRegionTransform pads every loaded batch to
+              # fixed post-pad shapes, so ROW_WISE A2A tolerates the divergent
+              # per-rank jagged lengths that sharding introduces.
               #
-              # With the CSI driver the volume is published before the
-              # container starts, so this per-pod probe normally passes on the
-              # first check; it's kept as a cheap guard that pod K sees its own
-              # shard before reaching jax.process_index().
+              # local_batch_size is the dump's own batch_size (512), so each
+              # step consumes a whole dumped batch and select_rows_slice is a
+              # no-op. A smaller value silently trains on a rotating subsample
+              # of each file, which is not what production consumed.
+              #
+              # num_candidates is deliberately NOT passed: under
+              # --prod_faithful the NRO budget comes from prod's
+              # hstu_max_output_len (=20) via _resolve_nro_per_sample
+              # (xsurface_helpers.py:94-99), and the flag would be inert but
+              # read as if it applied.
+              #
+              # bf16_training matches prod, which trains the dense tower in
+              # bf16 (and even allreduces in bf16 -- see the xsurface config's
+              # _ddp_config). fp32 master weights are still kept, and layernorm
+              # / softmax / loss reductions stay fp32. NOTE this changes
+              # activation dtypes, so it forces an XLA recompile.
+              #
+              # The probe checks metadata.json (which _discover_files reads
+              # first) and pod K's own first shard. With the CSI driver the
+              # volume is published before the container starts, so this
+              # normally passes on the first check.
+              # TensorBoard: rank 0 copies the events file out every
+              # TB_SYNC_SECS in a BACKGROUND loop, not just at exit. The
+              # end-of-run copy alone is useless for a long run -- nothing
+              # reaches GCS until the trainer terminates, so a run that is still
+              # going (or that gets preempted) shows nothing in TensorBoard.
+              # compare_experiment.py:781-783 works around this by capping
+              # --max_steps so the run COMPLETES; the loop below removes the need.
+              #
+              # The loop is a separate process from the trainer, so a slow or
+              # rate-limited gcsfuse write stalls the copy, never the training
+              # step -- which is what the original "TB straight to gcsfuse
+              # rate-limits (HTTP 429) and drags the whole synchronized loop"
+              # problem actually was. 60s is far below the per-object write rate
+              # limit for a file this size.
+              # --hash_size_cap 2e9 is a DEVIATION FROM PROD, forced by an int32
+              # limit in the ring-shift kernel. Prod's nonpooled_post_id is 3e9
+              # rows; jseq_embedding._prep takes `% vocab` against a Python int
+              # (:86) and builds its ids as int32 (`ids.astype(jnp.int32)`, :87),
+              # and 3e9 does not fit in int32's 2147483647. The modulo overflows
+              # loudly at XLA lowering -- "OverflowError: ... argument path is
+              # x2. Got <class 'int'> with value 3000000000" -- and the astype on
+              # the next line would wrap real ids NEGATIVE without saying
+              # anything, which is the worse half.
+              #
+              # 2e9 < 2147483647, and it divides evenly by the 256-device world
+              # size so _round_up does not push it back over. Only one table is
+              # affected: config.py caps with min(num_embeddings, cap) and the
+              # next largest is viewer_rid at 1e9.
+              #
+              # The cost is not cosmetic. remap_batch_ids folds ids by the table
+              # size, so a cap changes the MODULUS -- ids land on different rows
+              # than production put them on. This is a probe to see how much
+              # further the run gets, not a configuration to draw conclusions
+              # from. See C8 in docs/PROD_CONFIG_OVERRIDES.md.
               - >-
                 RANK=${JOB_COMPLETION_INDEX:-0} ;
-                FIRST_FILE=rank_${RANK}_batch_1.pt.zst ;
-                echo "Pod $RANK waiting for /mnt/barnfs/$FIRST_FILE as mount-ready probe..." ;
+                FIRST_FILE=rank_${RANK}/batch_0/0.pt.zst ;
+                echo "Pod $RANK waiting for /mnt/barnfs/metadata.json and /mnt/barnfs/$FIRST_FILE as mount-ready probe..." ;
                 START=$(date +%s) ;
-                while [ ! -e /mnt/barnfs/$FIRST_FILE ]; do
+                while [ ! -e /mnt/barnfs/metadata.json ] || [ ! -e /mnt/barnfs/$FIRST_FILE ]; do
                   sleep 5 ;
                 done ;
                 echo "barnfs mount ready (after $(($(date +%s) - START))s); starting trainer..." ;
+                TB_SRC=/mnt/gcs/mvai_cloud/tensorboard/${JOBSET_NAME} ;
+                TB_DST=/mnt/gcs-out/tensorboard/${JOBSET_NAME} ;
+                if [ "${RANK}" = "0" ]; then
+                  mkdir -p "$TB_DST" ;
+                  echo "TB sync loop -> gs://cq-mrs-core-shared_mrs_tpu_y317h/tensorboard/${JOBSET_NAME} every ${TB_SYNC_SECS}s" ;
+                  ( while true; do
+                      sleep "${TB_SYNC_SECS}" ;
+                      cp "$TB_SRC"/* "$TB_DST"/ 2>/dev/null || true ;
+                    done ) &
+                  TB_SYNC_PID=$! ;
+                fi ;
                 python3 -u -m recir.examples.rankfm_mvai.train
-                --max_steps 20
-                --local_batch_size 32
-                --num_candidates 32
-                --hash_size_cap 1000000
-                --l1_num_layers 3
-                --l2_num_layers 11
-                --embedding_backend cpu
+                --max_steps 629130
+                --local_batch_size 512
+                --prod_faithful
+                --bf16_training
+                --hash_size_cap 2000000000
+                --embedding_backend in_graph
                 --gcs_data_path /mnt/barnfs
-                --data_file_template "rank_${RANK}_batch_{i}.pt.zst"
-                --data_replicate_across_ranks
+                --metrics_report_interval 100
                 --profile_start_step 3
                 --profile_end_step 8
                 --profile_dir "gs://cq-mrs-core-shared_mrs_tpu_y317h/tpu-profiles/${JOBSET_NAME}" ;
                 rc=$? ;
-                if [ "${RANK}" = "0" ]; then echo "Copying TensorBoard events -> gs://cq-mrs-core-shared_mrs_tpu_y317h/tensorboard/${JOBSET_NAME} ..." ; mkdir -p /mnt/gcs-out/tensorboard/${JOBSET_NAME} ; cp /mnt/gcs/mvai_cloud/tensorboard/${JOBSET_NAME}/* /mnt/gcs-out/tensorboard/${JOBSET_NAME}/ || true ; fi ;
+                if [ "${RANK}" = "0" ]; then
+                  kill "$TB_SYNC_PID" 2>/dev/null || true ;
+                  echo "Final TensorBoard copy -> gs://cq-mrs-core-shared_mrs_tpu_y317h/tensorboard/${JOBSET_NAME} ..." ;
+                  mkdir -p "$TB_DST" ;
+                  cp "$TB_SRC"/* "$TB_DST"/ || true ;
+                fi ;
                 exit $rc
               ports:
               - containerPort: 8471
@@ -124,6 +238,9 @@ spec:
               volumeMounts:
               - name: barnfs-data
                 mountPath: /mnt/barnfs
+                readOnly: true
+              - name: prod-cfg
+                mountPath: /mnt/prodcfg
                 readOnly: true
               # Local emptyDir: TB events are written here during training (fast).
               # Writing TB straight to gcsfuse rate-limits (HTTP 429) on the
@@ -152,7 +269,18 @@ spec:
                 driver: barnfs.csi.meta.com
                 readOnly: true
                 volumeAttributes:
-                  sourcePath: "gs://mrs-tpu-y317h/datasets/udd_fm_20260415_dump/"
+                  # 3-day dump, Dataporter-transferred (BarnFS-encrypted
+                  # shards + BFS2_SHARD_MAP; the CSI driver decrypts at
+                  # mount, which is why the logical files are not visible
+                  # with plain `gcloud storage ls`). The trailing ":v0" is
+                  # part of the dataporter transfer id, not the dump format.
+                  # Source of truth for the layout is the Manifold original,
+                  # manifold://mrs_recsys_gcp/tree/czheo_test/udd_fm_3d_20260722,
+                  # whose metadata.json reads
+                  # {"version": 0, "num_ranks": 480, "num_batches": 41942,
+                  #  "batch_size": 512} -- i.e. the v0 bucketed layout
+                  # rank_R/batch_S/F.pt.zst, 480 shards, stride 512.
+                  sourcePath: "gs://mrs-tpu-y317h/czheo_test/dataporter_2:prod:dataporter:xdb.mwfs_orchestration_prod:3186:279354:v0/"
             # TensorBoard events. mvai's TensorboardLogger hardcodes
             # /mnt/gcs/mvai_cloud/tensorboard/$MVAI_JOB_NAME (metrics.py) and
             # appends to a single events file at every metric report. Backing
@@ -161,6 +289,12 @@ spec:
             # exceeds GCS's per-object write rate limit (HTTP 429), stalls the
             # per-step report, and drags the whole synchronized loop. So write TB
             # to a LOCAL emptyDir during training instead...
+            # Prod's config, exported on a devserver and published as a
+            # ConfigMap (~70KB, well under the 1MB limit). Not a bucket: this
+            # avoids a GCS round trip on every iteration.
+            - name: prod-cfg
+              configMap:
+                name: rankfm-prod-cfg
             - name: tensorboard
               emptyDir: {}
             # ...and have rank 0 copy the finished events to the SA-owned bucket
