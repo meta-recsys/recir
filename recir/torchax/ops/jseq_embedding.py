@@ -149,16 +149,31 @@ def _prep_local(
 
     pos = jnp.arange(seq, dtype=jnp.int32)[None, :]
     is_pad = pos >= lengths.astype(jnp.int32)[:, None]
+    # int64, not int32: ids span [0, global_vocab) and prod's largest table is
+    # 3e9 rows, past int32's 2147483647. An int32 cast here wraps the high ids
+    # NEGATIVE without failing, and _block_to_mod_ids downstream builds an
+    # intermediate that also reaches vocab. Requires jax_enable_x64; without it
+    # JAX silently narrows this back to int32 and only warns.
     rank = jax.lax.axis_index(_AXIS)
     flat_spread = (
-        rank * max_local_ids + jnp.arange(max_local_ids, dtype=jnp.int32)
+        rank * max_local_ids + jnp.arange(max_local_ids, dtype=jnp.int64)
     ) % global_vocab
+    ids64 = ids.astype(jnp.int64)
+    # Checked on the RESULT of the cast, not on jax.config: JAX narrows int64 to
+    # int32 when jax_enable_x64 is off and only warns, which would restore the
+    # wraparound silently. Tables that fit in int32 are unaffected either way.
+    if global_vocab > 2**31 - 1 and ids64.dtype != jnp.int64:
+        raise RuntimeError(
+            f"vocab {global_vocab} exceeds int32 but the id path came out as "
+            f"{ids64.dtype}: ids above 2147483647 would wrap to negative "
+            f"row indices. Set JAX_ENABLE_X64=1."
+        )
     ids_dist = cast(
         jax.Array,
         jnp.where(
             is_pad,
             flat_spread.reshape(batch, seq),
-            ids.astype(jnp.int32),
+            ids64,
         ),
     )
     count = jnp.asarray(max_local_ids, dtype=jnp.int32)
