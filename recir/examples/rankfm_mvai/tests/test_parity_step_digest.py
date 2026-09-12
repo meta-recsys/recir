@@ -12,7 +12,7 @@ import os
 import unittest
 import unittest.mock
 from contextlib import redirect_stdout
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 from unittest import TestCase
 
 import hammer.v2.modules.fused_hstu as fused_hstu
@@ -25,9 +25,19 @@ from hammer.v3.models.udd_fm_v3.parity.digest import (
     parse_digest,
 )
 from hammer.v3.models.udd_fm_v3.parity.step_digest import _trim_inputs, arm
-from hammer.v3.models.udd_fm_v3.recir_core.compile import recir_train_step
-from recir.api import trace
+from hammer.v3.models.udd_fm_v3.recir_core.compile import (
+    _declared_tensor_attr_holders,
+    LR_DENSE_BUFFER,
+    LR_ITER_BUFFER,
+    recir_train_step,
+    WARMUP_ATTR,
+)
+from hammer.v3.models.udd_fm_v3.recir_core.optim import WarmupController
+from recir.api import compile_from_gm, make_compiled_runner, trace
 from recir.examples.rankfm_mvai.debug_digest_op import debug_digest
+from recir.region_transforms.base import RegionTransform
+from recir.tests.test_utils import _NoopBackend, _PassthroughParallel
+from torchrec.optim.warmup import WarmupPolicy, WarmupStage
 
 
 class _Toy(torch.nn.Module):
@@ -522,3 +532,280 @@ class EagerInputGradientIsAccumulatedTest(TestCase):
         # ones @ (Wa + Wb) -- each branch alone would give only its own term.
         expected = torch.ones(3, 4) @ (mod.inner.a.weight + mod.inner.b.weight)
         torch.testing.assert_close(store["GRADIN:inner.a"][0], expected)
+
+
+class _ToyWarmup(torch.nn.Module):
+    """``_Toy`` plus the two 0-d buffers the warmup schedule drives.
+
+    Registered exactly as ``setup._build_lr_buffered_optimizer`` /
+    ``_register_iter_buffer`` do it: non-persistent, on the top-level module, so
+    they ride ``flat_state`` via ``named_buffers()`` as graph placeholders AND
+    graph outputs.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.w = torch.nn.Parameter(torch.ones(4))
+        self.register_buffer(
+            LR_DENSE_BUFFER, torch.tensor(0.0, dtype=torch.float32), persistent=False
+        )
+        self.register_buffer(
+            LR_ITER_BUFFER, torch.zeros((), dtype=torch.int64), persistent=False
+        )
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        return (self.w * x).sum().reshape(1), {}
+
+
+class WarmupAdvancesInGraphTest(TestCase):
+    """The schedule has to move when the COMPILED step runs.
+
+    Eager arithmetic is not enough evidence. A controller that holds its buffers
+    as attributes captured at construction passes every eager test, because
+    ``stateless._reparametrize_module`` cannot swap an attribute: the compiled
+    step then writes pre-trace tensors while the graph reads placeholders
+    nothing wrote, and the LR is frozen for the life of the job.
+
+    So these compile the step and run it twice. That combination -- traced, then
+    stepped more than once -- is what distinguishes graph state from a captured
+    tensor, and no other test in this area does it.
+    """
+
+    BASE_LR: float = 4e-4
+    MAX_ITERS: int = 37500
+    START: float = 0.1
+
+    def _stages(self) -> List[Any]:
+        return [
+            WarmupStage(
+                policy=WarmupPolicy.LINEAR,
+                max_iters=self.MAX_ITERS,
+                value=self.START,
+                lr_scale=1.0,
+            )
+        ]
+
+    def _expected_lr(self, it: int) -> float:
+        """torchrec's LINEAR multiplier; matches WarmupScheduleBaselineTest."""
+        if it > self.MAX_ITERS:
+            return self.BASE_LR
+        return self.BASE_LR * (self.START + (1.0 - self.START) * it / self.MAX_ITERS)
+
+    def _build(
+        self, *, detached_tensors: bool = False
+    ) -> Tuple[_ToyWarmup, torch.optim.Optimizer, WarmupController]:
+        """A toy wired the way production is.
+
+        ``detached_tensors=True`` is the NEGATIVE CONTROL: the controller holds
+        0-d tensors that are NOT the module's buffers, so recir's identity match
+        finds nothing to rewire and the writes cannot reach the graph. It pins
+        the rule the mechanism runs on -- identity against the real params and
+        buffers -- rather than merely observing that something got rewired.
+        """
+        mod = _ToyWarmup()
+        opt = torch.optim.SGD(mod.parameters(), lr=0.5, foreach=True)
+        if detached_tensors:
+            iter_buffer = torch.zeros((), dtype=torch.int64)
+            lr_buffer = torch.tensor(0.0, dtype=torch.float32)
+        else:
+            iter_buffer = getattr(mod, LR_ITER_BUFFER)
+            lr_buffer = getattr(mod, LR_DENSE_BUFFER)
+        warmup = WarmupController(
+            iter_buffer=iter_buffer,
+            dense_lr_buffer=lr_buffer,
+            dense_base_lr=self.BASE_LR,
+            dense_lr_warmup_schedule=self._stages(),
+        )
+        warmup.apply()  # seed iter 0, as setup.py does
+        setattr(mod, WARMUP_ATTR, warmup)
+        return mod, opt, warmup
+
+    @staticmethod
+    def _trace_only(
+        mod: torch.nn.Module,
+        opt: torch.optim.Optimizer,
+        region_transforms: Sequence[Any] = (),
+        holders: Optional[Sequence[Any]] = None,
+    ) -> torch.fx.GraphModule:
+        gm, _flat_state = trace(
+            recir_train_step,
+            mod,
+            opt,
+            torch.arange(4.0),
+            region_transforms=region_transforms,
+            _tensor_attr_holders=(
+                _declared_tensor_attr_holders(mod) if holders is None else holders
+            ),
+        )
+        return gm
+
+    @staticmethod
+    def _compile(
+        mod: torch.nn.Module,
+        opt: torch.optim.Optimizer,
+        region_transforms: Sequence[Any] = (),
+    ) -> Any:
+        gm, flat_state = trace(
+            recir_train_step,
+            mod,
+            opt,
+            torch.arange(4.0),
+            region_transforms=region_transforms,
+            _tensor_attr_holders=_declared_tensor_attr_holders(mod),
+        )
+        compiled = compile_from_gm(
+            gm,
+            flat_state,
+            parallel_mode=_PassthroughParallel(),
+            backend=_NoopBackend(),
+        )
+        return make_compiled_runner(compiled)
+
+    @staticmethod
+    def _counter_is_graph_state(gm: torch.fx.GraphModule) -> bool:
+        """Does the counter placeholder feed anything in the graph?
+
+        Assert on the GRAPH, not on the counter's value, because on the CPU FX
+        backend the value cannot tell the two cases apart. A controller holding
+        a captured tensor still ends up mutating it: make_fx interns the real
+        tensor as a graph CONSTANT, and eager FX execution really does run
+        ``add_`` on it -- the same object the module holds -- so the counter
+        climbs and everything looks fine.
+
+        Under XLA that constant is baked into the HLO and the host never sees a
+        write, which is why a real TPU run freezes where a CPU run of the same
+        code does not. What distinguishes graph state from a baked constant is
+        whether the PLACEHOLDER is what gets consumed -- the same distinction
+        that makes a `_threefry_fold_in` call prove nothing about dropout unless
+        a parameter reaches its operand.
+        """
+        counter = next(
+            (
+                n
+                for n in gm.graph.nodes
+                if n.op == "placeholder" and n.meta.get("fqn") == LR_ITER_BUFFER
+            ),
+            None,
+        )
+        if counter is None:
+            raise AssertionError(
+                f"no placeholder tagged {LR_ITER_BUFFER}; the buffer did not "
+                "reach flat_state at all"
+            )
+        # Exclude the output node. Every buffer placeholder is echoed there --
+        # ``stateless_func`` returns the whole ``buffers`` dict -- so counting
+        # it would make this trivially true. Being ECHOED is precisely the
+        # broken case: output == input is what froze the schedule. What matters
+        # is whether some real op reads the placeholder.
+        return any(
+            counter in n.all_input_nodes for n in gm.graph.nodes if n.op != "output"
+        )
+
+    def test_the_counter_advances_once_per_compiled_step(self) -> None:
+        """The property the whole design rests on: the counter is graph state,
+        so running the compiled step is what moves it."""
+        mod, opt, warmup = self._build()
+        runner = self._compile(mod, opt)
+        for expected in (1, 2, 3):
+            runner(mod, opt, torch.arange(4.0))
+            self.assertEqual(
+                int(getattr(mod, LR_ITER_BUFFER)),
+                expected,
+                "the compiled step did not advance the warmup counter; the "
+                "in-graph add_ is writing a tensor the graph cannot see",
+            )
+            self.assertEqual(warmup.iter, expected)
+
+    def test_the_lr_ramps_across_compiled_steps(self) -> None:
+        """Not just the counter: the LR derived from it has to land in the
+        buffer the optimizer reads. A counter that advances while the LR stays
+        put is the same bug one step further along."""
+        mod, opt, _warmup = self._build()
+        runner = self._compile(mod, opt)
+        seeded = float(getattr(mod, LR_DENSE_BUFFER))
+        self.assertAlmostEqual(seeded / self._expected_lr(0), 1.0, places=6)
+        for expected_iter in (1, 2, 3):
+            runner(mod, opt, torch.arange(4.0))
+            got = float(getattr(mod, LR_DENSE_BUFFER))
+            self.assertAlmostEqual(
+                got / self._expected_lr(expected_iter),
+                1.0,
+                places=6,
+                msg=f"LR wrong at iter {expected_iter}: {got:.9g}",
+            )
+        self.assertGreater(float(getattr(mod, LR_DENSE_BUFFER)), seeded)
+
+    def test_captured_tensors_do_not_reach_the_graph(self) -> None:
+        """NEGATIVE CONTROL -- tensors recir cannot match must not be rewired.
+
+        The mechanism keys off identity against the module's real params and
+        buffers. Hand the controller unrelated 0-d tensors and the counter
+        placeholder must feed NOTHING: the graph carries a read-only input it
+        echoes straight back out, which is exactly the shape the bug had.
+
+        Note this control fails if you assert on the counter's VALUE instead.
+        On the CPU FX backend a controller writing an unlifted tensor can still
+        appear to work, because make_fx interns real tensors as graph constants
+        and eager execution mutates them. It is XLA that turns the constant into
+        a genuine constant and freezes the schedule. Asserting on the value
+        would report the bug as fixed on CPU while 128 chips trained frozen.
+        """
+        mod, opt, _warmup = self._build(detached_tensors=True)
+        gm = self._trace_only(mod, opt, holders=())
+        self.assertFalse(
+            self._counter_is_graph_state(gm),
+            "the counter placeholder has a consumer even though the controller "
+            "holds tensors that are not the module's buffers, so this control "
+            "no longer distinguishes graph state from a baked constant",
+        )
+
+    def test_declaring_a_controller_recir_cannot_match_raises(self) -> None:
+        mod, opt, _warmup = self._build(detached_tensors=True)
+        with self.assertRaisesRegex(AssertionError, "nothing was rewired"):
+            self._trace_only(mod, opt)
+
+    def test_the_counter_placeholder_is_consumed_when_wired_normally(self) -> None:
+        """The positive half of the control above, on the same measure.
+
+        Together they are the whole fix in one property: a captured tensor that
+        IS a module buffer gets rewired to the proxy and shows up as a real
+        consumer of the placeholder; one that is not, does not.
+        """
+        mod, opt, _warmup = self._build()
+        gm = self._trace_only(mod, opt)
+        self.assertTrue(
+            self._counter_is_graph_state(gm),
+            "nothing in the graph consumes the counter placeholder, so the "
+            "schedule is not graph state and will freeze once lowered",
+        )
+
+    def test_tracing_does_not_advance_the_schedule(self) -> None:
+        """Compiling is not training.
+
+        The rewiring is what makes this true: the trace writes proxies, so the
+        real counter is untouched. Before it, make_fx's constant-propagation
+        path ran ``add_`` on the real 0-d tensor for real (``add_`` / ``copy_``
+        / ``_to_copy`` are all on torch's ``should_allow_numbers_as_tensors``
+        list), leaving the schedule at iteration 1. That is why the frozen LR
+        measured 240 ppm above ``base_lr * 0.1`` and was misread as a correct
+        iter-0 seed.
+
+        Armed with a RegionTransform so recir's eager discovery pass runs too
+        (it is skipped when the transform list is empty). That pass invokes the
+        real step against the real module, and reaches neither ``opt.step()``
+        nor ``warmup.step()`` only because its ``torch.no_grad()`` makes
+        ``loss.backward()`` throw first -- worth covering, since nothing states
+        that ordering as a guarantee.
+        """
+        mod, opt, warmup = self._build()
+        self.assertEqual(warmup.iter, 0)
+        self._compile(mod, opt, region_transforms=[RegionTransform()])
+        self.assertEqual(
+            warmup.iter, 0, "compilation leaked an iteration into the schedule"
+        )
+        self.assertAlmostEqual(
+            float(getattr(mod, LR_DENSE_BUFFER)) / self._expected_lr(0),
+            1.0,
+            places=6,
+            msg="the LR buffer was left at a contaminated iteration",
+        )
