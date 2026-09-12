@@ -368,7 +368,7 @@ def _compiled_step(
         f"has_hstu_posw={any('_pos_weights' in n for n in dense_named)}"
     )
     sparse_runtime = embedding_setup.sparse_runtime
-    dense_opt, warmup = setup_dense_optimizer_and_warmup(
+    dense_opt, _ = setup_dense_optimizer_and_warmup(
         model,
         dense_params,
         build_optimizer_config().dense.default,
@@ -452,7 +452,6 @@ def _compiled_step(
         loss_value = float(losses.detach().to(torch.float64).sum())
         loss_values.append(loss_value)
         logger.info("[PARITY][COMPILED][step=%d] loss=%.6f", step + 1, loss_value)
-        warmup.step()
         if isinstance(named, dict):
             for k in (
                 "loss",

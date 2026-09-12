@@ -141,6 +141,22 @@ def _llw_series(
     return series
 
 
+def _lr_series(model: Any) -> Dict[str, torch.Tensor]:
+    """The live learning rates as TB scalars."""
+    series: Dict[str, torch.Tensor] = {}
+    warmup = getattr(model, "_warmup", None)
+    if warmup is None:
+        return series
+    for attr, key in (
+        ("_dense_lr_buffer", "lr/dense"),
+        ("_sparse_lr_buffer", "lr/sparse"),
+    ):
+        buf = getattr(warmup, attr, None)
+        if isinstance(buf, torch.Tensor) and buf.numel() > 0:
+            series[key] = buf.detach().float().reshape(-1)[0]
+    return series
+
+
 def _hstu_series(named: Dict[str, Any]) -> Dict[str, torch.Tensor]:
     """MoT mt_aux (ue.ie) total loss as a TB scalar. Value stays a 0-dim tensor so
     WindowLoss syncs it to a Python scalar only at report cadence (Citrine C6)."""
@@ -284,6 +300,7 @@ class RecirXLATrainPipeline(RankingTrainPipeline):
         )
         _series.update(_llw_series(named, self._loss_task_names))
         _series.update(_hstu_series(named))
+        _series.update(_lr_series(self._model))
         self._loss_metric.update(values=_series)
         return losses, ret
 
@@ -524,6 +541,7 @@ class EagerCPUTrainPipeline(RankingTrainPipeline):
         )
         _series.update(_llw_series(named, self._loss_task_names))
         _series.update(_hstu_series(named))
+        _series.update(_lr_series(self._model))
         self._loss_metric.update(values=_series)
         return all_losses, ret
 
