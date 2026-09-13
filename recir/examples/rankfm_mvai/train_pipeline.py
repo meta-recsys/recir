@@ -33,7 +33,7 @@ from hammer.v3.models.udd_fm_v3.parity.step_probe import StepProbe
 from minimal_viable_ai.core.trainer.train_pipeline import RecTrainPipelineProvider
 
 from .eager_step import EagerCPUStep
-from .loss_metric import WindowLoss
+from .snapshot_metrics import SnapshotMetrics
 from .xsurface_helpers import _log_hbm_memory
 
 # minimal_viable_ai is provided at RUNTIME via the Docker image (Dockerfile
@@ -57,114 +57,54 @@ else:
 logger: logging.Logger = logging.getLogger(__name__)
 
 
-def _build_loss_metric(*metric_lists: Any) -> WindowLoss:
-    """Build a WindowLoss whose rank + report cadence match the sibling metrics
-    (so the loss scalar is written at the same interval as NE/CTR/MSE)."""
+def _sibling_env(*metric_lists: Any) -> Tuple[int, int, int]:
+    """Rank, report cadence and global batch size, read off the sibling metrics."""
     rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
-    # First sibling metric (across lists, in order) with a report interval; the
+    # First sibling (across lists, in order) that carries each attribute; the
     # `is not None` check keeps interval==1 a valid hit so selection is
     # deterministic regardless of which list is scanned first.
     report_interval = 1
+    global_batch_size = 0
     for lst in metric_lists:
         for m in lst or []:
             ri = getattr(m, "_report_interval", None)
-            if ri is not None:
+            if ri is not None and report_interval == 1:
                 report_interval = int(ri)
-                break
-        else:
-            continue
-        break
-    return WindowLoss(rank=rank, report_interval=report_interval)
+            gbs = getattr(m, "_global_batch_size", None)
+            if gbs is not None and not global_batch_size:
+                global_batch_size = int(gbs)
+    if not global_batch_size:
+        raise ValueError(
+            "no sibling metric exposes _global_batch_size; the snapshot "
+            "channel would report every scalar at cumulative-examples 0"
+        )
+    return rank, report_interval, global_batch_size
 
 
-def _cls_task_names(cls_metrics: Optional[List[Any]]) -> List[str]:
-    """Task names for the classification (NE) metrics, in cls_task_indices order
-    (each NE metric exposes its per-task names as `_tasks`)."""
-    names: List[str] = []
-    for m in cls_metrics or []:
-        names.extend(getattr(m, "_tasks", None) or [])
-    return names
+def _build_snapshot_metrics(
+    all_task_names: List[str], *metric_lists: Any
+) -> SnapshotMetrics:
+    """Build the MAST-equivalent per-task snapshot channel."""
+    rank, report_interval, global_batch_size = _sibling_env(*metric_lists)
+    return SnapshotMetrics(
+        rank=rank,
+        report_interval=report_interval,
+        global_batch_size=global_batch_size,
+        all_task_names=all_task_names,
+    )
 
 
-def _loss_series(
-    losses: torch.Tensor, task_names: List[str], cls_indices: Any
-) -> Dict[str, torch.Tensor]:
-    """Build the {series_key: scalar-tensor} dict for WindowLoss: the aggregate
-    loss plus one entry per NE task. `losses` is the model's per-task loss vector
-    (same task order as `prediction`), so index_select(cls_indices) aligns with
-    the NE tasks. Values stay 0-dim tensors -- WindowLoss accumulates them on
-    device and only syncs to Python scalars at report cadence (Citrine C6: no
-    per-step .item()/.tolist() device-to-host sync in the training loop)."""
-    series: Dict[str, torch.Tensor] = {"loss": losses.detach().sum()}
-    if task_names and cls_indices is not None:
-        try:
-            per_task = losses.detach().index_select(0, cls_indices)
-            if per_task.numel() == len(task_names):
-                for i, name in enumerate(task_names):
-                    series[f"loss/{name}"] = per_task[i]
-        except Exception as e:  # never break training for a metric
-            logger.warning("[loss-metric] per-task loss skipped: %r", e)
-    return series
-
-
-def _llw_series(
-    named: Dict[str, Any], task_names: List[str]
-) -> Dict[str, torch.Tensor]:
-    """LLW `s` (loss_scale) + derived weights as TB scalars, one series per task
-    (plus s_mean/min/max aggregates over all tasks). Per-task series are keyed by
-    task name when the per-task count matches `task_names` (mirrors `_loss_series`,
-    so the LLW curves cross-reference the loss curves and survive task reordering)
-    and fall back to positional index otherwise. Values stay 0-dim tensors so
-    WindowLoss accumulates them on device and only syncs to Python scalars at
-    report cadence (Citrine C6: no per-step .item()/.tolist() device-to-host sync
-    in the training loop)."""
-    series: Dict[str, torch.Tensor] = {}
-
-    def _label(i: int, n: int) -> str:
-        return task_names[i] if len(task_names) == n else str(i)
-
-    s = named.get("loss_scale")
-    if isinstance(s, torch.Tensor) and s.numel() > 0:
-        sf = s.detach().float().reshape(-1)
-        series["llw/s_mean"] = sf.mean()
-        series["llw/s_min"] = sf.min()
-        series["llw/s_max"] = sf.max()
-        n = sf.numel()
-        for i in range(n):
-            series[f"llw/s_{_label(i, n)}"] = sf[i]
-    w = named.get("llw_weights")
-    if isinstance(w, torch.Tensor) and w.numel() > 0:
-        wf = w.detach().float().reshape(-1)
-        n = wf.numel()
-        for i in range(n):
-            series[f"llw/w_{_label(i, n)}"] = wf[i]
-    return series
-
-
-def _lr_series(model: Any) -> Dict[str, torch.Tensor]:
-    """The live learning rates as TB scalars."""
-    series: Dict[str, torch.Tensor] = {}
-    warmup = getattr(model, "_warmup", None)
-    if warmup is None:
-        return series
-    for attr, key in (
-        ("_dense_lr_buffer", "lr/dense"),
-        ("_sparse_lr_buffer", "lr/sparse"),
-    ):
-        buf = getattr(warmup, attr, None)
-        if isinstance(buf, torch.Tensor) and buf.numel() > 0:
-            series[key] = buf.detach().float().reshape(-1)[0]
-    return series
-
-
-def _hstu_series(named: Dict[str, Any]) -> Dict[str, torch.Tensor]:
-    """MoT mt_aux (ue.ie) total loss as a TB scalar. Value stays a 0-dim tensor so
-    WindowLoss syncs it to a Python scalar only at report cadence (Citrine C6)."""
-    series: Dict[str, torch.Tensor] = {}
-    m = named.get("mt_loss_total")
-    if isinstance(m, torch.Tensor) and m.numel() > 0:
-        series["mt_loss/total"] = m.detach().float().reshape(-1)[0]
-    return series
+def _assert_task_rows(prediction: torch.Tensor, all_task_names: List[str]) -> None:
+    """Fail fast when the model's row count disagrees with the task partition."""
+    if not all_task_names:
+        return
+    n_rows = prediction.size(0)
+    if n_rows != len(all_task_names):
+        raise ValueError(
+            f"model emitted {n_rows} task rows but the partition names "
+            f"{len(all_task_names)} tasks; per-task metrics would be misaligned. "
+            "Check module_config.num_main_tasks and mt_tasks_configs."
+        )
 
 
 class RecirXLATrainPipeline(RankingTrainPipeline):
@@ -191,6 +131,7 @@ class RecirXLATrainPipeline(RankingTrainPipeline):
         step_metrics: Optional[List[Any]] = None,
         cls_task_indices: Optional[List[int]] = None,
         reg_task_indices: Optional[List[int]] = None,
+        all_task_names: Optional[List[str]] = None,
         host_sync_every: int = 1,
         jax_profiling: bool = False,
         profile_start_step: int = -1,
@@ -217,10 +158,14 @@ class RecirXLATrainPipeline(RankingTrainPipeline):
         self._profile_end_step = profile_end_step
         self._profile_dir = profile_dir
         self._enable_memory_log = enable_memory_log
-        self._loss_metric: WindowLoss = _build_loss_metric(
-            step_metrics, cls_metrics, reg_metrics
+        self._all_task_names: List[str] = list(all_task_names or [])
+        self._snapshot_metrics: SnapshotMetrics = _build_snapshot_metrics(
+            self._all_task_names, step_metrics, cls_metrics, reg_metrics
         )
-        self._loss_task_names: List[str] = _cls_task_names(cls_metrics)
+        # Appended to the base's step-metric list rather than returned from
+        # `metrics`: only step metrics are handed the unsliced per-task tensors
+        # by `_update_ranking_metrics`, and that list also feeds `super().metrics`.
+        self._step_metrics.extend(self._snapshot_metrics.step_metrics)
         self._step = 0
         self._host_sync_every: int = max(1, host_sync_every)
         self._profiling_active = False
@@ -292,21 +237,14 @@ class RecirXLATrainPipeline(RankingTrainPipeline):
             # Computed from the raw batch so the model needn't emit it.
             "num_real_candidates": int(batch.num_candidates.sum()),
         }
+        _assert_task_rows(ret["prediction"], self._all_task_names)
         self._update_ranking_metrics(ret)
-        # Log the training loss to TB (aggregate + per NE task + LLW s/weights + MT
-        # mt_loss); the base pipeline only reports prediction-derived NE/CTR/MSE.
-        _series: Dict[str, Any] = _loss_series(
-            losses, self._loss_task_names, self._cls_indices
-        )
-        _series.update(_llw_series(named, self._loss_task_names))
-        _series.update(_hstu_series(named))
-        _series.update(_lr_series(self._model))
-        self._loss_metric.update(values=_series)
+        self._snapshot_metrics.update(losses, named, self._model)
         return losses, ret
 
     @property
     def metrics(self) -> List[Any]:
-        return list(super().metrics) + [self._loss_metric]
+        return list(super().metrics) + self._snapshot_metrics.metrics
 
     def on_train_end(self) -> None:
         # Stop any still-active trace (e.g. training ended before profile_end_step).
@@ -338,6 +276,7 @@ class RecirXLATrainPipelineProvider(
         reg_metric_defs: Optional[List[RankingMetricDef]] = None,
         cls_task_indices: Optional[List[int]] = None,
         reg_task_indices: Optional[List[int]] = None,
+        all_task_names: Optional[List[str]] = None,
         is_variable_step: bool = True,
         report_interval: int = 1,
         jax_profiling: bool = False,
@@ -348,6 +287,7 @@ class RecirXLATrainPipelineProvider(
     ) -> None:
         self._cls_task_indices = cls_task_indices
         self._reg_task_indices = reg_task_indices
+        self._all_task_names = all_task_names
         self._host_sync_every = report_interval
         self._jax_profiling = jax_profiling
         self._profile_start_step = profile_start_step
@@ -393,6 +333,7 @@ class RecirXLATrainPipelineProvider(
             step_metrics=base_pipeline._step_metrics,
             cls_task_indices=self._cls_task_indices,
             reg_task_indices=self._reg_task_indices,
+            all_task_names=self._all_task_names,
             host_sync_every=self._host_sync_every,
             jax_profiling=self._jax_profiling,
             profile_start_step=self._profile_start_step,
@@ -431,6 +372,7 @@ class EagerCPUTrainPipeline(RankingTrainPipeline):
         step_metrics: Optional[List[Any]] = None,
         cls_task_indices: Optional[List[int]] = None,
         reg_task_indices: Optional[List[int]] = None,
+        all_task_names: Optional[List[str]] = None,
         light_loss_norm: bool = False,
         grad_accum_steps: int = 1,
     ) -> None:
@@ -461,10 +403,11 @@ class EagerCPUTrainPipeline(RankingTrainPipeline):
         self._raw_model: nn.Module = self._step.raw_model
         # Inert unless PARITY_EMIT_DIGEST is set, and latched after one step.
         self._probe: StepProbe = StepProbe(self._raw_model)
-        self._loss_metric: WindowLoss = _build_loss_metric(
-            step_metrics, cls_metrics, reg_metrics
+        self._all_task_names: List[str] = list(all_task_names or [])
+        self._snapshot_metrics: SnapshotMetrics = _build_snapshot_metrics(
+            self._all_task_names, step_metrics, cls_metrics, reg_metrics
         )
-        self._loss_task_names: List[str] = _cls_task_names(cls_metrics)
+        self._step_metrics.extend(self._snapshot_metrics.step_metrics)
         self._raw_model.train(True)
 
     def progress(
@@ -525,6 +468,7 @@ class EagerCPUTrainPipeline(RankingTrainPipeline):
                 "weight": named["weight"].detach(),
                 "num_real_candidates": n_i,
             }
+            _assert_task_rows(ret["prediction"], self._all_task_names)
             self._update_ranking_metrics(ret)
 
         all_losses, named = self._step.run_step(
@@ -534,20 +478,12 @@ class EagerCPUTrainPipeline(RankingTrainPipeline):
             after_backward=_after_backward,
         )
         self._probe.finish()
-        # Log the training loss to TB (aggregate + per NE task + LLW s/weights + MT
-        # mt_loss); parity with RecirXLATrainPipeline. all_losses is the per-task vector.
-        _series: Dict[str, Any] = _loss_series(
-            all_losses, self._loss_task_names, self._cls_indices
-        )
-        _series.update(_llw_series(named, self._loss_task_names))
-        _series.update(_hstu_series(named))
-        _series.update(_lr_series(self._model))
-        self._loss_metric.update(values=_series)
+        self._snapshot_metrics.update(all_losses, named, self._model)
         return all_losses, ret
 
     @property
     def metrics(self) -> List[Any]:
-        return list(super().metrics) + [self._loss_metric]
+        return list(super().metrics) + self._snapshot_metrics.metrics
 
     def on_train_end(self) -> None:
         logger.info("EagerCPUTrainPipeline: training complete.")
@@ -569,6 +505,7 @@ class EagerCPUTrainPipelineProvider(
         reg_metric_defs: Optional[List[RankingMetricDef]] = None,
         cls_task_indices: Optional[List[int]] = None,
         reg_task_indices: Optional[List[int]] = None,
+        all_task_names: Optional[List[str]] = None,
         is_variable_step: bool = True,
         report_interval: int = 1,
         light_loss_norm: bool = False,
@@ -576,6 +513,7 @@ class EagerCPUTrainPipelineProvider(
     ) -> None:
         self._cls_task_indices = cls_task_indices
         self._reg_task_indices = reg_task_indices
+        self._all_task_names = all_task_names
         self._light_loss_norm = light_loss_norm
         self._grad_accum_steps = grad_accum_steps
         # Annotated Any: RankingTrainPipelineProvider is a runtime-only import
@@ -611,6 +549,7 @@ class EagerCPUTrainPipelineProvider(
             step_metrics=base_pipeline._step_metrics,
             cls_task_indices=self._cls_task_indices,
             reg_task_indices=self._reg_task_indices,
+            all_task_names=self._all_task_names,
             light_loss_norm=self._light_loss_norm,
             grad_accum_steps=self._grad_accum_steps,
         )
