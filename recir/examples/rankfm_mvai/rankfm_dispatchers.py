@@ -5,6 +5,7 @@
 """RankFM xsurface tracing stubs and eager dispatchers."""
 
 import contextlib
+import logging
 from typing import Any, Dict, Generator, List, Optional, Tuple
 
 import torch
@@ -22,6 +23,7 @@ from recir.eager_dispatch import (
     mark_output_with_bwd,
 )
 from recir.region_transforms.padding import (
+    _per_chip_real_counts,
     pad_candidate_axis_to_static,
     pad_jagged_pair_to_static,
     runtime_num_local,
@@ -29,6 +31,7 @@ from recir.region_transforms.padding import (
 )
 from torchrec import JaggedTensor, KeyedJaggedTensor
 
+logger: logging.Logger = logging.getLogger(__name__)
 
 XSURFACE_PREPROCESSOR_MARKER_PREFIX = "recir.examples.rankfm.preprocessor"
 
@@ -88,12 +91,49 @@ def _fit_to_shape(
     return out
 
 
+def _assert_within_budget(
+    current_lengths: torch.Tensor,
+    keys: List[str],
+    per_key_budgets: List[int],
+    num_processes: int,
+    kjt_name: str,
+    count: Optional[torch.Tensor] = None,
+) -> None:
+    num_keys = len(keys)
+    b_stride = int(current_lengths.shape[0] // num_keys)
+    num_local = runtime_num_local()
+    rc = _per_chip_real_counts(b_stride, num_local, count)
+    key_lengths = current_lengths.view(num_keys, b_stride)
+    violations: List[str] = []
+    for k, (key, budget_global) in enumerate(zip(keys, per_key_budgets)):
+        budget = int(budget_global) // num_processes // num_local
+        row_off = 0
+        for chip in range(num_local):
+            real = int(key_lengths[k][row_off : row_off + rc[chip]].sum().item())
+            row_off += rc[chip]
+            if real > budget:
+                violations.append(
+                    f"  {kjt_name}/{key} chip {chip}: {real} real tokens vs "
+                    f"{budget} budgeted ({real / max(budget, 1):.1f}x)"
+                )
+    if violations:
+        raise ValueError(
+            "[static-shape] token budget exceeded; the padder would drop the "
+            "excess by zeroing trailing samples of the chip block, not by "
+            "trimming evenly:\n"
+            + "\n".join(violations)
+            + "\nTurn on --budgeted_seq_len_sampling so the sampler holds the "
+            "per-chip total under the budget."
+        )
+
+
 def _pad_kjt_to_cached(
     current_values: torch.Tensor,
     current_lengths: torch.Tensor,
-    num_keys: int,
+    keys: List[str],
     cached_lengths_buf: torch.Tensor,
     num_processes: int,
+    kjt_name: str,
     count: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Pad an output KJT to the per-host cached shape.
@@ -107,6 +147,7 @@ def _pad_kjt_to_cached(
     each output KJT's granularity.
     """
 
+    num_keys = len(keys)
     global_stride = int(cached_lengths_buf.shape[0] // num_keys)  # global batch_size
     cached_per_key_global = (
         cached_lengths_buf.view(num_keys, global_stride).sum(dim=1).tolist()
@@ -116,6 +157,9 @@ def _pad_kjt_to_cached(
     b_stride = int(current_lengths.shape[0] // num_keys)
     eff_count = (
         count if (count is not None and int(count.sum().item()) == b_stride) else None
+    )
+    _assert_within_budget(
+        current_lengths, keys, per_key_budgets, num_processes, kjt_name, eff_count
     )
     return pad_jagged_pair_to_static(
         current_values,
@@ -471,10 +515,11 @@ class PreprocessorDispatcher:
                     fitted_v, fitted_l = _pad_kjt_to_cached(
                         val.values(),
                         val.lengths(),
-                        num_keys,
+                        dummy._kjt_keys[kjt_i],
                         cached_l,
                         num_processes_fit,
                         count=real_num_candidates,
+                        kjt_name=desc.name,
                     )
                     if (
                         desc.name == "merged"
@@ -535,10 +580,11 @@ class PreprocessorDispatcher:
                 fitted_v, fitted_l = _pad_kjt_to_cached(
                     v_val,
                     l_val,
-                    1,
+                    [v_desc.name],
                     cached_l,
                     num_processes_fit,
                     count=real_num_candidates,
+                    kjt_name="addemb",
                 )
                 addemb_fitted[v_desc.name] = fitted_v.to(cached_v.dtype)
                 addemb_fitted[l_desc.name] = fitted_l.to(cached_l.dtype)
