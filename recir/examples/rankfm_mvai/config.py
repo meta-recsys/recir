@@ -36,11 +36,13 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import logging
+import math
 import os
 from dataclasses import dataclass
 from typing import Any, Dict, Tuple
 
 from hammer.v2.modules.configs import STUStackConfig
+from hammer.v2.modules.uih_sampling_modules import SequenceLengthSamplingStrategy
 from hammer.v3.models.udd_fm_v3.batch_loader import BlueReelsVDDFeatureConfig
 from hammer.v3.models.udd_fm_v3.udd_fm_config import (
     BlueReelsVDDModuleConfig,
@@ -179,6 +181,14 @@ class RankFMTrainerConfig:
     profile_dir: str = "/tmp/tpu_profile"
     enable_memory_log: bool = False
 
+    # Make the sequence-length sampler enforce a derived token budget
+    # rather than letting the padder truncate whatever overshoots. A trainer
+    # knob, not a model one: the sampler is swapped on the built modules at
+    # setup, and only the static-shape path has a budget to enforce. Off by
+    # default -- it changes which rows keep their history, so it is not
+    # prod-faithful.
+    budgeted_seq_len_sampling: bool = False
+
     # TensorBoard scalar logging. Empty tb_dir disables TB entirely.
     # Local paths write directly; gs:// paths buffer to a local tempdir
     # during training and upload on flush/close (gcsfs has no append).
@@ -288,6 +298,7 @@ def build_module_config(
     model_args: RankFMModelArgs,
     *,
     enable_padding: bool,
+    budgeted_seq_len_sampling: bool = False,
 ) -> Tuple[BlueReelsVDDModuleConfig, BlueReelsVDDFeatureConfig]:
     """CLI args -> fully configured (module_config, feature_config)."""
     # Declared up front so both branches narrow to the same types; without this
@@ -341,7 +352,7 @@ def build_module_config(
 
     # Static-shape mode (TPU/GSPMD path).
     if enable_padding:
-        _apply_static_shape_mode(module_config, model_args)
+        _apply_static_shape_mode(module_config, model_args, budgeted_seq_len_sampling)
 
     return module_config, feature_config
 
@@ -402,16 +413,32 @@ def _apply_bench_shape_overrides(
 def _apply_static_shape_mode(
     module_config: BlueReelsVDDModuleConfig,
     model_args: RankFMModelArgs,
+    budgeted_seq_len_sampling: bool = False,
 ) -> None:
     """Pin the padding budgets the TPU/GSPMD path needs.
 
-    In prod-faithful mode the budgets follow the config's own sequence shapes;
-    otherwise they come from the CLI.
+    Two paths for the RO budget. By default it stays ``hstu_max_seq_len``:
+    nothing bounds the per-chip token total, so the padding has to cover the
+    UNSAMPLED worst case -- every row at the longest history the config
+    admits, even though the sequence-length sampler truncates most rows far
+    below it.
+
+    With ``budgeted_seq_len_sampling`` the sampler enforces a total, so the
+    budget can be what the sampler actually emits (see
+    ``_sampler_derived_ro_budget``) rather than what it might. The gap is pure
+    padding: the budget sizes a packed tensor and is a per-chip total, not a
+    per-row cap.
+
+    Outside prod-faithful mode both budgets come from the CLI.
     """
     module_config.static_shape_mode = True
     if model_args.prod_faithful:
         nro_budget = module_config.hstu_max_output_len
-        ro_budget = module_config.hstu_max_seq_len
+        ro_budget = (
+            _sampler_derived_ro_budget(module_config)
+            if budgeted_seq_len_sampling
+            else module_config.hstu_max_seq_len
+        )
     else:
         nro_budget = model_args.num_candidates
         ro_budget = model_args.seq_ro_per_sample_budget
@@ -419,6 +446,49 @@ def _apply_static_shape_mode(
     module_config.static_ro_per_sample_budgets = _build_static_ro_budgets(
         module_config, ro_budget
     )
+
+
+def _sampler_derived_ro_budget(module_config: BlueReelsVDDModuleConfig) -> int:
+    configs = module_config.hstu_seq_len_sampling_configs
+    if configs is None:
+        raise ValueError(
+            "budgeted_seq_len_sampling needs a sequence-length sampler to "
+            "derive the budget from, but this config ships none (is "
+            "--disable_seq_len_sampling set?)."
+        )
+    _distribution_type, strategy = configs
+    if not isinstance(strategy, SequenceLengthSamplingStrategy):
+        raise TypeError(
+            f"the budget is derived from alpha/beta, which only "
+            f"SequenceLengthSamplingStrategy carries; this config ships "
+            f"{type(strategy).__name__}."
+        )
+    alpha = float(strategy.alpha)
+    beta = float(strategy.beta)
+    max_seq_len = float(module_config.hstu_max_seq_len)
+
+    sampled_len = beta * max_seq_len ** (alpha / 2.0)
+    # alpha >= 2 makes the keep-whole probability >= 1: nothing is ever
+    # sampled and the budget is just the full length.
+    keep_whole_prob = min(1.0, max_seq_len ** (alpha - 2.0))
+    budget = int(
+        math.ceil(keep_whole_prob * max_seq_len + (1.0 - keep_whole_prob) * sampled_len)
+    )
+    logger.info(
+        "[config] RO budget %d derived from the sampler at L=N: alpha=%.3g, "
+        "beta=%.3g, N=%d -> P(keep whole)=%.3g, sampled length=%.0f. "
+        "hstu_max_seq_len stays %d -- the budget sizes the packed sequence "
+        "tensor as a per-chip total, so rows longer than it are fine and only "
+        "an over-budget chip total is not.",
+        budget,
+        alpha,
+        beta,
+        int(max_seq_len),
+        keep_whole_prob,
+        sampled_len,
+        module_config.hstu_max_seq_len,
+    )
+    return budget
 
 
 def _trim_stu_stack(stack: STUStackConfig, num_layers: int) -> None:
@@ -567,6 +637,7 @@ def build_model_family_config(
     module_config, feature_config = build_module_config(
         model_args,
         enable_padding=trainer_cfg.enable_padding,
+        budgeted_seq_len_sampling=trainer_cfg.budgeted_seq_len_sampling,
     )
 
     base_config.module_config = module_config

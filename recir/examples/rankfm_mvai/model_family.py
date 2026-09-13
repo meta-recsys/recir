@@ -76,6 +76,7 @@ from minimal_viable_ai.core.model_family_api.optimizer_configs import RecOptimiz
 from recir.api import sync_device_state_to_torch
 from recir.backends import XLAGSPMDBackend
 from recir.distributed.parallel_mode import GSPMDParallel
+from recir.examples.rankfm_mvai.budgeted_sampling import install_budgeted_sampling
 from recir.examples.rankfm_mvai.rankfm_batch_utils import (
     create_random_train_batch,
     create_uniform_train_batch,
@@ -278,6 +279,12 @@ class RecirXLACompiledModule(RecirCompiledModuleBase):
             if trainer_cfg.enable_padding
             else global_bs
         )
+
+        if trainer_cfg.budgeted_seq_len_sampling:
+            # Before the override build, which runs the preprocessor with
+            # sampling disabled: the swap has to be on the live modules by the
+            # time fwd_fn calls them.
+            install_budgeted_sampling(model, module_config)
 
         # Expanded (global / padded) override-build sample from the trace batch.
         # get_override only inspects structure (keys + budget-set lengths), so

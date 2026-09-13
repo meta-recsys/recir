@@ -440,7 +440,15 @@ class TraceableMoTPreprocessor(nn.Module):
         """Reconstruct FeatureBundle, run real preprocessor, decompose output."""
         bundle = self._reconstruct_input_bundle(input_tensors)
         out_bundle = self._real(bundle)
-        return self._decompose_output(out_bundle, input_tensors[0])
+        # Strides come from the INPUT bundle: the preprocessor may drop the raw
+        # id lists from its output (keep_raw_id_lists=False), and the batch size
+        # is the same either side.
+        return self._decompose_output(
+            out_bundle,
+            input_tensors[0],
+            bundle.require_kjt(InputFeatures.UIH_ID_LIST).stride(),
+            bundle.require_kjt(InputFeatures.CANDIDATE_ID_LIST).stride(),
+        )
 
     @staticmethod
     def _tensor_shape_matches(
@@ -557,7 +565,11 @@ class TraceableMoTPreprocessor(nn.Module):
         raise RuntimeError(f"Unknown output kind: {kind}")
 
     def _decompose_output(
-        self, bundle: FeatureBundle, ref_tensor: torch.Tensor
+        self,
+        bundle: FeatureBundle,
+        ref_tensor: torch.Tensor,
+        ro_batch: int,
+        nro_batch: int,
     ) -> List[torch.Tensor]:
         """Extract outputs from the FeatureBundle into a flat tensor list,
         in the order described by self._output_spec.
@@ -577,9 +589,9 @@ class TraceableMoTPreprocessor(nn.Module):
         # The traced graph carries ONE symbol per jagged group, so members that
         # diverge at runtime would contradict shapes Inductor already baked in.
         # Check the descriptor policy here; this runs inside the opaque op and
-        # therefore adds no nodes to the traced graph.
-        ro_batch = bundle.require_kjt(InputFeatures.UIH_ID_LIST).stride()
-        nro_batch = bundle.require_kjt(InputFeatures.CANDIDATE_ID_LIST).stride()
+        # therefore adds no nodes to the traced graph. ``ro_batch`` / ``nro_batch``
+        # are supplied by the caller from the INPUT bundle -- the output bundle
+        # no longer carries the raw id lists once keep_raw_id_lists is off.
         jagged_group_seen: Dict[Any, Tuple[Any, int]] = {}
         for spec in self._output_spec:
             val = bundle.get(spec[1])
