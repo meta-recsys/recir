@@ -53,15 +53,11 @@ from minimal_viable_ai.core.trainer.trainer import RecTrainer
 
 from .config import build_model_family_config, build_trainer_config, parse_cli
 from .model_family import RankFMMvaiModelFamily
+from .task_partition import build_cls_reg_partition
 
 # Shared bootstrap (gr::batched_complete_cumsum, runs on import) + dist/metric
 # helpers, kept identical with the CPU-eager entry (train_cpu_eager.py).
-from .train_common import (
-    build_cls_reg_partition,
-    force_cpu_barrier,
-    resolve_dist_env,
-    setup_logging,
-)
+from .train_common import force_cpu_barrier, resolve_dist_env, setup_logging
 from .train_pipeline import RecirXLATrainPipelineProvider
 from .xsurface_helpers import _is_jax_profiling_enabled
 
@@ -156,9 +152,7 @@ def main() -> None:
     module_config: BlueReelsVDDModuleConfig = cast(
         BlueReelsVDDModuleConfig, model_config.module_config
     )
-    cls_task_names, cls_task_indices, reg_task_names, reg_task_indices = (
-        build_cls_reg_partition(module_config)
-    )
+    partition = build_cls_reg_partition(module_config)
     report_interval = trainer_config.metrics_config.report_interval
     batch_size = trainer_config.data_source_config.batch_size
 
@@ -177,14 +171,14 @@ def main() -> None:
                 # pyrefly: ignore [bad-instantiation]
                 RankingMetricDef(
                     metric_cls=FixedStepNE,
-                    tasks=cls_task_names,
+                    tasks=partition.cls_task_names,
                     batch_size=batch_size,
                     report_interval=report_interval,
                 ),
                 # pyrefly: ignore [bad-instantiation]
                 RankingMetricDef(
                     metric_cls=FixedStepCTR,
-                    tasks=cls_task_names,
+                    tasks=partition.cls_task_names,
                     batch_size=batch_size,
                     report_interval=report_interval,
                 ),
@@ -193,13 +187,14 @@ def main() -> None:
                 # pyrefly: ignore [bad-instantiation]
                 RankingMetricDef(
                     metric_cls=FixedStepMSE,
-                    tasks=reg_task_names,
+                    tasks=partition.reg_task_names,
                     batch_size=batch_size,
                     report_interval=report_interval,
                 ),
             ],
-            cls_task_indices=cls_task_indices,
-            reg_task_indices=reg_task_indices,
+            cls_task_indices=partition.cls_task_indices,
+            reg_task_indices=partition.reg_task_indices,
+            all_task_names=partition.all_task_names,
             is_variable_step=True,
             report_interval=report_interval,
             jax_profiling=jax_profiling,

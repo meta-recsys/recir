@@ -11,8 +11,10 @@ Both ``train.py`` (recir XLA-GSPMD TPU run) and ``train_cpu_eager.py`` (the
 matched-config CPU-eager reference) import from here so they agree EXACTLY on:
   * the gr::batched_complete_cumsum bootstrap (module-level, runs on import),
   * dist-env resolution (RANK/WORLD_SIZE/MASTER_*) for the gloo PG,
-  * the CPU barrier shim for the metric all-gather, and
-  * the cls/reg task partition for metric reporting.
+  * the CPU barrier shim for the metric all-gather.
+
+The cls/reg task partition lives in ``task_partition.py`` -- a leaf module, so it
+stays importable (and unit-testable) without this module's gr-op bootstrap.
 
 Keeping these in one place guarantees the CPU baseline and the TPU run differ
 only where they must (compile vs eager, jax.distributed.initialize), not in
@@ -30,7 +32,6 @@ import fbgemm_gpu  # noqa: F401 -- force C++ op registration before fallback
 import recir.lowering.fbgemm_fallback  # noqa: F401 -- registers SPMD_DECOMP_TABLE entries
 import torch
 import torch.distributed as dist
-from hammer.v3.models.udd_fm_v3.udd_fm_config import BlueReelsVDDModuleConfig
 from recir.decompositions import SPMD_DECOMP_TABLE
 from recir.lowering.fbgemm_fallback import _batched_complete_cumsum_impl
 
@@ -53,38 +54,6 @@ except AttributeError:
 SPMD_DECOMP_TABLE[torch.ops.gr.batched_complete_cumsum.default] = (
     _batched_complete_cumsum_impl
 )
-
-
-def build_cls_reg_partition(
-    module_config: BlueReelsVDDModuleConfig,
-) -> Tuple[List[str], List[int], List[str], List[int]]:
-    """Partition the udd_fm_v3 tasks into cls/reg buckets for metric reporting.
-
-    Mirrors mvai_cloud/.../models/udd_fm/train.py:226-242 exactly. rankfm_mvai
-    runs the SAME model (hammer udd_fm_v3 ``BlueReelsVDDTrainV3``) so the same
-    task structure (num_main_tasks / num_main_reg_tasks / has_unpersonalized /
-    num_unpersonalized_tasks) applies. The naive split using only
-    num_main_reg_tasks is wrong when has_unpersonalized=True because the
-    unpersonalized tasks live AFTER the regression block and are trained as
-    classification (sigmoid+BCE); without this account, metric reporting would
-    compute classification NE on regression heads and vice versa.
-    """
-    all_task_names = list(module_config.task_names)
-    n_total = module_config.num_main_tasks
-    n_reg = module_config.num_main_reg_tasks
-    if module_config.has_unpersonalized:
-        n_unpers = module_config.num_unpersonalized_tasks
-        cls_end = n_total - n_reg - n_unpers
-        reg_end = n_total - n_unpers
-        cls_indices = list(range(cls_end)) + list(range(reg_end, n_total))
-        reg_indices = list(range(cls_end, reg_end))
-    else:
-        cls_end = n_total - n_reg
-        cls_indices = list(range(cls_end))
-        reg_indices = list(range(cls_end, n_total))
-    cls_task_names = [all_task_names[i] for i in cls_indices]
-    reg_task_names = [all_task_names[i] for i in reg_indices]
-    return cls_task_names, cls_indices, reg_task_names, reg_indices
 
 
 def setup_logging() -> None:
