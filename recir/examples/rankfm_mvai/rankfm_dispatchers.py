@@ -147,7 +147,7 @@ class DummyPreprocessorStack(nn.Module):
     adds data dependency on inputs so GSPMD can infer sharding.
     """
 
-    def __init__(
+    def __init__(  # noqa: C901 -- one linear capture pass over the sample bundle: inputs, then output tensors / KJTs / exports. The branches are per-value-kind and read as a table; splitting them would scatter one structure-capture across four helpers.
         self,
         real_stack: PreprocessorStack,
         device: torch.device,
@@ -233,6 +233,16 @@ class DummyPreprocessorStack(nn.Module):
             else:
                 self._nontensor_map[desc] = val
 
+        self._export_keys: List[str] = []
+        for e_key, e_val in sorted(cached_output.exports.items()):
+            if not isinstance(e_val, torch.Tensor):
+                continue
+            # Index off the dense key list, not enumerate(): skipping a
+            # non-tensor export would otherwise leave a hole that the dense
+            # lookup in forward reads past.
+            self.register_buffer(f"_export_{len(self._export_keys)}", e_val)
+            self._export_keys.append(e_key)
+
         self._num_tensors: int = tensor_idx
         self._num_kjts: int = kjt_idx
 
@@ -272,6 +282,8 @@ class DummyPreprocessorStack(nn.Module):
             lbuf = getattr(self, f"_kjt_lengths_{i}")
             output_tensors.append(torch.zeros_like(vbuf))
             output_tensors.append(lbuf.clone())
+        for i in range(len(self._export_keys)):
+            output_tensors.append(torch.zeros_like(getattr(self, f"_export_{i}")))
 
         deps: List[torch.Tensor] = anchored_inputs + [self._grad_anchor]
         anchored = [
@@ -295,6 +307,9 @@ class DummyPreprocessorStack(nn.Module):
             out_idx += 2
         for desc, v in self._nontensor_map.items():
             bundle.set(desc, v, validate=False)
+        for key in self._export_keys:
+            bundle.set_export(key, anchored[out_idx])
+            out_idx += 1
         return bundle
 
 
@@ -650,8 +665,31 @@ class PreprocessorDispatcher:
                     )
                 tensor_i += 1
 
-            # FX trace order: all tensors first, then KJT (values, lengths) pairs.
-            flat: List[torch.Tensor] = flat_tensors + flat_kjts
+            # Exports last, matching the order DummyPreprocessorStack.forward
+            # emits them. The dummy carries them so the traced bundle has the
+            # output_segments _post_processing indexes; the runtime side has to
+            # fill the same slots or the graph indexes past the end of the
+            # dispatch result.
+            flat_exports: List[torch.Tensor] = []
+            for e_i, e_key in enumerate(dummy._export_keys):
+                cached_e = getattr(dummy, f"_export_{e_i}")
+                val = output.exports.get(e_key)
+                if isinstance(val, torch.Tensor):
+                    flat_exports.append(
+                        _fit_to_shape(val, _per_host_target(cached_e.shape))
+                    )
+                else:
+                    flat_exports.append(
+                        torch.zeros(
+                            _per_host_target(cached_e.shape),
+                            dtype=cached_e.dtype,
+                            device=cached_e.device,
+                        )
+                    )
+
+            # FX trace order: all tensors first, then KJT (values, lengths)
+            # pairs, then exports.
+            flat: List[torch.Tensor] = flat_tensors + flat_kjts + flat_exports
             # Return raw (grad-preserving) tensors; the install helper wraps
             # this callable with save-for-backward + detach.
             return tuple(flat)
@@ -706,6 +744,21 @@ def capture_sparse_arch_io(
     for handle in handles:
         handle.remove()
 
+    # Gate on what the preprocessor was actually configured to emit. Prod sets
+    # output_segments=["unsampled_inputs"] and _post_processing then hard-indexes
+    # it, so a missing export there has to fail here rather than inside the
+    # trace. A config that never requests the segment (the xsurface tests) has
+    # nothing to check -- and could not produce it anyway, since the capture
+    # above runs under _disable_sampling.
+    # pyre-ignore[16]: dynamic attr from PreprocessorStack setattr
+    needs_unsampled = getattr(
+        recblock.preprocessor_stack.mot_preprocessor, "_needs_unsampled_inputs", []
+    )
+    if any(needs_unsampled):
+        assert "unsampled_inputs" in preproc_output.exports, (
+            "capture_sparse_arch_io produced exports "
+            f"{sorted(preproc_output.exports.keys())} with no 'unsampled_inputs'"
+        )
     assert "kjt" in input_captured, "Sparse arch pre-hook did not fire"
     if capture_output:
         assert "output" in captured, "Sparse arch forward hook did not fire"

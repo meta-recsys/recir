@@ -2108,3 +2108,77 @@ class ProdConfigArtifactTest(TestCase):
             "the artifact references classes mvai_cloud does not provide, so it "
             "will fail to unpickle in the image:\n  " + "\n  ".join(unresolvable),
         )
+
+
+class DummyStackCarriesExportsTest(TestCase):
+    """The trace-time stack swap has to preserve FeatureBundle exports.
+
+    `udd_fm_train_v3._post_processing` hard-indexes `exported_tensors[name]` for
+    every name in `module_config.output_segments`, and prod sets
+    `["unsampled_inputs"]`. On the recir path `install_eager` replaces the real
+    `PreprocessorStack` with `DummyPreprocessorStack` for the trace, and exports
+    ride a separate str-keyed channel on FeatureBundle that
+    the dummy's tensor/KJT/nontensor rebuild does not reach. Dropping them there
+    killed the trace with KeyError('unsampled_inputs') before a single step ran.
+
+    Reproduces that locally instead of on 128 chips.
+    """
+
+    def test_dummy_stack_keeps_the_export_through_the_trace_swap(self) -> None:
+        """The link after the capture: install_eager swaps the real stack for
+        DummyPreprocessorStack, and whatever that returns is what the trace --
+        and therefore _post_processing -- actually sees."""
+        from hammer.v3.modules.core.preprocessors.preprocessor_stack import (
+            PreprocessorStack,
+        )
+        from hammer.v3.modules.mot.preprocessors.mot_preprocessor import MoTPreprocessor
+        from recir.examples.rankfm_mvai.rankfm_dispatchers import (
+            capture_sparse_arch_io,
+            PreprocessorDispatcher,
+        )
+
+        recir_module_config = _recir_module_config()
+        _clamp_tables(recir_module_config)
+        model = build_model_from_config(
+            recir_module_config,
+            device=torch.device("cpu"),
+            bf16_training=False,
+        )
+        recblock = model.recblock
+        preprocessor = cast(
+            MoTPreprocessor, recblock.preprocessor_stack.mot_preprocessor
+        )
+        sample_input = preprocessor.sample_inputs(
+            batch_size=2,
+            device=torch.device("cpu"),
+            max_uih_seq_len=8,
+            num_candidates=2,
+        )
+        _, _, preproc_output = capture_sparse_arch_io(recblock, sample_input)
+
+        dispatcher = PreprocessorDispatcher(
+            torch.device("cpu"),
+            batch_size=2,
+            max_uih_seq_len=8,
+            num_candidates=2,
+            sample_feature_bundle=sample_input,
+            precomputed_output=preproc_output,
+        )
+        dispatcher.install_eager(model)
+
+        swapped = type(model.recblock.preprocessor_stack).__name__
+        self.assertNotIsInstance(
+            model.recblock.preprocessor_stack,
+            PreprocessorStack,
+            f"install_eager did not swap the stack (still {swapped}); the trace "
+            "would then run the real preprocessor, not the dummy",
+        )
+
+        out = model.recblock.preprocessor_stack(sample_input)
+        self.assertIn(
+            "unsampled_inputs",
+            out.exports,
+            f"the swapped-in {swapped} dropped the export; captured "
+            f"{sorted(preproc_output.exports.keys())} but emitted "
+            f"{sorted(out.exports.keys())}",
+        )
