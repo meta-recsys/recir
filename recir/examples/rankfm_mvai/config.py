@@ -80,7 +80,12 @@ class RankFMTrainerConfig:
     Nothing here changes the model identity or FX graph topology.
     """
 
-    # Data
+    # Data. Must be a whole multiple of the dump's own batch_size (512) on the
+    # replay path -- data_pipe.BatchReplayPipe.batches_per_step raises
+    # otherwise, because a step reads whole files and anything else silently
+    # trains on a subsample. A multiple above 1 merges that many dumped files
+    # per step, so the global batch is local_batch_size * hosts, and every
+    # doubling halves the steps per epoch, so max_steps has to follow.
     local_batch_size: int = 32
 
     # Training

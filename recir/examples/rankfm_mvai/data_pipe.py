@@ -21,9 +21,12 @@ Public surface:
     compute_kjt_key_to_size      EC config -> {feature_name: num_embeddings}
     remap_batch_ids              clamp loaded IDs into model's hash space
     select_rows_slice            slice loaded batch to RO rows [start, start+n)
+    merge_batches                concatenate n loaded batches into one, so a
+                                 step can consume more rows than one dumped
+                                 file holds
     replay_batch_iter            yields ready-to-train batches from a
-                                 BatchReplayPipe (slice + remap + per-step
-                                 NRO-budget log)
+                                 BatchReplayPipe (merge + slice + remap +
+                                 per-step NRO-budget log)
 """
 
 from __future__ import annotations
@@ -141,7 +144,7 @@ class BatchReplayPipe:
         self._world_size = world_size
         self._replicate = replicate_across_ranks
         # Read from metadata.json, by _discover_files or lazily by
-        # assert_supports_batch_size. Stays None for dumps predating the key.
+        # batches_per_step. Stays None for dumps predating the key.
         self._dump_batch_size: Optional[int] = None
 
         self._is_gcs: bool = self._path.startswith("gs://")
@@ -268,24 +271,33 @@ class BatchReplayPipe:
             f"{batches_per_rank} batches."
         )
 
-    def assert_supports_batch_size(self, local_batch_size: int) -> None:
-        """Fail early when the dump's rows cannot satisfy ``local_batch_size``.
+    def batches_per_step(self, local_batch_size: int) -> int:
+        """How many dumped files one step of ``local_batch_size`` rows needs.
 
-        Without this the mismatch surfaces deep inside ``select_rows_slice`` on
-        the first step, long after the model has been built and traced. In
-        explicit file-list mode nothing has read the manifest yet, so read it
-        here -- the file list still addresses the same dump root.
+        ``local_batch_size`` must be a whole multiple of the dump's own
+        ``batch_size``. A step reads whole files, so anything else silently
+        trains on a subsample of the dump:
         """
         if self._dump_batch_size is None:
             metadata = self._load_json(f"{self._name_prefix()}metadata.json")
             self._dump_batch_size = metadata.get("batch_size")
         dump_batch_size = self._dump_batch_size
-        if dump_batch_size is not None and local_batch_size > dump_batch_size:
+        if dump_batch_size is None:
+            return 1
+        if local_batch_size % dump_batch_size:
+            # floor is 0 below one file, which would suggest a batch size of 0
+            # and then repeat the same number twice.
+            lower = (local_batch_size // dump_batch_size) * dump_batch_size
+            lower = lower if lower else dump_batch_size
             raise ValueError(
-                f"--local_batch_size {local_batch_size} exceeds the dump's "
-                f"batch_size {dump_batch_size} ({self._path}); each dumped batch "
-                f"has only {dump_batch_size} rows to slice from."
+                f"--local_batch_size {local_batch_size} is not a whole multiple "
+                f"of the dump's batch_size {dump_batch_size} ({self._path}). A "
+                f"step reads whole files, so this would consume "
+                f"{local_batch_size / dump_batch_size:.4g} of one and never "
+                f"revisit the rest -- training on a subsample of the dump. Use "
+                f"{lower} or {lower + dump_batch_size}."
             )
+        return local_batch_size // dump_batch_size
 
     def _download_bytes(self, name: str) -> bytes:
         if self._is_manifold:
@@ -524,6 +536,105 @@ def select_rows_slice(batch: Any, start: int, n: int) -> Any:
 
 
 # ---------------------------------------------------------------------------
+# Row merging (n loaded batches -> one batch of n x the rows)
+# ---------------------------------------------------------------------------
+
+
+def _merge_kjts(kjts: List[KeyedJaggedTensor]) -> KeyedJaggedTensor:
+    """Concatenate KJTs along the batch (stride) dimension, per key.
+
+    Both ``values`` and ``lengths`` are laid out KEY-MAJOR -- all of key 0's
+    rows, then all of key 1's -- so a plain ``torch.cat`` of either tensor
+    interleaves the keys and yields a structurally valid KJT holding scrambled
+    features. Every key's slice is therefore extracted from each input and
+    concatenated within that key.
+    """
+    if len(kjts) == 1:
+        return kjts[0]
+    keys = kjts[0].keys()
+    num_keys = len(keys)
+    has_weights = kjts[0].weights_or_none() is not None
+    lengths_2d: List[torch.Tensor] = []
+    key_offsets: List[torch.Tensor] = []
+    for kjt in kjts:
+        if kjt.keys() != keys:
+            raise ValueError(
+                f"cannot merge KJTs with different keys: {keys} vs {kjt.keys()}"
+            )
+        if (kjt.weights_or_none() is not None) != has_weights:
+            raise ValueError(
+                "cannot merge weighted and unweighted KJTs; the result would "
+                "carry weights for only some rows"
+            )
+        lens = kjt.lengths().view(num_keys, -1)
+        lengths_2d.append(lens)
+        per_key_total = lens.sum(dim=1)
+        key_offsets.append(
+            torch.cat(
+                [torch.zeros(1, dtype=per_key_total.dtype), per_key_total.cumsum(0)]
+            )
+        )
+    value_chunks: List[torch.Tensor] = []
+    weight_chunks: List[torch.Tensor] = []
+    for ki in range(num_keys):
+        for kjt, offsets in zip(kjts, key_offsets):
+            lo, hi = int(offsets[ki]), int(offsets[ki + 1])
+            value_chunks.append(kjt.values()[lo:hi])
+            weights = kjt.weights_or_none()
+            if weights is not None:
+                weight_chunks.append(weights[lo:hi])
+    return KeyedJaggedTensor(
+        keys=keys,
+        values=torch.cat(value_chunks).contiguous(),
+        lengths=torch.cat(lengths_2d, dim=1).flatten().contiguous(),
+        weights=torch.cat(weight_chunks).contiguous() if has_weights else None,
+    )
+
+
+def merge_batches(batches: List[Any]) -> Any:
+    """Concatenate loaded batches into one holding all of their rows."""
+    if len(batches) == 1:
+        return batches[0]
+    first = batches[0]
+    fields: Dict[str, Any] = {
+        "ro_float_features": torch.cat(
+            [b.ro_float_features for b in batches]
+        ).contiguous(),
+        "nro_float_features": torch.cat(
+            [b.nro_float_features for b in batches]
+        ).contiguous(),
+        "num_candidates": torch.cat([b.num_candidates for b in batches]).contiguous(),
+        "supervision_label": torch.cat(
+            [b.supervision_label for b in batches], dim=1
+        ).contiguous(),
+        "supervision_weight": torch.cat(
+            [b.supervision_weight for b in batches], dim=1
+        ).contiguous(),
+        "ro_id_list_features": _merge_kjts([b.ro_id_list_features for b in batches]),
+        "nro_id_list_features": _merge_kjts([b.nro_id_list_features for b in batches]),
+    }
+    if first.unary_features is not None:
+        fields["unary_features"] = _merge_kjts([b.unary_features for b in batches])
+    if first.all_labels is not None:
+        label_keys = set(first.all_labels)
+        for b in batches[1:]:
+            if set(b.all_labels) != label_keys:
+                raise ValueError(
+                    "cannot merge batches with different all_labels keys: "
+                    f"{sorted(label_keys)} vs {sorted(b.all_labels)}"
+                )
+        fields["all_labels"] = {
+            k: torch.cat([b.all_labels[k] for b in batches]).contiguous()
+            for k in first.all_labels
+        }
+    # Carried as a scalar so the padding path need not sync sum(num_candidates)
+    # back to the host; it has to grow with the merge, not stay at file 0's.
+    if getattr(first, "B_NRO", None) is not None:
+        fields["B_NRO"] = sum(int(b.B_NRO) for b in batches)
+    return dataclasses.replace(first, **fields)
+
+
+# ---------------------------------------------------------------------------
 # Top-level orchestrator (the public entry point trainers should use)
 # ---------------------------------------------------------------------------
 
@@ -540,6 +651,11 @@ def replay_batch_iter(
     """Yield up to ``max_steps`` ready-to-train batches from ``data_pipe``.
 
     Composes the standard real-data preprocessing chain in order:
+      0. ``merge_batches`` — concatenate the ``n`` dumped files a step needs
+         into one batch, where ``n = local_batch_size / dump batch_size``
+         (``BatchReplayPipe.batches_per_step``). At or below the dump's own
+         batch size ``n`` is 1 and the step consumes exactly one file, as it
+         always has.
       1. ``select_rows_slice`` — slice the loaded batch to ``local_batch_size``
          RO rows. Loaded files have B_loaded ~hundreds-thousands; the trace
          expects per-rank ``local_batch_size`` rows. The window rotates by
@@ -555,14 +671,33 @@ def replay_batch_iter(
 
     Reads by global position ``pos = start_index + step`` and cycles through
     the pipe via ``data_pipe.load_at`` (``pos % num_files``); ``max_steps`` is
-    the terminator. ``start_index`` (the checkpointed data pointer) lets a
-    resumed run continue the data stream from where the prior run stopped
-    instead of re-reading from position 0 (which would overlap the data the
-    prior run already consumed).
+    the terminator. ``start_index`` (the checkpointed data pointer) counts
+    STEPS, not files, so it stays valid when a step merges several: step ``pos``
+    consumes files ``[pos * n, (pos + 1) * n)``. A resumed run continues the
+    data stream from where the prior run stopped instead of re-reading from
+    position 0 (which would overlap the data the prior run already consumed).
+
+    Note that an epoch is ``len(data_pipe) / n`` steps, so raising
+    ``local_batch_size`` past one file shortens the epoch by the same factor;
+    past it ``load_at`` wraps and replays.
     """
+    batches_per_step = data_pipe.batches_per_step(local_batch_size)
+    if batches_per_step > len(data_pipe):
+        raise ValueError(
+            f"--local_batch_size {local_batch_size} needs {batches_per_step} "
+            f"files per step but this rank holds {len(data_pipe)}; load_at "
+            f"wraps, so the merge would repeat the same file inside one batch "
+            f"(duplicate rows) rather than enlarge it. --data_file_template "
+            f"resolves to a single file and cannot serve a merged batch."
+        )
     for step in range(max_steps):
         pos = start_index + step
-        batch = data_pipe.load_at(pos)
+        batch = merge_batches(
+            [
+                data_pipe.load_at(pos * batches_per_step + i)
+                for i in range(batches_per_step)
+            ]
+        )
         B_loaded = batch.num_candidates.shape[0]
         n_windows = max(1, B_loaded // local_batch_size)
         # Rotate the row window by the GLOBAL position so a resumed run keeps
@@ -575,7 +710,8 @@ def replay_batch_iter(
         real_total = int(nc.sum())
         budget = nc.shape[0] * num_candidates
         logger.info(
-            f"[Replay] step {step + 1} (pos {pos}): sum(num_candidates)={real_total}, "
+            f"[Replay] step {step + 1} (pos {pos}, {batches_per_step} file(s)): "
+            f"sum(num_candidates)={real_total}, "
             f"NRO budget={budget} (fill={real_total / budget:.2%}, "
             f"max nc[i]={int(nc.max())}/{num_candidates})"
         )

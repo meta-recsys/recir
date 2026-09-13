@@ -608,11 +608,13 @@ class RankFMMvaiModelFamily(BlueReelsVDDModelFamily):
             file_list=explicit_files,
         )
         # Fail here rather than on the first select_rows_slice, which happens
-        # after the model is built and traced.
-        data_pipe.assert_supports_batch_size(trainer_cfg.local_batch_size)
+        # after the model is built and traced. Also reports how many files a
+        # step will merge, which is the only place that number is visible.
+        batches_per_step = data_pipe.batches_per_step(trainer_cfg.local_batch_size)
         logger.info(
             f"Replay pipe: {len(data_pipe)} batches for rank {gloo_rank} "
-            f"(replicate={trainer_cfg.data_replicate_across_ranks})"
+            f"(replicate={trainer_cfg.data_replicate_across_ranks}, "
+            f"{batches_per_step} file(s)/step)"
         )
         return data_pipe
 
