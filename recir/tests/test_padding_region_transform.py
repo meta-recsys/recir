@@ -353,6 +353,34 @@ class PadJaggedValuesOpTest(unittest.TestCase):
         torch.testing.assert_close(v1.grad, v0.grad)  # pyre-ignore
         torch.testing.assert_close(v1.grad, torch.ones(10, 4))  # pyre-ignore
 
+    @patch("recir.region_transforms.padding.runtime_num_local", return_value=2)
+    def test_chip_with_zero_rows_yields_zero_block_total(
+        self, _mock_num_local: Any
+    ) -> None:
+        """A chip owning no candidates must produce an empty block, not a negative one.
+
+        `count` puts every candidate on chip 1, so chip 0 owns zero rows. Each
+        block total is a difference of prefix sums, and the empty range has to
+        read as 0 on both sides; gating the upper term on `end > start` instead
+        returns `-csum[start - 1]` for key 1 chip 0 (-10 here), which then blows
+        up in `values.narrow`.
+        """
+        count = torch.tensor([0, 0, 2, 2], dtype=torch.long)  # chip0: 0, chip1: 4
+        lengths = torch.tensor([1, 2, 3, 4, 1, 1, 2, 2], dtype=torch.long)
+        values = torch.arange(1, 17, dtype=torch.long)  # 1..16, so 0 means pad
+
+        result = pad_jagged_values(values, lengths, [24, 16], 0, -1, 1, count, False)
+
+        self.assertEqual(result.shape, (40,))
+        # key0 (budget/chip 12): chip0 owns nothing, chip1 owns all 10 values.
+        self.assertEqual(result[:12].tolist(), [0] * 12)
+        self.assertEqual(result[12:22].tolist(), list(range(1, 11)))
+        self.assertEqual(result[22:24].tolist(), [0, 0])
+        # key1 (budget/chip 8): same, 6 real values on chip1.
+        self.assertEqual(result[24:32].tolist(), [0] * 8)
+        self.assertEqual(result[32:38].tolist(), list(range(11, 17)))
+        self.assertEqual(result[38:40].tolist(), [0, 0])
+
 
 class PadJaggedPairToStaticTest(unittest.TestCase):
     @patch("recir.region_transforms.padding.runtime_num_local", return_value=2)
