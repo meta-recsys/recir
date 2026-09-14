@@ -7,8 +7,9 @@
 
 """Tests for the background-thread batch prefetcher used by the rankfm trainer."""
 
+import time
 import unittest
-from typing import Iterator
+from typing import Iterator, List
 
 from recir.examples.rankfm_mvai.prefetch import PrefetchingIterator
 
@@ -67,3 +68,39 @@ class PrefetchingIteratorTest(unittest.TestCase):
             self.assertEqual(next(it), 0)
         # exiting the context closes without error; closed flag is set
         self.assertTrue(it._closed)
+
+    def test_the_producer_runs_ahead_of_the_consumer(self) -> None:
+        """Why a checkpointed data cursor must be advanced on the CONSUMER side.
+
+        Running ahead is the whole point of the class, but it means "batches
+        built" and "batches trained on" are different numbers, differing by up
+        to ``depth``. ``_RankFMIterableDataset.__iter__`` therefore advances
+        ``_batch_index`` around the ``__next__`` that returns a batch, not
+        inside the wrapped generator that produces it: a cursor written by the
+        producer would checkpoint a position past what the model has actually
+        seen, and the resumed run would silently skip those batches -- no error,
+        just a hole in the data.
+        """
+        produced: List[int] = []
+
+        def source() -> Iterator[int]:
+            for i in range(100):
+                produced.append(i)
+                yield i
+
+        depth = 4
+        with PrefetchingIterator(source(), depth=depth) as it:
+            self.assertEqual(next(it), 0)
+            # Let the producer fill the queue; it then blocks on a full put.
+            deadline = time.monotonic() + 30
+            while len(produced) < depth + 1 and time.monotonic() < deadline:
+                time.sleep(0.01)
+            consumed = 1
+            self.assertGreater(
+                len(produced),
+                consumed,
+                "producer never ran ahead, so this invariant is untested",
+            )
+            # Bounded by the queue: depth queued + one handed out + one in the
+            # producer's hand, blocked on put.
+            self.assertLessEqual(len(produced), consumed + depth + 1)

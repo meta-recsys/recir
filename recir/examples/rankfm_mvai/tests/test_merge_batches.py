@@ -12,8 +12,10 @@ import dataclasses
 import json
 import os
 import tempfile
+import threading
+import time
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Callable, Dict, List, Optional, Sequence
 
 import torch
 from later.unittest import TestCase
@@ -21,6 +23,7 @@ from pyre_extensions import none_throws
 from recir.examples.rankfm_mvai.data_pipe import (
     BatchReplayPipe,
     merge_batches,
+    replay_batch_iter,
     select_rows_slice,
 )
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
@@ -377,3 +380,169 @@ class BatchesPerStepTest(TestCase):
         with contextlib.ExitStack() as stack:
             pipe = BatchReplayPipe(path=_dump_root(stack), replicate_across_ranks=True)
             self.assertEqual(pipe.batches_per_step(4096), 1)
+
+
+# ---------------------------------------------------------------------------
+# Concurrent per-step file loading
+# ---------------------------------------------------------------------------
+
+_FILES_PER_STEP = 2
+_NC_PER_FILE: List[int] = [2, 1, 3]
+_ROWS_PER_FILE: int = len(_NC_PER_FILE)
+
+
+class _ProbePipe:
+    """``BatchReplayPipe`` stand-in exposing only what ``replay_batch_iter`` uses.
+
+    Faked rather than dumped to disk because what is under test is the loader's
+    fan-out, not the file format: a real dump would make the load fast and
+    uniform, which is precisely the condition under which an ordering bug is
+    invisible. ``on_load`` lets a test control completion order or force the
+    loads to be simultaneous, and the recorded thread ids are how "did it
+    actually run in parallel" is answered without timing anything.
+    """
+
+    def __init__(
+        self,
+        files_per_step: int = _FILES_PER_STEP,
+        num_files: int = 64,
+        on_load: Optional[Callable[[int], None]] = None,
+    ) -> None:
+        self._files_per_step = files_per_step
+        self._num_files = num_files
+        self._on_load = on_load
+        self._lock = threading.Lock()
+        self.threads: List[int] = []
+        self.positions: List[int] = []
+
+    def batches_per_step(self, local_batch_size: int) -> int:
+        return self._files_per_step
+
+    def __len__(self) -> int:
+        return self._num_files
+
+    def load_at(self, pos: int) -> _FakeBatch:
+        if self._on_load is not None:
+            self._on_load(pos)
+        with self._lock:
+            self.threads.append(threading.get_ident())
+            self.positions.append(pos)
+        # base is a function of pos, so every field of a wrongly ordered merge
+        # differs -- not just the row count, which a bad merge gets right.
+        return _build(base=100 * (pos + 1), num_candidates=list(_NC_PER_FILE))
+
+
+def _replay(
+    pipe: _ProbePipe,
+    *,
+    max_steps: int = 2,
+    files_per_step: int = _FILES_PER_STEP,
+    **kwargs: Any,
+) -> List[_FakeBatch]:
+    """Drive ``replay_batch_iter`` over ``pipe`` to exhaustion.
+
+    ``local_batch_size`` is set to exactly the merged row count so the rotating
+    window is a no-op (``n_windows == 1``) and each yielded batch is the plain
+    in-order merge of that step's files -- the thing being asserted on.
+    """
+    return list(
+        replay_batch_iter(
+            pipe,  # pyre-ignore[6]: structural stand-in for BatchReplayPipe
+            {},
+            max_steps=max_steps,
+            local_batch_size=_ROWS_PER_FILE * files_per_step,
+            num_candidates=max(_NC_PER_FILE),
+            **kwargs,
+        )
+    )
+
+
+class ReplayLoadConcurrencyTest(TestCase):
+    """A step's files are read concurrently, and that must change nothing.
+
+    The reads are independent and dominated by blocking FUSE I/O, so loading
+    them one after another put 1.19 s/step -- 37% of the step -- in front of
+    the device on the 128-chip profile. Overlapping them is free throughput
+    only if the merge still sees the files in position order, which is the
+    invariant these tests defend.
+    """
+
+    def test_out_of_order_completion_still_merges_in_position_order(self) -> None:
+        """Delay the EARLY positions so completion order is the reverse.
+
+        ``merge_batches`` is position-sensitive: file 0's rows must land first
+        or ``select_rows_slice``'s window stops lining up with the RO->NRO
+        segmentation (see test_merge_then_slice_recovers_the_first_batch), and
+        nothing downstream raises -- it just trains on scrambled rows. An
+        implementation that consumed futures as they completed would produce
+        the reverse here and fail; ``Executor.map`` yields in argument order.
+        """
+
+        def slow_early(pos: int) -> None:
+            time.sleep(0.05 * (_FILES_PER_STEP - 1 - pos % _FILES_PER_STEP))
+
+        serial = _replay(_ProbePipe())
+        threaded = _replay(_ProbePipe(on_load=slow_early), load_workers=_FILES_PER_STEP)
+
+        self.assertEqual(len(threaded), len(serial))
+        for i, (want, got) in enumerate(zip(serial, threaded)):
+            self.assertEqual(
+                got.num_candidates.tolist(), want.num_candidates.tolist(), f"step {i}"
+            )
+            torch.testing.assert_close(got.ro_float_features, want.ro_float_features)
+            torch.testing.assert_close(got.nro_float_features, want.nro_float_features)
+            torch.testing.assert_close(got.supervision_label, want.supervision_label)
+            self.assertEqual(
+                got.ro_id_list_features.values().tolist(),
+                want.ro_id_list_features.values().tolist(),
+            )
+            self.assertEqual(
+                got.nro_id_list_features.values().tolist(),
+                want.nro_id_list_features.values().tolist(),
+            )
+
+    def test_the_files_of_one_step_are_in_flight_together(self) -> None:
+        """The barrier IS the assertion.
+
+        It only clears when every file of the step is inside ``load_at`` at the
+        same moment, so a serial loader (or a pool that was silently bypassed)
+        hits the timeout and raises ``BrokenBarrierError`` instead of passing
+        slowly. Asserting on elapsed time would be flaky; this is not.
+        """
+        barrier = threading.Barrier(_FILES_PER_STEP, timeout=60)
+
+        def wait(pos: int) -> None:
+            # Barrier.wait returns the arrival index; swallow it so the callback
+            # matches on_load's None return.
+            barrier.wait()
+
+        pipe = _ProbePipe(on_load=wait)
+        batches = _replay(pipe, max_steps=1, load_workers=_FILES_PER_STEP)
+
+        self.assertEqual(len(batches), 1)
+        self.assertEqual(len(set(pipe.threads)), _FILES_PER_STEP)
+
+    def test_workers_are_capped_at_the_files_a_step_needs(self) -> None:
+        """One file per step has nothing to overlap, so no pool is created.
+
+        Worth pinning: that is the shape of every unmerged run (local batch ==
+        the dump's own), and handing each load to a worker thread there would
+        add a queue round-trip to the critical path for no I/O overlap.
+        """
+        pipe = _ProbePipe(files_per_step=1)
+        _replay(pipe, max_steps=3, files_per_step=1, load_workers=8)
+
+        self.assertEqual(set(pipe.threads), {threading.get_ident()})
+
+    def test_the_default_is_the_previous_serial_behaviour(self) -> None:
+        """Callers that never opt in are untouched.
+
+        ``replay_batch_iter`` is also used for the one-off trace-batch pull and
+        by the parity harness, where a background thread would only add
+        nondeterminism to a comparison that exists to be bit-exact.
+        """
+        pipe = _ProbePipe()
+        _replay(pipe, max_steps=2)
+
+        self.assertEqual(set(pipe.threads), {threading.get_ident()})
+        self.assertEqual(pipe.positions, [0, 1, 2, 3])

@@ -38,6 +38,7 @@ import logging
 import os
 import subprocess
 import tempfile
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, Iterator, List, Optional
 
 import torch
@@ -647,6 +648,7 @@ def replay_batch_iter(
     local_batch_size: int,
     num_candidates: int,
     start_index: int = 0,
+    load_workers: int = 1,
 ) -> Iterator[Any]:
     """Yield up to ``max_steps`` ready-to-train batches from ``data_pipe``.
 
@@ -680,6 +682,13 @@ def replay_batch_iter(
     Note that an epoch is ``len(data_pipe) / n`` steps, so raising
     ``local_batch_size`` past one file shortens the epoch by the same factor;
     past it ``load_at`` wraps and replays.
+
+    ``load_workers`` fetches a step's ``n`` files concurrently. The reads are
+    independent and the expensive part of each -- blocking ``read`` on the
+    barnfs FUSE mount, then zstd decompression -- drops the GIL, so the step's
+    load cost falls toward that of its slowest file. Capped at ``n``: beyond
+    that there is nothing left to overlap within a step, and running ahead
+    across steps is the caller's prefetch depth to decide.
     """
     batches_per_step = data_pipe.batches_per_step(local_batch_size)
     if batches_per_step > len(data_pipe):
@@ -690,29 +699,44 @@ def replay_batch_iter(
             f"(duplicate rows) rather than enlarge it. --data_file_template "
             f"resolves to a single file and cannot serve a merged batch."
         )
-    for step in range(max_steps):
-        pos = start_index + step
-        batch = merge_batches(
-            [
-                data_pipe.load_at(pos * batches_per_step + i)
-                for i in range(batches_per_step)
-            ]
-        )
-        B_loaded = batch.num_candidates.shape[0]
-        n_windows = max(1, B_loaded // local_batch_size)
-        # Rotate the row window by the GLOBAL position so a resumed run keeps
-        # advancing through the loaded file's rows rather than repeating them.
-        window = pos % n_windows
-        start = window * local_batch_size
-        batch = select_rows_slice(batch, start, local_batch_size)
-        batch = remap_batch_ids(batch, key_to_size)
-        nc = batch.num_candidates
-        real_total = int(nc.sum())
-        budget = nc.shape[0] * num_candidates
-        logger.info(
-            f"[Replay] step {step + 1} (pos {pos}, {batches_per_step} file(s)): "
-            f"sum(num_candidates)={real_total}, "
-            f"NRO budget={budget} (fill={real_total / budget:.2%}, "
-            f"max nc[i]={int(nc.max())}/{num_candidates})"
-        )
-        yield batch
+    n_workers = max(1, min(load_workers, batches_per_step))
+    pool: Optional[ThreadPoolExecutor] = (
+        ThreadPoolExecutor(max_workers=n_workers, thread_name_prefix="replay-load")
+        if n_workers > 1
+        else None
+    )
+    logger.info(
+        f"[Replay] {batches_per_step} file(s)/step loaded across "
+        f"{n_workers} thread(s) (load_workers={load_workers})"
+    )
+    try:
+        for step in range(max_steps):
+            pos = start_index + step
+            positions = [pos * batches_per_step + i for i in range(batches_per_step)]
+            loaded = (
+                [data_pipe.load_at(p) for p in positions]
+                if pool is None
+                else list(pool.map(data_pipe.load_at, positions))
+            )
+            batch = merge_batches(loaded)
+            B_loaded = batch.num_candidates.shape[0]
+            n_windows = max(1, B_loaded // local_batch_size)
+            # Rotate the row window by the GLOBAL position so a resumed run keeps
+            # advancing through the loaded file's rows rather than repeating them.
+            window = pos % n_windows
+            start = window * local_batch_size
+            batch = select_rows_slice(batch, start, local_batch_size)
+            batch = remap_batch_ids(batch, key_to_size)
+            nc = batch.num_candidates
+            real_total = int(nc.sum())
+            budget = nc.shape[0] * num_candidates
+            logger.info(
+                f"[Replay] step {step + 1} (pos {pos}, {batches_per_step} file(s)): "
+                f"sum(num_candidates)={real_total}, "
+                f"NRO budget={budget} (fill={real_total / budget:.2%}, "
+                f"max nc[i]={int(nc.max())}/{num_candidates})"
+            )
+            yield batch
+    finally:
+        if pool is not None:
+            pool.shutdown(wait=False)
