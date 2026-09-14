@@ -497,17 +497,23 @@ def pad_jagged_values(
     # layout. rc_c is the real row count per chip (data-dependent when count set).
     num_local = runtime_num_local()
     rc = _per_chip_real_counts(B, num_local, count)
-    key_lengths = lengths.reshape(num_keys, B)
+    assert lengths.shape[0] == num_keys * B, (
+        f"pad_jagged_values: lengths.shape[0]={lengths.shape[0]} is not "
+        f"num_keys={num_keys} * B={B}"
+    )
+    csum = lengths.cumsum(0).tolist()
+    chip_bounds = list(itertools.accumulate(rc, initial=0))
     block_sizes: List[int] = []
     parts: List[torch.Tensor] = []
     offset = 0
     for k in range(num_keys):
         budget_pb = per_host_budgets[k] // num_local
-        cand_off = 0
+        base = k * B
         for c in range(num_local):
-            rc_c = rc[c]
-            block_total = int(key_lengths[k][cand_off : cand_off + rc_c].sum().item())
-            cand_off += rc_c
+            start, end = base + chip_bounds[c], base + chip_bounds[c + 1]
+            block_total = int(csum[end - 1] if end > 0 else 0) - int(
+                csum[start - 1] if start > 0 else 0
+            )
             block_sizes.append(block_total)
             block_vals = values.narrow(dim, offset, block_total)
             offset += block_total
@@ -523,10 +529,9 @@ def pad_jagged_values(
                 # uniform -- matching the real ids -- instead of routing every pad
                 # to id 0 -> block-owner 0, which skews the ring-shift all-to-all.
                 # Real ids stay at the block front so backward/fake are unchanged.
-                deficit = budget_pb - current
-                idx = torch.arange(deficit, device=block_vals.device) % current
-                pad_vals = block_vals.index_select(dim, idx)
-                parts.append(torch.cat([block_vals, pad_vals], dim=dim))
+                reps = [1] * values.ndim
+                reps[dim] = -(-budget_pb // current)
+                parts.append(block_vals.repeat(reps).narrow(dim, 0, budget_pb))
             else:
                 pw = [0] * (2 * values.ndim)
                 pw[2 * (values.ndim - 1 - dim) + 1] = budget_pb - current
