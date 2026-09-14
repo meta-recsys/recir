@@ -388,6 +388,7 @@ class PreprocessorDispatcher:
         sample_feature_bundle: FeatureBundle | None = None,
         precomputed_output: FeatureBundle | None = None,
         num_processes: int = 1,
+        skip_backward_break: bool = False,
     ) -> None:
         self._device = device
         self._batch_size = batch_size
@@ -404,6 +405,9 @@ class PreprocessorDispatcher:
         # (= cached.shape with dim 0 // num_processes) so _to_sharded_jax
         # can expand back to global at the XLA boundary.
         self._num_processes: int = num_processes
+        # Only safe where the embedding backend registers no backward of its
+        # own; see the in_graph call site in rankfm_embedding_backends.py.
+        self._skip_backward_break: bool = skip_backward_break
 
     def install_eager(self, model: nn.Module) -> None:
         for fqn, mod in list(model.named_modules()):
@@ -746,6 +750,7 @@ class PreprocessorDispatcher:
             fwd_fn,
             num_state_tensors=len(flat_state),
             num_ranks=num_ranks,
+            register_backward=not self._skip_backward_break,
         )
         return gm, flat_state
 
