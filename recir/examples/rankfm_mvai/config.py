@@ -176,6 +176,9 @@ class RankFMTrainerConfig:
     # leg's METRICS_REPORT_INTERVAL for the two curves to line up.
     metrics_report_interval: int = 10
 
+    # Reduce the metric inputs on device instead of pulling them host-ward.
+    in_graph_metrics: bool = False
+
     # Profiling
     profile_start_step: int = -1
     profile_end_step: int = -1
