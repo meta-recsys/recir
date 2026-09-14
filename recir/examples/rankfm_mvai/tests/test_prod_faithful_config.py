@@ -586,7 +586,7 @@ class ForwardParityTest(TestCase):
             # the second call and show up as a spurious delta.
             torch.manual_seed(0)
             light_losses, light_named = wrapper(batch)
-            # flatten_batch bakes in world_candidate_sum, but the light
+            # flatten_batch's trailing slot is loss_denom_source, but the light
             # entrypoint passes no denominator at all, so pass None to compare
             # like for like (_candidate_axis_mean, udd_fm_train_v3.py:109-112).
             recir_args = list(flatten_batch(batch))
@@ -652,7 +652,7 @@ _GRAD_L2_RTOL: float = float(os.environ.get("PARITY_GRAD_RTOL", "0.02"))
 # accumulation order is left.
 _EMB_UPDATE_RTOL: float = 0.01
 
-# Which denominator the recir leg passes as world_candidate_sum. True mirrors
+# Which denominator the recir leg passes as loss_denom_source. True mirrors
 # --light_loss_norm (None -> _candidate_axis_mean falls back to torch.mean,
 # which is exactly what the light entrypoint gets); False passes the group
 # candidate count the way train_pipeline.py:631 does by default. At one rank

@@ -198,7 +198,7 @@ def _udd_fm_v3_forward_step(
     supervision_weight_t: torch.Tensor,
     all_labels: Dict[str, torch.Tensor],
     candidate_sum: torch.Tensor,
-    world_candidate_sum: torch.Tensor,
+    loss_denom_source: torch.Tensor,
 ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
     """recir_train_step minus backward()/opt.step() (opt unused). Same named
     signature as _udd_fm_v3_train_step so PaddingRegionTransform can bind args."""
@@ -216,7 +216,7 @@ def _udd_fm_v3_forward_step(
         supervision_weight_t,
         all_labels,
         candidate_sum,
-        world_candidate_sum,
+        loss_denom_source,
     )
     detached_named: Dict[str, torch.Tensor] = {
         k: (v.detach() if isinstance(v, torch.Tensor) else v)
