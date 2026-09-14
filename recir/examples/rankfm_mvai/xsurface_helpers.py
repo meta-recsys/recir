@@ -37,7 +37,6 @@ import recir.lowering.fbgemm_fallback  # noqa: F401 -- registers SPMD_DECOMP_TAB
 import torch
 import torch.nn as nn
 from hammer.v3.models.udd_fm_v3.udd_fm_config import BlueReelsVDDModuleConfig
-from hammer.v3.models.udd_fm_v3.utils import world_candidate_sum
 from hammer.v3.modules.recblock import _inputs_to_feature_bundle
 from recir.backends import XLAGSPMDBackend
 from recir.decompositions import SPMD_DECOMP_TABLE
@@ -182,7 +181,6 @@ def make_padding_region_transforms(
                 "nro_id_list_lengths",
                 "all_labels",
                 "candidate_sum",
-                "world_candidate_sum",
             },
         ),
     ]
@@ -349,7 +347,7 @@ def _extract_train_step_args(
         batch.supervision_label.t().contiguous(),
         batch.supervision_weight.t().contiguous(),
         batch.all_labels,
-        world_candidate_sum(batch.num_candidates),
+        batch.num_candidates,
     )
 
 
