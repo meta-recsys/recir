@@ -477,6 +477,47 @@ class PadCountToSumOpTest(unittest.TestCase):
             self.assertEqual(result.shape, (20,))
 
 
+class LossDenomSourcePaddingTest(unittest.TestCase):
+    """Guards the contract that makes the in-graph loss denominator correct.
+
+    ``flatten_batch``'s trailing ``loss_denom_source`` slot carries the pre-pad
+    per-sample candidate counts, and the model reduces it with ``.sum()`` inside
+    the traced graph so XLA emits the cross-device all-reduce instead of the host
+    paying a blocking gloo collective every step.
+
+    That only works because a plain batch-axis tensor goes through
+    ``pad_to_static`` with a ZERO fill, which preserves the sum. The same counts
+    at position 8 go through ``pad_count_to_sum`` instead, whose dummies are
+    deliberately nonzero. Summing THAT would return the padded budget constant.
+
+    If ``loss_denom_source`` is ever added to PRT's ``skip_args``, or bound as a
+    jagged pair's ``count_arg``, the denominator silently becomes wrong with no
+    other assertion to catch it -- ``skip_args`` names are not validated.
+    """
+
+    def test_zero_fill_preserves_the_sum(self) -> None:
+        counts = torch.tensor([3, 5, 2, 4], dtype=torch.int32)  # sum=14
+        padded = pad_to_static(counts, target_size=8, dim=0)
+        self.assertEqual(padded.shape, (8,))
+        self.assertEqual(padded.tolist(), [3, 5, 2, 4, 0, 0, 0, 0])
+        self.assertEqual(int(padded.sum()), int(counts.sum()))
+
+    @patch("recir.region_transforms.padding.runtime_num_local", return_value=2)
+    def test_zero_fill_preserves_the_sum_per_chip(self, _m: Any) -> None:
+        counts = torch.tensor([3, 5, 2, 4], dtype=torch.int32)  # sum=14
+        padded = pad_to_static(counts, target_size=8, dim=0)
+        # Real rows stay at the front of EACH chip block, dummies are zero.
+        self.assertEqual(padded.tolist(), [3, 5, 0, 0, 2, 4, 0, 0])
+        self.assertEqual(int(padded.sum()), int(counts.sum()))
+
+    def test_count_arg_padding_does_not_preserve_the_sum(self) -> None:
+        """The contrast that motivates the separate slot."""
+        counts = torch.tensor([3, 5, 2, 4], dtype=torch.int32)  # sum=14
+        as_count_arg = pad_count_to_sum(counts, target_size=8, target_sum=20)
+        self.assertEqual(int(as_count_arg.sum()), 20)
+        self.assertNotEqual(int(as_count_arg.sum()), int(counts.sum()))
+
+
 # ---------------------------------------------------------------------------
 # Tests: mark_padding_graph_breaks
 # ---------------------------------------------------------------------------

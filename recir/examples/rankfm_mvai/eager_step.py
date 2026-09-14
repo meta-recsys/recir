@@ -161,15 +161,11 @@ class EagerCPUStep:
         self.fused_opt.zero_grad()
 
     def forward(self, batch: Any, n_total: int) -> Tuple[torch.Tensor, Dict[str, Any]]:
-        """One micro-batch through the raw-tensor entrypoint.
-
-        ``flatten_batch``'s last element is an all-reduced
-        ``world_candidate_sum``, replaced because this leg picks the
-        denominator itself: ``None`` falls back to ``torch.mean`` (what light
-        gets, since it passes none), ``n_total`` normalizes by the group.
-        """
+        """One micro-batch through the raw-tensor entrypoint."""
         flat_args = list(flatten_batch(batch))
-        flat_args[-1] = None if self.light_loss_norm else n_total
+        flat_args[-1] = (
+            None if self.light_loss_norm else torch.tensor(n_total, dtype=torch.int64)
+        )
         return self.raw_model(*flat_args)
 
     def scale_loss(self, all_losses: torch.Tensor) -> torch.Tensor:
