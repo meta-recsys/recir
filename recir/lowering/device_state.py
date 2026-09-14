@@ -21,17 +21,18 @@ class DeviceStateManager:
         self._used_fast_path: bool = False
         self.torch_device: torch.device = torch_device
         # FQNs (fully-qualified names) aligned 1:1 with flat_state, populated at
-        # compile time. Lets sync_to_torch skip specific state entries by name
-        # (e.g. large device-resident embedding tables) rather than by a size
-        # heuristic. None until the compiler attaches it.
+        # compile time. Lets copy_state_to_host skip specific state entries by
+        # name (e.g. large device-resident embedding tables) rather than by a
+        # size heuristic. None until the compiler attaches it.
         self.state_fqns: Optional[List[str]] = None
-        # When True, process_outputs returns the raw (JAX) step output instead of
-        # materializing it to torch every step. This lets a training loop defer the
-        # output device->host pull to a cadence so JAX can pipeline (the host runs
-        # ahead, overlapping step i+1's H2D/dispatch with step i's compute). The
-        # caller is responsible for materializing the output when it actually needs
-        # the values (e.g. metric logging). No effect for the base manager (whose
-        # outputs are already torch); honored by XLADeviceStateManager.
+        # When True, ``defers_output`` says yes and the runner hands the caller the
+        # raw (JAX) step output instead of materializing it every step. This lets a
+        # training loop defer the output device->host pull to a cadence so JAX can
+        # pipeline (the host runs ahead, overlapping step i+1's H2D/dispatch with
+        # step i's compute). The caller is then responsible for calling
+        # ``materialize_output`` when it actually needs the values (e.g. metric
+        # logging). No effect for the base manager (whose outputs are already
+        # torch); honored by XLADeviceStateManager.
         self.keep_output_jax: bool = False
 
     def prepare_inputs(
@@ -43,27 +44,38 @@ class DeviceStateManager:
     ) -> List[Any]:
         return flat_state + user_inps
 
-    def process_outputs(
+    def commit_step_state(
         self,
         flat_state: List[torch.Tensor],
-        output: Any,
         updated_flat: List[Any],
         last_train_step: bool,
-    ) -> torch.Tensor:
+    ) -> None:
+        """Make the step's state outputs the resident state.
+
+        The state half of the runner's per-step epilogue. Says nothing about the
+        step's output -- that is ``defers_output`` / ``materialize_output``.
+        """
         for i, state_tensor in enumerate(flat_state):
             if i < len(updated_flat):
                 updated = updated_flat[i]
                 assert isinstance(updated, torch.Tensor)
                 if updated.data_ptr() != state_tensor.data_ptr():
                     state_tensor.copy_(updated)
-        return output
+
+    def defers_output(self, last_train_step: bool) -> bool:
+        """Whether the caller asked to pull the step output itself, later.
+
+        The last step always materializes, so a caller that stops training holds
+        values rather than a handle it can no longer cash.
+        """
+        return self.keep_output_jax and not last_train_step
 
     def materialize_output(self, output: Any) -> Any:
         """Convert a (possibly deferred) step output to torch. No-op for the base
         manager, whose outputs are already torch. See ``keep_output_jax``."""
         return output
 
-    def sync_to_torch(
+    def copy_state_to_host(
         self,
         flat_state: List[torch.Tensor],
         skip_fqns: Optional[Sequence[str]] = None,

@@ -231,12 +231,11 @@ class TestXLAShardMapOwnedState(unittest.TestCase):
         ).reshape_as(process_parameter)
         updated_state = updated_parameter + 100
         with torch.no_grad():
-            DeviceStateManager().process_outputs(
+            DeviceStateManager().commit_step_state(
                 [
                     params_for_layout["weight"],
                     states_for_layout["weight"]["exp_avg"],
                 ],
-                torch.zeros(()),
                 [updated_parameter, updated_state],
                 last_train_step=False,
             )

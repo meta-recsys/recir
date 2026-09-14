@@ -12,7 +12,7 @@ The original bug fixed by commit 18 was invisible to the structural
 recompiled the sub-GMs and invoked ``forward``. Commit 16's silent
 ``None`` substitution corrupted the recompiled setup_gm / cleanup_gm
 forward; the corruption only surfaced at runtime when downstream code
-(``recir/lowering/xla_device_state.py:_sync_flat_state``) tried to
+(``recir/lowering/xla_device_state.py:_copy_state_into``) tried to
 ``state_tensor.copy_(None)``.
 
 This module exercises the full flow:

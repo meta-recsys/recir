@@ -268,12 +268,12 @@ class XLADeviceStateManagerTest(unittest.TestCase):
             "recir.lowering.xla_device_state._jax_to_torch",
             return_value=updated_torch,
         ) as mock_jax_to_torch:
-            output = manager.process_outputs(
+            manager.commit_step_state(
                 flat_state,
-                torch.tensor(1.0),
                 [updated],
                 last_train_step=False,
             )
+            output = manager.materialize_output(torch.tensor(1.0))
             cached_state = manager.device_state
 
             self.assertTrue(torch.equal(flat_state[0], torch.zeros(2)))
@@ -283,7 +283,7 @@ class XLADeviceStateManagerTest(unittest.TestCase):
             self.assertIs(cached_state[0], updated)
             mock_jax_to_torch.assert_not_called()
 
-            manager.sync_to_torch(flat_state)
+            manager.copy_state_to_host(flat_state)
 
         self.assertTrue(torch.equal(flat_state[0], updated_torch))
         self.assertIs(manager.device_state, cached_state)
@@ -301,9 +301,8 @@ class XLADeviceStateManagerTest(unittest.TestCase):
             "recir.lowering.xla_device_state._jax_to_torch",
             return_value=updated_torch,
         ) as mock_jax_to_torch:
-            manager.process_outputs(
+            manager.commit_step_state(
                 flat_state,
-                torch.tensor(1.0),
                 [updated],
                 last_train_step=True,
             )
@@ -319,7 +318,7 @@ class XLADeviceStateManagerTest(unittest.TestCase):
         flat_state = [torch.zeros(2)]
         user_input = torch.ones(2)
 
-        with mock.patch.object(manager, "sync_to_torch") as sync_to_torch:
+        with mock.patch.object(manager, "copy_state_to_host") as copy_state_to_host:
             inputs = manager.prepare_inputs(
                 gm,
                 flat_state,
@@ -335,7 +334,7 @@ class XLADeviceStateManagerTest(unittest.TestCase):
 
         self.assertEqual(
             [mock.call(flat_state), mock.call(flat_state)],
-            sync_to_torch.call_args_list,
+            copy_state_to_host.call_args_list,
         )
         self.assertIs(manager.device_state, cached_state)
         self.assertIs(inputs[0], flat_state[0])

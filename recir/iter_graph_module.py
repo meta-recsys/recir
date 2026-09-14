@@ -461,7 +461,7 @@ class IterGraph(fx.Graph):
                 survives into the recompiled mirror forward and
                 crashes downstream consumers -- the runtime regression
                 that motivated commit 18 (see
-                ``recir/lowering/xla_device_state.py:_sync_flat_state``).
+                ``recir/lowering/xla_device_state.py:_copy_state_into``).
 
         Background:
             Commit 16 generalized commit 15's profiler-marker fix by
