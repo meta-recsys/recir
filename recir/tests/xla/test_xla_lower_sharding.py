@@ -285,5 +285,69 @@ class ToShardedJaxTest(unittest.TestCase):
         self.assertIs(out, arr)
 
 
+class HostArrayAssemblyTest(unittest.TestCase):
+    """A torch input must reach the mesh in ONE dispatch, not one per device.
+
+    Assembling the global array as ``[jax.device_put(shard, dev) for dev in
+    local_devices]`` + ``make_array_from_single_device_arrays`` costs a full JAX
+    dispatch per local device. On a 128-chip rankfm_mvai step that was 98 host
+    tensors x 8 local devices = 784 dispatches, 157 ms/step, for 15 ms of actual
+    H2D. ``make_array_from_process_local_data`` reaches a single
+    ``xc.batched_device_put`` covering all of this host's shards instead.
+
+    Counting ``jax.device_put`` catches a reintroduced per-device loop: the loop
+    resolves it as a module attribute (so the patch sees it), while the current
+    path never calls it by that name. A value-only assertion would pass either
+    way, so it would not guard the thing that regressed.
+    """
+
+    def setUp(self) -> None:
+        self.assertGreater(
+            jax.device_count(), 1, "test requires >=2 spoofed CPU devices"
+        )
+        self.mesh: Mesh = _mesh()
+        self.n: int = len(jax.local_devices())
+
+    def _assert_one_dispatch(self, tensor: torch.Tensor, **kwargs: object) -> object:
+        real = jax.device_put
+        with mock.patch.object(
+            jax, "device_put", side_effect=real, autospec=True
+        ) as spy:
+            out = _XLAModule._to_sharded_jax(tensor, self.mesh, **kwargs)
+        self.assertLessEqual(
+            spy.call_count,
+            1,
+            f"{spy.call_count} jax.device_put calls for one input; the "
+            "per-local-device assembly loop is back",
+        )
+        return out
+
+    def test_replicated_input(self) -> None:
+        host = np.arange(6, dtype=np.float32)
+        out = self._assert_one_dispatch(torch.from_numpy(host))
+        self.assertEqual(out.sharding, NamedSharding(self.mesh, P()))
+        np.testing.assert_array_equal(np.asarray(jax.device_get(out)), host)
+
+    def test_batch_input(self) -> None:
+        host = np.arange(4 * self.n * 3, dtype=np.float32).reshape(4 * self.n, 3)
+        out = self._assert_one_dispatch(torch.from_numpy(host), is_batch_input=True)
+        self.assertEqual(out.sharding, NamedSharding(self.mesh, P("torch_dist", None)))
+        np.testing.assert_array_equal(np.asarray(jax.device_get(out)), host)
+
+    def test_fsdp_input(self) -> None:
+        host = np.arange(2 * self.n * 5, dtype=np.float32).reshape(2 * self.n, 5)
+        out = self._assert_one_dispatch(torch.from_numpy(host), is_fsdp_tensor=True)
+        self.assertEqual(out.sharding, NamedSharding(self.mesh, P("torch_dist", None)))
+        np.testing.assert_array_equal(np.asarray(jax.device_get(out)), host)
+
+    def test_bool_input_is_not_recopied(self) -> None:
+        # torch.bool -> .numpy() is already np.bool_, so the astype() the old
+        # path applied was a pure copy: 5.7 ms/step for one [134676, 28] mask.
+        host = (np.arange(4 * self.n * 2).reshape(4 * self.n, 2) % 3) == 0
+        out = self._assert_one_dispatch(torch.from_numpy(host), is_batch_input=True)
+        self.assertEqual(out.dtype, np.bool_)
+        np.testing.assert_array_equal(np.asarray(jax.device_get(out)), host)
+
+
 if __name__ == "__main__":
     unittest.main()
