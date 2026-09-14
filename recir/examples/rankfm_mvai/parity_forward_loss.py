@@ -626,16 +626,17 @@ def _eager_step(
             else contextlib.nullcontext()
         )
         with autocast_ctx:
-            # flatten_batch bakes in world_candidate_sum = cross-host all_reduce(SUM)
-            # over num_candidates (trace_sample.py). But eager consumes ONLY the
-            # per-host batch (loss_module._num_local=1), so its main-head
-            # normalization denom (_candidate_axis_mean: sum(x)/world_candidate_sum)
-            # must be the LOCAL per-host candidate sum, matching its per-host
-            # numerator. Pairing a per-host numerator with the global (num_processes
-            # x) denom leaves the leaf params that feed ONLY the world-normalized
-            # main heads (mlp_task_arch._bias, debias_arch final layer) exactly
-            # num_processes x off in backward -- invisible single-host (all_reduce is
-            # identity), a hard fail on 32-host. Override to the local sum.
+            # flatten_batch's trailing slot is now the PRE-PAD per-sample
+            # candidate counts, reduced by .sum() inside the model
+            # (trace_sample.py). Eager has no device mesh, so that sum is
+            # already the LOCAL per-host count -- which is what this leg needs,
+            # since it consumes ONLY the per-host batch (loss_module._num_local
+            # =1) and its numerator is per-host too. The explicit override below
+            # is kept as a guard: pairing a per-host numerator with a global
+            # (num_processes x) denom leaves the leaf params that feed ONLY the
+            # world-normalized main heads (mlp_task_arch._bias, debias_arch
+            # final layer) exactly num_processes x off in backward -- invisible
+            # single-host, a hard fail on 32-host.
             _eager_args = list(flatten_batch(batch))
             _eager_args[-1] = batch.num_candidates.sum()
             all_losses, _named = model(*_eager_args)
