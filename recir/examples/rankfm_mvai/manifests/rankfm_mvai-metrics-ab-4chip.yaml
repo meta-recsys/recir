@@ -1,0 +1,280 @@
+# 4-chip A/B for the in-graph ranking-metric reduction.
+#
+# ONE image, two runs. `--in_graph_metrics` defaults to False, so the baseline
+# is this same file with that single line deleted -- no control image, which
+# removes "different build" as a variable. Produce the pair and prove it:
+#
+#   sed '/^ *--in_graph_metrics$/d' rankfm_mvai-metrics-ab-4chip.yaml > /tmp/base.yaml
+#   cp rankfm_mvai-metrics-ab-4chip.yaml /tmp/test.yaml
+#   diff /tmp/base.yaml /tmp/test.yaml     # must be exactly one line
+#   kubectl create -f /tmp/base.yaml && kubectl create -f /tmp/test.yaml
+#
+# What has to hold: NE/CTR/MSE/calibration curves identical. The diff under
+# test only moves where the reduction happens; the metric window is still
+# credited `padded_rows`, the same count `predictions.shape[-1]` gives today.
+# The pre-pad fix is the follow-up diff and is NOT armed here.
+#
+# Also check the batch-sharded counts match between the two. A missing GSPMD
+# all-reduce on the new `sum(dim=-1)` would show as an exact integer factor,
+# the same way D117449692 argued its denominator could not be 1/8.
+#
+# Differences from rankfm_mvai-verify-4chip.yaml, which this is copied from:
+#
+#   1. max_steps 4 -> 60. Four steps is a yes/no smoke test; it cannot produce
+#      a metric curve, and step 4 is still inside compile/warmup so a profile
+#      taken there says nothing about steady state.
+#   2. Profiling armed at steps 30-36, past warmup. The xplane is the direct
+#      evidence: `process_outputs` -> `_jax_to_torch` should collapse from its
+#      211 ms/step, and the delinearize CPU total with it.
+#   3. A separate image tag. The manifest this came from warns that pushing
+#      over a tag an `imagePullPolicy: Always` job is using kills that job on
+#      the next pod restart.
+#
+# Fast 4-chip verification of the prod-faithful COMPILED path.
+#
+# Purpose: get a yes/no on trace- and runtime-level defects in minutes instead
+# of waiting on a 4x4x8 slice. Everything here is prod's own config (the
+# artifact, prod's seq-len sampling, prod's dropout) EXCEPT the table size,
+# which is capped so 4 chips can hold it.
+#
+# Derived from rankfm_mvai-parity-in-graph.yaml. Four deliberate changes,
+# plus three parity-only flags dropped so the command tracks the 128-chip
+# manifest: --grad_accum_steps (made `[Replay] step N` mean micro-batches
+# rather than compiled calls), --light_loss_norm (exists to make the loss
+# comparable to the light leg, and is documented as meaningful only with
+# enable_padding=False), and --no_on_device_init (parity needs it to copy a
+# checkpoint into the tables; nothing is loaded here and 128-chip relies on
+# on-device init to stay within host memory).
+#
+# The four changes:
+#
+#   1. --disable_seq_len_sampling REMOVED. Prod turns the L1 sampler on, and
+#      whether the trace survives that is one of the things this checks.
+#   2. Data is the 128-chip barnfs dump, not parity_dump. The parity_dump
+#      prefix no longer exists in GCS, and a pod pointed at it waits on the
+#      mount-ready probe forever rather than failing.
+#   3. image tag linjianma-assert, NOT linjianma-compiled or linjianma-parity.
+#      These are different images; four rounds of diagnostics once landed in an
+#      image this job never pulled, and every one of them looked like "the code
+#      did not run". A SEPARATE tag from the 128-chip run on purpose: that run
+#      is live on linjianma-compiled with imagePullPolicy: Always, so pushing
+#      the hard-assert build over its tag would kill it the moment any pod
+#      restarted.
+#   4. RECIR_DUMP_GRAPHS=full, so the HLO is dumped. Set it to 0 for a plain
+#      functional check -- full costs roughly 270k log lines.
+#
+# WHAT THIS CANNOT TELL YOU
+#
+#   * --hash_size_cap 100000 means no table here is anywhere near int32, so
+#     nothing about the 3e9 vocabulary, its id widths, or HBM is exercised.
+#     That needs rankfm_mvai-128chip.yaml.
+#   * Reaching the last step is not the same as being correct. A constant
+#     PRNG key and a frozen LR both produce a clean run to completion; both
+#     were caught only by reading the HLO.
+#
+# RUN
+#
+#   export HTTPS_PROXY=http://fwdproxy:8080
+#   kubectl create -f recir/examples/rankfm_mvai/manifests/rankfm_mvai-verify-4chip.yaml \
+#       -n ns-mrs-core-shared
+#
+# LOGS -- the container is named `rankfm` here, not `rankfm-mvai` as in the
+# 128-chip manifest:
+#
+#   kubectl logs -n ns-mrs-core-shared <pod> -c rankfm
+#
+# Artifacts (TensorBoard + xprof trace) can be mirrored to Manifold with
+# scripts/sync_run_artifacts.sh <jobset-name>.
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  generateName: rankfm-metrics-ab-4chip-
+  namespace: ns-mrs-core-shared
+spec:
+  replicatedJobs:
+  - name: worker
+    replicas: 1
+    template:
+      spec:
+        parallelism: 1
+        completions: 1
+        template:
+          metadata:
+            annotations:
+              # Injects the gcsfuse CSI sidecar for the parity-ckpt volume below.
+              # Without it the volume never mounts and the pod hangs on the
+              # missing file rather than reporting anything useful.
+              gke-gcsfuse/volumes: "true"
+          spec:
+            serviceAccountName: default
+            containers:
+            - name: rankfm
+              image: us-central1-docker.pkg.dev/mrs-tpu-y317h/recml/rankfm_mvai_tpu:linjianma-ingraph
+              imagePullPolicy: Always
+              env:
+              - name: PYTHONUNBUFFERED
+                value: "1"
+              - name: MASTER_PORT
+                value: "29500"
+              - name: JOBSET_NAME
+                valueFrom:
+                  fieldRef:
+                    fieldPath: metadata.labels['jobset.sigs.k8s.io/jobset-name']
+              # Which digests recir_train_step emits from inside the compiled
+              # program. This is the WHOLE gate for the compiled leg: unset or
+              # empty and the traced graph contains none of it. Distinct from
+              # PARITY_EMIT_DIGEST, which the driver injects and which arms the
+              # EAGER instrumentation -- setting only that one produces a run
+              # with zero digest lines and no indication why.
+              #
+              # Read at TRACE time, so it changes the graph: an armed and an
+              # unarmed run are not bit-identical and must not be compared
+              # across that boundary.
+              # Empty on purpose. Inherited armed from the manifest this was
+              # copied from, where it floods ~30k lines and rotated the metric
+              # report out of `kubectl logs` before the run finished -- which is
+              # the one thing this A/B needs to read. Both legs are compared
+              # against each other, not against a digest baseline.
+              - name: PARITY_DIGEST_KINDS
+                value: ""
+              # Diagnostic: print the make_fx graph with per-node shapes and
+              # stack traces (api.py:75-87). On for the GSPMD batch-dim
+              # investigation -- the (105, 10400) per-task tensor reaches
+              # xla_lower with batch_dim=0 and gets its TASK axis sharded, and
+              # the dump is what names the node that lost the real axis.
+              # Verbose; drop it once that is settled.
+              - name: RECIR_DUMP_GRAPHS
+                value: "0"
+              # The seq length the checkpoint was exported at and the light leg
+              # ran at. Position-embedding row counts follow from it, so a
+              # checkpoint exported at one length will not load at another.
+              - name: HSTU_MAX_SEQ_LEN
+                value: "256"
+              # Makes --prod_faithful work without //minimal_viable_ai, which is
+              # not staged into this image. See prod_config_artifact.py.
+              # Python stack on a fatal signal; a SIGSEGV otherwise leaves
+              # only stripped native frames and signal-handler noise.
+              - name: PYTHONFAULTHANDLER
+                value: "1"
+              - name: JAX_ENABLE_X64
+                value: "1"
+              - name: PROD_CONFIG_ARTIFACT
+                value: /mnt/prodcfg/prod_cfg.pt
+              # Mirrored from rankfm_mvai-parity-4chip.yaml so the TPU codegen
+              # path matches the other compiled runs.
+              - name: LIBTPU_INIT_ARGS
+                value: >-
+                  --xla_tpu_megacore_fusion_allow_ags=false
+                  --xla_enable_async_collective_permute=true
+                  --xla_tpu_enable_ag_backward_pipelining=true
+                  --xla_tpu_enable_data_parallel_all_reduce_opt=true
+                  --xla_tpu_data_parallel_opt_different_sized_ops=true
+                  --xla_tpu_enable_async_collective_fusion=true
+                  --xla_tpu_enable_async_collective_fusion_multiple_steps=true
+                  --xla_tpu_overlap_compute_collective_tc=true
+                  --xla_enable_async_all_gather=true
+              # NOTE: the block below is a FOLDED scalar (>-). Every line joins
+              # into ONE shell command, so a '#' anywhere inside comments out
+              # the whole rest of the command, silently. Do not annotate flags
+              # in place -- put remarks up here instead.
+              #
+              # No --grad_accum_steps here, unlike the parity manifest it came
+              # from. Parity needs accumulation to match the light leg's
+              # effective batch; this job only needs to know whether the graph
+              # traces, compiles and steps. Leaving it in made "step" ambiguous:
+              # `[Replay] step N` counts MICRO-BATCHES loaded, so with
+              # accumulation at 4 it is not the number of compiled calls, and
+              # defects that only appear on the second compiled call cannot be
+              # reasoned about from it. One progress() = one micro-batch = one
+              # optimizer step now.
+              #
+              # --init_state_dict_path is injected by the driver next to
+              # --prod_faithful. The FILE, not the mount point: the gcsfuse CSI
+              # ignores onlyDir and mounts the whole bucket, so the path carries
+              # the bucket-relative parity/ prefix, and /mnt/parity alone is a
+              # directory that fails with IsADirectoryError.
+              command:
+              - sh
+              - -c
+              - >-
+                echo "=== jax devices (see header note 1) ===" ;
+                python3 -c "import jax; print(jax.devices())" ;
+                FIRST_FILE=rank_0/batch_0/0.pt.zst ;
+                echo "waiting for /mnt/barnfs/$FIRST_FILE as mount-ready probe..." ;
+                START=$(date +%s) ;
+                while [ ! -e /mnt/barnfs/$FIRST_FILE ]; do
+                  sleep 5 ;
+                done ;
+                echo "data mount ready (after $(($(date +%s) - START))s); starting trainer..." ;
+                python3 -u -m recir.examples.rankfm_mvai.train
+                --prod_faithful
+                --embedding_backend in_graph
+                --max_steps 60
+                --local_batch_size 2048
+                --seq_len_cap 1400
+                --hash_size_cap 100000
+                --gcs_data_path /mnt/barnfs
+                --data_replicate_across_ranks
+                --metrics_report_interval 1
+                --pull_metrics_every 1
+                --profile_start_step 30
+                --profile_end_step 36
+                --profile_dir "gs://cq-mrs-core-shared_mrs_tpu_y317h/tpu-profiles/${JOBSET_NAME}"
+                --in_graph_metrics
+              ports:
+              - containerPort: 8471
+              resources:
+                limits:
+                  google.com/tpu: 4
+                requests:
+                  google.com/tpu: 4
+              volumeMounts:
+              - name: barnfs-data
+                mountPath: /mnt/barnfs
+                readOnly: true
+              - name: prod-cfg
+                mountPath: /mnt/prodcfg
+                readOnly: true
+              # Shared init weights. The comparison is only meaningful from
+              # identical starting weights, and the compare stage refuses to run
+              # when the two legs log different init ckpt sha256.
+              - name: parity-ckpt
+                mountPath: /mnt/parity
+                readOnly: true
+            nodeSelector:
+              cloud.google.com/gke-tpu-accelerator: tpu7x
+              cloud.google.com/gke-tpu-topology: 2x2x1
+            tolerations:
+            - key: google.com/tpu
+              operator: Exists
+              effect: NoSchedule
+            restartPolicy: Never
+            volumes:
+            # The dump the light leg replays, staged to GCS in the v0 layout
+            # (rank_R/batch_0/0.pt.zst + metadata.json) and served by gcsfuse.
+            # NOT the barnfs CSI: that driver is not registered on the TPU nodes
+            # this jobset schedules to.
+            - name: barnfs-data
+              csi:
+                driver: barnfs.csi.meta.com
+                readOnly: true
+                volumeAttributes:
+                  sourcePath: "gs://mrs-tpu-y317h/czheo_test/dataporter_2:prod:dataporter:xdb.mwfs_orchestration_prod:3186:279354:v0/"
+            - name: prod-cfg
+              configMap:
+                name: rankfm-prod-cfg
+            - name: parity-ckpt
+              csi:
+                driver: gcsfuse.csi.storage.gke.io
+                readOnly: true
+                volumeAttributes:
+                  # cq-mrs-core-shared_mrs_tpu_y317h, not mrs-tpu-y317h: the
+                  # latter holds the dump but is read-only for us
+                  # (storage.objects.create denied), so the checkpoint is staged
+                  # in the same bucket TensorBoard already writes to.
+                  bucketName: cq-mrs-core-shared_mrs_tpu_y317h
+                  # onlyDir is not honored by this CSI driver as a
+                  # volumeAttribute -- the whole BUCKET mounts at the mount
+                  # point. implicit-dirs so the prefix appears as a real
+                  # directory; GCS has no directories, only key prefixes.
+                  mountOptions: "implicit-dirs"

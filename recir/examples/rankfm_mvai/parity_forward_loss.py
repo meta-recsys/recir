@@ -1122,6 +1122,10 @@ def _build_cpu_tpu_model(padding: bool) -> Tuple[BlueReelsVDDTrainV3, Any]:
     module_config, _feature_config = build_module_config(
         model_args, enable_padding=padding
     )
+    # This comparison reads tb:user_export/{user,item}_embedding, and they are
+    # off by default because training copies 168 MB/step host-ward for nothing.
+    # Parity is the one caller that needs them.
+    module_config.export_user_item_embedding = True
     model = build_model_from_config(
         module_config,
         device,
