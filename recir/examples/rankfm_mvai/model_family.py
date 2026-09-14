@@ -67,7 +67,11 @@ from hammer.v3.models.udd_fm_v3.recir_core import (
     setup_dense_optimizer_and_warmup,
     WarmupController,
 )
-from hammer.v3.models.udd_fm_v3.recir_core.compile import compile_step
+from hammer.v3.models.udd_fm_v3.recir_core.compile import (
+    compile_step,
+    IN_GRAPH_METRICS_ATTR,
+    in_graph_metrics_enabled,
+)
 from hammer.v3.models.udd_fm_v3.recir_core.trace_sample import flatten_batch
 from hammer.v3.models.udd_fm_v3.udd_fm_config import BlueReelsVDDModuleConfig
 from hammer.v3.models.udd_fm_v3.udd_fm_family import BlueReelsVDDModelFamily
@@ -229,6 +233,18 @@ def _load_parity_checkpoint(target: nn.Module, ckpt_path: str) -> None:
     load_init_checkpoint(target, ckpt_path)
 
 
+def _in_graph_metric_states(
+    prediction: torch.Tensor, label: torch.Tensor, weight: torch.Tensor
+) -> Dict[str, torch.Tensor]:
+    """The in-graph ranking-metric reduction, as recir_train_step's hook."""
+    from recir.examples.rankfm_mvai.metric_states import (
+        compute_metric_states,
+        emit_keys,
+    )
+
+    return emit_keys(compute_metric_states(prediction, label, weight))
+
+
 class RecirXLACompiledModule(RecirCompiledModuleBase):
     """Self-compiling GSPMD/TPU recir train module (built by RankFMMvaiModelFamily).
 
@@ -352,6 +368,15 @@ class RecirXLACompiledModule(RecirCompiledModuleBase):
             sparse_lr_buffer=sparse_lr_buffer,
         )
         emb_opt = sparse_runtime.optimizer
+        # Hand recir_train_step the reduction itself rather than letting it
+        # import this package: recir_core is linked into every hammer
+        # udd_fm_v3 binary, and the torchrec metrics chain behind
+        # metric_states does not fit in those link trees.
+        setattr(
+            model,
+            IN_GRAPH_METRICS_ATTR,
+            _in_graph_metric_states if trainer_cfg.in_graph_metrics else None,
+        )
 
         region_transforms: List[Any] = []
         if trainer_cfg.enable_padding:
@@ -490,6 +515,10 @@ class RecirXLACompiledModule(RecirCompiledModuleBase):
             *flatten_batch(batch),
         )
         return result
+
+    @property
+    def in_graph_metrics(self) -> bool:
+        return in_graph_metrics_enabled(self._model)
 
     def flush_host_state(self, full: bool = False) -> None:
         """Mirror device-resident state back to torch for host consumers (e.g.

@@ -33,6 +33,12 @@ from hammer.v3.models.udd_fm_v3.parity.step_probe import StepProbe
 from minimal_viable_ai.core.trainer.train_pipeline import RecTrainPipelineProvider
 
 from .eager_step import EagerCPUStep
+from .metric_states import (
+    extract_states,
+    PADDED_ROWS,
+    update_ranking_metrics_from_states,
+    W_SUM,
+)
 from .snapshot_metrics import SnapshotMetrics
 from .xsurface_helpers import _log_hbm_memory
 
@@ -168,6 +174,9 @@ class RecirXLATrainPipeline(RankingTrainPipeline):
         self._step_metrics.extend(self._snapshot_metrics.step_metrics)
         self._step = 0
         self._host_sync_every: int = max(1, host_sync_every)
+        self._in_graph_metrics: bool = cast(
+            "RecirXLACompiledModule", model
+        ).in_graph_metrics
         self._profiling_active = False
         if jax_profiling:
             logger.info(
@@ -228,19 +237,63 @@ class RecirXLATrainPipeline(RankingTrainPipeline):
         # expects; the metrics were constructed on torch.device("cpu") to match
         # these host CPU tensors. weight=0 keeps padded rows out of NE/CTR/MSE;
         # num_real_candidates keeps variable-step x-axes and QPS padding-invariant.
-        ret: Dict[str, Any] = {
-            "prediction": named["prediction"],
-            "label": named["label"],
-            "weight": named["weight"],
-            # Real (pre-pad) per-host candidate count -> variable-step metrics
-            # x-axis stride (else it falls back to the PADDED labels.size(1)).
-            # Computed from the raw batch so the model needn't emit it.
-            "num_real_candidates": int(batch.num_candidates.sum()),
-        }
-        _assert_task_rows(ret["prediction"], self._all_task_names)
-        self._update_ranking_metrics(ret)
+        num_real_candidates = int(batch.num_candidates.sum())
+        if self._in_graph_metrics:
+            # The graph reduced prediction/label/weight to per-task accumulators,
+            # so those three were never emitted and never crossed the bus.
+            # `extract_states` raises if they are missing, which would mean the
+            # traced program and this flag disagree.
+            return losses, self._update_metrics_from_states(
+                named, losses, num_real_candidates
+            )
+        else:
+            ret: Dict[str, Any] = {
+                "prediction": named["prediction"],
+                "label": named["label"],
+                "weight": named["weight"],
+                # Real (pre-pad) per-host candidate count -> variable-step metrics
+                # x-axis stride (else it falls back to the PADDED labels.size(1)).
+                # Computed from the raw batch so the model needn't emit it.
+                "num_real_candidates": num_real_candidates,
+            }
+            _assert_task_rows(ret["prediction"], self._all_task_names)
+            self._update_ranking_metrics(ret)
+            self._snapshot_metrics.update(losses, named, self._model)
+            return losses, ret
+
+    def _update_metrics_from_states(
+        self,
+        named: Dict[str, Any],
+        losses: torch.Tensor,
+        num_real_candidates: int,
+    ) -> Dict[str, Any]:
+        states = extract_states(named)
+        _assert_task_rows(states[W_SUM], self._all_task_names)
+        # The PADDED width, which is exactly what the host path credits the
+        # window as `predictions.shape[-1]`. Keeping it identical is what lets
+        # this change be A/B'd against a control run for exact equality.
+        num_samples = int(states[PADDED_ROWS].item())
+        unfed = update_ranking_metrics_from_states(
+            states,
+            num_samples=num_samples,
+            num_real_candidates=num_real_candidates,
+            cls_metrics=self._cls_metrics,
+            reg_metrics=self._reg_metrics,
+            step_metrics=self._step_metrics,
+            cls_indices=self._cls_indices,
+            reg_indices=self._reg_indices,
+        )
+        if unfed:
+            # Loud rather than a frozen curve: a metric with no state mapper
+            # would otherwise report its seed value forever.
+            raise RuntimeError(
+                "in-graph metrics cannot feed "
+                f"{[type(getattr(m, 'rec_metric', m)).__name__ for m in unfed]}; "
+                "add a mapper in metric_states._mapper_for or keep this metric "
+                "off the in-graph path"
+            )
         self._snapshot_metrics.update(losses, named, self._model)
-        return losses, ret
+        return {"num_real_candidates": num_real_candidates, **states}
 
     @property
     def metrics(self) -> List[Any]:
