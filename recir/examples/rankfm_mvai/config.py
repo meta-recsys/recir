@@ -131,6 +131,7 @@ class RankFMTrainerConfig:
     # prepare ahead so file load, decompression, slicing, and ID remapping overlap
     # the device train_step. 0 disables prefetch (synchronous load).
     data_prefetch_buffer: int = 2
+    data_load_workers: int = 2
 
     # Initial weights from //hammer/v3/models/udd_fm_v3/parity:export_parity_checkpoint.
     # Empty (default) = normal initialisation.

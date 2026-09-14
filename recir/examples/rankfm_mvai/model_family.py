@@ -91,6 +91,7 @@ from torch.utils.data import IterableDataset
 # recir-compiled paths and the parity check use.
 from .config import RankFMModelArgs, RankFMTrainerConfig
 from .data_pipe import BatchReplayPipe, compute_kjt_key_to_size, replay_batch_iter
+from .prefetch import PrefetchingIterator
 from .rankfm_embedding_backends import build_embedding_backend
 from .xsurface_helpers import (
     _resolve_nro_per_sample,
@@ -869,20 +870,24 @@ class _RankFMIterableDataset(IterableDataset):
         device = torch.device("cpu")
         if self._data_pipe is not None:
             start = self._batch_index
-            for i, batch in enumerate(
-                replay_batch_iter(
-                    self._data_pipe,
-                    self._key_to_size or {},
-                    max_steps=trainer_cfg.max_steps,
-                    local_batch_size=trainer_cfg.local_batch_size,
-                    num_candidates=self._num_candidates,
-                    start_index=start,
-                )
-            ):
-                # Advance the checkpointable pointer as batches are consumed so
-                # a checkpoint saved mid-run records the exact data position.
-                self._batch_index = start + i + 1
-                yield batch
+            source = replay_batch_iter(
+                self._data_pipe,
+                self._key_to_size or {},
+                max_steps=trainer_cfg.max_steps,
+                local_batch_size=trainer_cfg.local_batch_size,
+                num_candidates=self._num_candidates,
+                start_index=start,
+                load_workers=trainer_cfg.data_load_workers,
+            )
+            depth = trainer_cfg.data_prefetch_buffer
+            prefetch = PrefetchingIterator(source, depth=depth) if depth > 0 else None
+            try:
+                for i, batch in enumerate(prefetch if prefetch is not None else source):
+                    self._batch_index = start + i + 1
+                    yield batch
+            finally:
+                if prefetch is not None:
+                    prefetch.close()
             return
 
         # Synthetic mode: same uniform batch unless padding (then fresh random).
