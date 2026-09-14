@@ -250,6 +250,7 @@ class InGraphRankFMBackend(InGraphEmbeddingBackend):
                 sample_feature_bundle=batch_sample,
                 precomputed_output=preproc_output,
                 num_processes=num_processes,
+                skip_backward_break=True,
             ),
             SparseArchInputBreakDispatcher(
                 input_kjt_keys=keys,
