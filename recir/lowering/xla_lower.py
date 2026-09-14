@@ -580,8 +580,8 @@ class _XLAModule(torch.nn.Module):
 
         Returns a plain ``numpy.ndarray`` (with ``ml_dtypes`` dtypes where
         numpy lacks native support, e.g. ``bfloat16``). The caller passes
-        the array directly to ``jax.device_put`` / ``np.split`` — no JAX
-        entry happens here, so this path never emits a tracer-level
+        the array directly to ``jax.make_array_from_process_local_data`` —
+        no JAX entry happens here, so this path never emits a tracer-level
         ``jit(convert_element_type)``.
 
         Why this matters: the previous implementation routed bf16 through
@@ -596,8 +596,6 @@ class _XLAModule(torch.nn.Module):
         zero JAX entry, and bit-identical.
         """
         t = tensor.detach().cpu().contiguous()
-        if t.dtype == torch.bool:
-            return t.numpy().astype(np.bool_)
         if t.dtype == torch.bfloat16:
             # ``torch.Tensor.view(dtype)`` requires contiguous memory and
             # reinterprets the underlying bits without copy. The numpy
@@ -622,9 +620,9 @@ class _XLAModule(torch.nn.Module):
         """Convert a PyTorch tensor to a properly sharded JAX array.
 
         Routes torch tensors through a pure-numpy intermediate (via
-        :meth:`_torch_to_numpy_for_jax`) and shards with :func:`np.split`
-        — JAX is only entered at the final :func:`jax.device_put`. This
-        avoids the per-weight ``jit(stage)+jit(convert_element_type)``
+        :meth:`_torch_to_numpy_for_jax`) — JAX is only entered at the
+        final :func:`jax.make_array_from_process_local_data`. This avoids
+        the per-weight ``jit(stage)+jit(convert_element_type)``
         micro-compile pair that the previous bf16 round-trip
         (``fp32 torch -> numpy fp32 -> astype(jnp.bfloat16)``) emitted
         and that deadlocked multi-host TPU runs above ~50 bf16 weights.
@@ -703,8 +701,7 @@ class _XLAModule(torch.nn.Module):
 
             nparray = _XLAModule._torch_to_numpy_for_jax(tensor)
 
-        local_devices = _get_local_devices()
-        num_local = len(local_devices)
+        num_local = len(_get_local_devices())
         # Honor :func:`aot_topology` here too: when set, the topology's
         # devices are reported globally, but ``_get_local_devices`` returns
         # the per-process slice so ``num_global // num_local`` still
@@ -713,12 +710,12 @@ class _XLAModule(torch.nn.Module):
         # AOT mode: the compile-only client returned by
         # ``get_topology_desc`` raises ``MakeArraysFromHostBufferShards
         # not available with compile-only client`` from
-        # ``jax.device_put`` / ``make_array_from_single_device_arrays``.
-        # Lowering only needs abstract input shapes/dtypes/shardings, so
-        # return ``jax.ShapeDtypeStruct`` instead. The corresponding
-        # ``run`` closures (see ``_build_*_executable``) short-circuit
-        # before invoking the executable so these abstract values are
-        # never executed.
+        # ``jax.make_array_from_process_local_data``. Lowering only needs
+        # abstract input shapes/dtypes/shardings, so return
+        # ``jax.ShapeDtypeStruct`` instead. The corresponding ``run``
+        # closures (see ``_build_*_executable``) short-circuit before
+        # invoking the executable so these abstract values are never
+        # executed.
         aot_active = _AOT_TOPOLOGY.get() is not None
         # Local→global multiplier. Use the topology-aware ratio
         # (num_global // num_local) so prebuild and runtime agree on the
@@ -748,12 +745,8 @@ class _XLAModule(torch.nn.Module):
                 return jax.ShapeDtypeStruct(
                     tuple(global_shape), nparray.dtype, sharding=sharding
                 )
-            local_shards = np.split(nparray, num_local, axis=input_batch_dim)
-            local_buffers = [
-                jax.device_put(s, d) for s, d in zip(local_shards, local_devices)
-            ]
-            return jax.make_array_from_single_device_arrays(
-                tuple(global_shape), sharding, local_buffers
+            return jax.make_array_from_process_local_data(
+                sharding, nparray, tuple(global_shape)
             )
         if is_fsdp_tensor and nparray.ndim >= 1:
             # FSDP: input is a local shard (after shard_params). Same
@@ -769,21 +762,16 @@ class _XLAModule(torch.nn.Module):
                 return jax.ShapeDtypeStruct(
                     tuple(global_shape), nparray.dtype, sharding=sharding
                 )
-            local_shards = np.split(nparray, num_local, axis=0)
-            local_buffers = [
-                jax.device_put(s, d) for s, d in zip(local_shards, local_devices)
-            ]
-            return jax.make_array_from_single_device_arrays(
-                tuple(global_shape), sharding, local_buffers
+            return jax.make_array_from_process_local_data(
+                sharding, nparray, tuple(global_shape)
             )
         sharding = NamedSharding(mesh, P())
         if aot_active:
             return jax.ShapeDtypeStruct(
                 tuple(nparray.shape), nparray.dtype, sharding=sharding
             )
-        local_buffers = [jax.device_put(nparray, d) for d in local_devices]
-        return jax.make_array_from_single_device_arrays(
-            nparray.shape, sharding, local_buffers
+        return jax.make_array_from_process_local_data(
+            sharding, nparray, tuple(nparray.shape)
         )
 
     def _jit_shard_map(
