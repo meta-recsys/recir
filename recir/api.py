@@ -858,7 +858,7 @@ def _compute_state_fqns(structure: Any) -> List[str]:
 
     ``structure`` must be the SAME object passed to ``tree_leaves`` to build
     flat_state (params/buffers dict + named_states), so the paths line up 1:1
-    with flat_state. Used to let ``sync_to_torch`` skip entries by name.
+    with flat_state. Used to let ``copy_state_to_host`` skip entries by name.
     """
     try:
         leaves_with_path, _ = pytree.tree_flatten_with_path(structure)
@@ -2480,7 +2480,7 @@ PREPARE_COMPILED_ATTR = "_recir_prepare_compiled"
 def make_compiled_runner(compiled_obj: Any) -> Callable[..., Any]:
     """Wrap a ``_CompiledResult`` into a user-facing callable.
 
-    Builds the standard "prepare_inputs -> gm(*flat_inps) -> process_outputs"
+    Builds the standard "prepare_inputs -> gm(*flat_inps) -> commit_step_state"
     runtime adapter that every recir orchestrator (``recir.compile``,
     :func:`recir.examples.dlrmv3.jax_embedding.compile_with_jax_embedding`,
     the rankfm trainer, custom dispatchers in tests) emits after stage 10.
@@ -2492,8 +2492,11 @@ def make_compiled_runner(compiled_obj: Any) -> Callable[..., Any]:
     * invokes ``compiled_obj.gm(*flat_inps)``, falling back to a plain call
       when the GM doesn't accept the ``last_iter`` kwarg (i.e. when no
       :class:`IterGraphModule` wrap was applied);
-    * post-processes via :meth:`compiled_obj.state_manager.process_outputs`
-      to map updated state tensors back into the user-visible return value;
+    * splits the epilogue between
+      :meth:`compiled_obj.state_manager.commit_step_state` (make the step's
+      state outputs the resident state) and :meth:`~materialize_output` (hand
+      the caller the step's output, unless it armed ``keep_output_jax`` to pull
+      it itself later);
     * stashes ``compiled_obj`` on the wrapper's ``__dict__`` under
       :data:`COMPILED_OBJECT_KEY` so :func:`sync_device_state_to_torch` can
       find it.
@@ -2541,12 +2544,13 @@ def make_compiled_runner(compiled_obj: Any) -> Callable[..., Any]:
                 output_all = compiled_obj.gm(*flat_inps)
             output = output_all[0]
             updated_flat = pytree.tree_leaves(output_all[1:])
-            return compiled_obj.state_manager.process_outputs(
-                compiled_obj.flat_state,
-                output,
-                updated_flat,
-                last_train_step,
+            state_manager = compiled_obj.state_manager
+            state_manager.commit_step_state(
+                compiled_obj.flat_state, updated_flat, last_train_step
             )
+            if state_manager.defers_output(last_train_step):
+                return output
+            return state_manager.materialize_output(output)
 
     runner.__dict__[COMPILED_OBJECT_KEY] = compiled_obj
     return runner
@@ -2807,12 +2811,12 @@ def compile(  # noqa: C901 — orchestration: stages 0-9 + legacy DP/GSPMD wirin
 
                 output = output_all[0]
                 updated_flat = pytree.tree_leaves(output_all[1:])
-                output = compiled_obj.state_manager.process_outputs(
-                    compiled_obj.flat_state,
-                    output,
-                    updated_flat,
-                    last_train_step,
+                state_manager = compiled_obj.state_manager
+                state_manager.commit_step_state(
+                    compiled_obj.flat_state, updated_flat, last_train_step
                 )
+                if not state_manager.defers_output(last_train_step):
+                    output = state_manager.materialize_output(output)
 
                 return output
 
@@ -2856,7 +2860,7 @@ def sync_device_state_to_torch(
         return
     if compiled_obj.state_manager.device_state is None:
         return
-    compiled_obj.state_manager.sync_to_torch(
+    compiled_obj.state_manager.copy_state_to_host(
         compiled_obj.flat_state, skip_fqns=skip_fqns
     )
 

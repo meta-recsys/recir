@@ -48,7 +48,7 @@ class TorchTPUBackend(Backend):
 
     def device_state_manager(self) -> DeviceStateManager:
         # State lives on the tpu device (model + lifted params are traced on
-        # tpu). The base manager's process_outputs copies returned (tpu) state
+        # tpu). The base manager's commit_step_state copies returned (tpu) state
         # back into the resident state tensors by index, matching recir's
         # state-as-output convention; per-subgraph device placement also happens
         # inside _TorchTPUModule.

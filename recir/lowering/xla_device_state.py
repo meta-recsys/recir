@@ -29,7 +29,7 @@ class XLADeviceStateManager(DeviceStateManager):
 
         They enter _XLAModule as inputs but are not returned as outputs.
 
-        This means process_outputs can never capture them as JAX arrays —
+        This means commit_step_state can never capture them as JAX arrays —
         they always remain whatever type was in flat_inps, i.e. torch.Tensor.
 
         Converting them here, once, and caching in
@@ -49,7 +49,8 @@ class XLADeviceStateManager(DeviceStateManager):
                     # "Cannot copy out of meta tensor". Leave them unconverted:
                     # _XLAModule._to_sharded_jax has a meta branch that generates
                     # each device's shard directly in HBM via jax.random (no host
-                    # alloc / H2D). After the first step, process_outputs caches the
+                    # alloc / H2D). After the first step, commit_step_state
+                    # caches the
                     # materialized jax.Array, so this only matters on the first call.
                     jax_state.append(t)
                 else:
@@ -69,7 +70,7 @@ class XLADeviceStateManager(DeviceStateManager):
         # convert state tensors to JAX arrays once and cache. On subsequent
         # calls, _XLAModule._t2j_safe / _to_sharded_jax sees jax.Array and
         # returns immediately, skipping per-tensor dispatch.
-        # For training, process_outputs overwrites device_state with updated
+        # For training, commit_step_state overwrites device_state with updated
         # weights from the graph output after each step, so this initial
         # conversion is overwritten and does not affect correctness.
         #
@@ -80,7 +81,7 @@ class XLADeviceStateManager(DeviceStateManager):
         # sharding check. For multi-device we leave device_state unset on the
         # first call and fall through to the slow path; _XLAModule._to_sharded_jax
         # then applies the correct shardings (and the meta-init branch), and
-        # process_outputs caches the correctly-sharded JAX device_state so the
+        # commit_step_state caches the correctly-sharded JAX device_state so the
         # fast path is used on subsequent steps.
         import jax  # @manual
 
@@ -93,10 +94,10 @@ class XLADeviceStateManager(DeviceStateManager):
         if last_train_step and self.device_state is not None:
             # The final slow path consumes every PyTorch flat_state leaf, so
             # partial/skip-FQN synchronization is not valid here. Keep the cache
-            # until process_outputs completes: if execution raises, the cached
+            # until commit_step_state completes: if execution raises, the cached
             # pre-call state remains authoritative and a retry can refresh the
             # host mirror again.
-            self.sync_to_torch(flat_state)
+            self.copy_state_to_host(flat_state)
         device_state = self.device_state
         self._used_fast_path = device_state is not None and not last_train_step
         if self._used_fast_path:
@@ -110,30 +111,21 @@ class XLADeviceStateManager(DeviceStateManager):
             self._set_keep_jax_output(gm, False)
             return flat_state + user_inps
 
-    def process_outputs(
+    def commit_step_state(
         self,
         flat_state: List[torch.Tensor],
-        output: Any,
         updated_flat: List[Any],
         last_train_step: bool,
-    ) -> torch.Tensor:
-        num_state = len(flat_state)
+    ) -> None:
+        # On the fast path the updated state stays on device and is simply
+        # re-cached; only the slow path (first multi-device call, last step)
+        # mirrors it host-ward.
         if not self._used_fast_path:
-            self._sync_flat_state(flat_state, updated_flat)
+            self._copy_state_into(flat_state, updated_flat)
         if last_train_step:
             self.device_state = None
         else:
-            self.device_state = updated_flat[:num_state]
-        # Phase-3 pipelining: optionally skip the per-step output device->host
-        # materialization so the caller can pull it on a cadence (lets JAX run the
-        # host ahead, overlapping the next step's H2D/dispatch with this step's
-        # compute). On the last step we always materialize so callers get a torch
-        # result. device_state above is unaffected (state still stays on-device).
-        if self.keep_output_jax and not last_train_step:
-            return output
-        if not isinstance(output, torch.Tensor) and output is not None:
-            output = _jax_to_torch(output, self.torch_device)
-        return output
+            self.device_state = updated_flat[: len(flat_state)]
 
     def materialize_output(self, output: Any) -> Any:
         """Convert a deferred (JAX) step output to torch. Passes through values
@@ -153,42 +145,31 @@ class XLADeviceStateManager(DeviceStateManager):
             }
         return _jax_to_torch(output, self.torch_device)
 
-    def _sync_flat_state(
+    def _copy_state_into(
         self,
         flat_state: List[torch.Tensor],
-        updated_flat: List[Any],
-    ) -> None:
-        """Copy graph outputs back to flat_state tensors."""
-        for i, state_tensor in enumerate(flat_state):
-            if i < len(updated_flat):
-                updated = updated_flat[i]
-                if isinstance(updated, torch.Tensor):
-                    if updated.data_ptr() != state_tensor.data_ptr():
-                        assert updated.shape == state_tensor.shape
-                        state_tensor.copy_(updated)
-                else:
-                    state_tensor.copy_(_jax_to_torch(updated, self.torch_device))
-
-    def sync_to_torch(
-        self,
-        flat_state: List[torch.Tensor],
+        source: Sequence[Any],
         skip_fqns: Optional[Sequence[str]] = None,
     ) -> None:
-        device_state = self.device_state
-        if device_state is None:
-            return
+        """Copy ``source[i]`` into ``flat_state[i]``, converting from JAX if needed.
+
+        The one device->host copy loop. Its two callers differ only in where the
+        values come from: ``commit_step_state`` passes the step's graph outputs,
+        ``copy_state_to_host`` passes the cached ``device_state``.
+
+        ``skip_fqns`` lets callers avoid the copy + transpose of named state
+        entries (e.g. the on-device embedding-table shards). Those are updated
+        in-graph and only need a host copy at checkpoint time; copying them every
+        step is O(table size) and dominates the step for large tables. Dense
+        params / metric buffers don't match and still sync. Matched as a
+        substring of the entry's FQN so a table prefix skips the table and (if
+        present) its optimizer state.
+        """
         fqns = self.state_fqns
         with torch.no_grad():
-            for i, jax_val in enumerate(device_state):
-                if i >= len(flat_state):
-                    continue
-                # skip_fqns lets callers avoid the per-step device->host copy +
-                # transpose of named state entries (e.g. the on-device embedding-
-                # table shards). Those are updated in-graph and only need a host
-                # copy at checkpoint time; copying them every step is O(table
-                # size) and dominates the step for large tables. Matched as a
-                # substring of the entry's FQN so a table prefix skips the table
-                # and (if present) its optimizer state.
+            for i, state_tensor in enumerate(flat_state):
+                if i >= len(source):
+                    break
                 if (
                     skip_fqns
                     and fqns is not None
@@ -196,4 +177,28 @@ class XLADeviceStateManager(DeviceStateManager):
                     and any(pat in fqns[i] for pat in skip_fqns)
                 ):
                     continue
-                flat_state[i].copy_(_jax_to_torch(jax_val, self.torch_device))
+                updated = source[i]
+                if isinstance(updated, torch.Tensor):
+                    if updated.data_ptr() == state_tensor.data_ptr():
+                        continue
+                    assert updated.shape == state_tensor.shape
+                    state_tensor.copy_(updated)
+                else:
+                    state_tensor.copy_(_jax_to_torch(updated, self.torch_device))
+
+    def copy_state_to_host(
+        self,
+        flat_state: List[torch.Tensor],
+        skip_fqns: Optional[Sequence[str]] = None,
+    ) -> None:
+        """Mirror the cached device state host-ward, on demand.
+
+        Distinct from ``commit_step_state``, which folds THIS step's graph
+        outputs in as part of the runner's epilogue. This one is driven by the
+        training loop on its own cadence (``sync_device_state_to_torch``) and
+        reads the cache.
+        """
+        device_state = self.device_state
+        if device_state is None:
+            return
+        self._copy_state_into(flat_state, device_state, skip_fqns)

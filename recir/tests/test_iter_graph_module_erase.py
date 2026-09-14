@@ -33,7 +33,7 @@ History
   graphs where the mirror's output flowed into ``output`` (e.g.
   Adam's ``addcdiv_`` mirror) because the substituted ``None`` was
   baked into the recompiled setup_gm / cleanup_gm forward and crashed
-  ``state_tensor.copy_(None)`` at runtime in ``_sync_flat_state``.
+  ``state_tensor.copy_(None)`` at runtime in ``_copy_state_into``.
 
 * Commit 18 (this file): ``IterGraph.erase_node`` now RAISES when a
   mirror still has live users at erase time, unless the caller
@@ -240,7 +240,7 @@ class IterGraphModuleEraseTest(unittest.TestCase):
             ``unsafe_drop_users=True``, accepting responsibility).
           * It MUST NOT silently leave a ``None`` reference in a
             recompiled Mirror graph that downstream consumers (the
-            recompiled forward, ``_sync_flat_state``, etc.) would
+            recompiled forward, ``_copy_state_into``, etc.) would
             interpret as a real tensor and crash on.
 
         The contract is enforced by two complementary paths in
