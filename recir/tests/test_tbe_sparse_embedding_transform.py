@@ -18,6 +18,7 @@ from functorch import make_fx
 from recir.pipeline import build_pipeline, PipelinedGraphModule
 from recir.pipeline_strategies import sdd_pipeline_config, semi_sync_pipeline_config
 from recir.region_transforms.tbe_sparse_embedding import TBESparseEmbeddingTransform
+from torch.distributed import ProcessGroup
 from torch.distributed.tensor import DeviceMesh
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
@@ -105,6 +106,7 @@ class TBESparseEmbeddingTransformTest(unittest.TestCase):
         model: _TwoTableModel | None = None,
         num_embeddings_map: dict[str, int] | None = None,
         use_index_dedup: bool = False,
+        process_group: ProcessGroup | None = None,
         learning_rate_tensor: torch.Tensor | None = None,
         meta_optimizer_state: bool = False,
     ) -> tuple[TBESparseEmbeddingTransform, _TwoTableModel, fx.GraphModule]:
@@ -133,6 +135,7 @@ class TBESparseEmbeddingTransformTest(unittest.TestCase):
             {"table_0.weight", "table_1.weight"},
             _mock_mesh(world_size, rank),
             model,
+            process_group=process_group,
             num_embeddings_map=num_embeddings_map
             or {
                 "table_0.weight": 8 * world_size,
@@ -288,12 +291,16 @@ class TBESparseEmbeddingTransformTest(unittest.TestCase):
             )
 
     def test_outer_transform_keeps_collectives_and_fused_tbe(self) -> None:
+        process_group = MagicMock(spec=ProcessGroup)
+        process_group.size.return_value = 2
+        process_group.group_name = "separate_tbe_test_group"
         transform, model, gm = self._transform(
             world_size=2,
             num_embeddings_map={
                 "table_0.weight": 15,
                 "table_1.weight": 11,
             },
+            process_group=process_group,
         )
 
         def train_step(
@@ -337,9 +344,14 @@ class TBESparseEmbeddingTransformTest(unittest.TestCase):
         self.assertEqual(
             sum("recir.tbe_backward_update" in target for target in targets), 1
         )
-        self.assertEqual(
-            sum("_c10d_functional.all_to_all_single" in target for target in targets),
-            4,
+        all_to_all_nodes = [
+            node
+            for node in joint.graph.nodes
+            if node.target == torch.ops._c10d_functional.all_to_all_single.default
+        ]
+        self.assertEqual(len(all_to_all_nodes), 4)
+        self.assertTrue(
+            all(node.args[3] == process_group.group_name for node in all_to_all_nodes)
         )
 
         pipeline = build_pipeline(joint, sdd_pipeline_config())
