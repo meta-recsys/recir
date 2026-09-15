@@ -15,6 +15,8 @@ import torch
 import torch.fx as fx
 import torch.nn as nn
 from functorch import make_fx
+from recir.pipeline import build_pipeline, PipelinedGraphModule
+from recir.pipeline_strategies import sdd_pipeline_config, semi_sync_pipeline_config
 from recir.region_transforms.tbe_sparse_embedding import TBESparseEmbeddingTransform
 from torch.distributed.tensor import DeviceMesh
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
@@ -339,6 +341,57 @@ class TBESparseEmbeddingTransformTest(unittest.TestCase):
             sum("_c10d_functional.all_to_all_single" in target for target in targets),
             4,
         )
+
+        pipeline = build_pipeline(joint, sdd_pipeline_config())
+        self.assertIsInstance(pipeline, PipelinedGraphModule)
+        stages = pipeline.stage_graph_modules()
+        self.assertEqual(len(stages), 3)
+        stage_targets = [
+            [str(node.target) for node in stage.graph.nodes] for stage in stages
+        ]
+        self.assertEqual(
+            sum(
+                "_c10d_functional.all_to_all_single" in target
+                for target in stage_targets[0]
+            ),
+            1,
+        )
+        self.assertEqual(
+            sum(
+                "_c10d_functional.all_to_all_single" in target
+                for target in stage_targets[1]
+            ),
+            1,
+        )
+        self.assertTrue(any("aten._to_copy" in target for target in stage_targets[1]))
+
+        del stage_targets, stages, pipeline
+        semi_sync = build_pipeline(
+            joint,
+            semi_sync_pipeline_config(start_batch=0),
+        )
+        self.assertIsInstance(semi_sync, PipelinedGraphModule)
+        semi_sync_stages = semi_sync.stage_graph_modules()
+        self.assertEqual(len(semi_sync_stages), 4)
+        self.assertTrue(
+            any(
+                node.target == torch.ops.recir.tbe_forward.default
+                for node in semi_sync_stages[2].graph.nodes
+            )
+        )
+        self.assertTrue(
+            any(
+                node.target == torch.ops._c10d_functional.all_to_all_single.default
+                for node in semi_sync_stages[2].graph.nodes
+            )
+        )
+        self.assertTrue(
+            any(
+                node.target == torch.ops.recir.tbe_backward_update.default
+                for node in semi_sync_stages[3].graph.nodes
+            )
+        )
+
         bucketize_nodes = [
             node
             for node in joint.graph.nodes
