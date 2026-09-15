@@ -34,6 +34,7 @@ from recir.region_transforms.base import RegionTransform
 from recir.region_transforms.sparse_embedding import _declare_split_invariants
 from recir.tbe.local import LocalTBEGroup, LocalTBETable, nobag_tbe_offsets
 from torch._subclasses.fake_tensor import unset_fake_temporarily
+from torch.distributed import ProcessGroup
 from torch.distributed.tensor import DeviceMesh
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
@@ -409,6 +410,7 @@ class TBESparseEmbeddingTransform(RegionTransform):
         mesh: DeviceMesh,
         mod: nn.Module | None = None,
         *,
+        process_group: ProcessGroup | None = None,
         embedding_location_map: dict[str, str] | None = None,
         num_embeddings_map: dict[str, int] | None = None,
         learning_rate: float = 0.1,
@@ -423,7 +425,13 @@ class TBESparseEmbeddingTransform(RegionTransform):
         self._source_fqns = set(embedding_param_fqns)
         self.mesh = mesh
         self.world_size = mesh.size()
-        self.group_name = funcol._resolve_group_name((mesh, 0))
+        if process_group is not None and process_group.size() != self.world_size:
+            raise ValueError(
+                "TBE process group size must match the embedding device mesh size."
+            )
+        self.group_name = funcol._resolve_group_name(
+            process_group if process_group is not None else (mesh, 0)
+        )
         self.mod = mod
         self.embedding_location_map = embedding_location_map or {}
         self.num_embeddings_map = num_embeddings_map or (
