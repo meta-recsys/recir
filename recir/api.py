@@ -53,6 +53,7 @@ from recir.distributed.parallel_mode import (
 )
 from recir.distributed.sharding_spec import FSDPWeightShardSpec, get_state_layout
 from recir.lowering.device_state import DeviceStateManager
+from recir.pipeline import build_pipeline, is_pipeline_pending, PipelineConfig
 from recir.region_transforms import (
     _apply_region_transforms,
     _discover_called_modules,
@@ -1728,6 +1729,7 @@ def compile_from_gm(  # noqa: C901 — orchestration: stages 4-8 of the pipeline
     parallel_mode: ParallelMode,
     backend: "Backend",
     region_transforms: Sequence[RegionTransform] = (),
+    pipeline_config: Optional[PipelineConfig] = None,
 ) -> _CompiledResult:
     """Stages 4-10: continue the pipeline from a pre-traced gm.
 
@@ -1996,8 +1998,10 @@ def compile_from_gm(  # noqa: C901 — orchestration: stages 4-8 of the pipeline
     for transform in region_transforms_list:
         transform.finalize_compiled_graph(gm)
 
+    pipeline = pipeline_config or PipelineConfig.none()
+    use_iter_graph = backend.uses_iter_graph and not pipeline.enabled
     # Stage 5.5: wrap before running passes that use IterGraph-only APIs.
-    if backend.uses_iter_graph:
+    if use_iter_graph:
         # Local import to avoid pulling IterGraphModule into the
         # module-import path for callers that don't use this path.
         from recir.iter_graph_module import IterGraphModule
@@ -2047,27 +2051,29 @@ def compile_from_gm(  # noqa: C901 — orchestration: stages 4-8 of the pipeline
         _annotate_fsdp_state_output_sharding(gm, flat_state, final_state_flags)
 
     # Stage 7: freeze cross-iteration rewrites and initialize extra-output state.
-    if backend.uses_iter_graph:
+    if use_iter_graph:
         from recir.iter_graph_module import IterGraphModule
 
         cast(IterGraphModule, gm).finalize_setup()
+
+    scheduled_gm: nn.Module = build_pipeline(gm, pipeline)
 
     # Stage 8: dispatch (backend.dispatch returns an nn.Module — typically
     # the same gm rewritten as a partial-lowered module, but the contract
     # only requires it be a callable nn.Module compatible with the flat-state
     # invocation convention).
-    dispatched = backend.dispatch(gm)
+    dispatched = backend.dispatch(cast(fx.GraphModule, scheduled_gm))
     # Preserve the gm reference (the dispatched module is typically the gm
     # itself, rewritten in place).  ``_CompiledResult.gm`` is callable, so
     # we use the dispatched module here.
-    final_gm = cast(fx.GraphModule, dispatched)
+    final_gm = dispatched
 
     sm = backend.device_state_manager()
     sm.state_fqns = _compute_state_fqns(
         [{**ctx.params, **ctx.buffers}, ctx.named_states]
     )
     return _CompiledResult(
-        gm=final_gm,
+        gm=cast(fx.GraphModule, final_gm),
         mod=ctx.mod,
         opts=ctx.opts,
         flat_state=flat_state,
@@ -2519,15 +2525,20 @@ def make_compiled_runner(compiled_obj: Any) -> Callable[..., Any]:
     # annotation is required because the value is captured by the ``runner``
     # closure below and pyre [53] flags unannotated captured locals.
     accepts_last_iter: bool
+    accepts_input_ready_event: bool
     try:
-        gm_sig = inspect.signature(compiled_obj.gm)
+        gm_forward = compiled_obj.gm.forward
+        gm_sig = inspect.signature(gm_forward)
         accepts_last_iter = "last_iter" in gm_sig.parameters
+        accepts_input_ready_event = "input_ready_event" in gm_sig.parameters
     except (TypeError, ValueError):
         accepts_last_iter = False
+        accepts_input_ready_event = False
 
     def runner(*call_args: Any, **call_kwargs: Any) -> Any:
-        last_train_step = (
-            call_kwargs.pop("last_train_step", False) if call_kwargs else False
+        last_train_step = call_kwargs.pop("last_train_step", False)
+        input_ready_event: Optional[torch.cuda.Event] = call_kwargs.pop(
+            "input_ready_event", None
         )
         user_inps = pytree.arg_tree_leaves(*call_args, **call_kwargs)
         flat_inps = compiled_obj.state_manager.prepare_inputs(
@@ -2537,11 +2548,18 @@ def make_compiled_runner(compiled_obj: Any) -> Callable[..., Any]:
             last_train_step,
         )
         with torch.no_grad():
+            gm_kwargs: Dict[str, Any] = {}
             if last_train_step and accepts_last_iter:
                 # Final iter: pass ``last_iter`` so IterGraphModule can flush.
-                output_all = compiled_obj.gm(*flat_inps, last_iter=last_train_step)
-            else:
-                output_all = compiled_obj.gm(*flat_inps)
+                gm_kwargs["last_iter"] = last_train_step
+            if input_ready_event is not None:
+                if accepts_input_ready_event:
+                    gm_kwargs["input_ready_event"] = input_ready_event
+                else:
+                    torch.cuda.current_stream().wait_event(input_ready_event)
+            output_all = compiled_obj.gm(*flat_inps, **gm_kwargs)
+            if is_pipeline_pending(output_all):
+                return output_all
             output = output_all[0]
             updated_flat = pytree.tree_leaves(output_all[1:])
             state_manager = compiled_obj.state_manager
