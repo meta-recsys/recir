@@ -185,6 +185,11 @@ class RankFMTrainerConfig:
     profile_dir: str = "/tmp/tpu_profile"
     enable_memory_log: bool = False
 
+    # Precompute the preprocessor graph break one step ahead on a background
+    # thread, so it overlaps the previous step's device compute instead of
+    # stalling it.
+    pipeline_preprocessor: bool = False
+
     # Make the sequence-length sampler enforce a derived token budget
     # rather than letting the padder truncate whatever overshoots. A trainer
     # knob, not a model one: the sampler is swapped on the built modules at

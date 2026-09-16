@@ -45,6 +45,7 @@ import recir.torchax.ops.jhstu_attention  # noqa: F401
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+import torch.utils._pytree as pytree
 
 if TYPE_CHECKING:
     from recir.embedding.backend import SparseOptimizerRuntime
@@ -63,7 +64,6 @@ from hammer.v3.models.udd_fm_v3.recir_core import (
     RecirCompiledModuleBase,
     RecirCompileSpec,
     RecirMode,
-    run_step_and_sync,
     setup_dense_optimizer_and_warmup,
     WarmupController,
 )
@@ -77,7 +77,7 @@ from hammer.v3.models.udd_fm_v3.udd_fm_config import BlueReelsVDDModuleConfig
 from hammer.v3.models.udd_fm_v3.udd_fm_family import BlueReelsVDDModelFamily
 from minimal_viable_ai.core.dataloader.dataloader_configs import DataSourceConfig
 from minimal_viable_ai.core.model_family_api.optimizer_configs import RecOptimizerConfig
-from recir.api import sync_device_state_to_torch
+from recir.api import COMPILED_OBJECT_KEY, sync_device_state_to_torch
 from recir.backends import XLAGSPMDBackend
 from recir.distributed.parallel_mode import GSPMDParallel
 from recir.examples.rankfm_mvai.budgeted_sampling import install_budgeted_sampling
@@ -259,7 +259,7 @@ class RecirXLACompiledModule(RecirCompiledModuleBase):
     ``set_recir_kjt_keys``, and builds the ``PaddingRegionTransform``. On the
     first forward it lazily compiles (``compile_gspmd_step`` for the single dense
     opt, or ``compile_step`` with (dense_opt, emb_opt) for the in_graph two-opt
-    program) and runs each step via ``run_step_and_sync`` / the runner.
+    program) and runs each step through the runner.
 
     Exposes ``dense_opt`` so the family can return it to the trainer (recir owns
     the step; the trainer never calls opt.step()), avoiding a NoOpOptimizer.
@@ -502,18 +502,26 @@ class RecirXLACompiledModule(RecirCompiledModuleBase):
 
         return compiled_step
 
+    def _step_args(self, batch: Any) -> Tuple[Any, ...]:
+        if self._emb_opt is None:
+            return (
+                self._model,
+                self._dense_opt,
+                *flatten_batch(batch, global_loss_denom=True),
+            )
+        return (self._model, self._dense_opt, self._emb_opt, *flatten_batch(batch))
+
+    def flat_step_args(self, batch: Any) -> List[Any]:
+        return pytree.arg_tree_leaves(*self._step_args(batch))
+
     def _run_step(
         self, compiled_step: Any, batch: Any
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-        if self._emb_opt is None:
-            return run_step_and_sync(compiled_step, self._model, self._dense_opt, batch)
-        # Two-optimizer runner: runner(model, dense_opt, emb_opt, *flat_batch).
         result: Tuple[torch.Tensor, Dict[str, torch.Tensor]] = compiled_step(
-            self._model,
-            self._dense_opt,
-            self._emb_opt,
-            *flatten_batch(batch),
+            *self._step_args(batch)
         )
+        if self._emb_opt is None:
+            sync_device_state_to_torch(compiled_step)
         return result
 
     @property
@@ -534,6 +542,26 @@ class RecirXLACompiledModule(RecirCompiledModuleBase):
         if compiled_step is not None:
             skip_fqns = None if full else _EMB_SYNC_SKIP_FQNS
             sync_device_state_to_torch(compiled_step, skip_fqns=skip_fqns)
+
+    def enable_output_pipelining(self) -> bool:
+        manager = self._state_manager()
+        if manager is None:
+            return False
+        manager.keep_output_jax = True
+        return True
+
+    def materialize_output(self, output: Any) -> Any:
+        manager = self._state_manager()
+        if manager is None:
+            return output
+        return manager.materialize_output(output)
+
+    def _state_manager(self) -> Any:
+        compiled_step = self._compiled_step
+        if compiled_step is None:
+            return None
+        compiled_obj = cast(Any, compiled_step).__dict__.get(COMPILED_OBJECT_KEY)
+        return None if compiled_obj is None else compiled_obj.state_manager
 
     def prepare_for_restore(self) -> None:
         """Ready the in_graph model to receive a checkpoint before dcp.load.
