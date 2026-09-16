@@ -1763,17 +1763,25 @@ def _materialize_meta_shard(
 def _shard_state_dict(
     state: Any,
     shard_spec: DTensorSpec,
+    state_device: Optional[torch.device] = None,
     *,
     own_storage: bool = False,
 ) -> None:
-    """Shard tensor values inside an optimizer state entry in-place."""
+    """Shard optimizer state and materialize meta shards on the parameter device."""
     if isinstance(state, dict):
         for key in state:
             if isinstance(state[key], torch.Tensor):
                 local_state = partition_value(
                     state[key], shard_spec, own_storage=own_storage
                 )
-                mark_meta_zero_init(local_state)
+                if (
+                    local_state.device.type == "meta"
+                    and state_device is not None
+                    and state_device.type != "meta"
+                ):
+                    local_state = torch.zeros_like(local_state, device=state_device)
+                else:
+                    mark_meta_zero_init(local_state)
                 state[key] = local_state
 
 
@@ -1810,6 +1818,7 @@ def _migrate_opt_after_param_swap(
                 _shard_state_dict(
                     state,
                     shard_spec,
+                    new_param.device,
                     own_storage=own_storage,
                 )
                 opt.state[new_param] = state

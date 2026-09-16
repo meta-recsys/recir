@@ -36,6 +36,7 @@ from recir.distributed.data_parallel import (
     shard_params_by_plan,
 )
 from recir.distributed.parallel_mode import DataParallel, HybridParallel
+from recir.meta_tensor_init import get_meta_init_spec
 from recir.passes import insert_weight_free_nodes
 from recir.region_transforms import RegatherTransform
 from recir.region_transforms.sparse_embedding import decomposed_row_wise_embedding
@@ -1891,6 +1892,12 @@ class EmbeddingMLP(nn.Module):
         return self.linear(emb_out.mean(dim=1))  # (batch, 4)
 
 
+class _MetaEmbedding(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.emb: nn.Embedding = nn.Embedding(16, 8, device="meta")
+
+
 def embedding_train_step(
     model: nn.Module, optim: torch.optim.Optimizer, train_batch: Any
 ) -> torch.Tensor:
@@ -2218,6 +2225,34 @@ class TestShardParamsByPlan(DTensorTestBase):
             opt.state[new_lin_param]["momentum_buffer"].shape,
             orig_lin_momentum_shape,
         )
+
+    @skip_if_lt_x_gpu(2)
+    @with_comms
+    def test_meta_optimizer_state_is_materialized_with_embedding_shard(self) -> None:
+        model = _MetaEmbedding()
+        optimizer = torch.optim.SGD([model.emb.weight], lr=0.1, foreach=True)
+        optimizer.state[model.emb.weight]["sum"] = torch.empty(
+            (16, 1), dtype=torch.float32, device="meta"
+        )
+        params: dict[str, torch.Tensor] = dict(model.named_parameters())
+        mesh = DeviceMesh("cuda", torch.arange(self.world_size))
+
+        shard_params_by_plan(
+            model,
+            params,
+            optimizer,
+            mesh,
+            DataParallelStyle.REPLICATE,
+            {"emb.weight"},
+        )
+
+        local_parameter = model.emb.weight
+        local_state = optimizer.state[local_parameter]["sum"]
+        self.assertEqual(local_parameter.device, torch.device(f"cuda:{self.rank}"))
+        self.assertEqual(local_state.device, local_parameter.device)
+        self.assertEqual(local_state.shape, (8, 1))
+        torch.testing.assert_close(local_state, torch.zeros_like(local_state))
+        self.assertIs(optimizer.param_groups[0]["params"][0], local_parameter)
 
     @skip_if_lt_x_gpu(2)
     @with_comms
@@ -2864,6 +2899,21 @@ class TestShardStateDict(unittest.TestCase):
         spec = MagicMock(spec=DTensorSpec)
         _shard_state_dict(None, spec)  # should not raise
         self.assertIsNone(None)  # verify no exception was raised
+
+    @unittest.mock.patch("recir.distributed.data_parallel.partition_value")
+    def test_meta_parameter_preserves_zero_state_initialization(
+        self,
+        mock_partition: Any,
+    ) -> None:
+        mock_partition.return_value = torch.empty((2, 1), device="meta")
+        state = {"sum": torch.empty((4, 1), device="meta")}
+        spec = MagicMock(spec=DTensorSpec)
+
+        _shard_state_dict(state, spec, state_device=torch.device("meta"))
+
+        self.assertEqual(state["sum"].device.type, "meta")
+        init_kind, _bound = get_meta_init_spec(state["sum"], default_bound=1.0)
+        self.assertEqual(init_kind, "zeros")
 
 
 class TestMultipleEmbeddingTables(DTensorTestBase):
