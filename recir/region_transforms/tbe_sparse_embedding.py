@@ -34,6 +34,7 @@ from recir.pipeline_strategies import PipelineRegion
 from recir.region_transforms.base import RegionTransform
 from recir.region_transforms.sparse_embedding import _declare_split_invariants
 from recir.tbe.local import LocalTBEGroup, LocalTBETable, nobag_tbe_offsets
+from recir.tbe.ops import get_permute_2d_sparse_data_op
 from torch._subclasses.fake_tensor import unset_fake_temporarily
 from torch.distributed import ProcessGroup
 from torch.distributed.tensor import DeviceMesh
@@ -791,41 +792,12 @@ def _lookup_dependencies(sites: Sequence[_LookupSite]) -> set[fx.Node]:
     return relevant
 
 
-def _replace_permuted_lengths(
-    gm: fx.GraphModule,
-    permutation: fx.Node,
-    lengths_2d: fx.Node,
-    flat_lengths: fx.Node,
-    feature_count: int,
-    before: fx.Node,
-) -> None:
-    """Express the length permutation without a data-dependent output size."""
-    with gm.graph.inserting_before(before):
-        dynamic_lengths = gm.graph.call_function(
-            torch.ops.aten.view.default,
-            args=(flat_lengths, [feature_count, -1]),
-        )
-        permuted_lengths = gm.graph.call_function(
-            torch.ops.aten.index_select.default,
-            args=(dynamic_lengths, 0, permutation),
-        )
-        flat_permuted_lengths = gm.graph.call_function(
-            torch.ops.aten.view.default,
-            args=(permuted_lengths, [-1]),
-        )
-    dynamic_lengths.meta = dict(lengths_2d.meta)
-    permuted_lengths.meta = dict(lengths_2d.meta)
-    for user in tuple(before.users):
-        if user.target is operator.getitem and user.args[1] == 0:
-            flat_permuted_lengths.meta = dict(user.meta)
-            user.replace_all_uses_with(flat_permuted_lengths)
-
-
 def _rewrite_relevant_kjt_permutations(
     gm: fx.GraphModule,
     sites: Sequence[_LookupSite],
 ) -> None:
     relevant = _lookup_dependencies(sites)
+    permutation_op = get_permute_2d_sparse_data_op()
 
     for node in tuple(gm.graph.nodes):
         if (
@@ -850,37 +822,23 @@ def _rewrite_relevant_kjt_permutations(
         permutation = _node_argument(node, 0, "permute", None)
         if not isinstance(permutation, fx.Node):
             continue
+        values = _node_argument(node, 2, "values", None)
+        if not isinstance(values, fx.Node):
+            continue
         with gm.graph.inserting_before(node):
-            length_count = gm.graph.call_function(
-                torch.ops.aten.sym_size.int,
-                args=(flat_lengths, 0),
-            )
-            stride = gm.graph.call_function(
-                operator.floordiv,
-                args=(length_count, feature_count),
-            )
             replacement = gm.graph.call_function(
-                torch.ops.fbgemm.permute_2D_sparse_data_input1D.default,
+                permutation_op,
                 args=cast(
                     tuple[Any, ...],
                     (
                         permutation,
                         flat_lengths,
-                        _node_argument(node, 2, "values", None),
-                        stride,
+                        values,
+                        feature_count,
                         _node_argument(node, 3, "weights", None),
-                        None,
                     ),
                 ),
             )
-        _replace_permuted_lengths(
-            gm,
-            permutation,
-            lengths_2d,
-            flat_lengths,
-            feature_count,
-            node,
-        )
         replacement.meta = dict(node.meta)
         node.replace_all_uses_with(replacement)
         gm.graph.erase_node(node)
@@ -1723,7 +1681,19 @@ class TBESparseEmbeddingTransform(RegionTransform):
         )
         if not isinstance(returned_output, fx.Node):
             raise RuntimeError("Expected pooled routing to return an FX node.")
+        source_offsets_value = source_offsets.meta.get("val")
+        forward_output_value = forward_output.meta.get("val")
+        if not isinstance(source_offsets_value, torch.Tensor) or not isinstance(
+            forward_output_value, torch.Tensor
+        ):
+            raise RuntimeError(
+                "Expected pooled routing nodes to carry tensor metadata."
+            )
         returned_output.meta = dict(forward_output.meta)
+        source_bag_count = (source_offsets_value.shape[0] - 1) // feature_count
+        returned_output.meta["val"] = forward_output_value.new_empty(
+            (source_bag_count, output_width)
+        )
         for user in tuple(forward_output.users):
             if user not in new_nodes:
                 user.replace_input_with(forward_output, returned_output)
