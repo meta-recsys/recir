@@ -6,7 +6,8 @@
 
 import contextlib
 import logging
-from typing import Any, Dict, Generator, List, Optional, Tuple
+import threading
+from typing import Any, Callable, Dict, Generator, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -22,6 +23,11 @@ from recir.eager_dispatch import (
     mark_input,
     mark_output_with_bwd,
 )
+from recir.examples.rankfm_mvai.graph_input_replay import (
+    build_dispatch_input_replay,
+    DispatchInputReplay,
+)
+from recir.examples.rankfm_mvai.preproc_pipeline import PreprocPipeline
 from recir.region_transforms.padding import (
     _per_chip_real_counts,
     pad_candidate_axis_to_static,
@@ -409,6 +415,66 @@ class PreprocessorDispatcher:
         # own; see the in_graph call site in rankfm_embedding_backends.py.
         self._skip_backward_break: bool = skip_backward_break
 
+        # --- one-step-ahead pipelining (off unless enable_pipelining runs) ---
+        self._pipeline: Optional[PreprocPipeline[Tuple[torch.Tensor, ...]]] = None
+        self._flat_step_args_fn: Optional[Callable[[Any], List[Any]]] = None
+        self._replay: Optional[DispatchInputReplay] = None
+        self._produce: Optional[Callable[..., Tuple[torch.Tensor, ...]]] = None
+        # (gm, dispatch_id, num_state_tensors) -- what build_dispatch_input_replay takes.
+        self._replay_build_args: Optional[Tuple[torch.fx.GraphModule, int, int]] = None
+        # Set by begin_step, read by the callback.
+        self._step: int = 0
+        self._fwd_calls_this_step: int = 0
+        self._batch: Optional[Any] = None
+        self._next_step: int = 0
+        self._next_batch: Optional[Any] = None
+        self._consumer: Optional[Callable[[], None]] = None
+        # The preprocessor stack is shared, and on a miss the callback runs it
+        # on the main thread while the worker may be running it for the next
+        # step. Serializing the degraded path costs nothing it was not already
+        # paying.
+        self._produce_lock: threading.Lock = threading.Lock()
+
+    def enable_pipelining(
+        self,
+        flat_step_args_fn: Callable[[Any], List[Any]],
+    ) -> None:
+        self._flat_step_args_fn = flat_step_args_fn
+        if self._pipeline is None:
+            self._pipeline = PreprocPipeline(name="preproc-producer")
+        build_args = self._replay_build_args
+        if build_args is not None and self._replay is None:
+            self._replay = build_dispatch_input_replay(*build_args)
+
+    def begin_step(self, step: int, batch: Any, next_batch: Optional[Any]) -> None:
+        self._step = step
+        self._fwd_calls_this_step = 0
+        self._batch = batch
+        self._next_step = step + 1
+        self._next_batch = next_batch
+
+    def set_consumer(self, consumer: Optional[Callable[[], None]]) -> None:
+        if consumer is not None and self._consumer is not None:
+            raise RuntimeError(
+                "the previous step's consume never ran; the graph break did "
+                "not fire, and its work would be dropped"
+            )
+        self._consumer = consumer
+
+    def drain_producer(self) -> None:
+        """Block until worker-side work has finished."""
+        if self._pipeline is not None:
+            self._pipeline.drain()
+
+    def close_pipelining(self) -> None:
+        if self._pipeline is not None:
+            logger.info(
+                f"[PIPE] producer hits={self._pipeline.hits} "
+                f"misses={self._pipeline.misses}"
+            )
+            self._pipeline.close()
+            self._pipeline = None
+
     def install_eager(self, model: nn.Module) -> None:
         for fqn, mod in list(model.named_modules()):
             if isinstance(mod, PreprocessorStack):
@@ -451,7 +517,7 @@ class PreprocessorDispatcher:
         output_tensor_descs: List[FeatureDescriptor] = dummy._tensor_descs
         output_kjt_descs: List[FeatureDescriptor] = dummy._kjt_descs
 
-        def fwd_fn(*input_tensors: torch.Tensor) -> Tuple[torch.Tensor, ...]:
+        def _produce(*input_tensors: torch.Tensor) -> Tuple[torch.Tensor, ...]:
             bundle = FeatureBundle()
             idx = 0
             for desc, type_tag, extra in entries:
@@ -744,7 +810,42 @@ class PreprocessorDispatcher:
             # this callable with save-for-backward + detach.
             return tuple(flat)
 
-        install_graph_break_dispatch(
+        def fwd_fn(*input_tensors: torch.Tensor) -> Tuple[torch.Tensor, ...]:
+            pipeline = self._pipeline
+            if pipeline is None:
+                return _produce(*input_tensors)
+            if self._replay is None:
+                raise RuntimeError(
+                    "preprocessor pipelining is on but no input replay was "
+                    "built for the installed graph break"
+                )
+
+            self._fwd_calls_this_step += 1
+            if self._fwd_calls_this_step != 1:
+                raise RuntimeError(
+                    f"the preprocessor graph break fired "
+                    f"{self._fwd_calls_this_step} times on step {self._step}; "
+                    "the step-keyed handoff requires exactly one"
+                )
+
+            result = pipeline.take(self._step)
+            if result is None:
+                with self._produce_lock:
+                    result = _produce(*input_tensors)
+
+            # Everything below is queued, not run: from here the device is busy
+            # for the rest of the step, which is the window the worker has to
+            # land in.
+            self._submit_verify(input_tensors)
+            self._submit_producer()
+            self._submit_consumer()
+            return result
+
+        self._replay = None
+        self._replay_build_args = None
+        self._produce = _produce
+
+        dispatch_id = install_graph_break_dispatch(
             gm,
             _xsurface_preprocessor_prefix(self._override_id),
             fwd_fn,
@@ -752,7 +853,69 @@ class PreprocessorDispatcher:
             num_ranks=num_ranks,
             register_backward=not self._skip_backward_break,
         )
+        if dispatch_id is None:
+            if self._pipeline is not None:
+                raise RuntimeError(
+                    "preprocessor pipelining is on but no graph-break dispatch "
+                    "was installed; there is nothing to run ahead of"
+                )
+            return gm, flat_state
+        self._replay_build_args = (gm, dispatch_id, len(flat_state))
+        if self._pipeline is not None:
+            self._replay = build_dispatch_input_replay(*self._replay_build_args)
         return gm, flat_state
+
+    def _submit_verify(self, from_graph: Tuple[torch.Tensor, ...]) -> None:
+        """Queue the check that the worker's inputs are the graph's inputs."""
+        replay = self._replay
+        flat_step_args_fn = self._flat_step_args_fn
+        batch = self._batch
+        pipeline = self._pipeline
+        if replay is None or flat_step_args_fn is None or batch is None:
+            raise RuntimeError(
+                "pipelining is on but the replay, the arg flattener or the "
+                "current batch is missing; enable_pipelining/begin_step were "
+                "not wired"
+            )
+
+        def check() -> None:
+            replay.assert_matches(from_graph, flat_step_args_fn(batch))
+
+        if pipeline is None or not pipeline.queue(check):
+            check()
+
+    def _submit_producer(self) -> None:
+        batch = self._next_batch
+        step = self._next_step
+        pipeline = self._pipeline
+        replay = self._replay
+        flat_step_args_fn = self._flat_step_args_fn
+        produce = self._produce
+        self._next_batch = None
+        if batch is None or pipeline is None or replay is None:
+            return
+        if flat_step_args_fn is None or produce is None:
+            return
+
+        def work() -> Tuple[torch.Tensor, ...]:
+            inputs = replay(flat_step_args_fn(batch))
+            with self._produce_lock, torch.enable_grad():
+                return produce(*inputs)
+
+        # A full queue is fine here and nowhere else: the next step's `take`
+        # misses and the callback computes inline, which is exactly the
+        # behaviour without pipelining.
+        if not pipeline.queue(work, step=step):
+            logger.debug("producer still busy; skipping precompute for this step")
+
+    def _submit_consumer(self) -> None:
+        consumer = self._consumer
+        pipeline = self._pipeline
+        if consumer is None:
+            return
+        self._consumer = None
+        if pipeline is None or not pipeline.queue(consumer):
+            consumer()
 
 
 def capture_sparse_arch_io(

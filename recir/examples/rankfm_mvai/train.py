@@ -202,6 +202,7 @@ def main() -> None:
             profile_end_step=trainer_cfg.profile_end_step,
             profile_dir=trainer_cfg.profile_dir,
             enable_memory_log=trainer_cfg.enable_memory_log,
+            pipeline_preprocessor=trainer_cfg.pipeline_preprocessor,
         ),
         job_resolver=JobResolver(),
     ).train()

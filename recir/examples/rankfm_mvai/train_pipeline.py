@@ -39,6 +39,7 @@ from .metric_states import (
     update_ranking_metrics_from_states,
     W_SUM,
 )
+from .rankfm_dispatchers import PreprocessorDispatcher
 from .snapshot_metrics import SnapshotMetrics
 from .xsurface_helpers import _log_hbm_memory
 
@@ -144,6 +145,7 @@ class RecirXLATrainPipeline(RankingTrainPipeline):
         profile_end_step: int = -1,
         profile_dir: str = "/tmp/tpu_profile",
         enable_memory_log: bool = False,
+        pipeline_preprocessor: bool = False,
     ) -> None:
         # pyre-ignore[19]: base RankingTrainPipeline is a runtime-only import
         # stubbed as Any (see module-level TYPE_CHECKING block), so pyre resolves
@@ -164,6 +166,8 @@ class RecirXLATrainPipeline(RankingTrainPipeline):
         self._profile_end_step = profile_end_step
         self._profile_dir = profile_dir
         self._enable_memory_log = enable_memory_log
+        self._pipeline_preprocessor: bool = pipeline_preprocessor
+        self._pending_batch: Optional[Any] = None
         self._all_task_names: List[str] = list(all_task_names or [])
         self._snapshot_metrics: SnapshotMetrics = _build_snapshot_metrics(
             self._all_task_names, step_metrics, cls_metrics, reg_metrics
@@ -178,17 +182,65 @@ class RecirXLATrainPipeline(RankingTrainPipeline):
             "RecirXLACompiledModule", model
         ).in_graph_metrics
         self._profiling_active = False
+        # The consumer (materialize + metric update) runs one step late, on the
+        # worker. These two are its input and its output: the input is the step
+        # output parked as JAX handles, the output is what `progress` returns.
+        self._deferred_consumer_input: Optional[Tuple[Any, Any, int]] = None
+        self._deferred_consumer_output: Optional[
+            Tuple[torch.Tensor, Dict[str, Any]]
+        ] = None
+        self._dispatcher: Optional[PreprocessorDispatcher] = next(
+            (
+                d
+                for d in getattr(model, "_dispatchers", ()) or ()
+                if isinstance(d, PreprocessorDispatcher)
+            ),
+            None,
+        )
+        if pipeline_preprocessor:
+            dispatcher = self._dispatcher
+            if dispatcher is None:
+                raise RuntimeError(
+                    "pipeline_preprocessor is set but the compiled module has "
+                    "no PreprocessorDispatcher; there is no graph break to run "
+                    "ahead of"
+                )
+            dispatcher.enable_pipelining(
+                cast("RecirXLACompiledModule", model).flat_step_args
+            )
+            logger.info("Preprocessor pipelining enabled (1-step lookahead).")
         if jax_profiling:
             logger.info(
                 f"JAX profiling enabled: steps {profile_start_step}-"
                 f"{profile_end_step}, dir={profile_dir}"
             )
 
+    def _next_batch(self, dataloader_iter: Iterator[Any]) -> Tuple[Any, Optional[Any]]:
+        if not self._pipeline_preprocessor:
+            return next(dataloader_iter), None
+
+        if self._pending_batch is None:
+            self._pending_batch = next(dataloader_iter)
+        batch = self._pending_batch
+        try:
+            self._pending_batch = next(dataloader_iter)
+        except StopIteration:
+            self._pending_batch = None
+        return batch, self._pending_batch
+
     def progress(
         self, dataloader_iter: Iterator[Any]
     ) -> Tuple[torch.Tensor, Dict[str, Any]]:
-        batch = next(dataloader_iter)
+        batch, next_batch = self._next_batch(dataloader_iter)
         self._step += 1
+        pending = self._deferred_consumer_input
+        self._deferred_consumer_input = None
+        self._deferred_consumer_output = None
+        dispatcher = self._dispatcher
+        if dispatcher is not None:
+            dispatcher.begin_step(self._step, batch, next_batch)
+            if pending is not None:
+                dispatcher.set_consumer(lambda: self._stash_consume(*pending))
 
         # Start the xprof trace at the configured step (before the step runs so
         # the step lands fully captured). Local dirs are created; gs:// paths are
@@ -231,6 +283,7 @@ class RecirXLATrainPipeline(RankingTrainPipeline):
         # train end via on_train_end); report_interval=N keeps the metric report
         # compute on the same cadence.
         if self._step % self._host_sync_every == 0:
+            self._drain_deferred()
             cast("RecirXLACompiledModule", self._model).flush_host_state()
 
         # Rebuild the ret dict RankingTrainPipeline._update_ranking_metrics
@@ -238,6 +291,47 @@ class RecirXLATrainPipeline(RankingTrainPipeline):
         # these host CPU tensors. weight=0 keeps padded rows out of NE/CTR/MSE;
         # num_real_candidates keeps variable-step x-axes and QPS padding-invariant.
         num_real_candidates = int(batch.num_candidates.sum())
+
+        if self._pipeline_preprocessor:
+            if (
+                self._step == 1
+                and not cast(
+                    "RecirXLACompiledModule", self._model
+                ).enable_output_pipelining()
+            ):
+                raise RuntimeError(
+                    "output pipelining could not be armed after the first step; "
+                    "the model has no compiled step"
+                )
+            self._deferred_consumer_input = (losses, named, num_real_candidates)
+            if dispatcher is not None:
+                dispatcher.drain_producer()
+            deferred_result = self._deferred_consumer_output
+            if deferred_result is None:
+                if pending is not None:
+                    raise RuntimeError(
+                        f"step {self._step - 1}'s deferred consume never "
+                        "produced a result"
+                    )
+                return torch.zeros(()), {}
+            return deferred_result
+        else:
+            return self._consume_step(losses, named, num_real_candidates)
+
+    def _stash_consume(self, losses: Any, named: Any, nrc: int) -> None:
+        self._deferred_consumer_output = self._consume_step(losses, named, nrc)
+
+    def _consume_step(
+        self, losses: Any, named: Any, num_real_candidates: int
+    ) -> Tuple[torch.Tensor, Dict[str, Any]]:
+        """Materialize a step's output and fold it into the metrics.
+
+        ``losses``/``named`` are JAX handles when output deferral is armed, torch
+        tensors otherwise; ``materialize_output`` is a no-op on the latter.
+        """
+        model: RecirXLACompiledModule = cast("RecirXLACompiledModule", self._model)
+        losses = model.materialize_output(losses)
+        named = model.materialize_output(named)
         if self._in_graph_metrics:
             # The graph reduced prediction/label/weight to per-task accumulators,
             # so those three were never emitted and never crossed the bus.
@@ -295,8 +389,24 @@ class RecirXLATrainPipeline(RankingTrainPipeline):
         self._snapshot_metrics.update(losses, named, self._model)
         return {"num_real_candidates": num_real_candidates, **states}
 
+    def _drain_deferred(self) -> None:
+        """Consume the outstanding deferred step, if any.
+
+        Must run before anything READS metric state -- the host-state flush, the
+        metrics property, train end -- or the last step's contribution is
+        missing from the report.
+        """
+        prev = self._deferred_consumer_input
+        if prev is not None:
+            self._deferred_consumer_input = None
+            self._consume_step(*prev)
+        dispatcher = self._dispatcher
+        if dispatcher is not None:
+            dispatcher.drain_producer()
+
     @property
     def metrics(self) -> List[Any]:
+        self._drain_deferred()
         return list(super().metrics) + self._snapshot_metrics.metrics
 
     def on_train_end(self) -> None:
@@ -307,7 +417,11 @@ class RecirXLATrainPipeline(RankingTrainPipeline):
             logger.info("[PROFILE] Stopped trace (training ended).")
         # Final host-state flush so params/buffers are fresh for any end-of-run
         # inspection/checkpoint even if the last step was not a flush step.
+        self._drain_deferred()
         cast("RecirXLACompiledModule", self._model).flush_host_state()
+        dispatcher = self._dispatcher
+        if dispatcher is not None:
+            dispatcher.close_pipelining()
         logger.info("RecirXLATrainPipeline: training complete.")
 
 
@@ -337,6 +451,7 @@ class RecirXLATrainPipelineProvider(
         profile_end_step: int = -1,
         profile_dir: str = "/tmp/tpu_profile",
         enable_memory_log: bool = False,
+        pipeline_preprocessor: bool = False,
     ) -> None:
         self._cls_task_indices = cls_task_indices
         self._reg_task_indices = reg_task_indices
@@ -347,6 +462,7 @@ class RecirXLATrainPipelineProvider(
         self._profile_end_step = profile_end_step
         self._profile_dir = profile_dir
         self._enable_memory_log = enable_memory_log
+        self._pipeline_preprocessor = pipeline_preprocessor
         # Delegate metric-list construction (and the variable-step swap) to the
         # mvai_cloud provider verbatim -- same args udd_fm/train.py passes.
         # Annotated Any: RankingTrainPipelineProvider is a runtime-only import
@@ -393,6 +509,7 @@ class RecirXLATrainPipelineProvider(
             profile_end_step=self._profile_end_step,
             profile_dir=self._profile_dir,
             enable_memory_log=self._enable_memory_log,
+            pipeline_preprocessor=self._pipeline_preprocessor,
         )
 
 
