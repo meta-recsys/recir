@@ -6,6 +6,7 @@
 
 # pyre-strict
 
+import operator
 import unittest
 from collections import OrderedDict
 from typing import Any
@@ -15,11 +16,17 @@ import torch
 import torch.fx as fx
 import torch.nn as nn
 from functorch import make_fx
+from recir.ops.fake.kjt import patch_ebc_for_tracing
 from recir.pipeline import build_pipeline, PipelinedGraphModule
 from recir.pipeline_strategies import sdd_pipeline_config, semi_sync_pipeline_config
-from recir.region_transforms.tbe_sparse_embedding import TBESparseEmbeddingTransform
+from recir.region_transforms.tbe_sparse_embedding import (
+    _LookupSite,
+    TBESparseEmbeddingTransform,
+)
 from torch.distributed import ProcessGroup
 from torch.distributed.tensor import DeviceMesh
+from torchrec.modules.embedding_configs import EmbeddingBagConfig, PoolingType
+from torchrec.modules.embedding_modules import EmbeddingBagCollection
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
 
@@ -28,6 +35,12 @@ class _TwoTableModel(nn.Module):
         super().__init__()
         self.table_0 = nn.Embedding(rows_0, 4)
         self.table_1 = nn.Embedding(rows_1, 4)
+
+
+class _OneTableBagModel(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.table = nn.Embedding(8, 4)
 
 
 class _TestRowWiseAdagrad(torch.optim.Optimizer):
@@ -86,12 +99,40 @@ def _embedding_graph(model: _TwoTableModel) -> fx.GraphModule:
     return fx.GraphModule(model, graph)
 
 
+def _keyword_embedding_bag_graph(model: _OneTableBagModel) -> fx.GraphModule:
+    graph = fx.Graph()
+    weight = graph.placeholder("weight")
+    weight.meta["val"] = model.table.weight
+    weight.meta["fqn"] = "table.weight"
+    indices = graph.placeholder("indices")
+    indices.meta["val"] = torch.tensor([1, 3], dtype=torch.int64)
+    offsets = graph.placeholder("offsets")
+    offsets.meta["val"] = torch.tensor([0, 1, 2], dtype=torch.int64)
+    embedding_bag = graph.call_function(
+        torch.ops.aten._embedding_bag.default,
+        kwargs={
+            "weight": weight,
+            "indices": indices,
+            "offsets": offsets,
+            "include_last_offset": True,
+        },
+    )
+    output = graph.call_function(operator.getitem, args=(embedding_bag, 0))
+    output.meta["val"] = torch.randn(2, 4)
+    graph.output(output)
+    return fx.GraphModule(model, graph)
+
+
 class TBESparseEmbeddingTransformTest(unittest.TestCase):
     def test_recir_tbe_ops_have_meta_kernels(self) -> None:
         for op_name in (
             "bucketize_sparse_features",
             "dedup_sparse_features",
+            "permute_sparse_data_1d",
             "permute_sparse_data_2d",
+            "pooled_source_to_feature_permute",
+            "reshape_pooled_gradients",
+            "sum_pooled_embeddings",
             "tbe_forward",
             "tbe_backward_update",
         ):
@@ -113,6 +154,35 @@ class TBESparseEmbeddingTransformTest(unittest.TestCase):
         )
         torch.testing.assert_close(actual_values, torch.tensor([20, 21, 10, 11, 12]))
 
+    def test_permute_sparse_data_1d_preserves_variable_segments(self) -> None:
+        lengths = torch.tensor([1, 2, 0], dtype=torch.int64)
+        values = torch.tensor([10, 20, 21], dtype=torch.int64)
+
+        actual_lengths, actual_values = torch.ops.recir.permute_sparse_data_1d(
+            torch.tensor([1, 0, 2], dtype=torch.int32),
+            lengths,
+            values,
+        )
+
+        torch.testing.assert_close(actual_lengths, torch.tensor([2, 1, 0]))
+        torch.testing.assert_close(actual_values, torch.tensor([20, 21, 10]))
+
+    def test_pooled_permutation_handles_uneven_rank_batches(
+        self,
+    ) -> None:
+        source_major_lengths = torch.empty(6, dtype=torch.int64)
+
+        actual = torch.ops.recir.pooled_source_to_feature_permute(
+            source_major_lengths,
+            torch.tensor([2, 1], dtype=torch.int64),
+            2,
+        )
+
+        torch.testing.assert_close(
+            actual,
+            torch.tensor([0, 1, 4, 2, 3, 5], dtype=torch.int64),
+        )
+
     def _transform(
         self,
         world_size: int,
@@ -124,6 +194,7 @@ class TBESparseEmbeddingTransformTest(unittest.TestCase):
         process_group: ProcessGroup | None = None,
         learning_rate_tensor: torch.Tensor | None = None,
         meta_optimizer_state: bool = False,
+        optimizer_state_value: float | None = None,
     ) -> tuple[TBESparseEmbeddingTransform, _TwoTableModel, fx.GraphModule]:
         if model is None:
             model = _TwoTableModel()
@@ -145,6 +216,17 @@ class TBESparseEmbeddingTransformTest(unittest.TestCase):
                     (parameter.shape[0], 1),
                     dtype=torch.float32,
                     device="meta",
+                )
+        if optimizer_state_value is not None:
+            if not optimizers:
+                raise ValueError("Optimizer state requires an optimizer.")
+            optimizer = optimizers[0]
+            for parameter in model.parameters():
+                optimizer.state[parameter]["sum"] = torch.full(
+                    (parameter.shape[0], 1),
+                    optimizer_state_value,
+                    dtype=torch.float32,
+                    device=parameter.device,
                 )
         transform = TBESparseEmbeddingTransform(
             {"table_0.weight", "table_1.weight"},
@@ -171,6 +253,74 @@ class TBESparseEmbeddingTransformTest(unittest.TestCase):
         ):
             transform.transform_graph(gm, called)
         return transform, model, gm
+
+    def _pooled_transform(
+        self,
+        world_size: int,
+    ) -> tuple[
+        TBESparseEmbeddingTransform,
+        fx.GraphModule,
+        tuple[torch.Tensor, ...],
+    ]:
+        ebc = EmbeddingBagCollection(
+            tables=[
+                EmbeddingBagConfig(
+                    name="table",
+                    embedding_dim=4,
+                    num_embeddings=8 // world_size,
+                    feature_names=["feature"],
+                    pooling=PoolingType.SUM,
+                ),
+            ],
+            device=torch.device("cpu"),
+        )
+        patch_ebc_for_tracing(ebc)
+        parameter_items = tuple(ebc.named_parameters())
+        parameter_fqns = tuple(name for name, _ in parameter_items)
+        parameters = tuple(parameter for _, parameter in parameter_items)
+        values = torch.tensor([1], dtype=torch.int64)
+        lengths = torch.tensor([1, 0], dtype=torch.int64)
+        inputs = (*parameters, values, lengths)
+
+        def forward(
+            weight: torch.Tensor,
+            input_values: torch.Tensor,
+            input_lengths: torch.Tensor,
+        ) -> torch.Tensor:
+            features = KeyedJaggedTensor(
+                keys=["feature"],
+                values=input_values,
+                lengths=input_lengths,
+            )
+            return torch.func.functional_call(
+                ebc,
+                dict(zip(parameter_fqns, (weight,))),
+                (features,),
+            ).values()
+
+        gm = make_fx(
+            forward,
+            tracing_mode="fake",
+            _allow_non_fake_inputs=True,
+        )(*inputs)
+        transform = TBESparseEmbeddingTransform(
+            set(parameter_fqns),
+            _mock_mesh(world_size),
+            ebc,
+            num_embeddings_map={parameter_fqns[0]: 8},
+            stochastic_rounding=False,
+        )
+        transform.prepare_after_shard(ebc, ())
+        called: OrderedDict[str, tuple[nn.Module, tuple[Any, ...], dict[str, Any]]] = (
+            OrderedDict({"": (ebc, (), {})})
+        )
+        transform.select_forward_root_fqns(called)
+        with patch(
+            "fbgemm_gpu.config.feature_list.FeatureGate.is_enabled",
+            return_value=False,
+        ):
+            transform.transform_graph(gm, called)
+        return transform, gm, inputs
 
     def test_inner_transform_reuses_optimizer_learning_rate_tensor(self) -> None:
         learning_rate = torch.tensor(0.1, dtype=torch.float32, device="cpu")
@@ -200,6 +350,21 @@ class TBESparseEmbeddingTransformTest(unittest.TestCase):
                 torch.zeros_like(table_states[0]),
             )
 
+    def test_inner_transform_preserves_materialized_optimizer_state(self) -> None:
+        _transform, _model, gm = self._transform(
+            world_size=1,
+            learning_rate_tensor=torch.tensor(0.1, dtype=torch.float32),
+            optimizer_state_value=2.5,
+        )
+
+        group: Any = gm.get_submodule("_recir_tbe_group_0")
+        for table_states in group.split_optimizer_states():
+            self.assertEqual(len(table_states), 1)
+            torch.testing.assert_close(
+                table_states[0],
+                torch.full_like(table_states[0], 2.5),
+            )
+
     def test_transform_inputs_materializes_kjt_offsets(self) -> None:
         transform = TBESparseEmbeddingTransform(set(), _mock_mesh(1))
         features = KeyedJaggedTensor(
@@ -225,9 +390,9 @@ class TBESparseEmbeddingTransformTest(unittest.TestCase):
         )
         node = fx.Graph().placeholder("feature")
         sites = (
-            (node, node, "table_0.weight"),
-            (node, node, "table_0.weight"),
-            (node, node, "table_1.weight"),
+            _LookupSite(node, node, "table_0.weight"),
+            _LookupSite(node, node, "table_0.weight"),
+            _LookupSite(node, node, "table_1.weight"),
         )
 
         self.assertEqual(
@@ -268,6 +433,197 @@ class TBESparseEmbeddingTransformTest(unittest.TestCase):
         (actual_0.sum() + actual_1.sum()).backward()
         self.assertFalse(torch.equal(model.table_0.weight, weight_0_before))
         self.assertFalse(torch.equal(model.table_1.weight, weight_1_before))
+
+    def test_pooled_transform_accepts_keyword_embedding_bag_arguments(self) -> None:
+        model = _OneTableBagModel()
+        gm = _keyword_embedding_bag_graph(model)
+        transform = TBESparseEmbeddingTransform(
+            {"table.weight"},
+            _mock_mesh(1),
+            model,
+            stochastic_rounding=False,
+            segments_per_feature=4,
+        )
+        transform.prepare_after_shard(model, ())
+        called: OrderedDict[str, tuple[nn.Module, tuple[Any, ...], dict[str, Any]]] = (
+            OrderedDict({"": (model, (), {})})
+        )
+        transform.select_forward_root_fqns(called)
+
+        with patch(
+            "fbgemm_gpu.config.feature_list.FeatureGate.is_enabled",
+            return_value=False,
+        ):
+            transform.transform_graph(gm, called)
+
+        indices = torch.tensor([1, 3], dtype=torch.int64)
+        offsets = torch.tensor([0, 1, 2], dtype=torch.int64)
+        actual = gm(model.table.weight, indices, offsets)
+        expected = torch.nn.functional.embedding_bag(
+            indices,
+            model.table.weight,
+            offsets,
+            mode="sum",
+            include_last_offset=True,
+        )
+        torch.testing.assert_close(actual, expected)
+
+    def test_patched_ebc_preserves_mixed_dims_and_empty_feature_after_tbe_rewrite(
+        self,
+    ) -> None:
+        ebc = EmbeddingBagCollection(
+            tables=[
+                EmbeddingBagConfig(
+                    name="table_0",
+                    embedding_dim=4,
+                    num_embeddings=8,
+                    feature_names=["feature_0"],
+                    pooling=PoolingType.SUM,
+                ),
+                EmbeddingBagConfig(
+                    name="table_1",
+                    embedding_dim=8,
+                    num_embeddings=6,
+                    feature_names=["feature_1"],
+                    pooling=PoolingType.MEAN,
+                ),
+            ],
+            device=torch.device("cpu"),
+        )
+        patch_ebc_for_tracing(ebc)
+        parameter_items = tuple(ebc.named_parameters())
+        parameter_fqns = tuple(name for name, _ in parameter_items)
+        parameters = tuple(parameter for _, parameter in parameter_items)
+        values = torch.tensor([4, 5, 1, 3, 2, 0, 2], dtype=torch.int64)
+        lengths = torch.tensor([1, 0, 1, 2, 0, 1, 0, 1, 1], dtype=torch.int64)
+
+        def forward(
+            weight_0: torch.Tensor,
+            weight_1: torch.Tensor,
+            input_values: torch.Tensor,
+            input_lengths: torch.Tensor,
+        ) -> torch.Tensor:
+            features = KeyedJaggedTensor(
+                keys=["unused", "feature_0", "feature_1"],
+                values=input_values,
+                lengths=input_lengths,
+            )
+            pooled = torch.func.functional_call(
+                ebc,
+                dict(zip(parameter_fqns, (weight_0, weight_1))),
+                (features.permute([1, 2]),),
+            ).values()
+            dense = input_lengths.view(3, -1)[0].to(weight_0.dtype).unsqueeze(1)
+            return torch.cat((pooled, dense), dim=1)
+
+        weight_0, weight_1 = parameters
+        expected = forward(weight_0, weight_1, values, lengths)
+        gm = make_fx(
+            forward,
+            tracing_mode="fake",
+            _allow_non_fake_inputs=True,
+        )(weight_0, weight_1, values, lengths)
+        transform = TBESparseEmbeddingTransform(
+            set(parameter_fqns),
+            _mock_mesh(1),
+            ebc,
+            num_embeddings_map={
+                fqn: 8 if index == 0 else 6 for index, fqn in enumerate(parameter_fqns)
+            },
+            stochastic_rounding=False,
+        )
+        transform.prepare_after_shard(ebc, ())
+        called: OrderedDict[str, tuple[nn.Module, tuple[Any, ...], dict[str, Any]]] = (
+            OrderedDict({"": (ebc, (), {})})
+        )
+        transform.select_forward_root_fqns(called)
+
+        with patch(
+            "fbgemm_gpu.config.feature_list.FeatureGate.is_enabled",
+            return_value=False,
+        ):
+            transform.transform_graph(gm, called)
+        actual = gm(weight_0, weight_1, values, lengths)
+
+        torch.testing.assert_close(actual, expected)
+
+        resized_values = torch.tensor([1, 2, 3, 4], dtype=torch.int64)
+        resized_lengths = torch.tensor([0, 0, 0, 0, 2, 2], dtype=torch.int64)
+        torch.testing.assert_close(
+            gm(weight_0, weight_1, resized_values, resized_lengths),
+            forward(weight_0, weight_1, resized_values, resized_lengths),
+        )
+
+        empty_values = torch.empty(0, dtype=torch.int64)
+        empty_lengths = torch.zeros(6, dtype=torch.int64)
+        torch.testing.assert_close(
+            gm(weight_0, weight_1, empty_values, empty_lengths),
+            forward(weight_0, weight_1, empty_values, empty_lengths),
+        )
+
+    def test_pooled_outer_transform_builds_pipeline_stages(self) -> None:
+        transform, gm, inputs = self._pooled_transform(world_size=2)
+
+        def train_step(
+            weight: torch.Tensor,
+            input_values: torch.Tensor,
+            input_lengths: torch.Tensor,
+        ) -> torch.Tensor:
+            output = gm(weight, input_values, input_lengths)
+            output.sum().backward()
+            return output.detach()
+
+        with patch(
+            "fbgemm_gpu.config.feature_list.FeatureGate.is_enabled",
+            return_value=False,
+        ):
+            joint = make_fx(
+                train_step,
+                tracing_mode="fake",
+                _allow_non_fake_inputs=True,
+            )(*inputs)
+        transform.finalize_compiled_graph(joint)
+
+        sdd = build_pipeline(joint, sdd_pipeline_config())
+        self.assertIsInstance(sdd, PipelinedGraphModule)
+        self.assertEqual(len(sdd.stage_graph_modules()), 3)
+
+        semi_sync = build_pipeline(
+            joint,
+            semi_sync_pipeline_config(start_batch=0),
+        )
+        self.assertIsInstance(semi_sync, PipelinedGraphModule)
+        stages = semi_sync.stage_graph_modules()
+        self.assertEqual(len(stages), 4)
+        stage_targets = [
+            [node.target for node in stage.graph.nodes] for stage in stages
+        ]
+        self.assertEqual(
+            stage_targets[0].count(
+                torch.ops._c10d_functional.all_to_all_single.default
+            ),
+            1,
+        )
+        self.assertEqual(
+            stage_targets[1].count(
+                torch.ops._c10d_functional.all_to_all_single.default
+            ),
+            1,
+        )
+        self.assertEqual(
+            stage_targets[2].count(
+                torch.ops._c10d_functional.all_to_all_single.default
+            ),
+            1,
+        )
+        self.assertEqual(
+            stage_targets[3].count(
+                torch.ops._c10d_functional.all_to_all_single.default
+            ),
+            1,
+        )
+        self.assertIn(torch.ops.recir.tbe_forward.default, stage_targets[2])
+        self.assertIn(torch.ops.recir.tbe_backward_update.default, stage_targets[3])
 
     def test_inner_transform_accepts_short_final_shard(self) -> None:
         local_model = _TwoTableModel(rows_0=7)

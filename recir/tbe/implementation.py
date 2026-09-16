@@ -94,12 +94,72 @@ def _embedding_location(location: str, device: torch.device) -> EmbeddingLocatio
         ) from error
 
 
-class LocalTBEGroup(torch.nn.Module):
-    """A grouped, unpooled TBE containing rank-local table shards.
+def _pooling_mode(pooling_mode: str) -> PoolingMode:
+    if pooling_mode == "none":
+        return PoolingMode.NONE
+    if pooling_mode == "sum":
+        return PoolingMode.SUM
+    raise ValueError(
+        f"LocalTBEGroup pooling_mode must be 'none' or 'sum', got {pooling_mode!r}."
+    )
 
-    The main interface accepts one routed ID tensor per feature and returns one
-    embedding tensor per feature. ``forward_flat`` exposes TBE's native packed
-    ``indices`` and ``offsets`` interface for lower-level callers.
+
+def _validate_group(
+    tables: Sequence[LocalTBETable],
+    feature_table_map: Sequence[int],
+    segments_per_feature: int,
+) -> int:
+    if segments_per_feature <= 0:
+        raise ValueError("TBE segments per feature must be positive.")
+    if not tables:
+        raise ValueError("LocalTBEGroup requires at least one table.")
+    if not feature_table_map:
+        raise ValueError("LocalTBEGroup requires at least one feature.")
+    if any(index < 0 or index >= len(tables) for index in feature_table_map):
+        raise ValueError("feature_table_map contains an index outside the table list.")
+    embedding_dims = {table.embedding_dim for table in tables}
+    if len(embedding_dims) != 1:
+        raise ValueError("Tables in one LocalTBEGroup must have the same dimension.")
+    for table in tables:
+        if table.local_rows <= 0:
+            raise ValueError(f"Table {table.name!r} must have at least one local row.")
+        if table.embedding_dim <= 0 or table.embedding_dim % 4 != 0:
+            raise ValueError(
+                f"Table {table.name!r} embedding_dim must be a positive "
+                f"multiple of 4, got {table.embedding_dim}."
+            )
+    return next(iter(embedding_dims))
+
+
+def _validate_pooled_offset_spans(
+    feature_indices: Sequence[torch.Tensor],
+    feature_offsets: Sequence[torch.Tensor],
+) -> None:
+    for offsets in feature_offsets:
+        torch._check(
+            offsets.shape[0] > 0,
+            lambda: "Pooled local TBE offsets must contain an initial boundary.",
+        )
+    spans = torch.stack(
+        tuple(
+            (offsets[0] == 0) & (offsets[-1] == indices.shape[0])
+            for indices, offsets in zip(feature_indices, feature_offsets)
+        )
+    )
+    torch._assert_async(
+        spans.all(),
+        "Pooled local TBE offsets must start at zero and consume every feature ID.",
+    )
+
+
+class LocalTBEGroup(torch.nn.Module):
+    """A grouped TBE containing rank-local table shards.
+
+    The main interface accepts one routed ID tensor per feature. Unpooled groups
+    return one embedding per ID. SUM groups also accept one offsets tensor per
+    feature and return one embedding per bag. ``forward_flat`` exposes TBE's
+    native packed ``indices`` and ``offsets`` interface for lower-level callers.
+    ``segments_per_feature`` controls only unpooled no-bag work subdivision.
 
     The module owns embedding weights and RowWiseAdagrad state. Its backward
     updates touched rows inside FBGEMM; callers must not put these weights in a
@@ -119,45 +179,30 @@ class LocalTBEGroup(torch.nn.Module):
         eps: float,
         stochastic_rounding: bool = True,
         segments_per_feature: int = 1,
+        pooling_mode: str = "none",
     ) -> None:
         super().__init__()
-        if segments_per_feature <= 0:
-            raise ValueError("TBE segments per feature must be positive.")
-        if not tables:
-            raise ValueError("LocalTBEGroup requires at least one table.")
-        if not feature_table_map:
-            raise ValueError("LocalTBEGroup requires at least one feature.")
-        if any(index < 0 or index >= len(tables) for index in feature_table_map):
+        resolved_pooling_mode = _pooling_mode(pooling_mode)
+        if pooling_mode != "none" and segments_per_feature != 1:
             raise ValueError(
-                "feature_table_map contains an index outside the table list."
+                "TBE segments_per_feature only applies to unpooled groups."
             )
-
-        embedding_dims = {table.embedding_dim for table in tables}
-        if len(embedding_dims) != 1:
-            raise ValueError(
-                "Unpooled tables in one LocalTBEGroup must have the same "
-                "embedding dimension."
-            )
-        for table in tables:
-            if table.local_rows <= 0:
-                raise ValueError(
-                    f"Table {table.name!r} must have at least one local row."
-                )
-            if table.embedding_dim <= 0 or table.embedding_dim % 4 != 0:
-                raise ValueError(
-                    f"Table {table.name!r} embedding_dim must be a positive "
-                    f"multiple of 4, got {table.embedding_dim}."
-                )
+        embedding_dim = _validate_group(
+            tables,
+            feature_table_map,
+            segments_per_feature,
+        )
 
         compute_device = (
             ComputeDevice.CPU if device.type == "cpu" else ComputeDevice.CUDA
         )
         resolved_output_dtype = output_dtype or weight_dtype
-        self.embedding_dim: int = next(iter(embedding_dims))
+        self.embedding_dim: int = embedding_dim
         self.output_dtype: torch.dtype = resolved_output_dtype
         self.table_names: tuple[str, ...] = tuple(table.name for table in tables)
         self.feature_table_map: tuple[int, ...] = tuple(feature_table_map)
         self.segments_per_feature: int = segments_per_feature
+        self.pooling_mode: str = pooling_mode
         self.tbe: SplitTableBatchedEmbeddingBagsCodegen = (
             SplitTableBatchedEmbeddingBagsCodegen(
                 embedding_specs=[
@@ -170,7 +215,7 @@ class LocalTBEGroup(torch.nn.Module):
                     for table in tables
                 ],
                 feature_table_map=list(feature_table_map),
-                pooling_mode=PoolingMode.NONE,
+                pooling_mode=resolved_pooling_mode,
                 weights_precision=SparseType.from_dtype(weight_dtype),
                 output_dtype=SparseType.from_dtype(resolved_output_dtype),
                 optimizer=EmbOptimType.EXACT_ROWWISE_ADAGRAD,
@@ -212,8 +257,14 @@ class LocalTBEGroup(torch.nn.Module):
     def forward(
         self,
         feature_indices: Sequence[torch.Tensor],
+        feature_offsets: Sequence[torch.Tensor] | None = None,
     ) -> tuple[torch.Tensor, ...]:
-        """Pack per-feature routed IDs into one grouped local lookup."""
+        """Pack per-feature routed IDs into one grouped local lookup.
+
+        Pooled callers provide canonical ``include_last_offset=True`` offsets
+        spanning each corresponding ID tensor. RecIR's EBC tracing and routing
+        paths construct that representation before calling this module.
+        """
         if len(feature_indices) != len(self.feature_table_map):
             raise ValueError(
                 f"Expected {len(self.feature_table_map)} feature tensors, "
@@ -222,6 +273,34 @@ class LocalTBEGroup(torch.nn.Module):
         if any(indices.dim() != 1 for indices in feature_indices):
             raise ValueError("Local TBE feature indices must be one-dimensional.")
 
+        if self.pooling_mode == "sum":
+            if feature_offsets is None:
+                raise ValueError("Pooled local TBE requires per-feature offsets.")
+            if len(feature_offsets) != len(feature_indices):
+                raise ValueError(
+                    f"Expected {len(feature_indices)} feature offsets tensors, "
+                    f"got {len(feature_offsets)}."
+                )
+            if any(offsets.dim() != 1 for offsets in feature_offsets):
+                raise ValueError("Local TBE feature offsets must be one-dimensional.")
+            bag_count = feature_offsets[0].shape[0]
+            if any(offsets.shape[0] != bag_count for offsets in feature_offsets[1:]):
+                raise ValueError(
+                    "Pooled local TBE features must have the same number of bags."
+                )
+            _validate_pooled_offset_spans(feature_indices, feature_offsets)
+            packed_lengths = torch.cat(
+                tuple(offsets[1:] - offsets[:-1] for offsets in feature_offsets)
+            )
+            flat_indices = torch.cat(tuple(feature_indices))
+            packed_offsets = torch.cat(
+                (packed_lengths.new_zeros((1,)), packed_lengths)
+            ).cumsum(dim=0)
+            flat_output = self.forward_flat(flat_indices, packed_offsets)
+            return tuple(torch.split(flat_output, self.embedding_dim, dim=1))
+
+        if feature_offsets is not None:
+            raise ValueError("Unpooled local TBE does not accept feature offsets.")
         feature_lengths = [indices.shape[0] for indices in feature_indices]
         flat_indices = torch.cat(tuple(feature_indices))
         offsets = nobag_tbe_offsets(
@@ -256,6 +335,7 @@ class LocalTBEGroup(torch.nn.Module):
             self.get_buffer("_recir_learning_rate"),
             indices,
             offsets,
+            self.pooling_mode != "none",
         )
 
     def _forward_impl(
