@@ -68,7 +68,7 @@ def _fwd_fallback(
     k_dense = _pad_packed(k, seq_offsets, max_seq_len)
     v_dense = _pad_packed(v, seq_offsets, max_seq_len)
     lengths = (seq_offsets[1:] - seq_offsets[:-1]).to(torch.int32)
-    return (
+    dense_out = (
         _hstu_attention_ref(
             q_dense,
             k_dense,
@@ -80,6 +80,7 @@ def _fwd_fallback(
         )
         * attn_scale
     )
+    return _pack_dense(dense_out, seq_offsets, v.shape[0])
 
 
 def _bwd_fallback(
@@ -138,8 +139,7 @@ def _fwd_meta(
     alpha: float,
     max_seq_len: int,
 ) -> torch.Tensor:
-    batch = seq_offsets.shape[0] - 1
-    return v.new_empty((batch, q.shape[1], max_seq_len, v.shape[2]))
+    return torch.empty_like(v)
 
 
 @torch.library.register_fake("recir::pallas_jagged_hstu_attention_bwd")
@@ -236,7 +236,7 @@ def _recir_pallas_jagged_hstu_mha(
             "packed Pallas HSTU attention does not differentiate attn_scale"
         )
 
-    dense_out = torch.ops.recir.pallas_jagged_hstu_attention_fwd(
+    return torch.ops.recir.pallas_jagged_hstu_attention_fwd(
         q,
         k,
         v,
@@ -246,7 +246,6 @@ def _recir_pallas_jagged_hstu_mha(
         alpha,
         N,
     )
-    return _pack_dense(dense_out, seq_offsets, q.shape[0])
 
 
 def install_pallas_jagged_hstu_attention_swap() -> None:

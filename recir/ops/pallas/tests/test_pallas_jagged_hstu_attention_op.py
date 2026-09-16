@@ -127,7 +127,7 @@ class PallasJaggedHSTUAttentionOpTest(unittest.TestCase):
                 0.25,
                 8,
             )
-            self.assertEqual(output.shape, (2, 4, 8, 32))
+            self.assertEqual(output.shape, v.shape)
             self.assertEqual(output.dtype, v.dtype)
 
     def test_trace_keeps_forward_and_backward_opaque(self) -> None:
@@ -162,28 +162,14 @@ class PallasJaggedHSTUAttentionOpTest(unittest.TestCase):
             for target in targets
             if target.endswith("pallas_jagged_hstu_attention_bwd.default")
         ]
-        input_padding_indices = [
-            index
-            for index, target in enumerate(targets)
-            if "jagged_to_padded_dense" in target
-        ]
-        output_packing_indices = [
-            index for index, target in enumerate(targets) if "dense_to_jagged" in target
-        ]
         self.assertEqual(len(forward), 1, targets)
         self.assertEqual(len(backward), 1, targets)
-        self.assertEqual(len(output_packing_indices), 1, targets)
-        forward_index = targets.index(forward[0])
-        backward_index = targets.index(backward[0])
         self.assertFalse(
-            [index for index in input_padding_indices if index < forward_index],
+            [target for target in targets if "jagged_to_padded_dense" in target],
             targets,
         )
-        self.assertTrue(
-            all(
-                output_packing_indices[0] < index < backward_index
-                for index in input_padding_indices
-            ),
+        self.assertFalse(
+            [target for target in targets if "dense_to_jagged" in target],
             targets,
         )
         self.assertFalse([target for target in targets if "silu" in target], targets)

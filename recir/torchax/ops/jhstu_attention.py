@@ -48,6 +48,11 @@ directly on the full ``L`` with the global ``seq_offsets``.
 Both lowerings are ``is_jax_function=True`` (default): they receive JAX arrays and
 return JAX arrays. Neither mutates its inputs -- the forward op's
 ``register_autograd`` produced the separate backward node these two lower.
+
+The Pallas jagged path keeps Q/K/V, the forward output, backward ``grad_out``,
+and dQ/dK/dV packed as ``[T, H, D]``. Its sample-sharded helpers map the packed
+token dimension to the data-parallel mesh axis, avoiding dense
+``[B, H, N, D]`` values at the lowering boundary.
 """
 
 from typing import Any
@@ -236,7 +241,7 @@ def _jpallas_jagged_hstu_attention_fwd(
     )
     return jax.lax.with_sharding_constraint(
         output,
-        NamedSharding(mesh, P(_AXIS, None, None, None)),
+        NamedSharding(mesh, P(_AXIS, None, None)),
     )
 
 
