@@ -8,9 +8,10 @@
 
 """TBE-backed row-wise sparse embedding transform.
 
-The inner rewrite replaces compatible ``aten.embedding`` sites with grouped,
-rank-local FBGEMM TBE calls.  The outer rewrite keeps row-wise routing as
-ordinary functional collective nodes around the opaque native TBE operators.
+The inner rewrite replaces compatible ``aten.embedding`` and
+``aten._embedding_bag`` sites with grouped, rank-local FBGEMM TBE calls. The
+outer rewrite keeps row-wise routing as ordinary functional collective nodes
+around the opaque native TBE operators.
 """
 
 from __future__ import annotations
@@ -21,7 +22,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from functools import partial
 from itertools import accumulate
-from typing import Any, cast
+from typing import Any, cast, Literal
 
 import torch
 import torch.distributed._functional_collectives as funcol
@@ -48,6 +49,17 @@ _WEIGHT_PASSTHROUGH_OPS: tuple[object, ...] = (
     torch.ops.aten.view.default,
     torch.ops.aten.reshape.default,
 )
+
+
+def _node_argument(
+    node: fx.Node,
+    position: int,
+    name: str,
+    default: object,
+) -> object:
+    if len(node.args) > position:
+        return node.args[position]
+    return node.kwargs.get(name, default)
 
 
 def _resolve_weight_placeholder(
@@ -100,11 +112,21 @@ class _FeatureSite:
 
 
 @dataclass(frozen=True)
+class _LookupSite:
+    output: fx.Node
+    indices: fx.Node
+    fqn: str
+    offsets: fx.Node | None = None
+    pooling: str = "none"
+
+
+@dataclass(frozen=True)
 class _CompiledGroup:
     sites: tuple[_FeatureSite, ...]
     device: torch.device
     hash_size_cumsum: tuple[int, ...]
     hash_size_offset: tuple[int, ...]
+    is_pooled: bool
 
 
 def _as_float(value: object, name: str) -> float:
@@ -313,6 +335,322 @@ def _dependency_closure(
     return closure
 
 
+def _exchange_pooled_counts(
+    send_counts: torch.Tensor,
+    packed_lengths: torch.Tensor,
+    feature_count: int,
+    group_name: str,
+    world_size: int,
+) -> tuple[torch.Tensor, torch.Tensor, list[int], torch.Tensor]:
+    local_batch_size = packed_lengths.shape[0] // feature_count
+    local_batch_size_tensor = torch.scalar_tensor(
+        local_batch_size,
+        dtype=torch.int64,
+        device=packed_lengths.device,
+    ).reshape(1)
+    batch_sizes = torch.ops._c10d_functional.all_gather_into_tensor(
+        local_batch_size_tensor,
+        world_size,
+        group_name,
+    )
+    batch_sizes = torch.ops._c10d_functional.wait_tensor(batch_sizes)
+    sent_segment_counts = batch_sizes.new_full(
+        (world_size,),
+        local_batch_size * feature_count,
+    )
+    received_segment_counts = batch_sizes * feature_count
+    send_splits, receive_splits, cpu_count_splits = _materialize_splits(
+        sent_segment_counts,
+        received_segment_counts,
+    )
+    received_counts = torch.ops._c10d_functional.all_to_all_single(
+        send_counts,
+        receive_splits,
+        send_splits,
+        group_name,
+    )
+    return (
+        received_counts,
+        batch_sizes,
+        receive_splits,
+        cpu_count_splits,
+    )
+
+
+def _exchange_pooled_indices(
+    bucketized_indices: torch.Tensor,
+    send_counts: torch.Tensor,
+    received_counts: torch.Tensor,
+    received_count_splits: list[int],
+    group_name: str,
+    world_size: int,
+) -> torch.Tensor:
+    send_splits = send_counts.reshape(world_size, -1).sum(dim=1)
+    receive_splits = torch.stack(
+        tuple(
+            source_counts.sum()
+            for source_counts in torch.split(
+                received_counts,
+                received_count_splits,
+            )
+        )
+    )
+    send_split_list, receive_split_list, _cpu_splits = _materialize_splits(
+        send_splits,
+        receive_splits,
+    )
+    _declare_split_invariants(send_split_list, bucketized_indices.shape[0])
+    _declare_split_invariants(receive_split_list)
+    received_indices = torch.ops._c10d_functional.all_to_all_single(
+        bucketized_indices,
+        receive_split_list,
+        send_split_list,
+        group_name,
+    )
+    return received_indices
+
+
+def _pooled_embedding_splits(
+    cpu_count_splits: torch.Tensor,
+    feature_count: int,
+    output_width: int,
+    world_size: int,
+) -> tuple[list[int], list[int]]:
+    local_count_splits, source_count_splits = _split_lists(
+        cpu_count_splits,
+        world_size,
+    )
+    return (
+        [size // feature_count * output_width for size in local_count_splits],
+        [size // feature_count * output_width for size in source_count_splits],
+    )
+
+
+def route_row_wise_pooled_indices_grouped(
+    packed_indices: torch.Tensor,
+    packed_offsets: torch.Tensor,
+    *,
+    num_embeddings: tuple[int, ...],
+    group_name: str,
+    world_size: int,
+) -> tuple[
+    tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    tuple[torch.Tensor, ...],
+    tuple[torch.Tensor, ...],
+]:
+    """Route pooled IDs while preserving every feature and bag boundary."""
+    feature_count = len(num_embeddings)
+    packed_lengths = packed_offsets[1:] - packed_offsets[:-1]
+    block_sizes = torch.stack(
+        tuple(
+            packed_indices.new_full((), _row_wise_block_size(rows, world_size))
+            for rows in num_embeddings
+        )
+    )
+    send_counts, bucketized_indices, _bucketize_permute, _unbucketize_permute = (
+        torch.ops.recir.bucketize_sparse_features(
+            packed_lengths,
+            packed_indices,
+            block_sizes,
+            world_size,
+        )
+    )
+    (
+        pending_received_counts,
+        batch_sizes,
+        received_count_splits,
+        cpu_count_splits,
+    ) = _exchange_pooled_counts(
+        send_counts,
+        packed_lengths,
+        feature_count,
+        group_name,
+        world_size,
+    )
+    received_counts = torch.ops._c10d_functional.wait_tensor(pending_received_counts)
+    pending_received_indices = _exchange_pooled_indices(
+        bucketized_indices,
+        send_counts,
+        received_counts,
+        received_count_splits,
+        group_name,
+        world_size,
+    )
+    received_indices = torch.ops._c10d_functional.wait_tensor(pending_received_indices)
+    source_to_feature = torch.ops.recir.pooled_source_to_feature_permute(
+        received_counts,
+        batch_sizes,
+        feature_count,
+    )
+    feature_major_counts, feature_major_indices = (
+        torch.ops.recir.permute_sparse_data_1d(
+            source_to_feature.to(torch.int32),
+            received_counts,
+            received_indices,
+        )
+    )
+    local_offsets = torch.cat(
+        (feature_major_counts.new_zeros((1,)), feature_major_counts)
+    ).cumsum(dim=0)
+    return (
+        (feature_major_indices, local_offsets, cpu_count_splits),
+        (pending_received_counts, bucketized_indices, cpu_count_splits),
+        (pending_received_indices, received_counts),
+    )
+
+
+def return_row_wise_pooled_embeddings_grouped(
+    local_embeddings: torch.Tensor,
+    source_offsets: torch.Tensor,
+    cpu_count_splits: torch.Tensor,
+    *,
+    feature_count: int,
+    group_name: str,
+    world_size: int,
+) -> torch.Tensor:
+    """Return owner-local partial bag sums and combine them on source ranks."""
+    output_width = local_embeddings.shape[1]
+    local_splits, source_splits = _pooled_embedding_splits(
+        cpu_count_splits,
+        feature_count,
+        output_width,
+        world_size,
+    )
+    _declare_split_invariants(source_splits, local_embeddings.numel())
+    _declare_split_invariants(local_splits)
+    returned = torch.ops._c10d_functional.all_to_all_single(
+        local_embeddings.reshape(-1),
+        local_splits,
+        source_splits,
+        group_name,
+    )
+    returned = torch.ops._c10d_functional.wait_tensor(returned)
+    return torch.ops.recir.sum_pooled_embeddings(
+        returned,
+        source_offsets,
+        feature_count,
+        world_size,
+        output_width,
+    )
+
+
+def route_row_wise_pooled_gradients_grouped(
+    gradients: torch.Tensor,
+    local_embeddings: torch.Tensor,
+    cpu_count_splits: torch.Tensor,
+    *,
+    feature_count: int,
+    group_name: str,
+    world_size: int,
+) -> torch.Tensor:
+    """Send each source bag gradient to every row owner."""
+    output_width = gradients.shape[1]
+    local_splits, source_splits = _pooled_embedding_splits(
+        cpu_count_splits,
+        feature_count,
+        output_width,
+        world_size,
+    )
+    replicated = gradients.unsqueeze(0).expand(world_size, -1, -1).contiguous()
+    _declare_split_invariants(local_splits, replicated.numel())
+    _declare_split_invariants(source_splits, local_embeddings.numel())
+    received = torch.ops._c10d_functional.all_to_all_single(
+        replicated.reshape(-1),
+        source_splits,
+        local_splits,
+        group_name,
+    )
+    received = torch.ops._c10d_functional.wait_tensor(received)
+    return torch.ops.recir.reshape_pooled_gradients(received, local_embeddings)
+
+
+def _mean_from_pooled_sum(
+    pooled: torch.Tensor,
+    offsets: torch.Tensor,
+) -> torch.Tensor:
+    lengths = offsets[1:] - offsets[:-1]
+    divisor = lengths.clamp_min(1).to(pooled.dtype).unsqueeze(1)
+    return pooled / divisor
+
+
+def _pooled_lookup_site(
+    node: fx.Node,
+    fqn: str,
+) -> _LookupSite:
+    indices = _node_argument(node, 1, "indices", None)
+    offsets = _node_argument(node, 2, "offsets", None)
+    if not isinstance(indices, fx.Node) or len(indices.meta["val"].shape) != 1:
+        raise ValueError("TBE sparse transform requires one-dimensional IDs.")
+    if not isinstance(offsets, fx.Node) or len(offsets.meta["val"].shape) != 1:
+        raise ValueError("TBE pooled transform requires one-dimensional offsets.")
+    unsupported = (
+        (_node_argument(node, 3, "scale_grad_by_freq", False), "frequency scaling"),
+        (_node_argument(node, 5, "sparse", False), "sparse gradients"),
+        (
+            _node_argument(node, 6, "per_sample_weights", None) is not None,
+            "weights",
+        ),
+        (
+            not _node_argument(node, 7, "include_last_offset", False),
+            "offsets without a final offset",
+        ),
+        (_node_argument(node, 8, "padding_idx", -1) != -1, "padding_idx"),
+    )
+    for is_unsupported, behavior in unsupported:
+        if is_unsupported:
+            raise NotImplementedError(
+                f"TBE pooled transform does not support {behavior}."
+            )
+    mode = _node_argument(node, 4, "mode", 0)
+    if mode not in (0, 1):
+        raise NotImplementedError(f"TBE pooled transform does not support mode={mode}.")
+    outputs = [
+        user
+        for user in node.users
+        if user.op == "call_function"
+        and user.target == operator.getitem
+        and user.args[1] == 0
+    ]
+    if len(outputs) != 1 or len(node.users) != 1:
+        raise NotImplementedError(
+            "TBE pooled transform only supports the embedding_bag output tensor."
+        )
+    return _LookupSite(
+        outputs[0],
+        indices,
+        fqn,
+        offsets,
+        "sum" if mode == 0 else "mean",
+    )
+
+
+def _lookup_site_from_node(
+    node: fx.Node,
+    weight_nodes: dict[fx.Node, str],
+) -> _LookupSite | None:
+    if node.op != "call_function":
+        return None
+    if node.target == torch.ops.aten.embedding.default:
+        root = _resolve_weight_placeholder(
+            _node_argument(node, 0, "weight", None), set(weight_nodes)
+        )
+        indices = _node_argument(node, 1, "indices", None)
+        if root is None:
+            return None
+        if not isinstance(indices, fx.Node) or len(indices.meta["val"].shape) != 1:
+            raise ValueError("TBE sparse transform requires one-dimensional IDs.")
+        return _LookupSite(node, indices, weight_nodes[root])
+    if node.target != torch.ops.aten._embedding_bag.default:
+        return None
+
+    root = _resolve_weight_placeholder(
+        _node_argument(node, 0, "weight", None), set(weight_nodes)
+    )
+    if root is None:
+        return None
+    return _pooled_lookup_site(node, weight_nodes[root])
+
+
 def return_row_wise_embeddings_grouped(
     local_embeddings: torch.Tensor,
     unbucketize_permute: torch.Tensor,
@@ -398,8 +736,10 @@ def _inline_before(
     function: Any,
     example_inputs: Sequence[torch.Tensor],
     input_nodes: Sequence[fx.Node],
+    *,
+    tracing_mode: Literal["fake", "real", "symbolic"] = "symbolic",
 ) -> tuple[Any, set[fx.Node]]:
-    traced = make_fx(function, tracing_mode="symbolic")(*example_inputs)
+    traced = make_fx(function, tracing_mode=tracing_mode)(*example_inputs)
     placeholders = [node for node in traced.graph.nodes if node.op == "placeholder"]
     val_map = dict(zip(placeholders, input_nodes))
     existing = set(gm.graph.nodes)
@@ -411,13 +751,121 @@ def _inline_before(
     return output, new_nodes
 
 
+def _lookup_dependencies(sites: Sequence[_LookupSite]) -> set[fx.Node]:
+    relevant: set[fx.Node] = set()
+    pending = [site.indices for site in sites]
+    pending.extend(site.offsets for site in sites if site.offsets is not None)
+    while pending:
+        node = pending.pop()
+        if node in relevant:
+            continue
+        relevant.add(node)
+        pending.extend(node.all_input_nodes)
+    return relevant
+
+
+def _replace_permuted_lengths(
+    gm: fx.GraphModule,
+    permutation: fx.Node,
+    lengths_2d: fx.Node,
+    flat_lengths: fx.Node,
+    feature_count: int,
+    before: fx.Node,
+) -> None:
+    """Express the length permutation without a data-dependent output size."""
+    with gm.graph.inserting_before(before):
+        dynamic_lengths = gm.graph.call_function(
+            torch.ops.aten.view.default,
+            args=(flat_lengths, [feature_count, -1]),
+        )
+        permuted_lengths = gm.graph.call_function(
+            torch.ops.aten.index_select.default,
+            args=(dynamic_lengths, 0, permutation),
+        )
+        flat_permuted_lengths = gm.graph.call_function(
+            torch.ops.aten.view.default,
+            args=(permuted_lengths, [-1]),
+        )
+    dynamic_lengths.meta = dict(lengths_2d.meta)
+    permuted_lengths.meta = dict(lengths_2d.meta)
+    for user in tuple(before.users):
+        if user.target is operator.getitem and user.args[1] == 0:
+            flat_permuted_lengths.meta = dict(user.meta)
+            user.replace_all_uses_with(flat_permuted_lengths)
+
+
+def _rewrite_relevant_kjt_permutations(
+    gm: fx.GraphModule,
+    sites: Sequence[_LookupSite],
+) -> None:
+    relevant = _lookup_dependencies(sites)
+
+    for node in tuple(gm.graph.nodes):
+        if (
+            node not in relevant
+            or node.op != "call_function"
+            or node.target != torch.ops.fbgemm.permute_2D_sparse_data.default
+        ):
+            continue
+        lengths_2d = _node_argument(node, 1, "lengths", None)
+        if not (
+            isinstance(lengths_2d, fx.Node)
+            and lengths_2d.op == "call_function"
+            and lengths_2d.target == torch.ops.aten.view.default
+            and isinstance(lengths_2d.args[0], fx.Node)
+        ):
+            continue
+        lengths_value = lengths_2d.meta.get("val")
+        if not isinstance(lengths_value, torch.Tensor) or lengths_value.dim() != 2:
+            continue
+        feature_count = int(lengths_value.shape[0])
+        flat_lengths = cast(fx.Node, lengths_2d.args[0])
+        permutation = _node_argument(node, 0, "permute", None)
+        if not isinstance(permutation, fx.Node):
+            continue
+        with gm.graph.inserting_before(node):
+            length_count = gm.graph.call_function(
+                torch.ops.aten.sym_size.int,
+                args=(flat_lengths, 0),
+            )
+            stride = gm.graph.call_function(
+                operator.floordiv,
+                args=(length_count, feature_count),
+            )
+            replacement = gm.graph.call_function(
+                torch.ops.fbgemm.permute_2D_sparse_data_input1D.default,
+                args=cast(
+                    tuple[Any, ...],
+                    (
+                        permutation,
+                        flat_lengths,
+                        _node_argument(node, 2, "values", None),
+                        stride,
+                        _node_argument(node, 3, "weights", None),
+                        None,
+                    ),
+                ),
+            )
+        _replace_permuted_lengths(
+            gm,
+            permutation,
+            lengths_2d,
+            flat_lengths,
+            feature_count,
+            node,
+        )
+        replacement.meta = dict(node.meta)
+        node.replace_all_uses_with(replacement)
+        gm.graph.erase_node(node)
+
+
 class TBESparseEmbeddingTransform(RegionTransform):
     """Use grouped local TBE while retaining sparse collectives in the graph.
 
-    This first implementation supports unpooled, one-dimensional feature ID
-    tensors and Exact RowWiseAdagrad without weight decay.  Compatible lookup
-    sites are grouped by dtype, device, embedding dimension, storage location,
-    and optimizer settings.
+    Supports unpooled and SUM/MEAN pooled one-dimensional feature ID tensors
+    with Exact RowWiseAdagrad and no weight decay. Compatible lookup sites are
+    grouped by pooling shape, dtype, device, embedding dimension, storage
+    location, and optimizer settings.
     """
 
     def __init__(
@@ -587,6 +1035,7 @@ class TBESparseEmbeddingTransform(RegionTransform):
             raise RuntimeError("prepare_after_shard must run before transform_graph.")
         if self._forward_root_fqn is None:
             raise RuntimeError("TBE forward root was not selected before tracing.")
+        gm.graph.eliminate_dead_code()
         root_module = called_modules[self._forward_root_fqn][0]
         relative_fqns = [
             fqn for fqn, _ in root_module.named_parameters(remove_duplicate=False)
@@ -601,42 +1050,35 @@ class TBESparseEmbeddingTransform(RegionTransform):
             )
             if full_fqn in self._source_fqns:
                 weight_nodes[placeholder] = full_fqn
-        sites: list[tuple[fx.Node, fx.Node, str]] = []
-        roots = set(weight_nodes)
+        sites: list[_LookupSite] = []
         for node in gm.graph.nodes:
-            if (
-                node.op != "call_function"
-                or node.target != torch.ops.aten.embedding.default
-            ):
-                continue
-            root = _resolve_weight_placeholder(node.args[0], roots)
-            if root is None:
-                continue
-            indices = node.args[1]
-            if not isinstance(indices, fx.Node) or len(indices.meta["val"].shape) != 1:
-                raise ValueError("TBE sparse transform requires one-dimensional IDs.")
-            sites.append((node, indices, weight_nodes[root]))
-        rewritten_fqns = {fqn for _, _, fqn in sites}
+            site = _lookup_site_from_node(node, weight_nodes)
+            if site is not None:
+                sites.append(site)
+        rewritten_fqns = {site.fqn for site in sites}
         missing_fqns = self._source_fqns - rewritten_fqns
         if missing_fqns:
             raise RuntimeError(
                 "TBE sparse transform did not find lookup sites for row-wise "
                 f"embedding parameters: {sorted(missing_fqns)}"
             )
+        _rewrite_relevant_kjt_permutations(gm, sites)
         self._rewrite_compatible_groups(gm, sites)
+        gm.graph.eliminate_dead_code()
         gm.graph.lint()
         gm.recompile()
 
     def _rewrite_compatible_groups(
         self,
         gm: fx.GraphModule,
-        sites: Sequence[tuple[fx.Node, fx.Node, str]],
+        sites: Sequence[_LookupSite],
     ) -> None:
-        grouped: dict[tuple[object, ...], list[tuple[fx.Node, fx.Node, str]]] = {}
+        grouped: dict[tuple[object, ...], list[_LookupSite]] = {}
         for site in sites:
-            state = self._table_states[site[2]]
+            state = self._table_states[site.fqn]
             parameter = state.parameter
             key = (
+                site.pooling != "none",
                 parameter.device,
                 parameter.dtype,
                 int(parameter.shape[1]),
@@ -655,12 +1097,12 @@ class TBESparseEmbeddingTransform(RegionTransform):
         owner = nn.ModuleDict()
         module.add_module(_TBE_ROOT_NAME, owner)
         for group_index, group_sites in enumerate(grouped.values()):
-            table_order = tuple(dict.fromkeys(fqn for _, _, fqn in group_sites))
+            table_order = tuple(dict.fromkeys(site.fqn for site in group_sites))
             ordered_sites = tuple(
                 site
                 for table_fqn in table_order
                 for site in group_sites
-                if site[2] == table_fqn
+                if site.fqn == table_fqn
             )
             self._rewrite_group(gm, owner, group_index, ordered_sites)
 
@@ -669,11 +1111,14 @@ class TBESparseEmbeddingTransform(RegionTransform):
         gm: fx.GraphModule,
         owner: nn.ModuleDict,
         group_index: int,
-        sites: Sequence[tuple[fx.Node, fx.Node, str]],
+        sites: Sequence[_LookupSite],
     ) -> None:
-        table_fqns = tuple(dict.fromkeys(fqn for _, _, fqn in sites))
+        table_fqns = tuple(dict.fromkeys(site.fqn for site in sites))
         table_index = {fqn: index for index, fqn in enumerate(table_fqns)}
         first_state = self._table_states[table_fqns[0]]
+        is_pooled = sites[0].pooling != "none"
+        if any((site.pooling != "none") != is_pooled for site in sites):
+            raise RuntimeError("TBE group mixed pooled and unpooled lookup sites.")
         tables = tuple(
             LocalTBETable(
                 name=fqn,
@@ -686,14 +1131,15 @@ class TBESparseEmbeddingTransform(RegionTransform):
         with unset_fake_temporarily():
             local_tbe = LocalTBEGroup(
                 tables,
-                tuple(table_index[fqn] for _, _, fqn in sites),
+                tuple(table_index[site.fqn] for site in sites),
                 device=first_state.parameter.device,
                 weight_dtype=first_state.parameter.dtype,
                 learning_rate=first_state.settings.learning_rate,
                 learning_rate_tensor=first_state.settings.learning_rate_tensor,
                 eps=first_state.settings.eps,
                 stochastic_rounding=first_state.settings.stochastic_rounding,
-                segments_per_feature=self._segments_per_feature,
+                segments_per_feature=1 if is_pooled else self._segments_per_feature,
+                pooling_mode="sum" if is_pooled else "none",
             )
             local_tbe.load_table_weights(
                 tuple(self._table_states[fqn].parameter for fqn in table_fqns)
@@ -704,64 +1150,108 @@ class TBESparseEmbeddingTransform(RegionTransform):
         gm.add_submodule(graph_name, local_tbe)
         self._migrate_group_state(table_fqns, local_tbe)
 
-        first_node = sites[0][0]
         node_positions = {node: index for index, node in enumerate(gm.graph.nodes)}
+        insertion_target = min(
+            sites, key=lambda site: node_positions[site.output]
+        ).output
         if any(
-            node_positions[index] >= node_positions[first_node] for _, index, _ in sites
+            node_positions[site.indices] >= node_positions[insertion_target]
+            or (
+                site.offsets is not None
+                and node_positions[site.offsets] >= node_positions[insertion_target]
+            )
+            for site in sites
         ):
             raise RuntimeError("TBE feature inputs must be available before the group.")
-        with gm.graph.inserting_before(first_node):
-            grouped_output = gm.graph.call_module(
-                graph_name,
-                args=(tuple(indices for _, indices, _ in sites),),
-            )
-        for feature_index, (embedding, _indices, _fqn) in enumerate(sites):
-            with gm.graph.inserting_before(embedding):
+        if is_pooled and any(site.offsets is None for site in sites):
+            raise RuntimeError("Pooled TBE lookup site is missing offsets.")
+        with gm.graph.inserting_before(insertion_target):
+            if is_pooled:
+                grouped_output = gm.graph.call_module(
+                    graph_name,
+                    args=(
+                        tuple(site.indices for site in sites),
+                        tuple(cast(fx.Node, site.offsets) for site in sites),
+                    ),
+                )
+            else:
+                grouped_output = gm.graph.call_module(
+                    graph_name,
+                    args=(tuple(site.indices for site in sites),),
+                )
+        replacements: list[tuple[fx.Node, fx.Node]] = []
+        for feature_index, site in enumerate(sites):
+            with gm.graph.inserting_before(insertion_target):
                 output = gm.graph.call_function(
                     operator.getitem, args=(grouped_output, feature_index)
                 )
-                output.meta = dict(embedding.meta)
-            embedding.replace_all_uses_with(output)
-            gm.graph.erase_node(embedding)
+                output.meta = dict(site.output.meta)
+            if site.pooling == "mean":
+                offsets = cast(fx.Node, site.offsets)
+                output, _ = _inline_before(
+                    gm,
+                    insertion_target,
+                    _mean_from_pooled_sum,
+                    (
+                        torch.randn(
+                            3,
+                            int(self._table_states[site.fqn].parameter.shape[1]),
+                            device=first_state.parameter.device,
+                        ),
+                        torch.tensor(
+                            [0, 1, 3, 3],
+                            dtype=torch.int64,
+                            device=first_state.parameter.device,
+                        ),
+                    ),
+                    (output, offsets),
+                    tracing_mode="fake",
+                )
+                output.meta = dict(site.output.meta)
+            replacements.append((site.output, output))
+        for original, replacement in replacements:
+            original.replace_all_uses_with(replacement)
+            gm.graph.erase_node(original)
 
         self._compiled_groups.append(
             _CompiledGroup(
                 tuple(
                     _FeatureSite(
-                        fqn,
+                        site.fqn,
                         self.num_embeddings_map.get(
-                            fqn,
-                            int(self._table_states[fqn].parameter.shape[0])
+                            site.fqn,
+                            int(self._table_states[site.fqn].parameter.shape[0])
                             * self.world_size,
                         ),
-                        int(self._table_states[fqn].parameter.shape[1]),
+                        int(self._table_states[site.fqn].parameter.shape[1]),
                     )
-                    for _, _, fqn in sites
+                    for site in sites
                 ),
                 first_state.parameter.device,
                 self._dedup_hash_size_cumsum(sites),
                 self._dedup_hash_size_offset(sites),
+                is_pooled,
             )
         )
 
     def _dedup_hash_size_cumsum(
         self,
-        sites: Sequence[tuple[fx.Node, fx.Node, str]],
+        sites: Sequence[_LookupSite],
     ) -> tuple[int, ...]:
         feature_hash_sizes: list[int] = []
-        for table_fqn in dict.fromkeys(fqn for _, _, fqn in sites):
-            table_feature_count = sum(fqn == table_fqn for _, _, fqn in sites)
+        for table_fqn in dict.fromkeys(site.fqn for site in sites):
+            table_feature_count = sum(site.fqn == table_fqn for site in sites)
             feature_hash_sizes.extend([0] * (table_feature_count - 1))
             feature_hash_sizes.append(self.num_embeddings_map[table_fqn])
         return (0, *accumulate(feature_hash_sizes))
 
     @staticmethod
     def _dedup_hash_size_offset(
-        sites: Sequence[tuple[fx.Node, fx.Node, str]],
+        sites: Sequence[_LookupSite],
     ) -> tuple[int, ...]:
         feature_hash_size_lengths: list[int] = []
-        for table_fqn in dict.fromkeys(fqn for _, _, fqn in sites):
-            table_feature_count = sum(fqn == table_fqn for _, _, fqn in sites)
+        for table_fqn in dict.fromkeys(site.fqn for site in sites):
+            table_feature_count = sum(site.fqn == table_fqn for site in sites)
             feature_hash_size_lengths.append(table_feature_count)
             feature_hash_size_lengths.extend([0] * (table_feature_count - 1))
         return (0, *accumulate(feature_hash_size_lengths))
@@ -848,6 +1338,9 @@ class TBESparseEmbeddingTransform(RegionTransform):
         group: _CompiledGroup,
         group_index: int,
     ) -> None:
+        if group.is_pooled:
+            self._route_pooled_group(gm, forward, group)
+            return
         packed_indices = forward.args[5]
         packed_offsets = forward.args[6]
         forward_output = next(
@@ -1061,6 +1554,231 @@ class TBESparseEmbeddingTransform(RegionTransform):
             received_lengths,
             cpu_splits,
         )
+
+    def _route_pooled_group(
+        self,
+        gm: fx.GraphModule,
+        forward: fx.Node,
+        group: _CompiledGroup,
+    ) -> None:
+        packed_indices = forward.args[5]
+        packed_offsets = forward.args[6]
+        forward_output = next(
+            (
+                user
+                for user in forward.users
+                if user.op == "call_function"
+                and user.target == operator.getitem
+                and user.args[1] == 0
+            ),
+            None,
+        )
+        if forward_output is None:
+            raise RuntimeError("Expected tensor output from recir::tbe_forward.")
+        if not isinstance(packed_indices, fx.Node) or not isinstance(
+            packed_offsets, fx.Node
+        ):
+            raise RuntimeError("Expected pooled TBE indices and offsets nodes.")
+
+        feature_count = len(group.sites)
+        route_output, route_nodes = _inline_before(
+            gm,
+            forward,
+            partial(
+                route_row_wise_pooled_indices_grouped,
+                num_embeddings=tuple(site.global_rows for site in group.sites),
+                group_name=self.group_name,
+                world_size=self.world_size,
+            ),
+            (
+                torch.arange(
+                    feature_count * _PLACEHOLDER_SIZE,
+                    device=group.device,
+                ),
+                torch.arange(
+                    feature_count * _PLACEHOLDER_SIZE + 1,
+                    dtype=torch.int64,
+                    device=group.device,
+                ),
+            ),
+            (packed_indices, packed_offsets),
+        )
+        output, start_boundary, continue_boundary = route_output
+        start_nodes = _dependency_closure(start_boundary, route_nodes)
+        continue_nodes = (
+            _dependency_closure(continue_boundary, route_nodes) - start_nodes
+        )
+        graph_nodes = set(gm.graph.nodes)
+        preprocess_nodes = {
+            node
+            for node in _dependency_closure(
+                (packed_indices, packed_offsets), graph_nodes - route_nodes
+            )
+            if node.op not in ("placeholder", "get_attr")
+        }
+        mark_pipeline_region(preprocess_nodes, PipelineRegion.PREPROCESS)
+        mark_pipeline_region(start_nodes, PipelineRegion.ROUTE_START)
+        mark_pipeline_region(continue_nodes, PipelineRegion.ROUTE_CONTINUE)
+        received_indices, local_offsets, cpu_count_splits = output
+        lookup_nodes = self._replace_forward_inputs(
+            gm,
+            forward,
+            packed_indices,
+            packed_offsets,
+            received_indices,
+            local_offsets,
+        )
+        lookup_nodes.update(
+            self._return_pooled_group_output(
+                gm,
+                forward_output,
+                packed_offsets,
+                cpu_count_splits,
+                group,
+            )
+        )
+        mark_pipeline_region(lookup_nodes, PipelineRegion.EMBEDDING_LOOKUP)
+        self._route_pooled_group_backward(
+            gm,
+            forward,
+            forward_output,
+            cpu_count_splits,
+            group,
+        )
+
+    def _return_pooled_group_output(
+        self,
+        gm: fx.GraphModule,
+        forward_output: fx.Node,
+        source_offsets: fx.Node,
+        cpu_count_splits: fx.Node,
+        group: _CompiledGroup,
+    ) -> set[fx.Node]:
+        feature_count = len(group.sites)
+        output_width = feature_count * group.sites[0].embedding_dim
+        node_positions = {node: index for index, node in enumerate(gm.graph.nodes)}
+        first_output_user = min(
+            forward_output.users,
+            key=node_positions.__getitem__,
+        )
+        returned_output, new_nodes = _inline_before(
+            gm,
+            first_output_user,
+            partial(
+                return_row_wise_pooled_embeddings_grouped,
+                feature_count=feature_count,
+                group_name=self.group_name,
+                world_size=self.world_size,
+            ),
+            (
+                torch.randn(
+                    self.world_size * _PLACEHOLDER_SIZE,
+                    output_width,
+                    device=group.device,
+                ),
+                torch.arange(
+                    feature_count * _PLACEHOLDER_SIZE + 1,
+                    dtype=torch.int64,
+                    device=group.device,
+                ),
+                torch.full(
+                    (2 * self.world_size,),
+                    feature_count * _PLACEHOLDER_SIZE,
+                    dtype=torch.int64,
+                ),
+            ),
+            (forward_output, source_offsets, cpu_count_splits),
+        )
+        if not isinstance(returned_output, fx.Node):
+            raise RuntimeError("Expected pooled routing to return an FX node.")
+        returned_output.meta = dict(forward_output.meta)
+        for user in tuple(forward_output.users):
+            if user not in new_nodes:
+                user.replace_input_with(forward_output, returned_output)
+        return new_nodes
+
+    def _replace_forward_inputs(
+        self,
+        gm: fx.GraphModule,
+        forward: fx.Node,
+        old_indices: fx.Node,
+        old_offsets: fx.Node,
+        new_indices: fx.Node,
+        new_offsets: fx.Node,
+    ) -> set[fx.Node]:
+        forward_args = list(forward.args)
+        forward_args[5] = new_indices
+        forward_args[6] = new_offsets
+        forward.args = tuple(forward_args)
+        lookup_nodes = {forward}
+        for node in tuple(gm.graph.nodes):
+            if (
+                node.op == "call_function"
+                and node.target == torch.ops.fbgemm.bounds_check_indices.default
+                and len(node.args) > 2
+                and node.args[1] is old_indices
+                and node.args[2] is old_offsets
+            ):
+                bounds_args = list(node.args)
+                bounds_args[1] = new_indices
+                bounds_args[2] = new_offsets
+                node.args = tuple(bounds_args)
+                forward.prepend(node)
+                lookup_nodes.add(node)
+        return lookup_nodes
+
+    def _route_pooled_group_backward(
+        self,
+        gm: fx.GraphModule,
+        forward: fx.Node,
+        forward_output: fx.Node,
+        cpu_count_splits: fx.Node,
+        group: _CompiledGroup,
+    ) -> None:
+        backward = next(
+            (
+                node
+                for node in gm.graph.nodes
+                if node.op == "call_function"
+                and node.target == torch.ops.recir.tbe_backward_update.default
+                and node.args[0] == forward.args[0]
+            ),
+            None,
+        )
+        if backward is None:
+            raise RuntimeError("Could not find fused TBE backward for forward group.")
+        grad_output = backward.args[4]
+        if not isinstance(grad_output, fx.Node):
+            raise RuntimeError("TBE backward gradient must be an FX node.")
+        feature_count = len(group.sites)
+        output_width = feature_count * group.sites[0].embedding_dim
+        routed_grad, _ = _inline_before(
+            gm,
+            backward,
+            partial(
+                route_row_wise_pooled_gradients_grouped,
+                feature_count=feature_count,
+                group_name=self.group_name,
+                world_size=self.world_size,
+            ),
+            (
+                torch.randn(_PLACEHOLDER_SIZE, output_width, device=group.device),
+                torch.randn(
+                    self.world_size * _PLACEHOLDER_SIZE,
+                    output_width,
+                    device=group.device,
+                ),
+                torch.full(
+                    (2 * self.world_size,),
+                    feature_count * _PLACEHOLDER_SIZE,
+                    dtype=torch.int64,
+                ),
+            ),
+            (grad_output, forward_output, cpu_count_splits),
+        )
+        backward_args = list(backward.args)
+        backward_args[4] = routed_grad
+        backward.args = tuple(backward_args)
 
     def _route_group_backward(
         self,
