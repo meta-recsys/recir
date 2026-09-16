@@ -2,11 +2,12 @@
 
 # pyre-ignore-all-errors
 
-"""FakeTensor (Meta dispatch) registration for torchrec KJT operations.
+"""FakeTensor (Meta dispatch) registration for TorchRec KJT operations.
 
-torchrec ``EmbeddingCollection.forward`` calls ``KJT.to_dict()`` which routes
-through ``length_per_key()`` -> ``_safe_tolist()`` -> ``tensor.tolist()``.
-That call is data-dependent and breaks ``make_fx(tracing_mode="fake")`` with
+TorchRec ``EmbeddingCollection.forward`` and
+``EmbeddingBagCollection.forward`` call ``KJT.to_dict()``, which routes through
+``length_per_key()`` -> ``_safe_tolist()`` -> ``tensor.tolist()``. That call is
+data-dependent and breaks ``make_fx(tracing_mode="fake")`` with
 ``DataDependentOutputException: aten._local_scalar_dense.default``.
 
 Strategy:
@@ -14,32 +15,42 @@ Strategy:
      real impl computes per-key index tensors (using ``.item()``, safe at
      execution time on real tensors) and whose fake (Meta) kernel emits
      fresh ``SymInt``-sized output tensors via ``new_dynamic_size()``.
-  2. Replace ``EmbeddingCollection.forward`` with a version that calls the
-     custom op for the KJT split, then calls ``nn.Embedding`` per feature.
-     The per-feature ``aten.embedding(weight, indices)`` nodes remain
-     visible in the traced graph so HybridParallel's
-     ``rewrite_sparse_embeddings`` can shard them row-wise.
+     EBC uses a companion variant that also returns per-feature offsets and
+     optional weights. Fixed-stride offset sizes stay shape-derived.
+  2. Replace collection forwards with versions that call the custom op for the
+     KJT split, then call ``nn.Embedding`` or ``embedding_bag`` per feature.
+     These lookup nodes remain visible in the traced graph so HybridParallel
+     can shard them row-wise.
 
 Usage:
-    from recir.ops.fake.kjt import patch_ec_for_tracing
+    from recir.ops.fake.kjt import patch_ebc_for_tracing, patch_ec_for_tracing
     patch_ec_for_tracing(model)
-    # Now make_fx(tracing_mode="fake") can trace ECSparseArch end-to-end.
+    patch_ebc_for_tracing(model)
+    # Now make_fx(tracing_mode="fake") can trace supported collection paths.
 
-Limitations:
-  * Assumes single stride per key (``KJT.variable_stride_per_key`` is
-    False).  Asserted at patch-call time.
-  * Assumes pooling=NONE (the ``EmbeddingCollection`` path; not
-    ``EmbeddingBagCollection``).
+EBC contract:
+  * Every feature has the same stride within one invocation, while that shared
+    stride may change between invocations.
+  * Forward and parameter backward are traceable for unweighted and weighted
+    inputs. Eager gradients to per-sample weights are preserved.
+  * Variable-stride inputs and inverse-index reconstruction are not supported.
 """
 
 import logging
 import types
-from typing import Dict, List
+from collections.abc import Callable
+from typing import Any, Dict, List, Optional
 
 import torch
 import torch.nn as nn
-from torchrec.modules.embedding_modules import EmbeddingCollection
-from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor
+from torchrec.modules.embedding_modules import (
+    EmbeddingBagCollection,
+    EmbeddingCollection,
+    process_pooled_embeddings,
+    reorder_inverse_indices,
+)
+from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor, KeyedTensor
+from torchrec.sparse.tensor_dict import maybe_td_to_kjt
 
 logger: logging.Logger = logging.getLogger(__name__)
 
@@ -104,6 +115,95 @@ def _register_kjt_split_op() -> None:
             out.append(values.new_empty(sz))
         return out
 
+    split_bags = torch.library.custom_op(
+        "recir_torchrec::kjt_split_per_feature_with_offsets", mutates_args=()
+    )(_kjt_split_per_feature_with_offsets_impl)
+    split_bags.register_fake(_kjt_split_per_feature_with_offsets_fake)
+    split_bags.register_autograd(
+        _split_backward,
+        setup_context=_setup_split_context,
+    )
+
+
+def _stride_per_key(lengths: torch.Tensor, num_keys: int) -> List[int]:
+    total_bags = lengths.numel()
+    if total_bags % num_keys != 0:
+        raise ValueError("KJT lengths must contain the same stride for every key")
+    return [total_bags // num_keys] * num_keys
+
+
+def _kjt_split_per_feature_with_offsets_impl(
+    values: torch.Tensor,
+    lengths: torch.Tensor,
+    weights: Optional[torch.Tensor],
+    num_keys: int,
+) -> List[torch.Tensor]:
+    if num_keys <= 0:
+        raise ValueError("KJT key count must be positive")
+    if weights is not None and weights.numel() != values.numel():
+        raise ValueError("KJT weights must contain one value per ID")
+
+    per_key_lengths = torch.split(
+        lengths,
+        _stride_per_key(lengths, num_keys),
+    )
+    value_counts = [int(key_lengths.sum().item()) for key_lengths in per_key_lengths]
+    per_key_values = [part.clone() for part in torch.split(values, value_counts)]
+    per_key_offsets = [
+        torch.cat((key_lengths.new_zeros((1,)), key_lengths)).cumsum(dim=0)
+        for key_lengths in per_key_lengths
+    ]
+    per_key_weights = (
+        [part.clone() for part in torch.split(weights, value_counts)]
+        if weights is not None
+        else []
+    )
+    return [*per_key_values, *per_key_offsets, *per_key_weights]
+
+
+def _kjt_split_per_feature_with_offsets_fake(
+    values: torch.Tensor,
+    lengths: torch.Tensor,
+    weights: Optional[torch.Tensor],
+    num_keys: int,
+) -> List[torch.Tensor]:
+    if num_keys <= 0:
+        raise ValueError("KJT key count must be positive")
+    ctx = torch.library.get_ctx()
+    value_sizes = [ctx.new_dynamic_size() for _ in range(num_keys)]
+    for size in value_sizes:
+        torch._check_is_size(size)
+    offset_sizes = [lengths.numel() // num_keys + 1] * num_keys
+    outputs = [values.new_empty(size) for size in value_sizes]
+    outputs.extend(lengths.new_empty(size) for size in offset_sizes)
+    if weights is not None:
+        outputs.extend(weights.new_empty(size) for size in value_sizes)
+    return outputs
+
+
+def _setup_split_context(
+    ctx: Any,
+    inputs: tuple[
+        torch.Tensor,
+        torch.Tensor,
+        Optional[torch.Tensor],
+        int,
+    ],
+    output: List[torch.Tensor],
+) -> None:
+    del output
+    _, _, weights, num_keys = inputs
+    ctx.num_keys = num_keys
+    ctx.has_weights = weights is not None
+
+
+def _split_backward(
+    ctx: Any,
+    grad_outputs: List[torch.Tensor],
+) -> tuple[None, None, Optional[torch.Tensor], None]:
+    grad_weights = torch.cat(grad_outputs[-ctx.num_keys :]) if ctx.has_weights else None
+    return None, None, grad_weights, None
+
 
 def _traceable_ec_forward(
     self: EmbeddingCollection,
@@ -153,26 +253,105 @@ def _traceable_ec_forward(
     return out
 
 
+def _traceable_ebc_forward(
+    self: EmbeddingBagCollection,
+    features: KeyedJaggedTensor,
+) -> KeyedTensor:
+    """Mirror native EBC forward with only KJT decomposition replaced."""
+    features = maybe_td_to_kjt(features, None)
+    if features.variable_stride_per_key():
+        raise NotImplementedError(
+            "RecIR EBC tracing requires a fixed-stride KeyedJaggedTensor."
+        )
+    input_inverse_indices = features.inverse_indices_or_none()
+    if input_inverse_indices is not None:
+        raise NotImplementedError(
+            "RecIR EBC tracing does not support inverse-index reconstruction."
+        )
+    flat_feature_names = [name for names in self._feature_names for name in names]
+    inverse_indices = reorder_inverse_indices(
+        inverse_indices=input_inverse_indices,
+        feature_names=flat_feature_names,
+    )
+    keys: List[str] = features.keys()
+    weights = features.weights() if self._is_weighted else None
+    split_outputs: List[torch.Tensor] = (
+        torch.ops.recir_torchrec.kjt_split_per_feature_with_offsets(
+            features.values(),
+            features.lengths(),
+            weights,
+            len(keys),
+        )
+    )
+    per_key_indices = split_outputs[: len(keys)]
+    per_key_offsets = split_outputs[len(keys) : 2 * len(keys)]
+    per_key_weights = split_outputs[2 * len(keys) :]
+    key_to_idx: Dict[str, int] = {key: index for index, key in enumerate(keys)}
+
+    pooled_embeddings: List[torch.Tensor] = []
+    for table_index, embedding_bag in enumerate(self.embedding_bags.values()):
+        for feature_name in self._feature_names[table_index]:
+            feature_index = key_to_idx[feature_name]
+            pooled_embeddings.append(
+                embedding_bag(
+                    input=per_key_indices[feature_index],
+                    offsets=per_key_offsets[feature_index],
+                    per_sample_weights=(
+                        per_key_weights[feature_index] if self._is_weighted else None
+                    ),
+                ).float()
+            )
+
+    return KeyedTensor(
+        keys=self._embedding_names,
+        values=process_pooled_embeddings(
+            pooled_embeddings=pooled_embeddings,
+            inverse_indices=inverse_indices,
+        ),
+        length_per_key=self._lengths_per_embedding,
+    )
+
+
+def _patch_collection_for_tracing(
+    model: nn.Module,
+    collection_type: type[nn.Module],
+    forward: Callable[..., object],
+) -> int:
+    patched = 0
+    for fqn, mod in model.named_modules():
+        if not isinstance(mod, collection_type):
+            continue
+        if getattr(mod, "_recir_patched", False):
+            continue
+        mod.forward = types.MethodType(forward, mod)
+        mod._recir_patched = True
+        patched += 1
+        logger.info("Patched %s at %s for tracing", type(mod).__name__, fqn)
+    return patched
+
+
 def patch_ec_for_tracing(model: nn.Module) -> int:
-    """Replace ``EmbeddingCollection.forward`` on every EC instance in ``model``.
+    """Replace TorchRec EC forwards with the FakeTensor-traceable variant.
 
     Registers the KJT-split custom op (idempotent), then walks the module
-    tree and monkey-patches each ``EmbeddingCollection``'s ``forward`` to
-    the FakeTensor-traceable variant.  Caches per-instance metadata
-    (``_recir_patched`` flag) so re-invocation is a no-op.
+    tree and monkey-patches each ``EmbeddingCollection`` forward. Caches
+    per-instance metadata so re-invocation is a no-op.
 
     Returns the number of EC instances patched.
     """
     _register_kjt_split_op()
+    return _patch_collection_for_tracing(
+        model,
+        EmbeddingCollection,
+        _traceable_ec_forward,
+    )
 
-    patched = 0
-    for fqn, mod in model.named_modules():
-        if not isinstance(mod, EmbeddingCollection):
-            continue
-        if getattr(mod, "_recir_patched", False):
-            continue
-        mod.forward = types.MethodType(_traceable_ec_forward, mod)
-        mod._recir_patched = True
-        patched += 1
-        logger.info("Patched EmbeddingCollection at %s for tracing", fqn)
-    return patched
+
+def patch_ebc_for_tracing(model: nn.Module) -> int:
+    """Replace TorchRec EBC forwards with the KJT-split traceable variant."""
+    _register_kjt_split_op()
+    return _patch_collection_for_tracing(
+        model,
+        EmbeddingBagCollection,
+        _traceable_ebc_forward,
+    )
