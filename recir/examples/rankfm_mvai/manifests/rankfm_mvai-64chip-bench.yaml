@@ -55,13 +55,11 @@ spec:
                 value: "1"
               - name: MASTER_PORT
                 value: "29500"
-              # Inject the Helion HSTU attention kernels into the compiled step:
-              # rebinds pytorch_hstu_mha to the recir Helion adapter, so attention
-              # traces as one recir::helion_ragged_attention_fwd node (plus its
-              # autograd bwd) that torchax lowers to the Helion Pallas -> Mosaic
-              # kernels (mirrors rankfm_mvai-helion-4chip).
-              - name: RANKFM_MVAI_USE_HELION
-                value: "1"
+              # Use the Helion HSTU attention kernels in the compiled step.
+              # Separate 64-chip manifests select the padded and jagged Pallas
+              # implementations for direct performance comparisons.
+              - name: RANKFM_MVAI_ATTENTION_BACKEND
+                value: "helion"
               # The sample-sharded HSTU path assumes each chip's L//world_size token
               # block is exactly its b_local whole sequences; the CPU unit tests
               # assert that alignment at build time.
@@ -169,12 +167,6 @@ spec:
                   --xla_dump_to=/tmp/xladump
                   --xla_dump_hlo_as_text
                   --xla_dump_hlo_module_re=jit_jax_fn
-              # Route HSTU attention to the recir Pallas HSTU attention kernel:
-              # build_model_from_config installs the RecIR operation behind
-              # Hammer's PYTORCH seam and imports its TorchAX lowering. Unset /
-              # "0" -> default materialized-XLA PYTORCH attention.
-              - name: RECIR_HSTU_PALLAS
-                value: "1"
               # Perf-debug knobs (off by default; flip on to debug XLA lowering).
               # RECIR_DUMP_GRAPHS=1: log each XLA subgraph's FX index/scatter ops +
               #   HLO collectives, and jagged<->dense lowering branch decisions.
