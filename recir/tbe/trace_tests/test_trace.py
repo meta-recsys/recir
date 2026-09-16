@@ -14,7 +14,7 @@ from recir.tbe.local import LocalTBEGroup, LocalTBETable
 
 
 class LocalTBETraceTest(unittest.TestCase):
-    def _group(self) -> LocalTBEGroup:
+    def _group(self, pooling_mode: str = "none") -> LocalTBEGroup:
         with patch(
             "fbgemm_gpu.config.feature_list.FeatureGate.is_enabled",
             return_value=False,
@@ -27,6 +27,7 @@ class LocalTBETraceTest(unittest.TestCase):
                 learning_rate=0.1,
                 eps=1.0e-8,
                 stochastic_rounding=False,
+                pooling_mode=pooling_mode,
             )
 
     def test_fake_trace_contains_tbe_forward_boundary(self) -> None:
@@ -78,6 +79,26 @@ class LocalTBETraceTest(unittest.TestCase):
             if node.target == torch.ops.recir.tbe_backward_update.default
         ]
         self.assertEqual(len(updates), 1)
+
+    def test_pooled_offset_validation_is_fake_traceable(self) -> None:
+        group = self._group(pooling_mode="sum")
+        indices = (torch.tensor([1, 3], dtype=torch.int64),)
+        offsets = (torch.tensor([0, 1, 2], dtype=torch.int64),)
+        expected = group(indices, offsets)
+
+        traced = make_fx(
+            group,
+            tracing_mode="fake",
+            _allow_non_fake_inputs=True,
+        )(indices, offsets)
+
+        actual = traced(indices, offsets)
+        torch.testing.assert_close(actual[0], expected[0])
+        with self.assertRaisesRegex(RuntimeError, "consume every feature ID"):
+            traced(
+                indices,
+                (torch.tensor([0, 1, 1], dtype=torch.int64),),
+            )
 
     def test_grouped_features_trace_to_one_tbe_forward(self) -> None:
         with patch(

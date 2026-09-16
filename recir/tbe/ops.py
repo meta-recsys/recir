@@ -168,6 +168,151 @@ def _fake_permute_sparse_data_2d(
     return lengths.new_empty(lengths.shape), values.new_empty(values.shape)
 
 
+@torch.library.custom_op("recir::permute_sparse_data_1d", mutates_args=())
+def permute_sparse_data_1d(
+    permutation: torch.Tensor,
+    lengths: torch.Tensor,
+    values: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Permute arbitrary variable-length segments with FBGEMM."""
+    permuted_lengths, permuted_values, _permuted_weights = (
+        torch.ops.fbgemm.permute_1D_sparse_data(
+            permutation,
+            lengths,
+            values,
+            None,
+            values.numel(),
+        )
+    )
+    return permuted_lengths, permuted_values
+
+
+@permute_sparse_data_1d.register_fake
+def _fake_permute_sparse_data_1d(
+    permutation: torch.Tensor,
+    lengths: torch.Tensor,
+    values: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    del permutation
+    return lengths.new_empty(lengths.shape), values.new_empty(values.shape)
+
+
+@torch.library.custom_op("recir::pooled_source_to_feature_permute", mutates_args=())
+def pooled_source_to_feature_permute(
+    source_major_lengths: torch.Tensor,
+    batch_sizes: torch.Tensor,
+    feature_count: int,
+) -> torch.Tensor:
+    """Build the segment permutation from source-major to feature-major bags.
+
+    For each source rank, ``source_major_lengths`` contains
+    ``batch_sizes[source] * feature_count`` consecutive bag lengths.
+    """
+    if source_major_lengths.dim() != 1 or batch_sizes.dim() != 1:
+        raise ValueError("Pooled lengths and batch sizes must be one-dimensional.")
+    if feature_count <= 0:
+        raise ValueError("Pooled feature count must be positive.")
+    source_spans = batch_sizes * feature_count
+    source_ids = torch.repeat_interleave(
+        torch.arange(batch_sizes.shape[0], device=batch_sizes.device),
+        source_spans,
+        output_size=source_major_lengths.shape[0],
+    )
+    source_starts = source_spans.cumsum(dim=0) - source_spans
+    source_indices = torch.arange(
+        source_major_lengths.shape[0], device=source_major_lengths.device
+    )
+    source_positions = source_indices - source_starts[source_ids]
+    source_batch_sizes = batch_sizes[source_ids]
+    feature_ids = torch.div(
+        source_positions,
+        source_batch_sizes,
+        rounding_mode="floor",
+    )
+    bag_ids = torch.remainder(source_positions, source_batch_sizes)
+    batch_starts = batch_sizes.cumsum(dim=0) - batch_sizes
+    target_positions = (
+        feature_ids * batch_sizes.sum() + batch_starts[source_ids] + bag_ids
+    )
+    return torch.empty_like(source_indices).scatter(
+        0,
+        target_positions,
+        source_indices,
+    )
+
+
+@pooled_source_to_feature_permute.register_fake
+def _fake_pooled_source_to_feature_permute(
+    source_major_lengths: torch.Tensor,
+    batch_sizes: torch.Tensor,
+    feature_count: int,
+) -> torch.Tensor:
+    del batch_sizes, feature_count
+    return source_major_lengths.new_empty(
+        source_major_lengths.shape,
+        dtype=torch.int64,
+    )
+
+
+@torch.library.custom_op("recir::sum_pooled_embeddings", mutates_args=())
+def sum_pooled_embeddings(
+    partials: torch.Tensor,
+    source_offsets: torch.Tensor,
+    feature_count: int,
+    world_size: int,
+    output_width: int,
+) -> torch.Tensor:
+    """Combine one row-wise pooled partial per owner and source bag."""
+    if partials.dim() != 1:
+        raise ValueError("Pooled embedding partials must be one-dimensional.")
+    if source_offsets.dim() != 1:
+        raise ValueError("Pooled source offsets must be one-dimensional.")
+    if feature_count <= 0:
+        raise ValueError("Pooled feature count must be positive.")
+    if (source_offsets.shape[0] - 1) % feature_count != 0:
+        raise ValueError("Pooled source offsets do not contain equal-sized features.")
+    batch_size = (source_offsets.shape[0] - 1) // feature_count
+    if partials.shape[0] != world_size * batch_size * output_width:
+        raise ValueError("Pooled embedding partial size does not match the mesh.")
+    return partials.reshape(world_size, batch_size, output_width).sum(dim=0)
+
+
+@sum_pooled_embeddings.register_fake
+def _fake_sum_pooled_embeddings(
+    partials: torch.Tensor,
+    source_offsets: torch.Tensor,
+    feature_count: int,
+    world_size: int,
+    output_width: int,
+) -> torch.Tensor:
+    del world_size
+    batch_size = (source_offsets.shape[0] - 1) // feature_count
+    return partials.new_empty((batch_size, output_width))
+
+
+@torch.library.custom_op("recir::reshape_pooled_gradients", mutates_args=())
+def reshape_pooled_gradients(
+    gradients: torch.Tensor,
+    local_embeddings: torch.Tensor,
+) -> torch.Tensor:
+    """Restore owner-local bag gradients after a flat all-to-all."""
+    if gradients.dim() != 1:
+        raise ValueError("Pooled gradients must be one-dimensional.")
+    if local_embeddings.dim() != 2:
+        raise ValueError("Pooled local embeddings must be two-dimensional.")
+    if gradients.shape[0] != local_embeddings.numel():
+        raise ValueError("Pooled gradient size does not match local embeddings.")
+    return gradients.reshape(local_embeddings.shape).clone()
+
+
+@reshape_pooled_gradients.register_fake
+def _fake_reshape_pooled_gradients(
+    gradients: torch.Tensor,
+    local_embeddings: torch.Tensor,
+) -> torch.Tensor:
+    return gradients.new_empty(local_embeddings.shape)
+
+
 def register_tbe_group(group: Any) -> int:
     handle = id(group)
     _TBE_GROUPS[handle] = group
@@ -191,9 +336,12 @@ def tbe_forward(
     learning_rate: torch.Tensor,
     indices: torch.Tensor,
     offsets: torch.Tensor,
+    pooled: bool,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     del state_token, autograd_placeholder
     group = _get_tbe_group(handle)
+    if pooled != (group.pooling_mode != "none"):
+        raise RuntimeError("TBE pooling metadata does not match the registered group.")
     autograd_key = (
         torch._C.DispatchKey.AutogradCUDA
         if indices.device.type == "cuda"
@@ -246,12 +394,21 @@ def _fake_tbe_forward(
     learning_rate: torch.Tensor,
     indices: torch.Tensor,
     offsets: torch.Tensor,
+    pooled: bool,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    del state_token, autograd_placeholder, tbe_state, learning_rate, offsets
+    del state_token, autograd_placeholder, tbe_state, learning_rate
     group = _get_tbe_group(handle)
-    output = indices.new_empty(
-        (indices.shape[0], group.embedding_dim), dtype=group.output_dtype
-    )
+    if pooled != (group.pooling_mode != "none"):
+        raise RuntimeError("TBE pooling metadata does not match the registered group.")
+    if not pooled:
+        output_shape = (indices.shape[0], group.embedding_dim)
+    else:
+        feature_count = len(group.feature_table_map)
+        output_shape = (
+            (offsets.shape[0] - 1) // feature_count,
+            feature_count * group.embedding_dim,
+        )
+    output = indices.new_empty(output_shape, dtype=group.output_dtype)
     context = torch.empty((), dtype=torch.int64, device="cpu")
     return output, context
 
@@ -299,6 +456,7 @@ class TBEFunction(torch.autograd.Function):
         learning_rate: torch.Tensor,
         indices: torch.Tensor,
         offsets: torch.Tensor,
+        pooled: bool,
     ) -> torch.Tensor:
         output, context = tbe_forward(
             handle,
@@ -308,6 +466,7 @@ class TBEFunction(torch.autograd.Function):
             learning_rate,
             indices,
             offsets,
+            pooled,
         )
         ctx.handle = handle
         ctx.tbe_state = tbe_state
@@ -326,4 +485,4 @@ class TBEFunction(torch.autograd.Function):
             context,
             grad_outputs[0].contiguous(),
         )
-        return None, None, None, None, None, None, None
+        return None, None, None, None, None, None, None, None
