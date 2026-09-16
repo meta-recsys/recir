@@ -9,10 +9,9 @@
 #     PARITY_GCS_DATA_PATH=gs://cq-mrs-core-shared_mrs_tpu_y317h/rankfm_1shard_data \
 #     ./recir/examples/rankfm_mvai/run_parity.sh
 #
-# PARITY_USE_HELION=1 (below) puts the COMPILED cell on the recir Helion HSTU
-# kernels while the CPU-eager cell stays the aten reference, so the PASS/FAIL
-# verdict is a Helion numerics check. Flip it with PARITY_USE_HELION=0 on the
-# run_parity.sh command line for the aten-vs-aten baseline.
+# RANKFM_MVAI_ATTENTION_BACKEND=helion (below) puts the COMPILED cell on the
+# recir Helion HSTU kernels while the CPU-eager cell stays the Aten reference.
+# Override it with `baseline` for the Aten-vs-Aten control run.
 apiVersion: jobset.x-k8s.io/v1alpha2
 kind: JobSet
 metadata:
@@ -84,16 +83,11 @@ spec:
                     fieldPath: metadata.labels['jobset.sigs.k8s.io/jobset-name']
               - name: PARITY_EMB_BACKEND
                 value: "in_graph"
-              # Run HSTU attention on the recir Helion kernels in the COMPILED cell:
-              # build_model_from_config(use_helion=True) rebinds the attention leaf
-              # to the recir Helion adapter, so the STU traces the single
-              # recir::helion_ragged_attention_fwd node the torchax lowering runs on
-              # the Helion Pallas/Mosaic kernels (mirrors the bench's
-              # RANKFM_MVAI_USE_HELION). The CPU-eager cell is unaffected -- the op's
-              # eager fallback is the captured original pytorch_hstu_mha -- so it stays
-              # the aten reference. Requires PARITY_EMB_BACKEND=in_graph.
-              - name: PARITY_USE_HELION
-                value: "1"
+              # Run HSTU attention on Helion in the COMPILED cell. Its eager
+              # fallback is the captured original pytorch_hstu_mha, so the CPU-eager
+              # cell remains the Aten reference. Requires PARITY_EMB_BACKEND=in_graph.
+              - name: RANKFM_MVAI_ATTENTION_BACKEND
+                value: "helion"
               # Same libtpu flags as the 64chip Helion bench, so the parity compile
               # sees the same collective scheduling / VMEM behaviour the bench
               # validated the kernels under. NOTE: libtpu FATALs on an unknown flag;
