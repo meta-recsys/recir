@@ -341,6 +341,7 @@ def _exchange_pooled_counts(
     feature_count: int,
     group_name: str,
     world_size: int,
+    variable_batch_per_rank: bool,
 ) -> tuple[torch.Tensor, torch.Tensor, list[int], torch.Tensor]:
     local_batch_size = packed_lengths.shape[0] // feature_count
     local_batch_size_tensor = torch.scalar_tensor(
@@ -354,6 +355,11 @@ def _exchange_pooled_counts(
         group_name,
     )
     batch_sizes = torch.ops._c10d_functional.wait_tensor(batch_sizes)
+    if not variable_batch_per_rank:
+        torch._assert_async(
+            (batch_sizes == local_batch_size_tensor).all(),
+            "Uniform pooled TBE routing requires the same bag count on every rank.",
+        )
     sent_segment_counts = batch_sizes.new_full(
         (world_size,),
         local_batch_size * feature_count,
@@ -433,6 +439,7 @@ def route_row_wise_pooled_indices_grouped(
     num_embeddings: tuple[int, ...],
     group_name: str,
     world_size: int,
+    variable_batch_per_rank: bool,
 ) -> tuple[
     tuple[torch.Tensor, torch.Tensor, torch.Tensor],
     tuple[torch.Tensor, ...],
@@ -466,6 +473,7 @@ def route_row_wise_pooled_indices_grouped(
         feature_count,
         group_name,
         world_size,
+        variable_batch_per_rank,
     )
     received_counts = torch.ops._c10d_functional.wait_tensor(pending_received_counts)
     pending_received_indices = _exchange_pooled_indices(
@@ -507,8 +515,18 @@ def return_row_wise_pooled_embeddings_grouped(
     feature_count: int,
     group_name: str,
     world_size: int,
+    variable_batch_per_rank: bool,
 ) -> torch.Tensor:
     """Return owner-local partial bag sums and combine them on source ranks."""
+    if not variable_batch_per_rank:
+        reduced = torch.ops._c10d_functional.reduce_scatter_tensor(
+            local_embeddings,
+            "sum",
+            world_size,
+            group_name,
+        )
+        return torch.ops._c10d_functional.wait_tensor(reduced)
+
     output_width = local_embeddings.shape[1]
     local_splits, source_splits = _pooled_embedding_splits(
         cpu_count_splits,
@@ -542,8 +560,17 @@ def route_row_wise_pooled_gradients_grouped(
     feature_count: int,
     group_name: str,
     world_size: int,
+    variable_batch_per_rank: bool,
 ) -> torch.Tensor:
     """Send each source bag gradient to every row owner."""
+    if not variable_batch_per_rank:
+        gathered = torch.ops._c10d_functional.all_gather_into_tensor(
+            gradients,
+            world_size,
+            group_name,
+        )
+        return torch.ops._c10d_functional.wait_tensor(gathered)
+
     output_width = gradients.shape[1]
     local_splits, source_splits = _pooled_embedding_splits(
         cpu_count_splits,
@@ -865,7 +892,8 @@ class TBESparseEmbeddingTransform(RegionTransform):
     Supports unpooled and SUM/MEAN pooled one-dimensional feature ID tensors
     with Exact RowWiseAdagrad and no weight decay. Compatible lookup sites are
     grouped by pooling shape, dtype, device, embedding dimension, storage
-    location, and optimizer settings.
+    location, and optimizer settings. Row-wise pooled groups assume equal bag
+    counts across ranks unless ``variable_pooled_batch_per_rank`` is enabled.
     """
 
     def __init__(
@@ -882,6 +910,7 @@ class TBESparseEmbeddingTransform(RegionTransform):
         stochastic_rounding: bool = True,
         segments_per_feature: int = 128,
         use_index_dedup: bool = True,
+        variable_pooled_batch_per_rank: bool = False,
     ) -> None:
         if segments_per_feature <= 0:
             raise ValueError("TBE segments per feature must be positive.")
@@ -912,6 +941,7 @@ class TBESparseEmbeddingTransform(RegionTransform):
         self._forward_root_fqn: str | None = None
         self._segments_per_feature: int = segments_per_feature
         self._use_index_dedup: bool = use_index_dedup
+        self._variable_pooled_batch_per_rank: bool = variable_pooled_batch_per_rank
 
     def select_forward_root_fqns(
         self,
@@ -1589,6 +1619,7 @@ class TBESparseEmbeddingTransform(RegionTransform):
                 num_embeddings=tuple(site.global_rows for site in group.sites),
                 group_name=self.group_name,
                 world_size=self.world_size,
+                variable_batch_per_rank=self._variable_pooled_batch_per_rank,
             ),
             (
                 torch.arange(
@@ -1669,6 +1700,7 @@ class TBESparseEmbeddingTransform(RegionTransform):
                 feature_count=feature_count,
                 group_name=self.group_name,
                 world_size=self.world_size,
+                variable_batch_per_rank=self._variable_pooled_batch_per_rank,
             ),
             (
                 torch.randn(
@@ -1760,6 +1792,7 @@ class TBESparseEmbeddingTransform(RegionTransform):
                 feature_count=feature_count,
                 group_name=self.group_name,
                 world_size=self.world_size,
+                variable_batch_per_rank=self._variable_pooled_batch_per_rank,
             ),
             (
                 torch.randn(_PLACEHOLDER_SIZE, output_width, device=group.device),
