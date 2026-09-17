@@ -96,11 +96,6 @@ def compute_metric_states(
         WERR_SUM: torch.sum(weights * torch.square(labels - predictions), dim=-1),
         WCE_SUM: torch.sum(cross_entropy, dim=-1),
         NNZ_SUM: torch.sum((weights > 0).to(weights.dtype), dim=-1),
-        # The PADDED candidate width, i.e. what the host path reads as
-        # `predictions.shape[-1]` and credits to the metric window. Static at
-        # trace time, so this is a constant node, not a reduction. Carried so
-        # the move-the-math change can reproduce today's window accounting
-        # exactly and be A/B'd for equality before the unpad fix lands.
         PADDED_ROWS: torch.full(
             (), float(weights.shape[-1]), dtype=weights.dtype, device=weights.device
         ),
