@@ -11,6 +11,7 @@ import numpy as np
 from recir.ops.pallas.jagged_hstu_attention import (
     jagged_hstu_attention_reference,
     pallas_jagged_hstu_attention,
+    pallas_jagged_hstu_attention_backward,
 )
 
 
@@ -103,6 +104,108 @@ class JaggedHSTUAttentionTest(unittest.TestCase):
         )
 
         np.testing.assert_allclose(small, mixed, rtol=2e-5, atol=2e-5)
+
+    def test_backward_parity(self) -> None:
+        for lengths, num_targets, max_seq_len in (
+            ([7, 3, 9], [0, 0, 0], 9),
+            ([0, 6, 2, 0], [0, 2, 1, 0], 8),
+            ([3, 5], [0, 2], 8),
+        ):
+            with self.subTest(lengths=lengths, num_targets=num_targets):
+                q, k, v, offsets = self._inputs(lengths)
+                targets = jnp.asarray(num_targets, dtype=jnp.int32)
+                alpha = 1.0 / math.sqrt(q.shape[-1])
+                inv_n = 0.17
+                output = jagged_hstu_attention_reference(
+                    q,
+                    k,
+                    v,
+                    offsets,
+                    targets,
+                    max_seq_len,
+                    alpha,
+                    inv_n,
+                )
+                grad_out = jax.random.normal(jax.random.key(7), output.shape)
+
+                _, pullback = jax.vjp(
+                    lambda q_,
+                    k_,
+                    v_,
+                    offsets=offsets,
+                    targets=targets,
+                    max_seq_len=max_seq_len,
+                    alpha=alpha,
+                    inv_n=inv_n: jagged_hstu_attention_reference(
+                        q_,
+                        k_,
+                        v_,
+                        offsets,
+                        targets,
+                        max_seq_len,
+                        alpha,
+                        inv_n,
+                    ),
+                    q,
+                    k,
+                    v,
+                )
+                expected = pullback(grad_out)
+                actual = pallas_jagged_hstu_attention_backward(
+                    grad_out,
+                    q,
+                    k,
+                    v,
+                    offsets,
+                    targets,
+                    jnp.asarray(inv_n, dtype=jnp.float32),
+                    max_seq_len=max_seq_len,
+                    alpha=alpha,
+                    interpret=True,
+                    block_q=4,
+                    block_k=4,
+                )
+
+                for actual_grad, expected_grad in zip(actual, expected):
+                    np.testing.assert_allclose(
+                        actual_grad,
+                        expected_grad,
+                        rtol=2e-4,
+                        atol=2e-4,
+                    )
+
+    def test_native_backward_traces(self) -> None:
+        q, k, v, offsets = self._inputs(
+            [128],
+            heads=1,
+            dqk=128,
+            dv=128,
+        )
+        q = q.astype(jnp.bfloat16)
+        k = k.astype(jnp.bfloat16)
+        v = v.astype(jnp.bfloat16)
+        grad_out = jnp.ones((1, 1, 128, 128), dtype=jnp.bfloat16)
+        targets = jnp.zeros((1,), dtype=jnp.int32)
+        inv_n = jnp.asarray(1.0 / 128, dtype=jnp.float32)
+
+        traced = jax.make_jaxpr(
+            lambda do_, q_, k_, v_: pallas_jagged_hstu_attention_backward(
+                do_,
+                q_,
+                k_,
+                v_,
+                offsets,
+                targets,
+                inv_n,
+                max_seq_len=128,
+                alpha=1.0 / math.sqrt(128),
+                interpret=False,
+                block_q=128,
+                block_k=128,
+            )
+        )(grad_out, q, k, v)
+
+        self.assertIn("pallas_call", str(traced))
 
     def test_rejects_invalid_shapes(self) -> None:
         q, k, v, offsets = self._inputs([3, 2])
