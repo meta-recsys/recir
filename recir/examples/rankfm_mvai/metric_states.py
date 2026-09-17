@@ -207,7 +207,7 @@ def _feed_effective_sample_cnt(metric: Any, nnz: torch.Tensor) -> bool:
     metric._itrn += 1
     if not metric.should_update():
         return True
-    counts = nnz.to(lifetime.dtype)
+    counts = nnz.to(lifetime.dtype) * float(getattr(metric, "state_scale", 1.0))
     n = min(counts.numel(), lifetime.numel())
     lifetime[:n] += counts[:n]
     window[:n] += counts[:n]

@@ -473,18 +473,24 @@ class ComputeCacheTest(unittest.TestCase):
 class _FakeEffectiveSampleCnt:
     """The buffers ``_feed_effective_sample_cnt`` duck-types on."""
 
-    def __init__(self, n_tasks: int, global_batch_size: int = 1024) -> None:
+    def __init__(
+        self,
+        n_tasks: int,
+        global_batch_size: int = 1024,
+        state_scale: float = 1.0,
+    ) -> None:
         self._lifetime = torch.zeros(n_tasks, dtype=torch.float64)
         self._window = torch.zeros(n_tasks, dtype=torch.float64)
         self._itrn = 0
         self._step_stride = 0
         self._global_batch_size = global_batch_size
+        self.state_scale = state_scale
 
     def should_update(self) -> bool:
         return True
 
     def update(self, *_: Any, weights: torch.Tensor, **__: Any) -> None:
-        counts = (weights.detach() > 0).sum(dim=1).to(torch.float64)
+        counts = (weights.detach() > 0).sum(dim=1).to(torch.float64) * self.state_scale
         n = min(counts.numel(), self._lifetime.numel())
         self._lifetime[:n] += counts[:n]
         self._window[:n] += counts[:n]
@@ -553,6 +559,59 @@ class StepMetricsTest(unittest.TestCase):
         states = compute_metric_states(predictions, labels, weights)
         self.assertEqual(int(states[PADDED_ROWS].item()), predictions.shape[-1])
         self.assertEqual(states[PADDED_ROWS].ndim, 0)
+
+    def test_state_scale_survives_the_metrics_own_cross_rank_sum(self) -> None:
+        """The recir states are global on every rank, and the metric sums them
+        again over the process group -- so the feed has to pre-divide.
+
+        Asserted as a ROUND TRIP: scaling by 1/N and adding the N rank copies
+        back up must land on the unscaled count. Testing only that the buffer
+        shrank would pass for any scale, including a wrong one.
+        """
+        world_size = 32
+        predictions, labels, weights = _inputs(torch.float64)
+        weights[:, :1000] = 0.0
+        states = compute_metric_states(predictions, labels, weights)
+
+        unscaled = _FakeEffectiveSampleCnt(_TASKS)
+        update_ranking_metrics_from_states(
+            states, num_samples=_N, num_real_candidates=_N, step_metrics=[unscaled]
+        )
+
+        # Every rank holds the SAME global states, so N identical feeds is what
+        # the all_reduce in report_metrics sees.
+        per_rank = [
+            _FakeEffectiveSampleCnt(_TASKS, state_scale=1.0 / world_size)
+            for _ in range(world_size)
+        ]
+        for metric in per_rank:
+            update_ranking_metrics_from_states(
+                states, num_samples=_N, num_real_candidates=_N, step_metrics=[metric]
+            )
+        reduced = torch.stack([m._lifetime for m in per_rank]).sum(dim=0)
+
+        self.assertTrue(
+            torch.equal(reduced, unscaled._lifetime),
+            f"round trip lost precision: {reduced} vs {unscaled._lifetime}",
+        )
+        self.assertGreater(float(unscaled._lifetime.min()), 0.0)
+
+    def test_unscaled_feed_is_world_size_too_big(self) -> None:
+        """The bug this pins. Without the scale, the N identical global feeds
+        the metric all-reduces come out N times the true count -- measured at
+        31.94x against the MAST leg on all 101 tasks. If this ever starts
+        failing, the states stopped being global and the scale is wrong."""
+        world_size = 32
+        predictions, labels, weights = _inputs(torch.float64)
+        states = compute_metric_states(predictions, labels, weights)
+
+        per_rank = [_FakeEffectiveSampleCnt(_TASKS) for _ in range(world_size)]
+        for metric in per_rank:
+            update_ranking_metrics_from_states(
+                states, num_samples=_N, num_real_candidates=_N, step_metrics=[metric]
+            )
+        reduced = torch.stack([m._lifetime for m in per_rank]).sum(dim=0)
+        self.assertTrue(torch.equal(reduced, states[NNZ_SUM] * world_size))
 
 
 class _FakeCollection:
