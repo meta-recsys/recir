@@ -28,8 +28,10 @@ Usage:
 
 from __future__ import annotations
 
+import json
 import logging
 import os
+from pathlib import Path
 from typing import Any, cast, TYPE_CHECKING
 
 import jax
@@ -97,8 +99,43 @@ def _init_gloo_pg() -> None:
     )
 
 
+def _log_build_info() -> None:
+    """Report what the image was built from.
+
+    ``build_image_podman.sh`` stages the working tree, so the code in an image
+    can match no commit; this is the only mapping from a running pod back to
+    source, and it is worth a line in every log.
+    """
+    path = Path(__file__).parents[2] / "BUILD_INFO.json"
+    try:
+        info = json.loads(path.read_text())
+    except (OSError, ValueError):
+        logger.warning(
+            "[build] no readable %s -- image predates build stamping, so its "
+            "contents cannot be mapped to a revision",
+            path,
+        )
+        return
+    logger.info(
+        "[build] tag=%s revision=%s built_at=%s by=%s",
+        info.get("tag"),
+        info.get("revision"),
+        info.get("built_at"),
+        info.get("built_by"),
+    )
+    dirty = info.get("dirty_files") or []
+    if dirty:
+        logger.warning(
+            "[build] built from a DIRTY tree: %d uncommitted file(s) are in "
+            "this image and may exist in no commit: %s",
+            len(dirty),
+            ", ".join(dirty),
+        )
+
+
 def main() -> None:
     setup_logging()
+    _log_build_info()
     resolve_dist_env()
 
     # Multi-host (e.g. 128-chip): must call jax.distributed.initialize() before

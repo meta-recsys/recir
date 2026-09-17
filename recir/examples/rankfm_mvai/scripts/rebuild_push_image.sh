@@ -17,6 +17,14 @@ set -euo pipefail
 
 : "${IMAGE_TAG:=${USER}-compiled}"
 : "${REGISTRY:=us-central1-docker.pkg.dev/mrs-tpu-y317h/recml}"
+# `never` reuses the base image already in local storage, which is the common
+# case and avoids a Docker Hub round trip on every build. But the base image is
+# evicted periodically, and then `never` turns that into
+# `python:3.12-slim: image not known` at STEP 1/33 -- a failure that reads like
+# a broken Dockerfile rather than a missing pull. Re-run with
+# PODMAN_PULL_POLICY=missing to fetch it once; this is a default, not a
+# hardcode, so that override reaches build_image_podman.sh.
+: "${PODMAN_PULL_POLICY:=never}"
 
 FBCODE="$(hg root 2>/dev/null || sl root 2>/dev/null)/fbcode"
 cd "$FBCODE"
@@ -25,9 +33,7 @@ LOCAL="localhost/rankfm_mvai_tpu:${IMAGE_TAG}"
 REMOTE="${REGISTRY}/rankfm_mvai_tpu:${IMAGE_TAG}"
 
 echo "=== build  ${LOCAL}"
-# PODMAN_PULL_POLICY=never reuses the base image already in local storage;
-# without it the build tries to reach Docker Hub and fails on a devserver.
-IMAGE_TAG="${IMAGE_TAG}" PODMAN_PULL_POLICY=never \
+IMAGE_TAG="${IMAGE_TAG}" PODMAN_PULL_POLICY="${PODMAN_PULL_POLICY}" \
     bash recir/examples/rankfm_mvai/scripts/build_image_podman.sh
 
 # The build runs in a SUBSHELL, so the proxy it exports does not come back

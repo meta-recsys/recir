@@ -211,6 +211,50 @@ for rel in "${DCN_FILES[@]}"; do
     done
 done
 
+# Record what actually went into the image. Everything above rsyncs the WORKING
+# TREE, not a commit, so uncommitted edits ship silently -- and disappear from
+# the checkout as soon as the tree moves on, leaving a running pod whose code
+# exists in no revision. That has already happened once: an image shipped a
+# `_warn_if_over_budget` and a `--prod_ro_per_sample_budget` flag that were
+# replaced before landing, and the only way to read the running binary was to
+# `podman run ... sed` it. BUILD_INFO.json makes the mapping recoverable, and
+# train.py logs it at startup.
+echo "--- Stamping build provenance ---"
+BUILD_REV="$(sl --cwd "$FBCODE_DIR" id -i 2>/dev/null)" || BUILD_REV=""
+BUILD_REV="${BUILD_REV:-unknown}"
+BUILD_DIRTY="$(sl --cwd "$FBCODE_DIR" status -n recir hammer mvai_cloud generative_recommenders mrs hpc 2>/dev/null)" || BUILD_DIRTY=""
+
+BUILD_REV="$BUILD_REV" \
+BUILD_DIRTY="$BUILD_DIRTY" \
+BUILD_TAG="$IMAGE_TAG" \
+BUILD_OUT="${STAGING_DIR}/recir/BUILD_INFO.json" \
+python3 -c '
+import datetime, json, os
+
+dirty = sorted(line for line in os.environ["BUILD_DIRTY"].splitlines() if line.strip())
+with open(os.environ["BUILD_OUT"], "w") as f:
+    json.dump(
+        {
+            "revision": os.environ["BUILD_REV"],
+            "tag": os.environ["BUILD_TAG"],
+            "built_at": datetime.datetime.now(datetime.timezone.utc).isoformat(
+                timespec="seconds"
+            ),
+            "built_by": os.environ.get("USER", "unknown"),
+            "dirty_files": dirty,
+        },
+        f,
+        indent=2,
+    )
+'
+echo "  revision ${BUILD_REV}, tag ${IMAGE_TAG}"
+
+if [ -n "$BUILD_DIRTY" ]; then
+    echo "WARNING: building from a DIRTY tree. These uncommitted files go into" >&2
+    echo "         ${IMAGE_TAG} and will exist in no commit once the tree moves on:" >&2
+    echo "$BUILD_DIRTY" | sed 's/^/           /' >&2
+fi
+
 echo "============================================"
 echo "  Building RankFM-MVAI TPU image"
 echo "  Source:  ${RECIR_DIR}"

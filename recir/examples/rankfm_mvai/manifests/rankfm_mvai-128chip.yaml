@@ -10,7 +10,7 @@
 apiVersion: jobset.x-k8s.io/v1alpha2
 kind: JobSet
 metadata:
-  generateName: rankfm-mvai-128chip-
+  generateName: rankfm-ingraph-128chip-
   namespace: ns-mrs-core-shared
   labels:
     kueue.x-k8s.io/queue-name: lq-training
@@ -37,7 +37,7 @@ spec:
             serviceAccountName: default
             containers:
             - name: rankfm-mvai
-              image: us-central1-docker.pkg.dev/mrs-tpu-y317h/recml/rankfm_mvai_tpu:latest
+              image: us-central1-docker.pkg.dev/mrs-tpu-y317h/recml/rankfm_mvai_tpu:linjianma-pipeline
               imagePullPolicy: Always
               env:
               - name: PYTHONUNBUFFERED
@@ -97,6 +97,14 @@ spec:
               # off by default.
               - name: TPU_STDERR_LOG_LEVEL
                 value: "3"
+              # Print the PYTHON stack on a fatal signal. A SIGSEGV kills the
+              # process before the exception machinery runs, so the log
+              # otherwise carries only a native trace whose frames are all
+              # "(unknown)" (symbols are stripped) followed by pages of noise
+              # from the signal handler crashing inside itself. Costs nothing
+              # unless the process dies.
+              - name: PYTHONFAULTHANDLER
+                value: "1"
               - name: JAX_ENABLE_X64
                 value: "1"
               # Which op builds the 82.52GiB f32[65,332800,128,8]? The XLA memory
@@ -137,10 +145,29 @@ spec:
               # fixed post-pad shapes, so ROW_WISE A2A tolerates the divergent
               # per-rank jagged lengths that sharding introduces.
               #
-              # local_batch_size is the dump's own batch_size (512), so each
-              # step consumes a whole dumped batch and select_rows_slice is a
-              # no-op. A smaller value silently trains on a rotating subsample
-              # of each file, which is not what production consumed.
+              # local_batch_size is a MULTIPLE of the dump's own batch_size
+              # (512): the loader merges that many dumped batches per step, so
+              # 2048 consumes four files and select_rows_slice stays a no-op. A
+              # value that is not a multiple silently trains on a rotating
+              # subsample of each file, which is not what production consumed.
+              #
+              # --data_load_workers / --data_prefetch_buffer keep the host input
+              # pipeline off the critical path. At --local_batch_size 1024 a step
+              # reads two 512-row files; workers=2 overlaps those two blocking
+              # FUSE reads with each other, and prefetch_buffer=2 runs whole steps
+              # ahead on a producer thread so the load overlaps the DEVICE step.
+              # Both are the defaults and are spelled out here because they are
+              # what the throughput investigation turned on -- serial loading was
+              # 1.19 s/step, 37% of the step. Set both to 0/1 to reproduce the
+              # old serial behaviour for an A/B.
+              #
+              # --seq_len_cap truncates history: hstu_max_seq_len 3554 -> the
+              # cap, and mot_preprocessor keeps only the most recent events per
+              # row. It is here because activation memory is superlinear in
+              # sequence length and batch 2048 does not otherwise fit. The ten
+              # history keys average 2929 events, so a cap of 1024 discards
+              # roughly two thirds of an average history and this run's NE is
+              # NOT comparable with prod's.
               #
               # num_candidates is deliberately NOT passed: under
               # --prod_faithful the NRO budget comes from prod's
@@ -172,6 +199,19 @@ spec:
               # rate-limits (HTTP 429) and drags the whole synchronized loop"
               # problem actually was. 60s is far below the per-object write rate
               # limit for a file this size.
+              #
+              # The metric window is credited the real pre-pad GLOBAL row
+              # count, not the padded width (660,480 padded vs ~166,910 real
+              # per step here), so its length no longer drifts with the pad
+              # fraction. Unconditional -- there is no flag.
+              #
+              # --metric_window_size: torchrec's 1e6 default is a PER-RANK row
+              # budget, so MAST's window spans ~64e6 global rows (~384 steps)
+              # across its 64 GPUs. The recir metric states are already global,
+              # so reproducing that span takes the global budget. Do not scale
+              # this with the TPU host count -- it tracks the reference leg.
+              # NOTE: this is a FOLDED (>-) scalar. A '#' anywhere below
+              # comments out the rest of the command.
               - >-
                 RANK=${JOB_COMPLETION_INDEX:-0} ;
                 FIRST_FILE=rank_${RANK}/batch_0/0.pt.zst ;
@@ -194,14 +234,20 @@ spec:
                 fi ;
                 python3 -u -m recir.examples.rankfm_mvai.train
                 --max_steps 629130
-                --local_batch_size 512
+                --local_batch_size 1024
+                --seq_len_cap 1024
                 --prod_faithful
                 --bf16_training
                 --embedding_backend in_graph
                 --gcs_data_path /mnt/barnfs
+                --data_load_workers 2
+                --data_prefetch_buffer 32
                 --metrics_report_interval 100
-                --profile_start_step 3
-                --profile_end_step 8
+                --in_graph_metrics
+                --metric_window_size 64000000
+                --pipeline_preprocessor
+                --profile_start_step 900
+                --profile_end_step 906
                 --profile_dir "gs://cq-mrs-core-shared_mrs_tpu_y317h/tpu-profiles/${JOBSET_NAME}" ;
                 rc=$? ;
                 if [ "${RANK}" = "0" ]; then
