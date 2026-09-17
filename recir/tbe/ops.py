@@ -197,6 +197,76 @@ def _fake_permute_sparse_data_1d(
     return lengths.new_empty(lengths.shape), values.new_empty(values.shape)
 
 
+def _permute_2d_sparse_data_stride(
+    lengths: torch.Tensor,
+    feature_count: int,
+) -> int:
+    if feature_count <= 0:
+        raise ValueError("KJT feature count must be positive.")
+    if lengths.dim() != 1:
+        raise ValueError("KJT lengths must be one-dimensional.")
+    length_count = lengths.numel()
+    if isinstance(length_count, torch.SymInt):
+        torch._check(
+            length_count % feature_count == 0,
+            lambda: "KJT lengths must contain the same stride for every feature.",
+        )
+    elif length_count % feature_count != 0:
+        raise ValueError("KJT lengths must contain the same stride for every feature.")
+    return length_count // feature_count
+
+
+@torch.library.custom_op(
+    "recir::permute_2d_sparse_data",
+    mutates_args=(),
+    schema=(
+        "(Tensor permutation, Tensor lengths, Tensor values, "
+        "SymInt feature_count, Tensor? weights=None) -> "
+        "(Tensor, Tensor, Tensor?)"
+    ),
+)
+def permute_2d_sparse_data(
+    permutation: torch.Tensor,
+    lengths: torch.Tensor,
+    values: torch.Tensor,
+    feature_count: int,
+    weights: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    """Permute feature-major KJT data with a runtime-derived stride."""
+    stride = _permute_2d_sparse_data_stride(lengths, feature_count)
+    return torch.ops.fbgemm.permute_2D_sparse_data_input1D(
+        permutation,
+        lengths,
+        values,
+        stride,
+        weights,
+        None,
+    )
+
+
+@permute_2d_sparse_data.register_fake
+def _fake_permute_2d_sparse_data(
+    permutation: torch.Tensor,
+    lengths: torch.Tensor,
+    values: torch.Tensor,
+    feature_count: int,
+    weights: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    stride = _permute_2d_sparse_data_stride(lengths, feature_count)
+    output_lengths = lengths.new_empty((permutation.shape[0] * stride,))
+    output_size = torch.library.get_ctx().new_dynamic_size()
+    torch._check_is_size(output_size)
+    return (
+        output_lengths,
+        values.new_empty((output_size,)),
+        weights.new_empty((output_size,)) if weights is not None else None,
+    )
+
+
+def get_permute_2d_sparse_data_op() -> torch._ops.OpOverload:
+    return torch.ops.recir.permute_2d_sparse_data.default
+
+
 @torch.library.custom_op("recir::pooled_source_to_feature_permute", mutates_args=())
 def pooled_source_to_feature_permute(
     source_major_lengths: torch.Tensor,

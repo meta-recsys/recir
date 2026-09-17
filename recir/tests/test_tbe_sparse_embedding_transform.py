@@ -16,6 +16,7 @@ import torch
 import torch.fx as fx
 import torch.nn as nn
 from functorch import make_fx
+from recir.lowering.partial_lower import _InductorModule, partial_lower
 from recir.ops.fake.kjt import patch_ebc_for_tracing
 from recir.pipeline import build_pipeline, PipelinedGraphModule
 from recir.pipeline_strategies import sdd_pipeline_config, semi_sync_pipeline_config
@@ -23,8 +24,15 @@ from recir.region_transforms.tbe_sparse_embedding import (
     _LookupSite,
     TBESparseEmbeddingTransform,
 )
+from torch._dynamo.source import LocalSource
+from torch._subclasses.fake_tensor import FakeTensorMode
 from torch.distributed import ProcessGroup
 from torch.distributed.tensor import DeviceMesh
+from torch.fx.experimental.symbolic_shapes import (
+    DimDynamic,
+    ShapeEnv,
+    StatelessSymbolicContext,
+)
 from torchrec.modules.embedding_configs import EmbeddingBagConfig, PoolingType
 from torchrec.modules.embedding_modules import EmbeddingBagCollection
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
@@ -73,6 +81,28 @@ def _mock_mesh(world_size: int, rank: int = 0) -> DeviceMesh:
     mesh.get_coordinate.return_value = [rank]
     mesh._dim_group_names = ["fake_tbe_sparse_test_group"]
     return mesh
+
+
+def _dynamic_fake_inputs(
+    prefix: str,
+    parameters: tuple[torch.Tensor, ...],
+    inputs: tuple[torch.Tensor, ...],
+) -> tuple[FakeTensorMode, tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
+    fake_mode = FakeTensorMode(allow_non_fake_inputs=True, shape_env=ShapeEnv())
+    fake_parameters = tuple(fake_mode.from_tensor(value) for value in parameters)
+    fake_inputs = tuple(
+        fake_mode.from_tensor(
+            value,
+            static_shapes=False,
+            source=LocalSource(f"{prefix}_{index}"),
+            symbolic_context=StatelessSymbolicContext(
+                dynamic_sizes=[DimDynamic.DYNAMIC]
+                + [DimDynamic.STATIC] * (value.ndim - 1)
+            ),
+        )
+        for index, value in enumerate(inputs)
+    )
+    return fake_mode, fake_parameters, fake_inputs
 
 
 def _embedding_graph(model: _TwoTableModel) -> fx.GraphModule:
@@ -129,6 +159,7 @@ class TBESparseEmbeddingTransformTest(unittest.TestCase):
             "bucketize_sparse_features",
             "dedup_sparse_features",
             "permute_sparse_data_1d",
+            "permute_2d_sparse_data",
             "permute_sparse_data_2d",
             "pooled_source_to_feature_permute",
             "reshape_pooled_gradients",
@@ -166,6 +197,66 @@ class TBESparseEmbeddingTransformTest(unittest.TestCase):
 
         torch.testing.assert_close(actual_lengths, torch.tensor([2, 1, 0]))
         torch.testing.assert_close(actual_values, torch.tensor([20, 21, 10]))
+
+    def test_permute_2d_sparse_data_derives_stride_from_lengths(self) -> None:
+        lengths = torch.tensor([1, 0, 2, 1, 0, 2], dtype=torch.int64)
+        values = torch.tensor([10, 20, 21, 30, 40, 41], dtype=torch.int64)
+
+        output_lengths, output_values, output_weights = (
+            torch.ops.recir.permute_2d_sparse_data(
+                torch.tensor([2, 0], dtype=torch.int32),
+                lengths,
+                values,
+                3,
+            )
+        )
+
+        torch.testing.assert_close(
+            output_lengths,
+            torch.tensor([0, 2, 1, 0], dtype=torch.int64),
+        )
+        torch.testing.assert_close(
+            output_values,
+            torch.tensor([40, 41, 10], dtype=torch.int64),
+        )
+        self.assertIsNone(output_weights)
+
+    def test_permute_2d_sparse_data_rejects_uneven_feature_strides(self) -> None:
+        args = (
+            torch.tensor([0], dtype=torch.int32),
+            torch.ones(5, dtype=torch.int64),
+            torch.ones(5, dtype=torch.int64),
+            3,
+        )
+        with self.assertRaisesRegex(ValueError, "same stride"):
+            torch.ops.recir.permute_2d_sparse_data(*args)
+
+        with FakeTensorMode(allow_non_fake_inputs=True, shape_env=ShapeEnv()):
+            with self.assertRaisesRegex(ValueError, "same stride"):
+                torch.ops.recir.permute_2d_sparse_data(*args)
+
+    def test_permute_2d_sparse_data_requires_flat_lengths(self) -> None:
+        args = (
+            torch.tensor([0], dtype=torch.int32),
+            torch.ones((1, 2), dtype=torch.int64),
+            torch.ones(2, dtype=torch.int64),
+            1,
+        )
+        with self.assertRaisesRegex(ValueError, "one-dimensional"):
+            torch.ops.recir.permute_2d_sparse_data(*args)
+
+        with FakeTensorMode(allow_non_fake_inputs=True):
+            with self.assertRaisesRegex(ValueError, "one-dimensional"):
+                torch.ops.recir.permute_2d_sparse_data(*args)
+
+    def test_permute_2d_sparse_data_rejects_empty_feature_set(self) -> None:
+        with self.assertRaisesRegex(ValueError, "positive"):
+            torch.ops.recir.permute_2d_sparse_data(
+                torch.empty(0, dtype=torch.int32),
+                torch.empty(0, dtype=torch.int64),
+                torch.empty(0, dtype=torch.int64),
+                0,
+            )
 
     def test_pooled_permutation_handles_uneven_rank_batches(
         self,
@@ -261,15 +352,24 @@ class TBESparseEmbeddingTransformTest(unittest.TestCase):
         TBESparseEmbeddingTransform,
         fx.GraphModule,
         tuple[torch.Tensor, ...],
+        torch.Tensor,
+        torch.Tensor,
     ]:
         ebc = EmbeddingBagCollection(
             tables=[
                 EmbeddingBagConfig(
-                    name="table",
+                    name="table_0",
                     embedding_dim=4,
                     num_embeddings=8 // world_size,
-                    feature_names=["feature"],
+                    feature_names=["feature_0"],
                     pooling=PoolingType.SUM,
+                ),
+                EmbeddingBagConfig(
+                    name="table_1",
+                    embedding_dim=4,
+                    num_embeddings=6 // world_size,
+                    feature_names=["feature_1"],
+                    pooling=PoolingType.MEAN,
                 ),
             ],
             device=torch.device("cpu"),
@@ -278,23 +378,23 @@ class TBESparseEmbeddingTransformTest(unittest.TestCase):
         parameter_items = tuple(ebc.named_parameters())
         parameter_fqns = tuple(name for name, _ in parameter_items)
         parameters = tuple(parameter for _, parameter in parameter_items)
-        values = torch.tensor([1], dtype=torch.int64)
-        lengths = torch.tensor([1, 0], dtype=torch.int64)
-        inputs = (*parameters, values, lengths)
+        values = torch.tensor([1, 2], dtype=torch.int64)
+        lengths = torch.tensor([1, 0, 0, 1], dtype=torch.int64)
 
         def forward(
-            weight: torch.Tensor,
+            weight_0: torch.Tensor,
+            weight_1: torch.Tensor,
             input_values: torch.Tensor,
             input_lengths: torch.Tensor,
         ) -> torch.Tensor:
             features = KeyedJaggedTensor(
-                keys=["feature"],
+                keys=["feature_0", "feature_1"],
                 values=input_values,
                 lengths=input_lengths,
             )
             return torch.func.functional_call(
                 ebc,
-                dict(zip(parameter_fqns, (weight,))),
+                dict(zip(parameter_fqns, (weight_0, weight_1))),
                 (features,),
             ).values()
 
@@ -302,12 +402,15 @@ class TBESparseEmbeddingTransformTest(unittest.TestCase):
             forward,
             tracing_mode="fake",
             _allow_non_fake_inputs=True,
-        )(*inputs)
+        )(*parameters, values, lengths)
         transform = TBESparseEmbeddingTransform(
             set(parameter_fqns),
             _mock_mesh(world_size),
             ebc,
-            num_embeddings_map={parameter_fqns[0]: 8},
+            num_embeddings_map={
+                parameter_fqns[0]: 8,
+                parameter_fqns[1]: 6,
+            },
             stochastic_rounding=False,
         )
         transform.prepare_after_shard(ebc, ())
@@ -320,7 +423,7 @@ class TBESparseEmbeddingTransformTest(unittest.TestCase):
             return_value=False,
         ):
             transform.transform_graph(gm, called)
-        return transform, gm, inputs
+        return transform, gm, parameters, values, lengths
 
     def test_inner_transform_reuses_optimizer_learning_rate_tensor(self) -> None:
         learning_rate = torch.tensor(0.1, dtype=torch.float32, device="cpu")
@@ -416,7 +519,6 @@ class TBESparseEmbeddingTransformTest(unittest.TestCase):
         grouped_calls = [node for node in gm.graph.nodes if node.op == "call_module"]
         self.assertEqual(embedding_nodes, [])
         self.assertEqual(len(grouped_calls), 1)
-
         indices_0 = torch.tensor([1, 3], dtype=torch.int64)
         indices_1 = torch.tensor([0, 2, 5], dtype=torch.int64)
         actual_0, actual_1 = gm(
@@ -468,6 +570,21 @@ class TBESparseEmbeddingTransformTest(unittest.TestCase):
         )
         torch.testing.assert_close(actual, expected)
 
+    def test_unpooled_transform_accepts_changed_feature_lengths(self) -> None:
+        _transform, model, gm = self._transform(world_size=1)
+
+        indices_0 = torch.tensor([1, 1, 3, 4, 2], dtype=torch.int64)
+        indices_1 = torch.tensor([5], dtype=torch.int64)
+        actual_0, actual_1 = gm(
+            model.table_0.weight,
+            model.table_1.weight,
+            indices_0,
+            indices_1,
+        )
+
+        torch.testing.assert_close(actual_0, model.table_0.weight[indices_0])
+        torch.testing.assert_close(actual_1, model.table_1.weight[indices_1])
+
     def test_patched_ebc_preserves_mixed_dims_and_empty_feature_after_tbe_rewrite(
         self,
     ) -> None:
@@ -518,11 +635,15 @@ class TBESparseEmbeddingTransformTest(unittest.TestCase):
 
         weight_0, weight_1 = parameters
         expected = forward(weight_0, weight_1, values, lengths)
-        gm = make_fx(
-            forward,
-            tracing_mode="fake",
-            _allow_non_fake_inputs=True,
-        )(weight_0, weight_1, values, lengths)
+        fake_mode, fake_parameters, fake_inputs = _dynamic_fake_inputs(
+            "pooled_tbe_input", parameters, (values, lengths)
+        )
+        with fake_mode:
+            gm = make_fx(
+                forward,
+                tracing_mode="fake",
+                _allow_non_fake_inputs=False,
+            )(*fake_parameters, *fake_inputs)
         transform = TBESparseEmbeddingTransform(
             set(parameter_fqns),
             _mock_mesh(1),
@@ -543,33 +664,69 @@ class TBESparseEmbeddingTransformTest(unittest.TestCase):
             return_value=False,
         ):
             transform.transform_graph(gm, called)
-        actual = gm(weight_0, weight_1, values, lengths)
+            with fake_mode:
+                transformed = make_fx(
+                    gm,
+                    tracing_mode="fake",
+                    _allow_non_fake_inputs=False,
+                )(*fake_parameters, *fake_inputs)
+        placeholders = [
+            node for node in transformed.graph.nodes if node.op == "placeholder"
+        ]
+        for placeholder in placeholders[:2]:
+            placeholder.meta["is_batch_input"] = False
+        for placeholder in placeholders[2:]:
+            placeholder.meta["is_batch_input"] = True
+            placeholder.meta["batch_dim"] = 0
+        lowered = partial_lower(
+            transformed,
+            node_predicate=lambda node: node.op == "call_function",
+            subgraph_predicate=lambda _nodes: True,
+        )
+        lowered_targets = {
+            node.target
+            for module in lowered.modules()
+            if isinstance(module, _InductorModule)
+            for node in module.gm.graph.nodes
+        }
+        self.assertIn(
+            torch.ops.recir_torchrec.kjt_split_per_feature_with_offsets.default,
+            lowered_targets,
+        )
+        self.assertIn(
+            torch.ops.recir.permute_2d_sparse_data.default,
+            lowered_targets,
+        )
+        actual = lowered(weight_0, weight_1, values, lengths)
 
         torch.testing.assert_close(actual, expected)
 
         resized_values = torch.tensor([1, 2, 3, 4], dtype=torch.int64)
         resized_lengths = torch.tensor([0, 0, 0, 0, 2, 2], dtype=torch.int64)
         torch.testing.assert_close(
-            gm(weight_0, weight_1, resized_values, resized_lengths),
+            lowered(weight_0, weight_1, resized_values, resized_lengths),
             forward(weight_0, weight_1, resized_values, resized_lengths),
         )
 
         empty_values = torch.empty(0, dtype=torch.int64)
         empty_lengths = torch.zeros(6, dtype=torch.int64)
         torch.testing.assert_close(
-            gm(weight_0, weight_1, empty_values, empty_lengths),
+            lowered(weight_0, weight_1, empty_values, empty_lengths),
             forward(weight_0, weight_1, empty_values, empty_lengths),
         )
 
     def test_pooled_outer_transform_builds_pipeline_stages(self) -> None:
-        transform, gm, inputs = self._pooled_transform(world_size=2)
+        transform, gm, parameters, values, lengths = self._pooled_transform(
+            world_size=2
+        )
 
         def train_step(
-            weight: torch.Tensor,
+            weight_0: torch.Tensor,
+            weight_1: torch.Tensor,
             input_values: torch.Tensor,
             input_lengths: torch.Tensor,
         ) -> torch.Tensor:
-            output = gm(weight, input_values, input_lengths)
+            output = gm(weight_0, weight_1, input_values, input_lengths)
             output.sum().backward()
             return output.detach()
 
@@ -581,7 +738,7 @@ class TBESparseEmbeddingTransformTest(unittest.TestCase):
                 train_step,
                 tracing_mode="fake",
                 _allow_non_fake_inputs=True,
-            )(*inputs)
+            )(*parameters, values, lengths)
         transform.finalize_compiled_graph(joint)
 
         sdd = build_pipeline(joint, sdd_pipeline_config())
@@ -610,20 +767,105 @@ class TBESparseEmbeddingTransformTest(unittest.TestCase):
             ),
             1,
         )
-        self.assertEqual(
-            stage_targets[2].count(
-                torch.ops._c10d_functional.all_to_all_single.default
-            ),
-            1,
+        self.assertIn(
+            torch.ops._c10d_functional.reduce_scatter_tensor.default,
+            stage_targets[2],
         )
-        self.assertEqual(
-            stage_targets[3].count(
-                torch.ops._c10d_functional.all_to_all_single.default
-            ),
-            1,
+        self.assertIn(
+            torch.ops._c10d_functional.all_gather_into_tensor.default,
+            stage_targets[3],
         )
         self.assertIn(torch.ops.recir.tbe_forward.default, stage_targets[2])
         self.assertIn(torch.ops.recir.tbe_backward_update.default, stage_targets[3])
+
+    def test_pooled_outer_transform_preserves_source_bags_and_topology(
+        self,
+    ) -> None:
+        transform, gm, parameters, values, lengths = self._pooled_transform(
+            world_size=2
+        )
+
+        def train_step(
+            weight_0: torch.Tensor,
+            weight_1: torch.Tensor,
+            input_values: torch.Tensor,
+            input_lengths: torch.Tensor,
+        ) -> torch.Tensor:
+            output = gm(weight_0, weight_1, input_values, input_lengths)
+            output.sum().backward()
+            return output.detach()
+
+        with patch(
+            "fbgemm_gpu.config.feature_list.FeatureGate.is_enabled",
+            return_value=False,
+        ):
+            joint = make_fx(
+                train_step,
+                tracing_mode="fake",
+                _allow_non_fake_inputs=True,
+            )(*parameters, values, lengths)
+        forward = next(
+            node
+            for node in joint.graph.nodes
+            if node.target == torch.ops.recir.tbe_forward.default
+        )
+        forward_output = next(
+            node
+            for node in forward.users
+            if node.target == operator.getitem and node.args[1] == 0
+        )
+        source_offsets = forward.args[6]
+        self.assertIsInstance(source_offsets, fx.Node)
+        source_offsets.meta["val"] = torch.empty(7, dtype=torch.int64)
+        graph_output = next(node for node in joint.graph.nodes if node.op == "output")
+        with joint.graph.inserting_before(graph_output):
+            late_alias = joint.graph.call_function(
+                torch.ops.aten.alias.default,
+                args=(forward_output,),
+            )
+            late_alias.meta = dict(forward_output.meta)
+        positions = {node: index for index, node in enumerate(joint.graph.nodes)}
+        earliest_user = min(forward_output.users, key=positions.__getitem__)
+        with joint.graph.inserting_before(earliest_user):
+            early_alias = joint.graph.call_function(
+                torch.ops.aten.alias.default,
+                args=(forward_output,),
+            )
+            early_alias.meta = dict(forward_output.meta)
+        earliest_user.replace_input_with(forward_output, early_alias)
+
+        transform.finalize_compiled_graph(joint)
+
+        updated_positions = {
+            node: index for index, node in enumerate(joint.graph.nodes)
+        }
+        routed_output = early_alias.args[0]
+        self.assertIsInstance(routed_output, fx.Node)
+        self.assertLess(
+            updated_positions[routed_output], updated_positions[early_alias]
+        )
+        self.assertEqual(
+            routed_output.meta["val"].shape,
+            torch.Size((3, 8)),
+        )
+        targets = [str(node.target) for node in joint.graph.nodes]
+        self.assertEqual(
+            sum(
+                "_c10d_functional.reduce_scatter_tensor" in target for target in targets
+            ),
+            1,
+        )
+        self.assertEqual(
+            sum(
+                "_c10d_functional.all_gather_into_tensor" in target
+                for target in targets
+            ),
+            2,
+        )
+        self.assertEqual(
+            sum("_c10d_functional.all_to_all_single" in target for target in targets),
+            2,
+        )
 
     def test_inner_transform_accepts_short_final_shard(self) -> None:
         local_model = _TwoTableModel(rows_0=7)

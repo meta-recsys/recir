@@ -329,16 +329,11 @@ class TraceableMoTPreprocessor(nn.Module):
                 ro_lengths.shape[0] == len(self._ro_kjt_keys) * num_candidates.shape[0]
             )
 
-        nro_batch = None
-        if self._all_label_keys:
-            nro_batch = input_tensors[7].shape[0]
-        elif self._has_supervision_weight:
-            nro_batch = input_tensors[6].shape[1]
-        if nro_batch is None:
-            return
-
+        nro_batch = self._canonical_nro_batch_size(input_tensors)
         if self._nro_kjt_keys:
             torch._check(nro_lengths.shape[0] == len(self._nro_kjt_keys) * nro_batch)
+        if self._has_supervision_weight:
+            torch._check(input_tensors[6].shape[1] == nro_batch)
         for label in input_tensors[7:]:
             torch._check(label.shape[0] == nro_batch)
 
@@ -347,6 +342,13 @@ class TraceableMoTPreprocessor(nn.Module):
         if not n_nro_keys:
             raise RuntimeError("Cannot infer NRO batch size without NRO KJT keys")
         return input_tensors[3].shape[0] // n_nro_keys
+
+    def _canonical_nro_batch_size(self, input_tensors: List[torch.Tensor]) -> Any:
+        if self._all_label_keys:
+            return input_tensors[7].shape[0]
+        if self._has_supervision_weight:
+            return input_tensors[6].shape[1]
+        return self._nro_batch_size(input_tensors)
 
     # ----- input decomposition (FeatureBundle -> List[Tensor]) -------------
 
@@ -696,7 +698,9 @@ class TraceableMoTPreprocessor(nn.Module):
         # canonical per-request input when partial lowering builds a fresh
         # ShapeEnv. Keep every RO-shaped output on the num_candidates symbol.
         batch = input_tensors[4].shape[0]
-        # Keep data-dependent NRO outputs unbacked during the top-level trace.
+        # The NRO batch is the data-dependent sum of num_candidates. Input
+        # tensor shapes may contain only the trace sample's total, so all
+        # candidate-shaped outputs share one fresh runtime size instead.
         nro_batch = torch.library.get_ctx().new_dynamic_size()
         torch._check_is_size(nro_batch)
         jagged_group_sizes: Dict[Any, Any] = {}
