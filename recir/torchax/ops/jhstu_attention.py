@@ -9,7 +9,7 @@
 
 Importing this module registers, on the recir/torchax path:
   - torch.ops.recir.hstu_attention -> Pallas forward kernel
-  - torch.ops.recir.hstu_attention_backward -> reference VJP for q/k/v gradients
+  - torch.ops.recir.hstu_attention_backward -> tiled Pallas backward kernel
   - torch.ops.recir.helion_ragged_attention_fwd -> forward Helion kernel (returns
     a single ``out`` array)
   - torch.ops.recir.helion_ragged_attention_bwd -> the three backward Helion
@@ -66,8 +66,8 @@ from recir.ops.helion.jagged_hstu_attention import (
     sample_sharded_hstu_fwd_jax,
 )
 from recir.ops.pallas.hstu_attention import (
-    hstu_attention_reference,
     pallas_hstu_attention,
+    pallas_hstu_attention_backward,
 )
 from recir.torchax.ops.decorators import op
 from torch._subclasses.fake_tensor import unset_fake_temporarily
@@ -151,16 +151,40 @@ def _jhstu_attention_backward(
     alpha: float,
     inv_n: float,
 ) -> tuple[Any, Any, Any]:
-    _, vjp_fn = jax.vjp(
-        lambda q_, k_, v_: hstu_attention_reference(
-            q_, k_, v_, lengths, num_targets, alpha, inv_n
-        ),
-        q,
-        k,
-        v,
+    interpret = _interpret_pallas()
+
+    def _bwd(grad_out_, q_, k_, v_, lengths_, num_targets_):
+        return pallas_hstu_attention_backward(
+            grad_out_,
+            q_,
+            k_,
+            v_,
+            lengths_,
+            num_targets_,
+            alpha,
+            inv_n,
+            interpret=interpret,
+        )
+
+    world_size = len(jax.devices())
+    if world_size <= 1:
+        return _bwd(grad_out, q, k, v, lengths, num_targets)
+
+    b = q.shape[0]
+    if b % world_size != 0:
+        raise ValueError(
+            f"hstu_attention batch {b} not divisible by world_size {world_size}"
+        )
+    qkv_spec = P(_AXIS, None, None, None)
+    len_spec = P(_AXIS)
+    mapped_bwd: Any = jax.shard_map(
+        _bwd,
+        mesh=_device_mesh(),
+        in_specs=(qkv_spec, qkv_spec, qkv_spec, qkv_spec, len_spec, len_spec),
+        out_specs=(qkv_spec, qkv_spec, qkv_spec),
+        check_vma=False,
     )
-    dq, dk, dv = vjp_fn(grad_out)
-    return dq, dk, dv
+    return mapped_bwd(grad_out, q, k, v, lengths, num_targets)
 
 
 @op(torch.ops.recir.helion_ragged_attention_fwd)  # pyre-ignore[56]

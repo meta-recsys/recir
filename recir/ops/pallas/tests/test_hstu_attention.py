@@ -10,6 +10,7 @@ import numpy as np
 from recir.ops.pallas.hstu_attention import (
     hstu_attention_reference,
     pallas_hstu_attention,
+    pallas_hstu_attention_backward,
 )
 
 
@@ -104,6 +105,41 @@ class HstuAttentionTest(unittest.TestCase):
         for a, b in zip(gk, gr):
             np.testing.assert_allclose(
                 np.asarray(a), np.asarray(b), rtol=1e-4, atol=1e-4
+            )
+
+    def test_tiled_backward_with_distinct_qk_and_v_dimensions(self):
+        q, k, _ = self._inputs(seed=7, seq_len=12, d=8)
+        v = jax.random.normal(jax.random.PRNGKey(8), (2, 2, 12, 6), dtype=jnp.float32)
+        grad_out = jax.random.normal(jax.random.PRNGKey(9), v.shape, dtype=jnp.float32)
+        alpha, inv_n = self._scales(q)
+        lengths = jnp.array([12, 7], dtype=jnp.int32)
+        num_targets = jnp.array([3, 2], dtype=jnp.int32)
+
+        grads = pallas_hstu_attention_backward(
+            grad_out,
+            q,
+            k,
+            v,
+            lengths,
+            num_targets,
+            alpha,
+            inv_n,
+            block_k=4,
+            block_q=6,
+            interpret=True,
+        )
+        _, vjp_fn = jax.vjp(
+            lambda q_, k_, v_: hstu_attention_reference(
+                q_, k_, v_, lengths, num_targets, alpha, inv_n
+            ),
+            q,
+            k,
+            v,
+        )
+        reference_grads = vjp_fn(grad_out)
+        for actual, expected in zip(grads, reference_grads):
+            np.testing.assert_allclose(
+                np.asarray(actual), np.asarray(expected), rtol=1e-4, atol=1e-4
             )
 
     def test_output_shape_and_dtype(self):
