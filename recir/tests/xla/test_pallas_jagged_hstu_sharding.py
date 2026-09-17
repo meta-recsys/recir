@@ -55,7 +55,7 @@ class PallasJaggedHSTUShardingTest(unittest.TestCase):
     def tearDown(self) -> None:
         jagged_hstu.clear_pad_seqs_per_device()
 
-    def test_forward_uses_local_offsets_and_restores_dense_pad_rows(self) -> None:
+    def test_forward_uses_local_offsets_and_drops_pad_sequences(self) -> None:
         def runner(
             q_: Any,
             k_: Any,
@@ -88,11 +88,11 @@ class PallasJaggedHSTUShardingTest(unittest.TestCase):
 
         self.assertEqual(
             output[:, 0, 0, 0].tolist(),
-            [4, 7, 12, 0, 2, 7, 11, 0],
+            [4, 7, 12, 2, 7, 11],
         )
         self.assertEqual(
             output[:, 0, 0, 1].tolist(),
-            [1, 2, 3, 0, 4, 5, 6, 0],
+            [1, 2, 3, 4, 5, 6],
         )
 
     def test_backward_uses_same_sequences_and_zeros_dropped_token_tail(self) -> None:
