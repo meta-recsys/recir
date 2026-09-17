@@ -6,13 +6,14 @@
 
 
 """SparseEmbeddingTransform — replace ``aten.embedding`` and
-``aten.embedding_dense_backward`` nodes whose weight is a row-wise
-sharded embedding parameter with the corresponding decomposed AllToAll
-sub-graphs.
+``aten._embedding_bag`` nodes whose weight is a row-wise sharded embedding
+parameter with the corresponding decomposed AllToAll sub-graphs.
 """
 
 from __future__ import annotations
 
+import operator
+from dataclasses import dataclass
 from functools import partial
 from typing import Callable, cast, Dict, List, Optional, Set, Tuple
 
@@ -79,9 +80,9 @@ def decomposed_row_wise_embedding(
 
     # Step 1: Bucketize
     flat_indices = indices.reshape(-1)
-    local_rows = num_embeddings // world_size
-    ranks = flat_indices // local_rows
-    local_indices = flat_indices % local_rows
+    block_rows = (num_embeddings + world_size - 1) // world_size
+    ranks = flat_indices // block_rows
+    local_indices = flat_indices % block_rows
     sort_order = torch.argsort(ranks, stable=True)
     sorted_local_indices = local_indices[sort_order]
     unsort_order = torch.argsort(sort_order)
@@ -131,6 +132,7 @@ def decomposed_row_wise_embedding_backward(
     grad_output: torch.Tensor,
     indices: torch.Tensor,
     num_embeddings: int,
+    local_num_embeddings: int,
     group_name: str,
     world_size: int,
     padding_idx: int,
@@ -152,6 +154,7 @@ def decomposed_row_wise_embedding_backward(
         grad_output: gradient of the embedding output, shape ``(*batch_shape, D)``.
         indices: input indices (global), shape ``(*batch_shape)``.
         num_embeddings: global vocabulary size ``V``.
+        local_num_embeddings: row count of this rank's weight shard.
         group_name: process-group name for collectives.
         world_size: number of ranks in the group.
         padding_idx: padding index (passed through to local backward).
@@ -159,16 +162,20 @@ def decomposed_row_wise_embedding_backward(
     """
     if world_size == 1:
         return torch.ops.aten.embedding_dense_backward.default(
-            grad_output, indices, num_embeddings, padding_idx, scale_grad_by_freq
+            grad_output,
+            indices,
+            local_num_embeddings,
+            padding_idx,
+            scale_grad_by_freq,
         )
 
-    local_rows = num_embeddings // world_size
+    block_rows = (num_embeddings + world_size - 1) // world_size
     D = grad_output.shape[-1]
 
     # Step 1: Bucketize (identical to forward)
     flat_indices = indices.reshape(-1)
-    ranks = flat_indices // local_rows
-    local_indices = flat_indices % local_rows
+    ranks = flat_indices // block_rows
+    local_indices = flat_indices % block_rows
     sort_order = torch.argsort(ranks, stable=True)
     sorted_local_indices = local_indices[sort_order]
 
@@ -208,7 +215,106 @@ def decomposed_row_wise_embedding_backward(
 
     # Step 5: Local embedding_dense_backward
     return torch.ops.aten.embedding_dense_backward(
-        received_grad, received_indices, local_rows, padding_idx, scale_grad_by_freq
+        received_grad,
+        received_indices,
+        local_num_embeddings,
+        padding_idx,
+        scale_grad_by_freq,
+    )
+
+
+def _bag_ids(offsets: torch.Tensor, num_indices: int) -> torch.Tensor:
+    positions = torch.arange(
+        num_indices,
+        dtype=offsets.dtype,
+        device=offsets.device,
+    )
+    return torch.searchsorted(offsets[1:], positions, right=True)
+
+
+def _check_complete_bags(offsets: torch.Tensor, num_indices: int) -> None:
+    """Validate the canonical ``include_last_offset=True`` representation."""
+    torch._check(
+        offsets.shape[0] > 0,
+        lambda: "EmbeddingBag offsets must include an initial offset.",
+    )
+    torch._check_tensor_all(
+        offsets[0] == 0,
+        lambda: "EmbeddingBag offsets must start at zero.",
+    )
+    torch._check_tensor_all(
+        offsets[1:] >= offsets[:-1],
+        lambda: "EmbeddingBag offsets must be nondecreasing.",
+    )
+    torch._check_tensor_all(
+        offsets[-1] == num_indices,
+        lambda: "EmbeddingBag offsets must consume every index.",
+    )
+
+
+def _pool_embedding_rows(
+    rows: torch.Tensor,
+    offsets: torch.Tensor,
+    mode: int,
+) -> torch.Tensor:
+    _check_complete_bags(offsets, rows.shape[0])
+    lengths = offsets[1:] - offsets[:-1]
+    pooled = rows.new_zeros((lengths.shape[0], rows.shape[1]))
+    pooled = pooled.index_add(0, _bag_ids(offsets, rows.shape[0]), rows)
+    if mode == 0:
+        return pooled
+    if mode == 1:
+        return pooled / lengths.clamp_min(1).to(pooled.dtype).unsqueeze(1)
+    raise ValueError(f"Unsupported embedding_bag pooling mode: {mode}")
+
+
+def decomposed_row_wise_embedding_bag(
+    sharded_weight: torch.Tensor,
+    indices: torch.Tensor,
+    offsets: torch.Tensor,
+    num_embeddings: int,
+    group_name: str,
+    world_size: int,
+    mode: int,
+) -> torch.Tensor:
+    rows = decomposed_row_wise_embedding(
+        sharded_weight,
+        indices,
+        num_embeddings,
+        group_name,
+        world_size,
+    )
+    offsets = torch.ops.aten._to_copy.default(offsets, device=rows.device)
+    return _pool_embedding_rows(rows, offsets, mode)
+
+
+def decomposed_row_wise_embedding_bag_backward(
+    grad_output: torch.Tensor,
+    indices: torch.Tensor,
+    offsets: torch.Tensor,
+    num_embeddings: int,
+    local_num_embeddings: int,
+    group_name: str,
+    world_size: int,
+    mode: int,
+) -> torch.Tensor:
+    offsets = torch.ops.aten._to_copy.default(offsets, device=grad_output.device)
+    _check_complete_bags(offsets, indices.shape[0])
+    bag_ids = _bag_ids(offsets, indices.shape[0])
+    per_index_grad = grad_output.index_select(0, bag_ids)
+    if mode == 1:
+        lengths = offsets[1:] - offsets[:-1]
+        divisors = lengths.clamp_min(1).to(grad_output.dtype)
+        per_index_grad = per_index_grad / divisors.index_select(0, bag_ids).unsqueeze(1)
+    return decomposed_row_wise_embedding_backward(
+        per_index_grad,
+        indices,
+        num_embeddings,
+        local_num_embeddings,
+        group_name,
+        world_size,
+        padding_idx=-1,
+        scale_grad_by_freq=False,
     )
 
 
@@ -244,6 +350,52 @@ def _trace_and_inline_subgraph(
 # ---------------------------------------------------------------------------
 # Region transform
 # ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class _PooledEmbeddingMeta:
+    indices: fx.Node
+    offsets: fx.Node
+    num_embeddings: int
+    local_num_embeddings: int
+    embedding_dim: int
+    mode: int
+
+
+def _node_argument(
+    node: fx.Node,
+    position: int,
+    name: str,
+    default: object,
+) -> object:
+    if len(node.args) > position:
+        return node.args[position]
+    return node.kwargs.get(name, default)
+
+
+def _embedding_bag_mode(node: fx.Node) -> int:
+    """Validate the shared native/TBE pooling contract and return its mode."""
+    unsupported = (
+        (_node_argument(node, 3, "scale_grad_by_freq", False), "frequency scaling"),
+        (_node_argument(node, 5, "sparse", False), "sparse gradients"),
+        (_node_argument(node, 6, "per_sample_weights", None) is not None, "weights"),
+        (
+            not _node_argument(node, 7, "include_last_offset", False),
+            "offsets without a final offset",
+        ),
+        (_node_argument(node, 8, "padding_idx", -1) != -1, "padding_idx"),
+    )
+    for is_unsupported, behavior in unsupported:
+        if is_unsupported:
+            raise NotImplementedError(
+                f"Row-wise embedding_bag transform does not support {behavior}."
+            )
+    mode = _node_argument(node, 4, "mode", 0)
+    if mode not in (0, 1):
+        raise NotImplementedError(
+            f"Row-wise embedding_bag transform does not support mode={mode}."
+        )
+    return cast(int, mode)
 
 
 class SparseEmbeddingTransform(RegionTransform):
@@ -288,14 +440,17 @@ class SparseEmbeddingTransform(RegionTransform):
         self.world_size: int = mesh.size()
         self.group_name: str = funcol._resolve_group_name((mesh, 0))
         self.mod: Optional[nn.Module] = mod
+        self._global_rows = (
+            {fqn: int(mod.get_parameter(fqn).shape[0]) for fqn in embedding_param_fqns}
+            if mod is not None
+            else {}
+        )
 
     def finalize_compiled_graph(
         self,
         gm: fx.GraphModule,
     ) -> None:
-        """Replace ``aten.embedding`` / ``aten.embedding_dense_backward``
-        nodes on sharded embedding weights with decomposed AllToAll
-        sub-graphs, in place.
+        """Replace unpooled and pooled lookups on row-wise sharded weights.
 
         Overrides :meth:`RegionTransform.finalize_compiled_graph` (which
         is a no-op by default).  Identifies sharded weight placeholders
@@ -324,6 +479,12 @@ class SparseEmbeddingTransform(RegionTransform):
             gm, embedding_weight_nodes, concrete_param_tensors
         )
         bwd_nodes = self._rewrite_backward_embeddings(gm, forward_indices_meta)
+        pooled_forward_meta = self._rewrite_forward_embedding_bags(
+            gm, embedding_weight_nodes, concrete_param_tensors
+        )
+        pooled_bwd_nodes = self._rewrite_backward_embedding_bags(
+            gm, pooled_forward_meta
+        )
 
         if forward_indices_meta:
             assert bwd_nodes, (
@@ -331,6 +492,19 @@ class SparseEmbeddingTransform(RegionTransform):
                 f"{len(forward_indices_meta)} forward embedding(s) but found "
                 f"no corresponding aten.embedding_dense_backward nodes"
             )
+        if pooled_forward_meta and pooled_bwd_nodes != set(pooled_forward_meta):
+            raise RuntimeError(
+                "SparseEmbeddingTransform requires one backward per forward "
+                "embedding_bag node."
+            )
+        if forward_indices_meta or pooled_forward_meta:
+            gm.graph.eliminate_dead_code()
+            remaining_pooled = set(gm.graph.nodes).intersection(pooled_forward_meta)
+            if remaining_pooled:
+                raise RuntimeError(
+                    "SparseEmbeddingTransform does not support live auxiliary "
+                    "embedding_bag outputs."
+                )
             gm.graph.lint()
             gm.recompile()
 
@@ -397,7 +571,11 @@ class SparseEmbeddingTransform(RegionTransform):
             local_V, embedding_dim, weight_dtype = self._weight_concrete_meta(
                 weight_node, concrete_param_tensors
             )
-            num_embeddings = local_V * self.world_size
+            fqn = cast(str, weight_node.meta["fqn"])
+            num_embeddings = self._global_rows.get(
+                fqn,
+                local_V * self.world_size,
+            )
 
             indices_val = indices_node.meta["val"]
             indices_ndim = len(indices_val.shape)
@@ -484,7 +662,7 @@ class SparseEmbeddingTransform(RegionTransform):
             scale_grad_by_freq = (
                 cast(bool, bwd_node.args[4]) if len(bwd_node.args) > 4 else False
             )
-            _local_V, num_embeddings, embedding_dim = forward_indices_meta[indices_node]
+            local_V, num_embeddings, embedding_dim = forward_indices_meta[indices_node]
             grad_val = grad_output_node.meta["val"]
             indices_val = indices_node.meta["val"]
             indices_ndim = len(indices_val.shape)
@@ -495,6 +673,7 @@ class SparseEmbeddingTransform(RegionTransform):
                 decomp_fn=partial(
                     decomposed_row_wise_embedding_backward,
                     num_embeddings=num_embeddings,
+                    local_num_embeddings=local_V,
                     group_name=self.group_name,
                     world_size=self.world_size,
                     padding_idx=padding_idx,
@@ -517,3 +696,160 @@ class SparseEmbeddingTransform(RegionTransform):
                 input_nodes=[grad_output_node, indices_node],
             )
         return bwd_nodes
+
+    def _rewrite_forward_embedding_bags(
+        self,
+        gm: fx.GraphModule,
+        embedding_weight_nodes: Set[fx.Node],
+        concrete_param_tensors: Dict[str, torch.Tensor],
+    ) -> Dict[fx.Node, _PooledEmbeddingMeta]:
+        pooled_nodes = [
+            node
+            for node in gm.graph.nodes
+            if node.op == "call_function"
+            and node.target == torch.ops.aten._embedding_bag.default
+            and node.args[0] in embedding_weight_nodes
+        ]
+        result: Dict[fx.Node, _PooledEmbeddingMeta] = {}
+        for pooled_node in pooled_nodes:
+            result[pooled_node] = self._rewrite_forward_embedding_bag(
+                gm,
+                pooled_node,
+                concrete_param_tensors,
+            )
+        return result
+
+    def _rewrite_forward_embedding_bag(
+        self,
+        gm: fx.GraphModule,
+        pooled_node: fx.Node,
+        concrete_param_tensors: Dict[str, torch.Tensor],
+    ) -> _PooledEmbeddingMeta:
+        weight_node = pooled_node.args[0]
+        indices_node = pooled_node.args[1]
+        offsets_node = pooled_node.args[2]
+        assert isinstance(weight_node, fx.Node)
+        assert isinstance(indices_node, fx.Node)
+        assert isinstance(offsets_node, fx.Node)
+        mode = _embedding_bag_mode(pooled_node)
+        local_rows, embedding_dim, weight_dtype = self._weight_concrete_meta(
+            weight_node, concrete_param_tensors
+        )
+        fqn = cast(str, weight_node.meta["fqn"])
+        num_embeddings = self._global_rows.get(
+            fqn,
+            local_rows * self.world_size,
+        )
+        device = self._weight_device(weight_node, concrete_param_tensors)
+        output_nodes = [
+            user
+            for user in pooled_node.users
+            if user.op == "call_function"
+            and user.target == operator.getitem
+            and user.args[1] == 0
+        ]
+        if len(output_nodes) != 1:
+            raise NotImplementedError(
+                "Sparse embedding transform requires one embedding_bag output."
+            )
+        _trace_and_inline_subgraph(
+            gm,
+            output_nodes[0],
+            decomp_fn=partial(
+                decomposed_row_wise_embedding_bag,
+                num_embeddings=num_embeddings,
+                group_name=self.group_name,
+                world_size=self.world_size,
+                mode=mode,
+            ),
+            example_inputs=[
+                torch.randn(
+                    (local_rows, embedding_dim),
+                    dtype=weight_dtype,
+                    device=device,
+                ),
+                torch.tensor([0, 1, 2], dtype=torch.int64, device=device),
+                torch.tensor([0, 2, 2, 3], dtype=torch.int64, device=device),
+            ],
+            input_nodes=[weight_node, indices_node, offsets_node],
+        )
+        return _PooledEmbeddingMeta(
+            indices=indices_node,
+            offsets=offsets_node,
+            num_embeddings=num_embeddings,
+            local_num_embeddings=local_rows,
+            embedding_dim=embedding_dim,
+            mode=mode,
+        )
+
+    def _weight_device(
+        self,
+        weight_node: fx.Node,
+        concrete_param_tensors: Dict[str, torch.Tensor],
+    ) -> torch.device:
+        fqn = weight_node.meta.get("fqn")
+        concrete = concrete_param_tensors.get(fqn) if fqn is not None else None
+        if concrete is not None:
+            return concrete.device
+        return weight_node.meta["val"].device
+
+    def _rewrite_backward_embedding_bags(
+        self,
+        gm: fx.GraphModule,
+        forward_meta: Dict[fx.Node, _PooledEmbeddingMeta],
+    ) -> Set[fx.Node]:
+        matched_forwards: Set[fx.Node] = set()
+        for node in list(gm.graph.nodes):
+            if (
+                node.op != "call_function"
+                or node.target != torch.ops.aten._embedding_bag_backward.default
+            ):
+                continue
+            offset2bag = node.args[3]
+            if not (
+                isinstance(offset2bag, fx.Node)
+                and offset2bag.op == "call_function"
+                and offset2bag.target == operator.getitem
+            ):
+                continue
+            pooled_node = offset2bag.args[0]
+            if not isinstance(pooled_node, fx.Node) or pooled_node not in forward_meta:
+                continue
+            if offset2bag.args[1] != 1:
+                raise RuntimeError(
+                    "SparseEmbeddingTransform requires embedding_bag backward "
+                    "to use the offset2bag output."
+                )
+            if pooled_node in matched_forwards:
+                raise RuntimeError(
+                    "SparseEmbeddingTransform requires exactly one backward per "
+                    "forward embedding_bag node."
+                )
+            meta = forward_meta[pooled_node]
+            grad_output = node.args[0]
+            assert isinstance(grad_output, fx.Node)
+            device = grad_output.meta["val"].device
+            _trace_and_inline_subgraph(
+                gm,
+                node,
+                decomp_fn=partial(
+                    decomposed_row_wise_embedding_bag_backward,
+                    num_embeddings=meta.num_embeddings,
+                    local_num_embeddings=meta.local_num_embeddings,
+                    group_name=self.group_name,
+                    world_size=self.world_size,
+                    mode=meta.mode,
+                ),
+                example_inputs=[
+                    torch.randn(
+                        (_SYMBOLIC_TRACE_PLACEHOLDER_DIM, meta.embedding_dim),
+                        dtype=grad_output.meta["val"].dtype,
+                        device=device,
+                    ),
+                    torch.tensor([0, 1, 2], dtype=torch.int64, device=device),
+                    torch.tensor([0, 2, 2, 3], dtype=torch.int64, device=device),
+                ],
+                input_nodes=[grad_output, meta.indices, meta.offsets],
+            )
+            matched_forwards.add(pooled_node)
+        return matched_forwards

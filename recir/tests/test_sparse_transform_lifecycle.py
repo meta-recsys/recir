@@ -46,7 +46,7 @@ class SparseTransformLifecycleTest(unittest.TestCase):
         self.assertEqual(transform.prepared_optimizers, (optimizer,))
 
     def test_hybrid_parallel_uses_default_sparse_transform(self) -> None:
-        model = nn.Linear(4, 2)
+        model = nn.ModuleDict({"embedding": nn.Embedding(4, 2)})
         mesh = MagicMock(spec=DeviceMesh)
         mesh.size.return_value = 2
         mesh._dim_group_names = ["fake_test_group"]
