@@ -20,12 +20,16 @@ from torch.distributed import _functional_collectives as funcol
 from torchrec.distributed.test_utils.multi_process import MultiProcessTestBase
 
 
-_BATCH_SIZES: tuple[int, int] = (2, 3)
+_VARIABLE_BATCH_SIZES: tuple[int, int] = (2, 3)
+_UNIFORM_BATCH_SIZES: tuple[int, int] = (2, 2)
 _FEATURE_ROWS: tuple[int, int] = (9, 7)
 _EMBEDDING_DIM: int = 2
 
 
-def _rank_features(rank: int) -> tuple[tuple[torch.Tensor, ...], ...]:
+def _rank_features(
+    rank: int,
+    variable_batch_per_rank: bool,
+) -> tuple[tuple[torch.Tensor, ...], ...]:
     if rank == 0:
         return (
             (
@@ -37,7 +41,7 @@ def _rank_features(rank: int) -> tuple[tuple[torch.Tensor, ...], ...]:
                 torch.tensor([2, 0], dtype=torch.int64),
             ),
         )
-    return (
+    variable_features = (
         (
             torch.tensor([3, 6], dtype=torch.int64),
             torch.tensor([0, 1, 1], dtype=torch.int64),
@@ -46,6 +50,12 @@ def _rank_features(rank: int) -> tuple[tuple[torch.Tensor, ...], ...]:
             torch.tensor([0, 3, 6], dtype=torch.int64),
             torch.tensor([1, 1, 1], dtype=torch.int64),
         ),
+    )
+    if variable_batch_per_rank:
+        return variable_features
+    return (
+        (variable_features[0][0][:1], variable_features[0][1][:2]),
+        (variable_features[1][0][:2], variable_features[1][1][:2]),
     )
 
 
@@ -69,14 +79,20 @@ def _global_weights() -> tuple[torch.Tensor, torch.Tensor]:
 
 class TBEPooledRoutingTest(MultiProcessTestBase):
     @classmethod
-    def _run_variable_batch_routing(
+    def _run_pooled_routing(
         cls,
         rank: int,
         world_size: int,
+        variable_batch_per_rank: bool,
     ) -> None:
         dist.init_process_group(rank=rank, world_size=world_size, backend="gloo")
         try:
-            features = _rank_features(rank)
+            batch_sizes = (
+                _VARIABLE_BATCH_SIZES
+                if variable_batch_per_rank
+                else _UNIFORM_BATCH_SIZES
+            )
+            features = _rank_features(rank, variable_batch_per_rank)
             feature_count = len(features)
             packed_lengths = torch.cat(tuple(lengths for _indices, lengths in features))
             packed_indices = torch.cat(tuple(indices for indices, _lengths in features))
@@ -92,10 +108,11 @@ class TBEPooledRoutingTest(MultiProcessTestBase):
                     num_embeddings=_FEATURE_ROWS,
                     group_name=group_name,
                     world_size=world_size,
+                    variable_batch_per_rank=variable_batch_per_rank,
                 )
             )
 
-            total_batch_size = sum(_BATCH_SIZES)
+            total_batch_size = sum(batch_sizes)
             feature_boundary = int(local_offsets[total_batch_size].item())
             global_weights = _global_weights()
             local_pooled = []
@@ -135,6 +152,7 @@ class TBEPooledRoutingTest(MultiProcessTestBase):
                 feature_count=feature_count,
                 group_name=group_name,
                 world_size=world_size,
+                variable_batch_per_rank=variable_batch_per_rank,
             )
             expected_sum = torch.cat(
                 tuple(
@@ -180,9 +198,9 @@ class TBEPooledRoutingTest(MultiProcessTestBase):
 
             source_gradients = (
                 torch.arange(
-                    _BATCH_SIZES[rank] * feature_count * _EMBEDDING_DIM,
+                    batch_sizes[rank] * feature_count * _EMBEDDING_DIM,
                     dtype=torch.float32,
-                ).reshape(_BATCH_SIZES[rank], -1)
+                ).reshape(batch_sizes[rank], -1)
                 + rank * 100
             )
             actual_gradients = route_row_wise_pooled_gradients_grouped(
@@ -192,6 +210,7 @@ class TBEPooledRoutingTest(MultiProcessTestBase):
                 feature_count=feature_count,
                 group_name=group_name,
                 world_size=world_size,
+                variable_batch_per_rank=variable_batch_per_rank,
             )
             expected_gradients = torch.cat(
                 tuple(
@@ -200,12 +219,35 @@ class TBEPooledRoutingTest(MultiProcessTestBase):
                         dtype=torch.float32,
                     ).reshape(batch_size, -1)
                     + source_rank * 100
-                    for source_rank, batch_size in enumerate(_BATCH_SIZES)
+                    for source_rank, batch_size in enumerate(batch_sizes)
                 )
             )
             torch.testing.assert_close(actual_gradients, expected_gradients)
         finally:
             dist.destroy_process_group()
+
+    @classmethod
+    def _run_uniform_batch_routing(
+        cls,
+        rank: int,
+        world_size: int,
+    ) -> None:
+        cls._run_pooled_routing(rank, world_size, False)
+
+    @classmethod
+    def _run_variable_batch_routing(
+        cls,
+        rank: int,
+        world_size: int,
+    ) -> None:
+        cls._run_pooled_routing(rank, world_size, True)
+
+    @unittest.skipIf(not dist.is_available(), "torch.distributed is unavailable")
+    def test_sum_and_mean_pooling_route_uniform_rank_batches(self) -> None:
+        self._run_multi_process_test(
+            callable=self._run_uniform_batch_routing,
+            world_size=2,
+        )
 
     @unittest.skipIf(not dist.is_available(), "torch.distributed is unavailable")
     def test_sum_and_mean_pooling_route_uneven_rank_batches(self) -> None:
