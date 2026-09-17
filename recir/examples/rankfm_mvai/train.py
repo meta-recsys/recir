@@ -155,6 +155,7 @@ def main() -> None:
     partition = build_cls_reg_partition(module_config)
     report_interval = trainer_config.metrics_config.report_interval
     batch_size = trainer_config.data_source_config.batch_size
+    window_size = trainer_cfg.metric_window_size
 
     # JAX profiling is gated on a real TPU + a positive profile_start_step; on
     # CPU / when unset it is a no-op. The trace (when enabled) lands in
@@ -174,6 +175,7 @@ def main() -> None:
                     tasks=partition.cls_task_names,
                     batch_size=batch_size,
                     report_interval=report_interval,
+                    window_size=window_size,
                 ),
                 # pyrefly: ignore [bad-instantiation]
                 RankingMetricDef(
@@ -181,6 +183,7 @@ def main() -> None:
                     tasks=partition.cls_task_names,
                     batch_size=batch_size,
                     report_interval=report_interval,
+                    window_size=window_size,
                 ),
             ],
             reg_metric_defs=[
@@ -190,6 +193,7 @@ def main() -> None:
                     tasks=partition.reg_task_names,
                     batch_size=batch_size,
                     report_interval=report_interval,
+                    window_size=window_size,
                 ),
             ],
             cls_task_indices=partition.cls_task_indices,
@@ -203,6 +207,7 @@ def main() -> None:
             profile_dir=trainer_cfg.profile_dir,
             enable_memory_log=trainer_cfg.enable_memory_log,
             pipeline_preprocessor=trainer_cfg.pipeline_preprocessor,
+            window_size=window_size,
         ),
         job_resolver=JobResolver(),
     ).train()
