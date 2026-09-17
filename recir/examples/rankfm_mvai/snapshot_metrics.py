@@ -33,6 +33,7 @@ import logging
 from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
 import torch
+import torch.distributed as dist
 
 if TYPE_CHECKING:
     FixedStepLocalTensor = Any
@@ -53,6 +54,42 @@ logger: logging.Logger = logging.getLogger(__name__)
 # groups -- it reads the LR straight off the warmup buffers -- so the two labels
 # are pinned here to keep the tags identical.
 LR_TASKS: List[str] = ["optimizer___dense", "optimizer___sparse_fused"]
+
+
+def global_state_scale() -> float:
+    if not (dist.is_available() and dist.is_initialized()):
+        return 1.0
+    return 1.0 / float(dist.get_world_size())
+
+
+class GlobalStateEffectiveSampleCnt(FixedStepEffectiveSampleCnt):
+    """``FixedStepEffectiveSampleCnt`` for a leg whose inputs are already global."""
+
+    def __init__(self, *, state_scale: float, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.state_scale: float = state_scale
+
+    # pyre-fixme[14]: matches the base's `weights`-keyword signature.
+    def update(
+        self,
+        *_: Any,
+        weights: Optional[torch.Tensor] = None,
+        **kwargs: Any,
+    ) -> None:
+        # Mirrors the base body (`effective_sample_cnt.py:83-92`); reproduced
+        # rather than wrapped because the scale has to land on `counts` before
+        # it is folded into two separate buffers.
+        self._itrn += 1
+        if not self.should_update(**kwargs):
+            return
+        if weights is None:
+            return
+        counts = (weights.detach() > 0).sum(dim=1).to(torch.float64)
+        counts = counts * self.state_scale
+        n = min(counts.numel(), self._lifetime.numel())
+        self._lifetime[:n] += counts[:n]
+        self._window[:n] += counts[:n]
+        self._step_stride += self._global_batch_size
 
 
 class SnapshotMetrics:
@@ -96,13 +133,13 @@ class SnapshotMetrics:
         # Not a snapshot -- it accumulates -- but it belongs to the same
         # all-task channel: it needs the full per-task weight tensor, which only
         # the unsliced step-metric path carries.
-        self._effective_sample_cnt: FixedStepEffectiveSampleCnt = (
-            # pyrefly: ignore [bad-instantiation]
-            FixedStepEffectiveSampleCnt(
+        self._effective_sample_cnt: GlobalStateEffectiveSampleCnt = (
+            GlobalStateEffectiveSampleCnt(
                 rank=rank,
                 tasks=all_task_names,
                 global_batch_size=global_batch_size,
                 report_interval=report_interval,
+                state_scale=global_state_scale(),
             )
         )
         self._enabled: bool = bool(all_task_names)
