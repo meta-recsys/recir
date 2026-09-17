@@ -20,13 +20,18 @@ in ``test_data_parallel.py``.
 Run: buck2 test //recir/tests:test_sparse_embedding_transform
 """
 
+import operator
 import unittest
 from unittest.mock import MagicMock
 
 import torch
 import torch.fx as fx
 import torch.nn as nn
-from recir.region_transforms.sparse_embedding import SparseEmbeddingTransform
+from recir.region_transforms.sparse_embedding import (
+    decomposed_row_wise_embedding_bag,
+    decomposed_row_wise_embedding_bag_backward,
+    SparseEmbeddingTransform,
+)
 from torch.distributed.tensor import DeviceMesh
 
 
@@ -90,6 +95,220 @@ def _build_joint_graph(
         outputs.append(bwd)
     graph.output(tuple(outputs))
     return fx.GraphModule(nn.Module(), graph)
+
+
+def _add_embedding_bag(
+    graph: fx.Graph,
+    weight: fx.Node,
+    indices: fx.Node,
+    offsets: fx.Node,
+    grad_output: fx.Node,
+) -> tuple[fx.Node, fx.Node]:
+    pooled = graph.call_function(
+        torch.ops.aten._embedding_bag.default,
+        args=(weight, indices, offsets, False, 0, False, None, True, -1),
+    )
+    output = graph.call_function(operator.getitem, args=(pooled, 0))
+    output.meta["val"] = torch.randn(2, 4)
+    offset2bag = graph.call_function(operator.getitem, args=(pooled, 1))
+    backward = graph.call_function(
+        torch.ops.aten._embedding_bag_backward.default,
+        args=(grad_output, indices, offsets, offset2bag),
+    )
+    backward.meta["val"] = torch.randn(8, 4)
+    return pooled, backward
+
+
+class DecomposedRowWiseEmbeddingBagTest(unittest.TestCase):
+    def test_rejects_offsets_that_do_not_consume_all_indices(self) -> None:
+        weight = torch.arange(24, dtype=torch.float32).reshape(6, 4)
+        indices = torch.tensor([1, 2, 3, 4], dtype=torch.int64)
+        offsets = torch.tensor([0, 1, 2], dtype=torch.int64)
+        grad_output = torch.tensor([[1.0, 2.0, 3.0, 4.0], [5.0, 6.0, 7.0, 8.0]])
+
+        for mode in (0, 1):
+            with self.subTest(mode=mode):
+                with self.assertRaisesRegex(RuntimeError, "consume every index"):
+                    decomposed_row_wise_embedding_bag(
+                        weight,
+                        indices,
+                        offsets,
+                        num_embeddings=weight.shape[0],
+                        group_name="unused",
+                        world_size=1,
+                        mode=mode,
+                    )
+                with self.assertRaisesRegex(RuntimeError, "consume every index"):
+                    decomposed_row_wise_embedding_bag_backward(
+                        grad_output,
+                        indices,
+                        offsets,
+                        num_embeddings=weight.shape[0],
+                        local_num_embeddings=weight.shape[0],
+                        group_name="unused",
+                        world_size=1,
+                        mode=mode,
+                    )
+
+    def test_rejects_noncanonical_offsets(self) -> None:
+        weight = torch.arange(24, dtype=torch.float32).reshape(6, 4)
+        indices = torch.tensor([1, 2, 3, 4], dtype=torch.int64)
+
+        for offsets, message in (
+            (torch.tensor([1, 2, 4], dtype=torch.int64), "start at zero"),
+            (torch.tensor([0, 3, 2, 4], dtype=torch.int64), "nondecreasing"),
+        ):
+            with self.subTest(message=message):
+                with self.assertRaisesRegex(RuntimeError, message):
+                    decomposed_row_wise_embedding_bag(
+                        weight,
+                        indices,
+                        offsets,
+                        num_embeddings=weight.shape[0],
+                        group_name="unused",
+                        world_size=1,
+                        mode=0,
+                    )
+                with self.assertRaisesRegex(RuntimeError, message):
+                    decomposed_row_wise_embedding_bag_backward(
+                        torch.randn(offsets.shape[0] - 1, weight.shape[1]),
+                        indices,
+                        offsets,
+                        num_embeddings=weight.shape[0],
+                        local_num_embeddings=weight.shape[0],
+                        group_name="unused",
+                        world_size=1,
+                        mode=0,
+                    )
+
+
+class SparseEmbeddingBagGraphContractTest(unittest.TestCase):
+    def _graph_inputs(
+        self,
+    ) -> tuple[fx.Graph, fx.Node, fx.Node, fx.Node, fx.Node]:
+        graph = fx.Graph()
+        weight = graph.placeholder("weight")
+        weight.meta["fqn"] = "emb.weight"
+        weight.meta["val"] = torch.randn(8, 4)
+        indices = graph.placeholder("indices")
+        indices.meta["val"] = torch.tensor([1, 2], dtype=torch.int64)
+        offsets = graph.placeholder("offsets")
+        offsets.meta["val"] = torch.tensor([0, 1, 2], dtype=torch.int64)
+        grad_output = graph.placeholder("grad_output")
+        grad_output.meta["val"] = torch.randn(2, 4)
+        return graph, weight, indices, offsets, grad_output
+
+    def _transform(self) -> SparseEmbeddingTransform:
+        return SparseEmbeddingTransform(
+            embedding_param_fqns={"emb.weight"},
+            mesh=_mock_mesh(world_size=1),
+        )
+
+    def test_rejects_unsupported_embedding_bag_options(self) -> None:
+        cases: tuple[tuple[int, object, str], ...] = (
+            (3, True, "frequency scaling"),
+            (4, 2, "mode=2"),
+            (5, True, "sparse gradients"),
+            (6, torch.tensor([1.0, 1.0]), "weights"),
+            (7, False, "final offset"),
+            (8, 0, "padding_idx"),
+        )
+        for position, value, message in cases:
+            with self.subTest(message=message):
+                graph, weight, indices, offsets, _grad_output = self._graph_inputs()
+                args: list[object] = [
+                    weight,
+                    indices,
+                    offsets,
+                    False,
+                    0,
+                    False,
+                    None,
+                    True,
+                    -1,
+                ]
+                args[position] = value
+                pooled = graph.call_function(
+                    torch.ops.aten._embedding_bag.default,
+                    args=tuple(args),
+                )
+                output = graph.call_function(operator.getitem, args=(pooled, 0))
+                output.meta["val"] = torch.randn(2, 4)
+                graph.output(output)
+                gm = fx.GraphModule(nn.Module(), graph)
+
+                with self.assertRaisesRegex(NotImplementedError, message):
+                    self._transform().finalize_compiled_graph(gm)
+
+    def test_rejects_live_auxiliary_outputs(self) -> None:
+        graph, weight, indices, offsets, grad_output = self._graph_inputs()
+        pooled, backward = _add_embedding_bag(
+            graph, weight, indices, offsets, grad_output
+        )
+        live_auxiliary = graph.call_function(operator.getitem, args=(pooled, 2))
+        graph.output((backward, live_auxiliary))
+        gm = fx.GraphModule(nn.Module(), graph)
+
+        with self.assertRaisesRegex(RuntimeError, "live auxiliary"):
+            self._transform().finalize_compiled_graph(gm)
+
+    def test_requires_each_forward_to_match_its_own_backward(self) -> None:
+        graph = fx.Graph()
+        weight = graph.placeholder("weight")
+        weight.meta["fqn"] = "emb.weight"
+        weight.meta["val"] = torch.randn(8, 4)
+        indices_0 = graph.placeholder("indices_0")
+        indices_0.meta["val"] = torch.tensor([1, 2], dtype=torch.int64)
+        indices_1 = graph.placeholder("indices_1")
+        indices_1.meta["val"] = torch.tensor([3, 4], dtype=torch.int64)
+        offsets_0 = graph.placeholder("offsets_0")
+        offsets_0.meta["val"] = torch.tensor([0, 1, 2], dtype=torch.int64)
+        offsets_1 = graph.placeholder("offsets_1")
+        offsets_1.meta["val"] = torch.tensor([0, 1, 2], dtype=torch.int64)
+        grad_0 = graph.placeholder("grad_0")
+        grad_0.meta["val"] = torch.randn(2, 4)
+        grad_1 = graph.placeholder("grad_1")
+        grad_1.meta["val"] = torch.randn(2, 4)
+
+        pooled_0, backward_0 = _add_embedding_bag(
+            graph, weight, indices_0, offsets_0, grad_0
+        )
+        _pooled_1, _backward_1 = _add_embedding_bag(
+            graph, weight, indices_1, offsets_1, grad_1
+        )
+        offset2bag_0 = graph.call_function(operator.getitem, args=(pooled_0, 1))
+        duplicate_backward = graph.call_function(
+            torch.ops.aten._embedding_bag_backward.default,
+            args=(grad_1, indices_0, offsets_0, offset2bag_0),
+        )
+        duplicate_backward.meta["val"] = torch.randn(8, 4)
+        graph.erase_node(_backward_1)
+        graph.output((backward_0, duplicate_backward))
+        gm = fx.GraphModule(nn.Module(), graph)
+        transform = SparseEmbeddingTransform(
+            embedding_param_fqns={"emb.weight"},
+            mesh=_mock_mesh(world_size=1),
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "one backward per forward"):
+            transform.finalize_compiled_graph(gm)
+
+    def test_rejects_multiple_backwards_for_one_forward(self) -> None:
+        graph, weight, indices, offsets, grad_output = self._graph_inputs()
+        pooled, backward = _add_embedding_bag(
+            graph, weight, indices, offsets, grad_output
+        )
+        offset2bag = graph.call_function(operator.getitem, args=(pooled, 1))
+        duplicate_backward = graph.call_function(
+            torch.ops.aten._embedding_bag_backward.default,
+            args=(grad_output, indices, offsets, offset2bag),
+        )
+        duplicate_backward.meta["val"] = torch.randn(8, 4)
+        graph.output((backward, duplicate_backward))
+        gm = fx.GraphModule(nn.Module(), graph)
+
+        with self.assertRaisesRegex(RuntimeError, "exactly one backward"):
+            self._transform().finalize_compiled_graph(gm)
 
 
 class TestSparseEmbeddingTransformFqnLookup(unittest.TestCase):

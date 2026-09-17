@@ -16,6 +16,7 @@ import torch.distributed as dist
 from recir.api import compile, sync_device_state_to_torch
 from recir.distributed.parallel_mode import HybridParallel
 from recir.ops.fake.kjt import patch_ebc_for_tracing
+from recir.region_transforms.base import RegionTransform
 from recir.region_transforms.tbe_sparse_embedding import TBESparseEmbeddingTransform
 from recir.sharding_plan import EmbeddingShardingPlan, EmbeddingShardingType
 from torch import nn
@@ -35,6 +36,7 @@ from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 _FEATURE_NAMES: tuple[str, str] = ("sum_feature", "mean_feature")
 _EMBEDDING_DIM: int = 4
 _NUM_EMBEDDINGS: int = 16
+_UNEVEN_NUM_EMBEDDINGS: int = 17
 
 
 class _TracingRowWiseAdagrad(torch.optim.Optimizer):
@@ -65,21 +67,25 @@ class _TracingRowWiseAdagrad(torch.optim.Optimizer):
 
 
 class _Model(nn.Module):
-    def __init__(self, device: torch.device) -> None:
+    def __init__(
+        self,
+        device: torch.device,
+        num_embeddings: int = _NUM_EMBEDDINGS,
+    ) -> None:
         super().__init__()
         self.ebc = EmbeddingBagCollection(
             tables=[
                 EmbeddingBagConfig(
                     name="sum_table",
                     embedding_dim=_EMBEDDING_DIM,
-                    num_embeddings=_NUM_EMBEDDINGS,
+                    num_embeddings=num_embeddings,
                     feature_names=[_FEATURE_NAMES[0]],
                     pooling=PoolingType.SUM,
                 ),
                 EmbeddingBagConfig(
                     name="mean_table",
                     embedding_dim=_EMBEDDING_DIM,
-                    num_embeddings=_NUM_EMBEDDINGS,
+                    num_embeddings=num_embeddings,
                     feature_names=[_FEATURE_NAMES[1]],
                     pooling=PoolingType.MEAN,
                 ),
@@ -263,23 +269,50 @@ class EmbeddingBagCollectionDistributedTest(DTensorTestBase):
 
     @skip_if_lt_x_gpu(2)
     @with_comms
-    def test_two_rank_compiled_training_matches_global_eager_reference(self) -> None:
+    def test_native_two_rank_training_matches_global_eager_reference(self) -> None:
+        self._run_two_rank_training(
+            sparse_transform_factory=None,
+            num_embeddings=_UNEVEN_NUM_EMBEDDINGS,
+        )
+
+    @skip_if_lt_x_gpu(2)
+    @with_comms
+    def test_tbe_two_rank_training_matches_global_eager_reference(self) -> None:
+        self._run_two_rank_training(sparse_transform_factory=_sparse_transform_factory)
+
+    def _run_two_rank_training(
+        self,
+        sparse_transform_factory: (
+            Callable[[set[str], DeviceMesh, nn.Module], RegionTransform] | None
+        ),
+        num_embeddings: int = _NUM_EMBEDDINGS,
+    ) -> None:
         torch.manual_seed(0)
         device = torch.device(f"cuda:{self.rank}")
-        reference = _Model(device)
+        reference = _Model(device, num_embeddings)
         compiled = deepcopy(reference)
         self.assertEqual(patch_ebc_for_tracing(compiled), 1)
 
-        compiled_optimizer = _TracingRowWiseAdagrad(list(compiled.parameters()))
-        reference_optimizer = RowWiseAdagrad(
-            reference.parameters(),
-            lr=0.1,
-            eps=1.0e-8,
-        )
+        compiled_optimizer: torch.optim.Optimizer
+        reference_optimizer: torch.optim.Optimizer
+        if sparse_transform_factory is None:
+            compiled_optimizer = torch.optim.SGD(
+                compiled.parameters(), lr=0.1, foreach=False
+            )
+            reference_optimizer = torch.optim.SGD(
+                reference.parameters(), lr=0.1, foreach=False
+            )
+        else:
+            compiled_optimizer = _TracingRowWiseAdagrad(list(compiled.parameters()))
+            reference_optimizer = RowWiseAdagrad(
+                reference.parameters(),
+                lr=0.1,
+                eps=1.0e-8,
+            )
         parallel_mode = HybridParallel(
             dense_style="replicate",
             embedding_plan=_sharding_plan(compiled),
-            sparse_transform_factory=_sparse_transform_factory,
+            sparse_transform_factory=sparse_transform_factory,
         )
 
         @compile(parallel_mode=parallel_mode)
