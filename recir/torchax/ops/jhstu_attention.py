@@ -56,6 +56,7 @@ from typing import Any
 import jax
 import recir.ops.helion_hstu_attention_op  # noqa: F401
 import recir.ops.hstu_attention_op  # noqa: F401
+import recir.ops.pallas_jagged_hstu_attention_op  # noqa: F401
 import torch
 import torch.utils._mode_utils as mode_utils
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
@@ -68,6 +69,12 @@ from recir.ops.helion.jagged_hstu_attention import (
 from recir.ops.pallas.hstu_attention import (
     pallas_hstu_attention,
     pallas_hstu_attention_backward,
+)
+from recir.ops.pallas.jagged_hstu_attention import (
+    pallas_jagged_hstu_attention,
+    pallas_jagged_hstu_attention_backward,
+    sample_sharded_jagged_hstu_attention,
+    sample_sharded_jagged_hstu_attention_backward,
 )
 from recir.torchax.ops.decorators import op
 from torch._subclasses.fake_tensor import unset_fake_temporarily
@@ -185,6 +192,103 @@ def _jhstu_attention_backward(
         check_vma=False,
     )
     return mapped_bwd(grad_out, q, k, v, lengths, num_targets)
+
+
+@op(torch.ops.recir.pallas_jagged_hstu_attention_fwd)  # pyre-ignore[56]
+def _jpallas_jagged_hstu_attention_fwd(
+    q: Any,
+    k: Any,
+    v: Any,
+    seq_offsets: Any,
+    num_targets: Any,
+    attn_scale: Any,
+    alpha: float,
+    N: int,
+) -> Any:
+    interpret = _interpret_pallas()
+    world_size = len(jax.devices())
+    if world_size <= 1:
+        return pallas_jagged_hstu_attention(
+            q,
+            k,
+            v,
+            seq_offsets,
+            num_targets,
+            max_seq_len=N,
+            scale=alpha,
+            inv_n=attn_scale,
+            interpret=interpret,
+        )
+
+    mesh = _device_mesh()
+    output = sample_sharded_jagged_hstu_attention(
+        q,
+        k,
+        v,
+        seq_offsets,
+        num_targets,
+        attn_scale,
+        max_seq_len=N,
+        alpha=alpha,
+        world_size=world_size,
+        mesh=mesh,
+        interpret=interpret,
+    )
+    return jax.lax.with_sharding_constraint(
+        output,
+        NamedSharding(mesh, P(_AXIS, None, None, None)),
+    )
+
+
+@op(torch.ops.recir.pallas_jagged_hstu_attention_bwd)  # pyre-ignore[56]
+def _jpallas_jagged_hstu_attention_bwd(
+    grad_out: Any,
+    q: Any,
+    k: Any,
+    v: Any,
+    seq_offsets: Any,
+    num_targets: Any,
+    attn_scale: Any,
+    alpha: float,
+    N: int,
+) -> tuple[Any, Any, Any]:
+    interpret = _interpret_pallas()
+    world_size = len(jax.devices())
+    if world_size <= 1:
+        return pallas_jagged_hstu_attention_backward(
+            grad_out,
+            q,
+            k,
+            v,
+            seq_offsets,
+            num_targets,
+            attn_scale,
+            max_seq_len=N,
+            alpha=alpha,
+            interpret=interpret,
+        )
+
+    mesh = _device_mesh()
+    dq, dk, dv = sample_sharded_jagged_hstu_attention_backward(
+        grad_out,
+        q,
+        k,
+        v,
+        seq_offsets,
+        num_targets,
+        attn_scale,
+        max_seq_len=N,
+        alpha=alpha,
+        world_size=world_size,
+        mesh=mesh,
+        interpret=interpret,
+    )
+    packed_sharding = NamedSharding(mesh, P(_AXIS, None, None))
+    return (
+        jax.lax.with_sharding_constraint(dq, packed_sharding),
+        jax.lax.with_sharding_constraint(dk, packed_sharding),
+        jax.lax.with_sharding_constraint(dv, packed_sharding),
+    )
 
 
 @op(torch.ops.recir.helion_ragged_attention_fwd)  # pyre-ignore[56]

@@ -59,11 +59,11 @@ spec:
               # Override per submit to sweep sequence length.
               - name: RANKFM_S
                 value: "4096"
-              # Route HSTU attention to the recir Pallas HSTU attention kernel.
-              # This bench uses --embedding_backend cpu (no ring-shift), so it
-              # isolates the attention kernel from the in_graph scatter path.
-              - name: RECIR_HSTU_PALLAS
-                value: "1"
+              # Use the padded-input Pallas HSTU attention implementation. This
+              # bench uses --embedding_backend cpu (no ring-shift), so it isolates
+              # the attention kernel from the in_graph scatter path.
+              - name: RANKFM_MVAI_ATTENTION_BACKEND
+                value: "pallas_padded"
               - name: JOBSET_NAME
                 valueFrom:
                   fieldRef:

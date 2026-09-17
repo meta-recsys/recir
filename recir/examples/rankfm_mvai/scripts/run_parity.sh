@@ -10,8 +10,7 @@
 # PARITY_RTOL, PARITY_ATOL, PARITY_GRAD_RTOL, PARITY_GRAD_ATOL,
 # PARITY_PRECISION, PARITY_BF16, PARITY_ON_DEVICE_INIT, RANKFM_S, PARITY_HASH_SIZE_CAP,
 # PARITY_DATA_FILE_TEMPLATE, PARITY_DATA_FILE_INDEX, PARITY_LOCAL_BATCH_SIZE,
-# PARITY_STEPS,
-# PARITY_USE_HELION.
+# PARITY_STEPS, RANKFM_MVAI_ATTENTION_BACKEND.
 
 set -uo pipefail
 
@@ -106,10 +105,9 @@ _add_env PARITY_LOCAL_BATCH_SIZE "${PARITY_LOCAL_BATCH_SIZE:-}"
 # two cells enter it from already-diverged weights and a grad mismatch no longer
 # isolates the backward.
 _add_env PARITY_STEPS "${PARITY_STEPS:-}"
-# Run HSTU attention on the recir Helion kernels in the COMPILED cell only
-# (requires PARITY_EMB_BACKEND=in_graph; the eager cell stays the aten reference).
-# PARITY_USE_HELION=0 gives the aten-vs-aten baseline to diff a Helion run against.
-_add_env PARITY_USE_HELION "${PARITY_USE_HELION:-}"
+# Select baseline or Helion attention for parity. Helion changes only the compiled
+# lowering because its eager fallback remains the Aten reference.
+_add_env RANKFM_MVAI_ATTENTION_BACKEND "${RANKFM_MVAI_ATTENTION_BACKEND:-}"
 if [ -n "${EXTRA_ENV}" ]; then
     # Injected entries REPLACE the yaml's own. A duplicate env name resolves to the
     # LAST entry in the list, so leaving the yaml default downstream of the

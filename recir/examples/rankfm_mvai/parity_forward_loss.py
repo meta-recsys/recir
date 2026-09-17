@@ -13,9 +13,8 @@ Required environment:
     PARITY_GCS_DATA_PATH=gs://<bucket>/rankfm_1shard_data
 
 Optional overrides include ``PARITY_BF16``, ``PARITY_HASH_SIZE_CAP``, ``RANKFM_S``,
-``PARITY_USE_HELION`` (run the compiled cell's HSTU attention on the recir Helion
-kernels), replay file/index/batch/step settings, matmul precision, and comparison
-tolerances.
+``RANKFM_MVAI_ATTENTION_BACKEND`` (``baseline`` or ``helion``), replay
+file/index/batch/step settings, matmul precision, and comparison tolerances.
 """
 
 from __future__ import annotations
@@ -67,7 +66,11 @@ from recir.examples.rankfm_mvai.rankfm_embedding_backends import (
     build_embedding_backend,
     RANKFM_EMBEDDING_PARAM_PREFIX,
 )
-from recir.examples.rankfm_mvai.rankfm_model_utils import build_model_from_config
+from recir.examples.rankfm_mvai.rankfm_model_utils import (
+    AttentionBackend,
+    build_model_from_config,
+    resolve_attention_backend,
+)
 from recir.examples.rankfm_mvai.train_common import (
     ensure_gloo_process_group,
     force_cpu_barrier,
@@ -118,14 +121,15 @@ _PARITY_BF16: bool = os.environ.get("PARITY_BF16", "1").lower() not in (
     "no",
     "",
 )
-# Run HSTU attention on the recir Helion kernels in the COMPILED cell (mirrors the
-# bench's RANKFM_MVAI_USE_HELION). The eager cell stays the aten reference:
-# install_helion_hstu_attention_swap() rebinds attention to an adapter whose op has
-# eager fwd/bwd deferring to the captured original pytorch_hstu_mha, so only the
-# XLA-lowered path changes and the PASS/FAIL verdict becomes a Helion numerics
-# check. Separate from RANKFM_MVAI_USE_HELION because parity builds and compiles
-# its own model instead of going through model_family.
-_PARITY_USE_HELION: bool = os.environ.get("PARITY_USE_HELION", "0") == "1"
+# Parity currently supports Helion because its adapter's eager fallback remains
+# the Aten reference. The Pallas adapters need separate compiled-only installation
+# before they can preserve that comparison contract.
+_PARITY_ATTENTION_BACKEND: AttentionBackend = resolve_attention_backend()
+if _PARITY_ATTENTION_BACKEND not in ("baseline", "helion"):
+    raise ValueError(
+        "RankFM parity supports only baseline or helion attention; "
+        "the CPU-eager cell must remain the Aten reference"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -228,7 +232,7 @@ def _helion_pre_compile() -> None:
     HSTU fwd/bwd register_fake kernels record their attention shapes. Clear stale
     sigs BEFORE the build; warm AFTER it, before the first (lazy) lower.
     """
-    if not _PARITY_USE_HELION:
+    if _PARITY_ATTENTION_BACKEND != "helion":
         return
     from recir.ops.helion.jagged_hstu_attention import clear_traced_sigs
 
@@ -243,7 +247,7 @@ def _helion_post_compile(real_bs: int, padded_bs: int) -> None:
     pad-row count matches what _drop_pad_rows slices off. len(jax.devices()) matches
     the lowering's world_size (recir/torchax/ops/jhstu_attention.py).
     """
-    if not _PARITY_USE_HELION:
+    if _PARITY_ATTENTION_BACKEND != "helion":
         return
     from recir.ops.helion.jagged_hstu_attention import (
         set_pad_seqs_per_device,
@@ -1130,7 +1134,7 @@ def _build_cpu_tpu_model(padding: bool) -> Tuple[BlueReelsVDDTrainV3, Any]:
         module_config,
         device,
         bf16_training=_PARITY_BF16,
-        use_helion=_PARITY_USE_HELION,
+        attention_backend=_PARITY_ATTENTION_BACKEND,
     )
     for p in model.parameters():
         if p.is_floating_point():

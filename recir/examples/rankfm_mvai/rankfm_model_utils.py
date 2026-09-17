@@ -7,7 +7,7 @@
 import contextlib
 import logging
 import os
-from typing import Any, Callable, Generator
+from typing import Any, Callable, cast, Generator, Literal
 
 import torch
 from hammer.ops.bf16_train_utils import set_autocast_factory
@@ -21,6 +21,60 @@ from hammer.v3.modules.mot.tokenizers.mot_sparse_arch import ECSparseArch
 from recir.torchax.amp import hammer_autocast_factory
 
 logger: logging.Logger = logging.getLogger(__name__)
+
+AttentionBackend = Literal[
+    "baseline",
+    "pallas_padded",
+    "pallas_jagged",
+    "helion",
+]
+_ATTENTION_BACKEND_ENV = "RANKFM_MVAI_ATTENTION_BACKEND"
+_ATTENTION_BACKENDS: frozenset[str] = frozenset(
+    ("baseline", "pallas_padded", "pallas_jagged", "helion")
+)
+
+
+def resolve_attention_backend() -> AttentionBackend:
+    """Resolve one deterministic HSTU implementation from the environment."""
+    backend = os.environ.get(_ATTENTION_BACKEND_ENV, "")
+    if not backend:
+        return "baseline"
+    if backend not in _ATTENTION_BACKENDS:
+        supported = ", ".join(sorted(_ATTENTION_BACKENDS))
+        raise ValueError(
+            f"{_ATTENTION_BACKEND_ENV} must be one of {supported}; got {backend!r}"
+        )
+    return cast(AttentionBackend, backend)
+
+
+def install_attention_backend(backend: AttentionBackend) -> None:
+    """Restore Hammer's baseline attention, then install exactly one adapter."""
+    import hammer.v2.ops.hstu_preprocess_and_attention as hstu_ops
+    from hammer.ops.pytorch.ragged_hstu_attention import pytorch_hstu_mha
+
+    if backend not in _ATTENTION_BACKENDS:
+        supported = ", ".join(sorted(_ATTENTION_BACKENDS))
+        raise ValueError(
+            f"attention backend must be one of {supported}; got {backend!r}"
+        )
+
+    hstu_ops.pytorch_hstu_mha = pytorch_hstu_mha
+    if backend == "pallas_padded":
+        from recir.ops.hstu_attention_op import install_hstu_attention_swap
+
+        install_hstu_attention_swap()
+    elif backend == "pallas_jagged":
+        from recir.ops.pallas_jagged_hstu_attention_op import (
+            install_pallas_jagged_hstu_attention_swap,
+        )
+
+        install_pallas_jagged_hstu_attention_swap()
+    elif backend == "helion":
+        from recir.ops.helion_hstu_attention_op import (
+            install_helion_hstu_attention_swap,
+        )
+
+        install_helion_hstu_attention_swap()
 
 
 @contextlib.contextmanager
@@ -54,15 +108,12 @@ def build_model_from_config(
     device: torch.device,
     bf16_training: bool = False,
     embeddings_on_meta: bool = False,
-    use_helion: bool = False,
+    attention_backend: AttentionBackend | None = None,
 ) -> BlueReelsVDDTrainV3:
     """Build the V3 xsurface model from a preconfigured ``module_config``.
 
-    When ``use_helion`` is True, the HSTU attention leaf is rebound to the recir
-    Helion adapter (``install_helion_hstu_attention_swap()``) so the STU traces
-    attention as the single ``recir::helion_ragged_attention_fwd`` node the torchax
-    lowering runs on the Helion kernels. Eager numerics are unchanged -- the op's
-    fallback is the captured original attention.
+    ``attention_backend`` selects the HSTU implementation explicitly. When omitted,
+    ``RANKFM_MVAI_ATTENTION_BACKEND`` is resolved from the environment.
 
     ``embeddings_on_meta``: when True, the ``ECSparseArch`` embedding tables are
     built on the ``meta`` device (no host allocation / init) while the dense
@@ -98,12 +149,13 @@ def build_model_from_config(
     # calling model.to(device) here would raise "Cannot copy out of meta tensor".
     # The in_graph backend materializes real on-device tables in setup().
 
-    # Install the RecIR operation behind Hammer's PyTorch attention seam.
-    if os.environ.get("RECIR_HSTU_PALLAS", "0") == "1":
+    backend = (
+        resolve_attention_backend() if attention_backend is None else attention_backend
+    )
+    install_attention_backend(backend)
+    if backend != "baseline":
         import recir.torchax.ops.jhstu_attention  # noqa: F401
-        from recir.ops.hstu_attention_op import install_hstu_attention_swap
 
-        install_hstu_attention_swap()
     # Force pure PyTorch kernels (Triton kernels lack TPU support).
     model.recursive_setattr("_hammer_kernel", HammerKernel.PYTORCH)
     resolved_hammer_kernels: set[str] = set()
@@ -112,16 +164,12 @@ def build_model_from_config(
         if callable(hammer_kernel):
             resolved_hammer_kernels.add(str(hammer_kernel()))
     logger.info(
-        "[HSTU_KERNEL_SELECT] RECIR_HSTU_PALLAS=%r; resolved hammer_kernel()=%r",
-        os.environ.get("RECIR_HSTU_PALLAS"),
+        "[HSTU_KERNEL_SELECT] backend=%s RANKFM_MVAI_ATTENTION_BACKEND=%r "
+        "hammer_kernel()=%r",
+        backend,
+        os.environ.get(_ATTENTION_BACKEND_ENV),
         sorted(resolved_hammer_kernels),
     )
-    if use_helion:
-        from recir.ops.helion_hstu_attention_op import (
-            install_helion_hstu_attention_swap,
-        )
-
-        install_helion_hstu_attention_swap()
     # Route the shared hammer.autocast() call sites to torchax AMP on this
     # TPU/JAX build (torch.autocast("cuda", ...) is inert without CUDA tensors).
     # Installed unconditionally here; the per-site enabled gate (_bf16_training)

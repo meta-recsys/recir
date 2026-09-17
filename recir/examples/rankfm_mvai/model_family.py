@@ -32,7 +32,6 @@ from __future__ import annotations
 
 import logging
 import math
-import os
 from typing import Any, cast, Dict, List, Optional, Tuple, TYPE_CHECKING
 
 import jax
@@ -85,7 +84,11 @@ from recir.examples.rankfm_mvai.rankfm_batch_utils import (
     create_random_train_batch,
     create_uniform_train_batch,
 )
-from recir.examples.rankfm_mvai.rankfm_model_utils import build_model_from_config
+from recir.examples.rankfm_mvai.rankfm_model_utils import (
+    AttentionBackend,
+    build_model_from_config,
+    resolve_attention_backend,
+)
 from recir.region_transforms.dropout_prng import DropoutPRNGTransform
 from recir.region_transforms.padding import compute_padded_shape
 from torch.utils.data import IterableDataset
@@ -114,19 +117,6 @@ logger: logging.Logger = logging.getLogger(__name__)
 # metric buffers don't match and still sync. Full sync (skip_fqns=None) is used
 # before checkpointing/inspecting the tables (flush_host_state(full=True)).
 _EMB_SYNC_SKIP_FQNS: Tuple[str, ...] = ("_sharded_tables", "_dp_tables")
-
-
-def _use_helion() -> bool:
-    """Whether to run HSTU attention on the recir Helion kernels (env-gated).
-
-    When ``RANKFM_MVAI_USE_HELION=1``, ``build_model_from_config(use_helion=True)``
-    rebinds the PYTORCH attention leaf to the recir Helion adapter (see
-    ``recir.ops.helion_hstu_attention_op``), so the STU traces attention as the
-    single ``recir::helion_ragged_attention_fwd`` node the torchax lowering runs on
-    the Helion kernels. When unset the rebind never happens and the run stays on
-    the eager baseline.
-    """
-    return os.environ.get("RANKFM_MVAI_USE_HELION", "0") == "1"
 
 
 def _udd_fm_v3_train_step(
@@ -276,6 +266,7 @@ class RecirXLACompiledModule(RecirCompiledModuleBase):
         num_ranks: int,
         num_processes: int,
         device: torch.device,
+        attention_backend: AttentionBackend,
     ) -> None:
         super().__init__()
         num_candidates_per_sample: int = _resolve_nro_per_sample(
@@ -412,6 +403,7 @@ class RecirXLACompiledModule(RecirCompiledModuleBase):
         self._num_processes = num_processes
         self._global_bs: int = global_bs
         self._padded_ro_bs: int = padded_ro_bs
+        self._attention_backend = attention_backend
         self._spec = RecirCompileSpec(
             mode=RecirMode.GSPMD_TPU,
             device=device,
@@ -438,8 +430,7 @@ class RecirXLACompiledModule(RecirCompiledModuleBase):
         # first XLA lower is lazy, so stale sigs are cleared BEFORE the build and the
         # kernels warmed AFTER it -- Helion compile cannot nest inside the lower's
         # tracer.
-        use_helion = _use_helion()
-        if use_helion:
+        if self._attention_backend == "helion":
             from recir.ops.helion.jagged_hstu_attention import clear_traced_sigs
 
             clear_traced_sigs()
@@ -482,7 +473,7 @@ class RecirXLACompiledModule(RecirCompiledModuleBase):
                 region_transforms=self._spec.region_transforms,
             )
 
-        if use_helion:
+        if self._attention_backend == "helion":
             # Warm the fwd + bwd kernels for the per-device shapes the sample-sharded
             # lowering will run, after the trace and before the first lower.
             # set_pad_seqs_per_device must run first: a wrong pad-row count faults the
@@ -499,6 +490,14 @@ class RecirXLACompiledModule(RecirCompiledModuleBase):
                 world_size=world_size,
             )
             warm_traced_hstu_kernels(world_size=world_size)
+        elif self._attention_backend == "pallas_jagged":
+            from recir.ops.pallas.jagged_hstu_attention import set_pad_seqs_per_device
+
+            set_pad_seqs_per_device(
+                real_batch_size=self._global_bs,
+                padded_batch_size=self._padded_ro_bs,
+                world_size=len(jax.devices()),
+            )
 
         return compiled_step
 
@@ -709,12 +708,14 @@ class RankFMMvaiModelFamily(BlueReelsVDDModelFamily):
             self._trainer_cfg.embedding_backend == "in_graph"
             and self._trainer_cfg.on_device_init
         )
+        attention_backend = resolve_attention_backend()
+        self._attention_backend = attention_backend
         return build_model_from_config(
             module_config,
             torch.device("cpu"),
             bf16_training=self._trainer_cfg.bf16_training,
             embeddings_on_meta=embeddings_on_meta,
-            use_helion=_use_helion(),
+            attention_backend=attention_backend,
         )
 
     def create_train_module_and_optimizer(
@@ -854,6 +855,7 @@ class RankFMMvaiModelFamily(BlueReelsVDDModelFamily):
             num_ranks=num_ranks,
             num_processes=num_processes,
             device=device,
+            attention_backend=self._attention_backend,
         )
         if ckpt_path and not seeds_tables_from_ec:
             _load_parity_checkpoint(wrapper, ckpt_path)
