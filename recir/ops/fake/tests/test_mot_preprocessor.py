@@ -18,7 +18,14 @@ from recir.ops.fake.mot_preprocessor import (
     patch_mot_preprocessor_for_tracing,
     TraceableMoTPreprocessor,
 )
+from torch._dynamo.source import LocalSource
+from torch._subclasses.fake_tensor import FakeTensorMode
 from torch.fx.experimental.proxy_tensor import make_fx
+from torch.fx.experimental.symbolic_shapes import (
+    DimDynamic,
+    ShapeEnv,
+    StatelessSymbolicContext,
+)
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
 
@@ -105,27 +112,24 @@ class _RawAdapter(nn.Module):
         torch.Tensor,
         torch.Tensor,
     ]:
+        label = torch.ones_like(supervision_weight[0])
         bundle = _inputs_to_feature_bundle(
             KeyedJaggedTensor(keys=["ro"], values=ro_values, lengths=ro_lengths),
             None,
             KeyedJaggedTensor(keys=["nro"], values=nro_values, lengths=nro_lengths),
             num_candidates,
-            {"label": torch.ones_like(supervision_weight[0])},
+            {"label": label},
             supervision_weight=supervision_weight,
         )
         output = self.preprocessor(bundle)
         nro_mask = output.require_tensor(_NRO_PADDING_MASK)
-        total_nro = cast(
-            int,
-            output.require_nontensor(MetadataFeatures.TOTAL_NUM_TARGETS),
-        )
         return (
             output.require_tensor(MetadataFeatures.SEQ_LENGTHS[0]),
             nro_mask,
             output.require_tensor(InputActionFeatures.QUERY_TIME[0]),
             output.get_export("metric"),
             output.get_export("unsampled_inputs"),
-            torch.stack((nro_mask, nro_mask.new_ones(total_nro))),
+            output.require(InputFeatures.ALL_LABELS)["label"],
             output.require_tensor(MetadataFeatures.MERGED_RUNTIME_MAX_SEQ_LEN),
         )
 
@@ -167,6 +171,36 @@ def _raw_args(bundle: FeatureBundle) -> tuple[torch.Tensor, ...]:
     )
 
 
+def _dynamic_fake_args(
+    args: tuple[torch.Tensor, ...],
+) -> tuple[FakeTensorMode, tuple[torch.Tensor, ...]]:
+    fake_mode = FakeTensorMode(allow_non_fake_inputs=True, shape_env=ShapeEnv())
+    fake_args = []
+    for index, arg in enumerate(args):
+        dynamic_sizes = [DimDynamic.STATIC, DimDynamic.DYNAMIC]
+        if index != 5:
+            dynamic_sizes = [DimDynamic.DYNAMIC] + [DimDynamic.STATIC] * (arg.ndim - 1)
+        symbolic_context = StatelessSymbolicContext(dynamic_sizes=dynamic_sizes)
+        fake_args.append(
+            fake_mode.from_tensor(
+                arg,
+                static_shapes=False,
+                source=LocalSource(f"test_input_{index}"),
+                symbolic_context=symbolic_context,
+            )
+        )
+    return fake_mode, tuple(fake_args)
+
+
+def _static_fake_args(
+    args: tuple[torch.Tensor, ...],
+) -> tuple[FakeTensorMode, tuple[torch.Tensor, ...]]:
+    fake_mode = FakeTensorMode(allow_non_fake_inputs=True, shape_env=ShapeEnv())
+    return fake_mode, tuple(
+        fake_mode.from_tensor(arg, static_shapes=True) for arg in args
+    )
+
+
 class TraceableMoTPreprocessorTest(TestCase):
     def test_custom_op_fake_contract(self) -> None:
         sample = _make_bundle(batch_size=2, nro_batch=4)
@@ -195,7 +229,13 @@ class TraceableMoTPreprocessorTest(TestCase):
         model = _Model(_StubMoTPreprocessor())
         self.assertEqual(patch_mot_preprocessor_for_tracing(model, sample), 1)
         adapter = _RawAdapter(cast(TraceableMoTPreprocessor, model.preprocessor))
-        traced = make_fx(adapter, tracing_mode="symbolic")(*_raw_args(sample))
+        fake_mode, fake_args = _dynamic_fake_args(_raw_args(sample))
+        with fake_mode:
+            traced = make_fx(
+                adapter,
+                tracing_mode="fake",
+                _allow_non_fake_inputs=False,
+            )(*fake_args)
 
         runtime = _make_bundle(batch_size=3, nro_batch=6)
         (
@@ -204,7 +244,7 @@ class TraceableMoTPreprocessorTest(TestCase):
             query_time,
             metric,
             unsampled,
-            aligned_nro,
+            label,
             merged_max_seq_len,
         ) = traced(*_raw_args(runtime))
 
@@ -213,10 +253,33 @@ class TraceableMoTPreprocessorTest(TestCase):
         self.assertEqual(query_time.shape, (6,))
         self.assertEqual(metric.shape, ())
         self.assertEqual(unsampled.shape, (6,))
-        self.assertEqual(aligned_nro.shape, (2, 6))
+        self.assertEqual(label.shape, (6,))
         # Traced at batch 2, run at batch 3: a batch-shaped policy would have
         # baked (2,) in here.
         self.assertEqual(merged_max_seq_len.shape, (1,))
+
+    def test_trace_preserves_data_dependent_nro_batch_from_static_sample(
+        self,
+    ) -> None:
+        sample = _make_bundle(batch_size=2, nro_batch=4)
+        model = _Model(_StubMoTPreprocessor())
+        self.assertEqual(patch_mot_preprocessor_for_tracing(model, sample), 1)
+        adapter = _RawAdapter(cast(TraceableMoTPreprocessor, model.preprocessor))
+        fake_mode, fake_args = _static_fake_args(_raw_args(sample))
+        with fake_mode:
+            traced = make_fx(
+                adapter,
+                tracing_mode="fake",
+                _allow_non_fake_inputs=False,
+            )(*fake_args)
+
+        runtime = _make_bundle(batch_size=2, nro_batch=6)
+        _, nro_mask, query_time, _, unsampled, label, _ = traced(*_raw_args(runtime))
+
+        self.assertEqual(nro_mask.shape, (6,))
+        self.assertEqual(query_time.shape, (6,))
+        self.assertEqual(unsampled.shape, (6,))
+        self.assertEqual(label.shape, (6,))
 
     def test_query_time_uses_nro_dense_policy(self) -> None:
         desc = FeatureDescriptor(

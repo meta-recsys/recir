@@ -14,6 +14,7 @@ from typing import overload
 import torch
 import torch.distributed as dist
 from recir.api import compile, sync_device_state_to_torch
+from recir.backends.inductor import InductorBackend
 from recir.distributed.parallel_mode import HybridParallel
 from recir.ops.fake.kjt import patch_ebc_for_tracing
 from recir.region_transforms.base import RegionTransform
@@ -137,18 +138,50 @@ def _sparse_transform_factory(
         mesh,
         module,
         stochastic_rounding=False,
+        variable_pooled_batch_per_rank=True,
+    )
+
+
+def _uniform_sparse_transform_factory(
+    fqns: set[str], mesh: DeviceMesh, module: nn.Module
+) -> TBESparseEmbeddingTransform:
+    return TBESparseEmbeddingTransform(
+        fqns,
+        mesh,
+        module,
+        stochastic_rounding=False,
     )
 
 
 def _rank_batch(
-    rank: int, device: torch.device
+    rank: int,
+    device: torch.device,
+    iteration: int,
+    *,
+    uniform_batch_per_rank: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    if rank == 0:
-        values = [1, 9, 2, 10]
-        lengths = [2, 0, 1, 1]
-    else:
-        values = [3, 12, 4, 13, 5]
-        lengths = [1, 1, 0, 0, 2, 1]
+    variable_batches = (
+        (
+            ([1, 9, 2, 10], [2, 0, 1, 1]),
+            ([3, 12, 4, 13, 5], [1, 1, 0, 0, 2, 1]),
+        ),
+        (
+            ([6, 7, 8, 14], [0, 2, 1, 1, 0, 0]),
+            ([9, 15], [1, 1]),
+        ),
+    )
+    uniform_batches = (
+        (
+            variable_batches[0][0],
+            ([3, 12, 4, 13], [1, 1, 0, 2]),
+        ),
+        (
+            variable_batches[1][0],
+            ([9, 15, 5, 13, 7], [1, 1, 0, 1, 1, 1]),
+        ),
+    )
+    batches = uniform_batches if uniform_batch_per_rank else variable_batches
+    values, lengths = batches[iteration][rank]
     batch_size = len(lengths) // len(_FEATURE_NAMES)
     coefficient = torch.arange(
         rank * batch_size * _EMBEDDING_DIM * len(_FEATURE_NAMES) + 1,
@@ -269,7 +302,7 @@ class EmbeddingBagCollectionDistributedTest(DTensorTestBase):
 
     @skip_if_lt_x_gpu(2)
     @with_comms
-    def test_native_two_rank_training_matches_global_eager_reference(self) -> None:
+    def test_native_two_rank_training_handles_runtime_bag_count_changes(self) -> None:
         self._run_two_rank_training(
             sparse_transform_factory=None,
             num_embeddings=_UNEVEN_NUM_EMBEDDINGS,
@@ -277,15 +310,47 @@ class EmbeddingBagCollectionDistributedTest(DTensorTestBase):
 
     @skip_if_lt_x_gpu(2)
     @with_comms
-    def test_tbe_two_rank_training_matches_global_eager_reference(self) -> None:
+    def test_tbe_two_rank_training_handles_runtime_bag_count_changes(self) -> None:
         self._run_two_rank_training(sparse_transform_factory=_sparse_transform_factory)
+
+    @skip_if_lt_x_gpu(2)
+    @with_comms
+    def test_tbe_uniform_rank_batches_match_global_eager_training(self) -> None:
+        self._run_two_rank_training(
+            sparse_transform_factory=_uniform_sparse_transform_factory,
+            uniform_batch_per_rank=True,
+        )
+
+    @skip_if_lt_x_gpu(2)
+    @with_comms
+    def test_tbe_inductor_two_rank_training_handles_runtime_bag_count_changes(
+        self,
+    ) -> None:
+        self._run_two_rank_training(
+            sparse_transform_factory=_sparse_transform_factory,
+            use_inductor=True,
+        )
+
+    @skip_if_lt_x_gpu(2)
+    @with_comms
+    def test_tbe_inductor_uniform_rank_batches_match_global_eager_training(
+        self,
+    ) -> None:
+        self._run_two_rank_training(
+            sparse_transform_factory=_uniform_sparse_transform_factory,
+            use_inductor=True,
+            uniform_batch_per_rank=True,
+        )
 
     def _run_two_rank_training(
         self,
         sparse_transform_factory: (
             Callable[[set[str], DeviceMesh, nn.Module], RegionTransform] | None
         ),
+        *,
         num_embeddings: int = _NUM_EMBEDDINGS,
+        use_inductor: bool = False,
+        uniform_batch_per_rank: bool = False,
     ) -> None:
         torch.manual_seed(0)
         device = torch.device(f"cuda:{self.rank}")
@@ -315,7 +380,9 @@ class EmbeddingBagCollectionDistributedTest(DTensorTestBase):
             sparse_transform_factory=sparse_transform_factory,
         )
 
-        @compile(parallel_mode=parallel_mode)
+        backend = InductorBackend() if use_inductor else None
+
+        @compile(parallel_mode=parallel_mode, backend=backend)
         def train_step(
             model: nn.Module,
             optimizer: torch.optim.Optimizer,
@@ -328,45 +395,56 @@ class EmbeddingBagCollectionDistributedTest(DTensorTestBase):
             optimizer.step()
             return output.detach()
 
-        values, lengths, coefficient = _rank_batch(self.rank, device)
-        expected_output = reference(values, lengths).detach()
-        compiled_optimizer.zero_grad()
-        actual_output = train_step(
-            compiled,
-            compiled_optimizer,
-            values,
-            lengths,
-            coefficient,
-        )
-        sync_device_state_to_torch(train_step)
+        for iteration in range(2):
+            values, lengths, coefficient = _rank_batch(
+                self.rank,
+                device,
+                iteration,
+                uniform_batch_per_rank=uniform_batch_per_rank,
+            )
+            expected_output = reference(values, lengths).detach()
+            compiled_optimizer.zero_grad()
+            actual_output = train_step(
+                compiled,
+                compiled_optimizer,
+                values,
+                lengths,
+                coefficient,
+            )
+            sync_device_state_to_torch(train_step)
 
-        reference_optimizer.zero_grad()
-        global_losses = []
-        for rank in range(self.world_size):
-            rank_values, rank_lengths, rank_coefficient = _rank_batch(rank, device)
-            global_losses.append(
-                (reference(rank_values, rank_lengths) * rank_coefficient).sum()
-            )
-        torch.stack(global_losses).sum().backward()
-        reference_optimizer.step()
+            reference_optimizer.zero_grad()
+            global_losses = []
+            for rank in range(self.world_size):
+                rank_values, rank_lengths, rank_coefficient = _rank_batch(
+                    rank,
+                    device,
+                    iteration,
+                    uniform_batch_per_rank=uniform_batch_per_rank,
+                )
+                global_losses.append(
+                    (reference(rank_values, rank_lengths) * rank_coefficient).sum()
+                )
+            torch.stack(global_losses).sum().backward()
+            reference_optimizer.step()
 
-        torch.testing.assert_close(actual_output, expected_output)
-        compiled_parameters = dict(compiled.named_parameters())
-        reference_parameters = dict(reference.named_parameters())
-        for name, reference_parameter in reference_parameters.items():
-            expected_local_parameter = torch.chunk(
-                reference_parameter,
-                self.world_size,
-                dim=0,
-            )[self.rank]
-            self.assertEqual(
-                compiled_parameters[name].shape,
-                expected_local_parameter.shape,
-            )
-            torch.testing.assert_close(
-                compiled_parameters[name],
-                expected_local_parameter,
-                atol=1.0e-5,
-                rtol=1.0e-5,
-                msg=f"rank-local EBC update mismatch: {name}",
-            )
+            torch.testing.assert_close(actual_output, expected_output)
+            compiled_parameters = dict(compiled.named_parameters())
+            reference_parameters = dict(reference.named_parameters())
+            for name, reference_parameter in reference_parameters.items():
+                expected_local_parameter = torch.chunk(
+                    reference_parameter,
+                    self.world_size,
+                    dim=0,
+                )[self.rank]
+                self.assertEqual(
+                    compiled_parameters[name].shape,
+                    expected_local_parameter.shape,
+                )
+                torch.testing.assert_close(
+                    compiled_parameters[name],
+                    expected_local_parameter,
+                    atol=1.0e-5,
+                    rtol=1.0e-5,
+                    msg=f"rank-local EBC update mismatch: {name}",
+                )
