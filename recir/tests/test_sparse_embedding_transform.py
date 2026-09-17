@@ -9,8 +9,8 @@
 """Unit tests for SparseEmbeddingTransform.
 
 CPU-only tests using a MagicMock DeviceMesh; the
-``finalize_compiled_graph`` method inlines the row-wise AllToAll
-decomposition via ``make_fx(tracing_mode="symbolic")`` whose Meta
+``finalize_compiled_graph`` method inlines sharded sparse-lookup
+decompositions via ``make_fx(tracing_mode="symbolic")`` whose Meta
 implementations don't need real distributed setup.
 
 End-to-end coverage with real comms is provided by
@@ -32,6 +32,7 @@ from recir.region_transforms.sparse_embedding import (
     decomposed_row_wise_embedding_bag_backward,
     SparseEmbeddingTransform,
 )
+from recir.sharding_plan import EmbeddingShardingPlan, EmbeddingShardingType
 from torch.distributed.tensor import DeviceMesh
 
 
@@ -123,6 +124,47 @@ def _add_embedding_bag(
     return pooled, backward
 
 
+def _crossed_embedding_bag_graph() -> fx.GraphModule:
+    graph = fx.Graph()
+    weight = graph.placeholder("weight")
+    weight.meta["fqn"] = "emb.weight"
+    weight.meta["val"] = torch.randn(8, 4)
+    indices_0 = graph.placeholder("indices_0")
+    indices_0.meta["val"] = torch.tensor([1, 2], dtype=torch.int64)
+    indices_1 = graph.placeholder("indices_1")
+    indices_1.meta["val"] = torch.tensor([3, 4], dtype=torch.int64)
+    offsets_0 = graph.placeholder("offsets_0")
+    offsets_0.meta["val"] = torch.tensor([0, 1, 2], dtype=torch.int64)
+    offsets_1 = graph.placeholder("offsets_1")
+    offsets_1.meta["val"] = torch.tensor([0, 1, 2], dtype=torch.int64)
+    grad_0 = graph.placeholder("grad_0")
+    grad_0.meta["val"] = torch.randn(2, 4)
+    grad_1 = graph.placeholder("grad_1")
+    grad_1.meta["val"] = torch.randn(2, 4)
+    pooled_0, backward_0 = _add_embedding_bag(
+        graph, weight, indices_0, offsets_0, grad_0
+    )
+    pooled_1, backward_1 = _add_embedding_bag(
+        graph, weight, indices_1, offsets_1, grad_1
+    )
+    graph.erase_node(backward_0)
+    graph.erase_node(backward_1)
+    offset2bag_0 = graph.call_function(operator.getitem, args=(pooled_0, 1))
+    offset2bag_1 = graph.call_function(operator.getitem, args=(pooled_1, 1))
+    backward_0 = graph.call_function(
+        torch.ops.aten._embedding_bag_backward.default,
+        args=(grad_0, indices_0, offsets_0, offset2bag_1),
+    )
+    backward_0.meta["val"] = torch.randn(8, 4)
+    backward_1 = graph.call_function(
+        torch.ops.aten._embedding_bag_backward.default,
+        args=(grad_1, indices_1, offsets_1, offset2bag_0),
+    )
+    backward_1.meta["val"] = torch.randn(8, 4)
+    graph.output((backward_0, backward_1))
+    return fx.GraphModule(nn.Module(), graph)
+
+
 class DecomposedRowWiseEmbeddingBagTest(unittest.TestCase):
     def test_rejects_offsets_that_do_not_consume_all_indices(self) -> None:
         weight = torch.arange(24, dtype=torch.float32).reshape(6, 4)
@@ -185,6 +227,19 @@ class DecomposedRowWiseEmbeddingBagTest(unittest.TestCase):
                         mode=0,
                     )
 
+    def test_backward_requires_one_gradient_row_per_bag(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "one row per bag"):
+            decomposed_row_wise_embedding_bag_backward(
+                torch.randn(1, 4),
+                torch.tensor([1, 2], dtype=torch.int64),
+                torch.tensor([0, 1, 2], dtype=torch.int64),
+                num_embeddings=8,
+                local_num_embeddings=8,
+                group_name="unused",
+                world_size=1,
+                mode=0,
+            )
+
 
 class SparseEmbeddingBagGraphContractTest(unittest.TestCase):
     def _graph_inputs(
@@ -202,11 +257,80 @@ class SparseEmbeddingBagGraphContractTest(unittest.TestCase):
         grad_output.meta["val"] = torch.randn(2, 4)
         return graph, weight, indices, offsets, grad_output
 
-    def _transform(self) -> SparseEmbeddingTransform:
+    def _transform(self, *, table_wise: bool = False) -> SparseEmbeddingTransform:
+        embedding_plan = None
+        module = None
+        if table_wise:
+            embedding_plan = EmbeddingShardingPlan(
+                sharding_map={"emb.weight": EmbeddingShardingType.TABLE_WISE},
+                table_wise_rank_map={"emb.weight": 0},
+            )
+            module = nn.Module()
+            module.add_module("emb", nn.Embedding(8, 4))
         return SparseEmbeddingTransform(
             embedding_param_fqns={"emb.weight"},
             mesh=_mock_mesh(world_size=1),
+            mod=module,
+            embedding_plan=embedding_plan,
         )
+
+    def test_table_wise_requires_pre_shard_module(self) -> None:
+        plan = EmbeddingShardingPlan(
+            sharding_map={"emb.weight": EmbeddingShardingType.TABLE_WISE},
+            table_wise_rank_map={"emb.weight": 0},
+        )
+
+        with self.assertRaisesRegex(ValueError, "pre-shard module"):
+            SparseEmbeddingTransform(
+                embedding_param_fqns={"emb.weight"},
+                mesh=_mock_mesh(world_size=1),
+                embedding_plan=plan,
+            )
+
+    def test_table_wise_rejects_unpooled_embedding(self) -> None:
+        gm = _build_joint_graph(
+            param_fqns=["emb.weight"],
+            embedding_index=0,
+        )
+
+        with self.assertRaisesRegex(NotImplementedError, "pooled EBC"):
+            self._transform(table_wise=True).finalize_compiled_graph(gm)
+
+    def test_plan_must_classify_each_embedding_weight(self) -> None:
+        gm = _build_joint_graph(
+            param_fqns=["emb.weight"],
+            embedding_index=0,
+        )
+
+        with self.assertRaisesRegex(ValueError, "does not classify"):
+            SparseEmbeddingTransform(
+                embedding_param_fqns={"emb.weight"},
+                mesh=_mock_mesh(world_size=1),
+                embedding_plan=EmbeddingShardingPlan(),
+            ).finalize_compiled_graph(gm)
+
+    def test_row_wise_does_not_query_table_wise_mesh_coordinate(self) -> None:
+        gm = _build_joint_graph(
+            param_fqns=["emb.weight"],
+            embedding_index=0,
+        )
+        mesh = _mock_mesh(world_size=1)
+        mesh.get_coordinate.side_effect = AssertionError(
+            "row-wise lowering queried table-wise placement"
+        )
+        plan = EmbeddingShardingPlan(
+            sharding_map={
+                "emb.weight": EmbeddingShardingType.ROW_WISE,
+                "other.weight": EmbeddingShardingType.TABLE_WISE,
+            },
+            table_wise_rank_map={"other.weight": 0},
+        )
+
+        SparseEmbeddingTransform(
+            embedding_param_fqns={"emb.weight"},
+            mesh=mesh,
+            embedding_plan=plan,
+        ).finalize_compiled_graph(gm)
 
     def test_rejects_unsupported_embedding_bag_options(self) -> None:
         cases: tuple[tuple[int, object, str], ...] = (
@@ -245,16 +369,18 @@ class SparseEmbeddingBagGraphContractTest(unittest.TestCase):
                     self._transform().finalize_compiled_graph(gm)
 
     def test_rejects_live_auxiliary_outputs(self) -> None:
-        graph, weight, indices, offsets, grad_output = self._graph_inputs()
-        pooled, backward = _add_embedding_bag(
-            graph, weight, indices, offsets, grad_output
-        )
-        live_auxiliary = graph.call_function(operator.getitem, args=(pooled, 2))
-        graph.output((backward, live_auxiliary))
-        gm = fx.GraphModule(nn.Module(), graph)
+        for table_wise in (False, True):
+            with self.subTest(table_wise=table_wise):
+                graph, weight, indices, offsets, grad_output = self._graph_inputs()
+                pooled, backward = _add_embedding_bag(
+                    graph, weight, indices, offsets, grad_output
+                )
+                live_auxiliary = graph.call_function(operator.getitem, args=(pooled, 2))
+                graph.output((backward, live_auxiliary))
+                gm = fx.GraphModule(nn.Module(), graph)
 
-        with self.assertRaisesRegex(RuntimeError, "live auxiliary"):
-            self._transform().finalize_compiled_graph(gm)
+                with self.assertRaisesRegex(RuntimeError, "live auxiliary"):
+                    self._transform(table_wise=table_wise).finalize_compiled_graph(gm)
 
     def test_rejects_non_offset2bag_backward_input(self) -> None:
         graph, weight, indices, offsets, grad_output = self._graph_inputs()
@@ -273,62 +399,30 @@ class SparseEmbeddingBagGraphContractTest(unittest.TestCase):
             self._transform().finalize_compiled_graph(gm)
 
     def test_requires_each_forward_to_match_its_own_backward(self) -> None:
-        graph = fx.Graph()
-        weight = graph.placeholder("weight")
-        weight.meta["fqn"] = "emb.weight"
-        weight.meta["val"] = torch.randn(8, 4)
-        indices_0 = graph.placeholder("indices_0")
-        indices_0.meta["val"] = torch.tensor([1, 2], dtype=torch.int64)
-        indices_1 = graph.placeholder("indices_1")
-        indices_1.meta["val"] = torch.tensor([3, 4], dtype=torch.int64)
-        offsets_0 = graph.placeholder("offsets_0")
-        offsets_0.meta["val"] = torch.tensor([0, 1, 2], dtype=torch.int64)
-        offsets_1 = graph.placeholder("offsets_1")
-        offsets_1.meta["val"] = torch.tensor([0, 1, 2], dtype=torch.int64)
-        grad_0 = graph.placeholder("grad_0")
-        grad_0.meta["val"] = torch.randn(2, 4)
-        grad_1 = graph.placeholder("grad_1")
-        grad_1.meta["val"] = torch.randn(2, 4)
-
-        pooled_0, backward_0 = _add_embedding_bag(
-            graph, weight, indices_0, offsets_0, grad_0
-        )
-        _pooled_1, _backward_1 = _add_embedding_bag(
-            graph, weight, indices_1, offsets_1, grad_1
-        )
-        offset2bag_0 = graph.call_function(operator.getitem, args=(pooled_0, 1))
-        duplicate_backward = graph.call_function(
-            torch.ops.aten._embedding_bag_backward.default,
-            args=(grad_1, indices_0, offsets_0, offset2bag_0),
-        )
-        duplicate_backward.meta["val"] = torch.randn(8, 4)
-        graph.erase_node(_backward_1)
-        graph.output((backward_0, duplicate_backward))
-        gm = fx.GraphModule(nn.Module(), graph)
-        transform = SparseEmbeddingTransform(
-            embedding_param_fqns={"emb.weight"},
-            mesh=_mock_mesh(world_size=1),
-        )
-
-        with self.assertRaisesRegex(RuntimeError, "one backward per forward"):
-            transform.finalize_compiled_graph(gm)
+        for table_wise in (False, True):
+            with self.subTest(table_wise=table_wise):
+                gm = _crossed_embedding_bag_graph()
+                with self.assertRaisesRegex(RuntimeError, "same indices and offsets"):
+                    self._transform(table_wise=table_wise).finalize_compiled_graph(gm)
 
     def test_rejects_multiple_backwards_for_one_forward(self) -> None:
-        graph, weight, indices, offsets, grad_output = self._graph_inputs()
-        pooled, backward = _add_embedding_bag(
-            graph, weight, indices, offsets, grad_output
-        )
-        offset2bag = graph.call_function(operator.getitem, args=(pooled, 1))
-        duplicate_backward = graph.call_function(
-            torch.ops.aten._embedding_bag_backward.default,
-            args=(grad_output, indices, offsets, offset2bag),
-        )
-        duplicate_backward.meta["val"] = torch.randn(8, 4)
-        graph.output((backward, duplicate_backward))
-        gm = fx.GraphModule(nn.Module(), graph)
+        for table_wise in (False, True):
+            with self.subTest(table_wise=table_wise):
+                graph, weight, indices, offsets, grad_output = self._graph_inputs()
+                pooled, backward = _add_embedding_bag(
+                    graph, weight, indices, offsets, grad_output
+                )
+                offset2bag = graph.call_function(operator.getitem, args=(pooled, 1))
+                duplicate_backward = graph.call_function(
+                    torch.ops.aten._embedding_bag_backward.default,
+                    args=(grad_output, indices, offsets, offset2bag),
+                )
+                duplicate_backward.meta["val"] = torch.randn(8, 4)
+                graph.output((backward, duplicate_backward))
+                gm = fx.GraphModule(nn.Module(), graph)
 
-        with self.assertRaisesRegex(RuntimeError, "exactly one backward"):
-            self._transform().finalize_compiled_graph(gm)
+                with self.assertRaisesRegex(RuntimeError, "exactly one backward"):
+                    self._transform(table_wise=table_wise).finalize_compiled_graph(gm)
 
 
 class TestSparseEmbeddingTransformFqnLookup(unittest.TestCase):

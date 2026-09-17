@@ -1320,6 +1320,7 @@ def _make_hybrid_sparse_transform(
         embedding_param_fqns=embedding_param_fqns,
         mesh=parallel_mode.mesh,
         mod=mod,
+        embedding_plan=parallel_mode.embedding_plan,
     )
 
 
