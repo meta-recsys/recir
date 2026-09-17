@@ -33,12 +33,7 @@ from hammer.v3.models.udd_fm_v3.parity.step_probe import StepProbe
 from minimal_viable_ai.core.trainer.train_pipeline import RecTrainPipelineProvider
 
 from .eager_step import EagerCPUStep
-from .metric_states import (
-    extract_states,
-    PADDED_ROWS,
-    update_ranking_metrics_from_states,
-    W_SUM,
-)
+from .metric_states import extract_states, update_ranking_metrics_from_states, W_SUM
 from .rankfm_dispatchers import PreprocessorDispatcher
 from .snapshot_metrics import SnapshotMetrics
 from .xsurface_helpers import _log_hbm_memory
@@ -182,6 +177,7 @@ class RecirXLATrainPipeline(RankingTrainPipeline):
             "RecirXLACompiledModule", model
         ).in_graph_metrics
         self._profiling_active = False
+        self._warned_missing_loss_norm_denom = False
         # The consumer (materialize + metric update) runs one step late, on the
         # worker. These two are its input and its output: the input is the step
         # output parked as JAX handles, the output is what `progress` returns.
@@ -363,10 +359,23 @@ class RecirXLATrainPipeline(RankingTrainPipeline):
     ) -> Dict[str, Any]:
         states = extract_states(named)
         _assert_task_rows(states[W_SUM], self._all_task_names)
-        # The PADDED width, which is exactly what the host path credits the
-        # window as `predictions.shape[-1]`. Keeping it identical is what lets
-        # this change be A/B'd against a control run for exact equality.
-        num_samples = int(states[PADDED_ROWS].item())
+        real_rows = named.get("loss_norm_denom")
+        if real_rows is None:
+            # The producer emits None when its forward computed no denominator.
+            # Falling back to the padded candidate count reinstates the very
+            # accounting this path exists to avoid, so say so rather than drift.
+            if not self._warned_missing_loss_norm_denom:
+                self._warned_missing_loss_norm_denom = True
+                logger.warning(
+                    "loss_norm_denom absent; crediting the metric window the "
+                    "PADDED candidate count, so window length varies with the "
+                    "pad fraction"
+                )
+            num_samples = num_real_candidates
+        else:
+            # An all-padded / all-zero-weight microbatch has no real examples;
+            # a 0 would park a never-evicted entry in the row-sized window.
+            num_samples = max(1, int(real_rows.item()))
         unfed = update_ranking_metrics_from_states(
             states,
             num_samples=num_samples,
@@ -452,6 +461,7 @@ class RecirXLATrainPipelineProvider(
         profile_dir: str = "/tmp/tpu_profile",
         enable_memory_log: bool = False,
         pipeline_preprocessor: bool = False,
+        window_size: int = 1_000_000,
     ) -> None:
         self._cls_task_indices = cls_task_indices
         self._reg_task_indices = reg_task_indices
@@ -475,6 +485,7 @@ class RecirXLATrainPipelineProvider(
             reg_task_indices=reg_task_indices,
             is_variable_step=is_variable_step,
             report_interval=report_interval,
+            window_size=window_size,
         )
 
     # pyre-ignore
@@ -678,6 +689,7 @@ class EagerCPUTrainPipelineProvider(
         all_task_names: Optional[List[str]] = None,
         is_variable_step: bool = True,
         report_interval: int = 1,
+        window_size: int = 1_000_000,
         light_loss_norm: bool = False,
         grad_accum_steps: int = 1,
     ) -> None:
@@ -696,6 +708,7 @@ class EagerCPUTrainPipelineProvider(
             reg_task_indices=reg_task_indices,
             is_variable_step=is_variable_step,
             report_interval=report_interval,
+            window_size=window_size,
         )
 
     # pyre-ignore

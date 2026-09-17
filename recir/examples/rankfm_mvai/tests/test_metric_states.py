@@ -746,3 +746,62 @@ class ClampBoundaryTest(unittest.TestCase):
         )
         rel = float(((ce_got - ce_ref).abs() / ce_ref.abs()).max())
         self.assertLess(rel, 1e-5, f"deviation grew to {rel}")
+
+
+class UnpadWindowTest(unittest.TestCase):
+    """The metric window is sized in ROWS, so crediting it padded rows makes its
+    true length depend on the pad fraction.
+    """
+
+    def _window_after(self, pad: int, *, unpad: bool) -> torch.Tensor:
+        from torchrec.metrics.ne import NEMetricComputation
+
+        predictions, labels, weights = _inputs(torch.float64, n=_N)
+        real_rows = _N
+        if pad:
+            g = torch.Generator().manual_seed(11)
+            predictions = torch.cat(
+                [predictions, torch.rand((_TASKS, pad), generator=g).double()], dim=-1
+            )
+            labels = torch.cat(
+                [labels, torch.rand((_TASKS, pad), generator=g).double()], dim=-1
+            )
+            weights = torch.cat(
+                [weights, torch.zeros((_TASKS, pad), dtype=torch.float64)], dim=-1
+            )
+
+        states = compute_metric_states(predictions, labels, weights)
+        # window_size chosen so eviction actually happens; that is the whole
+        # mechanism the padded accounting corrupts.
+        computation = NEMetricComputation(
+            my_rank=0, batch_size=_N, n_tasks=_TASKS, window_size=_N * 2
+        )
+        metric = _FakeFixedStepRecMetric(computation)
+        for _ in range(4):
+            update_ranking_metrics_from_states(
+                states,
+                num_samples=(real_rows if unpad else int(states[PADDED_ROWS].item())),
+                num_real_candidates=real_rows,
+                cls_metrics=[metric],
+                cls_indices=None,
+            )
+        return computation.get_window_state("weighted_num_samples").clone()
+
+    def test_window_is_padding_invariant_when_unpadded(self) -> None:
+        """What the pipeline now always does; there is no flag."""
+        self.assertTrue(
+            torch.equal(
+                self._window_after(0, unpad=True),
+                self._window_after(2048, unpad=True),
+            ),
+            "window state moved with the pad fraction",
+        )
+
+    def test_padded_row_accounting_would_still_be_wrong(self) -> None:
+        """The bug this closed, kept as a guard on the test above."""
+        self.assertFalse(
+            torch.equal(
+                self._window_after(0, unpad=False),
+                self._window_after(2048, unpad=False),
+            )
+        )

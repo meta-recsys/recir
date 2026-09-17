@@ -52,6 +52,10 @@ if TYPE_CHECKING:
             tasks: list[str],
             batch_size: int,
             report_interval: int,
+            # Forwarded verbatim to the metric constructor via `d.kwargs`
+            # (`ranking_common/train_pipeline.py:176-184`), so the real class
+            # takes anything the metric does.
+            **kwargs: Any,
         ) -> None: ...
 
 else:
@@ -116,6 +120,7 @@ def main() -> None:
     partition = build_cls_reg_partition(module_config)
     report_interval = trainer_config.metrics_config.report_interval
     batch_size = trainer_config.data_source_config.batch_size
+    window_size = trainer_cfg.metric_window_size
 
     RecTrainer(
         model_family_clazz=RankFMMvaiModelFamily,
@@ -128,12 +133,14 @@ def main() -> None:
                     tasks=partition.cls_task_names,
                     batch_size=batch_size,
                     report_interval=report_interval,
+                    window_size=window_size,
                 ),
                 RankingMetricDef(
                     metric_cls=FixedStepCTR,
                     tasks=partition.cls_task_names,
                     batch_size=batch_size,
                     report_interval=report_interval,
+                    window_size=window_size,
                 ),
             ],
             reg_metric_defs=[
@@ -142,6 +149,7 @@ def main() -> None:
                     tasks=partition.reg_task_names,
                     batch_size=batch_size,
                     report_interval=report_interval,
+                    window_size=window_size,
                 ),
             ],
             cls_task_indices=partition.cls_task_indices,
@@ -149,6 +157,7 @@ def main() -> None:
             all_task_names=partition.all_task_names,
             is_variable_step=True,
             report_interval=report_interval,
+            window_size=window_size,
             light_loss_norm=trainer_cfg.light_loss_norm,
             grad_accum_steps=trainer_cfg.grad_accum_steps,
         ),
