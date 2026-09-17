@@ -43,6 +43,7 @@ from recir.meta_tensor_init import (
 # in the bundle_runtime path) reuses the row-wise embedding decomposition
 # that now lives in ``recir/region_transforms/sparse_embedding.py``.
 from recir.region_transforms.sparse_embedding import decomposed_row_wise_embedding
+from recir.sharding_plan import EmbeddingShardingPlan
 from torch.distributed.tensor import DeviceMesh, DTensor, Replicate, Shard
 from torch.distributed.tensor._dtensor_spec import DTensorSpec
 from torch.distributed.tensor._op_schema import (
@@ -1362,10 +1363,30 @@ def _select_shared_parameter_group(
     return selections == {True}
 
 
-def _shard_shared_parameter(
+def _install_parameter_aliases(
     model: nn.Module,
     params_buffers: Dict[str, torch.Tensor],
-    fqns: Sequence[str],
+    aliases: Sequence[str],
+    full_tensor: torch.Tensor,
+    local_tensor: torch.Tensor,
+) -> nn.Parameter:
+    copy_meta_init_attrs(local_tensor, full_tensor)
+    new_param = nn.Parameter(local_tensor, requires_grad=full_tensor.requires_grad)
+    copy_meta_init_attrs(new_param, full_tensor)
+    for fqn in aliases:
+        params_buffers[fqn] = local_tensor
+        atoms = fqn.split(".")
+        parent = model
+        for atom in atoms[:-1]:
+            parent = getattr(parent, atom)
+        setattr(parent, atoms[-1], new_param)
+    return new_param
+
+
+def _shard_parameter_aliases(
+    model: nn.Module,
+    params_buffers: Dict[str, torch.Tensor],
+    aliases: Sequence[str],
     full_tensor: torch.Tensor,
     shard_spec: DTensorSpec,
     *,
@@ -1375,7 +1396,6 @@ def _shard_shared_parameter(
 ) -> nn.Parameter:
     """Shard one tensor and rebind every FQN that names it."""
     local_shard = partition_value(full_tensor, shard_spec, own_storage=own_storage)
-    copy_meta_init_attrs(local_shard, full_tensor)
     if materialize_meta_on_cuda and local_shard.device.type == "meta":
         local_shard = _materialize_meta_shard(
             local_shard,
@@ -1383,16 +1403,52 @@ def _shard_shared_parameter(
             torch.device(f"cuda:{torch.cuda.current_device()}"),
             location,
         )
-    new_param = nn.Parameter(local_shard, requires_grad=full_tensor.requires_grad)
-    copy_meta_init_attrs(new_param, full_tensor)
-    for fqn in fqns:
-        params_buffers[fqn] = local_shard
-        atoms = fqn.split(".")
-        parent = model
-        for atom in atoms[:-1]:
-            parent = getattr(parent, atom)
-        setattr(parent, atoms[-1], new_param)
-    return new_param
+    return _install_parameter_aliases(
+        model,
+        params_buffers,
+        aliases,
+        full_tensor,
+        local_shard,
+    )
+
+
+def _place_table_wise_parameter_aliases(
+    model: nn.Module,
+    params_buffers: Dict[str, torch.Tensor],
+    aliases: Sequence[str],
+    full_tensor: torch.Tensor,
+    *,
+    owner_rank: int,
+    rank: int,
+    location: str = "HBM",
+) -> nn.Parameter:
+    owns_table = rank == owner_rank
+    if owns_table:
+        local_tensor = full_tensor.detach()
+    else:
+        local_tensor = full_tensor.new_empty((0, *full_tensor.shape[1:]))
+    if local_tensor.device.type == "meta":
+        device = torch.device(f"cuda:{torch.cuda.current_device()}")
+        if owns_table:
+            local_tensor = _materialize_meta_shard(
+                local_tensor,
+                full_tensor,
+                device,
+                location,
+            )
+        else:
+            local_tensor = torch.empty(
+                local_tensor.shape,
+                dtype=local_tensor.dtype,
+                device=device,
+            )
+    return _install_parameter_aliases(
+        model,
+        params_buffers,
+        aliases,
+        full_tensor,
+        local_tensor,
+    )
 
 
 def shard_params_and_states(
@@ -1428,7 +1484,7 @@ def shard_params_and_states(
         if not _select_shared_parameter_group(old_param, fqns, shard_filter):
             continue
         sharded_keys.update(fqns)
-        new_param = _shard_shared_parameter(
+        new_param = _shard_parameter_aliases(
             model,
             params_buffers,
             fqns,
@@ -1796,6 +1852,16 @@ def _normalize_opts(
     return list(opt)
 
 
+def _replace_optimizer_parameters(
+    opt: torch.optim.Optimizer,
+    replacements: Dict[int, torch.Tensor],
+) -> None:
+    for group in opt.param_groups:
+        group["params"] = [
+            replacements.get(id(param), param) for param in group["params"]
+        ]
+
+
 def _migrate_opt_after_param_swap(
     opts: List[torch.optim.Optimizer],
     old_to_new: List[Tuple[torch.Tensor, torch.Tensor, DTensorSpec]],
@@ -1828,8 +1894,125 @@ def _migrate_opt_after_param_swap(
         id_to_new: Dict[int, torch.Tensor] = {
             id(old): new for old, new, _ in old_to_new
         }
-        for group in opt.param_groups:
-            group["params"] = [id_to_new.get(id(p), p) for p in group["params"]]
+        _replace_optimizer_parameters(opt, id_to_new)
+
+
+def _migrate_table_wise_opt_after_param_swaps(
+    opts: Sequence[torch.optim.Optimizer],
+    old_to_new: Sequence[Tuple[torch.Tensor, torch.Tensor, bool]],
+) -> None:
+    for opt in opts:
+        replacements: Dict[int, torch.Tensor] = {}
+        for old_param, new_param, owns_table in old_to_new:
+            state = opt.state.pop(old_param, None)
+            if owns_table and state is not None:
+                if isinstance(state, dict):
+                    for key, value in state.items():
+                        if (
+                            isinstance(value, torch.Tensor)
+                            and value.device.type == "meta"
+                        ):
+                            state[key] = torch.zeros_like(
+                                value, device=new_param.device
+                            )
+                opt.state[new_param] = state
+            replacements[id(old_param)] = new_param
+        _replace_optimizer_parameters(opt, replacements)
+
+
+def _embedding_group_placement(
+    aliases: Sequence[str],
+    embedding_plan: EmbeddingShardingPlan,
+) -> Tuple[str, int | None] | None:
+    planned_aliases = [
+        alias for alias in aliases if embedding_plan.is_embedding_param(alias)
+    ]
+    if not planned_aliases:
+        return None
+    if len(planned_aliases) != len(aliases):
+        raise RuntimeError(
+            "Shared parameter aliases must all be present in the embedding plan: "
+            f"aliases={aliases!r}, planned={planned_aliases!r}."
+        )
+    sharding_types = {embedding_plan.sharding_map[alias] for alias in planned_aliases}
+    if len(sharding_types) != 1:
+        raise RuntimeError(
+            "Shared parameter aliases must use one embedding sharding type: "
+            f"aliases={aliases!r}."
+        )
+    resolved_locations = {
+        embedding_plan.location_map.get(alias, "HBM") for alias in aliases
+    }
+    if len(resolved_locations) != 1:
+        raise RuntimeError(
+            "A shared parameter must use one embedding storage location: "
+            f"fqns={aliases!r}, locations={sorted(resolved_locations)!r}"
+        )
+    location = next(iter(resolved_locations))
+    if not embedding_plan.is_table_wise(planned_aliases[0]):
+        return location, None
+    owner_ranks = {embedding_plan.table_wise_owner(alias) for alias in planned_aliases}
+    if len(owner_ranks) != 1:
+        raise RuntimeError(
+            "Shared table-wise parameter aliases must have one owner rank: "
+            f"aliases={aliases!r}, owners={sorted(owner_ranks)!r}."
+        )
+    return location, next(iter(owner_ranks))
+
+
+def _validate_table_wise_owners(
+    embedding_plan: EmbeddingShardingPlan,
+    world_size: int,
+) -> None:
+    for fqn, owner_rank in embedding_plan.table_wise_rank_map.items():
+        if owner_rank >= world_size:
+            raise ValueError(
+                f"Table-wise owner rank {owner_rank} for {fqn!r} is outside "
+                f"world size {world_size}."
+            )
+
+
+def _validate_embedding_plan(
+    model: nn.Module,
+    params_buffers: Dict[str, torch.Tensor],
+    mesh: DeviceMesh,
+    embedding_plan: EmbeddingShardingPlan,
+) -> Tuple[int | None, Dict[int, Tuple[str, int | None]]]:
+    embedding_fqns = embedding_plan.param_fqns
+    model_parameter_fqns = {
+        fqn for fqn, _ in model.named_parameters(remove_duplicate=False)
+    }
+    non_parameter_fqns = embedding_fqns - model_parameter_fqns
+    if non_parameter_fqns:
+        raise ValueError(
+            "Embedding plan contains FQNs that are not model parameters: "
+            f"{sorted(non_parameter_fqns)!r}."
+        )
+    missing_fqns = embedding_fqns - set(params_buffers)
+    if missing_fqns:
+        raise ValueError(
+            "Embedding plan contains parameters absent from the state snapshot: "
+            f"{sorted(missing_fqns)!r}."
+        )
+    group_placements: Dict[int, Tuple[str, int | None]] = {}
+    for parameter, aliases in _group_shared_parameters(params_buffers):
+        placement = _embedding_group_placement(aliases, embedding_plan)
+        if placement is not None:
+            group_placements[id(parameter)] = placement
+
+    rank: int | None = None
+    if embedding_plan.table_wise_rank_map:
+        if mesh.ndim != 1:
+            raise ValueError(
+                "Table-wise embedding sharding requires a one-dimensional device mesh; "
+                f"got shape {mesh.shape}."
+            )
+        _validate_table_wise_owners(embedding_plan, mesh.size(0))
+        rank_coordinate = mesh.get_coordinate()
+        if rank_coordinate is None:
+            raise RuntimeError("Current rank is not part of the embedding device mesh.")
+        rank = rank_coordinate[0]
+    return rank, group_placements
 
 
 def shard_params_by_plan(
@@ -1838,21 +2021,22 @@ def shard_params_by_plan(
     opt: OptOrOpts,
     mesh: DeviceMesh,
     dense_style: DataParallelStyle,
-    embedding_param_fqns: Set[str],
-    embedding_location_map: Optional[Dict[str, str]] = None,
+    *,
+    embedding_plan: EmbeddingShardingPlan,
 ) -> Set[str]:
     """Shard parameters and optimizer states with per-param logic.
 
     Each parameter is sharded exactly once based on its role:
-      - Embedding params (in ``embedding_param_fqns``): always ``Shard(0)``
-        on the vocabulary dimension, regardless of ``dense_style``.
+      - Row-wise embedding params: ``Shard(0)`` on the vocabulary dimension.
+      - Table-wise embedding params: the owner rank keeps the complete table;
+        non-owner ranks keep an empty local placeholder.
       - Dense params: ``Shard(0)`` if ``dense_style`` is ``FULLY_SHARD``,
         otherwise left unsharded (replicated).
 
-    ``embedding_location_map`` (optional) maps embedding FQNs to their
-    storage location (``"HBM"`` or ``"UVM"``).  When a meta-device
-    embedding is materialized, UVM tables use FBGEMM's managed allocator
-    (host RAM + GPU direct access), matching DMP/TorchRec's placement.
+    ``embedding_plan`` is the sole source of embedding FQNs, sharding types,
+    table owners, and storage locations. When a meta-device embedding is
+    materialized, UVM tables use FBGEMM's managed allocator (host RAM + GPU
+    direct access), matching DMP/TorchRec's placement.
 
     ``opt`` accepts None, a single Optimizer, or a Sequence of Optimizers
     (for sparse + dense multi-opt setups). For each opt passed, the
@@ -1860,38 +2044,52 @@ def shard_params_by_plan(
     are migrated from old Parameter identity to new Parameter identity
     after the shard-driven Parameter object swap.
     """
+    embedding_fqns = embedding_plan.param_fqns
+    rank, group_placements = _validate_embedding_plan(
+        model, params_buffers, mesh, embedding_plan
+    )
+
     opts = _normalize_opts(opt)
     sharded_keys: Set[str] = set()
     shard_spec = DTensorSpec(mesh=mesh, placements=(Shard(0),))
-    loc_map = embedding_location_map or {}
     old_to_new: List[Tuple[torch.Tensor, torch.Tensor, DTensorSpec]] = []
+    table_wise_old_to_new: List[Tuple[torch.Tensor, torch.Tensor, bool]] = []
 
     def should_shard(key: str, _tensor: torch.Tensor) -> bool:
-        return (
-            key in embedding_param_fqns or dense_style == DataParallelStyle.FULLY_SHARD
-        )
+        return key in embedding_fqns or dense_style == DataParallelStyle.FULLY_SHARD
 
-    for old_param, fqns in _group_shared_parameters(params_buffers):
-        if not _select_shared_parameter_group(old_param, fqns, should_shard):
+    for old_param, aliases in _group_shared_parameters(params_buffers):
+        if not _select_shared_parameter_group(old_param, aliases, should_shard):
             continue
-        explicit_locations = {loc_map[fqn] for fqn in fqns if fqn in loc_map}
-        if len(explicit_locations) > 1:
-            raise RuntimeError(
-                "A shared parameter must use one embedding storage location: "
-                f"fqns={fqns!r}, locations={sorted(explicit_locations)!r}"
+        location, owner_rank = group_placements.get(id(old_param), ("HBM", None))
+        sharded_keys.update(aliases)
+        if owner_rank is not None:
+            if rank is None:
+                raise RuntimeError(
+                    "Table-wise placement requires the current mesh rank."
+                )
+            new_param = _place_table_wise_parameter_aliases(
+                model,
+                params_buffers,
+                aliases,
+                old_param,
+                owner_rank=owner_rank,
+                rank=rank,
+                location=location,
             )
-        location = next(iter(explicit_locations), "HBM")
-        sharded_keys.update(fqns)
-        new_param = _shard_shared_parameter(
+            table_wise_old_to_new.append((old_param, new_param, rank == owner_rank))
+            continue
+        new_param = _shard_parameter_aliases(
             model,
             params_buffers,
-            fqns,
+            aliases,
             old_param,
             shard_spec,
             materialize_meta_on_cuda=True,
             location=location,
         )
         old_to_new.append((old_param, new_param, shard_spec))
+    _migrate_table_wise_opt_after_param_swaps(opts, table_wise_old_to_new)
     _migrate_opt_after_param_swap(opts, old_to_new)
 
     # DDP synchronizes replicated parameters and buffers from rank 0 during construction

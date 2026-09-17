@@ -2106,7 +2106,12 @@ class TestShardParamsByPlan(DTensorTestBase):
         orig_lin_rows = params["linear.weight"].shape[0]  # 4
         mesh = DeviceMesh("cuda", torch.arange(self.world_size))
         shard_params_by_plan(
-            model, params, None, mesh, DataParallelStyle.FULLY_SHARD, set()
+            model,
+            params,
+            None,
+            mesh,
+            DataParallelStyle.FULLY_SHARD,
+            embedding_plan=EmbeddingShardingPlan(),
         )
         self.assertEqual(
             params["emb.weight"].shape[0], orig_emb_rows // self.world_size
@@ -2129,7 +2134,12 @@ class TestShardParamsByPlan(DTensorTestBase):
         orig_shapes = {k: v.shape for k, v in params.items()}
         mesh = DeviceMesh("cuda", torch.arange(self.world_size))
         shard_params_by_plan(
-            model, params, None, mesh, DataParallelStyle.REPLICATE, set()
+            model,
+            params,
+            None,
+            mesh,
+            DataParallelStyle.REPLICATE,
+            embedding_plan=EmbeddingShardingPlan(),
         )
         for k in params:
             self.assertEqual(params[k].shape, orig_shapes[k])
@@ -2153,7 +2163,7 @@ class TestShardParamsByPlan(DTensorTestBase):
             None,
             mesh,
             DataParallelStyle.REPLICATE,
-            set(),
+            embedding_plan=EmbeddingShardingPlan(),
         )
 
         self.assertEqual(model.runtime_value.device.type, "cpu")
@@ -2171,18 +2181,300 @@ class TestShardParamsByPlan(DTensorTestBase):
             ]
         )
         mesh = DeviceMesh("cuda", torch.arange(self.world_size))
+        plan = EmbeddingShardingPlan(
+            sharding_map={
+                "emb.weight": EmbeddingShardingType.ROW_WISE,
+            }
+        )
         shard_params_by_plan(
             model,
             params,  # pyre-fixme[6]
             None,
             mesh,
             DataParallelStyle.REPLICATE,
-            {"emb.weight"},
+            embedding_plan=plan,
         )
         # Embedding: sharded (16, 8) -> (8, 8)
         self.assertEqual(params["emb.weight"].shape, (8, 8))
         # Linear: NOT sharded (REPLICATE, not embedding)
         self.assertEqual(params["linear.weight"].shape, (4, 8))
+
+    @skip_if_lt_x_gpu(2)
+    @with_comms
+    def test_table_wise_embedding_is_materialized_only_on_owner(self) -> None:
+        model = EmbeddingMLP().cuda(self.rank)
+        original_shape = model.emb.weight.shape
+        optimizer = torch.optim.SGD(
+            model.parameters(), lr=0.1, momentum=0.9, foreach=True
+        )
+        model(torch.tensor([[1, 2]], device=f"cuda:{self.rank}")).sum().backward()
+        optimizer.step()
+        optimizer.zero_grad()
+        original_weight = model.emb.weight.detach().clone()
+        original_momentum = (
+            optimizer.state[model.emb.weight]["momentum_buffer"].detach().clone()
+        )
+        params = OrderedDict(model.named_parameters())
+        plan = EmbeddingShardingPlan(
+            sharding_map={
+                "emb.weight": EmbeddingShardingType.TABLE_WISE,
+            },
+            table_wise_rank_map={"emb.weight": 1},
+        )
+
+        shard_params_by_plan(
+            model,
+            params,
+            optimizer,
+            DeviceMesh("cuda", torch.arange(self.world_size)),
+            DataParallelStyle.REPLICATE,
+            embedding_plan=plan,
+        )
+
+        if self.rank == 1:
+            self.assertEqual(model.emb.weight.shape, original_shape)
+            self.assertIn(model.emb.weight, optimizer.state)
+            self.assertIn(model.emb.weight, optimizer.param_groups[0]["params"])
+            torch.testing.assert_close(model.emb.weight, original_weight)
+            torch.testing.assert_close(
+                optimizer.state[model.emb.weight]["momentum_buffer"],
+                original_momentum,
+            )
+        else:
+            self.assertEqual(model.emb.weight.shape, (0, original_shape[1]))
+            self.assertNotIn(model.emb.weight, optimizer.state)
+            self.assertIn(model.emb.weight, optimizer.param_groups[0]["params"])
+
+    @skip_if_lt_x_gpu(2)
+    @with_comms
+    def test_table_wise_embedding_preserves_optimizer_state_device(self) -> None:
+        model = EmbeddingMLP().cuda(self.rank)
+        optimizer = torch.optim.Adam([model.emb.weight], lr=0.1, foreach=True)
+        model(torch.tensor([[1, 2]], device=f"cuda:{self.rank}")).sum().backward()
+        optimizer.step()
+        optimizer.zero_grad()
+        original_step = optimizer.state[model.emb.weight]["step"].clone()
+        self.assertEqual(original_step.device.type, "cpu")
+
+        params = OrderedDict(model.named_parameters())
+        plan = EmbeddingShardingPlan(
+            sharding_map={"emb.weight": EmbeddingShardingType.TABLE_WISE},
+            table_wise_rank_map={"emb.weight": 1},
+        )
+        shard_params_by_plan(
+            model,
+            params,
+            optimizer,
+            DeviceMesh("cuda", torch.arange(self.world_size)),
+            DataParallelStyle.REPLICATE,
+            embedding_plan=plan,
+        )
+
+        if self.rank == 1:
+            local_state = optimizer.state[model.emb.weight]
+            self.assertEqual(local_state["step"].device.type, "cpu")
+            model.emb.weight.grad = torch.ones_like(model.emb.weight)
+            optimizer.step()
+            self.assertEqual(local_state["step"], original_step + 1)
+            self.assertEqual(local_state["step"].device.type, "cpu")
+        else:
+            self.assertEqual(model.emb.weight.shape, (0, 8))
+            self.assertNotIn(model.emb.weight, optimizer.state)
+            self.assertIn(model.emb.weight, optimizer.param_groups[0]["params"])
+
+    @skip_if_lt_x_gpu(2)
+    @with_comms
+    def test_mixed_row_wise_and_table_wise_parameter_placement(self) -> None:
+        model = MultiEmbeddingMLP().to(f"cuda:{self.rank}")
+        optimizer = torch.optim.SGD(
+            model.parameters(), lr=0.1, momentum=0.9, foreach=True
+        )
+        indices1 = torch.randint(0, 16, (4, 3), device=f"cuda:{self.rank}")
+        indices2 = torch.randint(0, 32, (4, 3), device=f"cuda:{self.rank}")
+        model(indices1, indices2).sum().backward()
+        optimizer.step()
+        optimizer.zero_grad()
+        original_emb1 = model.emb1.weight
+        original_emb2 = model.emb2.weight
+        params = OrderedDict(model.named_parameters())
+        plan = EmbeddingShardingPlan(
+            sharding_map={
+                "emb1.weight": EmbeddingShardingType.ROW_WISE,
+                "emb2.weight": EmbeddingShardingType.TABLE_WISE,
+            },
+            table_wise_rank_map={"emb2.weight": 1},
+        )
+
+        shard_params_by_plan(
+            model,
+            params,
+            optimizer,
+            DeviceMesh("cuda", torch.arange(self.world_size)),
+            DataParallelStyle.REPLICATE,
+            embedding_plan=plan,
+        )
+
+        self.assertEqual(model.emb1.weight.shape, (8, 8))
+        self.assertIn(model.emb1.weight, optimizer.state)
+        self.assertEqual(
+            optimizer.state[model.emb1.weight]["momentum_buffer"].shape,
+            (8, 8),
+        )
+        self.assertNotIn(original_emb1, optimizer.state)
+        optimizer_parameters = optimizer.param_groups[0]["params"]
+        self.assertTrue(
+            any(param is model.emb1.weight for param in optimizer_parameters)
+        )
+        self.assertFalse(any(param is original_emb1 for param in optimizer_parameters))
+        if self.rank == 1:
+            self.assertEqual(model.emb2.weight.shape, (32, 8))
+            self.assertIn(model.emb2.weight, optimizer.state)
+        else:
+            self.assertEqual(model.emb2.weight.shape, (0, 8))
+            self.assertNotIn(model.emb2.weight, optimizer.state)
+        self.assertNotIn(original_emb2, optimizer.state)
+        self.assertTrue(
+            any(param is model.emb2.weight for param in optimizer_parameters)
+        )
+        self.assertFalse(any(param is original_emb2 for param in optimizer_parameters))
+
+    @skip_if_lt_x_gpu(2)
+    @with_comms
+    def test_table_wise_shared_parameter_keeps_aliases_and_optimizer_state(
+        self,
+    ) -> None:
+        model = SharedParameterAliasModel().cuda(self.rank)
+        original_parameter = model.primary.weight
+        optimizer = torch.optim.SGD(
+            [original_parameter], lr=0.1, momentum=0.9, foreach=True
+        )
+        original_parameter.grad = torch.ones_like(original_parameter)
+        optimizer.step()
+        optimizer.zero_grad()
+        params = cast(
+            dict[str, torch.Tensor],
+            OrderedDict(model.named_parameters(remove_duplicate=False)),
+        )
+        plan = EmbeddingShardingPlan(
+            sharding_map={
+                "primary.weight": EmbeddingShardingType.TABLE_WISE,
+                "alias.weight": EmbeddingShardingType.TABLE_WISE,
+            },
+            table_wise_rank_map={"primary.weight": 1, "alias.weight": 1},
+        )
+
+        shard_params_by_plan(
+            model,
+            params,
+            optimizer,
+            DeviceMesh("cuda", torch.arange(self.world_size)),
+            DataParallelStyle.REPLICATE,
+            embedding_plan=plan,
+        )
+
+        self.assertIs(model.primary.weight, model.alias.weight)
+        self.assertIs(params["primary.weight"], params["alias.weight"])
+        self.assertIs(optimizer.param_groups[0]["params"][0], model.primary.weight)
+        if self.rank == 1:
+            self.assertIn(model.primary.weight, optimizer.state)
+        else:
+            self.assertNotIn(model.primary.weight, optimizer.state)
+
+    @skip_if_lt_x_gpu(2)
+    @with_comms
+    def test_table_wise_shared_parameter_rejects_inconsistent_plan(self) -> None:
+        model = SharedParameterAliasModel().cuda(self.rank)
+        params = cast(
+            dict[str, torch.Tensor],
+            OrderedDict(model.named_parameters(remove_duplicate=False)),
+        )
+        mesh = DeviceMesh("cuda", torch.arange(self.world_size))
+
+        mixed_plan = EmbeddingShardingPlan(
+            sharding_map={
+                "primary.weight": EmbeddingShardingType.ROW_WISE,
+                "alias.weight": EmbeddingShardingType.TABLE_WISE,
+            },
+            table_wise_rank_map={"alias.weight": 1},
+        )
+        with self.assertRaisesRegex(RuntimeError, "one embedding sharding type"):
+            shard_params_by_plan(
+                model,
+                params,
+                None,
+                mesh,
+                DataParallelStyle.REPLICATE,
+                embedding_plan=mixed_plan,
+            )
+
+        different_owner_plan = EmbeddingShardingPlan(
+            sharding_map={
+                "primary.weight": EmbeddingShardingType.TABLE_WISE,
+                "alias.weight": EmbeddingShardingType.TABLE_WISE,
+            },
+            table_wise_rank_map={"primary.weight": 0, "alias.weight": 1},
+        )
+        with self.assertRaisesRegex(RuntimeError, "one owner rank"):
+            shard_params_by_plan(
+                model,
+                params,
+                None,
+                mesh,
+                DataParallelStyle.REPLICATE,
+                embedding_plan=different_owner_plan,
+            )
+
+        incomplete_plan = EmbeddingShardingPlan(
+            sharding_map={
+                "primary.weight": EmbeddingShardingType.ROW_WISE,
+            }
+        )
+        with self.assertRaisesRegex(RuntimeError, "all be present"):
+            shard_params_by_plan(
+                model,
+                params,
+                None,
+                mesh,
+                DataParallelStyle.FULLY_SHARD,
+                embedding_plan=incomplete_plan,
+            )
+
+    @skip_if_lt_x_gpu(2)
+    @with_comms
+    def test_table_wise_meta_parameter_and_state_materialize_only_on_owner(
+        self,
+    ) -> None:
+        model = _MetaEmbedding()
+        optimizer = torch.optim.SGD([model.emb.weight], lr=0.1, foreach=True)
+        optimizer.state[model.emb.weight]["sum"] = torch.empty(
+            (16, 1), dtype=torch.float32, device="meta"
+        )
+        params: dict[str, torch.Tensor] = dict(model.named_parameters())
+        plan = EmbeddingShardingPlan(
+            sharding_map={"emb.weight": EmbeddingShardingType.TABLE_WISE},
+            table_wise_rank_map={"emb.weight": 1},
+        )
+
+        shard_params_by_plan(
+            model,
+            params,
+            optimizer,
+            DeviceMesh("cuda", torch.arange(self.world_size)),
+            DataParallelStyle.REPLICATE,
+            embedding_plan=plan,
+        )
+
+        local_parameter = model.emb.weight
+        self.assertEqual(local_parameter.device, torch.device(f"cuda:{self.rank}"))
+        self.assertIs(optimizer.param_groups[0]["params"][0], local_parameter)
+        if self.rank == 1:
+            self.assertEqual(local_parameter.shape, (16, 8))
+            local_state = optimizer.state[local_parameter]["sum"]
+            self.assertEqual(local_state.shape, (16, 1))
+            torch.testing.assert_close(local_state, torch.zeros_like(local_state))
+        else:
+            self.assertEqual(local_parameter.shape, (0, 8))
+            self.assertNotIn(local_parameter, optimizer.state)
 
     @skip_if_lt_x_gpu(2)
     @with_comms
@@ -2207,7 +2499,9 @@ class TestShardParamsByPlan(DTensorTestBase):
             opt,
             mesh,
             DataParallelStyle.REPLICATE,
-            {"emb.weight"},
+            embedding_plan=EmbeddingShardingPlan(
+                sharding_map={"emb.weight": EmbeddingShardingType.ROW_WISE}
+            ),
         )
         # Embedding state sharded (new param object is the key)
         new_emb_param = model.emb.weight
@@ -2243,7 +2537,9 @@ class TestShardParamsByPlan(DTensorTestBase):
             optimizer,
             mesh,
             DataParallelStyle.REPLICATE,
-            {"emb.weight"},
+            embedding_plan=EmbeddingShardingPlan(
+                sharding_map={"emb.weight": EmbeddingShardingType.ROW_WISE}
+            ),
         )
 
         local_parameter = model.emb.weight
@@ -2272,53 +2568,14 @@ class TestShardParamsByPlan(DTensorTestBase):
             None,
             mesh,
             DataParallelStyle.REPLICATE,
-            {"emb.weight"},
+            embedding_plan=EmbeddingShardingPlan(
+                sharding_map={"emb.weight": EmbeddingShardingType.ROW_WISE}
+            ),
         )
         # model.emb.weight should now be the local shard
         self.assertEqual(model.emb.weight.shape, (8, 8))
         # model.linear.weight unchanged in REPLICATE
         self.assertEqual(model.linear.weight.shape, (4, 8))
-
-
-class TestEmbeddingShardingPlan(unittest.TestCase):
-    """Unit tests for EmbeddingShardingPlan."""
-
-    def test_empty_plan(self) -> None:
-        """Default-constructed plan has empty param_fqns, is_embedding_param returns False."""
-        plan = EmbeddingShardingPlan()
-        self.assertEqual(plan.param_fqns, set())
-        self.assertFalse(plan.is_embedding_param("anything"))
-        self.assertFalse(plan.is_row_wise("anything"))
-
-    def test_param_fqns_returns_set_of_keys(self) -> None:
-        """Plan with 2 entries returns correct set of FQNs."""
-        plan = EmbeddingShardingPlan(
-            sharding_map={
-                "emb1.weight": EmbeddingShardingType.ROW_WISE,
-                "emb2.weight": EmbeddingShardingType.ROW_WISE,
-            }
-        )
-        self.assertEqual(plan.param_fqns, {"emb1.weight", "emb2.weight"})
-
-    def test_is_row_wise_true(self) -> None:
-        """is_row_wise returns True for ROW_WISE entries."""
-        plan = EmbeddingShardingPlan(
-            sharding_map={
-                "emb.weight": EmbeddingShardingType.ROW_WISE,
-            }
-        )
-        self.assertTrue(plan.is_row_wise("emb.weight"))
-        self.assertTrue(plan.is_embedding_param("emb.weight"))
-
-    def test_is_row_wise_false_for_missing(self) -> None:
-        """is_row_wise returns False for FQNs not in the plan."""
-        plan = EmbeddingShardingPlan(
-            sharding_map={
-                "emb.weight": EmbeddingShardingType.ROW_WISE,
-            }
-        )
-        self.assertFalse(plan.is_row_wise("linear.weight"))
-        self.assertFalse(plan.is_embedding_param("linear.weight"))
 
 
 class TestRingshiftEmbeddingStrategies(unittest.TestCase):
