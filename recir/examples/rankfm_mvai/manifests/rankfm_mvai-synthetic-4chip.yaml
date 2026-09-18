@@ -1,0 +1,123 @@
+# 4-chip run on SYNTHETIC data.
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  generateName: rankfm-synth-4chip-
+  namespace: ns-mrs-core-shared
+spec:
+  replicatedJobs:
+  - name: worker
+    replicas: 1
+    template:
+      spec:
+        parallelism: 1
+        completions: 1
+        template:
+          metadata:
+            annotations:
+              gke-gcsfuse/volumes: "true"
+          spec:
+            serviceAccountName: default
+            containers:
+            - name: rankfm
+              image: us-central1-docker.pkg.dev/mrs-tpu-y317h/recml/rankfm_mvai_tpu:prod
+              imagePullPolicy: Always
+              env:
+              - name: PYTHONUNBUFFERED
+                value: "1"
+              - name: MASTER_PORT
+                value: "29500"
+              - name: JOBSET_NAME
+                valueFrom:
+                  fieldRef:
+                    fieldPath: metadata.labels['jobset.sigs.k8s.io/jobset-name']
+              - name: MVAI_JOB_NAME
+                valueFrom:
+                  fieldRef:
+                    fieldPath: metadata.labels['jobset.sigs.k8s.io/jobset-name']
+              - name: TB_SYNC_SECS
+                value: "60"
+              - name: MVAI_CHECKPOINT_SAVE_DIR
+                value: /mnt/gcs-out/checkpoints
+              - name: PARITY_DIGEST_KINDS
+                value: ""
+              - name: RECIR_DUMP_GRAPHS
+                value: "0"
+              - name: PYTHONFAULTHANDLER
+                value: "1"
+              - name: JAX_ENABLE_X64
+                value: "1"
+              - name: LIBTPU_INIT_ARGS
+                value: >-
+                  --xla_tpu_megacore_fusion_allow_ags=false
+                  --xla_enable_async_collective_permute=true
+                  --xla_tpu_enable_ag_backward_pipelining=true
+                  --xla_tpu_enable_data_parallel_all_reduce_opt=true
+                  --xla_tpu_data_parallel_opt_different_sized_ops=true
+                  --xla_tpu_enable_async_collective_fusion=true
+                  --xla_tpu_enable_async_collective_fusion_multiple_steps=true
+                  --xla_tpu_overlap_compute_collective_tc=true
+                  --xla_enable_async_all_gather=true
+              command:
+              - sh
+              - -c
+              - >-
+                echo "=== jax devices ===" ;
+                python3 -c "import jax; print(jax.devices())" ;
+                TB_SRC=/mnt/gcs/mvai_cloud/tensorboard/${JOBSET_NAME} ;
+                TB_DST=/mnt/gcs-out/tensorboard/${JOBSET_NAME} ;
+                mkdir -p "$TB_DST" ;
+                echo "TB sync loop -> gs://cq-mrs-core-shared_mrs_tpu_y317h/tensorboard/${JOBSET_NAME} every ${TB_SYNC_SECS}s" ;
+                ( while true; do
+                    sleep "${TB_SYNC_SECS}" ;
+                    cp "$TB_SRC"/* "$TB_DST"/ 2>/dev/null || true ;
+                  done ) &
+                TB_SYNC_PID=$! ;
+                python3 -u -m recir.examples.rankfm_mvai.train
+                --embedding_backend in_graph
+                --max_steps 30
+                --local_batch_size 2048
+                --hash_size_cap 10000
+                --l1_num_layers 1
+                --l2_num_layers 1
+                --max_uih_seq_len 256
+                --seq_ro_per_sample_budget 256
+                --num_candidates 8
+                --metrics_report_interval 10
+                --pull_metrics_every 10
+                --save_every_n_steps 10
+                --keep_last_n 2 ;
+                rc=$? ;
+                kill "$TB_SYNC_PID" 2>/dev/null || true ;
+                echo "Final TensorBoard copy -> gs://cq-mrs-core-shared_mrs_tpu_y317h/tensorboard/${JOBSET_NAME} ..." ;
+                cp "$TB_SRC"/* "$TB_DST"/ || true ;
+                exit $rc
+              ports:
+              - containerPort: 8471
+              resources:
+                limits:
+                  google.com/tpu: 4
+                requests:
+                  google.com/tpu: 4
+              volumeMounts:
+              - name: tensorboard
+                mountPath: /mnt/gcs/mvai_cloud
+              - name: gcs-out
+                mountPath: /mnt/gcs-out
+            nodeSelector:
+              cloud.google.com/gke-tpu-accelerator: tpu7x
+              cloud.google.com/gke-tpu-topology: 2x2x1
+            tolerations:
+            - key: google.com/tpu
+              operator: Exists
+              effect: NoSchedule
+            restartPolicy: Never
+            volumes:
+            - name: tensorboard
+              emptyDir: {}
+            - name: gcs-out
+              csi:
+                driver: gcsfuse.csi.storage.gke.io
+                volumeAttributes:
+                  bucketName: cq-mrs-core-shared_mrs_tpu_y317h
+                  mountOptions: "implicit-dirs"

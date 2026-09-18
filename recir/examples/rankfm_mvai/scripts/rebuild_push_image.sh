@@ -13,6 +13,9 @@
 #
 #   bash recir/examples/rankfm_mvai/scripts/rebuild_push_image.sh
 #   IMAGE_TAG=someone-else bash .../rebuild_push_image.sh
+#
+# SKIP_BARNFS=1 and BARNFS_WHEEL=<path> are read by build_image_podman.sh and
+# pass straight through; see the comment there for when you need them.
 set -euo pipefail
 
 : "${IMAGE_TAG:=${USER}-compiled}"

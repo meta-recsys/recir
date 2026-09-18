@@ -30,32 +30,50 @@ done
 echo "--- Building BarnFS wheel ---"
 # BARNFS_WHEEL=<path> skips the build and uses that wheel.
 #
-# The wheel only exists so DCP checkpoint writes are encrypted; a parity run
-# writes no checkpoint and never loads it. But the build is a hard prerequisite
-# here, so when its dependency chain is broken -- as
-# `access/lib/attribute:attribute_consts` currently is under
-# opt-linux-x86_64-clang21-no-san, on master AND on fbcode/stable, because
-# AgentVocab.h annotates a constant with clang's `_Nonnull` and that config
-# compiles it with GCC -- there is otherwise no way to build an image at all.
-if [ -n "${BARNFS_WHEEL:-}" ]; then
+# The wheel encrypts DCP checkpoint writes, but only for a job that sets
+# TORCH_ENABLE_BARNFS=ON -- no manifest in this example does, and no python
+# module here imports barnfs. It is still a build prerequisite, and its
+# dependency chain has broken twice under the opt config it uses (most recently
+# common/system_features failing to link against boost_filesystem, which its
+# BUCK does declare -- a version skew, not a missing dep).
+#
+# Both times the DEFAULT (dev) config linked fine, and the resulting .so is
+# equally self-contained, so building it there and passing BARNFS_WHEEL=<path>
+# works. SKIP_BARNFS=1 omits it entirely, which is correct for every job here
+# and skips buck2 altogether. That choice is recorded in BUILD_INFO.json so a
+# pod built that way says so in its log.
+BARNFS_STAGE="${STAGING_DIR}/barnfs_wheel"
+mkdir -p "$BARNFS_STAGE"
+BARNFS_INCLUDED=true
+if [ "${SKIP_BARNFS:-0}" = "1" ]; then
+    BARNFS_INCLUDED=false
+    echo "SKIP_BARNFS=1: building without the BarnFS wheel."
+    echo "  DCP checkpoints will be UNENCRYPTED, and TORCH_ENABLE_BARNFS=ON"
+    echo "  against this image will fail to import rather than encrypt."
+elif [ -n "${BARNFS_WHEEL:-}" ]; then
     if [ ! -f "$BARNFS_WHEEL" ]; then
         echo "ERROR: BARNFS_WHEEL=$BARNFS_WHEEL does not exist" >&2
         exit 1
     fi
     echo "using the wheel from BARNFS_WHEEL: $BARNFS_WHEEL"
+    cp "$BARNFS_WHEEL" "$BARNFS_STAGE/"
 else
-    BARNFS_WHEEL="$(
+    if ! BARNFS_WHEEL="$(
         cd "$FBCODE_DIR"
         buck2 build @//mode/opt \
             //ai_infra/privacy_security/security/file_vault/python:barnfs.whl \
             --show-full-simple-output
-    )"
+    )" || [ ! -f "$BARNFS_WHEEL" ]; then
+        echo "ERROR: could not build the BarnFS wheel under @//mode/opt." >&2
+        echo "  Build it in the default config and pass it back in:" >&2
+        echo "    buck2 build //ai_infra/privacy_security/security/file_vault/python:barnfs.whl --show-full-simple-output" >&2
+        echo "    BARNFS_WHEEL=<that path> $0" >&2
+        echo "  Or omit it, which is correct for every job here:" >&2
+        echo "    SKIP_BARNFS=1 $0" >&2
+        exit 1
+    fi
+    cp "$BARNFS_WHEEL" "$BARNFS_STAGE/"
 fi
-if [ ! -f "$BARNFS_WHEEL" ]; then
-    echo "ERROR: BarnFS wheel not found at $BARNFS_WHEEL" >&2
-    exit 1
-fi
-cp "$BARNFS_WHEEL" "${STAGING_DIR}/$(basename "$BARNFS_WHEEL")"
 for dir in /var/facebook/x509_identities /var/facebook/credentials; do
     if [ ! -d "$dir" ]; then
         echo "Error: $dir not found." >&2
@@ -227,6 +245,7 @@ BUILD_DIRTY="$(sl --cwd "$FBCODE_DIR" status -n recir hammer mvai_cloud generati
 BUILD_REV="$BUILD_REV" \
 BUILD_DIRTY="$BUILD_DIRTY" \
 BUILD_TAG="$IMAGE_TAG" \
+BUILD_BARNFS="$BARNFS_INCLUDED" \
 BUILD_OUT="${STAGING_DIR}/recir/BUILD_INFO.json" \
 python3 -c '
 import datetime, json, os
@@ -242,6 +261,7 @@ with open(os.environ["BUILD_OUT"], "w") as f:
             ),
             "built_by": os.environ.get("USER", "unknown"),
             "dirty_files": dirty,
+            "barnfs": os.environ["BUILD_BARNFS"] == "true",
         },
         f,
         indent=2,
@@ -291,16 +311,31 @@ podman build \
 
 echo ""
 echo "--- Verifying image ---"
-podman run --rm \
-    -e TORCH_ENABLE_BARNFS=ON \
-    -e MODEL_TYPE_NAME=asset://ai.model.type/infra_mrs_research \
-    "${IMAGE_NAME}:${IMAGE_TAG}" python3 -c "
-import torch; print(f'PyTorch: {torch.__version__}')
+# The barnfs assertions only apply when the wheel was staged.
+if [ "$BARNFS_INCLUDED" = true ]; then
+    BARNFS_CHECK="
 import barnfs; print('BarnFS: OK')
 import torch.distributed.checkpoint as dcp
 assert dcp.save.__module__.endswith('dcp_filesystem_barnfs')
 assert dcp.load.__module__.endswith('dcp_filesystem_barnfs')
 print('BarnFS DCP hotpatch: OK')
+"
+else
+    BARNFS_CHECK="
+try:
+    import barnfs
+except ImportError:
+    print('BarnFS: absent, as built (SKIP_BARNFS=1)')
+else:
+    raise SystemExit('barnfs is importable in an image built with SKIP_BARNFS=1')
+"
+fi
+podman run --rm \
+    -e TORCH_ENABLE_BARNFS=ON \
+    -e MODEL_TYPE_NAME=asset://ai.model.type/infra_mrs_research \
+    "${IMAGE_NAME}:${IMAGE_TAG}" python3 -c "
+import torch; print(f'PyTorch: {torch.__version__}')
+${BARNFS_CHECK}
 import jax; print(f'JAX: {jax.__version__}')
 import recir; print('recir: OK')
 import helion; print('helion: OK')

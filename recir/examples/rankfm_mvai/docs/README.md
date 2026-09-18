@@ -79,15 +79,41 @@ cd ~/local/fbsource/fbcode
 ```
 
 What the script does end-to-end:
-1. Exports `HTTPS_PROXY=http://fwdproxy:8080` (override with `PROXY_URL=...`) so
+1. Builds the BarnFS wheel with `buck2` and stages it. This step is first, and
+   its dependency chain has broken twice under the `opt` config it uses — see
+   "When the BarnFS wheel will not build" below.
+2. Exports `HTTPS_PROXY=http://fwdproxy:8080` (override with `PROXY_URL=...`) so
    `gcloud`, `podman build`, and `podman push` all reach the public internet.
-2. Stages `recir/`, `hammer/v3/` (manifest-traced), `mvai_cloud/minimal_viable_ai/`,
+3. Stages `recir/`, `hammer/v3/` (manifest-traced), `mvai_cloud/minimal_viable_ai/`,
    and `generative_recommenders/` into a temp context.
-3. Builds the image (no `apt`/`git`-clone steps — everything's pre-staged).
-4. Runs an in-container import smoke check (includes
+4. Builds the image (no `apt`/`git`-clone steps — everything's pre-staged).
+5. Runs an in-container import smoke check (includes
    `minimal_viable_ai.core.trainer.trainer.RecTrainer`).
-5. Mints a fresh OAuth2 access token from `gcloud`, logs `podman` into Artifact
-   Registry, and pushes `${IMAGE_PATH}` (`rankfm_mvai_tpu:latest`).
+6. Mints a fresh OAuth2 access token from `gcloud`, logs `podman` into Artifact
+   Registry, and pushes `${IMAGE_PATH}` (`rankfm_mvai_tpu:latest`; override the
+   tag with `IMAGE_TAG=...`, which is how the `prod` tag the 4-chip manifests
+   pull is produced).
+
+### When the BarnFS wheel will not build
+
+The wheel only encrypts DCP writes for a job that sets
+`TORCH_ENABLE_BARNFS=ON`, which no manifest here does. It is still a build
+prerequisite, and its dependency chain under the `opt` config has broken twice.
+Two ways past it:
+
+```bash
+# Omit it. Correct for every job here, and skips buck2 entirely.
+SKIP_BARNFS=1 ./recir/examples/rankfm_mvai/scripts/build_image_podman.sh
+
+# Or build it in the default config, which has linked fine both times.
+buck2 build //ai_infra/privacy_security/security/file_vault/python:barnfs.whl \
+    --show-full-simple-output
+BARNFS_WHEEL=<that path> ./recir/examples/rankfm_mvai/scripts/build_image_podman.sh
+```
+
+`SKIP_BARNFS=1` is recorded in `BUILD_INFO.json`, warned about at trainer
+startup, and asserted in the verify step, so such an image cannot be mistaken
+for one that encrypts.
 
 ### Test the image locally before pushing to TPU
 
@@ -109,6 +135,13 @@ podman run --rm -it rankfm_mvai_tpu:latest
 kubectl create -f recir/examples/rankfm_mvai/manifests/rankfm_mvai-4chip.yaml \
   --context=mrs-tpu-y317h/us-central1/tpu-prod-training-cluster
 ```
+
+That one is a toy: batch 4, `--hash_size_cap 1000`, one layer per arch, the
+`cpu` embedding backend, and no TensorBoard or checkpoints. For a 4-chip run at
+the real model size that produces both artifacts, use
+`rankfm_mvai-synthetic-4chip.yaml` (synthetic data — step by step in
+`docs/RUNBOOK_SYNTHETIC_4CHIP.md`) or `rankfm_mvai-verify-4chip.yaml` (prod
+replay dump). `docs/RUNBOOK_RUNNING_JOBS.md` covers the choice between them.
 
 ### Run on a 128-chip TPU slice
 

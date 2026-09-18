@@ -1,38 +1,46 @@
 # Runbook — running jobs on 4 chips and on 128 chips
 
-Two ways to put this model on TPU. Picking the wrong one wastes either an hour
-or a slice, so start here.
+Three ways to put this model on TPU. Picking the wrong one wastes either an
+hour or a slice, so start here.
 
 `RUNBOOK_128CHIP_PROD_CONFIG.md` is the deep reference for the 128-chip path:
 exporting prod's config, publishing the ConfigMap, what the dump is, what to
 expect line by line in the log. This document does not repeat it. What is here
-is the 4-chip path, the choice between them, and the failure modes that cost
-real time.
+is the two 4-chip paths, the choice between them, and the failure modes that
+cost real time.
 
 ## Which one
 
-| | 4 chips | 128 chips |
-|---|---|---|
-| manifest | `rankfm_mvai-verify-4chip.yaml` | `rankfm_mvai-128chip.yaml` |
-| pods x chips | 1 x 4 | 32 x 4 |
-| jax devices | 8 | **256** (v7x is 2 cores per chip) |
-| tables | capped, `--hash_size_cap 100000` | **3e9, uncapped** |
-| slice | usually free | contended; has waited 16+ min |
-| turnaround | ~5 min | ~20 min plus queue |
-| container name | **`rankfm`** | **`rankfm-mvai`** |
+| | 4 chips, synthetic | 4 chips, prod data | 128 chips |
+|---|---|---|---|
+| manifest | `rankfm_mvai-synthetic-4chip.yaml` | `rankfm_mvai-verify-4chip.yaml` | `rankfm_mvai-128chip.yaml` |
+| pods x chips | 1 x 4 | 1 x 4 | 32 x 4 |
+| jax devices | 8 | 8 | **256** (v7x is 2 cores per chip) |
+| data | random jagged batches | barnfs replay dump | barnfs replay dump |
+| tables | capped, `--hash_size_cap 100000` | capped, `--hash_size_cap 100000` | **3e9, uncapped** |
+| slice | usually free | usually free | contended; has waited 16+ min |
+| turnaround | ~5 min | ~5 min | ~20 min plus queue |
+| container name | **`rankfm`** | **`rankfm`** | **`rankfm-mvai`** |
+| image tag | `prod` | `prod` | `linjianma-pipeline` |
+| checkpoints | yes, every 10 steps | yes, every 10 steps | no |
 
-Use **4 chips** for anything structural: does the graph trace, does it compile,
-does a code change break the step. Also for HBM scaling measurements, since
-activations dominate there once the tables are capped.
+Use **synthetic** when the dump is not the point: does the graph trace, does it
+compile, does a code change break the step, are TensorBoard and checkpoints
+produced. Also when the dump has expired and you do not want to rotate it yet.
+
+Use **4 chips on prod data** for anything that depends on the data path: file
+discovery, ID remapping, read order, real sequence shapes. Also for HBM scaling
+measurements, since activations dominate there once the tables are capped.
 
 Use **128 chips** for anything that depends on the real vocabulary or real
 scale: the 3e9 table, HBM at production shard size, loss and NE, the LR curve.
 
-**4 chips cannot tell you about**: int32 id overflow, the ring-shift at
+**Neither 4-chip run can tell you about**: int32 id overflow, the ring-shift at
 production vocabulary, HBM with a real table shard, or any metric you intend to
-compare against prod.
+compare against prod. **Synthetic additionally cannot tell you** anything about
+loss or NE — its labels are random.
 
-## 4 chips
+## 4 chips on prod data
 
 ```bash
 export HTTPS_PROXY=http://fwdproxy:8080
@@ -53,9 +61,70 @@ The manifest carries `--prod_faithful` with prod's config artifact, prod's
 seq-len sampling and prod's dropout. Only the table size differs from the
 128-chip run.
 
+It runs the shared `prod` tag, not a personal one. Rebuild with
+`IMAGE_TAG=prod bash .../scripts/rebuild_push_image.sh`, and do not push an
+experimental build over it while a run is live — `imagePullPolicy: Always`
+means the next pod restart picks it up.
+
 `RECIR_DUMP_GRAPHS` is `0` by default. Set it to `full` to dump HLO, which
 costs roughly 270k log lines and is the only way to answer questions about what
 is actually in the compiled program.
+
+### What it trains on
+
+A 3-day Dataporter dump of the udd_fm training stream, the same one the
+128-chip run uses, mounted by the `barnfs.csi.meta.com` CSI driver at
+`/mnt/barnfs`. The path is a literal `sourcePath` in the manifest.
+`--data_replicate_across_ranks` makes the single pod read the `rank_0` shard.
+
+Shards are BarnFS-encrypted and decrypted at mount, so the logical files are
+not visible under plain `gcloud storage ls`; the Manifold original is the
+inspectable copy.
+
+**Dumps expire, and that does not fail the pod** — it waits on the mount-ready
+probe forever and looks hung. The path is a literal in six manifests, so
+rotating it by hand is a dozen edits. Use the synthetic manifest below instead,
+and rotate separately.
+
+### TensorBoard and checkpoints
+
+Both are produced by the job itself, under the jobset name:
+
+```
+gs://cq-mrs-core-shared_mrs_tpu_y317h/tensorboard/$JS/
+gs://cq-mrs-core-shared_mrs_tpu_y317h/checkpoints/$JS/step_<NNNNNNN>/
+gs://cq-mrs-core-shared_mrs_tpu_y317h/checkpoints/$JS/latest.txt
+```
+
+TB goes through a local emptyDir and is copied out every `TB_SYNC_SECS` plus
+once at exit; written straight to gcsfuse the growing events file is
+re-uploaded whole on each flush and hits the per-object rate limit. Checkpoints
+have no such problem — each save writes fresh files — so they go direct.
+
+`latest.txt` names the newest *complete* checkpoint; a `step_` directory absent
+from it is a partial write. Resume by setting `MVAI_CHECKPOINT_LOAD_DIR`
+(optionally `MVAI_CHECKPOINT_VERSION=step_0000020`; unset means latest).
+
+Both paths key off `MVAI_JOB_NAME`, bound to the jobset name. Change one and
+not the other and the TB copy finds nothing.
+
+## 4 chips on synthetic data
+
+`rankfm_mvai-synthetic-4chip.yaml`. No dump, no ConfigMap, no prod access —
+same TB and checkpoint wiring as above, just no data source.
+
+**Step by step in `RUNBOOK_SYNTHETIC_4CHIP.md`.** Short form:
+
+```bash
+export HTTPS_PROXY=http://fwdproxy:8080
+kubectl create -f recir/examples/rankfm_mvai/manifests/rankfm_mvai-synthetic-4chip.yaml \
+    -n ns-mrs-core-shared
+```
+
+Reach for it when the dump is not the point, or when it has expired — that does
+not present as a data problem, the pod just sits in the mount-ready probe and
+looks hung. Its labels are random, so the curves show that metrics flow, not
+that they are good.
 
 ## 128 chips
 
@@ -78,12 +147,15 @@ kubectl describe pod <pod> -n ns-mrs-core-shared | grep -A3 '^Events:'
 means the pool is full, not that anything is wrong with the job. Check who
 holds it with `kubectl get jobsets -n ns-mrs-core-shared`.
 
-## Artifacts
+## Artifacts in a browser
 
-`scripts/sync_run_artifacts.sh` mirrors TensorBoard and the xprof trace into
-Manifold so they can be opened in a browser. TB is re-synced on an interval so
-the curves fill in while the job runs; the trace is picked up once, after the
-profile window.
+Both 4-chip runs and the 128-chip run write TensorBoard and (where enabled) the
+xprof trace to GCS themselves — see the paths above. GCS is awkward to read
+from a browser, so
+`scripts/sync_run_artifacts.sh` mirrors them into Manifold. TB is re-synced on
+an interval so the curves fill in while the job runs; the trace is picked up
+once, after the profile window. Checkpoints are not mirrored — they stay in
+GCS.
 
 ```bash
 nohup bash recir/examples/rankfm_mvai/scripts/sync_run_artifacts.sh $JS \
@@ -127,14 +199,13 @@ aggregated and not subject to the cap.
 **Pods `Pending` forever.** Slice contention, not your job. See above.
 
 **Everything succeeds but nothing changed.** Check the image tag actually used.
-`rankfm_mvai-verify-4chip.yaml` pulls `linjianma-compiled`; the parity
-manifests pull `linjianma-parity`. These are different images. Four consecutive
-rounds of diagnostics once went into an image that the running job never
-pulled, and every one of them presented as "the code did not execute". Verify
-with:
+`rankfm_mvai-verify-4chip.yaml` pulls `prod`; the parity manifests pull
+`linjianma-parity`. These are different images. Four consecutive rounds of
+diagnostics once went into an image that the running job never pulled, and
+every one of them presented as "the code did not execute". Verify with:
 
 ```bash
-podman run --rm --entrypoint python3 localhost/rankfm_mvai_tpu:linjianma-compiled \
+podman run --rm --entrypoint python3 localhost/rankfm_mvai_tpu:prod \
     -c "import inspect, <module>; print('<marker>' in inspect.getsource(<module>))"
 ```
 

@@ -123,6 +123,14 @@ def _log_build_info() -> None:
         info.get("built_at"),
         info.get("built_by"),
     )
+    # Absent in images built before this key existed, hence the None check --
+    # only an explicit False means the wheel was deliberately left out.
+    if info.get("barnfs") is False:
+        logger.warning(
+            "[build] this image has NO barnfs. DCP checkpoints are written "
+            "unencrypted, and TORCH_ENABLE_BARNFS=ON would fail to import "
+            "rather than encrypt them."
+        )
     dirty = info.get("dirty_files") or []
     if dirty:
         logger.warning(
