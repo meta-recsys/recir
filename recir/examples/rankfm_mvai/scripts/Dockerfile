@@ -36,8 +36,19 @@ RUN pip install 'torch==2.10.*' --index-url https://download.pytorch.org/whl/cpu
 # BarnFS encrypts DCP checkpoint payloads through its sitecustomize hook. TPU
 # jobs enable it with TORCH_ENABLE_BARNFS=ON and set MODEL_TYPE_NAME. GKE jobs
 # also set BARNFS_SHEPHERD_USE_INTERNET=1 to use their metadata identity.
-COPY barnfs-*.whl /tmp/
-RUN pip install /tmp/barnfs-*.whl && rm /tmp/barnfs-*.whl
+#
+# The directory is staged by build_image_podman.sh and is EMPTY when that ran
+# with SKIP_BARNFS=1 -- COPY cannot be made conditional, so the conditional
+# lives in the install. An image built that way has no barnfs at all, and
+# TORCH_ENABLE_BARNFS=ON against it will fail to import rather than silently
+# writing plaintext.
+COPY barnfs_wheel/ /tmp/barnfs_wheel/
+RUN if ls /tmp/barnfs_wheel/*.whl >/dev/null 2>&1; then \
+        pip install /tmp/barnfs_wheel/*.whl; \
+    else \
+        echo "no BarnFS wheel staged; image is built without it"; \
+    fi && \
+    rm -rf /tmp/barnfs_wheel
 
 # JAX with TPU support.
 # Pinned <0.11: JAX 0.11.0 removed pltpu.DeviceIdType, which recir's ringshift
