@@ -24,6 +24,8 @@ from recir.region_transforms.tbe_sparse_embedding import (
     _LookupSite,
     TBESparseEmbeddingTransform,
 )
+from recir.sharding_plan import EmbeddingShardingPlan, EmbeddingShardingType
+from recir.tbe.local import LocalTBEGroup
 from torch._dynamo.source import LocalSource
 from torch._subclasses.fake_tensor import FakeTensorMode
 from torch.distributed import ProcessGroup
@@ -274,6 +276,15 @@ class TBESparseEmbeddingTransformTest(unittest.TestCase):
             torch.tensor([0, 1, 4, 2, 3, 5], dtype=torch.int64),
         )
 
+    def test_pooled_permutation_handles_non_owner_empty_input(self) -> None:
+        actual = torch.ops.recir.pooled_source_to_feature_permute(
+            torch.empty(0, dtype=torch.int64),
+            torch.zeros(2, dtype=torch.int64),
+            2,
+        )
+
+        self.assertEqual(actual.shape, torch.Size((0,)))
+
     def _transform(
         self,
         world_size: int,
@@ -286,6 +297,7 @@ class TBESparseEmbeddingTransformTest(unittest.TestCase):
         learning_rate_tensor: torch.Tensor | None = None,
         meta_optimizer_state: bool = False,
         optimizer_state_value: float | None = None,
+        embedding_plan: EmbeddingShardingPlan | None = None,
     ) -> tuple[TBESparseEmbeddingTransform, _TwoTableModel, fx.GraphModule]:
         if model is None:
             model = _TwoTableModel()
@@ -324,6 +336,7 @@ class TBESparseEmbeddingTransformTest(unittest.TestCase):
             _mock_mesh(world_size, rank),
             model,
             process_group=process_group,
+            embedding_plan=embedding_plan,
             num_embeddings_map=num_embeddings_map
             or {
                 "table_0.weight": 8 * world_size,
@@ -345,9 +358,58 @@ class TBESparseEmbeddingTransformTest(unittest.TestCase):
             transform.transform_graph(gm, called)
         return transform, model, gm
 
+    def test_table_wise_rejects_unpooled_lookup(self) -> None:
+        plan = EmbeddingShardingPlan(
+            sharding_map={
+                "table_0.weight": EmbeddingShardingType.TABLE_WISE,
+                "table_1.weight": EmbeddingShardingType.TABLE_WISE,
+            },
+            table_wise_rank_map={
+                "table_0.weight": 0,
+                "table_1.weight": 0,
+            },
+        )
+
+        with self.assertRaisesRegex(NotImplementedError, "pooled EBC"):
+            self._transform(world_size=1, embedding_plan=plan)
+
+    def test_plan_must_classify_each_embedding_weight(self) -> None:
+        with self.assertRaisesRegex(ValueError, "does not classify"):
+            TBESparseEmbeddingTransform(
+                {"table.weight"},
+                _mock_mesh(1),
+                embedding_plan=EmbeddingShardingPlan(),
+            )
+
+    def test_embedding_plan_supplies_storage_location(self) -> None:
+        plan = EmbeddingShardingPlan(
+            sharding_map={
+                "table_0.weight": EmbeddingShardingType.ROW_WISE,
+                "table_1.weight": EmbeddingShardingType.ROW_WISE,
+            },
+            location_map={"table_0.weight": "UVM"},
+        )
+
+        with self.assertRaisesRegex(ValueError, "CPU TBE only supports host storage"):
+            self._transform(world_size=1, embedding_plan=plan)
+
+    def test_row_wise_rejects_empty_local_table_shard(self) -> None:
+        with self.assertRaisesRegex(NotImplementedError, "non-empty local"):
+            self._transform(
+                world_size=2,
+                rank=1,
+                model=_TwoTableModel(rows_0=0),
+                num_embeddings_map={
+                    "table_0.weight": 1,
+                    "table_1.weight": 12,
+                },
+            )
+
     def _pooled_transform(
         self,
         world_size: int,
+        *,
+        table_wise: bool = False,
     ) -> tuple[
         TBESparseEmbeddingTransform,
         fx.GraphModule,
@@ -360,14 +422,14 @@ class TBESparseEmbeddingTransformTest(unittest.TestCase):
                 EmbeddingBagConfig(
                     name="table_0",
                     embedding_dim=4,
-                    num_embeddings=8 // world_size,
+                    num_embeddings=8 if table_wise else 8 // world_size,
                     feature_names=["feature_0"],
                     pooling=PoolingType.SUM,
                 ),
                 EmbeddingBagConfig(
                     name="table_1",
                     embedding_dim=4,
-                    num_embeddings=6 // world_size,
+                    num_embeddings=6 if table_wise else 6 // world_size,
                     feature_names=["feature_1"],
                     pooling=PoolingType.MEAN,
                 ),
@@ -378,6 +440,16 @@ class TBESparseEmbeddingTransformTest(unittest.TestCase):
         parameter_items = tuple(ebc.named_parameters())
         parameter_fqns = tuple(name for name, _ in parameter_items)
         parameters = tuple(parameter for _, parameter in parameter_items)
+        embedding_plan = (
+            EmbeddingShardingPlan(
+                sharding_map={
+                    fqn: EmbeddingShardingType.TABLE_WISE for fqn in parameter_fqns
+                },
+                table_wise_rank_map=dict.fromkeys(parameter_fqns, 0),
+            )
+            if table_wise
+            else None
+        )
         values = torch.tensor([1, 2], dtype=torch.int64)
         lengths = torch.tensor([1, 0, 0, 1], dtype=torch.int64)
 
@@ -407,6 +479,7 @@ class TBESparseEmbeddingTransformTest(unittest.TestCase):
             set(parameter_fqns),
             _mock_mesh(world_size),
             ebc,
+            embedding_plan=embedding_plan,
             num_embeddings_map={
                 parameter_fqns[0]: 8,
                 parameter_fqns[1]: 6,
@@ -454,7 +527,7 @@ class TBESparseEmbeddingTransformTest(unittest.TestCase):
             )
 
     def test_inner_transform_preserves_materialized_optimizer_state(self) -> None:
-        _transform, _model, gm = self._transform(
+        transform, model, gm = self._transform(
             world_size=1,
             learning_rate_tensor=torch.tensor(0.1, dtype=torch.float32),
             optimizer_state_value=2.5,
@@ -467,6 +540,25 @@ class TBESparseEmbeddingTransformTest(unittest.TestCase):
                 table_states[0],
                 torch.full_like(table_states[0], 2.5),
             )
+
+        optimizer = transform._optimizers[0]
+        parameters = (model.table_0.weight, model.table_1.weight)
+        for parameter, table_states in zip(parameters, group.split_optimizer_states()):
+            self.assertTrue(
+                any(
+                    parameter is optimizer_parameter
+                    for optimizer_parameter in optimizer.param_groups[0]["params"]
+                )
+            )
+            checkpoint_state = optimizer.state[parameter]["sum"]
+            checkpoint_state.fill_(4.0)
+            torch.testing.assert_close(
+                table_states[0],
+                torch.full_like(table_states[0], 4.0),
+            )
+        serialized = optimizer.state_dict()
+        self.assertEqual(len(serialized["state"]), 2)
+        self.assertEqual(len(serialized["param_groups"][0]["params"]), 2)
 
     def test_transform_inputs_materializes_kjt_offsets(self) -> None:
         transform = TBESparseEmbeddingTransform(set(), _mock_mesh(1))
@@ -774,6 +866,66 @@ class TBESparseEmbeddingTransformTest(unittest.TestCase):
         self.assertIn(
             torch.ops._c10d_functional.all_gather_into_tensor.default,
             stage_targets[3],
+        )
+        self.assertIn(torch.ops.recir.tbe_forward.default, stage_targets[2])
+        self.assertIn(torch.ops.recir.tbe_backward_update.default, stage_targets[3])
+
+    def test_table_wise_pooled_transform_uses_native_pooling_and_pipeline(
+        self,
+    ) -> None:
+        transform, gm, parameters, values, lengths = self._pooled_transform(
+            world_size=2,
+            table_wise=True,
+        )
+        local_groups = [
+            module for module in gm.modules() if isinstance(module, LocalTBEGroup)
+        ]
+        self.assertCountEqual(
+            [group.pooling_mode for group in local_groups],
+            ["sum", "mean"],
+        )
+
+        def train_step(
+            weight_0: torch.Tensor,
+            weight_1: torch.Tensor,
+            input_values: torch.Tensor,
+            input_lengths: torch.Tensor,
+        ) -> torch.Tensor:
+            output = gm(weight_0, weight_1, input_values, input_lengths)
+            output.sum().backward()
+            return output.detach()
+
+        with patch(
+            "fbgemm_gpu.config.feature_list.FeatureGate.is_enabled",
+            return_value=False,
+        ):
+            joint = make_fx(
+                train_step,
+                tracing_mode="fake",
+                _allow_non_fake_inputs=True,
+            )(*parameters, values, lengths)
+        transform.finalize_compiled_graph(joint)
+
+        sdd = build_pipeline(joint, sdd_pipeline_config())
+        self.assertIsInstance(sdd, PipelinedGraphModule)
+        self.assertEqual(len(sdd.stage_graph_modules()), 3)
+        semi_sync = build_pipeline(
+            joint,
+            semi_sync_pipeline_config(start_batch=0),
+        )
+        self.assertIsInstance(semi_sync, PipelinedGraphModule)
+        stages = semi_sync.stage_graph_modules()
+        self.assertEqual(len(stages), 4)
+        stage_targets = [
+            [node.target for node in stage.graph.nodes] for stage in stages
+        ]
+        self.assertIn(
+            torch.ops._c10d_functional.all_to_all_single.default,
+            stage_targets[0],
+        )
+        self.assertIn(
+            torch.ops._c10d_functional.all_to_all_single.default,
+            stage_targets[1],
         )
         self.assertIn(torch.ops.recir.tbe_forward.default, stage_targets[2])
         self.assertIn(torch.ops.recir.tbe_backward_update.default, stage_targets[3])

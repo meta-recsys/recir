@@ -9,7 +9,6 @@
 import unittest
 from collections.abc import Callable
 from copy import deepcopy
-from functools import partial
 from typing import Literal, overload
 
 import torch
@@ -39,7 +38,12 @@ _FEATURE_NAMES: tuple[str, str] = ("sum_feature", "mean_feature")
 _EMBEDDING_DIM: int = 4
 _NUM_EMBEDDINGS: int = 16
 _UNEVEN_NUM_EMBEDDINGS: int = 17
-_ShardingCase = Literal["row_wise", "mixed", "table_wise"]
+_ShardingCase = Literal[
+    "row_wise",
+    "mixed",
+    "table_wise",
+    "table_wise_same_owner",
+]
 
 
 class _TracingRowWiseAdagrad(torch.optim.Optimizer):
@@ -133,7 +137,7 @@ def _sharding_plan(
     sharding_map = {}
     table_wise_rank_map = {}
     for table_index, (name, _parameter) in enumerate(model.named_parameters()):
-        is_table_wise = sharding_case == "table_wise" or (
+        is_table_wise = sharding_case in ("table_wise", "table_wise_same_owner") or (
             sharding_case == "mixed" and ".sum_table.weight" in name
         )
         if is_table_wise:
@@ -151,27 +155,24 @@ def _sharding_plan(
     )
 
 
-def _sparse_transform_factory(
-    fqns: set[str], mesh: DeviceMesh, module: nn.Module
-) -> TBESparseEmbeddingTransform:
-    return TBESparseEmbeddingTransform(
-        fqns,
-        mesh,
-        module,
-        stochastic_rounding=False,
-        variable_pooled_batch_per_rank=True,
-    )
+def _tbe_sparse_transform_factory(
+    embedding_plan: EmbeddingShardingPlan,
+    *,
+    variable_pooled_batch_per_rank: bool = False,
+) -> Callable[[set[str], DeviceMesh, nn.Module], RegionTransform]:
+    def create(
+        fqns: set[str], mesh: DeviceMesh, module: nn.Module
+    ) -> TBESparseEmbeddingTransform:
+        return TBESparseEmbeddingTransform(
+            fqns,
+            mesh,
+            module,
+            embedding_plan=embedding_plan,
+            stochastic_rounding=False,
+            variable_pooled_batch_per_rank=variable_pooled_batch_per_rank,
+        )
 
-
-def _uniform_sparse_transform_factory(
-    fqns: set[str], mesh: DeviceMesh, module: nn.Module
-) -> TBESparseEmbeddingTransform:
-    return TBESparseEmbeddingTransform(
-        fqns,
-        mesh,
-        module,
-        stochastic_rounding=False,
-    )
+    return create
 
 
 def _rank_batch(
@@ -247,10 +248,11 @@ class EmbeddingBagCollectionSingleRankTest(unittest.TestCase):
             lr=0.1,
             eps=1.0e-8,
         )
+        embedding_plan = _sharding_plan(compiled)
         parallel_mode = HybridParallel(
             dense_style="replicate",
-            embedding_plan=_sharding_plan(compiled),
-            sparse_transform_factory=_sparse_transform_factory,
+            embedding_plan=embedding_plan,
+            sparse_transform_factory=_tbe_sparse_transform_factory(embedding_plan),
         )
         parallel_mode._mesh = _fake_mesh()
 
@@ -325,7 +327,7 @@ class EmbeddingBagCollectionDistributedTest(DTensorTestBase):
     @with_comms
     def test_native_two_rank_training_handles_runtime_bag_count_changes(self) -> None:
         self._run_two_rank_training(
-            sparse_transform_factory=None,
+            use_tbe=False,
             num_embeddings=_UNEVEN_NUM_EMBEDDINGS,
         )
 
@@ -333,7 +335,7 @@ class EmbeddingBagCollectionDistributedTest(DTensorTestBase):
     @with_comms
     def test_native_mixed_sharding_matches_global_eager_training(self) -> None:
         self._run_two_rank_training(
-            sparse_transform_factory=None,
+            use_tbe=False,
             sharding_case="mixed",
         )
 
@@ -343,7 +345,7 @@ class EmbeddingBagCollectionDistributedTest(DTensorTestBase):
         self,
     ) -> None:
         self._run_two_rank_training(
-            sparse_transform_factory=None,
+            use_tbe=False,
             use_inductor=True,
             sharding_case="mixed",
         )
@@ -352,7 +354,7 @@ class EmbeddingBagCollectionDistributedTest(DTensorTestBase):
     @with_comms
     def test_native_table_wise_tables_on_distinct_owners_match_eager(self) -> None:
         self._run_two_rank_training(
-            sparse_transform_factory=None,
+            use_tbe=False,
             sharding_case="table_wise",
         )
 
@@ -360,19 +362,42 @@ class EmbeddingBagCollectionDistributedTest(DTensorTestBase):
     @with_comms
     def test_tbe_two_rank_training_handles_runtime_bag_count_changes(self) -> None:
         self._run_two_rank_training(
-            sparse_transform_factory=partial(
-                TBESparseEmbeddingTransform,
-                stochastic_rounding=False,
-                variable_pooled_batch_per_rank=True,
-            )
+            use_tbe=True,
+            num_embeddings=_UNEVEN_NUM_EMBEDDINGS,
+        )
+
+    @skip_if_lt_x_gpu(2)
+    @with_comms
+    def test_tbe_mixed_sharding_matches_global_eager_training(self) -> None:
+        self._run_two_rank_training(
+            use_tbe=True,
+            sharding_case="mixed",
+        )
+
+    @skip_if_lt_x_gpu(2)
+    @with_comms
+    def test_tbe_mixed_sharding_supports_nonzero_table_owner(self) -> None:
+        self._run_two_rank_training(
+            use_tbe=True,
+            sharding_case="mixed",
+            table_wise_owner_rank=1,
+        )
+
+    @skip_if_lt_x_gpu(2)
+    @with_comms
+    def test_tbe_table_wise_tables_on_same_owner_match_eager(self) -> None:
+        self._run_two_rank_training(
+            use_tbe=True,
+            sharding_case="table_wise_same_owner",
+            table_wise_owner_rank=1,
         )
 
     @skip_if_lt_x_gpu(2)
     @with_comms
     def test_tbe_uniform_rank_batches_match_global_eager_training(self) -> None:
         self._run_two_rank_training(
-            sparse_transform_factory=_uniform_sparse_transform_factory,
-            uniform_batch_per_rank=True,
+            use_tbe=True,
+            variable_pooled_batch_per_rank=False,
         )
 
     @skip_if_lt_x_gpu(2)
@@ -381,7 +406,7 @@ class EmbeddingBagCollectionDistributedTest(DTensorTestBase):
         self,
     ) -> None:
         self._run_two_rank_training(
-            sparse_transform_factory=_sparse_transform_factory,
+            use_tbe=True,
             use_inductor=True,
         )
 
@@ -391,22 +416,42 @@ class EmbeddingBagCollectionDistributedTest(DTensorTestBase):
         self,
     ) -> None:
         self._run_two_rank_training(
-            sparse_transform_factory=_uniform_sparse_transform_factory,
+            use_tbe=True,
             use_inductor=True,
-            uniform_batch_per_rank=True,
+            variable_pooled_batch_per_rank=False,
+        )
+
+    @skip_if_lt_x_gpu(2)
+    @with_comms
+    def test_tbe_inductor_mixed_sharding_matches_global_eager_training(
+        self,
+    ) -> None:
+        self._run_two_rank_training(
+            use_tbe=True,
+            use_inductor=True,
+            sharding_case="mixed",
+        )
+
+    @skip_if_lt_x_gpu(2)
+    @with_comms
+    def test_tbe_inductor_table_wise_tables_on_distinct_owners_match_eager(
+        self,
+    ) -> None:
+        self._run_two_rank_training(
+            use_tbe=True,
+            use_inductor=True,
+            sharding_case="table_wise",
         )
 
     def _run_two_rank_training(
         self,
-        sparse_transform_factory: (
-            Callable[[set[str], DeviceMesh, nn.Module], RegionTransform] | None
-        ),
+        use_tbe: bool,
         *,
         num_embeddings: int = _NUM_EMBEDDINGS,
         use_inductor: bool = False,
         sharding_case: _ShardingCase = "row_wise",
         table_wise_owner_rank: int = 0,
-        uniform_batch_per_rank: bool = False,
+        variable_pooled_batch_per_rank: bool = True,
     ) -> None:
         torch.manual_seed(0)
         device = torch.device(f"cuda:{self.rank}")
@@ -416,7 +461,7 @@ class EmbeddingBagCollectionDistributedTest(DTensorTestBase):
 
         compiled_optimizer: torch.optim.Optimizer
         reference_optimizer: torch.optim.Optimizer
-        if sparse_transform_factory is None:
+        if not use_tbe:
             compiled_optimizer = torch.optim.SGD(
                 compiled.parameters(), lr=0.1, foreach=False
             )
@@ -439,7 +484,14 @@ class EmbeddingBagCollectionDistributedTest(DTensorTestBase):
         parallel_mode = HybridParallel(
             dense_style="replicate",
             embedding_plan=embedding_plan,
-            sparse_transform_factory=sparse_transform_factory,
+            sparse_transform_factory=(
+                _tbe_sparse_transform_factory(
+                    embedding_plan,
+                    variable_pooled_batch_per_rank=(variable_pooled_batch_per_rank),
+                )
+                if use_tbe
+                else None
+            ),
         )
 
         backend = InductorBackend() if use_inductor else None
@@ -457,12 +509,14 @@ class EmbeddingBagCollectionDistributedTest(DTensorTestBase):
             optimizer.step()
             return output.detach()
 
-        for iteration in range(2):
+        iteration_count = 3 if use_inductor else 2
+        for iteration in range(iteration_count):
+            batch_iteration = iteration % 2
             values, lengths, coefficient = _rank_batch(
                 self.rank,
                 device,
-                iteration,
-                uniform_batch_per_rank=uniform_batch_per_rank,
+                batch_iteration,
+                uniform_batch_per_rank=not variable_pooled_batch_per_rank,
             )
             expected_output = reference(values, lengths).detach()
             compiled_optimizer.zero_grad()
@@ -472,6 +526,7 @@ class EmbeddingBagCollectionDistributedTest(DTensorTestBase):
                 values,
                 lengths,
                 coefficient,
+                last_train_step=iteration == iteration_count - 1,
             )
             sync_device_state_to_torch(train_step)
 
@@ -481,8 +536,8 @@ class EmbeddingBagCollectionDistributedTest(DTensorTestBase):
                 rank_values, rank_lengths, rank_coefficient = _rank_batch(
                     rank,
                     device,
-                    iteration,
-                    uniform_batch_per_rank=uniform_batch_per_rank,
+                    batch_iteration,
+                    uniform_batch_per_rank=not variable_pooled_batch_per_rank,
                 )
                 global_losses.append(
                     (reference(rank_values, rank_lengths) * rank_coefficient).sum()
@@ -520,3 +575,7 @@ class EmbeddingBagCollectionDistributedTest(DTensorTestBase):
                     rtol=1.0e-5,
                     msg=f"rank-local EBC update mismatch: {name}",
                 )
+
+        if sharding_case == "table_wise_same_owner":
+            tbe_groups = compiled.get_submodule("_recir_tbe_sparse_groups")
+            self.assertEqual(len(dict(tbe_groups.named_children())), 2)
