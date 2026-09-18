@@ -10,7 +10,7 @@ import unittest
 from collections.abc import Callable
 from copy import deepcopy
 from functools import partial
-from typing import overload
+from typing import Literal, overload
 
 import torch
 import torch.distributed as dist
@@ -39,6 +39,7 @@ _FEATURE_NAMES: tuple[str, str] = ("sum_feature", "mean_feature")
 _EMBEDDING_DIM: int = 4
 _NUM_EMBEDDINGS: int = 16
 _UNEVEN_NUM_EMBEDDINGS: int = 17
+_ShardingCase = Literal["row_wise", "mixed", "table_wise"]
 
 
 class _TracingRowWiseAdagrad(torch.optim.Optimizer):
@@ -122,12 +123,31 @@ def _fake_mesh() -> DeviceMesh:
     return mesh
 
 
-def _sharding_plan(model: nn.Module) -> EmbeddingShardingPlan:
+def _sharding_plan(
+    model: nn.Module,
+    sharding_case: _ShardingCase = "row_wise",
+    *,
+    table_wise_owner_rank: int = 0,
+    world_size: int = 2,
+) -> EmbeddingShardingPlan:
+    sharding_map = {}
+    table_wise_rank_map = {}
+    for table_index, (name, _parameter) in enumerate(model.named_parameters()):
+        is_table_wise = sharding_case == "table_wise" or (
+            sharding_case == "mixed" and ".sum_table.weight" in name
+        )
+        if is_table_wise:
+            sharding_map[name] = EmbeddingShardingType.TABLE_WISE
+            table_wise_rank_map[name] = (
+                table_index % world_size
+                if sharding_case == "table_wise"
+                else table_wise_owner_rank
+            )
+        else:
+            sharding_map[name] = EmbeddingShardingType.ROW_WISE
     return EmbeddingShardingPlan(
-        sharding_map={
-            name: EmbeddingShardingType.ROW_WISE
-            for name, _parameter in model.named_parameters()
-        }
+        sharding_map=sharding_map,
+        table_wise_rank_map=table_wise_rank_map,
     )
 
 
@@ -311,6 +331,33 @@ class EmbeddingBagCollectionDistributedTest(DTensorTestBase):
 
     @skip_if_lt_x_gpu(2)
     @with_comms
+    def test_native_mixed_sharding_matches_global_eager_training(self) -> None:
+        self._run_two_rank_training(
+            sparse_transform_factory=None,
+            sharding_case="mixed",
+        )
+
+    @skip_if_lt_x_gpu(2)
+    @with_comms
+    def test_native_inductor_mixed_sharding_matches_global_eager_training(
+        self,
+    ) -> None:
+        self._run_two_rank_training(
+            sparse_transform_factory=None,
+            use_inductor=True,
+            sharding_case="mixed",
+        )
+
+    @skip_if_lt_x_gpu(2)
+    @with_comms
+    def test_native_table_wise_tables_on_distinct_owners_match_eager(self) -> None:
+        self._run_two_rank_training(
+            sparse_transform_factory=None,
+            sharding_case="table_wise",
+        )
+
+    @skip_if_lt_x_gpu(2)
+    @with_comms
     def test_tbe_two_rank_training_handles_runtime_bag_count_changes(self) -> None:
         self._run_two_rank_training(
             sparse_transform_factory=partial(
@@ -357,6 +404,8 @@ class EmbeddingBagCollectionDistributedTest(DTensorTestBase):
         *,
         num_embeddings: int = _NUM_EMBEDDINGS,
         use_inductor: bool = False,
+        sharding_case: _ShardingCase = "row_wise",
+        table_wise_owner_rank: int = 0,
         uniform_batch_per_rank: bool = False,
     ) -> None:
         torch.manual_seed(0)
@@ -381,9 +430,15 @@ class EmbeddingBagCollectionDistributedTest(DTensorTestBase):
                 lr=0.1,
                 eps=1.0e-8,
             )
+        embedding_plan = _sharding_plan(
+            compiled,
+            sharding_case,
+            table_wise_owner_rank=table_wise_owner_rank,
+            world_size=self.world_size,
+        )
         parallel_mode = HybridParallel(
             dense_style="replicate",
-            embedding_plan=_sharding_plan(compiled),
+            embedding_plan=embedding_plan,
             sparse_transform_factory=sparse_transform_factory,
         )
 
@@ -439,11 +494,21 @@ class EmbeddingBagCollectionDistributedTest(DTensorTestBase):
             compiled_parameters = dict(compiled.named_parameters())
             reference_parameters = dict(reference.named_parameters())
             for name, reference_parameter in reference_parameters.items():
-                expected_local_parameter = torch.chunk(
-                    reference_parameter,
-                    self.world_size,
-                    dim=0,
-                )[self.rank]
+                if embedding_plan.is_table_wise(name):
+                    owner_rank = embedding_plan.table_wise_owner(name)
+                    expected_local_parameter = (
+                        reference_parameter
+                        if self.rank == owner_rank
+                        else reference_parameter.new_empty(
+                            (0, reference_parameter.shape[1])
+                        )
+                    )
+                else:
+                    expected_local_parameter = torch.chunk(
+                        reference_parameter,
+                        self.world_size,
+                        dim=0,
+                    )[self.rank]
                 self.assertEqual(
                     compiled_parameters[name].shape,
                     expected_local_parameter.shape,

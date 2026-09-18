@@ -32,10 +32,12 @@ from functorch import make_fx
 from recir.pipeline import mark_pipeline_region
 from recir.pipeline_strategies import PipelineRegion
 from recir.region_transforms.base import RegionTransform
-from recir.region_transforms.sparse_embedding import (
-    _declare_split_invariants,
-    _embedding_bag_mode,
+from recir.region_transforms.sparse_collectives import (
+    declare_split_invariants as _declare_split_invariants,
+    materialize_splits as _materialize_splits,
+    split_lists as _split_lists,
 )
+from recir.region_transforms.sparse_embedding import _embedding_bag_mode
 from recir.tbe.local import LocalTBEGroup, LocalTBETable, nobag_tbe_offsets
 from recir.tbe.ops import get_permute_2d_sparse_data_op
 from torch._subclasses.fake_tensor import unset_fake_temporarily
@@ -141,29 +143,6 @@ def _as_float(value: object, name: str) -> float:
         # This runs once during compilation, not in the training loop.
         return float(value.detach().to(device="cpu").item())
     return float(value)  # pyre-ignore[6]
-
-
-def _materialize_splits(
-    input_splits: torch.Tensor,
-    output_splits: torch.Tensor,
-) -> tuple[list[int], list[int], torch.Tensor]:
-    split_count = input_splits.shape[0]
-    # Citrine C6: one batched D2H copy supplies all later sparse routing stages.
-    cpu_splits = torch.cat((input_splits, output_splits)).to(device="cpu", copy=True)
-    return (
-        cpu_splits[:split_count].tolist(),
-        cpu_splits[split_count:].tolist(),
-        cpu_splits,
-    )
-
-
-def _split_lists(
-    cpu_splits: torch.Tensor, world_size: int
-) -> tuple[list[int], list[int]]:
-    return (
-        cpu_splits[:world_size].tolist(),
-        cpu_splits[world_size:].tolist(),
-    )
 
 
 def _row_wise_block_size(num_rows: int, world_size: int) -> int:

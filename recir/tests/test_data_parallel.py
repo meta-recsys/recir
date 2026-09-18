@@ -39,7 +39,10 @@ from recir.distributed.parallel_mode import DataParallel, HybridParallel
 from recir.meta_tensor_init import get_meta_init_spec
 from recir.passes import insert_weight_free_nodes
 from recir.region_transforms import RegatherTransform
-from recir.region_transforms.sparse_embedding import decomposed_row_wise_embedding
+from recir.region_transforms.sparse_embedding import (
+    decomposed_row_wise_embedding,
+    decomposed_table_wise_embedding_bag,
+)
 from recir.sharding_plan import EmbeddingShardingPlan, EmbeddingShardingType
 from torch._subclasses.fake_tensor import FakeTensorMode
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
@@ -3171,6 +3174,66 @@ class TestShardStateDict(unittest.TestCase):
         self.assertEqual(state["sum"].device.type, "meta")
         init_kind, _bound = get_meta_init_spec(state["sum"], default_bound=1.0)
         self.assertEqual(init_kind, "zeros")
+
+    @unittest.mock.patch("recir.distributed.data_parallel.partition_value")
+    def test_meta_optimizer_state_materializes_as_zeros(
+        self,
+        mock_partition: Any,
+    ) -> None:
+        mock_partition.return_value = torch.empty((2, 1), device="meta")
+        state = {"sum": torch.empty((4, 1), device="meta")}
+
+        _shard_state_dict(
+            state,
+            MagicMock(spec=DTensorSpec),
+            state_device=torch.device("cpu"),
+        )
+
+        self.assertEqual(state["sum"].device.type, "cpu")
+        torch.testing.assert_close(state["sum"], torch.zeros(2, 1))
+
+
+class TestShardParamsByPlanContract(unittest.TestCase):
+    def test_rejects_multidimensional_embedding_mesh(self) -> None:
+        model = EmbeddingMLP()
+        mesh = MagicMock(spec=DeviceMesh)
+        mesh.ndim = 2
+        mesh.shape = (1, 1)
+        plan = EmbeddingShardingPlan(
+            sharding_map={"emb.weight": EmbeddingShardingType.TABLE_WISE},
+            table_wise_rank_map={"emb.weight": 0},
+        )
+
+        with self.assertRaisesRegex(ValueError, "one-dimensional device mesh"):
+            shard_params_by_plan(
+                model,
+                OrderedDict(model.named_parameters()),
+                None,
+                mesh,
+                DataParallelStyle.REPLICATE,
+                embedding_plan=plan,
+            )
+
+
+class TestTableWiseEmbeddingBagDeviceContract(unittest.TestCase):
+    @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
+    def test_accepts_cpu_offsets_for_cuda_indices(self) -> None:
+        weight = torch.arange(32, dtype=torch.float32, device="cuda").reshape(8, 4)
+        indices = torch.tensor([1, 2], dtype=torch.int64, device="cuda")
+        offsets = torch.tensor([0, 1, 2], dtype=torch.int64)
+
+        actual = decomposed_table_wise_embedding_bag(
+            weight,
+            indices,
+            offsets,
+            owner_rank=0,
+            rank=0,
+            group_name="unused",
+            world_size=1,
+            mode=0,
+        )
+
+        torch.testing.assert_close(actual, weight.index_select(0, indices))
 
 
 class TestMultipleEmbeddingTables(DTensorTestBase):
