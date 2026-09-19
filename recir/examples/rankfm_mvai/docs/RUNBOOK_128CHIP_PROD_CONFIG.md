@@ -32,29 +32,24 @@ Two things to know before starting:
 
 ## 0. What the dump actually is
 
-Verified from the Manifold original that the light leg replays,
-`manifold://mrs_recsys_gcp/tree/czheo_test/udd_fm_3d_20260722`:
+**Which dump, and its shape, live in `dump.py`.** The numbers are deliberately
+not repeated here: they were, and a rotation left this page describing the
+previous dump. Read them there, and verify them against the dump itself with
 
-```json
-{"version": 0, "num_ranks": 480, "num_batches": 41942, "batch_size": 512}
+```bash
+python3 recir/examples/rankfm_mvai/scripts/set_dump.py --check
 ```
 
-The GCS path the manifest mounts is the BarnFS/Dataporter-packed copy of that
-dump. Read this before changing any data flag:
+Manifold holds the original the light leg replays; the GCS path the manifests
+mount is the BarnFS/Dataporter-packed copy of it. What matters when changing a
+data flag:
 
 | | |
 |---|---|
 | layout | **v0 bucketed**: `rank_R/batch_S/F.pt.zst`, 1000 files per `batch_S` |
-| shards | 480, so all 32 pods get a distinct one with room to spare |
-| stride | 512 rows per file — this is baked into every dumped KJT |
+| shards | `NUM_RANKS` in `dump.py` — must exceed the pod count, or pods repeat each other's data |
+| stride | `BATCH_SIZE` in `dump.py`, baked into every dumped KJT |
 | ids | already hashed at prod's table sizes, so no cap is needed and none is applied |
-
-Re-checkable from a devserver at any time; no pod required:
-
-```bash
-manifold get mrs_recsys_gcp/tree/czheo_test/udd_fm_3d_20260722/metadata.json /tmp/md.json && cat /tmp/md.json
-manifold ls mrs_recsys_gcp/tree/czheo_test/udd_fm_3d_20260722/rank_0/batch_0/ | head
-```
 
 The GCS side shows only `BFS2_SHARD_MAP` and numbered content-addressed shard
 dirs under `gcloud storage ls` — that is expected, the `barnfs.csi.meta.com`
@@ -158,7 +153,7 @@ and computes the v0 filenames arithmetically, never listing the directory.
 
 **`--data_replicate_across_ranks`.** Absent, so the pods shard instead of all
 reading the same file. Pod K takes `global_idx = K + step*32` across the dump's
-480 shards, giving 32 distinct files per step. `PaddingRegionTransform` pads
+400 shards, giving 32 distinct files per step. `PaddingRegionTransform` pads
 every loaded batch to fixed post-pad shapes, so the divergent per-rank jagged
 lengths that sharding introduces do not break the ROW_WISE all-to-all.
 
@@ -218,8 +213,7 @@ Beyond the generic startup, this run has four checkpoints:
    container starts, so this normally clears immediately. If it hangs, the
    mount failed or the dump's layout is not what section 0 says; exec in and
    look rather than waiting.
-2. `[Replay] Dump (v0 bucketed): 480 dump ranks x 41942 batches. Rank N assigned
-   629130 batches.` — proof that `_discover_files` read the manifest and that
+2. `[Replay] Dump (v0 bucketed): N dump ranks x M batches.` — N and M must match `dump.py`. Proof that `_discover_files` read the manifest and that
    the pods are sharding rather than replicating.
 3. Config load from the artifact. **Confirm the L2 stack has 11 layers** and
    that no `_trim_stu_stack` warning appears — that is the evidence the prod

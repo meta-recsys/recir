@@ -3,11 +3,6 @@
 # rankfm_mvai-128chip.yaml apart from the slice size, so it is the one to
 # reach for when the 4x4x8 slice is held by someone else.
 #
-# Halving the chips halves the global batch for the same --local_batch_size,
-# and it doubles the per-device table shard because 3e9 rows are spread over
-# 128 jax devices instead of 256. HBM is already the binding constraint at
-# batch 2048, so a config that fits on 128 chips will not automatically fit
-# here.
 #
 # Same model as recir/examples/rankfm,
 # driven by the mvai_cloud RecTrainer framework instead of rankfm's bespoke loop.
@@ -47,7 +42,7 @@ spec:
             serviceAccountName: default
             containers:
             - name: rankfm-mvai
-              image: us-central1-docker.pkg.dev/mrs-tpu-y317h/recml/rankfm_mvai_tpu:linjianma-compiled
+              image: us-central1-docker.pkg.dev/mrs-tpu-y317h/recml/rankfm_mvai_tpu:linjianma-cmp0903
               imagePullPolicy: Always
               env:
               - name: PYTHONUNBUFFERED
@@ -115,6 +110,10 @@ spec:
               # unless the process dies.
               - name: PYTHONFAULTHANDLER
                 value: "1"
+              # Route HSTU attention to the recir Helion kernels. Requires SLA off,
+              # which prod_config_shim already does at the config layer.
+              - name: RANKFM_MVAI_USE_HELION
+                value: "1"
               - name: JAX_ENABLE_X64
                 value: "1"
               # Which op builds the 82.52GiB f32[65,332800,128,8]? The XLA memory
@@ -149,7 +148,7 @@ spec:
               #
               # NO --data_replicate_across_ranks either: replicate makes all 16
               # pods read the same file every step. Sharded (the default), pod K
-              # takes global_idx = K + step*16 over the dump's 480 ranks, so the
+              # takes global_idx = K + step*16 over the dump's 400 ranks, so the
               # 16 pods see 16 distinct shards per step -- real data
               # parallelism. PaddingRegionTransform pads every loaded batch to
               # fixed post-pad shapes, so ROW_WISE A2A tolerates the divergent
@@ -220,16 +219,21 @@ spec:
                   TB_SYNC_PID=$! ;
                 fi ;
                 python3 -u -m recir.examples.rankfm_mvai.train
-                --max_steps 629130
+                --max_steps 320725
                 --local_batch_size 2048
                 --seq_len_cap 1024
                 --prod_faithful
                 --bf16_training
                 --embedding_backend in_graph
                 --gcs_data_path /mnt/barnfs
+                --data_load_workers 2
+                --data_prefetch_buffer 32
                 --metrics_report_interval 100
-                --profile_start_step 200
-                --profile_end_step 205
+                --in_graph_metrics
+                --metric_window_size 64000000
+                --pipeline_preprocessor
+                --profile_start_step 900
+                --profile_end_step 906
                 --profile_dir "gs://cq-mrs-core-shared_mrs_tpu_y317h/tpu-profiles/${JOBSET_NAME}" ;
                 rc=$? ;
                 if [ "${RANK}" = "0" ]; then
@@ -284,12 +288,12 @@ spec:
                   # with plain `gcloud storage ls`). The trailing ":v0" is
                   # part of the dataporter transfer id, not the dump format.
                   # Source of truth for the layout is the Manifold original,
-                  # manifold://mrs_recsys_gcp/tree/czheo_test/udd_fm_3d_20260722,
+                  # manifold://mrs_recsys_gcp/tree/czheo_test/udd_fm_3d_20260824,
                   # whose metadata.json reads
-                  # {"version": 0, "num_ranks": 480, "num_batches": 41942,
+                  # {"version": 0, "num_ranks": 400, "num_batches": 51316,
                   #  "batch_size": 512} -- i.e. the v0 bucketed layout
-                  # rank_R/batch_S/F.pt.zst, 480 shards, stride 512.
-                  sourcePath: "gs://mrs-tpu-y317h/czheo_test/dataporter_2:prod:dataporter:xdb.mwfs_orchestration_prod:3186:279354:v0/"
+                  # rank_R/batch_S/F.pt.zst, 400 shards, stride 512.
+                  sourcePath: "gs://mrs-tpu-y317h/czheo_test/udd_fm_3d_20260824/dataporter_2:prod:dataporter:xdb.mwfs_orchestration_prod:4070:467780:v0/"
             # TensorBoard events. mvai's TensorboardLogger hardcodes
             # /mnt/gcs/mvai_cloud/tensorboard/$MVAI_JOB_NAME (metrics.py) and
             # appends to a single events file at every metric report. Backing

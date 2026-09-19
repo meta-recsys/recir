@@ -21,9 +21,9 @@ i.e. file ``(b, r)`` sits at flat position ``b * num_ranks + r``.
 ``BatchReplayPipe._discover_files`` must agree. Its replicated branch was once
 nested the other way, putting ``(b, r)`` at ``r * num_batches + b`` -- the
 transpose. Nothing failed: both orders replay the whole dump. But a bounded run
-read entirely different data on the two legs. With 480 dump ranks, the first 400
-files were 400 writers at batch 0 for light versus writer 0 across 400 batches
-for recir, overlapping in exactly one file. An NE comparison across that is
+read entirely different data on the two legs: at the dump's rank count (see
+``dump.py``), a bounded run read one writer's first N batches on one leg and N
+writers' first batch on the other, overlapping in exactly one file. An NE comparison across that is
 measuring the data difference rather than the model, which is the one thing the
 comparison exists to rule out.
 """
@@ -42,8 +42,8 @@ from recir.examples.rankfm_mvai.data_pipe import (
     BatchReplayPipe,
 )
 
-# Small stand-ins for the real dump's 480 x 41942; the ordering property does
-# not depend on the magnitudes, and a wide-but-shallow grid is exactly the shape
+# Small stand-ins for the real dump (dump.py); the ordering property does not
+# depend on the magnitudes, and a wide-but-shallow grid is exactly the shape
 # that made the transpose invisible.
 _NUM_RANKS: int = 8
 _NUM_BATCHES: int = 5
