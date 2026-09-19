@@ -139,7 +139,7 @@ spec:
               #
               # NO --data_replicate_across_ranks either: replicate makes all 32
               # pods read the same file every step. Sharded (the default), pod K
-              # takes global_idx = K + step*32 over the dump's 480 ranks, so the
+              # takes global_idx = K + step*32 over the dump's 400 ranks, so the
               # 32 pods see 32 distinct shards per step -- real data
               # parallelism. PaddingRegionTransform pads every loaded batch to
               # fixed post-pad shapes, so ROW_WISE A2A tolerates the divergent
@@ -233,7 +233,7 @@ spec:
                   TB_SYNC_PID=$! ;
                 fi ;
                 python3 -u -m recir.examples.rankfm_mvai.train
-                --max_steps 629130
+                --max_steps 320725
                 --local_batch_size 1024
                 --seq_len_cap 1024
                 --prod_faithful
@@ -302,12 +302,12 @@ spec:
                   # with plain `gcloud storage ls`). The trailing ":v0" is
                   # part of the dataporter transfer id, not the dump format.
                   # Source of truth for the layout is the Manifold original,
-                  # manifold://mrs_recsys_gcp/tree/czheo_test/udd_fm_3d_20260722,
+                  # manifold://mrs_recsys_gcp/tree/czheo_test/udd_fm_3d_20260824,
                   # whose metadata.json reads
-                  # {"version": 0, "num_ranks": 480, "num_batches": 41942,
+                  # {"version": 0, "num_ranks": 400, "num_batches": 51316,
                   #  "batch_size": 512} -- i.e. the v0 bucketed layout
-                  # rank_R/batch_S/F.pt.zst, 480 shards, stride 512.
-                  sourcePath: "gs://mrs-tpu-y317h/czheo_test/dataporter_2:prod:dataporter:xdb.mwfs_orchestration_prod:3186:279354:v0/"
+                  # rank_R/batch_S/F.pt.zst, 400 shards, stride 512.
+                  sourcePath: "gs://mrs-tpu-y317h/czheo_test/udd_fm_3d_20260824/dataporter_2:prod:dataporter:xdb.mwfs_orchestration_prod:4070:467780:v0/"
             # TensorBoard events. mvai's TensorboardLogger hardcodes
             # /mnt/gcs/mvai_cloud/tensorboard/$MVAI_JOB_NAME (metrics.py) and
             # appends to a single events file at every metric report. Backing

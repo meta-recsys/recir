@@ -143,7 +143,7 @@ _ALLOWED_DIVERGENCES: Set[str] = set()
 # stays honest.
 _HASH_SIZE_CAP: int = 100_000
 
-# Shapes the dump at manifold://mrs_recsys_gcp/tree/czheo_test/udd_fm_3d_20260722
+# Shapes the dump at manifold://mrs_recsys_gcp/tree/czheo_test/udd_fm_3d_20260824
 # was preprocessed with, read off rank_0/batch_0/0.pt.zst. If the config stops
 # agreeing with these, the model can no longer consume that dump.
 #
@@ -161,7 +161,7 @@ _DUMP_NRO_FLOAT_FEATURES: int = 366
 
 # One real dump batch on local disk, used by ForwardParityTest. The test does
 # not fetch it -- pulling 17MB from Manifold does not belong in a unit test:
-#   manifold get mrs_recsys_gcp/tree/czheo_test/udd_fm_3d_20260722\
+#   manifold get mrs_recsys_gcp/tree/czheo_test/udd_fm_3d_20260824\
 #     /rank_0/batch_0/0.pt.zst /tmp/b0.pt.zst
 _DUMP_BATCH_PATH: str = os.environ.get("PARITY_DUMP_BATCH", "/tmp/b0.pt.zst")
 

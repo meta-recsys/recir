@@ -259,7 +259,7 @@ spec:
                 driver: barnfs.csi.meta.com
                 readOnly: true
                 volumeAttributes:
-                  sourcePath: "gs://mrs-tpu-y317h/czheo_test/dataporter_2:prod:dataporter:xdb.mwfs_orchestration_prod:3186:279354:v0/"
+                  sourcePath: "gs://mrs-tpu-y317h/czheo_test/udd_fm_3d_20260824/dataporter_2:prod:dataporter:xdb.mwfs_orchestration_prod:4070:467780:v0/"
             - name: prod-cfg
               configMap:
                 name: rankfm-prod-cfg

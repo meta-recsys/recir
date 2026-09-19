@@ -5,7 +5,7 @@
 # recir/examples/rankfm_mvai/docs/PARITY_HANDOVER.md. It differs from
 # rankfm_mvai-cpu-eager-4chip.yaml in four ways that all matter for validity:
 #
-#   1. sourcePath points at the BarnFS copy of czheo_test/udd_fm_3d_20260722 --
+#   1. sourcePath points at the BarnFS copy of czheo_test/udd_fm_3d_20260824 --
 #      the dump the light leg replays. The other manifest reads a DIFFERENT
 #      dump (udd_fm_20260415_dump), which would make any comparison meaningless.
 #   2. NO --data_file_template. That flag resolves to exactly ONE file

@@ -39,9 +39,10 @@ from minimal_viable_ai.core.ranking_common.configs import (  # noqa: F401
 # Reused rather than re-derived: the rank_X/batch_Y/Z.pt.zst vs legacy flat
 # layout choice must not drift from the reader the training job uses.
 from recir.examples.rankfm_mvai.data_pipe import _batch_file_name
+from recir.examples.rankfm_mvai.dump import MANIFOLD_ROOT
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
-_DEFAULT_PATH = "manifold://mrs_recsys_gcp/tree/czheo_test/udd_fm_3d_20260722"
+_DEFAULT_PATH = MANIFOLD_ROOT
 # Weighted to the LOW end on purpose. These lengths are produced by an upstream
 # truncation, so the interesting structure is the tail below the ceiling, not
 # above it -- an all-high quantile set reports p50 == p99 == max and hides it.
