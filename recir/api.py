@@ -1297,6 +1297,7 @@ class _TraceContext:
     params: Dict[str, nn.Parameter]
     buffers: Dict[str, torch.Tensor]
     named_states: Dict[str, Any]
+    state_fqns: List[str]
     input_batch_dim: int
     embedding_param_indices: Optional[set[int]] = None
     internal_transforms: List[RegionTransform] = field(default_factory=list)
@@ -1715,6 +1716,12 @@ def trace(  # noqa: C901 — orchestration: dispatches on parallel_mode flavor (
         params=local_result.params,
         buffers=local_result.buffers,
         named_states=local_result.named_states,
+        state_fqns=_compute_state_fqns(
+            [
+                {**local_result.params, **local_result.buffers},
+                local_result.named_states,
+            ]
+        ),
         input_batch_dim=input_batch_dim,
         embedding_param_indices=embedding_param_indices,
         internal_transforms=internal_transforms,
@@ -1806,6 +1813,14 @@ def compile_from_gm(  # noqa: C901 — orchestration: stages 4-8 of the pipeline
 
     ctx = _get_trace_ctx(gm)
     region_transforms_list = list(region_transforms)
+    trace_state_fqns = ctx.state_fqns
+    trace_state_leaf_count = len(trace_state_fqns)
+    if len(flat_state) < trace_state_leaf_count:
+        raise RuntimeError(
+            "compile_from_gm flat_state is missing trace-time state leaves: "
+            f"state={len(flat_state)}, trace_state={trace_state_leaf_count}"
+        )
+    added_state_tail = flat_state[trace_state_leaf_count:]
 
     # Stage 5: per-mode post-trace assembly.
     #
@@ -1870,7 +1885,7 @@ def compile_from_gm(  # noqa: C901 — orchestration: stages 4-8 of the pipeline
         )
         rebuilt_named_states: Dict[str, Any] = {}
         _opts = ctx.opts
-        if any(len(o.state) > 0 for o in _opts):
+        if ctx.named_states:
             # ``shard_params`` may have re-keyed each ``opt.state`` to the new
             # (post-shard) Parameter identities. Resolve the current FQN bindings,
             # then restore the trace-time dict order: pytree flattening is
@@ -1886,24 +1901,16 @@ def compile_from_gm(  # noqa: C901 — orchestration: stages 4-8 of the pipeline
                 for n in ctx.named_states
                 if n in rebuilt_named_states
             }
-            # Coverage check: ``shard_params`` may re-key params off the
-            # module so the walk above misses entries that ``trace`` captured
-            # in ``ctx.named_states``. Warn (rather than silently drop) so
-            # downstream optimizer-state restoration does not lose entries.
-            dropped = set(ctx.named_states.keys()) - set(named_states.keys())
+            dropped = set(ctx.named_states) - set(named_states)
             if dropped:
-                logger.warning(
-                    "GSPMD named_states rebuild dropped %d entries that were "
-                    "present in the pre-shard ctx snapshot: %s",
-                    len(dropped),
-                    sorted(dropped),
+                raise RuntimeError(
+                    "GSPMD named_states rebuild lost trace-time optimizer state; "
+                    "cannot safely align flat_state with graph placeholders: "
+                    f"dropped={sorted(dropped)!r}"
                 )
         else:
-            # Either no optimizer was supplied, or every ``opt.state`` is
-            # empty (optimizer not stepped yet, or a partial-lower path that
-            # never populated state).  In both cases ``ctx.named_states``
-            # — captured by ``trace`` — is the authoritative snapshot;
-            # fall through so we do not silently discard it.
+            # No optimizer state was lifted into the trace, so there are no
+            # optimizer-state placeholders to rebuild after sharding.
             named_states = ctx.named_states
 
         # GSPMD-specific tag_grad fixup.  GSPMD needs no DTensor partition
@@ -1961,11 +1968,17 @@ def compile_from_gm(  # noqa: C901 — orchestration: stages 4-8 of the pipeline
 
     # Rebuild flat_state from the post-shard params/buffers/named_states.
     # ``shard_params`` may have substituted parameter objects, so the
-    # original ``flat_state`` references can be stale.  Tail entries beyond
-    # the model state (added via ``recir.add_state``) are preserved.
-    rebuilt_state = pytree.tree_leaves([params_and_buffers, named_states])
-    if len(flat_state) > len(rebuilt_state):
-        rebuilt_state.extend(flat_state[len(rebuilt_state) :])
+    # original ``flat_state`` references can be stale.
+    state_structure = [params_and_buffers, named_states]
+    rebuilt_state = pytree.tree_leaves(state_structure)
+    rebuilt_state_fqns = _compute_state_fqns(state_structure)
+    if rebuilt_state_fqns != trace_state_fqns:
+        raise RuntimeError(
+            "Post-shard state structure no longer matches trace-time graph "
+            "placeholders; cannot safely rebuild flat_state: "
+            f"trace={trace_state_fqns!r}, rebuilt={rebuilt_state_fqns!r}"
+        )
+    rebuilt_state.extend(added_state_tail)
     flat_state = rebuilt_state
 
     # GSPMD/FSDP: mirror legacy ``_compile_gspmd`` by setting
@@ -2070,9 +2083,7 @@ def compile_from_gm(  # noqa: C901 — orchestration: stages 4-8 of the pipeline
     final_gm = dispatched
 
     sm = backend.device_state_manager()
-    sm.state_fqns = _compute_state_fqns(
-        [{**ctx.params, **ctx.buffers}, ctx.named_states]
-    )
+    sm.state_fqns = rebuilt_state_fqns
     return _CompiledResult(
         gm=cast(fx.GraphModule, final_gm),
         mod=ctx.mod,
