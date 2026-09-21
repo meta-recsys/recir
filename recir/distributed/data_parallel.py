@@ -2023,6 +2023,7 @@ def shard_params_by_plan(
     dense_style: DataParallelStyle,
     *,
     embedding_plan: EmbeddingShardingPlan,
+    dense_shard_param_fqns: Optional[Set[str]] = None,
 ) -> Set[str]:
     """Shard parameters and optimizer states with per-param logic.
 
@@ -2030,8 +2031,8 @@ def shard_params_by_plan(
       - Row-wise embedding params: ``Shard(0)`` on the vocabulary dimension.
       - Table-wise embedding params: the owner rank keeps the complete table;
         non-owner ranks keep an empty local placeholder.
-      - Dense params: ``Shard(0)`` if ``dense_style`` is ``FULLY_SHARD``,
-        otherwise left unsharded (replicated).
+      - Dense params: ``Shard(0)`` in ``FULLY_SHARD`` mode when selected by
+        ``dense_shard_param_fqns``; otherwise they remain replicated.
 
     ``embedding_plan`` is the sole source of embedding FQNs, sharding types,
     table owners, and storage locations. When a meta-device embedding is
@@ -2056,7 +2057,10 @@ def shard_params_by_plan(
     table_wise_old_to_new: List[Tuple[torch.Tensor, torch.Tensor, bool]] = []
 
     def should_shard(key: str, _tensor: torch.Tensor) -> bool:
-        return key in embedding_fqns or dense_style == DataParallelStyle.FULLY_SHARD
+        return key in embedding_fqns or (
+            dense_style == DataParallelStyle.FULLY_SHARD
+            and (dense_shard_param_fqns is None or key in dense_shard_param_fqns)
+        )
 
     for old_param, aliases in _group_shared_parameters(params_buffers):
         if not _select_shared_parameter_group(old_param, aliases, should_shard):

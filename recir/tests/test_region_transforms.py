@@ -91,6 +91,16 @@ class SharedWeightMLP(nn.Module):
         return self.linear(x)
 
 
+class ModelWithMetaLayer(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.meta_layer = nn.Linear(8, 8, device="meta")
+        self.output = nn.Linear(8, 4)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.output(self.meta_layer(x))
+
+
 # ---------------------------------------------------------------------------
 # Unit tests: _discover_called_modules
 # ---------------------------------------------------------------------------
@@ -145,6 +155,17 @@ class TestDiscoverCalledModules(unittest.TestCase):
 
         fqns = list(called.keys())
         self.assertEqual(fqns[0], "")
+
+    def test_meta_parameters_use_input_device_during_discovery(self) -> None:
+        model = ModelWithMetaLayer()
+        fake_mode = _make_fake_mode()
+        called = _discover_called_modules(
+            model, fake_mode, lambda m, inp: m(inp), model, torch.randn(2, 8)
+        )
+
+        self.assertIn("meta_layer", called)
+        self.assertIn("output", called)
+        self.assertEqual(model.meta_layer.weight.device.type, "meta")
 
 
 # ---------------------------------------------------------------------------
@@ -357,6 +378,27 @@ class TestReplaceRegion(unittest.TestCase):
 
 
 class TestRegatherTransformDetection(unittest.TestCase):
+    def test_select_configured_forward_root(self) -> None:
+        model = SimpleMLP()
+        fake_mode = _make_fake_mode()
+        called = _discover_called_modules(
+            model, fake_mode, lambda m, inp: m(inp), model, torch.randn(4, 50)
+        )
+        transform = RegatherTransform(forward_root_fqns={"net2"})
+
+        self.assertEqual(transform.select_forward_root_fqns(called), {"net2"})
+
+    def test_uncalled_configured_forward_root_raises(self) -> None:
+        model = SimpleMLP()
+        fake_mode = _make_fake_mode()
+        called = _discover_called_modules(
+            model, fake_mode, lambda m, inp: m(inp), model, torch.randn(4, 50)
+        )
+        transform = RegatherTransform(forward_root_fqns={"different.alias"})
+
+        with self.assertRaisesRegex(RuntimeError, "different.alias"):
+            transform.select_forward_root_fqns(called)
+
     def test_transform_graph_wraps_chains(self) -> None:
         """transform_graph wraps each parameter chain with checkpoint."""
         model = SimpleMLP()
@@ -407,6 +449,7 @@ class TestRegatherTransformDetection(unittest.TestCase):
     def test_skips_only_ringshift_owned_region(self) -> None:
         class _Schema:
             name: str = "recir::ringshift_embedding"
+            is_mutable: bool = False
 
         def fake_ringshift_embedding(
             ids: torch.Tensor,

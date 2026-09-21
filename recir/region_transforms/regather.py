@@ -113,8 +113,30 @@ def _collect_chain_regions(
 class RegatherTransform(RegionTransform):
     """Per-op FSDP: recompute the allgather + reshape chain in backward."""
 
-    def __init__(self, skip_param_fqns: Optional[Set[str]] = None) -> None:
+    def __init__(
+        self,
+        skip_param_fqns: Optional[Set[str]] = None,
+        forward_root_fqns: Optional[Set[str]] = None,
+    ) -> None:
         self.skip_param_fqns: Set[str] = skip_param_fqns or set()
+        self.forward_root_fqns: Optional[Set[str]] = (
+            None if forward_root_fqns is None else set(forward_root_fqns)
+        )
+
+    def select_forward_root_fqns(
+        self,
+        called_modules: OrderedDict[
+            str, tuple[nn.Module, tuple[Any, ...], dict[str, Any]]
+        ],
+    ) -> Optional[set[str]]:
+        if self.forward_root_fqns is None:
+            return None
+        missing = self.forward_root_fqns - called_modules.keys()
+        if missing:
+            raise RuntimeError(
+                f"Requested regather forward roots were not called: {sorted(missing)}"
+            )
+        return set(self.forward_root_fqns)
 
     @staticmethod
     def skip_fqns_for_recompute(
@@ -151,6 +173,8 @@ class RegatherTransform(RegionTransform):
             str, tuple[nn.Module, tuple[Any, ...], dict[str, Any]]
         ],
     ) -> None:
+        if gm.graph.eliminate_dead_code():
+            gm.recompile()
         root_mod, _root_args, _root_kwargs = next(iter(called_modules.values()))
         param_fqns = [fqn for fqn, _ in root_mod.named_parameters()]
         skip_indices = {

@@ -84,11 +84,31 @@ def _discover_called_modules(
     called: OrderedDict[str, tuple[nn.Module, tuple[Any, ...], dict[str, Any]]] = (
         OrderedDict()
     )
+    input_device = next(
+        (
+            value.device
+            for value in pytree.arg_tree_leaves(*args, **kwargs)
+            if isinstance(value, torch.Tensor) and value.device.type != "meta"
+        ),
+        None,
+    )
+    meta_state: dict[str, torch.Tensor] = {}
+    if input_device is not None:
+        with fake_mode:
+            meta_state = {
+                name: torch.empty_like(value, device=input_device)
+                for name, value in (
+                    *mod.named_parameters(remove_duplicate=False),
+                    *mod.named_buffers(remove_duplicate=False),
+                )
+                if value is not None and value.device.type == "meta"
+            }
 
     with (
         _forward_pre_hooks(mod, called),
         fake_mode,
         torch.no_grad(),
+        stateless._reparametrize_module(mod, meta_state),
     ):
         try:
             func(*args, **kwargs)

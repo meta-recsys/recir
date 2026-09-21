@@ -1336,6 +1336,7 @@ class HybridParallel(ParallelMode):
         dense_style: str = "fully_shard",
         *,
         embedding_plan: Optional[EmbeddingShardingPlan] = None,
+        dense_fsdp_module_fqns: Optional[Set[str]] = None,
         input_batch_dim: int = 0,
         custom_passes: Optional[Callable[[GraphModule], GraphModule]] = None,
         sparse_transform_factory: Optional[
@@ -1355,6 +1356,16 @@ class HybridParallel(ParallelMode):
         self.embedding_plan: EmbeddingShardingPlan = (
             embedding_plan or EmbeddingShardingPlan()
         )
+        if dense_fsdp_module_fqns is not None:
+            if not dense_fsdp_module_fqns:
+                raise ValueError("dense_fsdp_module_fqns must not be empty")
+            if self.dense_style != DataParallelStyle.FULLY_SHARD:
+                raise ValueError(
+                    "dense_fsdp_module_fqns requires dense_style='fully_shard'"
+                )
+        self.dense_fsdp_module_fqns: Optional[Set[str]] = (
+            None if dense_fsdp_module_fqns is None else set(dense_fsdp_module_fqns)
+        )
         self.input_batch_dim = input_batch_dim
         self.sparse_transform_factory = sparse_transform_factory
 
@@ -1364,6 +1375,7 @@ class HybridParallel(ParallelMode):
             self._gm_passes = lambda gm: gm
 
         self._mesh: Optional[DeviceMesh] = None
+        self._active_fsdp_sharded_keys: Optional[Set[str]] = None
 
     @property
     def num_ranks(self) -> int:
@@ -1391,20 +1403,49 @@ class HybridParallel(ParallelMode):
                 indices.add(idx)
         return indices if indices else None
 
+    def _resolve_dense_shard_param_fqns(
+        self, model: torch.nn.Module
+    ) -> Optional[Set[str]]:
+        if self.dense_fsdp_module_fqns is None:
+            return None
+
+        result: Set[str] = set()
+        for module_fqn in sorted(self.dense_fsdp_module_fqns):
+            try:
+                root_module = (
+                    model if not module_fqn else model.get_submodule(module_fqn)
+                )
+            except AttributeError as error:
+                raise ValueError(
+                    f"Dense FSDP module does not exist: {module_fqn!r}"
+                ) from error
+            root_param_fqns = {
+                f"{module_fqn}.{param_fqn}" if module_fqn else param_fqn
+                for param_fqn, _ in root_module.named_parameters(remove_duplicate=False)
+            }
+            if not root_param_fqns:
+                raise ValueError(f"Dense FSDP module has no parameters: {module_fqn!r}")
+            result.update(root_param_fqns)
+        return result
+
     def shard_params(
         self,
         model: torch.nn.Module,
         params_and_buffers: Dict[str, Any],
         opt: OptOrOpts,
     ) -> Set[str]:
-        return shard_params_by_plan(
+        dense_shard_param_fqns = self._resolve_dense_shard_param_fqns(model)
+        sharded_keys = shard_params_by_plan(
             model,
             params_and_buffers,
             opt,
             self.mesh,
             self.dense_style,
             embedding_plan=self.embedding_plan,
+            dense_shard_param_fqns=dense_shard_param_fqns,
         )
+        self._active_fsdp_sharded_keys = set(sharded_keys)
+        return sharded_keys
 
     def apply_state_layout(
         self,
@@ -1429,6 +1470,26 @@ class HybridParallel(ParallelMode):
             params_and_buffers
         )
 
+        replicated_param_state_indices: Optional[Set[int]] = None
+        if (
+            self.dense_style == DataParallelStyle.FULLY_SHARD
+            and self._active_fsdp_sharded_keys is not None
+        ):
+            param_buffer_keys = [*params, *buffers]
+            replicated_param_state_indices = {
+                index
+                for index, key in enumerate(param_buffer_keys)
+                if key not in self._active_fsdp_sharded_keys
+            }
+            state_index = len(param_buffer_keys)
+            for fqn, state in named_states.items():
+                state_leaves = pytree.tree_leaves(state)
+                if fqn not in self._active_fsdp_sharded_keys:
+                    replicated_param_state_indices.update(
+                        range(state_index, state_index + len(state_leaves))
+                    )
+                state_index += len(state_leaves)
+
         gm = partition_data_parallel(
             gm,
             params=params,
@@ -1438,6 +1499,7 @@ class HybridParallel(ParallelMode):
             parallel_style=self.dense_style,
             input_batch_dim=self.input_batch_dim,
             embedding_param_indices=embedding_param_indices,
+            replicated_param_state_indices=replicated_param_state_indices,
         )
 
         return gm
