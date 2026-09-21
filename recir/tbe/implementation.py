@@ -99,8 +99,11 @@ def _pooling_mode(pooling_mode: str) -> PoolingMode:
         return PoolingMode.NONE
     if pooling_mode == "sum":
         return PoolingMode.SUM
+    if pooling_mode == "mean":
+        return PoolingMode.MEAN
     raise ValueError(
-        f"LocalTBEGroup pooling_mode must be 'none' or 'sum', got {pooling_mode!r}."
+        "LocalTBEGroup pooling_mode must be 'none', 'sum', or 'mean', "
+        f"got {pooling_mode!r}."
     )
 
 
@@ -273,7 +276,7 @@ class LocalTBEGroup(torch.nn.Module):
         if any(indices.dim() != 1 for indices in feature_indices):
             raise ValueError("Local TBE feature indices must be one-dimensional.")
 
-        if self.pooling_mode == "sum":
+        if self.pooling_mode in ("sum", "mean"):
             if feature_offsets is None:
                 raise ValueError("Pooled local TBE requires per-feature offsets.")
             if len(feature_offsets) != len(feature_indices):

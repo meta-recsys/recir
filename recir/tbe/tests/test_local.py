@@ -122,6 +122,36 @@ class LocalTBEGroupTest(unittest.TestCase):
         torch.testing.assert_close(before[0][0], after[0][0])
         torch.testing.assert_close(before[1][1], after[1][1])
 
+    def test_pooled_mean_preserves_empty_bags(self) -> None:
+        group = self._make_group(pooling_mode="mean")
+        feature_indices = (
+            torch.tensor([1, 3, 2], dtype=torch.int64),
+            torch.tensor([0, 2], dtype=torch.int64),
+        )
+        feature_offsets = (
+            torch.tensor([0, 2, 2, 3], dtype=torch.int64),
+            torch.tensor([0, 0, 1, 2], dtype=torch.int64),
+        )
+
+        actual = group(feature_indices, feature_offsets)
+        weights = group.split_embedding_weights()
+        expected = tuple(
+            torch.nn.functional.embedding_bag(
+                indices,
+                weight,
+                offsets,
+                mode="mean",
+                include_last_offset=True,
+            )
+            for indices, offsets, weight in zip(
+                feature_indices,
+                feature_offsets,
+                weights,
+            )
+        )
+
+        torch.testing.assert_close(actual, expected)
+
     def test_pooled_features_can_share_one_table(self) -> None:
         with patch(
             "fbgemm_gpu.config.feature_list.FeatureGate.is_enabled",
