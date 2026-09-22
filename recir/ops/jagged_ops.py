@@ -128,7 +128,7 @@ _CONCAT_2D_JAGGED_SCHEMA = "concat_2d_jagged(Tensor values_left, Tensor offsets_
 # Schema for split_2d_jagged: (values, offsets_left, offsets_right) -> (Tensor, Tensor)
 # Splits a jagged tensor into left and right parts. The backward is
 # concat_2d_jagged (registered via register_autograd), so no separate backward op.
-_SPLIT_2D_JAGGED_SCHEMA = "split_2d_jagged(Tensor values, Tensor offsets_left, Tensor offsets_right, int seq_len_a, int seq_len_b) -> (Tensor, Tensor)"
+_SPLIT_2D_JAGGED_SCHEMA = "split_2d_jagged(Tensor values, Tensor offsets_left, Tensor offsets_right, SymInt seq_len_a, SymInt seq_len_b) -> (Tensor, Tensor)"
 
 _LIB.define(_DENSE_TO_JAGGED_SCHEMA)
 _LIB.define(_JAGGED_TO_PADDED_DENSE_SCHEMA)
@@ -308,7 +308,7 @@ def _split_2d_jagged_fake(
     seq_len_a: int,
     seq_len_b: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Fake tensor implementation for split (static output sizes)."""
+    """Fake tensor implementation for split with caller-provided output sizes."""
     if values.dim() == 1:
         left_shape = (seq_len_a,)
         right_shape = (seq_len_b,)
