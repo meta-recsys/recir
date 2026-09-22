@@ -166,6 +166,7 @@ class XLADeviceStateManager(DeviceStateManager):
         present) its optimizer state.
         """
         fqns = self.state_fqns
+        mismatches: List[str] = []
         with torch.no_grad():
             for i, state_tensor in enumerate(flat_state):
                 if i >= len(source):
@@ -181,10 +182,29 @@ class XLADeviceStateManager(DeviceStateManager):
                 if isinstance(updated, torch.Tensor):
                     if updated.data_ptr() == state_tensor.data_ptr():
                         continue
-                    assert updated.shape == state_tensor.shape
-                    state_tensor.copy_(updated)
+                    updated_tensor = updated
                 else:
-                    state_tensor.copy_(_jax_to_torch(updated, self.torch_device))
+                    updated_tensor = _jax_to_torch(updated, self.torch_device)
+                if updated_tensor.shape != state_tensor.shape:
+                    fqn = fqns[i] if fqns is not None and i < len(fqns) else "<unknown>"
+                    source_type = (
+                        f"{type(updated).__module__}.{type(updated).__qualname__}"
+                    )
+                    mismatches.append(
+                        f"  [{i}] {fqn}: output shape {tuple(updated_tensor.shape)} "
+                        f"({updated_tensor.dtype}) != host state shape "
+                        f"{tuple(state_tensor.shape)} ({state_tensor.dtype}); "
+                        f"source={source_type}"
+                    )
+                    continue
+                state_tensor.copy_(updated_tensor)
+
+        if mismatches:
+            raise RuntimeError(
+                "Compiled graph state outputs do not match host state shapes "
+                f"({len(mismatches)}/{len(flat_state)} entries):\n"
+                + "\n".join(mismatches)
+            )
 
     def copy_state_to_host(
         self,

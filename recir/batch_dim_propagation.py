@@ -407,28 +407,20 @@ def _output_batch_dim_for(
     ):
         return input_batch_dim
 
-    # view / reshape / _unsafe_view(input, sizes): default-passthrough.
-    # The leading-axis batch dim is preserved by ALL common view patterns
-    # used in engram / Gemma3 / FlatMM:
-    #   * [B, S, D] -> [B*S, D]              (flatten batch+seq)
-    #   * [B, S, H, D] -> [B, S, H*D]        (flatten heads)
-    #   * [B, S, D] -> [-1, D]               (negative-one collapse)
-    #   * [B, 1, D] -> [B, D]                (squeeze-like)
-    # In each, axis 0 still carries the batch sharding even if its size
-    # changes. Position-changing views (e.g. [B, S, D] -> [D, S, B]) are
-    # rare in practice; we accept the small risk of over-propagating
-    # because the alternative (returning None) caused 182 view nodes per
-    # engram step to drop is_batch_input, which surgery-downstream
-    # consumes as REPLICATED -> JAX broadcast mismatch at lower time.
-    # The only case we still bail on is "batch_dim is out of bounds for
-    # the new shape" (e.g. a view that drops dims below batch_dim).
+    # view / reshape / _unsafe_view(input, sizes): axis 0 still carries
+    # batch sharding through common flatten patterns such as [B, S, D] ->
+    # [B*S, D]. An inner batch axis needs stronger proof: for sequence-first
+    # [L, N, E], [L*N, E] folds N into axis 0, so retaining batch_dim=1 would
+    # incorrectly label the feature axis as batch.
     if target in (
         aten.view.default,
         aten.reshape.default,
         aten._unsafe_view.default,
         getattr(aten.view_copy, "default", None),
     ):
-        return _passthrough_if_rank_ok(node, input_batch_dim)
+        if input_batch_dim == 0:
+            return _passthrough_if_rank_ok(node, input_batch_dim)
+        return _view_passthrough_for_inner_batch_dim(node, input_batch_dim)
 
     # expand(input, sizes): only changes size-1 dims; non-1 dims must match
     # input. So a batch_dim with size > 1 will pass through unchanged; a
@@ -457,6 +449,35 @@ def _output_batch_dim_for(
         return input_batch_dim
     # Unknown op - don't propagate.
     return None
+
+
+def _view_passthrough_for_inner_batch_dim(
+    node: fx.Node, input_batch_dim: int
+) -> Optional[int]:
+    """Preserve an inner batch axis only when the view leaves it in place."""
+    if not node.args or not isinstance(node.args[0], fx.Node):
+        return None
+    input_val = node.args[0].meta.get("val")
+    output_val = node.meta.get("val")
+    if not hasattr(input_val, "shape") or not hasattr(output_val, "shape"):
+        return None
+    input_shape = tuple(input_val.shape)
+    output_shape = tuple(output_val.shape)
+    if input_batch_dim >= min(len(input_shape), len(output_shape)):
+        return None
+    if input_shape[input_batch_dim] != output_shape[input_batch_dim]:
+        return None
+
+    input_prefix_size = 1
+    output_prefix_size = 1
+    for input_size, output_size in zip(
+        input_shape[:input_batch_dim], output_shape[:input_batch_dim]
+    ):
+        input_prefix_size *= input_size
+        output_prefix_size *= output_size
+    if input_prefix_size != output_prefix_size:
+        return None
+    return input_batch_dim
 
 
 def _passthrough_if_rank_ok(node: fx.Node, input_batch_dim: int) -> Optional[int]:

@@ -310,6 +310,40 @@ class XLADeviceStateManagerTest(unittest.TestCase):
         self.assertTrue(torch.equal(flat_state[0], updated_torch))
         mock_jax_to_torch.assert_called_once_with(updated, manager.torch_device)
 
+    def test_shape_mismatch_names_all_entries(self) -> None:
+        manager = XLADeviceStateManager()
+        manager.state_fqns = [
+            "encoder.weight",
+            "decoder.in_proj_weight",
+            "decoder.in_proj_weight.exp_avg",
+            "embedding.table",
+        ]
+        flat_state = [
+            torch.zeros(2, 2),
+            torch.zeros(2, 2),
+            torch.zeros(2, 2),
+            torch.zeros(2, 2),
+        ]
+        manager.device_state = [
+            torch.ones(2, 2),
+            torch.zeros(4, 1),
+            torch.zeros(1, 4),
+            torch.zeros(8, 8),
+        ]
+
+        with self.assertRaises(RuntimeError) as context:
+            manager.copy_state_to_host(flat_state, skip_fqns=["embedding"])
+
+        message = str(context.exception)
+        self.assertIn("decoder.in_proj_weight", message)
+        self.assertIn("output shape (4, 1)", message)
+        self.assertIn("host state shape (2, 2)", message)
+        self.assertIn("decoder.in_proj_weight.exp_avg", message)
+        self.assertIn("output shape (1, 4)", message)
+        self.assertNotIn("encoder.weight", message)
+        self.assertNotIn("embedding.table", message)
+        self.assertTrue(torch.equal(flat_state[0], torch.ones(2, 2)))
+
     def test_final_call_flushes_device_state_before_host_inputs(self) -> None:
         manager = XLADeviceStateManager()
         cached_state = [object()]

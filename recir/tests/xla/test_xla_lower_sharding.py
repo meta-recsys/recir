@@ -69,6 +69,42 @@ class ToShardedJaxTest(unittest.TestCase):
         self.assertIsNotNone(sharding)
         self.assertEqual(sharding.spec, P(None, "torch_dist"))
 
+    def test_batch_boundary_skips_fsdp_state(self) -> None:
+        graph = torch.fx.Graph()
+        state = graph.placeholder("in_proj_weight")
+        state.meta["val"] = torch.empty(768, 256)
+        state.meta["is_batch_input"] = True
+        state.meta["batch_dim"] = 1
+        state.meta["is_fsdp_sharded"] = True
+
+        sharding = _XLAModule._batch_boundary_output_sharding(state, self.mesh)
+
+        self.assertIsNone(sharding)
+
+    def test_batch_boundary_skips_explicit_sharded_state_output(self) -> None:
+        graph = torch.fx.Graph()
+        state = graph.placeholder("in_proj_weight")
+        state.meta["val"] = torch.empty(768, 256)
+        state.meta["is_batch_input"] = True
+        state.meta["batch_dim"] = 1
+        state.meta["is_fsdp_sharded_output"] = True
+
+        sharding = _XLAModule._batch_boundary_output_sharding(state, self.mesh)
+
+        self.assertIsNone(sharding)
+
+    def test_batch_boundary_skips_explicit_replicated_state_output(self) -> None:
+        graph = torch.fx.Graph()
+        state = graph.placeholder("optimizer_step")
+        state.meta["val"] = torch.empty(768, 256)
+        state.meta["is_batch_input"] = True
+        state.meta["batch_dim"] = 1
+        state.meta["is_fsdp_sharded_output"] = False
+
+        sharding = _XLAModule._batch_boundary_output_sharding(state, self.mesh)
+
+        self.assertIsNone(sharding)
+
     def test_hybrid_mesh_shards_batch_over_data_and_fsdp_axes(self) -> None:
         devices = list(jax.devices())
         with mock.patch(

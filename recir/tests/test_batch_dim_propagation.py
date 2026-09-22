@@ -36,7 +36,8 @@ from recir.batch_dim_propagation import (
 # import, `torch.ops.recir.mark_boundary` is undefined at test-collection
 # time.
 from recir.ops import marker as _marker  # noqa: F401
-from torch import fx
+from torch import fx, nn
+from torch.fx.experimental.proxy_tensor import make_fx
 
 
 def _make_placeholder(
@@ -172,6 +173,32 @@ class PropagateBatchInputMetaTest(unittest.TestCase):
 
         self.assertTrue(viewed.meta.get("is_batch_input"))
         self.assertEqual(viewed.meta.get("batch_dim"), 0)
+
+    def test_sequence_first_flatten_drops_batch_tag(self) -> None:
+        graph = fx.Graph()
+        x = _make_placeholder(graph, "x", torch.empty(4, 2, 16), batch_dim=1)
+        viewed = graph.call_function(torch.ops.aten.view.default, args=(x, [8, 16]))
+        _set_val(viewed, torch.empty(8, 16))
+        graph.output(viewed)
+
+        self._run_propagation_on(graph)
+
+        self.assertFalse(viewed.meta.get("is_batch_input", False))
+        self.assertNotIn("batch_dim", viewed.meta)
+
+    def test_sequence_first_trailing_split_preserves_batch_tag(self) -> None:
+        graph = fx.Graph()
+        x = _make_placeholder(graph, "x", torch.empty(4, 2, 16), batch_dim=1)
+        viewed = graph.call_function(
+            torch.ops.aten.view.default, args=(x, [4, 2, 4, 4])
+        )
+        _set_val(viewed, torch.empty(4, 2, 4, 4))
+        graph.output(viewed)
+
+        self._run_propagation_on(graph)
+
+        self.assertTrue(viewed.meta.get("is_batch_input"))
+        self.assertEqual(viewed.meta.get("batch_dim"), 1)
 
     def test_view_drops_below_batch_dim_does_not_propagate(self) -> None:
         """view that produces a shape with rank <= batch_dim must NOT propagate."""
@@ -810,6 +837,43 @@ class PropagateFSDPShardedMetaTest(unittest.TestCase):
         propagate_fsdp_sharded_meta(fx.GraphModule(torch.nn.Module(), graph))
 
         self.assertFalse(flipped.meta.get("is_fsdp_sharded", False))
+
+
+class SequenceFirstAttentionPropagationTest(unittest.TestCase):
+    def test_cross_attention_weight_gradient_is_not_batch_tagged(self) -> None:
+        class CrossAttention(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.multihead_attn = nn.MultiheadAttention(16, 2)
+
+            def forward(
+                self, target: torch.Tensor, memory: torch.Tensor
+            ) -> torch.Tensor:
+                output, _ = self.multihead_attn(target, memory, memory)
+                return output.sum()
+
+        module = CrossAttention()
+
+        def step(target: torch.Tensor, memory: torch.Tensor) -> torch.Tensor:
+            loss = module(target, memory)
+            loss.backward()
+            return loss
+
+        gm = make_fx(step)(torch.randn(4, 2, 16), torch.randn(6, 2, 16))
+        placeholders = [node for node in gm.graph.nodes if node.op == "placeholder"]
+        for node in placeholders[:2]:
+            node.meta["is_batch_input"] = True
+            node.meta["batch_dim"] = 1
+        propagate_batch_input_meta(gm)
+
+        weight_shape = tuple(module.multihead_attn.in_proj_weight.shape)
+        offenders = [
+            node.name
+            for node in gm.graph.nodes
+            if node.meta.get("is_batch_input")
+            and tuple(getattr(node.meta.get("val"), "shape", ())) == weight_shape
+        ]
+        self.assertEqual([], offenders)
 
 
 class StackCatPropagationTest(unittest.TestCase):

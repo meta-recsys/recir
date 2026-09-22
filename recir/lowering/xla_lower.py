@@ -1028,6 +1028,13 @@ class _XLAModule(torch.nn.Module):
             "is_batch_input", False
         ):
             return None
+        # State placement is explicit and must not be overridden by activation
+        # batch-dimension inference. The output-sharding cascade handles these
+        # leaves in its FSDP or replicated-state branches below.
+        if leaf.meta.get("is_fsdp_sharded", False) or (
+            "is_fsdp_sharded_output" in leaf.meta
+        ):
+            return None
         val = leaf.meta.get("val")
         ndim = val.ndim if hasattr(val, "ndim") else 0
         batch_dim = leaf.meta.get("batch_dim", 0)
