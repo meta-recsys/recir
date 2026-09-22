@@ -698,11 +698,12 @@ class TraceableMoTPreprocessor(nn.Module):
         # canonical per-request input when partial lowering builds a fresh
         # ShapeEnv. Keep every RO-shaped output on the num_candidates symbol.
         batch = input_tensors[4].shape[0]
-        # The NRO batch is the data-dependent sum of num_candidates. Input
-        # tensor shapes may contain only the trace sample's total, so all
-        # candidate-shaped outputs share one fresh runtime size instead.
-        nro_batch = torch.library.get_ctx().new_dynamic_size()
-        torch._check_is_size(nro_batch)
+        # Dynamic inputs already carry the canonical candidate symbol. Static
+        # fake traces still need a fresh size for the data-dependent total.
+        nro_batch = self._canonical_nro_batch_size(input_tensors)
+        if not isinstance(nro_batch, torch.SymInt):
+            nro_batch = torch.library.get_ctx().new_dynamic_size()
+            torch._check_is_size(nro_batch)
         jagged_group_sizes: Dict[Any, Any] = {}
         for spec in self._output_spec:
             out.extend(

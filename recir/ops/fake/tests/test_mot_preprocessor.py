@@ -6,6 +6,7 @@ from typing import cast
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from hammer.v3.modules.core.features.bundle import FeatureBundle
 from hammer.v3.modules.core.features.descriptor import FeatureDescriptor
 from hammer.v3.modules.core.features.input_features import InputFeatures
@@ -134,6 +135,31 @@ class _RawAdapter(nn.Module):
         )
 
 
+class _NROConsumerAdapter(nn.Module):
+    def __init__(self, preprocessor: TraceableMoTPreprocessor) -> None:
+        super().__init__()
+        self._raw_adapter = _RawAdapter(preprocessor)
+
+    def forward(
+        self,
+        ro_values: torch.Tensor,
+        ro_lengths: torch.Tensor,
+        nro_values: torch.Tensor,
+        nro_lengths: torch.Tensor,
+        num_candidates: torch.Tensor,
+        supervision_weight: torch.Tensor,
+    ) -> torch.Tensor:
+        _, nro_mask, _, _, _, _, _ = self._raw_adapter(
+            ro_values,
+            ro_lengths,
+            nro_values,
+            nro_lengths,
+            num_candidates,
+            supervision_weight,
+        )
+        return F.dropout(nro_mask, p=0.5, training=True)
+
+
 def _make_bundle(batch_size: int, nro_batch: int) -> FeatureBundle:
     ro_kjt = KeyedJaggedTensor(
         keys=["ro"],
@@ -257,6 +283,24 @@ class TraceableMoTPreprocessorTest(TestCase):
         # Traced at batch 2, run at batch 3: a batch-shaped policy would have
         # baked (2,) in here.
         self.assertEqual(merged_max_seq_len.shape, (1,))
+
+    def test_trace_allows_downstream_ops_on_dynamic_nro_outputs(self) -> None:
+        sample = _make_bundle(batch_size=2, nro_batch=4)
+        model = _Model(_StubMoTPreprocessor())
+        self.assertEqual(patch_mot_preprocessor_for_tracing(model, sample), 1)
+        adapter = _NROConsumerAdapter(
+            cast(TraceableMoTPreprocessor, model.preprocessor)
+        )
+        fake_mode, fake_args = _dynamic_fake_args(_raw_args(sample))
+        with fake_mode:
+            traced = make_fx(
+                adapter,
+                tracing_mode="fake",
+                _allow_non_fake_inputs=False,
+            )(*fake_args)
+
+        runtime = _make_bundle(batch_size=3, nro_batch=6)
+        self.assertEqual(traced(*_raw_args(runtime)).shape, (6,))
 
     def test_trace_preserves_data_dependent_nro_batch_from_static_sample(
         self,
