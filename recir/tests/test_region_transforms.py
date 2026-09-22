@@ -843,12 +843,56 @@ class ModelWithCustomAF(nn.Module):
         return ScaleAndShiftFunction.apply(h, self.scale, self.shift)
 
 
+@torch.library.custom_op("recir_test::region_transform_scale", mutates_args=())
+def _region_transform_scale(x: torch.Tensor) -> torch.Tensor:
+    return x * 2
+
+
+@_region_transform_scale.register_fake
+def _region_transform_scale_fake(x: torch.Tensor) -> torch.Tensor:
+    return torch.empty_like(x)
+
+
+def _region_transform_scale_backward(
+    ctx: Any,
+    grad_output: torch.Tensor,
+) -> torch.Tensor:
+    return grad_output * 2
+
+
+_region_transform_scale.register_autograd(_region_transform_scale_backward)
+
+
 # ---------------------------------------------------------------------------
 # Unit tests: _preserve_all_autograd_function_leaves
 # ---------------------------------------------------------------------------
 
 
 class TestPreserveAutogradFunctionLeaves(unittest.TestCase):
+    def test_torch_library_op_uses_registered_fake_and_backward(self) -> None:
+        fake_mode = _make_fake_mode()
+        x = torch.randn(4, 8, requires_grad=True)
+
+        with fake_mode, _preserve_all_autograd_function_leaves():
+            gm = make_fx(
+                _region_transform_scale,
+                tracing_mode="fake",
+                _allow_non_fake_inputs=True,
+            )(fake_mode.from_tensor(x))
+
+        self.assertIn(
+            torch.ops.recir_test.region_transform_scale.default,
+            [node.target for node in gm.graph.nodes],
+        )
+        traced_input = torch.randn(4, 8, requires_grad=True)
+        output = gm(traced_input)
+        output.sum().backward()
+        torch.testing.assert_close(output, traced_input.detach() * 2)
+        torch.testing.assert_close(
+            traced_input.grad,
+            torch.full_like(traced_input, 2),
+        )
+
     def test_leaf_produces_single_node(self) -> None:
         """With leaf preservation, the AF appears as a single call_function
         node in the make_fx graph, not decomposed into individual aten ops."""
