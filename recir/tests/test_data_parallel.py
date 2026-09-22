@@ -344,12 +344,11 @@ class TestDataParallel(DTensorTestBase):
         sgd_configs: list[dict[str, Any]] = [
             {"lr": 0.1},
             {"lr": 0.1, "momentum": 0.9},
-            {"lr": 0.1, "momentum": 0.9, "foreach": True},
         ]
 
         for config in sgd_configs:
             ddp_mod = SimpleMLP().cuda(self.rank)
-            ddp_opt = torch.optim.SGD(ddp_mod.parameters(), **config)
+            ddp_opt = torch.optim.SGD(ddp_mod.parameters(), **config, foreach=True)
 
             train_batch = (
                 torch.randn((128, 50), device=torch.device(self.rank)),
@@ -357,7 +356,7 @@ class TestDataParallel(DTensorTestBase):
             )
 
             ref_mod = DDP(deepcopy(ddp_mod), device_ids=[self.rank])
-            ref_opt = torch.optim.SGD(ref_mod.parameters(), **config)
+            ref_opt = torch.optim.SGD(ref_mod.parameters(), **config, foreach=True)
 
             self._test_ddp(
                 ddp_mod,
@@ -401,12 +400,11 @@ class TestDataParallel(DTensorTestBase):
         sgd_configs: list[dict[str, Any]] = [
             {"lr": 0.1},
             {"lr": 0.1, "momentum": 0.9},
-            {"lr": 0.1, "momentum": 0.9, "foreach": True},
         ]
 
         for config in sgd_configs:
             fsdp_mod = SimpleMLP().cuda(self.rank)
-            fsdp_opt = torch.optim.SGD(fsdp_mod.parameters(), **config)
+            fsdp_opt = torch.optim.SGD(fsdp_mod.parameters(), **config, foreach=True)
 
             train_batch = (
                 torch.randn((128, 50), device=torch.device(self.rank)),
@@ -414,7 +412,7 @@ class TestDataParallel(DTensorTestBase):
             )
 
             ref_mod = FSDP(deepcopy(fsdp_mod), device_id=self.rank)
-            ref_opt = torch.optim.SGD(ref_mod.parameters(), **config)
+            ref_opt = torch.optim.SGD(ref_mod.parameters(), **config, foreach=True)
             self._test_fsdp(
                 fsdp_mod,
                 ref_mod,
@@ -485,7 +483,7 @@ class TestDataParallel(DTensorTestBase):
         step = make_train_step(reduction)
         for parallel_mode in ["replicate", "fully_shard"]:
             mod = WrapperModule().cuda(self.rank)
-            opt = torch.optim.SGD(mod.parameters(), lr=0.1)
+            opt = torch.optim.SGD(mod.parameters(), lr=0.1, foreach=True)
 
             train_batch = (
                 torch.randn((128, 50), device=torch.device(self.rank)),
@@ -497,7 +495,7 @@ class TestDataParallel(DTensorTestBase):
                 if parallel_mode == "fully_shard"
                 else DDP(deepcopy(mod), device_ids=[self.rank])
             )
-            ref_opt = torch.optim.SGD(ref_mod.parameters(), lr=0.1)
+            ref_opt = torch.optim.SGD(ref_mod.parameters(), lr=0.1, foreach=True)
             test_fn = (
                 self._test_fsdp if parallel_mode == "fully_shard" else self._test_ddp
             )
@@ -559,7 +557,7 @@ class TestPerOpFSDP(DTensorTestBase):
     def test_fully_shard_separate_allgathers(self) -> None:
         """Verify FSDP inserts allgathers for each parameter."""
         mod = SimpleMLP().cuda(self.rank)
-        opt = torch.optim.SGD(mod.parameters(), lr=0.1)
+        opt = torch.optim.SGD(mod.parameters(), lr=0.1, foreach=True)
 
         train_batch = (
             torch.randn((128, 50), device=torch.device(self.rank)),
@@ -610,7 +608,7 @@ class TestPerOpFSDP(DTensorTestBase):
     def test_fully_shard_shared_weight_allgathers(self) -> None:
         """Verify allgather counts when a parameter is reused multiple times in forward."""
         mod = SharedWeightMLP().cuda(self.rank)
-        opt = torch.optim.SGD(mod.parameters(), lr=0.1)
+        opt = torch.optim.SGD(mod.parameters(), lr=0.1, foreach=True)
 
         train_batch = (
             torch.randn((64, 32), device=torch.device(self.rank)),
@@ -650,7 +648,7 @@ class TestPerOpFSDP(DTensorTestBase):
         The test still runs but no assertions fire (trivially passes).
         """
         mod = SimpleMLP().cuda(self.rank)
-        opt = torch.optim.SGD(mod.parameters(), lr=0.1)
+        opt = torch.optim.SGD(mod.parameters(), lr=0.1, foreach=True)
 
         train_batch = (
             torch.randn((128, 50), device=torch.device(self.rank)),
@@ -692,7 +690,7 @@ class TestPerOpFSDP(DTensorTestBase):
     def test_fully_shard_numerical_correctness_with_per_op(self) -> None:
         """Verify per-op FSDP still produces numerically correct results."""
         fsdp_mod = SimpleMLP().cuda(self.rank)
-        fsdp_opt = torch.optim.SGD(fsdp_mod.parameters(), lr=0.1)
+        fsdp_opt = torch.optim.SGD(fsdp_mod.parameters(), lr=0.1, foreach=True)
 
         train_batch = (
             torch.randn((128, 50), device=torch.device(self.rank)),
@@ -700,7 +698,7 @@ class TestPerOpFSDP(DTensorTestBase):
         )
 
         ref_mod = FSDP(deepcopy(fsdp_mod), device_id=self.rank)
-        ref_opt = torch.optim.SGD(ref_mod.parameters(), lr=0.1)
+        ref_opt = torch.optim.SGD(ref_mod.parameters(), lr=0.1, foreach=True)
 
         ref_inp = deepcopy(train_batch)
 
@@ -741,7 +739,7 @@ class TestPerOpFSDP(DTensorTestBase):
         insertion + ordering relative to last consumer) is unchanged.
         """
         mod = SimpleMLP().cuda(self.rank)
-        opt = torch.optim.SGD(mod.parameters(), lr=0.1)
+        opt = torch.optim.SGD(mod.parameters(), lr=0.1, foreach=True)
 
         train_batch = (
             torch.randn((128, 50), device=torch.device(self.rank)),
@@ -826,9 +824,9 @@ class TestPerOpFSDP(DTensorTestBase):
         device = torch.device(self.rank)
 
         mod_with = LargeLinearModel().cuda(self.rank)
-        opt_with = torch.optim.SGD(mod_with.parameters(), lr=0.1)
+        opt_with = torch.optim.SGD(mod_with.parameters(), lr=0.1, foreach=True)
         mod_without = deepcopy(mod_with)
-        opt_without = torch.optim.SGD(mod_without.parameters(), lr=0.1)
+        opt_without = torch.optim.SGD(mod_without.parameters(), lr=0.1, foreach=True)
 
         batch_with = (
             torch.randn((4, 1024), device=device),
@@ -2075,6 +2073,24 @@ class TestHybridParallelInit(unittest.TestCase):
         mode = HybridParallel(dense_style="fully_shard")
         self.assertEqual(mode.embedding_plan.param_fqns, set())
 
+    def test_empty_dense_fsdp_module_set_raises(self) -> None:
+        with self.assertRaisesRegex(
+            ValueError, "dense_fsdp_module_fqns must not be empty"
+        ):
+            HybridParallel(
+                dense_style="fully_shard",
+                dense_fsdp_module_fqns=set(),
+            )
+
+    def test_dense_fsdp_modules_require_fully_shard(self) -> None:
+        with self.assertRaisesRegex(
+            ValueError, "dense_fsdp_module_fqns requires dense_style"
+        ):
+            HybridParallel(
+                dense_style="replicate",
+                dense_fsdp_module_fqns={"linear"},
+            )
+
     def test_dense_style_mapping(self) -> None:
         """'replicate'/'fully_shard'/'default' map to correct DataParallelStyle values."""
         mode_rep = HybridParallel(dense_style="replicate")
@@ -2121,6 +2137,34 @@ class TestShardParamsByPlan(DTensorTestBase):
         )
         self.assertEqual(
             params["linear.weight"].shape[0], orig_lin_rows // self.world_size
+        )
+
+    @skip_if_lt_x_gpu(2)
+    @with_comms
+    def test_hybrid_parallel_shards_selected_dense_module(self) -> None:
+        model = EmbeddingMLP().cuda(self.rank)
+        params = OrderedDict(
+            [
+                ("emb.weight", model.emb.weight.data.clone()),
+                ("linear.weight", model.linear.weight.data.clone()),
+            ]
+        )
+        original_embedding_shape = params["emb.weight"].shape
+        original_linear_rows = params["linear.weight"].shape[0]
+        mesh = DeviceMesh("cuda", torch.arange(self.world_size))
+        mode = HybridParallel(
+            dense_style="fully_shard",
+            dense_fsdp_module_fqns={"linear"},
+        )
+        mode._mesh = mesh
+
+        sharded_keys = mode.shard_params(model, params, None)
+
+        self.assertEqual(sharded_keys, {"linear.weight"})
+        self.assertEqual(params["emb.weight"].shape, original_embedding_shape)
+        self.assertEqual(
+            params["linear.weight"].shape[0],
+            original_linear_rows // self.world_size,
         )
 
     @skip_if_lt_x_gpu(2)

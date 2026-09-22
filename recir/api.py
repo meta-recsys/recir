@@ -1154,18 +1154,32 @@ def _discover_for_region_transforms(
     return _RegionDiscovery(called_modules=called_modules)
 
 
+def _relative_parametrize_kwargs(
+    root_fqn: str, parametrize_kwargs: Dict[str, Any]
+) -> Dict[str, Any]:
+    if not root_fqn:
+        return parametrize_kwargs
+    prefix = f"{root_fqn}."
+    return {
+        key: {fqn[len(prefix) :] for fqn in fqns if fqn.startswith(prefix)}
+        for key, fqns in parametrize_kwargs.items()
+    }
+
+
 def _enter_region_transform_contexts(
     region_stack: ExitStack,  # pyre-ignore
     transforms: List[RegionTransform],
     discovery: Optional[_RegionDiscovery],
     fake_mode: FakeTensorMode,
     *,
-    parametrize_cm_factory: Optional[Callable[[nn.Module], Callable[[], Any]]] = None,
+    parametrize_cm_factory: Optional[
+        Callable[[str, nn.Module], Callable[[], Any]]
+    ] = None,
 ) -> None:
     """Enter `_apply_region_transforms` once per forward root on `region_stack`.
 
     No-op when ``discovery`` is None or ``transforms`` is empty.
-    ``parametrize_cm_factory(root_mod)`` returns a context-manager factory
+    ``parametrize_cm_factory(root_fqn, root_mod)`` returns a context-manager factory
     used during the per-root trace inside ``_apply_region_transforms``;
     pass ``None`` when no parametrization is needed (e.g. GSPMD path).
     """
@@ -1195,7 +1209,7 @@ def _enter_region_transform_contexts(
     ):
         root_mod, root_fake_args, root_fake_kwargs = root_data[fqn]
         cm_factories = (
-            [parametrize_cm_factory(root_mod)]
+            [parametrize_cm_factory(fqn, root_mod)]
             if parametrize_cm_factory is not None
             else []
         )
@@ -1494,7 +1508,12 @@ def trace(  # noqa: C901 — orchestration: dispatches on parallel_mode flavor (
                 _mod, region_transforms_list, base_skip=embedding_param_fqns
             )
             regather_transform = RegatherTransform(
-                skip_param_fqns=regather_skip or None
+                skip_param_fqns=regather_skip or None,
+                forward_root_fqns=(
+                    parallel_mode.dense_fsdp_module_fqns
+                    if isinstance(parallel_mode, HybridParallel)
+                    else None
+                ),
             )
             internal_transforms.append(regather_transform)
         if isinstance(parallel_mode, HybridParallel) and embedding_param_fqns:
@@ -1559,10 +1578,12 @@ def trace(  # noqa: C901 — orchestration: dispatches on parallel_mode flavor (
         sharded_param_fqns: Optional[set[str]] = None
         replicated_param_fqns: set[str] = set()
         if (
-            isinstance(parallel_mode, DataParallel)
+            isinstance(parallel_mode, (DataParallel, HybridParallel))
             and dp_style == DataParallelStyle.FULLY_SHARD
         ):
-            sharded_param_fqns = parameter_fqns & sharded_keys
+            sharded_param_fqns = (parameter_fqns & sharded_keys) - set(
+                embedding_param_fqns or ()
+            )
             replicated_param_fqns = parameter_fqns - sharded_keys
             if regather_transform is not None:
                 regather_transform.skip_param_fqns.update(replicated_param_fqns)
@@ -1585,11 +1606,11 @@ def trace(  # noqa: C901 — orchestration: dispatches on parallel_mode flavor (
                 dp_transforms,
                 discovery,
                 fake_mode,
-                parametrize_cm_factory=lambda root_mod: partial(
+                parametrize_cm_factory=lambda root_fqn, root_mod: partial(
                     parametrize_params,
                     root_mod,
                     collectives_fn,
-                    **parametrize_kwargs,
+                    **_relative_parametrize_kwargs(root_fqn, parametrize_kwargs),
                 ),
             )
             # Whether the OUTER trace must parametrize dense params with
@@ -2191,7 +2212,14 @@ def _compile_data_parallel_v2(
     transforms: list[RegionTransform] = []
     regather_transform: Optional[RegatherTransform] = None
     if dp_style == DataParallelStyle.FULLY_SHARD:
-        regather_transform = RegatherTransform(skip_param_fqns=embedding_param_fqns)
+        regather_transform = RegatherTransform(
+            skip_param_fqns=embedding_param_fqns,
+            forward_root_fqns=(
+                parallel_mode.dense_fsdp_module_fqns
+                if isinstance(parallel_mode, HybridParallel)
+                else None
+            ),
+        )
         transforms.append(regather_transform)
     if isinstance(parallel_mode, HybridParallel) and embedding_param_fqns:
         transforms.append(
@@ -2251,10 +2279,12 @@ def _compile_data_parallel_v2(
     sharded_param_fqns: Optional[set[str]] = None
     replicated_param_fqns: set[str] = set()
     if (
-        isinstance(parallel_mode, DataParallel)
+        isinstance(parallel_mode, (DataParallel, HybridParallel))
         and dp_style == DataParallelStyle.FULLY_SHARD
     ):
-        sharded_param_fqns = parameter_fqns & sharded_keys
+        sharded_param_fqns = (parameter_fqns & sharded_keys) - set(
+            embedding_param_fqns or ()
+        )
         replicated_param_fqns = parameter_fqns - sharded_keys
         if regather_transform is not None:
             regather_transform.skip_param_fqns.update(replicated_param_fqns)
@@ -2277,11 +2307,11 @@ def _compile_data_parallel_v2(
             transforms,
             discovery,
             fake_mode,
-            parametrize_cm_factory=lambda root_mod: partial(
+            parametrize_cm_factory=lambda root_fqn, root_mod: partial(
                 parametrize_params,
                 root_mod,
                 collectives_fn,
-                **parametrize_kwargs,
+                **_relative_parametrize_kwargs(root_fqn, parametrize_kwargs),
             ),
         )
 
