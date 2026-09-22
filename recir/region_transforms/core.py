@@ -105,8 +105,7 @@ def _discover_called_modules(
 
 
 def _build_leaf_apply(orig_fn: Any) -> Any:
-    """Build a replacement ``autograd.Function.apply`` classmethod that records a
-    single opaque ``call_function`` leaf during ``make_fx`` tracing.
+    """Preserve user-defined ``autograd.Function`` calls as ``make_fx`` leaves.
 
     During ``make_fx``, ``autograd.Function.apply()`` is traced *through*: each
     aten op inside ``forward()`` becomes a separate FX node and the custom
@@ -127,6 +126,11 @@ def _build_leaf_apply(orig_fn: Any) -> Any:
     ) -> Any:
         proxy_mode = get_proxy_mode()
         if proxy_mode is None:
+            return orig_fn(klass, *args, **kwargs)
+        # torch.library autograd kernels pass private dispatcher metadata that
+        # FX cannot represent. Trace through these implementation wrappers so
+        # ProxyTensor records the registered OpOverload instead.
+        if klass.__module__ == "torch._library.autograd":
             return orig_fn(klass, *args, **kwargs)
 
         tracer: Any = proxy_mode.tracer
@@ -172,11 +176,10 @@ def _build_leaf_apply(orig_fn: Any) -> Any:
 
 @contextmanager
 def _preserve_all_autograd_function_leaves() -> Generator[None, None, None]:
-    """Make EVERY ``autograd.Function`` opaque to the inner ``make_fx`` trace.
+    """Make user-defined ``autograd.Function`` calls opaque to ``make_fx``.
 
-    Patches the base ``torch.autograd.Function.apply`` so that any subclass
-    invoked during the trace collapses to a single opaque leaf (see
-    :func:`_build_leaf_apply`).
+    ``torch.library`` generated wrappers continue through the dispatcher so
+    their registered fake and autograd implementations remain authoritative.
     """
     original_descriptor = torch.autograd.Function.__dict__["apply"]
     orig_fn: Any = getattr(original_descriptor, "__func__", original_descriptor)
@@ -442,11 +445,9 @@ def _apply_region_transforms(
     constant to compensate for DTensor's ``Partial("avg")`` gradient placement
     being lost when ``to_local(grad_placements=...)`` is decomposed by make_fx.
 
-    Every ``torch.autograd.Function`` invoked during the inner ``make_fx``
-    trace is treated as an opaque leaf (see
-    :func:`_preserve_all_autograd_function_leaves`) — its ``forward()`` is NOT
-    decomposed into individual aten ops, preserving its custom ``backward()`` in
-    the traced graph.
+    User-defined ``torch.autograd.Function`` calls are opaque during the inner
+    trace, preserving their custom backward. ``torch.library`` ops retain their
+    registered fake and autograd behavior.
 
     When *fake_kwargs* is supplied, keyword arguments captured during
     discovery are flattened into positional args for ``make_fx`` tracing
