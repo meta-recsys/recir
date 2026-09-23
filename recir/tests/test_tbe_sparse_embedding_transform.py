@@ -18,8 +18,12 @@ import torch.nn as nn
 from functorch import make_fx
 from recir.lowering.partial_lower import _InductorModule, partial_lower
 from recir.ops.fake.kjt import patch_ebc_for_tracing
-from recir.pipeline import build_pipeline, PipelinedGraphModule
-from recir.pipeline_strategies import sdd_pipeline_config, semi_sync_pipeline_config
+from recir.pipeline import build_pipeline, PipelinedGraphModule, SteadyStateGraphModule
+from recir.pipeline_strategies import (
+    embedding_steady_state_pipeline_config,
+    sdd_pipeline_config,
+    semi_sync_pipeline_config,
+)
 from recir.region_transforms.tbe_sparse_embedding import (
     _LookupSite,
     TBESparseEmbeddingTransform,
@@ -1165,6 +1169,27 @@ class TBESparseEmbeddingTransformTest(unittest.TestCase):
         self.assertTrue(
             all(node.args[3] == process_group.group_name for node in all_to_all_nodes)
         )
+
+        steady = build_pipeline(joint, embedding_steady_state_pipeline_config())
+        self.assertIsInstance(steady, SteadyStateGraphModule)
+        crossing_collectives = [
+            (node, user)
+            for node in all_to_all_nodes
+            for user in node.users
+            if user.target == torch.ops._c10d_functional.wait_tensor.default
+            and steady._node_stages[node] == 0
+            and steady._node_stages[user] == 1
+        ]
+        self.assertEqual(len(crossing_collectives), 1)
+        pending_indices, _ = crossing_collectives[0]
+        bucketized_indices = pending_indices.args[0]
+        if not isinstance(bucketized_indices, fx.Node):
+            raise AssertionError(
+                f"Expected FX collective input, got {type(bucketized_indices)}."
+            )
+        self.assertIn(pending_indices, steady._live_after[0])
+        self.assertIn(bucketized_indices, steady._live_after[0])
+        self.assertEqual(steady._node_stages[forward_nodes[0]], 1)
 
         pipeline = build_pipeline(joint, sdd_pipeline_config())
         self.assertIsInstance(pipeline, PipelinedGraphModule)
