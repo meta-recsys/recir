@@ -4,11 +4,15 @@
 # This source code is licensed under the BSD-3-Clause license found in the
 # LICENSE file in the root directory of this source tree.
 
-from typing import Any, List, Optional, Sequence
+import logging
+import time
+from typing import Any, List, Optional, Sequence, Tuple
 
 import torch
 from recir.lowering.device_state import DeviceStateManager
 from recir.lowering.xla_lower import _jax_to_torch, _XLAModule
+
+logger: logging.Logger = logging.getLogger(__name__)
 
 
 class XLADeviceStateManager(DeviceStateManager):
@@ -150,6 +154,8 @@ class XLADeviceStateManager(DeviceStateManager):
         flat_state: List[torch.Tensor],
         source: Sequence[Any],
         skip_fqns: Optional[Sequence[str]] = None,
+        *,
+        log_summary: bool = False,
     ) -> None:
         """Copy ``source[i]`` into ``flat_state[i]``, converting from JAX if needed.
 
@@ -166,6 +172,11 @@ class XLADeviceStateManager(DeviceStateManager):
         present) its optimizer state.
         """
         fqns = self.state_fqns
+        started = time.perf_counter()
+        copied = skipped = 0
+        copied_bytes = 0
+        from_jax_bytes = 0
+        per_entry: List[Tuple[float, str, int, bool]] = []
         with torch.no_grad():
             for i, state_tensor in enumerate(flat_state):
                 if i >= len(source):
@@ -178,13 +189,42 @@ class XLADeviceStateManager(DeviceStateManager):
                 ):
                     continue
                 updated = source[i]
+                entry_started = time.perf_counter() if log_summary else 0.0
+                was_jax = False
                 if isinstance(updated, torch.Tensor):
                     if updated.data_ptr() == state_tensor.data_ptr():
+                        if log_summary:
+                            skipped += 1
                         continue
                     assert updated.shape == state_tensor.shape
                     state_tensor.copy_(updated)
                 else:
+                    was_jax = True
                     state_tensor.copy_(_jax_to_torch(updated, self.torch_device))
+                if log_summary:
+                    nbytes = state_tensor.numel() * state_tensor.element_size()
+                    copied += 1
+                    copied_bytes += nbytes
+                    if was_jax:
+                        from_jax_bytes += nbytes
+                    name = fqns[i] if fqns is not None and i < len(fqns) else f"#{i}"
+                    per_entry.append(
+                        (time.perf_counter() - entry_started, name, nbytes, was_jax)
+                    )
+        if log_summary:
+            elapsed = time.perf_counter() - started
+            gb = copied_bytes / 1e9
+            logger.info(
+                f"[flush] full device->host sync: {copied} entries, {gb:.1f} GB "
+                f"({from_jax_bytes / 1e9:.1f} GB via jax->numpy->torch), "
+                f"{skipped} already-host, {elapsed:.1f}s "
+                f"({gb / elapsed if elapsed else 0:.2f} GB/s)"
+            )
+            for dt, name, nbytes, was_jax in sorted(per_entry, reverse=True)[:8]:
+                logger.info(
+                    f"[flush]   {dt:7.1f}s {nbytes / 1e9:7.1f} GB "
+                    f"{'jax' if was_jax else 'torch':>5} {name}"
+                )
 
     def copy_state_to_host(
         self,
@@ -201,4 +241,7 @@ class XLADeviceStateManager(DeviceStateManager):
         device_state = self.device_state
         if device_state is None:
             return
-        self._copy_state_into(flat_state, device_state, skip_fqns)
+        # Only the full sync is instrumented
+        self._copy_state_into(
+            flat_state, device_state, skip_fqns, log_summary=skip_fqns is None
+        )
