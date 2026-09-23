@@ -225,6 +225,116 @@ class CompileFromGmTest(unittest.TestCase):
         )
         self.assertLess(second_idx, first_idx)
 
+    def test_added_tail_survives_the_post_shard_rebuild(self) -> None:
+        """The happy path: nothing is dropped, so the tail lands where it began.
+
+        ``shard_params`` substitutes state objects, so ``compile_from_gm``
+        rebuilds ``flat_state`` from the post-shard snapshot. The substituted
+        object must still be the one the graph's placeholder is named for, and
+        an entry appended by ``add_state`` must still sit past the base state
+        rather than inside it.
+        """
+        model = _ToyModel()
+        opt = torch.optim.SGD(model.parameters(), lr=0.01, momentum=0.9, foreach=True)
+        weight = model.linear.weight
+        opt.state[weight]["momentum_buffer"] = torch.zeros_like(weight)
+        x = torch.randn(2, 4)
+
+        gm, flat_state = recir.trace(_toy_train_step, model, opt, x)
+        traced_leaf_count = len(_get_trace_ctx(gm).state_fqns)
+        # Stand in for what shard_params does: same structure, new object.
+        replacement = torch.zeros_like(weight)
+        opt.state[weight] = {"momentum_buffer": replacement}
+        tail = torch.tensor(11.0)
+        recir.add_state(gm, flat_state, "extra_input", tail)
+
+        compiled = recir.compile_from_gm(
+            gm,
+            flat_state,
+            parallel_mode=_PassthroughParallel(),
+            backend=_NoopBackend(),
+        )
+
+        state_fqns = compiled.state_manager.state_fqns
+        if state_fqns is None:
+            self.fail("compile_from_gm did not populate state FQNs")
+        replacement_index = next(
+            index
+            for index, value in enumerate(compiled.flat_state)
+            if value is replacement
+        )
+        self.assertEqual(
+            state_fqns[replacement_index],
+            "[1]['linear.weight']['momentum_buffer']",
+        )
+        # The tail is still the first entry past the traced base state.
+        self.assertIs(compiled.flat_state[traced_leaf_count], tail)
+        self.assertEqual(len(compiled.flat_state), traced_leaf_count + 1)
+
+    def test_a_dropped_optimizer_leaf_is_refused_not_absorbed_as_tail(
+        self,
+    ) -> None:
+        """Inferring the tail boundary from a length silently shifts indices.
+
+        Momentum on both parameters makes the traced base state four leaves:
+
+            0 [0]['linear.weight']                      W
+            1 [0]['linear.bias']                        B
+            2 [1]['linear.weight']['momentum_buffer']   Mw
+            3 [1]['linear.bias']['momentum_buffer']     Mb
+
+        so ``add_state`` leaves ``flat_state = [W, B, Mw, Mb, T]``, and the
+        graph has one placeholder per entry, in that order.
+
+        Now drop the FIRST optimizer leaf, ``Mw``. The rebuild is three entries
+        long, and a boundary inferred from that length starts the tail one slot
+        early::
+
+            rebuilt = [W, B, Mb]
+            tail    = flat_state[3:] = [Mb, T]    # should have been [T]
+            result  = [W, B, Mb, Mb, T]
+
+        Same length as before and no error raised, but ``Mw`` is gone, ``Mb``
+        appears twice, and the placeholder the graph wired to ``Mw`` is now fed
+        ``Mb``. Everything downstream that pairs ``flat_state`` with an FQN --
+        a checkpoint save, a restore -- is then off by one, silently.
+
+        Reading the boundary off the traced FQN list instead makes the
+        divergence visible, and it is refused rather than re-aligned.
+        """
+        model = _ToyModel()
+        opt = torch.optim.SGD(model.parameters(), lr=0.01, momentum=0.9, foreach=True)
+        for param in model.parameters():
+            opt.state[param]["momentum_buffer"] = torch.zeros_like(param)
+        x = torch.randn(2, 4)
+
+        gm, flat_state = recir.trace(_toy_train_step, model, opt, x)
+        # Pin the scenario the docstring describes: if pytree ever reorders the
+        # leaves, this fails here rather than quietly testing something else.
+        self.assertEqual(
+            _get_trace_ctx(gm).state_fqns,
+            [
+                "[0]['linear.weight']",
+                "[0]['linear.bias']",
+                "[1]['linear.weight']['momentum_buffer']",
+                "[1]['linear.bias']['momentum_buffer']",
+            ],
+        )
+        recir.add_state(gm, flat_state, "extra_input", torch.tensor(11.0))
+        self.assertEqual(len(flat_state), 5)
+
+        opt.state[model.linear.weight].clear()
+
+        with self.assertRaisesRegex(
+            RuntimeError, "Post-shard state structure no longer matches"
+        ):
+            recir.compile_from_gm(
+                gm,
+                flat_state,
+                parallel_mode=_PassthroughParallel(),
+                backend=_NoopBackend(),
+            )
+
     def test_compile_from_gm_without_trace_ctx_raises(self) -> None:
         """A naked gm (not produced by recir.trace) raises a clear error."""
 
