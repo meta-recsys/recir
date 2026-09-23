@@ -4,21 +4,12 @@
 # chips = 64 chips, keeping --local_batch_size 512 PER HOST (so ~128/chip is
 # unchanged) -> global batch = 512 * 16 = 8192. This is weak scaling: 16x the
 # chips and 16x the global batch at constant per-chip work, so ideal throughput
-# (examples/s) scales 16x vs the 4-chip baseline. Scaling efficiency =
-# Scaling efficiency =
+# (examples/s) scales 16x vs the 4-chip baseline. Scaling efficiency is
 # (ex/s_64 / ex/s_4) / 16.
 #
-# NOTE (HBM-headroom debug): --local_batch_size is temporarily HALVED to 256
-# (global batch 4096, local batch ~32/chip) to ~halve HSTU activation memory.
-# cap=1 fit at compile (92.22G/94.75G) but a peer host hit a runtime OOM on the
-# thin 2.5G margin (see bench_results.md). Restore to 512 once headroom is
-# understood / use_pallas_attn lands.
-#
-# Same model/config/data as the 4-chip bench (synthetic data, S=4096, l1=8/l2=10,
-# num_candidates=10, bf16, materialized HSTU attention) -- only the slice size and
-# global batch differ. Multi-host scaffolding (parallelism, Indexed completion,
-# slice-autoprovisioning, slice topology, TPU init timeouts, tolerations) mirrors
-# rankfm-128chip.yaml. train.py already calls jax.distributed.initialize().
+# Model, batch, data, and TPU settings match the 64-chip Helion control in
+# rankfm_mvai-64chip-bench.yaml. Only the generated job name and
+# RANKFM_MVAI_ATTENTION_BACKEND select this Pallas variant.
 apiVersion: jobset.x-k8s.io/v1alpha2
 kind: JobSet
 metadata:

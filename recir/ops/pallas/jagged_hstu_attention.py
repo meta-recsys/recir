@@ -174,10 +174,13 @@ def _aligned_values_to_packed(
     seq_offsets: jax.Array,
     aligned_offsets: jax.Array,
     total_length: int,
+    max_seq_len: int,
 ) -> tuple[jax.Array, ...]:
     sequence_ids, positions = _packed_row_sources(seq_offsets, total_length)
     source_rows = aligned_offsets[sequence_ids] + positions
-    valid = jnp.arange(total_length, dtype=seq_offsets.dtype) < seq_offsets[-1]
+    valid = (jnp.arange(total_length, dtype=seq_offsets.dtype) < seq_offsets[-1]) & (
+        positions < max_seq_len
+    )
 
     feature_sizes = tuple(value.shape[-1] for value in values)
     combined = values[0] if len(values) == 1 else jnp.concatenate(values, axis=-1)
@@ -196,7 +199,9 @@ def _dense_values_to_packed(
     total_length: int,
 ) -> tuple[jax.Array, ...]:
     sequence_ids, positions = _packed_row_sources(seq_offsets, total_length)
-    valid = jnp.arange(total_length, dtype=seq_offsets.dtype) < seq_offsets[-1]
+    valid = (jnp.arange(total_length, dtype=seq_offsets.dtype) < seq_offsets[-1]) & (
+        positions < values[0].shape[2]
+    )
     positions = jnp.minimum(positions, values[0].shape[2] - 1)
     feature_sizes = tuple(value.shape[-1] for value in values)
     combined = jnp.concatenate(
@@ -323,13 +328,15 @@ def _jagged_fwd_kernel(
     alpha: float,
     block_k: int,
     block_q: int,
+    max_seq_len: int,
     query_tiles_per_program: int,
 ) -> None:
     sequence = pl.program_id(0)
     query_group = pl.program_id(1)
     start = seq_offsets_ref[sequence]
     end = seq_offsets_ref[sequence + 1]
-    length = end - start
+    raw_length = end - start
+    length = jnp.minimum(raw_length, max_seq_len)
     num_targets = num_targets_ref[sequence]
     inv_n = attn_scale_ref[0]
 
@@ -359,7 +366,7 @@ def _jagged_fwd_kernel(
         copy.start()
         copy.wait()
 
-    max_id = length - num_targets
+    max_id = raw_length - num_targets
 
     def _accumulate(k_stage_ref, v_stage_ref) -> None:
         kv_block = pl.program_id(0)
@@ -540,6 +547,7 @@ def _native_jagged_hstu_attention(
         alpha=scale,
         block_k=block_k,
         block_q=block_q,
+        max_seq_len=max_seq_len,
         query_tiles_per_program=query_tiles_per_program,
     )
     output = pl.pallas_call(
@@ -567,7 +575,7 @@ def _native_jagged_hstu_attention(
         name="pallas_jagged_hstu_attention_fwd_pipelined",
     )(*scalar_args, *hbm_args)
     return _aligned_values_to_packed(
-        (output,), seq_offsets, aligned_offsets, q.shape[0]
+        (output,), seq_offsets, aligned_offsets, q.shape[0], max_seq_len
     )[0]
 
 
@@ -658,13 +666,15 @@ def _jagged_bwd_dq_kernel(
     alpha: float,
     block_k: int,
     block_q: int,
+    max_seq_len: int,
     query_tiles_per_program: int,
 ) -> None:
     sequence = pl.program_id(0)
     query_group = pl.program_id(1)
     start = seq_offsets_ref[sequence]
     end = seq_offsets_ref[sequence + 1]
-    length = end - start
+    raw_length = end - start
+    length = jnp.minimum(raw_length, max_seq_len)
     num_targets = num_targets_ref[sequence]
     inv_n = attn_scale_ref[0]
 
@@ -704,7 +714,7 @@ def _jagged_bwd_dq_kernel(
         for copy in copies:
             copy.wait()
 
-    max_id = length - num_targets
+    max_id = raw_length - num_targets
 
     def _accumulate(k_stage_ref, v_stage_ref) -> None:
         kv_block = pl.program_id(0)
@@ -873,12 +883,14 @@ def _jagged_bwd_dkv_kernel(
     alpha: float,
     block_k: int,
     block_q: int,
+    max_seq_len: int,
 ) -> None:
     sequence = pl.program_id(0)
     kv_block = pl.program_id(1)
     start = seq_offsets_ref[sequence]
     end = seq_offsets_ref[sequence + 1]
-    length = end - start
+    raw_length = end - start
+    length = jnp.minimum(raw_length, max_seq_len)
     num_targets = num_targets_ref[sequence]
     inv_n = attn_scale_ref[0]
 
@@ -917,7 +929,7 @@ def _jagged_bwd_dkv_kernel(
         for copy in copies:
             copy.wait()
 
-    max_id = length - num_targets
+    max_id = raw_length - num_targets
     key_positions = kv_start + jnp.arange(block_k)
     key_ids = jnp.minimum(key_positions, max_id)
     k_tile = jnp.swapaxes(
@@ -1155,6 +1167,7 @@ def _native_jagged_hstu_attention_backward(
             alpha=alpha,
             block_k=block_k,
             block_q=block_q,
+            max_seq_len=max_seq_len,
             query_tiles_per_program=query_tiles_per_program,
         ),
         out_shape=jax.ShapeDtypeStruct((output_capacity, num_heads, dqk), q.dtype),
@@ -1190,6 +1203,7 @@ def _native_jagged_hstu_attention_backward(
             alpha=alpha,
             block_k=block_k,
             block_q=block_q,
+            max_seq_len=max_seq_len,
         ),
         out_shape=(
             jax.ShapeDtypeStruct((output_capacity, num_heads, dqk), k.dtype),
@@ -1202,7 +1216,7 @@ def _native_jagged_hstu_attention_backward(
         name="pallas_jagged_hstu_attention_bwd_dkv",
     )(*scalar_args, *backward_hbm_args)
     dq_packed, dk_packed, dv_packed = _aligned_values_to_packed(
-        (dq, dk, dv), seq_offsets, aligned_offsets, q.shape[0]
+        (dq, dk, dv), seq_offsets, aligned_offsets, q.shape[0], max_seq_len
     )
     return dq_packed, dk_packed, dv_packed
 
@@ -1431,10 +1445,13 @@ def pallas_jagged_hstu_attention(
             lengths,
             num_targets,
             scale=scale,
-            inv_n=resolved_inv_n,
+            inv_n=1.0,
             interpret=True,
             block_q=block_q,
             block_k=block_k,
+        )
+        dense_output *= jax.lax.stop_gradient(
+            jnp.asarray(resolved_inv_n, dtype=dense_output.dtype)
         )
         return _dense_values_to_packed((dense_output,), seq_offsets, q.shape[0])[0]
 

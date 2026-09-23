@@ -121,15 +121,6 @@ _PARITY_BF16: bool = os.environ.get("PARITY_BF16", "1").lower() not in (
     "no",
     "",
 )
-# Parity currently supports Helion because its adapter's eager fallback remains
-# the Aten reference. The Pallas adapters need separate compiled-only installation
-# before they can preserve that comparison contract.
-_PARITY_ATTENTION_BACKEND: AttentionBackend = resolve_attention_backend()
-if _PARITY_ATTENTION_BACKEND not in ("baseline", "helion"):
-    raise ValueError(
-        "RankFM parity supports only baseline or helion attention; "
-        "the CPU-eager cell must remain the Aten reference"
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -225,21 +216,25 @@ def _norm_param_name(name: str) -> str:
     return name
 
 
-def _helion_pre_compile() -> None:
+def _helion_pre_compile(attention_backend: AttentionBackend) -> None:
     """Clear stale Helion attention shape sigs before the trace (no-op unless gated).
 
     The compile runs recir's eager make_fx trace synchronously, during which the
     HSTU fwd/bwd register_fake kernels record their attention shapes. Clear stale
     sigs BEFORE the build; warm AFTER it, before the first (lazy) lower.
     """
-    if _PARITY_ATTENTION_BACKEND != "helion":
+    if attention_backend != "helion":
         return
     from recir.ops.helion.jagged_hstu_attention import clear_traced_sigs
 
     clear_traced_sigs()
 
 
-def _helion_post_compile(real_bs: int, padded_bs: int) -> None:
+def _helion_post_compile(
+    real_bs: int,
+    padded_bs: int,
+    attention_backend: AttentionBackend,
+) -> None:
     """Latch the PRT pad-row count and warm the Helion kernels (no-op unless gated).
 
     ``padded_bs`` is the override-build size (compute_padded_shape of the global RO
@@ -247,7 +242,7 @@ def _helion_post_compile(real_bs: int, padded_bs: int) -> None:
     pad-row count matches what _drop_pad_rows slices off. len(jax.devices()) matches
     the lowering's world_size (recir/torchax/ops/jhstu_attention.py).
     """
-    if _PARITY_ATTENTION_BACKEND != "helion":
+    if attention_backend != "helion":
         return
     from recir.ops.helion.jagged_hstu_attention import (
         set_pad_seqs_per_device,
@@ -266,6 +261,7 @@ def _compiled_step(
     num_processes: int,
     global_bs: int,
     padding: bool,
+    attention_backend: AttentionBackend,
     emb_backend: str = _PARITY_EMB_BACKEND,
 ) -> Tuple[
     Dict[str, torch.Tensor],
@@ -399,7 +395,7 @@ def _compiled_step(
         loss_reduction="mean",
         region_transforms=region_transforms,
     )
-    _helion_pre_compile()
+    _helion_pre_compile(attention_backend)
     if emb_opt is None:
         runner = compile_gspmd_step(
             model,
@@ -443,7 +439,11 @@ def _compiled_step(
             sync_device_state_to_torch(runner)
             return result
 
-    _helion_post_compile(real_bs=global_bs, padded_bs=override_bs)
+    _helion_post_compile(
+        real_bs=global_bs,
+        padded_bs=override_bs,
+        attention_backend=attention_backend,
+    )
 
     # Reuse the compiled runner so model and optimizer state carry across steps.
     loss_values: List[float] = []
@@ -1099,7 +1099,10 @@ def _log_export_breakdown(
     return matched
 
 
-def _build_cpu_tpu_model(padding: bool) -> Tuple[BlueReelsVDDTrainV3, Any]:
+def _build_cpu_tpu_model(
+    padding: bool,
+    attention_backend: AttentionBackend,
+) -> Tuple[BlueReelsVDDTrainV3, Any]:
     """Seeded build of the 64-chip training model for CPU-vs-TPU parity:
     Returns (model, module_config).
 
@@ -1134,7 +1137,7 @@ def _build_cpu_tpu_model(padding: bool) -> Tuple[BlueReelsVDDTrainV3, Any]:
         module_config,
         device,
         bf16_training=_PARITY_BF16,
-        attention_backend=_PARITY_ATTENTION_BACKEND,
+        attention_backend=attention_backend,
     )
     for p in model.parameters():
         if p.is_floating_point():
@@ -1165,7 +1168,11 @@ def _load_raw_jagged_batches(
     return _load_e2e_batches(model, module_config, gcs)
 
 
-def _run_cpu_tpu_parity(rtol: float, atol: float) -> None:
+def _run_cpu_tpu_parity(
+    rtol: float,
+    atol: float,
+    attention_backend: AttentionBackend,
+) -> None:
     """Multi-step CPU-eager vs TPU-compiled parity on one real e2e file.
 
     Consecutive training steps, two ways, on the SAME real e2e data file:
@@ -1187,7 +1194,10 @@ def _run_cpu_tpu_parity(rtol: float, atol: float) -> None:
     #    lowering if it ran first. Use padding=True (PRT), the selected embedding
     #    backend, and gradient capture. The raw jagged batch is loaded via the
     #    padding config and reused by BOTH cells.
-    model_c, mc_c = _build_cpu_tpu_model(padding=True)
+    model_c, mc_c = _build_cpu_tpu_model(
+        padding=True,
+        attention_backend=attention_backend,
+    )
     batches = _load_raw_jagged_batches(model_c, mc_c)
     global_bs = int(batches[0].ro_float_features.shape[0]) * num_processes
     comp_params, comp_loss, comp_exp, comp_grads = _compiled_step(
@@ -1197,13 +1207,17 @@ def _run_cpu_tpu_parity(rtol: float, atol: float) -> None:
         num_processes,
         global_bs,
         padding=True,
+        attention_backend=attention_backend,
         emb_backend=_PARITY_EMB_BACKEND,
     )
 
     # 2) CPU-eager cell LAST. enable_padding=False (static_shape_mode off), consumes
     #    the SAME raw jagged batch natively. exports_out captures the forward
     #    weight_sum / label_wsum / pred_wsum.
-    model_e, _mc_e = _build_cpu_tpu_model(padding=False)
+    model_e, _mc_e = _build_cpu_tpu_model(
+        padding=False,
+        attention_backend=attention_backend,
+    )
     eager_exp: Dict[str, torch.Tensor] = {}
     eager_params, eager_loss, eager_grads = _eager_step(
         model_e,
@@ -1292,6 +1306,13 @@ def main() -> None:
         level=logging.INFO,
         force=True,
     )
+    attention_backend = resolve_attention_backend()
+    if attention_backend not in ("baseline", "helion"):
+        raise ValueError(
+            "RankFM parity supports only baseline or helion attention; "
+            "the CPU-eager cell must remain the Aten reference"
+        )
+
     # On GKE TPU, initialize the JAX distributed runtime BEFORE any jax op, like
     # the trainer (train.py:77): the PJRT plugin reads the coordinator + process
     # info from the TPU runtime metadata. The CPU-spoof path must NOT call this.
@@ -1330,7 +1351,7 @@ def main() -> None:
             "CPU-eager vs TPU-compiled parity requires PARITY_DEVICE=tpu"
         )
     logger.info("[PARITY] CPU-eager vs TPU-compiled on real replay data")
-    _run_cpu_tpu_parity(rtol, atol)
+    _run_cpu_tpu_parity(rtol, atol, attention_backend)
     return
 
 

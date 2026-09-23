@@ -70,13 +70,14 @@ def _pack_dense_output(
     dense: jax.Array,
     lengths: list[int],
 ) -> jax.Array:
-    return jnp.concatenate(
-        tuple(
-            dense[index, :, :length, :].transpose(1, 0, 2)
-            for index, length in enumerate(lengths)
-        ),
-        axis=0,
-    )
+    packed_sequences = []
+    for index, length in enumerate(lengths):
+        visible_length = min(length, dense.shape[2])
+        sequence = dense[index, :, :visible_length, :].transpose(1, 0, 2)
+        packed_sequences.append(
+            jnp.pad(sequence, ((0, length - visible_length), (0, 0), (0, 0)))
+        )
+    return jnp.concatenate(tuple(packed_sequences), axis=0)
 
 
 class JaggedHSTUAttentionTest(unittest.TestCase):
@@ -103,7 +104,7 @@ class JaggedHSTUAttentionTest(unittest.TestCase):
         *,
         max_seq_len: int,
         inv_n: float = 0.17,
-    ) -> None:
+    ) -> jax.Array:
         q, k, v, offsets = self._inputs(lengths)
         targets = jnp.asarray(num_targets, dtype=jnp.int32)
         scale = 1.0 / math.sqrt(q.shape[-1])
@@ -137,12 +138,55 @@ class JaggedHSTUAttentionTest(unittest.TestCase):
 
         np.testing.assert_allclose(actual, expected, rtol=2e-5, atol=2e-5)
         self.assertEqual(actual.shape, (sum(lengths), 2, 6))
+        return actual
 
     def test_nonuniform_causal_sequences(self) -> None:
         self._assert_parity([7, 3, 9], [0, 0, 0], max_seq_len=9)
 
     def test_target_attention_and_empty_sequences(self) -> None:
         self._assert_parity([0, 6, 2, 0], [0, 2, 1, 0], max_seq_len=8)
+
+    def test_overlong_sequence_is_truncated(self) -> None:
+        actual = self._assert_parity([6, 3], [2, 1], max_seq_len=4)
+        np.testing.assert_array_equal(actual[4:6], jnp.zeros_like(actual[4:6]))
+
+    def test_jitted_runtime_scale(self) -> None:
+        lengths = [4, 3]
+        q, k, v, offsets = self._inputs(lengths)
+        targets = jnp.asarray([2, 1], dtype=jnp.int32)
+        scale = 1.0 / math.sqrt(q.shape[-1])
+
+        actual = jax.jit(
+            lambda inv_n: pallas_jagged_hstu_attention(
+                q,
+                k,
+                v,
+                offsets,
+                targets,
+                max_seq_len=4,
+                scale=scale,
+                inv_n=inv_n,
+                interpret=True,
+                block_q=4,
+                block_k=4,
+            )
+        )(jnp.asarray(0.37, dtype=jnp.float32))
+        expected = _pack_dense_output(
+            jagged_hstu_attention_reference(
+                q,
+                k,
+                v,
+                offsets,
+                targets,
+                4,
+                scale,
+                0.37,
+            ),
+            lengths,
+        )
+
+        np.testing.assert_allclose(actual, expected, rtol=2e-5, atol=2e-5)
+        self.assertEqual(actual.shape, v.shape)
 
     def test_start_offset_residues(self) -> None:
         for residue in range(8):
@@ -178,6 +222,7 @@ class JaggedHSTUAttentionTest(unittest.TestCase):
             ([0, 6, 2, 0], [0, 2, 1, 0], 8),
             ([3, 5], [0, 2], 8),
             ([1, 1, 1, 1, 1, 1, 1, 1, 2], [0] * 9, 2),
+            ([6, 3], [2, 1], 4),
         ):
             with self.subTest(lengths=lengths, num_targets=num_targets):
                 q, k, v, offsets = self._inputs(lengths)
@@ -248,6 +293,12 @@ class JaggedHSTUAttentionTest(unittest.TestCase):
                         rtol=2e-4,
                         atol=2e-4,
                     )
+                    for index, length in enumerate(lengths):
+                        if length <= max_seq_len:
+                            continue
+                        start = sum(lengths[:index])
+                        tail = actual_grad[start + max_seq_len : start + length]
+                        np.testing.assert_array_equal(tail, jnp.zeros_like(tail))
 
     def _trace_native_forward(
         self,
