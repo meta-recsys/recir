@@ -833,6 +833,29 @@ class TBESparseEmbeddingTransformTest(unittest.TestCase):
             )(*parameters, values, lengths)
         transform.finalize_compiled_graph(joint)
 
+        cond_nodes = [
+            node
+            for node in joint.graph.nodes
+            if node.op == "call_function" and node.target is torch.ops.higher_order.cond
+        ]
+        self.assertEqual(len(cond_nodes), 2)
+        for cond_node in cond_nodes:
+            for branch in cond_node.args[1:3]:
+                if not isinstance(branch, fx.Node):
+                    raise AssertionError(
+                        f"Expected cond branch get_attr node, got {type(branch)}."
+                    )
+                self.assertEqual(branch.op, "get_attr")
+                if not isinstance(branch.target, str):
+                    raise AssertionError(
+                        f"Expected string get_attr target, got {type(branch.target)}."
+                    )
+                self.assertIn(".", branch.target)
+                self.assertIsInstance(
+                    joint.get_submodule(branch.target),
+                    fx.GraphModule,
+                )
+
         sdd = build_pipeline(joint, sdd_pipeline_config())
         self.assertIsInstance(sdd, PipelinedGraphModule)
         self.assertEqual(len(sdd.stage_graph_modules()), 3)
@@ -847,6 +870,15 @@ class TBESparseEmbeddingTransformTest(unittest.TestCase):
         stage_targets = [
             [node.target for node in stage.graph.nodes] for stage in stages
         ]
+        recursive_stage_targets = [
+            [
+                node.target
+                for submodule in stage.modules()
+                if isinstance(submodule, fx.GraphModule)
+                for node in submodule.graph.nodes
+            ]
+            for stage in stages
+        ]
         self.assertEqual(
             stage_targets[0].count(
                 torch.ops._c10d_functional.all_to_all_single.default
@@ -859,15 +891,25 @@ class TBESparseEmbeddingTransformTest(unittest.TestCase):
             ),
             1,
         )
+        self.assertIn(torch.ops.higher_order.cond, stage_targets[2])
         self.assertIn(
             torch.ops._c10d_functional.reduce_scatter_tensor.default,
-            stage_targets[2],
+            recursive_stage_targets[2],
         )
         self.assertIn(
-            torch.ops._c10d_functional.all_gather_into_tensor.default,
-            stage_targets[3],
+            torch.ops._c10d_functional.all_to_all_single.default,
+            recursive_stage_targets[2],
         )
         self.assertIn(torch.ops.recir.tbe_forward.default, stage_targets[2])
+        self.assertIn(torch.ops.higher_order.cond, stage_targets[3])
+        self.assertIn(
+            torch.ops._c10d_functional.all_gather_into_tensor.default,
+            recursive_stage_targets[3],
+        )
+        self.assertIn(
+            torch.ops._c10d_functional.all_to_all_single.default,
+            recursive_stage_targets[3],
+        )
         self.assertIn(torch.ops.recir.tbe_backward_update.default, stage_targets[3])
 
     def test_table_wise_pooled_transform_uses_native_pooling_and_pipeline(
@@ -1000,7 +1042,12 @@ class TBESparseEmbeddingTransformTest(unittest.TestCase):
             routed_output.meta["val"].shape,
             torch.Size((3, 8)),
         )
-        targets = [str(node.target) for node in joint.graph.nodes]
+        targets = [
+            str(node.target)
+            for submodule in joint.modules()
+            if isinstance(submodule, fx.GraphModule)
+            for node in submodule.graph.nodes
+        ]
         self.assertEqual(
             sum(
                 "_c10d_functional.reduce_scatter_tensor" in target for target in targets
@@ -1016,7 +1063,7 @@ class TBESparseEmbeddingTransformTest(unittest.TestCase):
         )
         self.assertEqual(
             sum("_c10d_functional.all_to_all_single" in target for target in targets),
-            2,
+            4,
         )
 
     def test_inner_transform_accepts_short_final_shard(self) -> None:

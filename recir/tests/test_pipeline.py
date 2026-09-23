@@ -101,6 +101,28 @@ def _two_stage_graph() -> fx.GraphModule:
     return _mark_add(fx.symbolic_trace(_TwoStageModule()))
 
 
+def _conditional_graph() -> fx.GraphModule:
+    def true_branch(value: torch.Tensor) -> torch.Tensor:
+        return value + 1
+
+    def false_branch(value: torch.Tensor) -> torch.Tensor:
+        return value - 1
+
+    def forward(predicate: torch.Tensor, value: torch.Tensor) -> torch.Tensor:
+        routed = value * 2
+        selected = torch.cond(predicate, true_branch, false_branch, (routed,))
+        return selected * 3
+
+    gm = make_fx(forward)(torch.tensor(True), torch.tensor(1))
+    cond = next(
+        node
+        for node in gm.graph.nodes
+        if node.op == "call_function" and node.target is torch.ops.higher_order.cond
+    )
+    mark_pipeline_region((cond,), PipelineRegion.ROUTE_START)
+    return gm
+
+
 def _two_stage_config() -> PipelineConfig:
     return PipelineConfig.from_plan(
         PipelinePlan(
@@ -196,6 +218,37 @@ class _AscendingPipelineSchedule(PipelineSchedule):
 
 
 class PipelineTest(unittest.TestCase):
+    def test_pipeline_preserves_cond_branches(self) -> None:
+        gm = _conditional_graph()
+        partition_meta = "recir_pipeline_partition"
+        branch_get_attrs = [node for node in gm.graph.nodes if node.op == "get_attr"]
+        self.assertTrue(branch_get_attrs)
+        for node in branch_get_attrs:
+            node.meta[partition_meta] = 99
+        pipeline = build_pipeline(gm, _two_stage_config())
+        self.assertIsInstance(pipeline, PipelinedGraphModule)
+        for node in branch_get_attrs:
+            self.assertNotIn(partition_meta, node.meta)
+        self.assertFalse(
+            any(
+                node.op == "get_attr" and not node.users
+                for node in pipeline.graph.nodes
+            )
+        )
+        for stage in pipeline.stage_graph_modules():
+            for node in stage.graph.nodes:
+                if node.op == "get_attr":
+                    self.assertNotIn(partition_meta, node.meta)
+
+        self.assertTrue(
+            is_pipeline_pending(pipeline(torch.tensor(True), torch.tensor(2)))
+        )
+        self.assertEqual(
+            pipeline(torch.tensor(False), torch.tensor(2)),
+            torch.tensor(15),
+        )
+        self.assertEqual(pipeline(last_iter=True), torch.tensor(9))
+
     def test_two_stage_pipeline_launches_compute_before_next_prefix(self) -> None:
         pipeline = build_pipeline(_two_stage_graph(), _two_stage_config())
         self.assertIsInstance(pipeline, PipelinedGraphModule)
