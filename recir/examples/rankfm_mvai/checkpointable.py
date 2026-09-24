@@ -17,8 +17,10 @@ entries as ``DTensor``s so DCP saves/loads each host's shard; all other
 """
 
 import copy
+import itertools
 import logging
-from typing import Any, cast, Dict, List, Sequence, Tuple
+import time
+from typing import Any, cast, Dict, Iterator, List, Sequence, Tuple
 
 import torch
 import torch.distributed as dist
@@ -71,7 +73,7 @@ def _to_plain_host_tensor(value: Any) -> Any:
 def _freeze_checkpoint_value(value: Any) -> Any:
     value = _to_plain_host_tensor(value)
     if isinstance(value, torch.Tensor):
-        return value.clone()
+        return value
     return copy.deepcopy(value)
 
 
@@ -225,40 +227,287 @@ def wrap_sharded_for_save(
 
 
 def unwrap_after_load(state_dict: Dict[str, Any]) -> Dict[str, Any]:
-    """Return a copy of ``state_dict`` with any ``DTensor`` value replaced by its
-    local shard tensor; non-DTensor entries pass through unchanged."""
+    """Return a copy of ``state_dict`` with top-level ``DTensor`` values local."""
     out: Dict[str, Any] = {}
     for key, value in state_dict.items():
         out[key] = value.to_local() if isinstance(value, DTensor) else value
     return out
 
 
-def materialize_meta_params(
-    module: torch.nn.Module, table_prefixes: Sequence[str]
-) -> None:
-    """Give real host storage to the in_graph embedding-table params.
+def _replace_tensor_impl(tensor: torch.Tensor, replacement: torch.Tensor) -> None:
+    """Replace storage while preserving the Python object and its weakrefs."""
+    if tensor.grad_fn is not None or tensor.grad is not None:
+        raise RuntimeError(
+            "cannot replace storage while the tensor has live autograd state"
+        )
 
-    The in_graph tables (``_sharded_tables`` / ``_dp_tables``) are ``on_device_init``
-    meta tensors; ``copy_`` into a meta tensor is a silent no-op, so both a full
-    device->host flush (save) and ``dcp.load`` (restore) write nothing until the
-    param has real storage. After the compile shape-shards a table to
-    ``[V/num_processes, D]`` (still meta), we reassign ``.data`` IN PLACE (same
-    Parameter object, so the compiled runner's ``flat_state`` binding is
-    preserved) to an empty CPU tensor of the sharded shape. Idempotent: params
-    that already have real storage are skipped.
-    """
-    for name, param in module.named_parameters():
-        if not any(prefix in name for prefix in table_prefixes):
-            continue
-        if param.is_meta:
-            # `param.data = torch.empty(..., device="cpu")` fails: a meta tensor
-            # and a CPU tensor are shallow-copy-incompatible types (meta is not a
-            # "dense backend"), so set_data raises. swap_tensors swaps the
-            # underlying TensorImpl in place, preserving the Parameter object
-            # identity (and thus recir's flat_state binding), and works meta->cpu.
-            torch.utils.swap_tensors(
-                param, torch.empty(param.shape, dtype=param.dtype, device="cpu")
+    use_count = tensor._use_count()
+    if use_count > 1:
+        if use_count != 2 or not tensor.is_leaf:
+            raise RuntimeError(
+                "cannot replace storage while the tensor has live references"
             )
+        accumulate_grad = torch.autograd.graph.get_gradient_edge(tensor).node
+        if tensor._use_count() != 2:
+            raise RuntimeError(
+                "cannot replace storage while the tensor has live references"
+            )
+
+        def reject_backward(grad_outputs: Any) -> None:
+            raise RuntimeError(
+                "cannot run backward through checkpoint host-storage replacement"
+            )
+
+        accumulate_grad.register_prehook(reject_backward)
+
+    replacement.requires_grad_(tensor.requires_grad)
+    torch._C._swap_tensor_impl(tensor, replacement)
+
+
+def _param_leaf_indices(state_fqns: Sequence[str]) -> Dict[str, int]:
+    """Map a params/buffers FQN to its ``flat_state`` index.
+
+    ``state_fqns`` entries are pytree keypaths over ``[params_buffers,
+    named_states]`` (recir.api._compute_state_fqns), so a params/buffers leaf is
+    exactly ``[0]['<fqn>']``. Optimizer state for the same parameter lives under
+    ``[1]['<fqn>']['<state>']`` and must not match.
+    """
+    prefix, suffix = "[0]['", "']"
+    indices: Dict[str, int] = {}
+    for index, path in enumerate(state_fqns):
+        if not path.startswith(prefix) or not path.endswith(suffix):
+            continue
+        fqn = path[len(prefix) : -len(suffix)]
+        if "'" not in fqn:
+            indices[fqn] = index
+    return indices
+
+
+def _state_leaf_indices(state_fqns: Sequence[str]) -> Dict[Tuple[str, str], int]:
+    """Map an optimizer-state ``(param FQN, state key)`` to its index.
+
+    The optimizer half of ``flat_state`` is keyed ``[1]['<fqn>']['<state>']``:
+    ``recir.api`` builds ``named_states`` as ``{fqn: opt.state[param]}``, a dict
+    per parameter. These leaves are row-sharded alongside the parameter they
+    belong to (``shard_params_and_states`` -- note the *and states*), so they
+    carry the same dual binding the parameters do.
+    """
+    prefix, suffix = "[1]['", "']"
+    indices: Dict[Tuple[str, str], int] = {}
+    for index, path in enumerate(state_fqns):
+        if not path.startswith(prefix) or not path.endswith(suffix):
+            continue
+        parts = path[len(prefix) : -len(suffix)].split("']['")
+        if len(parts) == 2 and not any("'" in part for part in parts):
+            indices[(parts[0], parts[1])] = index
+    return indices
+
+
+def _optimizer_states(
+    model: torch.nn.Module,
+    optimizers: Sequence[Any],
+    parameter_prefixes: Sequence[str] | None = None,
+) -> Dict[str, Dict[str, Any]]:
+    """Return optimizer state keyed exactly like recir's ``named_states``."""
+    named: Dict[str, Dict[str, Any]] = {}
+    for name, param in model.named_parameters(remove_duplicate=False):
+        if parameter_prefixes is not None and not any(
+            prefix in name for prefix in parameter_prefixes
+        ):
+            continue
+        owners = [
+            optimizer
+            for optimizer in optimizers
+            if optimizer is not None and param in optimizer.state
+        ]
+        if len(owners) > 1:
+            raise RuntimeError(f"parameter {name!r} has state in multiple optimizers")
+        if owners:
+            named[name] = owners[0].state[param]
+    return named
+
+
+def _optimizer_payload_leaves(
+    optimizer: Any, model: torch.nn.Module, payload: Dict[str, Any]
+) -> Iterator[Tuple[str, str, Any]]:
+    """``(param FQN, state key, tensor)`` for each tensor in an optimizer payload."""
+    names = {id(p): n for n, p in model.named_parameters(remove_duplicate=False)}
+    state = payload.get("state", {})
+    for live_group, saved_group in zip(
+        optimizer.param_groups, payload.get("param_groups", ())
+    ):
+        for param, state_id in zip(live_group["params"], saved_group["params"]):
+            fqn = names.get(id(param))
+            if fqn is None:
+                continue
+            for key, value in state.get(state_id, {}).items():
+                yield fqn, key, value
+
+
+class HostStateBuffers:
+    """The run's one set of host tensors for checkpoint state."""
+
+    def __init__(
+        self,
+        flat_state: List[torch.Tensor],
+        state_fqns: Sequence[str],
+        model: torch.nn.Module,
+        optimizers: Sequence[Any],
+        table_prefixes: Sequence[str],
+    ) -> None:
+        self._flat_state = flat_state
+        self._model = model
+        self._optimizers = optimizers
+        self._table_prefixes = table_prefixes
+        self._param_indices = _param_leaf_indices(state_fqns)
+        self._state_indices = _state_leaf_indices(state_fqns)
+        self._owned: Dict[int, int] = {}
+
+    def _state_leaves(self) -> Iterator[Tuple[int, torch.Tensor, str, bool]]:
+        """Every ``(flat_state index, owning tensor, name, zero_when_meta)``."""
+        for name, owner in itertools.chain(
+            self._model.named_parameters(remove_duplicate=False),
+            self._model.named_buffers(remove_duplicate=False),
+        ):
+            index = self._param_indices.get(name)
+            if index is None:
+                if any(prefix in name for prefix in self._table_prefixes):
+                    raise RuntimeError(
+                        f"no flat_state leaf for table parameter {name!r}; the "
+                        "compiled graph state and the module have diverged, and "
+                        "a silent skip here restores a randomized table"
+                    )
+                continue
+            yield index, owner, name, False
+
+        for fqn, states in _optimizer_states(self._model, self._optimizers).items():
+            for key, value in states.items():
+                if not isinstance(value, torch.Tensor):
+                    continue
+                index = self._state_indices.get((fqn, key))
+                if index is None:
+                    raise RuntimeError(
+                        f"no flat_state leaf for optimizer state {fqn!r}[{key!r}]"
+                    )
+                yield index, value, f"{fqn}[{key!r}]", True
+
+    def build(self) -> None:
+        """Give every state leaf real host storage and bind it. Idempotent."""
+        allocated = 0
+        for index, owner, _name, zero_when_meta in self._state_leaves():
+            if owner.is_meta:
+                # set_data cannot go meta->cpu; swapping the TensorImpl keeps the
+                # Parameter object (and recir's flat_state binding) alive. zeros
+                # for accumulators: a restore that fails before the optimizer
+                # state loads must not expose uninitialized memory as a moment.
+                make = torch.zeros if zero_when_meta else torch.empty
+                _replace_tensor_impl(
+                    owner, make(owner.shape, dtype=owner.dtype, device="cpu")
+                )
+                allocated += owner.numel() * owner.element_size()
+            self._adopt(index, owner)
+
+        logger.info(
+            "[hostbuf] build: allocated %.2f GB, %d leaves owned",
+            allocated / 1e9,
+            len(self._owned),
+        )
+
+    def check_payload(
+        self,
+        module_entries: Dict[str, Any],
+        optimizer_payloads: Sequence[Tuple[Any, Any]] = (),
+    ) -> None:
+        """Raise unless every tensor DCP touches IS the buffer ``build`` set up."""
+        for fqn, value in module_entries.items():
+            self._check_payload_entry(self._param_indices.get(fqn), value, fqn)
+
+        for optimizer, payload in optimizer_payloads:
+            if optimizer is None or not payload:
+                continue
+            for fqn, key, value in _optimizer_payload_leaves(
+                optimizer, self._model, payload
+            ):
+                self._check_payload_entry(
+                    self._state_indices.get((fqn, key)), value, f"{fqn}[{key!r}]"
+                )
+
+    def _check_payload_entry(self, index: int | None, value: Any, name: str) -> None:
+        if index is None or not isinstance(value, (torch.Tensor, DTensor)):
+            return
+        expected = self._owned.get(index)
+        if expected is None:
+            return
+        local = value.to_local() if isinstance(value, DTensor) else value
+        if local.is_meta or local.data_ptr() != expected:
+            raise RuntimeError(
+                f"the checkpoint payload for {name} is not the host buffer "
+                "build() established; a save would upload a tensor the graph "
+                "does not compute on, and a load would write where it never reads"
+            )
+
+    def _adopt(self, index: int, owner: torch.Tensor) -> None:
+        leaf = self._flat_state[index]
+        if leaf.shape != owner.shape or leaf.dtype != owner.dtype:
+            raise RuntimeError(
+                f"flat_state[{index}] does not match its owner: "
+                f"{tuple(leaf.shape)}/{leaf.dtype} vs "
+                f"{tuple(owner.shape)}/{owner.dtype}"
+            )
+        # shard_params leaves the graph leaf and the module object as two
+        # TensorImpls over one storage; point the graph at the object every
+        # writer (dcp.load, the flush) reaches.
+        self._flat_state[index] = owner.detach()
+        self._owned[index] = owner.data_ptr()
+
+
+def load_module_state_without_self_copy(
+    module: torch.nn.Module, state_dict: Dict[str, Any]
+) -> None:
+    """``module.load_state_dict`` minus the entries that are already in place.
+
+    DCP builds its read destination by calling ``state_dict()``, so ``dcp.load``
+    has already written the bytes straight into the live Parameter's storage
+    by the time we get here. Handing that value back to ``nn.Module.load_state_dict``
+    makes it run ``param.copy_(input_param)`` with source and destination over one storage:
+    ATen only short-circuits on ``self.is_same(src)``, TensorImpl identity
+    (``aten/src/ATen/native/Copy.cpp``), and these are two impls sharing one
+    buffer -- so it memcpys 256 GB onto itself on every restore.
+
+    ``assign=True`` would also avoid the copy and is the wrong tool: it rebinds
+    the Parameter to the incoming tensor, and the compiled graph's ``flat_state``
+    holds the old object. Dropping the entry is what leaves identity alone.
+
+    Strictness is preserved rather than traded away: the aliased names are the
+    only ones allowed to come back as missing.
+    """
+    local = unwrap_after_load(state_dict)
+    live: Dict[str, torch.Tensor] = {
+        **dict(module.named_parameters()),
+        **dict(module.named_buffers()),
+    }
+
+    def already_written(name: str, value: Any) -> bool:
+        target = live.get(name)
+        return (
+            isinstance(value, torch.Tensor)
+            and target is not None
+            and not target.is_meta
+            and not value.is_meta
+            and target.shape == value.shape
+            and target.data_ptr() == value.data_ptr()
+        )
+
+    aliased = {name for name, value in local.items() if already_written(name, value)}
+    incompatible = module.load_state_dict(
+        {k: v for k, v in local.items() if k not in aliased}, strict=False
+    )
+    missing = [k for k in incompatible.missing_keys if k not in aliased]
+    if missing or incompatible.unexpected_keys:
+        raise RuntimeError(
+            f"checkpoint does not match the model: missing={sorted(missing)} "
+            f"unexpected={sorted(incompatible.unexpected_keys)}"
+        )
 
 
 class RecirCheckpointable(Stateful):
@@ -289,6 +538,7 @@ class RecirCheckpointable(Stateful):
         sharded_prefixes: Sequence[str],
         table_prefixes: Sequence[str],
         warmup: Any,
+        host_buffers: Any = None,
         optimizer: Any = None,
         shard_order: Sequence[int] | None = None,
     ) -> None:
@@ -297,6 +547,7 @@ class RecirCheckpointable(Stateful):
         self._sharded_prefixes = tuple(sharded_prefixes)
         self._table_prefixes = tuple(table_prefixes)
         self._warmup = warmup
+        self._host_buffers = host_buffers
         # The dense optimizer is carried inside this checkpointable (nested +
         # sanitized) rather than as a separate DCP entry, so its tensors are also
         # converted to plain host tensors (a torchax optimizer-state tensor would
@@ -330,12 +581,12 @@ class RecirCheckpointable(Stateful):
         return mesh
 
     def state_dict(self) -> Dict[str, Any]:
-        # Tables are meta until materialized; do it before the full flush so the
-        # device->host copy actually lands (see materialize_meta_params).
-        materialize_meta_params(self._wrapper, self._table_prefixes)
+        t_start = time.perf_counter()
+        buffers = self._host_buffers() if self._host_buffers is not None else None
         # Full sync so the on-device embedding tables are mirrored back to host,
         # not just the dense state.
         self._wrapper.flush_host_state(full=True)
+        t_flush = time.perf_counter()
         # Sanitize every value to a plain host tensor (drops any torchax
         # jax.Array/env refs that torch.save/DCP can't pickle).
         sd: Dict[str, Any] = {}
@@ -347,11 +598,13 @@ class RecirCheckpointable(Stateful):
                 sd[key] = _to_plain_host_tensor(value)
             else:
                 sd[key] = pytree.tree_map(_freeze_checkpoint_value, value)
+        t_sanitize = time.perf_counter()
         # Single host: tables are not row-sharded, so plain tensors are correct
         # (and a DTensor mesh would need a process group we don't init).
         mesh = self._mesh() if self._num_processes > 1 else None
         if mesh is not None:
             sd = wrap_sharded_for_save(sd, self._sharded_prefixes, mesh)
+        t_wrap = time.perf_counter()
         if self._optimizer is not None:
             sd[OPTIMIZER_STATE_KEY] = pytree.tree_map(
                 _freeze_checkpoint_value, self._optimizer.state_dict()
@@ -359,6 +612,20 @@ class RecirCheckpointable(Stateful):
         sd[WARMUP_ITER_KEY] = int(self._warmup.iter)
         if mesh is not None:
             sd[SHARD_ORDER_KEY] = list(self.shard_order())
+        # Everything DCP is about to upload is now assembled. On a restore this
+        # same dict is what it will write into, so this is the one place both
+        # directions can be checked against the buffers.
+        if buffers is not None:
+            buffers.check_payload(sd, [(self._optimizer, sd.get(OPTIMIZER_STATE_KEY))])
+        logger.info(
+            "[stage] state_dict %.1fs = flush %.1fs + sanitize %.1fs + "
+            "wrap %.1fs + opt %.1fs",
+            time.perf_counter() - t_start,
+            t_flush - t_start,
+            t_sanitize - t_flush,
+            t_wrap - t_sanitize,
+            time.perf_counter() - t_wrap,
+        )
         return sd
 
     def make_async_stager(self) -> Any:
@@ -380,7 +647,12 @@ class RecirCheckpointable(Stateful):
             for k, v in state_dict.items()
             if k not in (WARMUP_ITER_KEY, OPTIMIZER_STATE_KEY, SHARD_ORDER_KEY)
         }
-        self._wrapper.load_state_dict(unwrap_after_load(body))
+        load_module_state_without_self_copy(self._wrapper, body)
         if opt_sd is not None and self._optimizer is not None:
             self._optimizer.load_state_dict(opt_sd)
+        # DCP has written, and `Optimizer.load_state_dict` has had its chance to
+        # swap slot objects. Everything just written has to still be the buffer
+        # the graph reads, or the restore landed somewhere nothing looks.
+        if self._host_buffers is not None:
+            self._host_buffers().check_payload(body, [(self._optimizer, opt_sd)])
         reseed_warmup(self._warmup, warmup_iter)

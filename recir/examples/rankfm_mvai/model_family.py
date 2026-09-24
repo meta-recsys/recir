@@ -76,35 +76,40 @@ from hammer.v3.models.udd_fm_v3.udd_fm_config import BlueReelsVDDModuleConfig
 from hammer.v3.models.udd_fm_v3.udd_fm_family import BlueReelsVDDModelFamily
 from minimal_viable_ai.core.dataloader.dataloader_configs import DataSourceConfig
 from minimal_viable_ai.core.model_family_api.optimizer_configs import RecOptimizerConfig
-from recir.api import COMPILED_OBJECT_KEY, sync_device_state_to_torch
+from recir.api import (
+    COMPILED_OBJECT_KEY,
+    sync_device_state_to_torch,
+    sync_named_state_to_torch,
+)
 from recir.backends import XLAGSPMDBackend
 from recir.distributed.parallel_mode import GSPMDParallel
 from recir.examples.rankfm_mvai.budgeted_sampling import install_budgeted_sampling
+from recir.examples.rankfm_mvai.checkpointable import HostStateBuffers
+from recir.examples.rankfm_mvai.config import RankFMModelArgs, RankFMTrainerConfig
+from recir.examples.rankfm_mvai.data_pipe import (
+    BatchReplayPipe,
+    compute_kjt_key_to_size,
+    replay_batch_iter,
+)
+from recir.examples.rankfm_mvai.prefetch import PrefetchingIterator
 from recir.examples.rankfm_mvai.rankfm_batch_utils import (
     create_random_train_batch,
     create_uniform_train_batch,
 )
+from recir.examples.rankfm_mvai.rankfm_embedding_backends import build_embedding_backend
 from recir.examples.rankfm_mvai.rankfm_model_utils import (
     AttentionBackend,
     build_model_from_config,
     resolve_attention_backend,
 )
-from recir.region_transforms.dropout_prng import DropoutPRNGTransform
-from recir.region_transforms.padding import compute_padded_shape
-from torch.utils.data import IterableDataset
-
-# Local recir backend factory + data pipe helpers + the static-NRO resolver and
-# the shared override/padding helpers. These are the exact same wiring the
-# recir-compiled paths and the parity check use.
-from .config import RankFMModelArgs, RankFMTrainerConfig
-from .data_pipe import BatchReplayPipe, compute_kjt_key_to_size, replay_batch_iter
-from .prefetch import PrefetchingIterator
-from .rankfm_embedding_backends import build_embedding_backend
-from .xsurface_helpers import (
+from recir.examples.rankfm_mvai.xsurface_helpers import (
     _resolve_nro_per_sample,
     make_padding_region_transforms,
     prepare_override_build_sample,
 )
+from recir.region_transforms.dropout_prng import DropoutPRNGTransform
+from recir.region_transforms.padding import compute_padded_shape
+from torch.utils.data import IterableDataset
 
 logger: logging.Logger = logging.getLogger(__name__)
 
@@ -117,6 +122,17 @@ logger: logging.Logger = logging.getLogger(__name__)
 # metric buffers don't match and still sync. Full sync (skip_fqns=None) is used
 # before checkpointing/inspecting the tables (flush_host_state(full=True)).
 _EMB_SYNC_SKIP_FQNS: Tuple[str, ...] = ("_sharded_tables", "_dp_tables")
+
+# The only state the training loop needs mirrored host-ward between
+# checkpoints: the warmup controller's LR buffers, which
+# ``snapshot_metrics._lr_tensor`` reads for the learning_rate/* curves. Named
+# after the module buffers (hammer recir_core/compile.py LR_*_BUFFER); the
+# WarmupController holds the same tensors under its own attribute names.
+_LR_SYNC_ONLY_FQNS: Tuple[str, ...] = (
+    "_lr_dense_buffer",
+    "_lr_sparse_buffer",
+    "_lr_iter_buffer",
+)
 
 
 def _udd_fm_v3_train_step(
@@ -394,6 +410,7 @@ class RecirXLACompiledModule(RecirCompiledModuleBase):
         watch_params(self)
         self._dense_opt: torch.optim.Optimizer = dense_opt
         self._emb_opt: Optional[torch.optim.Optimizer] = emb_opt
+        self._host_state_buffers: Any = None
         self._warmup: WarmupController = warmup
         self._sparse_runtime: SparseOptimizerRuntime = sparse_runtime
         self._sparse_lr_buffer: Optional[torch.Tensor] = sparse_lr_buffer
@@ -534,13 +551,19 @@ class RecirXLACompiledModule(RecirCompiledModuleBase):
         By default the GB-scale embedding tables are skipped (kept resident on
         device -- see _EMB_SYNC_SKIP_FQNS); pass full=True before checkpointing
         to also mirror them (skip_fqns=None). The table host params must already
-        have real storage (see checkpointable.materialize_meta_params) or the
+        have real storage (see checkpointable.HostStateBuffers) or the
         copy_ is a silent no-op.
         """
         compiled_step = self._compiled_step
         if compiled_step is not None:
             skip_fqns = None if full else _EMB_SYNC_SKIP_FQNS
             sync_device_state_to_torch(compiled_step, skip_fqns=skip_fqns)
+
+    def sync_lr_to_host(self) -> None:
+        """Refresh only the LR buffers ``snapshot_metrics._lr_tensor`` reads."""
+        compiled_step = self._compiled_step
+        if compiled_step is not None:
+            sync_named_state_to_torch(compiled_step, _LR_SYNC_ONLY_FQNS)
 
     def enable_output_pipelining(self) -> bool:
         manager = self._state_manager()
@@ -563,30 +586,44 @@ class RecirXLACompiledModule(RecirCompiledModuleBase):
         return None if compiled_obj is None else compiled_obj.state_manager
 
     def prepare_for_restore(self) -> None:
-        """Ready the in_graph model to receive a checkpoint before dcp.load.
-
-        The embedding tables are on_device_init meta params of full shape [V, D]
-        until the first compile shape-shards them to [V/num_processes, D] (still
-        meta). dcp.load cannot write per-process shards into full-shape meta
-        params, so we force a compile-only pass on the trace batch (shape-shards
-        the tables; runs no fwd/bwd/opt.step, applies no update) and cache it, so
-        the first real forward reuses it (no recompile). Then give the sharded
-        table params real host storage so dcp.load lands.
-
-        NOTE: this force-compile MUST trace the FULL training graph with the
-        tables at their GLOBAL [V, D] shape -- shard_params row-shards them only
-        AFTER tracing, so the graph placeholders keep the global shape that
-        _to_sharded_jax feeds at runtime (it reconstructs global = local x
-        host_count). Sharding the params BEFORE this trace makes the placeholders
-        local [V/P, D] and mismatches the global array _to_sharded_jax provides.
-        That is why the (host-RAM-heavy) full compile can't simply be replaced by
-        a cheap standalone shard here; see the restore-memory follow-up.
-        """
+        """Compile, then build the run's host buffers so dcp.load can write into them."""
         if self._compiled_step is None:
             self._compiled_step = self._build_compiled_step(self._trace_batch)
-        from .checkpointable import materialize_meta_params
+        self._host_buffers()
 
-        materialize_meta_params(self, _EMB_SYNC_SKIP_FQNS)
+    def _host_buffers(self) -> Any:
+        buffers = self._host_state_buffers
+        if buffers is None:
+            compiled_obj = cast(Any, self._compiled_step).__dict__.get(
+                COMPILED_OBJECT_KEY
+            )
+            if compiled_obj is None:
+                raise RuntimeError(
+                    "host state buffers need a compiled step; call "
+                    "prepare_for_restore after the force-compile"
+                )
+            buffers = HostStateBuffers(
+                compiled_obj.flat_state,
+                compiled_obj.state_manager.state_fqns or [],
+                self._model,
+                [self._dense_opt, self._emb_opt],
+                _EMB_SYNC_SKIP_FQNS,
+            )
+            buffers.build()
+            self._host_state_buffers = buffers
+        return buffers
+
+    def finalize_restore(self) -> None:
+        """Seed device state from the freshly loaded host buffers."""
+        compiled_step = self._compiled_step
+        if compiled_step is None:
+            return
+        compiled_obj = cast(Any, compiled_step).__dict__.get(COMPILED_OBJECT_KEY)
+        if compiled_obj is None:
+            return
+        compiled_obj.state_manager.prefill_device_state_from_host(
+            compiled_obj.gm, compiled_obj.flat_state
+        )
 
     def make_checkpointable(self) -> Any:
         """Return a DCP Stateful view of this module (see checkpointable.py).
@@ -604,6 +641,7 @@ class RecirXLACompiledModule(RecirCompiledModuleBase):
             sharded_prefixes=(SHARDED_TABLE_PREFIX,),
             table_prefixes=(SHARDED_TABLE_PREFIX, DP_TABLE_PREFIX),
             warmup=self._warmup,
+            host_buffers=self._host_buffers,
             optimizer=self._dense_opt,
             shard_order=(
                 gather_shard_order(self._num_processes)
