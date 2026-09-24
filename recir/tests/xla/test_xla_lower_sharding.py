@@ -34,18 +34,46 @@ if "xla_force_host_platform_device_count" not in _existing_xla_flags:
     ).strip()
 
 import contextlib
+import sys
 import unittest
+from typing import Any, Tuple
 from unittest import mock
 
 import jax  # @manual
 import numpy as np
 import torch
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
-from recir.lowering.xla_lower import _gspmd_mesh, _jax_to_torch, _XLAModule
+from recir.lowering.xla_lower import (
+    _copy_jax_addressable_shards_to_torch,
+    _gspmd_mesh,
+    _jax_to_torch,
+    _single_device_array_to_numpy_uncached,
+    _XLAModule,
+)
 
 
 def _mesh() -> Mesh:
     return Mesh(np.array(jax.devices()), axis_names=("torch_dist",))
+
+
+class _FakeMultiProcessArray:
+    """A jax array as a non-primary process sees it: global shape, local shards.
+
+    `jax.Array.shape` is the shape across *all* processes, while
+    `addressable_shards` holds only the slices this process owns. Single-process
+    tests cannot produce that split -- every device is local -- so this widens a
+    real sharded array's reported shape while leaving its shards alone.
+    """
+
+    def __init__(self, local: Any, num_processes: int) -> None:
+        self._local = local
+        self.shape: Tuple[int, ...] = (
+            local.shape[0] * num_processes,
+            *local.shape[1:],
+        )
+        self.dtype: Any = local.dtype
+        self.sharding: Any = local.sharding
+        self.addressable_shards: Any = local.addressable_shards
 
 
 class ToShardedJaxTest(unittest.TestCase):
@@ -211,6 +239,179 @@ class ToShardedJaxTest(unittest.TestCase):
 
         self.assertEqual(output.shape, torch.Size([3, 8]))
         torch.testing.assert_close(output, torch.from_numpy(host))
+
+    def test_copy_shards_matches_jax_to_torch_on_the_sharded_axis(self) -> None:
+        host = np.arange(64, dtype=np.float32).reshape(8, 8)
+        sharded = jax.device_put(host, NamedSharding(self.mesh, P("torch_dist", None)))
+
+        dest = torch.zeros(8, 8)
+        _copy_jax_addressable_shards_to_torch(sharded, dest)
+
+        torch.testing.assert_close(dest, _jax_to_torch(sharded, torch.device("cpu")))
+        torch.testing.assert_close(dest, torch.from_numpy(host))
+
+    def test_copy_shards_never_takes_the_caching_transfer_path(self) -> None:
+        # `jax.device_get` stores the host array on the source shard as
+        # `_npy_value`, which would keep all eight of a table's 24 GB shards
+        # alive at once instead of one rotating buffer -- and `_npy_value`
+        # cannot be cleared afterwards, its setter rejects None. Asserting the
+        # cache is empty would pass vacuously here: on the CPU backend the
+        # transfer is zero-copy, so `did_copy` is False and `_value` never
+        # caches either. Pin the routing instead.
+        host = np.arange(64, dtype=np.float32).reshape(8, 8)
+        sharded = jax.device_put(host, NamedSharding(self.mesh, P("torch_dist", None)))
+        dest = torch.zeros(8, 8)
+
+        module = sys.modules["recir.lowering.xla_lower"]
+        with mock.patch.object(
+            module, "_jax_to_numpy", side_effect=AssertionError("cached transfer")
+        ):
+            _copy_jax_addressable_shards_to_torch(sharded, dest)
+
+        torch.testing.assert_close(dest, torch.from_numpy(host))
+
+    def test_shard_to_numpy_falls_back_when_the_private_entry_point_is_gone(
+        self,
+    ) -> None:
+        # `_single_device_array_to_np_array_did_copy` is private JAX API. A
+        # version bump that renames it must degrade to the caching transfer,
+        # not crash the checkpoint flush. A plain ndarray stands in for the
+        # renamed case: it is what `getattr(..., None)` sees either way.
+        host = np.arange(8, dtype=np.float32)
+
+        np.testing.assert_array_equal(
+            _single_device_array_to_numpy_uncached(host), host
+        )
+
+    def test_shard_to_numpy_refuses_a_multi_device_array(self) -> None:
+        # The fast path is a SINGLE-device entry point. Handed a sharded array
+        # it would return one device's data as if it were the whole tensor --
+        # a silently wrong checkpoint. Refuse instead of reading shard 0.
+        host = np.arange(24, dtype=np.float32).reshape(3, 8)
+        sharded = jax.device_put(host, NamedSharding(self.mesh, P(None, "torch_dist")))
+        self.assertGreater(len(sharded.addressable_shards), 1)
+
+        with self.assertRaisesRegex(ValueError, "expected one device's array"):
+            _single_device_array_to_numpy_uncached(sharded)
+
+    def test_copy_shards_reassembles_a_non_zero_sharded_axis(self) -> None:
+        host = np.arange(24, dtype=np.float32).reshape(3, 8)
+        sharded = jax.device_put(host, NamedSharding(self.mesh, P(None, "torch_dist")))
+
+        dest = torch.zeros(3, 8)
+        _copy_jax_addressable_shards_to_torch(sharded, dest)
+
+        torch.testing.assert_close(dest, torch.from_numpy(host))
+
+    def test_copy_shards_refuses_a_multi_axis_sharded_array(self) -> None:
+        # The shards are concatenated along one axis, so an array sharded on
+        # two axes would be reassembled with every shard at the wrong offset.
+        # That is a silently corrupt checkpoint; refuse it instead.
+        mesh = Mesh(np.array(jax.devices()).reshape(2, 2), axis_names=("rows", "cols"))
+        sharded = jax.device_put(
+            np.arange(16, dtype=np.float32).reshape(4, 4),
+            NamedSharding(mesh, P("rows", "cols")),
+        )
+        dest = torch.zeros(4, 4)
+
+        with self.assertRaisesRegex(ValueError, "sharded on axes"):
+            _copy_jax_addressable_shards_to_torch(sharded, dest)
+
+        torch.testing.assert_close(dest, torch.zeros(4, 4))
+
+    def test_copy_shards_handles_a_replicated_array(self) -> None:
+        host = np.arange(12, dtype=np.float32).reshape(3, 4)
+        replicated = jax.device_put(host, self.replicated)
+
+        dest = torch.zeros(3, 4)
+        _copy_jax_addressable_shards_to_torch(replicated, dest)
+
+        torch.testing.assert_close(dest, torch.from_numpy(host))
+
+    def test_copy_shards_casts_to_the_destination_dtype(self) -> None:
+        host = np.arange(16, dtype=np.float32).reshape(4, 4)
+        sharded = jax.device_put(host, NamedSharding(self.mesh, P("torch_dist", None)))
+
+        dest = torch.zeros(4, 4, dtype=torch.bfloat16)
+        _copy_jax_addressable_shards_to_torch(sharded, dest)
+
+        self.assertEqual(dest.dtype, torch.bfloat16)
+        torch.testing.assert_close(dest.float(), torch.from_numpy(host))
+
+    def test_copy_shards_rejects_a_mismatched_destination_before_writing(self) -> None:
+        # A half-written mirror that reports success is a silently half-stale
+        # checkpoint, so the shape check has to precede every copy.
+        sharded = jax.device_put(
+            np.arange(16, dtype=np.float32).reshape(4, 4),
+            NamedSharding(self.mesh, P("torch_dist", None)),
+        )
+        dest = torch.zeros(4, 8)
+
+        with self.assertRaises(ValueError):
+            _copy_jax_addressable_shards_to_torch(sharded, dest)
+
+        torch.testing.assert_close(dest, torch.zeros(4, 8))
+
+    def test_jax_to_torch_routes_a_sharded_array_through_the_shard_copy(self) -> None:
+        sharded = jax.device_put(
+            np.arange(64, dtype=np.float32).reshape(8, 8),
+            NamedSharding(self.mesh, P("torch_dist", None)),
+        )
+
+        with mock.patch(
+            "recir.lowering.xla_lower._copy_jax_addressable_shards_to_torch"
+        ) as copy_shards:
+            _jax_to_torch(sharded, torch.device("cpu"))
+
+        copy_shards.assert_called_once()
+        self.assertIs(copy_shards.call_args.args[0], sharded)
+        self.assertEqual(copy_shards.call_args.args[1].shape, torch.Size([8, 8]))
+
+    def test_jax_to_torch_preserves_bf16_for_a_sharded_array(self) -> None:
+        host = np.arange(16, dtype=np.float32).reshape(4, 4)
+        sharded = jax.device_put(
+            jax.numpy.asarray(host, dtype=jax.numpy.bfloat16),
+            NamedSharding(self.mesh, P("torch_dist", None)),
+        )
+
+        out = _jax_to_torch(sharded, torch.device("cpu"))
+
+        self.assertEqual(out.dtype, torch.bfloat16)
+        torch.testing.assert_close(out.float(), torch.from_numpy(host))
+
+    def test_copy_shards_sizes_the_mirror_per_process_not_globally(self) -> None:
+        # A multi-process array reports the *global* shape but exposes only this
+        # process's shards, so the host mirror is 1/num_processes of `.shape`.
+        # Checking `dest` against `t.shape` would reject every sharded table on
+        # a real multi-host run.
+        host = np.arange(32, dtype=np.float32).reshape(4, 8)
+        local = jax.device_put(host, NamedSharding(self.mesh, P("torch_dist", None)))
+        global_view = _FakeMultiProcessArray(local, num_processes=4)
+
+        self.assertEqual(global_view.shape, (16, 8))
+        dest = torch.zeros(4, 8)
+        _copy_jax_addressable_shards_to_torch(global_view, dest)
+
+        torch.testing.assert_close(dest, torch.from_numpy(host))
+
+    def test_jax_to_torch_allocates_the_per_process_shape(self) -> None:
+        host = np.arange(32, dtype=np.float32).reshape(4, 8)
+        local = jax.device_put(host, NamedSharding(self.mesh, P("torch_dist", None)))
+        global_view = _FakeMultiProcessArray(local, num_processes=4)
+
+        out = _jax_to_torch(global_view, torch.device("cpu"))
+
+        self.assertEqual(out.shape, torch.Size([4, 8]))
+        torch.testing.assert_close(out, torch.from_numpy(host))
+
+    def test_jax_to_torch_keeps_scalar_dtype_normalisation(self) -> None:
+        scalar = jax.device_put(np.float32(2.5), jax.devices()[0])
+
+        out = _jax_to_torch(scalar, torch.device("cpu"))
+
+        self.assertEqual(out.shape, torch.Size([]))
+        self.assertEqual(out.dtype, torch.float32)
+        self.assertEqual(out.item(), 2.5)
 
     def test_fsdp_state_is_not_replicated_as_final_user_output(self) -> None:
         graph = torch.fx.Graph()

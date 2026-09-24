@@ -7,6 +7,7 @@
 import contextlib
 import contextvars
 import ctypes
+import functools
 import gc
 import logging
 import os
@@ -1448,6 +1449,42 @@ def _is_xla_compatible(node: torch.fx.Node) -> Tuple[bool, str]:
     return True, ""
 
 
+@functools.lru_cache(maxsize=1)
+def _warn_uncached_transfer_unavailable() -> None:
+    logger.warning(
+        "jax.Array._single_device_array_to_np_array_did_copy is gone; falling "
+        "back to jax.device_get, which caches each shard's host array and so "
+        "holds every shard of a state entry resident at once. Re-point "
+        "_single_device_array_to_numpy_uncached at the renamed entry point."
+    )
+
+
+def _single_device_array_to_numpy_uncached(t: Any) -> Any:
+    """One device's array to numpy, without JAX caching the result on the source."""
+    import numpy as np
+
+    shards = getattr(t, "addressable_shards", ())
+    if len(shards) > 1:
+        raise ValueError(
+            f"expected one device's array, got {len(shards)} shards; the JAX "
+            "entry point below reads only the first. Iterate the shards, or "
+            "use _jax_to_numpy, which handles multi-device arrays."
+        )
+
+    to_np = getattr(t, "_single_device_array_to_np_array_did_copy", None)
+    if to_np is None:
+        # Private JAX API; a version bump may rename it. Degrading to the
+        # caching transfer keeps the flush correct, but silently reinstates the
+        # pinning this exists to avoid -- which on 64 chips surfaces as an OOM
+        # that looks like it came from somewhere else. Say so, once.
+        _warn_uncached_transfer_unavailable()
+        return _jax_to_numpy(t)
+    host_arr = np.asarray(to_np()[0])
+    if host_arr.dtype.name == "bfloat16":
+        host_arr = host_arr.astype(np.float32)
+    return host_arr
+
+
 def _jax_to_numpy(t: Any) -> Any:
     """Convert a JAX array to a numpy array, handling bfloat16.
 
@@ -1473,12 +1510,74 @@ def _jax_to_numpy(t: Any) -> Any:
     return host_arr
 
 
+def _sharded_axis_and_shards(t: Any) -> Optional[Tuple[int, List[Any]]]:
+    """The axis ``t``'s addressable shards are split on, and those shards in index order."""
+    shards = t.addressable_shards
+    if len(shards) <= 1 or shards[0].data.shape == t.shape:
+        return None
+    sharding_spec = getattr(getattr(t, "sharding", None), "spec", ())
+    sharded_axes = [axis for axis, partition in enumerate(sharding_spec) if partition]
+    if len(sharded_axes) > 1:
+        # The shards are concatenated along a single axis below. Reassembling a
+        # multi-axis sharded array that way places every shard at the wrong
+        # offset and reports success -- a silently corrupt checkpoint.
+        raise ValueError(
+            f"cannot reassemble an array sharded on axes {sharded_axes}; "
+            "only single-axis sharding is supported "
+            f"(spec {tuple(sharding_spec)}, shape {tuple(t.shape)})"
+        )
+    axis = sharded_axes[0] if sharded_axes else 0
+    return axis, sorted(shards, key=lambda s: s.index)
+
+
+def _local_shard_shape(t: Any) -> Tuple[int, ...]:
+    """Shape of the tensor this process's addressable shards reassemble into."""
+    split = _sharded_axis_and_shards(t)
+    if split is None:
+        return tuple(t.addressable_shards[0].data.shape)
+    axis, shards = split
+    shape = list(shards[0].data.shape)
+    shape[axis] = sum(s.data.shape[axis] for s in shards)
+    return tuple(shape)
+
+
+def _copy_jax_addressable_shards_to_torch(t: Any, dest: torch.Tensor) -> None:
+    """Reassemble the addressable shards of JAX array ``t`` into ``dest``, in place."""
+    local_shape = _local_shard_shape(t)
+    if tuple(dest.shape) != local_shape:
+        raise ValueError(
+            f"destination shape {tuple(dest.shape)} does not match the shape "
+            f"this process's shards reassemble into, {local_shape} "
+            f"(jax array is globally {tuple(t.shape)})"
+        )
+
+    split = _sharded_axis_and_shards(t)
+    if split is None:
+        dest.copy_(
+            torch.from_numpy(
+                _single_device_array_to_numpy_uncached(t.addressable_shards[0].data)
+            )
+        )
+        return
+
+    axis, ordered_shards = split
+    offset = 0
+    for shard in ordered_shards:
+        arr = _single_device_array_to_numpy_uncached(shard.data)
+        length = arr.shape[axis]
+        # `arr` is the only extra buffer alive, and only until the next
+        # iteration rebinds it -- that is the whole point of the loop, and it
+        # only holds because `_single_device_array_to_numpy_uncached` keeps JAX from caching it.
+        dest.narrow(axis, offset, length).copy_(torch.from_numpy(arr))
+        offset += length
+
+
 def _jax_to_torch(t: Any, device: torch.device) -> Any:
     """Convert a JAX output (array, None, or nested list/tuple) to a torch tensor.
 
-    For batch-sharded arrays (shards differ), concatenates all addressable
-    shards to reconstruct the per-process tensor.  For replicated arrays
-    (all shards identical), takes a single shard.
+    For arrays with addressable shards, allocates the per-process host tensor
+    (this process's shards only, not the global shape) and hands it to
+    `_copy_jax_addressable_shards_to_torch`, which fills it shard by shard.
 
     Preserves bf16 dtype: numpy doesn't natively represent bf16 so the
     transfer round-trips through fp32 in `_jax_to_numpy`; the inverse
@@ -1503,26 +1602,23 @@ def _jax_to_torch(t: Any, device: torch.device) -> Any:
         return {k: _jax_to_torch(v, device) for k, v in t.items()}
     src_is_bf16 = hasattr(t, "dtype") and getattr(t.dtype, "name", "") == "bfloat16"
     if hasattr(t, "addressable_shards") and t.addressable_shards:
-        shards = t.addressable_shards
-        if len(shards) > 1 and shards[0].data.shape != t.shape:
-            # Batch-sharded: each shard is a slice. Concatenate to
-            # reconstruct the per-process tensor.
-            sorted_shards = sorted(shards, key=lambda s: s.index)
-            arrays = [_jax_to_numpy(s.data) for s in sorted_shards]
-            sharding_spec = getattr(getattr(t, "sharding", None), "spec", ())
-            sharded_axes = [
-                axis for axis, partition in enumerate(sharding_spec) if partition
-            ]
-            concat_axis = sharded_axes[0] if len(sharded_axes) == 1 else 0
-            np_arr = np.concatenate(arrays, axis=concat_axis)
-        else:
-            # Replicated: all shards identical, take one.
-            np_arr = _jax_to_numpy(shards[0].data)
-        if np_arr.ndim == 0:
-            return torch.tensor(np_arr.item(), device=device)
-        out = torch.tensor(np_arr, device=device)
-        if src_is_bf16:
-            out = out.to(torch.bfloat16)
+        if not t.shape:
+            # A scalar has no shards to reassemble, and routing it through the
+            # shard path would change its dtype: `.item()` has always
+            # normalised to a python scalar's type, dropping bf16 to fp32.
+            return torch.tensor(
+                _jax_to_numpy(t.addressable_shards[0].data).item(), device=device
+            )
+        out = torch.empty(
+            _local_shard_shape(t),
+            dtype=(
+                torch.bfloat16
+                if src_is_bf16
+                else torch.from_numpy(np.empty(0, dtype=t.dtype)).dtype
+            ),
+            device=device,
+        )
+        _copy_jax_addressable_shards_to_torch(t, out)
         return out
     np_arr = _jax_to_numpy(t)
     if np_arr.ndim == 0:
