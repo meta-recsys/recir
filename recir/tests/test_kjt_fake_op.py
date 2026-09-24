@@ -27,6 +27,7 @@ Verifies that:
 import copy
 import unittest
 from typing import Dict, List
+from unittest.mock import patch
 
 import torch
 from functorch import make_fx
@@ -177,6 +178,27 @@ class KjtSplitPerFeatureTest(unittest.TestCase):
         self.assertTrue(torch.equal(out[1], kjt.values()[5:6]))
         self.assertTrue(torch.equal(out[2], kjt.values()[6:12]))
 
+    def test_real_impl_does_not_read_individual_scalars(self) -> None:
+        """Real impl materializes all split boundaries in one batch."""
+        kjt = _make_kjt(
+            keys=["f0", "f1", "f2"],
+            per_key_lengths=[[2, 3], [1, 0], [4, 2]],
+            vocab_size=100,
+            seed=42,
+        )
+        with patch.object(
+            torch.Tensor,
+            "item",
+            side_effect=AssertionError("split boundaries must not use Tensor.item"),
+        ):
+            out = torch.ops.recir_torchrec.kjt_split_per_feature(
+                kjt.values(),
+                kjt.offsets(),
+                kjt.stride(),
+                len(kjt.keys()),
+            )
+        self.assertEqual([tensor.numel() for tensor in out], [5, 1, 6])
+
     def test_fake_kernel_emits_symint_sizes(self) -> None:
         """Fake kernel produces tensors with SymInt-sized first dim."""
         with FakeTensorMode(shape_env=ShapeEnv()):
@@ -209,6 +231,24 @@ class KjtSplitPerFeatureTest(unittest.TestCase):
         torch.testing.assert_close(outputs[1], torch.tensor([20, 21, 22, 23]))
         torch.testing.assert_close(outputs[2], torch.tensor([0, 2, 3, 3]))
         torch.testing.assert_close(outputs[3], torch.tensor([0, 1, 3, 4]))
+
+    def test_fixed_stride_split_does_not_read_individual_counts(self) -> None:
+        lengths = torch.tensor([2, 1, 0, 1, 2, 1], dtype=torch.int64)
+        values = torch.tensor([10, 11, 12, 20, 21, 22, 23], dtype=torch.int64)
+
+        with patch.object(
+            torch.Tensor,
+            "item",
+            side_effect=AssertionError("value counts must not use Tensor.item"),
+        ):
+            outputs = torch.ops.recir_torchrec.kjt_split_per_feature_with_offsets(
+                values,
+                lengths,
+                None,
+                2,
+            )
+
+        self.assertEqual([tensor.numel() for tensor in outputs[:2]], [3, 4])
 
     def test_fixed_stride_split_rejects_uneven_feature_strides(self) -> None:
         with self.assertRaisesRegex(ValueError, "same stride"):

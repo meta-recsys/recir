@@ -12,8 +12,8 @@ data-dependent and breaks ``make_fx(tracing_mode="fake")`` with
 
 Strategy:
   1. Register a custom op ``recir_torchrec::kjt_split_per_feature`` whose
-     real impl computes per-key index tensors (using ``.item()``, safe at
-     execution time on real tensors) and whose fake (Meta) kernel emits
+     real impl computes per-key index tensors after one batched D2H of the split
+     boundaries, and whose fake (Meta) kernel emits
      fresh ``SymInt``-sized output tensors via ``new_dynamic_size()``.
      EBC uses a companion variant that also returns per-feature offsets and
      optional weights. Fixed-stride offset sizes stay shape-derived.
@@ -49,7 +49,12 @@ from torchrec.modules.embedding_modules import (
     process_pooled_embeddings,
     reorder_inverse_indices,
 )
-from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor, KeyedTensor
+from torchrec.sparse.jagged_tensor import (
+    _cuda_to_cpu_safe,
+    JaggedTensor,
+    KeyedJaggedTensor,
+    KeyedTensor,
+)
 from torchrec.sparse.tensor_dict import maybe_td_to_kjt
 
 logger: logging.Logger = logging.getLogger(__name__)
@@ -78,10 +83,16 @@ def _register_kjt_split_op() -> None:
         range is ``values[per_key_offsets[k]:per_key_offsets[k+1]]``.
         """
         per_key_offsets = offsets[::stride]
+        # Citrine C6: batch the data-dependent boundaries into one D2H sync.
+        host_offsets: List[int] = (
+            _cuda_to_cpu_safe(per_key_offsets).tolist()
+            if per_key_offsets.is_cuda
+            else per_key_offsets.tolist()
+        )
         out: List[torch.Tensor] = []
         for k in range(num_keys):
-            start = int(per_key_offsets[k].item())
-            end = int(per_key_offsets[k + 1].item())
+            start = host_offsets[k]
+            end = host_offsets[k + 1]
             # Clone instead of slice-view: ``custom_op`` forbids any
             # output from aliasing an input.
             out.append(values[start:end].clone())
@@ -143,11 +154,15 @@ def _kjt_split_per_feature_with_offsets_impl(
     if weights is not None and weights.numel() != values.numel():
         raise ValueError("KJT weights must contain one value per ID")
 
-    per_key_lengths = torch.split(
-        lengths,
-        _stride_per_key(lengths, num_keys),
+    stride_per_key = _stride_per_key(lengths, num_keys)
+    per_key_lengths = torch.split(lengths, stride_per_key)
+    value_count_tensor = lengths.reshape(num_keys, stride_per_key[0]).sum(dim=1)
+    # Citrine C6: batch the data-dependent value counts into one D2H sync.
+    value_counts: List[int] = (
+        _cuda_to_cpu_safe(value_count_tensor).tolist()
+        if value_count_tensor.is_cuda
+        else value_count_tensor.tolist()
     )
-    value_counts = [int(key_lengths.sum().item()) for key_lengths in per_key_lengths]
     per_key_values = [part.clone() for part in torch.split(values, value_counts)]
     per_key_offsets = [
         torch.cat((key_lengths.new_zeros((1,)), key_lengths)).cumsum(dim=0)
