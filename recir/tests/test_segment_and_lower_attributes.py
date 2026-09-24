@@ -43,12 +43,23 @@ cleanup); ``lower_subgraph_nodes`` invokes it when the parent is an
 the lowered submodule.
 """
 
+import operator
 import unittest
 from typing import List
+from unittest import mock
 
 import torch
 from recir.iter_graph_module import IterGraphModule
 from recir.lowering.lowering_utils import create_subgraph_module, segment_and_lower
+from recir.lowering.partial_lower import (
+    _prune_control_deps_to_frontier,
+    _shape_env_for_subgraph,
+    _StreamSyncOrderingGraphPass,
+    partial_lower,
+)
+from torch._inductor.fx_passes.control_dependencies import control_deps
+from torch._subclasses.fake_tensor import FakeTensorMode
+from torch.fx.experimental.symbolic_shapes import ShapeEnv
 
 
 def _always_compatible(node: torch.fx.Node) -> tuple[bool, str]:
@@ -86,6 +97,177 @@ class _StubSubgraphModule(torch.nn.Module):
 
 
 class SegmentAndLowerAttributesTest(unittest.TestCase):
+    def test_stream_sync_passthroughs_become_ordering_edges(self) -> None:
+        from torch._functorch._aot_autograd.streams import (
+            wrap_all_sync_nodes_with_control_deps,
+        )
+
+        graph = torch.fx.Graph()
+        value = graph.placeholder("value")
+        value.meta["val"] = torch.ones(2)
+        side = graph.call_function(torch.ops.aten.relu.default, args=(value,))
+        side.meta.update({"val": torch.ones(2), "custom": {"stream": 5}})
+        graph.call_function(
+            torch.ops.streams.record_event.default,
+            args=(11, 5),
+        )
+        other = graph.call_function(torch.ops.aten.neg.default, args=(value,))
+        other.meta.update({"val": torch.ones(2), "custom": {"stream": 7}})
+        graph.call_function(
+            torch.ops.streams.wait_event.default,
+            args=(11, 7),
+        )
+        consumer = graph.call_function(
+            torch.ops.aten.add.Tensor,
+            args=(side, other),
+        )
+        consumer.meta.update({"val": torch.ones(2), "custom": {"stream": 7}})
+        graph.output(consumer)
+        gm = torch.fx.GraphModule(root={}, graph=graph)
+
+        wrap_all_sync_nodes_with_control_deps(gm)
+
+        control_nodes = [
+            node
+            for node in gm.graph.nodes
+            if node.op == "call_function" and node.target is control_deps
+        ]
+        self.assertEqual(len(control_nodes), 2)
+        self.assertTrue(all(len(node.args) > 2 for node in control_nodes))
+        wait_node = control_nodes[1]
+        subgraph_attr = wait_node.args[1]
+        if not isinstance(subgraph_attr, torch.fx.Node) or not isinstance(
+            subgraph_attr.target, str
+        ):
+            raise AssertionError("expected control-deps subgraph attribute")
+        wait_subgraph = getattr(gm, subgraph_attr.target)
+        self.assertTrue(
+            any(
+                subgraph_node.op == "call_function"
+                and subgraph_node.target is torch.ops.streams.wait_event.default
+                for subgraph_node in wait_subgraph.graph.nodes
+            )
+        )
+        _StreamSyncOrderingGraphPass()(gm.graph)
+
+        self.assertEqual([len(node.args) for node in control_nodes], [2, 2])
+        self.assertFalse(
+            any(
+                node.op == "call_function" and node.target is operator.getitem
+                for node in gm.graph.nodes
+            )
+        )
+        ordered_consumer = gm.graph.output_node().args[0]
+        if not isinstance(ordered_consumer, torch.fx.Node):
+            raise AssertionError("expected FX node output")
+        self.assertIs(ordered_consumer.target, control_deps)
+        self.assertEqual(ordered_consumer.args[0], (wait_node,))
+        gm.graph.lint()
+
+    def test_control_deps_are_pruned_to_dependency_frontier(self) -> None:
+        graph = torch.fx.Graph()
+        value = graph.placeholder("value")
+        first = graph.call_function(torch.ops.aten.relu.default, args=(value,))
+        middle = graph.call_function(torch.ops.aten.neg.default, args=(first,))
+        second = graph.call_function(torch.ops.aten.relu.default, args=(middle,))
+        independent = graph.call_function(torch.ops.aten.neg.default, args=(value,))
+        barrier = graph.call_function(
+            control_deps,
+            args=((value, first, second, independent), None),
+        )
+        graph.output(barrier)
+
+        _prune_control_deps_to_frontier(graph)
+
+        self.assertEqual(barrier.args[0], (second, independent))
+
+    def test_partial_lower_keeps_stream_syncs_inside_one_subgraph(self) -> None:
+        graph = torch.fx.Graph()
+        value = graph.placeholder("value")
+        value.meta["val"] = torch.ones(2)
+        current = value
+        for _ in range(12):
+            current = graph.call_function(
+                torch.ops.aten.relu.default,
+                args=(current,),
+            )
+            current.meta["val"] = torch.ones(2)
+        collective = graph.call_function(
+            torch.ops._c10d_functional.all_reduce.default,
+            args=(current, "sum", "0"),
+        )
+        collective.meta["val"] = torch.ones(2)
+        current = graph.call_function(
+            torch.ops._c10d_functional.wait_tensor.default,
+            args=(collective,),
+        )
+        current.meta["val"] = torch.ones(2)
+        graph.call_function(
+            torch.ops.streams.record_event.default,
+            args=(11, 5),
+        )
+        graph.call_function(
+            torch.ops.streams.wait_event.default,
+            args=(11, 7),
+        )
+        for _ in range(12):
+            current = graph.call_function(
+                torch.ops.aten.relu.default,
+                args=(current,),
+            )
+            current.meta["val"] = torch.ones(2)
+        graph.output(current)
+        gm = torch.fx.GraphModule(root={}, graph=graph)
+
+        lowered = partial_lower(gm)
+        calls = [node for node in lowered.graph.nodes if node.op == "call_module"]
+        self.assertEqual(len(calls), 1)
+
+        compiled_graphs: list[torch.fx.GraphModule] = []
+
+        def compile_fx(
+            compiled_gm: torch.fx.GraphModule,
+            _inputs: tuple[object, ...],
+            **_kwargs: object,
+        ) -> object:
+            compiled_graphs.append(compiled_gm)
+            return lambda *args: (args[0],)
+
+        with mock.patch("torch._inductor.compile_fx.compile_fx", compile_fx):
+            result = lowered(torch.ones(2))
+
+        self.assertTrue(torch.equal(result, torch.ones(2)))
+        self.assertEqual(len(compiled_graphs), 1)
+        control_nodes = [
+            node
+            for node in compiled_graphs[0].graph.nodes
+            if node.op == "call_function" and node.target is control_deps
+        ]
+        self.assertEqual([len(node.args[0]) for node in control_nodes], [1, 1])
+        collective_node = next(
+            node
+            for node in compiled_graphs[0].graph.nodes
+            if node.target is torch.ops._c10d_functional.all_reduce.default
+        )
+        self.assertEqual(
+            [user.target for user in collective_node.users],
+            [torch.ops._c10d_functional.wait_tensor.default],
+        )
+
+    def test_shape_env_accepts_metadata_from_multiple_fake_modes(self) -> None:
+        graph = torch.fx.Graph()
+        value = graph.placeholder("value")
+        output = graph.output(value)
+        first_mode = FakeTensorMode(shape_env=ShapeEnv())
+        second_mode = FakeTensorMode(shape_env=ShapeEnv())
+        output.meta["val"] = (
+            first_mode.from_tensor(torch.ones(2)),
+            second_mode.from_tensor(torch.ones(2)),
+        )
+        gm = torch.fx.GraphModule(root={}, graph=graph)
+
+        self.assertIsInstance(_shape_env_for_subgraph(gm), ShapeEnv)
+
     def test_subgraph_output_shares_boundary_metadata(self) -> None:
         graph = torch.fx.Graph()
         source = graph.placeholder("source")
