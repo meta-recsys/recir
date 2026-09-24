@@ -49,6 +49,23 @@ class _RunnerModule(torch.nn.Module):
         return (distributed * 2,)
 
 
+class _InputReadyRunnerModule(torch.nn.Module):
+    def __init__(self, calls: list[str]) -> None:
+        super().__init__()
+        self.calls = calls
+        self.input_ready_event: object | None = None
+
+    def forward(
+        self,
+        value: torch.Tensor,
+        *,
+        input_ready_event: object | None = None,
+    ) -> tuple[torch.Tensor]:
+        self.calls.append("gm")
+        self.input_ready_event = input_ready_event
+        return (value,)
+
+
 class _FanoutModule(torch.nn.Module):
     def forward(self, value: torch.Tensor) -> torch.Tensor:
         preprocessed = value + 1
@@ -981,13 +998,39 @@ class PipelineTest(unittest.TestCase):
         )
         runner = make_compiled_runner(compiled_obj)
 
-        first = runner(torch.tensor(1), input_ready_event=object())
+        with mock.patch.object(torch.cuda, "is_available", return_value=False):
+            first = runner(torch.tensor(1), input_ready_event=object())
         second = runner(torch.tensor(2))
         final = runner(last_train_step=True)
 
         self.assertTrue(is_pipeline_pending(first))
         self.assertEqual(second, torch.tensor(4))
         self.assertEqual(final, torch.tensor(6))
+
+    def test_compiled_runner_forwards_input_ready_event(self) -> None:
+        calls: list[str] = []
+        input_ready_event = object()
+        state_manager = mock.Mock()
+        state_manager.prepare_inputs.side_effect = (
+            lambda gm, flat_state, user_inps, last_train_step: (
+                calls.append("prepare") or user_inps
+            )
+        )
+        state_manager.defers_output.return_value = False
+        state_manager.materialize_output.side_effect = lambda output: output
+        gm = _InputReadyRunnerModule(calls)
+        compiled_obj = SimpleNamespace(
+            gm=gm,
+            flat_state=[],
+            state_manager=state_manager,
+        )
+        runner = make_compiled_runner(compiled_obj)
+
+        output = runner(torch.tensor(1), input_ready_event=input_ready_event)
+
+        self.assertEqual(calls, ["prepare", "gm"])
+        self.assertEqual(output, torch.tensor(1))
+        self.assertIs(gm.input_ready_event, input_ready_event)
 
     def test_sdd_pipeline_rejects_state_read_in_prefix(self) -> None:
         gm = _region_graph()
