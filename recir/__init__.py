@@ -31,13 +31,17 @@ from recir.distributed.parallel_mode import (  # noqa: F401
 )
 from recir.ops.marker import attach_markers, mark_boundary  # noqa: F401
 from recir.pipeline import (  # noqa: F401
+    mark_execution_stream,
     PipelineAction,
     PipelineConfig,
     PipelinePlan,
     PipelineSchedule,
     PipelineStageSpec,
+    PipelineStreamSpec,
 )
 from recir.pipeline_strategies import (  # noqa: F401
+    embedding_steady_state_pipeline_config,
+    embedding_steady_state_pipeline_plan,
     PipelineRegion,
     sdd_pipeline_config,
     sdd_pipeline_plan,
