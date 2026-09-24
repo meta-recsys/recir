@@ -26,6 +26,10 @@ _PIPELINE_REGION_META = "recir_pipeline_region"
 _PIPELINE_PARTITION_META = "recir_pipeline_partition"
 
 
+def _is_pipeline_partition_node(node: fx.Node) -> bool:
+    return node.op not in ("placeholder", "get_attr", "output")
+
+
 @dataclass(frozen=True)
 class PipelineAction:
     stage_index: int
@@ -199,7 +203,7 @@ class PipelinedGraphModule(nn.Module):
             partition_indices = {
                 index
                 for node in cast(fx.GraphModule, stage).graph.nodes
-                if node.op not in ("placeholder", "output")
+                if _is_pipeline_partition_node(node)
                 and isinstance(
                     (index := node.meta.get(_PIPELINE_PARTITION_META)),
                     int,
@@ -622,8 +626,10 @@ def build_pipeline(
     process_outputs = gm.graph._codegen.process_outputs
     node_stages, compute_stage, stage_names = _collect_pipeline_stages(gm, config.plan)
     for node in gm.graph.nodes:
-        if node.op not in ("placeholder", "output"):
+        if _is_pipeline_partition_node(node):
             node.meta[_PIPELINE_PARTITION_META] = node_stages.get(node, compute_stage)
+        else:
+            node.meta.pop(_PIPELINE_PARTITION_META, None)
     split_gm = split_module(
         gm,
         gm,
@@ -632,6 +638,11 @@ def build_pipeline(
         tuple_return=True,
         partition_affix="pipeline",
     )
+    for node in tuple(split_gm.graph.nodes):
+        if node.op == "get_attr" and not node.users:
+            split_gm.graph.erase_node(node)
+    split_gm.graph.lint()
+    split_gm.recompile()
     pipeline = PipelinedGraphModule(
         split_gm,
         process_outputs,

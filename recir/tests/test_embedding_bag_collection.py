@@ -157,8 +157,6 @@ def _sharding_plan(
 
 def _tbe_sparse_transform_factory(
     embedding_plan: EmbeddingShardingPlan,
-    *,
-    variable_pooled_batch_per_rank: bool = False,
 ) -> Callable[[set[str], DeviceMesh, nn.Module], RegionTransform]:
     def create(
         fqns: set[str], mesh: DeviceMesh, module: nn.Module
@@ -169,7 +167,6 @@ def _tbe_sparse_transform_factory(
             module,
             embedding_plan=embedding_plan,
             stochastic_rounding=False,
-            variable_pooled_batch_per_rank=variable_pooled_batch_per_rank,
         )
 
     return create
@@ -397,7 +394,7 @@ class EmbeddingBagCollectionDistributedTest(DTensorTestBase):
     def test_tbe_uniform_rank_batches_match_global_eager_training(self) -> None:
         self._run_two_rank_training(
             use_tbe=True,
-            variable_pooled_batch_per_rank=False,
+            uniform_batch_per_rank=True,
         )
 
     @skip_if_lt_x_gpu(2)
@@ -418,7 +415,7 @@ class EmbeddingBagCollectionDistributedTest(DTensorTestBase):
         self._run_two_rank_training(
             use_tbe=True,
             use_inductor=True,
-            variable_pooled_batch_per_rank=False,
+            uniform_batch_per_rank=True,
         )
 
     @skip_if_lt_x_gpu(2)
@@ -451,7 +448,7 @@ class EmbeddingBagCollectionDistributedTest(DTensorTestBase):
         use_inductor: bool = False,
         sharding_case: _ShardingCase = "row_wise",
         table_wise_owner_rank: int = 0,
-        variable_pooled_batch_per_rank: bool = True,
+        uniform_batch_per_rank: bool = False,
     ) -> None:
         torch.manual_seed(0)
         device = torch.device(f"cuda:{self.rank}")
@@ -485,12 +482,7 @@ class EmbeddingBagCollectionDistributedTest(DTensorTestBase):
             dense_style="replicate",
             embedding_plan=embedding_plan,
             sparse_transform_factory=(
-                _tbe_sparse_transform_factory(
-                    embedding_plan,
-                    variable_pooled_batch_per_rank=(variable_pooled_batch_per_rank),
-                )
-                if use_tbe
-                else None
+                _tbe_sparse_transform_factory(embedding_plan) if use_tbe else None
             ),
         )
 
@@ -516,7 +508,7 @@ class EmbeddingBagCollectionDistributedTest(DTensorTestBase):
                 self.rank,
                 device,
                 batch_iteration,
-                uniform_batch_per_rank=not variable_pooled_batch_per_rank,
+                uniform_batch_per_rank=uniform_batch_per_rank,
             )
             expected_output = reference(values, lengths).detach()
             compiled_optimizer.zero_grad()
@@ -537,7 +529,7 @@ class EmbeddingBagCollectionDistributedTest(DTensorTestBase):
                     rank,
                     device,
                     batch_iteration,
-                    uniform_batch_per_rank=not variable_pooled_batch_per_rank,
+                    uniform_batch_per_rank=uniform_batch_per_rank,
                 )
                 global_losses.append(
                     (reference(rank_values, rank_lengths) * rank_coefficient).sum()
