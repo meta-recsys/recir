@@ -34,9 +34,10 @@ logger: logging.Logger = logging.getLogger(__name__)
 # Key under which the WarmupController iter is persisted inside the model
 # checkpoint (it lives in no nn.Module state_dict, so we carry it explicitly).
 WARMUP_ITER_KEY = "__recir_warmup_iter__"
-# Key under which the dense optimizer state_dict is nested inside the model
-# checkpoint (so it too is sanitized to plain host tensors before DCP writes it).
+# Keys under which optimizer state_dicts are nested inside the model checkpoint
+# (so they too are sanitized to plain host tensors before DCP writes them).
 OPTIMIZER_STATE_KEY = "__recir_optimizer__"
+EMBEDDING_OPTIMIZER_STATE_KEY = "__recir_embedding_optimizer__"
 # Save-time ``mesh slot -> torch rank`` permutation for the row-sharded tables.
 SHARD_ORDER_KEY = "__recir_shard_order__"
 
@@ -232,6 +233,85 @@ def unwrap_after_load(state_dict: Dict[str, Any]) -> Dict[str, Any]:
     for key, value in state_dict.items():
         out[key] = value.to_local() if isinstance(value, DTensor) else value
     return out
+
+
+def _unwrap_dtensors(value: Any) -> Any:
+    """Recursively replace checkpoint ``DTensor`` leaves by their local shards."""
+    return pytree.tree_map(
+        lambda leaf: leaf.to_local() if isinstance(leaf, DTensor) else leaf,
+        value,
+    )
+
+
+def _sharded_optimizer_state_ids(
+    optimizer: Any,
+    model: torch.nn.Module,
+    sharded_prefixes: Sequence[str],
+    state_dict: Dict[str, Any],
+) -> set[Any]:
+    """Optimizer state IDs whose parameters are row-sharded model tables."""
+    parameter_names = {id(param): name for name, param in model.named_parameters()}
+    state_ids: set[Any] = set()
+    saved_groups = state_dict.get("param_groups", ())
+    if len(saved_groups) != len(optimizer.param_groups):
+        raise RuntimeError(
+            "optimizer state_dict param-group count does not match the live optimizer"
+        )
+    for live_group, saved_group in zip(optimizer.param_groups, saved_groups):
+        live_params = live_group["params"]
+        saved_params = saved_group["params"]
+        if len(live_params) != len(saved_params):
+            raise RuntimeError(
+                "optimizer state_dict parameter count does not match the live optimizer"
+            )
+        for param, state_id in zip(live_params, saved_params):
+            name = parameter_names.get(id(param))
+            if name is not None and _is_sharded_table_key(name, sharded_prefixes):
+                state_ids.add(state_id)
+    return state_ids
+
+
+def _embedding_optimizer_state_for_save(
+    optimizer: Any,
+    model: torch.nn.Module,
+    sharded_prefixes: Sequence[str],
+    mesh: DeviceMesh | None,
+) -> Dict[str, Any]:
+    """Freeze embedding optimizer state and mark local row shards for DCP."""
+    state_dict = optimizer.state_dict()
+    sharded_state_ids = _sharded_optimizer_state_ids(
+        optimizer, model, sharded_prefixes, state_dict
+    )
+    frozen = pytree.tree_map(_freeze_checkpoint_value, state_dict)
+    if mesh is None:
+        return frozen
+
+    for state_id in sharded_state_ids:
+        param_state = frozen["state"].get(state_id)
+        if param_state is None:
+            continue
+        frozen["state"][state_id] = pytree.tree_map(
+            lambda leaf: (
+                DTensor.from_local(leaf, mesh, [Shard(0)], run_check=False)
+                if isinstance(leaf, torch.Tensor) and leaf.ndim > 0
+                else leaf
+            ),
+            param_state,
+        )
+    return frozen
+
+
+def _load_optimizer_state_preserving_lr(
+    optimizer: Any, state_dict: Dict[str, Any]
+) -> None:
+    """Load optimizer state without replacing its graph-captured LR tensors."""
+    live_lrs = [group.get("lr") for group in optimizer.param_groups]
+    optimizer.load_state_dict(_unwrap_dtensors(state_dict))
+    if len(live_lrs) != len(optimizer.param_groups):
+        raise RuntimeError("optimizer param-group count changed while loading state")
+    for group, live_lr in zip(optimizer.param_groups, live_lrs):
+        if isinstance(live_lr, torch.Tensor):
+            group["lr"] = live_lr
 
 
 def _replace_tensor_impl(tensor: torch.Tensor, replacement: torch.Tensor) -> None:
@@ -539,7 +619,8 @@ class RecirCheckpointable(Stateful):
         table_prefixes: Sequence[str],
         warmup: Any,
         host_buffers: Any = None,
-        optimizer: Any = None,
+        dense_optimizer: Any = None,
+        embedding_optimizer: Any = None,
         shard_order: Sequence[int] | None = None,
     ) -> None:
         self._wrapper = wrapper
@@ -548,11 +629,8 @@ class RecirCheckpointable(Stateful):
         self._table_prefixes = tuple(table_prefixes)
         self._warmup = warmup
         self._host_buffers = host_buffers
-        # The dense optimizer is carried inside this checkpointable (nested +
-        # sanitized) rather than as a separate DCP entry, so its tensors are also
-        # converted to plain host tensors (a torchax optimizer-state tensor would
-        # otherwise break torch.save; see _to_plain_host_tensor).
-        self._optimizer = optimizer
+        self._dense_optimizer = dense_optimizer
+        self._embedding_optimizer = embedding_optimizer
         self._shard_order: List[int] | None = (
             None if shard_order is None else list(shard_order)
         )
@@ -605,9 +683,16 @@ class RecirCheckpointable(Stateful):
         if mesh is not None:
             sd = wrap_sharded_for_save(sd, self._sharded_prefixes, mesh)
         t_wrap = time.perf_counter()
-        if self._optimizer is not None:
+        if self._dense_optimizer is not None:
             sd[OPTIMIZER_STATE_KEY] = pytree.tree_map(
-                _freeze_checkpoint_value, self._optimizer.state_dict()
+                _freeze_checkpoint_value, self._dense_optimizer.state_dict()
+            )
+        if self._embedding_optimizer is not None:
+            sd[EMBEDDING_OPTIMIZER_STATE_KEY] = _embedding_optimizer_state_for_save(
+                self._embedding_optimizer,
+                self._wrapper,
+                self._sharded_prefixes,
+                mesh,
             )
         sd[WARMUP_ITER_KEY] = int(self._warmup.iter)
         if mesh is not None:
@@ -616,7 +701,16 @@ class RecirCheckpointable(Stateful):
         # same dict is what it will write into, so this is the one place both
         # directions can be checked against the buffers.
         if buffers is not None:
-            buffers.check_payload(sd, [(self._optimizer, sd.get(OPTIMIZER_STATE_KEY))])
+            buffers.check_payload(
+                sd,
+                [
+                    (self._dense_optimizer, sd.get(OPTIMIZER_STATE_KEY)),
+                    (
+                        self._embedding_optimizer,
+                        sd.get(EMBEDDING_OPTIMIZER_STATE_KEY),
+                    ),
+                ],
+            )
         logger.info(
             "[stage] state_dict %.1fs = flush %.1fs + sanitize %.1fs + "
             "wrap %.1fs + opt %.1fs",
@@ -635,6 +729,7 @@ class RecirCheckpointable(Stateful):
     def load_state_dict(self, state_dict: Dict[str, Any]) -> None:
         warmup_iter = int(state_dict.get(WARMUP_ITER_KEY, 0))
         opt_sd = state_dict.get(OPTIMIZER_STATE_KEY, None)
+        embedding_opt_sd = state_dict.get(EMBEDDING_OPTIMIZER_STATE_KEY, None)
         saved_order = state_dict.get(SHARD_ORDER_KEY, None)
         if saved_order is not None:
             logger.info(
@@ -645,14 +740,30 @@ class RecirCheckpointable(Stateful):
         body = {
             k: v
             for k, v in state_dict.items()
-            if k not in (WARMUP_ITER_KEY, OPTIMIZER_STATE_KEY, SHARD_ORDER_KEY)
+            if k
+            not in (
+                WARMUP_ITER_KEY,
+                OPTIMIZER_STATE_KEY,
+                EMBEDDING_OPTIMIZER_STATE_KEY,
+                SHARD_ORDER_KEY,
+            )
         }
         load_module_state_without_self_copy(self._wrapper, body)
-        if opt_sd is not None and self._optimizer is not None:
-            self._optimizer.load_state_dict(opt_sd)
+        if opt_sd is not None and self._dense_optimizer is not None:
+            _load_optimizer_state_preserving_lr(self._dense_optimizer, opt_sd)
+        if embedding_opt_sd is not None and self._embedding_optimizer is not None:
+            _load_optimizer_state_preserving_lr(
+                self._embedding_optimizer, embedding_opt_sd
+            )
         # DCP has written, and `Optimizer.load_state_dict` has had its chance to
         # swap slot objects. Everything just written has to still be the buffer
         # the graph reads, or the restore landed somewhere nothing looks.
         if self._host_buffers is not None:
-            self._host_buffers().check_payload(body, [(self._optimizer, opt_sd)])
+            self._host_buffers().check_payload(
+                body,
+                [
+                    (self._dense_optimizer, opt_sd),
+                    (self._embedding_optimizer, embedding_opt_sd),
+                ],
+            )
         reseed_warmup(self._warmup, warmup_iter)
