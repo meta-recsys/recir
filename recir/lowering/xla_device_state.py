@@ -10,7 +10,11 @@ from typing import Any, List, Optional, Sequence, Tuple
 
 import torch
 from recir.lowering.device_state import DeviceStateManager
-from recir.lowering.xla_lower import _jax_to_torch, _XLAModule
+from recir.lowering.xla_lower import (
+    _copy_jax_addressable_shards_to_torch,
+    _jax_to_torch,
+    _XLAModule,
+)
 
 logger: logging.Logger = logging.getLogger(__name__)
 
@@ -200,7 +204,10 @@ class XLADeviceStateManager(DeviceStateManager):
                     state_tensor.copy_(updated)
                 else:
                     was_jax = True
-                    state_tensor.copy_(_jax_to_torch(updated, self.torch_device))
+                    if getattr(updated, "addressable_shards", None):
+                        _copy_jax_addressable_shards_to_torch(updated, state_tensor)
+                    else:
+                        state_tensor.copy_(_jax_to_torch(updated, self.torch_device))
                 if log_summary:
                     nbytes = state_tensor.numel() * state_tensor.element_size()
                     copied += 1
