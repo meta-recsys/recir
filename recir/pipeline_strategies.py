@@ -16,6 +16,7 @@ from recir.pipeline import (
     PipelinePlan,
     PipelineSchedule,
     PipelineStageSpec,
+    PipelineStreamSpec,
 )
 
 
@@ -130,6 +131,51 @@ def semi_sync_pipeline_plan(
             state_write_stage="compute",
             async_start_batch=start_batch,
         ),
+    )
+
+
+def embedding_steady_state_pipeline_plan(
+    schedule: PipelineSchedule | None = None,
+) -> PipelinePlan:
+    return PipelinePlan(
+        stages=(
+            PipelineStageSpec(
+                name="embedding",
+                regions=(
+                    PipelineRegion.PREPROCESS,
+                    PipelineRegion.ROUTE_START,
+                    PipelineRegion.ROUTE_CONTINUE,
+                ),
+                required_regions=(
+                    PipelineRegion.ROUTE_START,
+                    PipelineRegion.ROUTE_CONTINUE,
+                ),
+                allow_state_reads=True,
+            ),
+            PipelineStageSpec(
+                name="compute",
+                include_unassigned_nodes=True,
+            ),
+        ),
+        schedule=schedule or PipelineSchedule(),
+        side_streams=(
+            PipelineStreamSpec(
+                name="embedding_input",
+                regions=(PipelineRegion.PREPROCESS, PipelineRegion.ROUTE_START),
+            ),
+        ),
+    )
+
+
+def embedding_steady_state_pipeline_config(
+    *,
+    gradient_accumulation_steps: int = 1,
+    schedule: PipelineSchedule | None = None,
+) -> PipelineConfig:
+    return PipelineConfig.from_plan(
+        embedding_steady_state_pipeline_plan(schedule),
+        gradient_accumulation_steps=gradient_accumulation_steps,
+        materialize_steady_state=True,
     )
 
 
