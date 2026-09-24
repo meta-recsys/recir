@@ -2594,11 +2594,8 @@ def make_compiled_runner(compiled_obj: Any) -> Callable[..., Any]:
             if last_train_step and accepts_last_iter:
                 # Final iter: pass ``last_iter`` so IterGraphModule can flush.
                 gm_kwargs["last_iter"] = last_train_step
-            if input_ready_event is not None:
-                if accepts_input_ready_event:
-                    gm_kwargs["input_ready_event"] = input_ready_event
-                else:
-                    torch.cuda.current_stream().wait_event(input_ready_event)
+            if input_ready_event is not None and accepts_input_ready_event:
+                gm_kwargs["input_ready_event"] = input_ready_event
             output_all = compiled_obj.gm(*flat_inps, **gm_kwargs)
             if is_pipeline_pending(output_all):
                 return output_all
