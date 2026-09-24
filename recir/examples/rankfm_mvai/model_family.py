@@ -596,7 +596,7 @@ class RecirXLACompiledModule(RecirCompiledModuleBase):
         """
         from recir.embedding.in_graph import DP_TABLE_PREFIX, SHARDED_TABLE_PREFIX
 
-        from .checkpointable import RecirCheckpointable
+        from .checkpointable import gather_shard_order, RecirCheckpointable
 
         return RecirCheckpointable(
             self,
@@ -605,6 +605,11 @@ class RecirXLACompiledModule(RecirCompiledModuleBase):
             table_prefixes=(SHARDED_TABLE_PREFIX, DP_TABLE_PREFIX),
             warmup=self._warmup,
             optimizer=self._dense_opt,
+            shard_order=(
+                gather_shard_order(self._num_processes)
+                if self._num_processes > 1
+                else None
+            ),
         )
 
 

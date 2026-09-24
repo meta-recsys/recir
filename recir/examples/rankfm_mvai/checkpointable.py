@@ -17,13 +17,17 @@ entries as ``DTensor``s so DCP saves/loads each host's shard; all other
 """
 
 import copy
-from typing import Any, cast, Dict, Sequence
+import logging
+from typing import Any, cast, Dict, List, Sequence, Tuple
 
 import torch
+import torch.distributed as dist
 import torch.utils._pytree as pytree
 from torch.distributed.checkpoint.stateful import Stateful
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor, Shard
+
+logger: logging.Logger = logging.getLogger(__name__)
 
 # Key under which the WarmupController iter is persisted inside the model
 # checkpoint (it lives in no nn.Module state_dict, so we carry it explicitly).
@@ -31,6 +35,8 @@ WARMUP_ITER_KEY = "__recir_warmup_iter__"
 # Key under which the dense optimizer state_dict is nested inside the model
 # checkpoint (so it too is sanitized to plain host tensors before DCP writes it).
 OPTIMIZER_STATE_KEY = "__recir_optimizer__"
+# Save-time ``mesh slot -> torch rank`` permutation for the row-sharded tables.
+SHARD_ORDER_KEY = "__recir_shard_order__"
 
 
 def _to_plain_host_tensor(value: Any) -> Any:
@@ -106,6 +112,98 @@ def reseed_warmup(warmup: Any, iteration: int) -> None:
 
 def _is_sharded_table_key(key: str, sharded_prefixes: Sequence[str]) -> bool:
     return any(prefix in key for prefix in sharded_prefixes)
+
+
+def host_ordinal_from_device_positions(
+    positions: Sequence[int],
+    num_global_devices: int,
+    num_processes: int,
+) -> int:
+    """This process's slot on the GSPMD FSDP axis, from its devices' positions."""
+    if num_processes <= 0 or num_global_devices % num_processes:
+        raise RuntimeError(
+            "GSPMD devices must divide evenly across processes; got "
+            f"devices={num_global_devices}, processes={num_processes}"
+        )
+    local_count = num_global_devices // num_processes
+    ordered = sorted(positions)
+    if len(ordered) != local_count:
+        raise RuntimeError(
+            f"expected {local_count} local devices for {num_processes} "
+            f"processes over {num_global_devices} devices, got {len(ordered)}"
+        )
+    first = ordered[0]
+    if ordered != list(range(first, first + local_count)):
+        raise RuntimeError(
+            "this process's devices are not a contiguous block on the GSPMD "
+            f"FSDP axis (positions {ordered}); a Shard(0) checkpoint cannot "
+            "express a scattered host block"
+        )
+    if first % local_count:
+        raise RuntimeError(
+            f"the local device block starts at axis position {first}, which is "
+            f"not a multiple of the {local_count} devices per process"
+        )
+    return first // local_count
+
+
+def shard_mesh_order(
+    rank_ordinals: Sequence[Tuple[int, int]], num_processes: int
+) -> List[int]:
+    order: List[int] = [-1] * num_processes
+    for rank, ordinal in rank_ordinals:
+        if not 0 <= rank < num_processes:
+            raise RuntimeError(
+                f"torch rank {rank} is out of range for {num_processes} processes"
+            )
+        if not 0 <= ordinal < num_processes:
+            raise RuntimeError(
+                f"FSDP ordinal {ordinal} is out of range for {num_processes} processes"
+            )
+        if order[ordinal] != -1:
+            raise RuntimeError(
+                f"torch ranks {order[ordinal]} and {rank} both claim FSDP "
+                f"ordinal {ordinal}; the rank -> ordinal map is not a bijection"
+            )
+        order[ordinal] = rank
+    missing = [j for j, rank in enumerate(order) if rank == -1]
+    if missing:
+        raise RuntimeError(f"no process reported FSDP ordinal(s) {missing}")
+    return order
+
+
+def fsdp_host_ordinal(num_processes: int) -> int:
+    """Read this process's FSDP-axis slot off the live JAX device list."""
+    from recir.lowering.xla_lower import _get_global_devices, _get_local_devices
+
+    global_devices = _get_global_devices()
+    local_devices = _get_local_devices()
+    position = {id(device): i for i, device in enumerate(global_devices)}
+    try:
+        positions = [position[id(device)] for device in local_devices]
+    except KeyError as error:
+        raise RuntimeError(
+            "a local JAX device is absent from the global device list, so the "
+            "FSDP shard ordinal cannot be derived"
+        ) from error
+    return host_ordinal_from_device_positions(
+        positions, len(global_devices), num_processes
+    )
+
+
+def gather_shard_order(num_processes: int) -> List[int]:
+    ordinal = fsdp_host_ordinal(num_processes)
+    gathered: List[Any] = [None] * num_processes
+    dist.all_gather_object(gathered, (dist.get_rank(), ordinal))
+    order = shard_mesh_order(gathered, num_processes)
+    logger.info(
+        "[checkpoint] FSDP shard order (mesh slot -> torch rank): %s; "
+        "this rank %d sits at ordinal %d",
+        order,
+        dist.get_rank(),
+        ordinal,
+    )
+    return order
 
 
 def wrap_sharded_for_save(
@@ -192,6 +290,7 @@ class RecirCheckpointable(Stateful):
         table_prefixes: Sequence[str],
         warmup: Any,
         optimizer: Any = None,
+        shard_order: Sequence[int] | None = None,
     ) -> None:
         self._wrapper = wrapper
         self._num_processes = num_processes
@@ -203,9 +302,32 @@ class RecirCheckpointable(Stateful):
         # converted to plain host tensors (a torchax optimizer-state tensor would
         # otherwise break torch.save; see _to_plain_host_tensor).
         self._optimizer = optimizer
+        self._shard_order: List[int] | None = (
+            None if shard_order is None else list(shard_order)
+        )
+        self._mesh_cache: DeviceMesh | None = None
+
+    def shard_order(self) -> List[int]:
+        order = self._shard_order
+        if order is None:
+            raise RuntimeError(
+                "RecirCheckpointable needs a shard_order to number the "
+                "checkpoint's row blocks (see gather_shard_order); numbering "
+                "them by torch rank instead writes blocks that only the job "
+                "that saved them can read back"
+            )
+        return order
 
     def _mesh(self) -> DeviceMesh:
-        return DeviceMesh("cpu", torch.arange(self._num_processes))
+        mesh = self._mesh_cache
+        if mesh is None:
+            # Cached: DeviceMesh materializes a process group, and state_dict()
+            # runs on every checkpoint.
+            mesh = DeviceMesh(
+                "cpu", torch.tensor(self.shard_order(), dtype=torch.int64)
+            )
+            self._mesh_cache = mesh
+        return mesh
 
     def state_dict(self) -> Dict[str, Any]:
         # Tables are meta until materialized; do it before the full flush so the
@@ -227,13 +349,16 @@ class RecirCheckpointable(Stateful):
                 sd[key] = pytree.tree_map(_freeze_checkpoint_value, value)
         # Single host: tables are not row-sharded, so plain tensors are correct
         # (and a DTensor mesh would need a process group we don't init).
-        if self._num_processes > 1:
-            sd = wrap_sharded_for_save(sd, self._sharded_prefixes, self._mesh())
+        mesh = self._mesh() if self._num_processes > 1 else None
+        if mesh is not None:
+            sd = wrap_sharded_for_save(sd, self._sharded_prefixes, mesh)
         if self._optimizer is not None:
             sd[OPTIMIZER_STATE_KEY] = pytree.tree_map(
                 _freeze_checkpoint_value, self._optimizer.state_dict()
             )
         sd[WARMUP_ITER_KEY] = int(self._warmup.iter)
+        if mesh is not None:
+            sd[SHARD_ORDER_KEY] = list(self.shard_order())
         return sd
 
     def make_async_stager(self) -> Any:
@@ -243,10 +368,17 @@ class RecirCheckpointable(Stateful):
     def load_state_dict(self, state_dict: Dict[str, Any]) -> None:
         warmup_iter = int(state_dict.get(WARMUP_ITER_KEY, 0))
         opt_sd = state_dict.get(OPTIMIZER_STATE_KEY, None)
+        saved_order = state_dict.get(SHARD_ORDER_KEY, None)
+        if saved_order is not None:
+            logger.info(
+                "[checkpoint] shard order at save %s, at restore %s",
+                list(saved_order),
+                self.shard_order(),
+            )
         body = {
             k: v
             for k, v in state_dict.items()
-            if k not in (WARMUP_ITER_KEY, OPTIMIZER_STATE_KEY)
+            if k not in (WARMUP_ITER_KEY, OPTIMIZER_STATE_KEY, SHARD_ORDER_KEY)
         }
         self._wrapper.load_state_dict(unwrap_after_load(body))
         if opt_sd is not None and self._optimizer is not None:
