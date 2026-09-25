@@ -807,6 +807,58 @@ class ClampBoundaryTest(unittest.TestCase):
         self.assertLess(rel, 1e-5, f"deviation grew to {rel}")
 
 
+class MetricCheckpointContinuityTest(unittest.TestCase):
+    def test_lifetime_restores_but_window_history_is_lost(self) -> None:
+        from torchrec.metrics.ne import NEMetricComputation
+
+        kwargs = {
+            "my_rank": 0,
+            "batch_size": _N,
+            "n_tasks": _TASKS,
+            "window_size": _N * 2,
+        }
+        reference = NEMetricComputation(**kwargs)
+        for seed in (1, 2, 3):
+            predictions, labels, weights = _inputs(torch.float64, seed=seed)
+            reference.update(
+                predictions=predictions.clone(), labels=labels, weights=weights
+            )
+
+        checkpoint = _clone_metric_state(
+            cast("dict[str, torch.Tensor]", reference.state_dict())
+        )
+        self.assertFalse(any("window_" in key for key in checkpoint))
+
+        next_inputs = _inputs(torch.float64, seed=9)
+        reference.update(
+            predictions=next_inputs[0].clone(),
+            labels=next_inputs[1],
+            weights=next_inputs[2],
+        )
+        expected_lifetime, expected_window = reference.compute()
+
+        restored = NEMetricComputation(**kwargs)
+        restored.load_state_dict(checkpoint)
+        restored.update(
+            predictions=next_inputs[0].clone(),
+            labels=next_inputs[1],
+            weights=next_inputs[2],
+        )
+        restored_lifetime, restored_window = restored.compute()
+
+        torch.testing.assert_close(restored_lifetime.value, expected_lifetime.value)
+        self.assertFalse(
+            torch.equal(restored_window.value, expected_window.value),
+            "window history unexpectedly survived a state_dict roundtrip",
+        )
+
+
+def _clone_metric_state(
+    state: dict[str, torch.Tensor],
+) -> dict[str, torch.Tensor]:
+    return {key: value.detach().clone() for key, value in state.items()}
+
+
 class UnpadWindowTest(unittest.TestCase):
     """The metric window is sized in ROWS, so crediting it padded rows makes its
     true length depend on the pad fraction.
