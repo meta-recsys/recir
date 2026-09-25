@@ -84,7 +84,10 @@ from recir.api import (
 from recir.backends import XLAGSPMDBackend
 from recir.distributed.parallel_mode import GSPMDParallel
 from recir.examples.rankfm_mvai.budgeted_sampling import install_budgeted_sampling
-from recir.examples.rankfm_mvai.checkpointable import HostStateBuffers
+from recir.examples.rankfm_mvai.checkpointable import (
+    HostStateBuffers,
+    logical_replay_rank,
+)
 from recir.examples.rankfm_mvai.config import RankFMModelArgs, RankFMTrainerConfig
 from recir.examples.rankfm_mvai.data_pipe import (
     BatchReplayPipe,
@@ -688,18 +691,37 @@ class RankFMMvaiModelFamily(BlueReelsVDDModelFamily):
     def _build_data_pipe(self) -> Optional[BatchReplayPipe]:
         """Build a BatchReplayPipe when --gcs_data_path is set, else None.
 
-        Rank/world are taken from the embedding backend's PG view (already
-        initialized by the time the family is built).
+        World size comes from the embedding backend's PG view. Multi-host TPU
+        replay uses the stable JAX/FSDP host ordinal; CPU and single-host paths
+        retain the PG rank.
         """
         trainer_cfg = self._trainer_cfg
         if not trainer_cfg.gcs_data_path:
             logger.info("Using synthetic data (no --gcs_data_path)")
             return None
 
-        # gloo rank/world are resolved by the entrypoint and stored on the
-        # cfg-adjacent attributes below; fall back to single-host (0, 1).
+        # Gloo rank/world are resolved by the entrypoint; fall back to (0, 1).
         gloo_rank = getattr(self, "_gloo_rank", 0)
         gloo_world = getattr(self, "_gloo_world", 1)
+        global_device_platforms = [device.platform for device in jax.devices()]
+        replay_rank = logical_replay_rank(
+            gloo_rank,
+            gloo_world,
+            global_device_platforms,
+        )
+        uses_logical_replay_rank = (
+            gloo_world > 1
+            and len(global_device_platforms) > 1
+            and all(platform == "tpu" for platform in global_device_platforms)
+        )
+        logger.info(
+            "Replay ownership: gloo_rank=%d, jax_process_index=%d, "
+            "fsdp_host_ordinal=%s, replay_rank=%d",
+            gloo_rank,
+            jax.process_index(),
+            replay_rank if uses_logical_replay_rank else None,
+            replay_rank,
+        )
 
         explicit_files: Optional[List[str]] = None
         if trainer_cfg.data_file_template:
@@ -710,7 +732,7 @@ class RankFMMvaiModelFamily(BlueReelsVDDModelFamily):
             )
         data_pipe = BatchReplayPipe(
             path=trainer_cfg.gcs_data_path,
-            rank=gloo_rank,
+            rank=replay_rank,
             world_size=gloo_world,
             replicate_across_ranks=trainer_cfg.data_replicate_across_ranks,
             file_list=explicit_files,
@@ -720,7 +742,7 @@ class RankFMMvaiModelFamily(BlueReelsVDDModelFamily):
         # step will merge, which is the only place that number is visible.
         batches_per_step = data_pipe.batches_per_step(trainer_cfg.local_batch_size)
         logger.info(
-            f"Replay pipe: {len(data_pipe)} batches for rank {gloo_rank} "
+            f"Replay pipe: {len(data_pipe)} batches for replay rank {replay_rank} "
             f"(replicate={trainer_cfg.data_replicate_across_ranks}, "
             f"{batches_per_step} file(s)/step)"
         )
