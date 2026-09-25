@@ -277,10 +277,11 @@ class RecirXLATrainPipeline(RankingTrainPipeline):
         # every step serializes ~0.3s/step of device->host copy with no device
         # overlap. Host params/metric buffers are then fresh every N steps (and at
         # train end via on_train_end); report_interval=N keeps the metric report
-        # compute on the same cadence.
+        # compute on the same cadence. Only the LR buffers the metrics reporter
+        # reads go back.
         if self._step % self._host_sync_every == 0:
             self._drain_deferred()
-            cast("RecirXLACompiledModule", self._model).flush_host_state()
+            cast("RecirXLACompiledModule", self._model).sync_lr_to_host()
 
         # Rebuild the ret dict RankingTrainPipeline._update_ranking_metrics
         # expects; the metrics were constructed on torch.device("cpu") to match

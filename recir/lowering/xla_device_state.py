@@ -12,6 +12,10 @@ import torch
 from recir.lowering.device_state import DeviceStateManager
 from recir.lowering.xla_lower import (
     _copy_jax_addressable_shards_to_torch,
+    _get_global_devices,
+    _get_local_devices,
+    _GSPMD_FSDP_AXIS,
+    _gspmd_mesh,
     _jax_to_torch,
     _XLAModule,
 )
@@ -66,6 +70,53 @@ class XLADeviceStateManager(DeviceStateManager):
             else:
                 jax_state.append(t)
         return jax_state
+
+    def prefill_device_state_from_host(
+        self,
+        gm: torch.fx.GraphModule,
+        flat_state: List[torch.Tensor],
+    ) -> None:
+        """Convert every ``flat_state`` leaf to its device layout and cache it."""
+
+        placeholders = [n for n in gm.graph.nodes if n.op == "placeholder"]
+        if len(placeholders) < len(flat_state):
+            raise RuntimeError(
+                "compiled graph has fewer placeholders than flat_state entries: "
+                f"{len(placeholders)} < {len(flat_state)}"
+            )
+        meta_leaves = [i for i, t in enumerate(flat_state) if t.is_meta]
+        if meta_leaves:
+            named = ", ".join(
+                f"{i} ({self.state_fqns[i]})"
+                if self.state_fqns and i < len(self.state_fqns)
+                else str(i)
+                for i in meta_leaves
+            )
+            raise RuntimeError(
+                f"flat_state entries [{named}] are still meta; seeding would "
+                "regenerate them from jax.random instead of using the checkpoint"
+            )
+
+        devices = _get_global_devices()
+        fsdp_axis_size = int(
+            getattr(gm, "meta", {}).get("gspmd_fsdp_axis_size", len(devices))
+        )
+        mesh, batch_axis_resource, _ = _gspmd_mesh(devices, fsdp_axis_size)
+        fsdp_host_shard_count = fsdp_axis_size // len(_get_local_devices())
+        self.device_state = [
+            _XLAModule._to_sharded_jax(
+                leaf,
+                mesh,
+                # State entries are never batch inputs.
+                False,
+                0,
+                is_fsdp_tensor=placeholders[i].meta.get("is_fsdp_sharded", False),
+                batch_axis_resource=batch_axis_resource,
+                fsdp_axis_name=_GSPMD_FSDP_AXIS,
+                fsdp_host_shard_count=fsdp_host_shard_count,
+            )
+            for i, leaf in enumerate(flat_state)
+        ]
 
     def prepare_inputs(
         self,
@@ -252,3 +303,28 @@ class XLADeviceStateManager(DeviceStateManager):
         self._copy_state_into(
             flat_state, device_state, skip_fqns, log_summary=skip_fqns is None
         )
+
+    def copy_named_state_to_host(
+        self,
+        flat_state: List[torch.Tensor],
+        fqn_substrings: Sequence[str],
+    ) -> None:
+        """Copy back a named handful of entries, bypassing the bulk loop."""
+        device_state = self.device_state
+        fqns = self.state_fqns
+        if device_state is None or fqns is None:
+            return
+        with torch.no_grad():
+            for i, state_tensor in enumerate(flat_state):
+                if i >= len(device_state) or i >= len(fqns):
+                    break
+                if not any(pat in fqns[i] for pat in fqn_substrings):
+                    continue
+                updated = device_state[i]
+                if isinstance(updated, torch.Tensor):
+                    if updated.data_ptr() != state_tensor.data_ptr():
+                        state_tensor.copy_(updated)
+                elif getattr(updated, "addressable_shards", None):
+                    _copy_jax_addressable_shards_to_torch(updated, state_tensor)
+                else:
+                    state_tensor.copy_(_jax_to_torch(updated, self.torch_device))

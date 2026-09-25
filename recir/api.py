@@ -2922,6 +2922,18 @@ def sync_device_state_to_torch(
     )
 
 
+def sync_named_state_to_torch(
+    compiled_fn: Callable[..., Any], fqn_substrings: Sequence[str]
+) -> None:
+    """Copy back only the state entries whose FQN matches one of the substrings."""
+    compiled_obj = compiled_fn.__dict__.get(COMPILED_OBJECT_KEY, None)
+    if compiled_obj is None or compiled_obj.state_manager.device_state is None:
+        return
+    compiled_obj.state_manager.copy_named_state_to_host(
+        compiled_obj.flat_state, fqn_substrings
+    )
+
+
 def set_compiled_output_deferred(
     compiled_fn: Callable[..., Any], deferred: bool
 ) -> bool:
