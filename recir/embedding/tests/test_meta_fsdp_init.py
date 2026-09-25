@@ -20,7 +20,11 @@ import numpy as np
 import torch
 from jax.sharding import Mesh
 from recir.lowering.xla_lower import _XLAModule
-from recir.meta_tensor_init import mark_meta_uniform_init, mark_meta_zero_init
+from recir.meta_tensor_init import (
+    mark_meta_uniform_init,
+    mark_meta_zero_init,
+    table_init_stream_id,
+)
 
 
 class MetaFSDPInitTest(unittest.TestCase):
@@ -75,13 +79,39 @@ class MetaFSDPInitTest(unittest.TestCase):
         mesh = Mesh(np.array(devices), ("torch_dist",))
 
         meta = torch.empty(vocab, dim, device="meta")
-        mark_meta_uniform_init(meta, 0.01)
+        mark_meta_uniform_init(meta, 0.01, table_init_stream_id("explicit_bound_table"))
 
         arr = _XLAModule._to_sharded_jax(meta, mesh, is_fsdp_tensor=True)
 
         host = np.array(jax.device_get(arr))
         self.assertGreater(float(host.std()), 0.0)
         self.assertLessEqual(float(np.max(np.abs(host))), 0.01)
+
+    def _materialize(self, name: str, vocab: int, dim: int, bound: float) -> np.ndarray:
+        mesh = Mesh(np.array(jax.devices()), ("torch_dist",))
+        meta = torch.empty(vocab, dim, device="meta")
+        mark_meta_uniform_init(meta, bound, table_init_stream_id(name))
+        return np.array(
+            jax.device_get(_XLAModule._to_sharded_jax(meta, mesh, is_fsdp_tensor=True))
+        )
+
+    def test_two_tables_get_independent_streams(self) -> None:
+        """Two tables of the same shape must not materialize identically."""
+        world = len(jax.devices())
+        vocab, dim = 8 * world, 16
+        a = self._materialize("post_id", vocab, dim, 0.01)
+        b = self._materialize("viewer_rid", vocab, dim, 0.01)
+        self.assertFalse(bool(np.all(a == b)))
+
+    def test_smaller_table_is_not_a_rescaled_prefix(self) -> None:
+        """A short table must not be a long one's prefix times a constant."""
+        world = len(jax.devices())
+        dim = 16
+        small = self._materialize("w2v_user", 8 * world, dim, 0.01)
+        large = self._materialize("viewer_rid", 32 * world, dim, 0.02)
+
+        ratio = small.ravel() / large.ravel()[: small.size]
+        self.assertGreater(float(ratio.max() - ratio.min()), 1e-3)
 
 
 if __name__ == "__main__":
