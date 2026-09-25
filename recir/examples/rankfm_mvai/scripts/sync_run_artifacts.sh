@@ -1,12 +1,18 @@
 #!/usr/bin/env bash
-# Mirror a running job's TensorBoard and xprof trace into Manifold.
+# Mirror a running job's TensorBoard, xprof trace and checkpoint index into
+# Manifold.
 #
-# The job already writes both to GCS, but GCS is awkward to read from a browser
-# and the TensorBoard events file only becomes interesting while the job is
-# still going. So this polls: TB is re-synced on an interval so the curves fill
-# in live, and the trace is picked up once, when it appears (the profiler only
-# flushes at profile_end_step, so it does not exist for the first few hundred
-# steps).
+# The job already writes all three to GCS, but GCS is awkward to read from a
+# browser and the TensorBoard events file only becomes interesting while the job
+# is still going. So this polls: TB is re-synced on an interval so the curves
+# fill in live, and the trace is picked up once, when it appears (the profiler
+# only flushes at profile_end_step, so it does not exist for the first few
+# hundred steps).
+#
+# Checkpoints are the exception: only an INDEX is published, never the bytes.
+# They are TB-scale, and Model Store / MLHub cannot hold them anyway -- UMM's
+# StorageType enum has no GCS member and the trainer pods have no Meta identity,
+# so there is no route that puts them in the MLHub checkpoints tab.
 #
 # Runs until the job reaches a terminal phase and one final TB sync lands, or
 # until --max-minutes. Safe to ^C: everything already uploaded stays.
@@ -43,14 +49,19 @@ export HTTPS_PROXY="${HTTPS_PROXY:-http://fwdproxy:8080}"
 GCS_BUCKET="gs://cq-mrs-core-shared_mrs_tpu_y317h"
 TRACE_SRC="${GCS_BUCKET}/tpu-profiles/${JS}"
 TB_SRC="${GCS_BUCKET}/tensorboard/${JS}"
+CKPT_SRC="${GCS_BUCKET}/checkpoints/${JS}"
+
+CKPT_INDEX_PY="$(dirname "${BASH_SOURCE[0]}")/checkpoint_index.py"
 
 # Trace goes where perfetto can read it; TB where the intern viewer can.
 KERNELHUB_BUCKET="perfdoctor_gpu_traces_test"
 KERNELHUB_BASE="tree/traces/test/${USER}/rankfm_mvai"
 TB_BUCKET="mrs_recsys_gcp"
 TB_BASE="tree/tensorboard/${JS}"
+CKPT_BASE="tree/checkpoints/${JS}"
 
 TB_URL="https://www.internalfb.com/intern/tensorboard/?dir=manifold://${TB_BUCKET}/${TB_BASE}"
+CKPT_URL="https://www.internalfb.com/manifold/explorer/${TB_BUCKET}/${CKPT_BASE}"
 
 log() { echo "[$(date +%H:%M:%S)] $*"; }
 
@@ -114,6 +125,31 @@ sync_trace() {
     return 1
 }
 
+sync_checkpoints() {
+    # Only the index (step / timestamp / size / gs path) goes to Manifold. See
+    # the header: the checkpoints themselves stay in GCS.
+    local tmp
+    tmp=$(mktemp -d "/tmp/cksync-${JS}-XXXXXX")
+    local summary
+    if ! summary=$(python3 "${CKPT_INDEX_PY}" --gcs-prefix "${CKPT_SRC}" --out-dir "${tmp}" 2>/dev/null); then
+        rm -rf "${tmp}"
+        return 1
+    fi
+    manifold mkdirs "${TB_BUCKET}/${CKPT_BASE}" >/dev/null 2>&1 || true
+    # --overwrite and --userData false for the same reasons as sync_tb: without
+    # them the upload is a silent no-op / a hard rejection respectively.
+    local err rc
+    err=$(manifold putr --overwrite --userData false "${tmp}" "${TB_BUCKET}/${CKPT_BASE}" 2>&1)
+    rc=$?
+    if [ $rc -ne 0 ]; then
+        log "  checkpoint index upload FAILED: $(echo "${err}" | grep -viE '^[IW][0-9]|WARNING' | head -2 | tr '\n' ' ')"
+    else
+        log "  checkpoint index synced (${summary%% ->*})"
+    fi
+    rm -rf "${tmp}"
+    return $rc
+}
+
 job_is_live() {
     local phases
     phases=$(kubectl get pods -n "${NS}" \
@@ -126,12 +162,15 @@ job_is_live() {
 log "watching ${JS} (interval ${INTERVAL}s, max ${MAX_MINUTES}min)"
 log "TB will appear at:"
 log "  ${TB_URL}"
+log "checkpoint index will appear at:"
+log "  ${CKPT_URL}"
 
 TRACE_DONE=0
 DEADLINE=$(( $(date +%s) + MAX_MINUTES * 60 ))
 
 while :; do
     sync_tb || log "  TB not ready yet"
+    sync_checkpoints || log "  checkpoints not ready yet"
 
     if [ "${TRACE_DONE}" -eq 0 ]; then
         if sync_trace; then
@@ -145,6 +184,7 @@ while :; do
         log "job no longer live; final sync"
         sleep 30
         sync_tb || true
+        sync_checkpoints || true
         [ "${TRACE_DONE}" -eq 0 ] && sync_trace
         break
     fi
@@ -157,8 +197,10 @@ echo
 echo "================================================================"
 echo "JobSet: ${JS}"
 echo "  tensorboard: ${TB_URL}"
+echo "  checkpoints: ${CKPT_URL}"
 [ "${TRACE_DONE}" -eq 1 ] && echo "  trace      : uploaded to kernelhub (link above)"
 [ "${TRACE_DONE}" -eq 0 ] && echo "  trace      : never appeared (profile window not reached?)"
 echo "  gcs tb     : ${TB_SRC}"
 echo "  gcs trace  : ${TRACE_SRC}"
+echo "  gcs ckpts  : ${CKPT_SRC}"
 echo "================================================================"
