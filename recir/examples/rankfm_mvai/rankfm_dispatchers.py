@@ -11,7 +11,6 @@ from typing import Any, Callable, Dict, Generator, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from hammer.v3.modules.core.features.bundle import FeatureBundle
 from hammer.v3.modules.core.features.descriptor import FeatureDescriptor
 from hammer.v3.modules.core.features.input_features import InputFeatures
@@ -28,6 +27,7 @@ from recir.examples.rankfm_mvai.graph_input_replay import (
     DispatchInputReplay,
 )
 from recir.examples.rankfm_mvai.preproc_pipeline import PreprocPipeline
+from recir.examples.rankfm_mvai.row_padding import fit_rows_chip_major, fit_to_shape
 from recir.region_transforms.padding import (
     _per_chip_real_counts,
     pad_candidate_axis_to_static,
@@ -80,21 +80,7 @@ def _disable_sampling(real_stack: PreprocessorStack) -> Generator[None, None, No
             hp._feature_preprocessor._uih_sampling_module = s
 
 
-def _fit_to_shape(
-    t: torch.Tensor, target_shape: torch.Size | Tuple[int, ...]
-) -> torch.Tensor:
-    """End-pad with zeros (or narrow) each dim of *t* to ``target_shape``."""
-    target = tuple(int(s) for s in target_shape)
-    if tuple(t.shape) == target:
-        return t
-    pad_widths: List[int] = []
-    for actual, tgt in zip(reversed(t.shape), reversed(target)):
-        pad_widths += [0, max(0, int(tgt) - int(actual))]
-    out = F.pad(t, pad_widths) if any(p > 0 for p in pad_widths) else t
-    for d, (actual, tgt) in enumerate(zip(out.shape, target)):
-        if int(actual) > int(tgt):
-            out = out.narrow(d, 0, int(tgt))
-    return out
+_FALLTHROUGH_SEEN: set[str] = set()
 
 
 def _assert_within_budget(
@@ -768,8 +754,23 @@ class PreprocessorDispatcher:
                             None,
                             False,
                         )
+                    elif desc.name.endswith("/past_timestamps"):
+                        fitted = fit_rows_chip_major(
+                            val, int(target_shape[0]), num_local_fit
+                        )
                     else:
-                        fitted = _fit_to_shape(val, target_shape)
+                        if (
+                            val.dim() >= 1
+                            and int(val.shape[0]) != int(target_shape[0])
+                            and desc.name not in _FALLTHROUGH_SEEN
+                        ):
+                            _FALLTHROUGH_SEEN.add(desc.name)
+                            logger.warning(
+                                f"[FITFALLTHROUGH] {desc.name} "
+                                f"{tuple(val.shape)} -> {tuple(target_shape)} "
+                                "via tail pad (row-axis? then it is misaligned)"
+                            )
+                        fitted = fit_to_shape(val, target_shape)
                     flat_tensors.append(fitted)
                 else:
                     flat_tensors.append(
@@ -792,7 +793,7 @@ class PreprocessorDispatcher:
                 val = output.exports.get(e_key)
                 if isinstance(val, torch.Tensor):
                     flat_exports.append(
-                        _fit_to_shape(val, _per_host_target(cached_e.shape))
+                        fit_to_shape(val, _per_host_target(cached_e.shape))
                     )
                 else:
                     flat_exports.append(
