@@ -642,7 +642,8 @@ class RecirXLACompiledModule(RecirCompiledModuleBase):
             table_prefixes=(SHARDED_TABLE_PREFIX, DP_TABLE_PREFIX),
             warmup=self._warmup,
             host_buffers=self._host_buffers,
-            optimizer=self._dense_opt,
+            dense_optimizer=self._dense_opt,
+            embedding_optimizer=self._emb_opt,
             shard_order=(
                 gather_shard_order(self._num_processes)
                 if self._num_processes > 1
