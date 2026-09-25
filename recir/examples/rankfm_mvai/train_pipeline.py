@@ -181,7 +181,7 @@ class RecirXLATrainPipeline(RankingTrainPipeline):
         # The consumer (materialize + metric update) runs one step late, on the
         # worker. These two are its input and its output: the input is the step
         # output parked as JAX handles, the output is what `progress` returns.
-        self._deferred_consumer_input: Optional[Tuple[Any, Any, int]] = None
+        self._deferred_consumer_input: Optional[Tuple[Any, Any, int, int]] = None
         self._deferred_consumer_output: Optional[
             Tuple[torch.Tensor, Dict[str, Any]]
         ] = None
@@ -300,7 +300,12 @@ class RecirXLATrainPipeline(RankingTrainPipeline):
                     "output pipelining could not be armed after the first step; "
                     "the model has no compiled step"
                 )
-            self._deferred_consumer_input = (losses, named, num_real_candidates)
+            self._deferred_consumer_input = (
+                losses,
+                named,
+                num_real_candidates,
+                self._step,
+            )
             if dispatcher is not None:
                 dispatcher.drain_producer()
             deferred_result = self._deferred_consumer_output
@@ -313,13 +318,13 @@ class RecirXLATrainPipeline(RankingTrainPipeline):
                 return torch.zeros(()), {}
             return deferred_result
         else:
-            return self._consume_step(losses, named, num_real_candidates)
+            return self._consume_step(losses, named, num_real_candidates, self._step)
 
-    def _stash_consume(self, losses: Any, named: Any, nrc: int) -> None:
-        self._deferred_consumer_output = self._consume_step(losses, named, nrc)
+    def _stash_consume(self, losses: Any, named: Any, nrc: int, step: int) -> None:
+        self._deferred_consumer_output = self._consume_step(losses, named, nrc, step)
 
     def _consume_step(
-        self, losses: Any, named: Any, num_real_candidates: int
+        self, losses: Any, named: Any, num_real_candidates: int, step: int
     ) -> Tuple[torch.Tensor, Dict[str, Any]]:
         """Materialize a step's output and fold it into the metrics.
 
@@ -335,7 +340,7 @@ class RecirXLATrainPipeline(RankingTrainPipeline):
             # `extract_states` raises if they are missing, which would mean the
             # traced program and this flag disagree.
             return losses, self._update_metrics_from_states(
-                named, losses, num_real_candidates
+                named, losses, num_real_candidates, step
             )
         else:
             ret: Dict[str, Any] = {
@@ -346,6 +351,7 @@ class RecirXLATrainPipeline(RankingTrainPipeline):
                 # x-axis stride (else it falls back to the PADDED labels.size(1)).
                 # Computed from the raw batch so the model needn't emit it.
                 "num_real_candidates": num_real_candidates,
+                "step": step,
             }
             _assert_task_rows(ret["prediction"], self._all_task_names)
             self._update_ranking_metrics(ret)
@@ -357,6 +363,7 @@ class RecirXLATrainPipeline(RankingTrainPipeline):
         named: Dict[str, Any],
         losses: torch.Tensor,
         num_real_candidates: int,
+        step: int,
     ) -> Dict[str, Any]:
         states = extract_states(named)
         _assert_task_rows(states[W_SUM], self._all_task_names)
@@ -397,7 +404,11 @@ class RecirXLATrainPipeline(RankingTrainPipeline):
                 "off the in-graph path"
             )
         self._snapshot_metrics.update(losses, named, self._model)
-        return {"num_real_candidates": num_real_candidates, **states}
+        return {
+            "num_real_candidates": num_real_candidates,
+            "step": step,
+            **states,
+        }
 
     def _drain_deferred(self) -> None:
         """Consume the outstanding deferred step, if any.
