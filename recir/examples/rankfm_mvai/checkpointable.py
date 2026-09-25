@@ -194,6 +194,21 @@ def fsdp_host_ordinal(num_processes: int) -> int:
     )
 
 
+def logical_replay_rank(
+    gloo_rank: int,
+    num_processes: int,
+    global_device_platforms: Sequence[str],
+) -> int:
+    """Keep TPU replay streams attached to stable GSPMD host ordinals."""
+    if (
+        num_processes <= 1
+        or len(global_device_platforms) <= 1
+        or any(platform != "tpu" for platform in global_device_platforms)
+    ):
+        return gloo_rank
+    return fsdp_host_ordinal(num_processes)
+
+
 def gather_shard_order(num_processes: int) -> List[int]:
     ordinal = fsdp_host_ordinal(num_processes)
     gathered: List[Any] = [None] * num_processes
