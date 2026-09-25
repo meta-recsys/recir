@@ -14,9 +14,12 @@ device between steps. Stdlib-only (no torch / jax) so it is cheap to unit-test.
 
 from __future__ import annotations
 
+import logging
 import queue
 import threading
 from typing import Any, Iterator, Optional
+
+logger: logging.Logger = logging.getLogger(__name__)
 
 
 class PrefetchingIterator:
@@ -38,6 +41,7 @@ class PrefetchingIterator:
     """
 
     _DONE: Any = object()
+    _WAIT_WARN_SECS = 30.0
 
     def __init__(self, source: Iterator[Any], depth: int = 1) -> None:
         if depth < 1:
@@ -67,12 +71,26 @@ class PrefetchingIterator:
         return self
 
     def __next__(self) -> Any:
-        item = self._queue.get()
+        item = self._get_logging_long_waits()
         if item is self._DONE:
             if self._exc is not None:
                 raise self._exc
             raise StopIteration
         return item
+
+    def _get_logging_long_waits(self) -> Any:
+        waited = 0.0
+        while True:
+            try:
+                return self._queue.get(timeout=self._WAIT_WARN_SECS)
+            except queue.Empty:
+                waited += self._WAIT_WARN_SECS
+                logger.warning(
+                    "batch prefetch has had nothing to hand out for %.0fs "
+                    "(producer alive=%s); this rank is input-starved",
+                    waited,
+                    self._thread.is_alive(),
+                )
 
     def close(self) -> None:
         """Signal the producer to stop and drain the queue so its thread exits.

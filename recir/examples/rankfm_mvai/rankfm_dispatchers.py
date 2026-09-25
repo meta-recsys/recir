@@ -881,7 +881,7 @@ class PreprocessorDispatcher:
         def check() -> None:
             replay.assert_matches(from_graph, flat_step_args_fn(batch))
 
-        if pipeline is None or not pipeline.queue(check):
+        if pipeline is None or not pipeline.queue(check, label="verify"):
             check()
 
     def _submit_producer(self) -> None:
@@ -905,7 +905,7 @@ class PreprocessorDispatcher:
         # A full queue is fine here and nowhere else: the next step's `take`
         # misses and the callback computes inline, which is exactly the
         # behaviour without pipelining.
-        if not pipeline.queue(work, step=step):
+        if not pipeline.queue(work, step=step, label="produce"):
             logger.debug("producer still busy; skipping precompute for this step")
 
     def _submit_consumer(self) -> None:
@@ -914,7 +914,7 @@ class PreprocessorDispatcher:
         if consumer is None:
             return
         self._consumer = None
-        if pipeline is None or not pipeline.queue(consumer):
+        if pipeline is None or not pipeline.queue(consumer, label="consumer"):
             consumer()
 
 
