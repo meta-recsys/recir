@@ -5,6 +5,7 @@ import tempfile
 import unittest
 from collections.abc import Callable, Sequence
 from typing import Any, cast, Dict, TypeVar
+from unittest.mock import MagicMock, patch
 
 import torch
 import torch.distributed as dist
@@ -16,6 +17,7 @@ from recir.examples.rankfm_mvai.checkpointable import (
     EMBEDDING_OPTIMIZER_STATE_KEY,
     host_ordinal_from_device_positions,
     HostStateBuffers,
+    logical_replay_rank,
     OPTIMIZER_STATE_KEY,
     RecirCheckpointable,
     shard_mesh_order,
@@ -821,6 +823,37 @@ class HostOrdinalFromDevicePositionsTest(unittest.TestCase):
     def test_wrong_local_device_count_is_rejected(self) -> None:
         with self.assertRaisesRegex(RuntimeError, "expected 4 local devices"):
             host_ordinal_from_device_positions([0, 1], 16, 4)
+
+
+class LogicalReplayRankTest(unittest.TestCase):
+    @patch(
+        "recir.examples.rankfm_mvai.checkpointable.fsdp_host_ordinal",
+        return_value=7,
+    )
+    def test_multi_host_tpu_uses_stable_fsdp_ordinal(self, ordinal: MagicMock) -> None:
+        self.assertEqual(logical_replay_rank(0, 16, ["tpu"] * 64), 7)
+        ordinal.assert_called_once_with(16)
+
+    @patch("recir.examples.rankfm_mvai.checkpointable.fsdp_host_ordinal")
+    def test_multi_device_cpu_keeps_gloo_rank(self, ordinal: MagicMock) -> None:
+        self.assertEqual(logical_replay_rank(3, 4, ["cpu"] * 4), 3)
+        ordinal.assert_not_called()
+
+    @patch("recir.examples.rankfm_mvai.checkpointable.fsdp_host_ordinal")
+    def test_single_host_tpu_keeps_gloo_rank(self, ordinal: MagicMock) -> None:
+        self.assertEqual(logical_replay_rank(0, 1, ["tpu"] * 4), 0)
+        ordinal.assert_not_called()
+
+    def test_rank_remapping_keeps_stream_with_logical_ordinal(self) -> None:
+        platforms = ["tpu"] * 64
+        with patch(
+            "recir.examples.rankfm_mvai.checkpointable.fsdp_host_ordinal",
+            return_value=2,
+        ):
+            source_stream = logical_replay_rank(7, 16, platforms)
+            resumed_stream = logical_replay_rank(11, 16, platforms)
+        self.assertEqual(source_stream, resumed_stream)
+        self.assertEqual(resumed_stream, 2)
 
 
 class ShardMeshOrderTest(unittest.TestCase):
