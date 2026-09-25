@@ -85,7 +85,11 @@ from recir.embedding.backend import (
     TablePlan,
     TableSharding,
 )
-from recir.meta_tensor_init import default_embedding_init_bound, mark_meta_uniform_init
+from recir.meta_tensor_init import (
+    default_embedding_init_bound,
+    mark_meta_uniform_init,
+    table_init_stream_id,
+)
 from torchrec.modules.embedding_configs import data_type_to_dtype, EmbeddingConfig
 from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor
 
@@ -213,7 +217,7 @@ class InGraphSparseArch(nn.Module):
                     p = nn.Parameter(
                         torch.empty(vocab, tc.embedding_dim, device="meta", dtype=dtype)
                     )
-                    mark_meta_uniform_init(p, init_bound)
+                    mark_meta_uniform_init(p, init_bound, table_init_stream_id(tc.name))
                 else:
                     p = nn.Parameter(torch.empty(vocab, tc.embedding_dim, dtype=dtype))
                     nn.init.uniform_(p, -init_bound, init_bound)
