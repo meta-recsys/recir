@@ -11,7 +11,9 @@ service of that.
 
 `docs/RUNBOOK_RUNNING_JOBS.md` covers the mechanics shared with every other job
 (submitting, tailing logs, artifacts, cleanup, the common failure modes). This
-document is only what is specific to the prod-config run.
+document is only what is specific to the prod-config run — where the two
+overlap, as they do for TensorBoard and the trace, what is below is this
+manifest's own values and the general treatment is there.
 `docs/PROD_CONFIG_OVERRIDES.md` audits everything this run changes on top of
 prod's config; read it once before trusting a number off this run.
 
@@ -54,6 +56,42 @@ data flag:
 The GCS side shows only `BFS2_SHARD_MAP` and numbered content-addressed shard
 dirs under `gcloud storage ls` — that is expected, the `barnfs.csi.meta.com`
 driver reconstitutes the logical tree at `/mnt/barnfs`.
+
+### Rotating to a new dump
+
+One command does the whole rotation. Do not hand-edit `dump.py` — it is
+generated, and the paths used to be copy-pasted across six manifests and two
+modules, which is how stale copies got found by grep instead of by something
+that fails.
+
+```bash
+python3 recir/examples/rankfm_mvai/scripts/set_dump.py \
+    --manifold manifold://mrs_recsys_gcp/tree/czheo_test/<dump-name> \
+    --gcs 'gs://mrs-tpu-y317h/czheo_test/<dump-name>/dataporter_2:...:v0/'
+```
+
+It reads the dump's own `metadata.json` for the shape and rewrites:
+
+| | |
+|---|---|
+| `dump.py` | `DUMP_NAME`, the Manifold/GCS path parts, `NUM_RANKS`, `NUM_BATCHES`, `BATCH_SIZE` |
+| every `manifests/*.yaml` | the BarnFS `sourcePath` and any `manifold://` reference |
+| the epoch manifests | `--max_steps`, recomputed from `num_ranks × num_batches × batch_size` |
+| the light leg's replay provider | `BATCH_SIZE` and `REPLAY_PATH`, so both legs replay the same dump |
+
+Which manifests count as "epoch" ones — the runs whose `--max_steps` means one
+pass over the dump rather than a deliberate short cap — is a hardcoded list in
+`set_dump.py`. A bench or parity manifest is left alone on purpose; rewriting
+its step count would destroy what it is for.
+
+**Get the transfer id from the packing job, not from the old path.** It is
+assigned per packing job, so it changes on every rotation even when the dump
+name does not. The script refuses a `--manifold`/`--gcs` pair that names two
+different dump directories, which is the one mistake that would otherwise have
+the two legs quietly reading different data — the failure this whole comparison
+already lost time to once.
+
+Then `--check` and commit the three things it touched.
 
 ---
 
@@ -168,6 +206,40 @@ NRO budget comes from prod's `hstu_max_output_len` (=20) via
 `_resolve_nro_per_sample` (`xsurface_helpers.py:94-99`). Passing `32` would be
 read by a future reader as if it applied.
 
+### Running the HSTU attention on Helion
+
+Off by default here — `rankfm_mvai-128chip.yaml` sets no Helion variable, so
+attention runs the stock PyTorch path. To switch it on, add:
+
+```yaml
+              - name: RANKFM_MVAI_USE_HELION
+                value: "1"
+```
+
+`model_family._use_helion()` reads it and passes `use_helion=True` to
+`build_model_from_config`, which rebinds the attention leaf to the recir Helion
+adapter. The STU then traces attention as a single
+`recir::helion_ragged_attention_fwd` node that torchax lowers onto the Helion
+Pallas → Mosaic kernels, instead of the dense `[B, H, N, N]` score matrix the
+stock path materializes. That difference is the point: it is what makes larger
+per-chip batches fit at all.
+
+**The kernel is plain causal attention and refuses anything else.**
+`helion_hstu_attention_op.py` raises `ValueError` if `max_attn_len`,
+`full_attn_size` (i.e. `global_attn_window`), `contextual_seq_len`,
+`num_softmax_heads` or `dropout_pr` is non-zero. It fails loudly at
+construction rather than silently computing something else, so a config
+mismatch cannot reach a number you might believe.
+
+Nothing extra is needed to satisfy that on this path: `prod_config_shim` clears
+semi-local attention and dropout at the config layer for both legs, so the
+artifact this run mounts already carries zeros. If the assertion does fire, the
+artifact is older than that provider change — re-export and republish
+(sections 1–2) rather than reaching for a flag to suppress it.
+
+`rankfm_mvai-64chip.yaml` and `-64chip-bench.yaml` are the manifests that
+already run this way; copy the env block from either.
+
 ## 4. Build, push, submit
 
 Image build and job submission are the standard flow in
@@ -178,7 +250,165 @@ Image build and job submission are the standard flow in
   fails on master (a `_Nonnull` clang extension compiled by GCC under
   `opt-linux-x86_64-clang21-no-san`). Pass the artifact path in the environment.
 
-## 5. Does the data behave like production
+## 5. TensorBoard while it runs
+
+Rank 0 copies the events file to GCS every `TB_SYNC_SECS` (60 here) from a
+**background loop**, not just at exit. That matters on this manifest: at
+`--max_steps 320725` an end-of-run copy would mean nothing appears until the
+run terminates, so a job still going — or one that gets preempted — would show
+an empty dashboard. The loop is a separate process from the trainer, so a slow
+or rate-limited gcsfuse write stalls the copy and never the training step.
+
+The job writes to:
+
+```
+gs://cq-mrs-core-shared_mrs_tpu_y317h/tensorboard/$JOBSET_NAME
+```
+
+To read it in a browser, mirror it into Manifold and leave the mirror running:
+
+```bash
+nohup bash recir/examples/rankfm_mvai/scripts/sync_run_artifacts.sh $JS \
+    --interval 180 > /tmp/sync-$JS.log 2>&1 &
+```
+
+```
+https://www.internalfb.com/intern/tensorboard/?dir=manifold://mrs_recsys_gcp/tree/tensorboard/$JS
+```
+
+Empty for the first while is normal rather than broken — gcsfuse takes its time
+making the pod's write visible in the bucket. `RUNBOOK_RUNNING_JOBS.md` has the
+rest, including the `--userData` failure that looks exactly like "no data yet".
+
+What to read first is section 8: CTR before NE, always.
+
+## 6. The trace
+
+The manifest profiles steps 900–906 and writes the capture to
+
+```
+gs://cq-mrs-core-shared_mrs_tpu_y317h/tpu-profiles/$JOBSET_NAME
+```
+
+Steady state on purpose — a window near step 3 measures compile-warm behaviour
+the run spends almost none of its time in. The same `sync_run_artifacts.sh`
+picks the trace up once it appears (only at `profile_end_step`, so not for the
+first several hundred steps) and uploads it to kernelhub; the Perfetto link is
+printed into the sync log.
+
+**A 6-step window will not give you 6 steps in Perfetto.** The
+`.trace.json.gz` is written under a hard event cap and this model emits ~17k
+device ops per step, so the cap is spent inside the first step — and the
+eviction is indiscriminate, dropping the structural `Steps` / `XLA Modules`
+lines along with it. What opens looks like a one-step capture rather than a
+truncated one.
+
+The full data is in the `.xplane.pb` sitting next to it. Convert that instead:
+
+```bash
+python3 recir/examples/rankfm_mvai/scripts/xplane_to_chrome.py <worker>.xplane.pb
+```
+
+Or read `xplane.pb` through the TensorBoard Profile plugin, which is aggregated
+and not subject to the cap.
+
+## 7. Checkpoint and resume
+
+The manifest saves every 2500 steps and keeps the last two:
+
+```
+--save_every_n_steps 2500 --keep_last_n 2
+```
+
+**The save directory has to be on `/mnt/gcs-out`.** That is the durable GCS CSI
+bucket. `/mnt/gcs/mvai_cloud` — where TensorBoard writes — is a pod-local
+emptyDir, so a checkpoint written there is gone on exactly the restart it
+exists for.
+
+The two directory variables are not symmetric, and it is not a typo:
+`CheckpointManager` appends `$MVAI_JOB_NAME` to the **save** dir itself
+(`checkpoint.py:37-43`) but uses the **load** dir verbatim. So `LOAD_DIR`
+carries the jobset name and `SAVE_DIR` does not. `LOAD_DIR` is exported inside
+the command block, after the shell has interpolated `$JOBSET_NAME`.
+
+`--async_checkpoint` overlaps the upload with training; the blocking part is
+only the staging. `rankfm_mvai-64chip.yaml` sets it, `-128chip.yaml` does not
+yet.
+
+### What is in it
+
+Everything needed to make step N+1 identical to an uninterrupted run, which
+took more than the model weights:
+
+| | |
+|---|---|
+| model params and buffers | the `_sharded_tables` as `Shard(0)` DTensors, one row block per host; `_dp_tables` and dense params replicated |
+| `__recir_optimizer__` | the dense optimizer |
+| `__recir_embedding_optimizer__` | the embedding optimizer — the tables' accumulators, row-sharded the same way |
+| `__recir_warmup_iter__` | the LR warmup cursor, which lives in no `state_dict` |
+| `__recir_shard_order__` | the save-time `mesh slot -> torch rank` permutation |
+| `__recir_sl_sampler__` | the sequence-length sampler's load-balance counters |
+| `data_pipe` | the replay cursor, counted in batches whose step *completed* |
+
+The row blocks are numbered by FSDP ordinal, not by torch rank. That matters
+because the rank-to-slice assignment can change between the save and the
+resume, and numbering by rank would reassemble the tables permuted — with
+every shape matching and no error anywhere. The restore logs both orders:
+
+```
+[checkpoint] shard order at save [...], at restore [...]
+```
+
+They do not have to be equal. If they are equal every time you look, you have
+not yet exercised the case the ordinal numbering exists for.
+
+### What is NOT in it
+
+**The rolling metric window.** torchrec registers window states with
+`persistent=False`, so `window_ne` and friends restart their window empty and
+converge over the next `--metric_window_size` rows. Expect a visible step in
+the windowed metrics at the join; the lifetime metrics are continuous. Read
+CTR and the lifetime NE across a resume, not the windowed ones.
+
+### Resuming
+
+Point `MVAI_CHECKPOINT_LOAD_DIR` at a specific run's checkpoint directory. A
+resume that finds nothing there starts at step 0 rather than failing, which
+combined with a restart policy is how you get two curves from zero on one
+dashboard — check the log says `Resuming training from step N` before
+believing a restarted job resumed.
+
+Wait for `.metadata` before treating a checkpoint as complete. DCP writes it
+last, so it is a valid completion marker even under `--async_checkpoint`.
+
+The data cursor counts batches whose training step **finished**, not batches
+fetched. With `--data_prefetch_buffer 32` and `--pipeline_preprocessor` those
+differ by the whole lookahead, and the older encoding saved the fetch position
+— so a checkpoint from before that change is read as legacy and corrected by
+the lookahead depth. A resume replays the in-flight batches rather than
+skipping them.
+
+### Reading what a run has saved
+
+`sync_run_artifacts.sh` pushes an index — not the checkpoints, which are
+hundreds of GB — to Manifold alongside the TensorBoard mirror:
+
+```bash
+python3 recir/examples/rankfm_mvai/scripts/checkpoint_index.py <gcs-prefix>
+```
+
+It emits `index.json` and a rendered `index.md`: step, wall-clock time, size,
+and which one `latest.txt` points at.
+
+### If the checkpoint phase looks slow
+
+Two log lines attribute it. `[stage] state_dict ...` splits the blocking phase
+into materialize / flush / sanitize / wrap / opt, and `[flush] full
+device->host sync: ...` breaks the flush down further, listing the eight
+slowest entries by FQN. A uniform slowdown across all entries is a host or bus
+effect; one FQN standing out is a shape, dtype or sharding change.
+
+## 8. Does the data behave like production
 
 The reference is the production MAST run
 [fire-linjianma-train-hammerv3-20260804-524295](https://www.internalfb.com/mlhub/pipelines/runs/mast/fire-linjianma-train-hammerv3-20260804-524295?version=0&env=PRODUCTION).
@@ -204,7 +434,7 @@ low `sum(num_candidates)` fill and an optimistic step time, not as an error.
 If the numbers look too good, check the per-step `[Replay]` line before
 believing them.
 
-## 6. What the log should say
+## 9. What the log should say
 
 Beyond the generic startup, this run has four checkpoints:
 
