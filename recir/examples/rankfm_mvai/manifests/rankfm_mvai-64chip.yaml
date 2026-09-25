@@ -21,6 +21,8 @@ metadata:
     kueue.x-k8s.io/queue-name: lq-training
     x.tpu.cloud.google.com/slice-autoprovisioning: "async"
 spec:
+  failurePolicy:
+    maxRestarts: 0
   replicatedJobs:
   - name: worker
     replicas: 1
@@ -72,6 +74,8 @@ spec:
                 valueFrom:
                   fieldRef:
                     fieldPath: metadata.labels['jobset.sigs.k8s.io/jobset-name']
+              - name: MVAI_CHECKPOINT_SAVE_DIR
+                value: /mnt/gcs-out/checkpoints
               # Lets --prod_faithful work without //minimal_viable_ai, which is
               # not staged into this image: config._load_prod_module_config
               # reads the exported artifact instead. See prod_config_artifact.py
@@ -209,6 +213,15 @@ spec:
                 echo "barnfs mount ready (after $(($(date +%s) - START))s); starting trainer..." ;
                 TB_SRC=/mnt/gcs/mvai_cloud/tensorboard/${JOBSET_NAME} ;
                 TB_DST=/mnt/gcs-out/tensorboard/${JOBSET_NAME} ;
+                SEED_CKPT=/mnt/gcs-out/checkpoints/rankfm-mvai-64chip-kl6ns ;
+                OWN_CKPT=/mnt/gcs-out/checkpoints/${JOBSET_NAME} ;
+                if [ -f "${OWN_CKPT}/latest.txt" ]; then
+                  export MVAI_CHECKPOINT_LOAD_DIR="${OWN_CKPT}" ;
+                  echo "resume source: own checkpoints at ${OWN_CKPT}" ;
+                else
+                  export MVAI_CHECKPOINT_LOAD_DIR="${SEED_CKPT}" ;
+                  echo "resume source: seed checkpoints at ${SEED_CKPT}" ;
+                fi ;
                 if [ "${RANK}" = "0" ]; then
                   mkdir -p "$TB_DST" ;
                   echo "TB sync loop -> gs://cq-mrs-core-shared_mrs_tpu_y317h/tensorboard/${JOBSET_NAME} every ${TB_SYNC_SECS}s" ;
@@ -220,6 +233,9 @@ spec:
                 fi ;
                 python3 -u -m recir.examples.rankfm_mvai.train
                 --max_steps 320725
+                --save_every_n_steps 5000
+                --keep_last_n 2
+                --async_checkpoint
                 --local_batch_size 2048
                 --seq_len_cap 1024
                 --prod_faithful
