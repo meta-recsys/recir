@@ -964,15 +964,16 @@ class _RankFMIterableDataset(IterableDataset):
         self._num_candidates = num_candidates
         self._data_pipe = data_pipe
         self._key_to_size = key_to_size
-        # Global data pointer (batches consumed so far), checkpointed via
-        # state_dict so a resumed run continues from the next batch.
-        self._batch_index = 0
+        # Where to resume in the stream. The trainer sets it from the restored
+        # global_step before iteration; it is not tracked here, because the
+        # trainer already counts exactly this.
+        self._start_batch = 0
 
     def __iter__(self) -> Any:
         trainer_cfg = self._trainer_cfg
         device = torch.device("cpu")
         if self._data_pipe is not None:
-            start = self._batch_index
+            start = self._start_batch
             source = replay_batch_iter(
                 self._data_pipe,
                 self._key_to_size or {},
@@ -985,8 +986,7 @@ class _RankFMIterableDataset(IterableDataset):
             depth = trainer_cfg.data_prefetch_buffer
             prefetch = PrefetchingIterator(source, depth=depth) if depth > 0 else None
             try:
-                for i, batch in enumerate(prefetch if prefetch is not None else source):
-                    self._batch_index = start + i + 1
+                for batch in prefetch if prefetch is not None else source:
                     yield batch
             finally:
                 if prefetch is not None:
@@ -994,7 +994,7 @@ class _RankFMIterableDataset(IterableDataset):
             return
 
         # Synthetic mode: same uniform batch unless padding (then fresh random).
-        start = self._batch_index
+        start = self._start_batch
         torch.manual_seed(0)
         base_batch = create_uniform_train_batch(
             self._feature_config,
@@ -1012,17 +1012,9 @@ class _RankFMIterableDataset(IterableDataset):
                 )
             else:
                 batch = base_batch
-            self._batch_index = pos + 1
             yield batch
 
-    def state_dict(self) -> Dict[str, Any]:
-        """DCP-checkpointed data-stream position (see __iter__). The
-        CheckpointManager saves this and restores it via load_state_dict on
-        resume so real-data runs continue from the next unread batch. Mirrors
-        mvai_cloud PreprocOutputReplayDataPipe.state_dict."""
-        logger.info(f"[Replay] checkpoint data cursor: batch_index={self._batch_index}")
-        return {"batch_index": self._batch_index}
-
-    def load_state_dict(self, state_dict: Dict[str, Any]) -> None:
-        self._batch_index = int(state_dict["batch_index"])
-        logger.info(f"[Replay] restored data cursor: batch_index={self._batch_index}")
+    def set_start_batch(self, index: int) -> None:
+        """Resume the stream at ``index``, the trainer's restored step count."""
+        self._start_batch = index
+        logger.info(f"[Replay] data cursor set to batch_index={index}")

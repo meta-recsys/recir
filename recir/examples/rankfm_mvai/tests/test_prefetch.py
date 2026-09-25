@@ -7,6 +7,7 @@
 
 """Tests for the background-thread batch prefetcher used by the rankfm trainer."""
 
+import itertools
 import time
 import unittest
 from typing import Iterator, List
@@ -68,6 +69,36 @@ class PrefetchingIteratorTest(unittest.TestCase):
             self.assertEqual(next(it), 0)
         # exiting the context closes without error; closed flag is set
         self.assertTrue(it._closed)
+
+    def test_consumer_cursor_resumes_at_the_next_unread_batch(self) -> None:
+        cursor = 0
+        with PrefetchingIterator(iter(range(20)), depth=4) as prefetched:
+            consumed = []
+            for _ in range(3):
+                consumed.append(next(prefetched))
+                cursor += 1
+
+        resumed = iter(range(cursor, 20))
+        self.assertEqual(consumed, [0, 1, 2])
+        self.assertEqual(next(resumed), 3)
+
+    def test_resume_replays_what_was_fetched_but_never_trained(self) -> None:
+        """Why the resume index is the trained count, not the fetched one.
+
+        The prefetch buffer and the pipeline's 1-step lookahead both pull ahead,
+        so when a run dies several batches have left the iterator without their
+        optimizer step finishing. Resuming at the trained count redoes them;
+        resuming at the fetched count would drop them from the epoch.
+        """
+        source = PrefetchingIterator(iter(range(20)), depth=3)
+        fetched = [next(source) for _ in range(5)]
+        source.close()
+        trained_steps = 2  # the other three were in flight when the run died
+
+        resumed = list(itertools.islice(iter(range(trained_steps, 20)), 3))
+
+        self.assertEqual(fetched, [0, 1, 2, 3, 4])
+        self.assertEqual(resumed, [2, 3, 4])
 
     def test_the_producer_runs_ahead_of_the_consumer(self) -> None:
         """Why a checkpointed data cursor must be advanced on the CONSUMER side.
