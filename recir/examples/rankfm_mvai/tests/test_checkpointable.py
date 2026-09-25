@@ -13,14 +13,17 @@ import torch.utils._pytree as pytree
 from recir.api import _compute_state_fqns
 from recir.distributed.data_parallel import DataParallelStyle, shard_params_and_states
 from recir.examples.rankfm_mvai.checkpointable import (
+    EMBEDDING_OPTIMIZER_STATE_KEY,
     host_ordinal_from_device_positions,
     HostStateBuffers,
+    OPTIMIZER_STATE_KEY,
     RecirCheckpointable,
     shard_mesh_order,
     wrap_sharded_for_save,
 )
 from torch.distributed.checkpoint import FileSystemReader, FileSystemWriter
 from torch.distributed.device_mesh import DeviceMesh
+from torch.distributed.tensor import DTensor, Shard
 from torch.distributed.tensor._utils import compute_local_shape_and_global_offset
 from torch.testing._internal.distributed.fake_pg import FakeStore
 
@@ -191,6 +194,7 @@ class RecirCheckpointableTest(unittest.TestCase):
             wrapper.dense.fill_(4.0)
         torch.testing.assert_close(torch.tensor([4.0]), dense)
         self.assertIs(state, checkpointable.make_async_stager().stage(state))
+        self.assertNotIn(EMBEDDING_OPTIMIZER_STATE_KEY, state)
 
     def test_dense_weight_roundtrip_preserves_the_next_update(self) -> None:
         reference_model = _DenseModel()
@@ -353,6 +357,58 @@ class RecirCheckpointableTest(unittest.TestCase):
         # check_payload rejection above -- in a real run nothing re-points the
         # optimizer back, and the cloned slots would silently drift.
         torch.testing.assert_close(results[False][0], expected[0])
+
+    def test_embedding_optimizer_state_round_trips_and_preserves_lr(self) -> None:
+        wrapper = _ShardedTableWrapper(4, 2, meta=False)
+        wrapper.register_parameter("dense", torch.nn.Parameter(torch.tensor([1.0])))
+        dense = wrapper.get_parameter("dense")
+        dense_lr = torch.tensor(0.01)
+        embedding_lr = torch.tensor(0.02)
+        # Citrine C2: use the multi-tensor optimizer path.
+        dense_optimizer = torch.optim.SGD([dense], lr=dense_lr, foreach=True)
+        # Citrine C2: use the multi-tensor optimizer path.
+        embedding_optimizer = torch.optim.SGD(
+            [wrapper._sharded_tables["table"]], lr=embedding_lr, foreach=True
+        )
+        param = wrapper._sharded_tables["table"]
+        dense_optimizer.state[dense] = {"momentum": torch.tensor([3.0])}
+        embedding_optimizer.state[param] = {"sum": torch.full((param.shape[0], 1), 7.0)}
+        checkpointable = RecirCheckpointable(
+            wrapper,
+            num_processes=1,
+            sharded_prefixes=("_sharded_tables",),
+            table_prefixes=("_sharded_tables",),
+            warmup=_Warmup(),
+            dense_optimizer=dense_optimizer,
+            embedding_optimizer=embedding_optimizer,
+        )
+
+        # state_dict() hands out views of the live optimizer state, so take
+        # the bytes here: this stands in for DCP having uploaded them at save
+        # time, which is what the assertions below model.
+        state = cast(Dict[str, Any], _clone_tree(checkpointable.state_dict()))
+        self.assertIn(OPTIMIZER_STATE_KEY, state)
+        self.assertIn(EMBEDDING_OPTIMIZER_STATE_KEY, state)
+        saved_embedding_state = next(
+            iter(state[EMBEDDING_OPTIMIZER_STATE_KEY]["state"].values())
+        )["sum"]
+        torch.testing.assert_close(saved_embedding_state, torch.full((4, 1), 7.0))
+
+        embedding_optimizer.state[param]["sum"].zero_()
+        dense_optimizer.param_groups[0]["lr"] = torch.tensor(1.0)
+        embedding_optimizer.param_groups[0]["lr"] = torch.tensor(2.0)
+        live_dense_lr = dense_optimizer.param_groups[0]["lr"]
+        live_embedding_lr = embedding_optimizer.param_groups[0]["lr"]
+        # The asynchronous snapshot must not follow later optimizer mutations.
+        torch.testing.assert_close(saved_embedding_state, torch.full((4, 1), 7.0))
+
+        checkpointable.load_state_dict(state)
+
+        torch.testing.assert_close(
+            embedding_optimizer.state[param]["sum"], torch.full((4, 1), 7.0)
+        )
+        self.assertIs(dense_optimizer.param_groups[0]["lr"], live_dense_lr)
+        self.assertIs(embedding_optimizer.param_groups[0]["lr"], live_embedding_lr)
 
 
 class ShardedTableRestoreBindingTest(unittest.TestCase):
@@ -609,6 +665,132 @@ class ShardedTableRestoreBindingTest(unittest.TestCase):
             "regenerate it instead of using the restored momentum",
         )
         torch.testing.assert_close(leaf, restored)
+
+    def test_embedding_optimizer_state_is_row_sharded_for_dcp(self) -> None:
+        wrapper = _ShardedTableWrapper(self._VOCAB, self._DIM, meta=False)
+        params_buffers: dict[str, torch.Tensor] = dict(wrapper.named_parameters())
+        shard_params_and_states(
+            wrapper,
+            params_buffers,
+            None,
+            DeviceMesh("cpu", torch.arange(self._WORLD_SIZE)),
+            DataParallelStyle.FULLY_SHARD,
+        )
+        param = wrapper._sharded_tables["table"]
+        local_rows = self._VOCAB // self._WORLD_SIZE
+        embedding_lr = torch.tensor(0.02)
+        # Citrine C2: use the multi-tensor optimizer path.
+        embedding_optimizer = torch.optim.SGD([param], lr=embedding_lr, foreach=True)
+        embedding_optimizer.state[param] = {
+            "sum": torch.arange(local_rows, dtype=torch.float32).view(-1, 1)
+        }
+        checkpointable = RecirCheckpointable(
+            wrapper,
+            num_processes=self._WORLD_SIZE,
+            sharded_prefixes=("_sharded_tables",),
+            table_prefixes=("_sharded_tables",),
+            warmup=_Warmup(),
+            shard_order=list(range(self._WORLD_SIZE)),
+            embedding_optimizer=embedding_optimizer,
+        )
+
+        state = checkpointable.state_dict()[EMBEDDING_OPTIMIZER_STATE_KEY]
+        saved_sum = next(iter(state["state"].values()))["sum"]
+
+        self.assertIsInstance(saved_sum, DTensor)
+        self.assertEqual(tuple(saved_sum.shape), (self._VOCAB, 1))
+        self.assertEqual(tuple(saved_sum.to_local().shape), (local_rows, 1))
+        self.assertEqual(saved_sum.placements, (Shard(0),))
+        self.assertNotIsInstance(state["param_groups"][0]["lr"], DTensor)
+
+    def test_sparse_optimizer_rebind_preserves_the_next_update(self) -> None:
+        source = _ShardedTableWrapper(self._VOCAB, self._DIM, meta=False)
+        with torch.no_grad():
+            source._sharded_tables["table"].copy_(
+                torch.arange(self._VOCAB * self._DIM, dtype=torch.float32).reshape(
+                    self._VOCAB, self._DIM
+                )
+                / 10.0
+            )
+        source_optimizer = self._rowwise_optimizer(source)
+        source_flat_state, source_fqns = self._shard_with_optimizer_state(
+            source, source_optimizer
+        )
+        _build_buffers(source_flat_state, source_fqns, source, [source_optimizer])
+        checkpoint = RecirCheckpointable(
+            source,
+            num_processes=self._WORLD_SIZE,
+            sharded_prefixes=("_sharded_tables",),
+            table_prefixes=("_sharded_tables",),
+            warmup=_Warmup(),
+            shard_order=list(range(self._WORLD_SIZE)),
+            embedding_optimizer=source_optimizer,
+        ).state_dict()
+        # state_dict() hands out views of the live buffers, so take the bytes:
+        # this stands in for DCP having uploaded them at save time.
+        checkpoint = cast(Dict[str, Any], _clone_tree(checkpoint))
+        table_index = source_fqns.index(f"[0]['{self._FQN}']")
+        sum_index = source_fqns.index(f"[1]['{self._FQN}']['sum']")
+        row_ids = torch.tensor([0, 2], dtype=torch.int64)
+        expected = self._run_rowwise_step(
+            source_flat_state[table_index], source_flat_state[sum_index], row_ids
+        )
+
+        results = {}
+        for bound in (False, True):
+            restored = _ShardedTableWrapper(self._VOCAB, self._DIM, meta=False)
+            with torch.no_grad():
+                restored._sharded_tables["table"].fill_(-9.0)
+            optimizer = self._rowwise_optimizer(restored, accumulator=7.0)
+            flat_state, state_fqns = self._shard_with_optimizer_state(
+                restored, optimizer
+            )
+            restored_table_index = state_fqns.index(f"[0]['{self._FQN}']")
+            restored_sum_index = state_fqns.index(f"[1]['{self._FQN}']['sum']")
+            # Fresh storage for the accumulator the graph reads, holding the
+            # same pre-restore value. Only build() rebinds it to what the load
+            # writes into; unbound, flat_state points at storage nobody writes,
+            # which is what separates the table restore from the optimizer one.
+            flat_state[restored_sum_index] = torch.full_like(
+                flat_state[restored_sum_index], 7.0
+            )
+            if bound:
+                _build_buffers(flat_state, state_fqns, restored, [optimizer])
+            target = RecirCheckpointable(
+                restored,
+                num_processes=self._WORLD_SIZE,
+                sharded_prefixes=("_sharded_tables",),
+                table_prefixes=("_sharded_tables",),
+                warmup=_Warmup(),
+                shard_order=list(range(self._WORLD_SIZE)),
+                embedding_optimizer=optimizer,
+            )
+            # dcp.load writes the checkpoint bytes into the tensors state_dict()
+            # hands it, in place. Handing the source's payload straight to
+            # load_state_dict instead would rebind the optimizer to the source's
+            # tensors and leave the accumulator the graph reads untouched.
+            incoming = target.state_dict()
+            pytree.tree_map_(
+                lambda live, saved: (
+                    live.copy_(saved) if isinstance(live, torch.Tensor) else None
+                ),
+                incoming,
+                checkpoint,
+            )
+            target.load_state_dict(incoming)
+
+            results[bound] = self._run_rowwise_step(
+                flat_state[restored_table_index],
+                flat_state[restored_sum_index],
+                row_ids,
+            )
+
+        torch.testing.assert_close(results[False][0], expected[0])
+        torch.testing.assert_close(results[False][1], expected[1])
+        self.assertFalse(torch.equal(results[False][2], expected[2]))
+        self.assertFalse(torch.equal(results[False][3], expected[3]))
+        torch.testing.assert_close(results[True][2], expected[2])
+        torch.testing.assert_close(results[True][3], expected[3])
 
 
 class HostOrdinalFromDevicePositionsTest(unittest.TestCase):
