@@ -231,6 +231,40 @@ spec:
                     done ) &
                   TB_SYNC_PID=$! ;
                 fi ;
+                LOGDIR=/mnt/gcs-out/logs/${JOBSET_NAME} ;
+                mkdir -p "$LOGDIR" ;
+                LOGTAG=rank${RANK}.$(hostname) ;
+                LOCAL_LOG=/tmp/train_rank${RANK}.log ;
+                LOCAL_MEM=/tmp/mem_rank${RANK}.log ;
+                touch "$LOCAL_LOG" ;
+                ( tail -f "$LOCAL_LOG" ) &
+                TAIL_PID=$! ;
+                ( while true; do
+                    { printf '%s MemAvailKB=%s Committed_ASKB=%s' "$(date -u +%H:%M:%S)" "$(awk '/^MemAvailable:/{print $2}' /proc/meminfo)" "$(awk '/^Committed_AS:/{print $2}' /proc/meminfo)" ;
+                      awk '/^MemTotal:|^SwapTotal:|^Cached:|^AnonHugePages:/{gsub(":","",$1); printf " %sKB=%s", $1, $2}' /proc/meminfo ;
+                      awk '$1 ~ /^(compact_stall|compact_fail|thp_fault_alloc|thp_fault_fallback|pgmajfault)$/ || $1 ~ /^allocstall_/ || $1 ~ /^pg(scan|steal)_direct$/ {printf " %s=%s", $1, $2}' /proc/vmstat ;
+                      awk '/MemFree:/{printf " node%s_freeKB=%s", $2, $4}' /sys/devices/system/node/node*/meminfo 2>/dev/null ;
+                      for F in /sys/fs/cgroup/memory.current /sys/fs/cgroup/memory.high /sys/fs/cgroup/memory.max /sys/fs/cgroup/memory/memory.usage_in_bytes /sys/fs/cgroup/memory/memory.limit_in_bytes; do
+                        if [ -r "$F" ]; then printf ' cg_%s=%s' "${F##*/memory.}" "$(cat "$F")" ; fi ;
+                      done ;
+                      if [ -r /sys/fs/cgroup/memory.events ]; then awk '{printf " cg_ev_%s=%s", $1, $2}' /sys/fs/cgroup/memory.events ; fi ;
+                      TPID= ;
+                      for D in /proc/[0-9]*; do
+                        case "$(tr '\0' ' ' < "$D/cmdline" 2>/dev/null)" in python*rankfm_mvai.train*) TPID=$(echo "$D" | tr -dc '0-9') ; break ;; esac ;
+                      done ;
+                      if [ -n "$TPID" ] && [ -r "/proc/$TPID/status" ]; then awk '/^State:|^VmRSS:|^VmHWM:/{gsub(":","",$1); printf " %s=%s", $1, $2}' "/proc/$TPID/status" ; fi ;
+                      printf '\n' ;
+                    } >> "$LOCAL_MEM" 2>/dev/null ;
+                    sleep 15 ;
+                  done ) &
+                MEM_PID=$! ;
+                ( while true; do
+                    sleep 30 ;
+                    tail -n 4000 "$LOCAL_LOG" > "$LOGDIR/${LOGTAG}.tail.log" 2>/dev/null || true ;
+                    grep -aE 'Traceback|Error|error:|RuntimeError|ValueError|Fatal|Abort|Killed|CHECK failed|DEADLINE|RESOURCE_EXHAUSTED|still busy after|input-starved|producer' "$LOCAL_LOG" | tail -n 2000 > "$LOGDIR/${LOGTAG}.err.log" 2>/dev/null || true ;
+                    tail -n 400 "$LOCAL_MEM" > "$LOGDIR/${LOGTAG}.mem.log" 2>/dev/null || true ;
+                  done ) &
+                LOGSYNC_PID=$! ;
                 python3 -u -m recir.examples.rankfm_mvai.train
                 --max_steps 320725
                 --save_every_n_steps 5000
@@ -250,8 +284,15 @@ spec:
                 --pipeline_preprocessor
                 --profile_start_step 900
                 --profile_end_step 906
-                --profile_dir "gs://cq-mrs-core-shared_mrs_tpu_y317h/tpu-profiles/${JOBSET_NAME}" ;
+                --profile_dir "gs://cq-mrs-core-shared_mrs_tpu_y317h/tpu-profiles/${JOBSET_NAME}" > "$LOCAL_LOG" 2>&1 ;
                 rc=$? ;
+                kill "$MEM_PID" "$LOGSYNC_PID" "$TAIL_PID" 2>/dev/null || true ;
+                cp "$LOCAL_LOG" "$LOGDIR/${LOGTAG}.full.log" 2>/dev/null || true ;
+                tail -n 60000 "$LOCAL_LOG" > "$LOGDIR/${LOGTAG}.tail.log" 2>/dev/null || true ;
+                grep -aE 'Traceback|Error|error:|RuntimeError|ValueError|Fatal|Abort|Killed|CHECK failed|DEADLINE|RESOURCE_EXHAUSTED|still busy after|input-starved|producer' "$LOCAL_LOG" | tail -n 4000 > "$LOGDIR/${LOGTAG}.err.log" 2>/dev/null || true ;
+                tail -n 400 "$LOCAL_MEM" > "$LOGDIR/${LOGTAG}.mem.log" 2>/dev/null || true ;
+                echo "exit rc=$rc" > "$LOGDIR/${LOGTAG}.exit" 2>/dev/null || true ;
+                echo "trainer exited rc=$rc; logs at $LOGDIR/${LOGTAG}.*" ;
                 if [ "${RANK}" = "0" ]; then
                   kill "$TB_SYNC_PID" 2>/dev/null || true ;
                   echo "Final TensorBoard copy -> gs://cq-mrs-core-shared_mrs_tpu_y317h/tensorboard/${JOBSET_NAME} ..." ;
