@@ -5,6 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import logging
+import zlib
 from typing import Any
 
 import torch
@@ -13,6 +14,7 @@ logger: logging.Logger = logging.getLogger(__name__)
 
 _META_INIT_KIND_ATTR: str = "_recir_meta_init_kind"
 _META_INIT_BOUND_ATTR: str = "_recir_meta_init_bound"
+_META_INIT_STREAM_ID_ATTR: str = "_recir_meta_init_stream_id"
 
 
 def default_embedding_init_bound(num_embeddings: int) -> float:
@@ -35,9 +37,15 @@ def initialize_tensor_from_meta_init(
     return tensor
 
 
-def mark_meta_uniform_init(tensor: Any, bound: float) -> None:
+def table_init_stream_id(name: str) -> int:
+    """Stable per-table PRNG stream identifier for on-device init."""
+    return zlib.crc32(name.encode("utf-8"))
+
+
+def mark_meta_uniform_init(tensor: Any, bound: float, stream_id: int) -> None:
     setattr(tensor, _META_INIT_KIND_ATTR, "uniform")
     setattr(tensor, _META_INIT_BOUND_ATTR, bound)
+    setattr(tensor, _META_INIT_STREAM_ID_ATTR, int(stream_id))
 
 
 def mark_meta_zero_init(tensor: Any) -> None:
@@ -48,9 +56,17 @@ def mark_meta_zero_init(tensor: Any) -> None:
 def copy_meta_init_attrs(dst: Any, src: Any) -> None:
     if not (dst.is_meta and src.is_meta):
         return
-    for attr in (_META_INIT_KIND_ATTR, _META_INIT_BOUND_ATTR):
+    for attr in (
+        _META_INIT_KIND_ATTR,
+        _META_INIT_BOUND_ATTR,
+        _META_INIT_STREAM_ID_ATTR,
+    ):
         if hasattr(src, attr):
             setattr(dst, attr, getattr(src, attr))
+
+
+def get_meta_init_stream_id(tensor: Any) -> int:
+    return int(getattr(tensor, _META_INIT_STREAM_ID_ATTR, 0))
 
 
 def get_meta_init_spec(tensor: Any, default_bound: float) -> tuple[str, float]:

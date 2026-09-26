@@ -28,7 +28,11 @@ from recir.batch_dim_propagation import (
 from recir.distributed.sharding_spec import get_state_layout
 from recir.lowering.lowering_utils import segment_and_lower, strip_profiler_nodes
 from recir.lowering.op_swap import OpSwapRegistry, swap_ops
-from recir.meta_tensor_init import default_embedding_init_bound, get_meta_init_spec
+from recir.meta_tensor_init import (
+    default_embedding_init_bound,
+    get_meta_init_spec,
+    get_meta_init_stream_id,
+)
 from recir.torchax.gspmd_context import gspmd_mesh_context
 from recir.torchax.ops.mappings import t2j
 
@@ -236,6 +240,7 @@ def _materialize_meta_fsdp_tensor(tensor: Any, mesh: Any) -> Any:
     init_kind, bound = get_meta_init_spec(
         tensor, default_embedding_init_bound(global_shape[0])
     )
+    stream_id = get_meta_init_stream_id(tensor)
 
     # Bind statics as default args (not closure captures) to satisfy
     # pyre [53]; shard_map invokes _gen_shard with only the sharded arg.
@@ -246,11 +251,13 @@ def _materialize_meta_fsdp_tensor(tensor: Any, mesh: Any) -> Any:
         _kind: str = init_kind,
         _b: float = bound,
         _dt: Any = jdtype,
+        _stream_id: int = stream_id,
     ) -> Any:
         if _kind == "zeros":
             return jnp.zeros((_rpd, *_tr), dtype=_dt)
         gi = jax.lax.axis_index(_GSPMD_FSDP_AXIS)
         key = jax.random.fold_in(jax.random.PRNGKey(0), gi)
+        key = jax.random.fold_in(key, _stream_id)
         shard = jax.random.uniform(key, (_rpd, *_tr), dtype=_dt, minval=-_b, maxval=_b)
         return shard.astype(_dt)
 
