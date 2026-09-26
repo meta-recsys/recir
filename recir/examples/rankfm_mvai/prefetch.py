@@ -82,9 +82,9 @@ class PrefetchingIterator:
         waited = 0.0
         while True:
             try:
-                return self._queue.get(timeout=self._WAIT_WARN_SECS)
+                return self._queue.get(timeout=_WAIT_WARN_SECS)
             except queue.Empty:
-                waited += self._WAIT_WARN_SECS
+                waited += _WAIT_WARN_SECS
                 logger.warning(
                     "batch prefetch has had nothing to hand out for %.0fs "
                     "(producer alive=%s); this rank is input-starved",
