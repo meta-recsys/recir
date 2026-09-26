@@ -6,25 +6,26 @@
 
 # pyre-strict
 
-"""The per-task snapshot channel, matching what the MAST/mvai leg emits.
-
-MAST routes four quantities through one mechanism -- a named-tensor snapshot fed
-into ``FixedStepLocalTensor`` -- producing::
+"""The per-task snapshot channel, matching the tags the MAST/mvai leg emits::
 
     loss/local/lifetime/{task}/train
     llw_weights/local/lifetime/{task}/train
     loss_scale/local/lifetime/{task}/train
     learning_rate/optimizer___dense/train
     learning_rate/optimizer___sparse_fused/train
+    real_example_lengths/local/lifetime/{hstu_i}/train
 
-All five come off the same channel at the same cadence and on the same x-axis
-(cumulative examples), which is why the LR pair is expressed here as just
-another two-row "task" tensor rather than as a special case.
+Each is a ``FixedStepLocalTensor`` on the same cadence and the same
+cumulative-examples x-axis, which is why the LR pair is carried as a two-row
+"task" tensor rather than as a special case.
 
-The value semantics matter as much as the names: these are point-in-time
-snapshots, not window means. Averaging an LLW weight or an LR over a report
-interval smears the trajectory being inspected, so a mean-based channel is not
-a substitute even if the tags line up.
+They are point-in-time snapshots, not window means: averaging an LLW weight or
+an LR over a report interval smears the trajectory being inspected.
+
+``real_example_lengths`` is the one MAST gets from a tokenizer ``set_export``
+and this leg cannot. The tokenizer only sees the batch after the per-host
+dispatch has padded it, and PRT dumps each chip's whole token deficit into the
+pad rows, so it is computed from the raw batch in ``example_lengths`` instead.
 """
 
 from __future__ import annotations
@@ -69,7 +70,7 @@ class GlobalStateEffectiveSampleCnt(FixedStepEffectiveSampleCnt):
         super().__init__(**kwargs)
         self.state_scale: float = state_scale
 
-    # pyre-fixme[14]: matches the base's `weights`-keyword signature.
+    # Matches the base's `weights`-keyword signature.
     def update(
         self,
         *_: Any,
@@ -104,6 +105,7 @@ class SnapshotMetrics:
         report_interval: int,
         global_batch_size: int,
         all_task_names: List[str],
+        num_sequence_groups: int = 1,
     ) -> None:
         def make(key_name: str, tasks: List[str]) -> FixedStepLocalTensor:
             # pyrefly: ignore [bad-instantiation]
@@ -130,6 +132,12 @@ class SnapshotMetrics:
             "loss_scale/local/lifetime", all_task_names
         )
         self._learning_rate: FixedStepLocalTensor = make("learning_rate", LR_TASKS)
+        self._seq_group_tasks: List[str] = [
+            f"hstu_{i}" for i in range(max(0, num_sequence_groups))
+        ]
+        self._real_example_lengths: FixedStepLocalTensor = make(
+            "real_example_lengths/local/lifetime", self._seq_group_tasks
+        )
         # Not a snapshot -- it accumulates -- but it belongs to the same
         # all-task channel: it needs the full per-task weight tensor, which only
         # the unsliced step-metric path carries.
@@ -149,11 +157,22 @@ class SnapshotMetrics:
             )
 
     @property
+    def num_groups(self) -> int:
+        """Sequence groups this channel declared rows for."""
+        return len(self._seq_group_tasks)
+
+    @property
     def metrics(self) -> List[Any]:
         """Metrics that report on their own (registered on the pipeline)."""
         if not self._enabled:
             return []
-        return [self._loss, self._llw_weights, self._loss_scale, self._learning_rate]
+        return [
+            self._loss,
+            self._llw_weights,
+            self._loss_scale,
+            self._learning_rate,
+            self._real_example_lengths,
+        ]
 
     @property
     def step_metrics(self) -> List[Any]:
@@ -172,6 +191,7 @@ class SnapshotMetrics:
         losses: torch.Tensor,
         named: Dict[str, Any],
         model: Any,
+        real_example_lengths_value: Optional[torch.Tensor],
     ) -> None:
         """Snapshot this step's per-task tensors.
 
@@ -186,6 +206,7 @@ class SnapshotMetrics:
         self._llw_weights.update(value=named.get("llw_weights"))
         self._loss_scale.update(value=named.get("loss_scale"))
         self._learning_rate.update(value=_lr_tensor(model))
+        self._real_example_lengths.update(value=real_example_lengths_value)
 
 
 def _lr_tensor(model: Any) -> Optional[torch.Tensor]:

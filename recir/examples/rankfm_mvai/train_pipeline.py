@@ -33,8 +33,9 @@ from hammer.v3.models.udd_fm_v3.parity.step_probe import StepProbe
 from minimal_viable_ai.core.trainer.train_pipeline import RecTrainPipelineProvider
 
 from .eager_step import EagerCPUStep
+from .example_lengths import num_sequence_groups, real_example_lengths
 from .metric_states import extract_states, update_ranking_metrics_from_states, W_SUM
-from .rankfm_dispatchers import PreprocessorDispatcher
+from .rankfm_dispatchers import PreprocessorDispatcher, SEQ_LENGTHS_BASIS_KEY
 from .snapshot_metrics import SnapshotMetrics
 from .xsurface_helpers import _log_hbm_memory
 
@@ -84,7 +85,7 @@ def _sibling_env(*metric_lists: Any) -> Tuple[int, int, int]:
 
 
 def _build_snapshot_metrics(
-    all_task_names: List[str], *metric_lists: Any
+    all_task_names: List[str], model: Any, *metric_lists: Any
 ) -> SnapshotMetrics:
     """Build the MAST-equivalent per-task snapshot channel."""
     rank, report_interval, global_batch_size = _sibling_env(*metric_lists)
@@ -93,7 +94,20 @@ def _build_snapshot_metrics(
         report_interval=report_interval,
         global_batch_size=global_batch_size,
         all_task_names=all_task_names,
+        num_sequence_groups=num_sequence_groups(model),
     )
+
+
+def _uih_lengths(batch: Any) -> Optional[torch.Tensor]:
+    """Per-sample UIH length off the RAW batch, before any pad row exists."""
+    kjt = getattr(batch, "ro_id_list_features", None)
+    if kjt is None:
+        return None
+    keys = list(kjt.keys())
+    if SEQ_LENGTHS_BASIS_KEY not in keys:
+        return None
+    stride = int(kjt.stride())
+    return kjt.lengths().view(len(keys), stride)[keys.index(SEQ_LENGTHS_BASIS_KEY)]
 
 
 def _assert_task_rows(prediction: torch.Tensor, all_task_names: List[str]) -> None:
@@ -165,7 +179,7 @@ class RecirXLATrainPipeline(RankingTrainPipeline):
         self._pending_batch: Optional[Any] = None
         self._all_task_names: List[str] = list(all_task_names or [])
         self._snapshot_metrics: SnapshotMetrics = _build_snapshot_metrics(
-            self._all_task_names, step_metrics, cls_metrics, reg_metrics
+            self._all_task_names, self._model, step_metrics, cls_metrics, reg_metrics
         )
         # Appended to the base's step-metric list rather than returned from
         # `metrics`: only step metrics are handed the unsliced per-task tensors
@@ -181,7 +195,9 @@ class RecirXLATrainPipeline(RankingTrainPipeline):
         # The consumer (materialize + metric update) runs one step late, on the
         # worker. These two are its input and its output: the input is the step
         # output parked as JAX handles, the output is what `progress` returns.
-        self._deferred_consumer_input: Optional[Tuple[Any, Any, int, int]] = None
+        self._deferred_consumer_input: Optional[
+            Tuple[Any, Any, int, Optional[torch.Tensor], int]
+        ] = None
         self._deferred_consumer_output: Optional[
             Tuple[torch.Tensor, Dict[str, Any]]
         ] = None
@@ -288,6 +304,11 @@ class RecirXLATrainPipeline(RankingTrainPipeline):
         # these host CPU tensors. weight=0 keeps padded rows out of NE/CTR/MSE;
         # num_real_candidates keeps variable-step x-axes and QPS padding-invariant.
         num_real_candidates = int(batch.num_candidates.sum())
+        real_lengths = real_example_lengths(
+            _uih_lengths(batch),
+            batch.num_candidates,
+            self._snapshot_metrics.num_groups,
+        )
 
         if self._pipeline_preprocessor:
             if (
@@ -304,6 +325,7 @@ class RecirXLATrainPipeline(RankingTrainPipeline):
                 losses,
                 named,
                 num_real_candidates,
+                real_lengths,
                 self._step,
             )
             if dispatcher is not None:
@@ -318,13 +340,29 @@ class RecirXLATrainPipeline(RankingTrainPipeline):
                 return torch.zeros(()), {}
             return deferred_result
         else:
-            return self._consume_step(losses, named, num_real_candidates, self._step)
+            return self._consume_step(
+                losses, named, num_real_candidates, real_lengths, self._step
+            )
 
-    def _stash_consume(self, losses: Any, named: Any, nrc: int, step: int) -> None:
-        self._deferred_consumer_output = self._consume_step(losses, named, nrc, step)
+    def _stash_consume(
+        self,
+        losses: Any,
+        named: Any,
+        nrc: int,
+        real_lengths: Optional[torch.Tensor],
+        step: int,
+    ) -> None:
+        self._deferred_consumer_output = self._consume_step(
+            losses, named, nrc, real_lengths, step
+        )
 
     def _consume_step(
-        self, losses: Any, named: Any, num_real_candidates: int, step: int
+        self,
+        losses: Any,
+        named: Any,
+        num_real_candidates: int,
+        real_lengths: Optional[torch.Tensor],
+        step: int,
     ) -> Tuple[torch.Tensor, Dict[str, Any]]:
         """Materialize a step's output and fold it into the metrics.
 
@@ -340,7 +378,7 @@ class RecirXLATrainPipeline(RankingTrainPipeline):
             # `extract_states` raises if they are missing, which would mean the
             # traced program and this flag disagree.
             return losses, self._update_metrics_from_states(
-                named, losses, num_real_candidates, step
+                named, losses, num_real_candidates, real_lengths, step
             )
         else:
             ret: Dict[str, Any] = {
@@ -355,7 +393,7 @@ class RecirXLATrainPipeline(RankingTrainPipeline):
             }
             _assert_task_rows(ret["prediction"], self._all_task_names)
             self._update_ranking_metrics(ret)
-            self._snapshot_metrics.update(losses, named, self._model)
+            self._snapshot_metrics.update(losses, named, self._model, real_lengths)
             return losses, ret
 
     def _update_metrics_from_states(
@@ -363,6 +401,7 @@ class RecirXLATrainPipeline(RankingTrainPipeline):
         named: Dict[str, Any],
         losses: torch.Tensor,
         num_real_candidates: int,
+        real_lengths: Optional[torch.Tensor],
         step: int,
     ) -> Dict[str, Any]:
         states = extract_states(named)
@@ -403,7 +442,7 @@ class RecirXLATrainPipeline(RankingTrainPipeline):
                 "add a mapper in metric_states._mapper_for or keep this metric "
                 "off the in-graph path"
             )
-        self._snapshot_metrics.update(losses, named, self._model)
+        self._snapshot_metrics.update(losses, named, self._model, real_lengths)
         return {
             "num_real_candidates": num_real_candidates,
             "step": step,
@@ -598,7 +637,11 @@ class EagerCPUTrainPipeline(RankingTrainPipeline):
         self._probe: StepProbe = StepProbe(self._raw_model)
         self._all_task_names: List[str] = list(all_task_names or [])
         self._snapshot_metrics: SnapshotMetrics = _build_snapshot_metrics(
-            self._all_task_names, step_metrics, cls_metrics, reg_metrics
+            self._all_task_names,
+            self._raw_model,
+            step_metrics,
+            cls_metrics,
+            reg_metrics,
         )
         self._step_metrics.extend(self._snapshot_metrics.step_metrics)
         self._raw_model.train(True)
@@ -671,7 +714,18 @@ class EagerCPUTrainPipeline(RankingTrainPipeline):
             after_backward=_after_backward,
         )
         self._probe.finish()
-        self._snapshot_metrics.update(all_losses, named, self._model)
+        # `named` is the last micro-batch's forward, so measure that batch.
+        last = micro_batches[-1]
+        self._snapshot_metrics.update(
+            all_losses,
+            named,
+            self._model,
+            real_example_lengths(
+                _uih_lengths(last),
+                last.num_candidates,
+                self._snapshot_metrics.num_groups,
+            ),
+        )
         return all_losses, ret
 
     @property
