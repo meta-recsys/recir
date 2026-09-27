@@ -43,8 +43,8 @@ from typing import Any, Dict, Iterator, List, Optional
 
 import torch
 import torch.nn as nn
+from hammer.v3.models.udd_fm_v3.parity import leak_probe
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
-
 
 logger: logging.Logger = logging.getLogger(__name__)
 
@@ -727,6 +727,7 @@ def replay_batch_iter(
             start = window * local_batch_size
             batch = select_rows_slice(batch, start, local_batch_size)
             batch = remap_batch_ids(batch, key_to_size)
+            batch = leak_probe.apply_stimulus(batch, step)
             nc = batch.num_candidates
             real_total = int(nc.sum())
             budget = nc.shape[0] * num_candidates

@@ -29,6 +29,7 @@ import jax
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+from hammer.v3.models.udd_fm_v3.parity import leak_probe
 from hammer.v3.models.udd_fm_v3.parity.step_probe import StepProbe
 from minimal_viable_ai.core.trainer.train_pipeline import RecTrainPipelineProvider
 
@@ -270,6 +271,8 @@ class RecirXLATrainPipeline(RankingTrainPipeline):
         # (losses, named_tensors); metric update runs every step so the
         # example-count / variable_step_qps stay exact.
         losses, named = self._model(batch)
+
+        leak_probe.report(named, self._step)
 
         if self._profiling_active and self._enable_memory_log:
             _log_hbm_memory()
