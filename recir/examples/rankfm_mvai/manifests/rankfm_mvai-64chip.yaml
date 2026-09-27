@@ -44,7 +44,7 @@ spec:
             serviceAccountName: default
             containers:
             - name: rankfm-mvai
-              image: us-central1-docker.pkg.dev/mrs-tpu-y317h/recml/rankfm_mvai_tpu:linjianma-cmp0903
+              image: us-central1-docker.pkg.dev/mrs-tpu-y317h/recml/rankfm_mvai_tpu:prod
               imagePullPolicy: Always
               env:
               - name: PYTHONUNBUFFERED
@@ -76,6 +76,14 @@ spec:
                     fieldPath: metadata.labels['jobset.sigs.k8s.io/jobset-name']
               - name: MVAI_CHECKPOINT_SAVE_DIR
                 value: /mnt/gcs-out/checkpoints
+              # Resume from ANOTHER run's checkpoints. The jobset name carries a
+              # random suffix, so ${JOBSET_NAME} only ever finds this run's own
+              # checkpoints -- which on a fresh submit means a cold start even
+              # when a perfectly good checkpoint from the previous attempt is
+              # sitting in the bucket. Set this to that run's jobset name to
+              # pick up where it left off; leave empty for a cold start.
+              - name: SEED_CHECKPOINT_JOBSET
+                value: ""
               # Lets --prod_faithful work without //minimal_viable_ai, which is
               # not staged into this image: config._load_prod_module_config
               # reads the exported artifact instead. See prod_config_artifact.py
@@ -213,14 +221,19 @@ spec:
                 echo "barnfs mount ready (after $(($(date +%s) - START))s); starting trainer..." ;
                 TB_SRC=/mnt/gcs/mvai_cloud/tensorboard/${JOBSET_NAME} ;
                 TB_DST=/mnt/gcs-out/tensorboard/${JOBSET_NAME} ;
-                SEED_CKPT=/mnt/gcs-out/checkpoints/rankfm-mvai-64chip-kl6ns ;
                 OWN_CKPT=/mnt/gcs-out/checkpoints/${JOBSET_NAME} ;
+                SEED_CKPT=/mnt/gcs-out/checkpoints/${SEED_CHECKPOINT_JOBSET:-__none__} ;
                 if [ -f "${OWN_CKPT}/latest.txt" ]; then
                   export MVAI_CHECKPOINT_LOAD_DIR="${OWN_CKPT}" ;
-                  echo "resume source: own checkpoints at ${OWN_CKPT}" ;
-                else
+                  echo "resume source: own checkpoints at ${OWN_CKPT} ($(cat "${OWN_CKPT}/latest.txt"))" ;
+                elif [ -f "${SEED_CKPT}/latest.txt" ]; then
                   export MVAI_CHECKPOINT_LOAD_DIR="${SEED_CKPT}" ;
-                  echo "resume source: seed checkpoints at ${SEED_CKPT}" ;
+                  echo "resume source: SEED checkpoints at ${SEED_CKPT} ($(cat "${SEED_CKPT}/latest.txt"))" ;
+                elif [ -n "${SEED_CHECKPOINT_JOBSET:-}" ]; then
+                  echo "FATAL: SEED_CHECKPOINT_JOBSET=${SEED_CHECKPOINT_JOBSET} was requested but ${SEED_CKPT}/latest.txt does not exist" ;
+                  exit 1 ;
+                else
+                  echo "cold start: no MVAI_CHECKPOINT_LOAD_DIR, training from step 0" ;
                 fi ;
                 if [ "${RANK}" = "0" ]; then
                   mkdir -p "$TB_DST" ;
@@ -236,6 +249,7 @@ spec:
                 LOGTAG=rank${RANK}.$(hostname) ;
                 LOCAL_LOG=/tmp/train_rank${RANK}.log ;
                 LOCAL_MEM=/tmp/mem_rank${RANK}.log ;
+                LOCAL_FS=/tmp/fs_rank${RANK}.log ;
                 touch "$LOCAL_LOG" ;
                 ( tail -f "$LOCAL_LOG" ) &
                 TAIL_PID=$! ;
@@ -258,13 +272,71 @@ spec:
                     sleep 15 ;
                   done ) &
                 MEM_PID=$! ;
+                # gcsfuse mount health. The sidecar runs in its own container,
+                # so nothing above can see its cgroup or its process -- if it
+                # dies or wedges, the only symptom inside this container is that
+                # /mnt/gcs-out starts returning errors. Probe it directly:
+                # a cheap read every 15 s, a real write every 60 s, both timed.
+                # Checkpoints, TensorBoard and these very logs all ride on this
+                # mount, so a stall here explains all three going quiet at once.
+
+                ( PROBE=/mnt/gcs-out/logs/${JOBSET_NAME}/.probe.rank${RANK} ;
+                  i=0 ;
+                  while true; do
+                    i=$((i + 1)) ;
+                    T0=$(date +%s%N) ;
+                    if ls -d /mnt/gcs-out/checkpoints >/dev/null 2>&1; then R=ok; else R="ERR:$?"; fi ;
+                    T1=$(date +%s%N) ;
+                    W=skip ; T2="$T1" ;
+                    if [ $((i % 4)) -eq 0 ]; then
+                      if date -u +%s > "$PROBE" 2>/dev/null; then W=ok; else W="ERR:$?"; fi ;
+                      T2=$(date +%s%N) ;
+                    fi ;
+                    printf '%s read=%s read_ms=%s write=%s write_ms=%s %s\n' \
+                      "$(date -u +%H:%M:%S)" "$R" "$(( (T1 - T0) / 1000000 ))" \
+                      "$W" "$(( (T2 - T1) / 1000000 ))" \
+                      "$(stat -f -c 'blocks=%b avail=%a' /mnt/gcs-out 2>&1 | head -c 60)" \
+                      >> "$LOCAL_FS" 2>/dev/null ;
+                    sleep 15 ;
+                  done ) &
+                FS_PID=$! ;
+                # The full log used to be published ONLY on the exit path, so a
+                # SIGKILL -- the one case the log is actually needed for -- left
+                # nothing but a 4000-line window worth about three minutes.
+                # Append new bytes as they appear instead: survives any kill,
+                # and copies each byte once rather than the whole file each time.
+
+                LOG_SENT=0 ;
                 ( while true; do
                     sleep 30 ;
-                    tail -n 4000 "$LOCAL_LOG" > "$LOGDIR/${LOGTAG}.tail.log" 2>/dev/null || true ;
-                    grep -aE 'Traceback|Error|error:|RuntimeError|ValueError|Fatal|Abort|Killed|CHECK failed|DEADLINE|RESOURCE_EXHAUSTED|still busy after|input-starved|producer' "$LOCAL_LOG" | tail -n 2000 > "$LOGDIR/${LOGTAG}.err.log" 2>/dev/null || true ;
+                    LOG_NOW=$(stat -c%s "$LOCAL_LOG" 2>/dev/null || echo 0) ;
+                    if [ "$LOG_NOW" -gt "$LOG_SENT" ]; then
+                      tail -c "+$((LOG_SENT + 1))" "$LOCAL_LOG" >> "$LOGDIR/${LOGTAG}.full.log" 2>/dev/null && LOG_SENT="$LOG_NOW" ;
+                    fi ;
                     tail -n 400 "$LOCAL_MEM" > "$LOGDIR/${LOGTAG}.mem.log" 2>/dev/null || true ;
+                    tail -n 400 "$LOCAL_FS"  > "$LOGDIR/${LOGTAG}.fs.log"  2>/dev/null || true ;
                   done ) &
                 LOGSYNC_PID=$! ;
+                # SIGKILL cannot be trapped, but SIGTERM can -- and SIGTERM is
+                # what the Job controller sends to the other 15 pods when one
+                # fails. Last run all 16 ranks died leaving no .exit file, so
+                # there was no way to tell the pod that crashed from the pods
+                # that were shut down because of it. Record the signal and flush
+                # before the grace period expires.
+
+                flush_on_signal() {
+                    sig="$1" ;
+                    echo "signal=${sig} at $(date -u +%H:%M:%SZ)" > "$LOGDIR/${LOGTAG}.signal" 2>/dev/null || true ;
+                    LOG_NOW=$(stat -c%s "$LOCAL_LOG" 2>/dev/null || echo 0) ;
+                    tail -c "+$((LOG_SENT + 1))" "$LOCAL_LOG" >> "$LOGDIR/${LOGTAG}.full.log" 2>/dev/null || true ;
+                    tail -n 400 "$LOCAL_MEM" > "$LOGDIR/${LOGTAG}.mem.log" 2>/dev/null || true ;
+                    tail -n 400 "$LOCAL_FS"  > "$LOGDIR/${LOGTAG}.fs.log"  2>/dev/null || true ;
+                    echo "flushed ${LOG_NOW} bytes on ${sig}" ;
+                    kill -TERM "${TRAIN_PID:-0}" 2>/dev/null || true ;
+                } ;
+                trap 'flush_on_signal SIGTERM' TERM ;
+                trap 'flush_on_signal SIGINT'  INT ;
+                trap 'flush_on_signal SIGHUP'  HUP ;
                 python3 -u -m recir.examples.rankfm_mvai.train
                 --max_steps 320725
                 --save_every_n_steps 5000
@@ -284,14 +356,31 @@ spec:
                 --pipeline_preprocessor
                 --profile_start_step 900
                 --profile_end_step 906
-                --profile_dir "gs://cq-mrs-core-shared_mrs_tpu_y317h/tpu-profiles/${JOBSET_NAME}" > "$LOCAL_LOG" 2>&1 ;
-                rc=$? ;
-                kill "$MEM_PID" "$LOGSYNC_PID" "$TAIL_PID" 2>/dev/null || true ;
-                cp "$LOCAL_LOG" "$LOGDIR/${LOGTAG}.full.log" 2>/dev/null || true ;
+                --profile_dir "gs://cq-mrs-core-shared_mrs_tpu_y317h/tpu-profiles/${JOBSET_NAME}" > "$LOCAL_LOG" 2>&1 &
+                TRAIN_PID=$! ;
+                # bash defers a trap until the foreground command returns, so
+                # with the trainer in the foreground the SIGTERM handler above
+                # would only run after the trainer was already gone -- i.e.
+                # never, since the grace period ends in SIGKILL. Backgrounding
+                # it and blocking in `wait` is what makes the trap reachable.
+                # `wait` itself returns 128+signo when interrupted, so re-wait
+                # until the trainer is actually reaped to get its real code.
+
+                wait "$TRAIN_PID" ; rc=$? ;
+                while [ "$rc" -gt 128 ] && kill -0 "$TRAIN_PID" 2>/dev/null; do
+                  wait "$TRAIN_PID" ; rc=$? ;
+                done ;
+                kill "$MEM_PID" "$LOGSYNC_PID" "$TAIL_PID" "$FS_PID" 2>/dev/null || true ;
+                cp "$LOCAL_LOG" "$LOGDIR/${LOGTAG}.exitcopy.log" 2>/dev/null || true ;
                 tail -n 60000 "$LOCAL_LOG" > "$LOGDIR/${LOGTAG}.tail.log" 2>/dev/null || true ;
-                grep -aE 'Traceback|Error|error:|RuntimeError|ValueError|Fatal|Abort|Killed|CHECK failed|DEADLINE|RESOURCE_EXHAUSTED|still busy after|input-starved|producer' "$LOCAL_LOG" | tail -n 4000 > "$LOGDIR/${LOGTAG}.err.log" 2>/dev/null || true ;
+                grep -aE 'Traceback|Error|error:|RuntimeError|ValueError|Fatal|Abort|Killed|CHECK failed|DEADLINE|RESOURCE_EXHAUSTED|still busy after|input-starved|producer|ckpt-writer|ckpt-commit|upload in flight' "$LOCAL_LOG" | tail -n 4000 > "$LOGDIR/${LOGTAG}.err.log" 2>/dev/null || true ;
                 tail -n 400 "$LOCAL_MEM" > "$LOGDIR/${LOGTAG}.mem.log" 2>/dev/null || true ;
-                echo "exit rc=$rc" > "$LOGDIR/${LOGTAG}.exit" 2>/dev/null || true ;
+                tail -n 400 "$LOCAL_FS"  > "$LOGDIR/${LOGTAG}.fs.log"  2>/dev/null || true ;
+                if [ "$rc" -gt 128 ]; then
+                  echo "exit rc=$rc (killed by signal $((rc - 128)))" > "$LOGDIR/${LOGTAG}.exit" 2>/dev/null || true ;
+                else
+                  echo "exit rc=$rc" > "$LOGDIR/${LOGTAG}.exit" 2>/dev/null || true ;
+                fi ;
                 echo "trainer exited rc=$rc; logs at $LOGDIR/${LOGTAG}.*" ;
                 if [ "${RANK}" = "0" ]; then
                   kill "$TB_SYNC_PID" 2>/dev/null || true ;
@@ -328,6 +417,12 @@ spec:
               operator: "Exists"
               effect: "NoSchedule"
             restartPolicy: Never
+            priorityClassName: high-priority
+            # SIGTERM -> flush_on_signal has to push the log tail through
+            # gcsfuse before the kubelet escalates to SIGKILL. The 30 s default
+            # is not enough headroom when the mount is under checkpoint load,
+            # which is exactly when the evidence matters most.
+            terminationGracePeriodSeconds: 90
             volumes:
             # BarnFS dataporter dump, mounted by the barnfs.csi.meta.com CSI
             # driver. The driver stages the GCS bucket with its own gcsfuse and
