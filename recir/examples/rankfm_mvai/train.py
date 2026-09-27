@@ -36,6 +36,7 @@ from typing import Any, cast, TYPE_CHECKING
 
 import jax
 import torch.distributed as dist
+from hammer.v3.models.udd_fm_v3.parity import leak_probe
 from hammer.v3.models.udd_fm_v3.udd_fm_config import BlueReelsVDDModuleConfig
 from minimal_viable_ai.core.ranking_common.metrics.ctr import FixedStepCTR
 from minimal_viable_ai.core.ranking_common.metrics.mse import FixedStepMSE
@@ -145,6 +146,14 @@ def main() -> None:
     setup_logging()
     _log_build_info()
     resolve_dist_env()
+
+    # Arm the leak probe here and nowhere later. Everything downstream of the
+    # preprocessor is traced once into a compiled graph, so a probe installed
+    # after the model is built never runs -- and its export key is absent when
+    # the dummy preprocessor caches the graph's output shapes, which means its
+    # reading comes back as zeros rather than as missing. Inert unless
+    # RANKFM_DUP_TARGETS is set.
+    leak_probe.install(leak_probe.from_env())
 
     # Multi-host (e.g. 128-chip): must call jax.distributed.initialize() before
     # any JAX op so the PJRT plugin reads the coordinator address + process index
