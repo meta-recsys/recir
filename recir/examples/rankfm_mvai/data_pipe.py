@@ -48,6 +48,9 @@ from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
 logger: logging.Logger = logging.getLogger(__name__)
 
+_REPLAY_LOG_EVERY: int = int(os.environ.get("RANKFM_REPLAY_LOG_EVERY", "20"))
+_REPLAY_LOG_HEAD: int = int(os.environ.get("RANKFM_REPLAY_LOG_HEAD", "20"))
+
 
 # ---------------------------------------------------------------------------
 # Lazy third-party imports (soft deps so the module loads in any image)
@@ -333,7 +336,7 @@ class BatchReplayPipe:
     def __iter__(self) -> Iterator[Any]:
         for i, name in enumerate(self._file_list):
             batch = self._load_batch(name)
-            logger.info(
+            logger.debug(
                 f"[Replay] rank {self._rank} loaded {i + 1}/{len(self._file_list)}: "
                 f"{name}"
             )
@@ -350,7 +353,7 @@ class BatchReplayPipe:
         n = len(self._file_list)
         name = self._file_list[pos % n]
         batch = self._load_batch(name)
-        logger.info(
+        logger.debug(
             f"[Replay] rank {self._rank} loaded pos {pos} (file {pos % n + 1}/{n}): "
             f"{name}"
         )
@@ -728,15 +731,16 @@ def replay_batch_iter(
             batch = select_rows_slice(batch, start, local_batch_size)
             batch = remap_batch_ids(batch, key_to_size)
             batch = leak_probe.apply_stimulus(batch, step)
-            nc = batch.num_candidates
-            real_total = int(nc.sum())
-            budget = nc.shape[0] * num_candidates
-            logger.info(
-                f"[Replay] step {step + 1} (pos {pos}, {batches_per_step} file(s)): "
-                f"sum(num_candidates)={real_total}, "
-                f"NRO budget={budget} (fill={real_total / budget:.2%}, "
-                f"max nc[i]={int(nc.max())}/{num_candidates})"
-            )
+            if step < _REPLAY_LOG_HEAD or (step + 1) % _REPLAY_LOG_EVERY == 0:
+                nc = batch.num_candidates
+                real_total = int(nc.sum())
+                budget = nc.shape[0] * num_candidates
+                logger.info(
+                    f"[Replay] step {step + 1} (pos {pos}, {batches_per_step} file(s)): "
+                    f"sum(num_candidates)={real_total}, "
+                    f"NRO budget={budget} (fill={real_total / budget:.2%}, "
+                    f"max nc[i]={int(nc.max())}/{num_candidates})"
+                )
             yield batch
     finally:
         if pool is not None:
