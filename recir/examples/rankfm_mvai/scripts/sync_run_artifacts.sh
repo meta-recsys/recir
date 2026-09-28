@@ -49,7 +49,16 @@ export HTTPS_PROXY="${HTTPS_PROXY:-http://fwdproxy:8080}"
 GCS_BUCKET="gs://cq-mrs-core-shared_mrs_tpu_y317h"
 TRACE_SRC="${GCS_BUCKET}/tpu-profiles/${JS}"
 TB_SRC="${GCS_BUCKET}/tensorboard/${JS}"
-CKPT_SRC="${GCS_BUCKET}/checkpoints/${JS}"
+# Two prefixes because two launchers write to different ones: the hand-written
+# manifests set MVAI_CHECKPOINT_SAVE_DIR=/mnt/gcs-out/checkpoints, while
+# mvai-cloud's JobSet template uses .../checkpoints-encrypted (and turns
+# TORCH_ENABLE_BARNFS on, which is what makes them encrypted). Probing both
+# means this keeps working for either, and for a run submitted before the
+# launch_configs migration. Whichever holds the run is used; a run cannot be in both.
+CKPT_SRC_CANDIDATES=(
+    "${GCS_BUCKET}/checkpoints-encrypted/${JS}"
+    "${GCS_BUCKET}/checkpoints/${JS}"
+)
 
 CKPT_INDEX_PY="$(dirname "${BASH_SOURCE[0]}")/checkpoint_index.py"
 
@@ -130,11 +139,29 @@ sync_checkpoints() {
     # the header: the checkpoints themselves stay in GCS.
     local tmp
     tmp=$(mktemp -d "/tmp/cksync-${JS}-XXXXXX")
-    local summary
-    if ! summary=$(python3 "${CKPT_INDEX_PY}" --gcs-prefix "${CKPT_SRC}" --out-dir "${tmp}" 2>/dev/null); then
-        rm -rf "${tmp}"
+    local summary found=0 probe_err
+    # Keep each candidate's stderr. Discarding it made an auth failure or a
+    # transient GCS error on the RIGHT prefix look identical to "no checkpoint
+    # here yet", so the real error never reached the log.
+    probe_err=$(mktemp "/tmp/ckprobe-${JS}-XXXXXX")
+    for ckpt_src in "${CKPT_SRC_CANDIDATES[@]}"; do
+        # Fresh between attempts: a failed probe can leave partial output, and
+        # the next candidate's upload would carry it along.
+        rm -rf "${tmp}" && mkdir -p "${tmp}"
+        if summary=$(python3 "${CKPT_INDEX_PY}" --gcs-prefix "${ckpt_src}" --out-dir "${tmp}" 2>>"${probe_err}"); then
+            found=1
+            break
+        fi
+    done
+    if [ "${found}" -eq 0 ]; then
+        if [ -s "${probe_err}" ]; then
+            echo "  checkpoint probe failed on every prefix:" >&2
+            sed 's/^/    /' "${probe_err}" >&2
+        fi
+        rm -rf "${tmp}" "${probe_err}"
         return 1
     fi
+    rm -f "${probe_err}"
     manifold mkdirs "${TB_BUCKET}/${CKPT_BASE}" >/dev/null 2>&1 || true
     # --overwrite and --userData false for the same reasons as sync_tb: without
     # them the upload is a silent no-op / a hard rejection respectively.
@@ -202,5 +229,5 @@ echo "  checkpoints: ${CKPT_URL}"
 [ "${TRACE_DONE}" -eq 0 ] && echo "  trace      : never appeared (profile window not reached?)"
 echo "  gcs tb     : ${TB_SRC}"
 echo "  gcs trace  : ${TRACE_SRC}"
-echo "  gcs ckpts  : ${CKPT_SRC}"
+echo "  gcs ckpts  : ${CKPT_SRC_CANDIDATES[*]}"
 echo "================================================================"

@@ -58,16 +58,32 @@ HTTPS_PROXY=http://fwdproxy:8080 \
     gcloud container clusters get-credentials tpu-prod-training-cluster \
     --region us-central1 --project mrs-tpu-y317h
 
-# --- Every session ---
-cd ~/local/fbsource/fbcode
-source recir/examples/rankfm_mvai/scripts/helpers.sh   # defines rankfm_mvai_*, exports CTX
+# --- One-time, for the launcher ---
+cd ~/fbsource/fbcode/mvai_cloud && bash scripts/dev-setup.sh
 
 # --- Kick off training ---
-rankfm_mvai_iterate    # build_image_podman.sh -> kubectl create -> tail rank 0
+cd ~/fbsource/fbcode
+mvai-cloud run --hardware tpu-v7 -j 16x8 --launch-config rankfm-prod
 ```
 
-`rankfm_mvai_iterate` defaults to the 128-chip yaml; pass any other yaml as `$1`
-(e.g. `rankfm_mvai_iterate recir/examples/rankfm_mvai/manifests/rankfm_mvai-4chip.yaml`).
+That one command exports prod's config, builds and pushes a per-job image,
+renders the JobSet and submits it. `-j 32x8` for 128 chips; `--dry-run` to see
+what it would submit. Flags after `--` override the launch config's.
+
+### The manifest path
+
+The `manifests/*.yaml` still work, and the 4-chip ones are only reachable that
+way:
+
+```bash
+source recir/examples/rankfm_mvai/scripts/helpers.sh   # rankfm_mvai_*, exports CTX
+rankfm_mvai_iterate recir/examples/rankfm_mvai/manifests/rankfm_mvai-4chip.yaml
+```
+
+For 64 and 128 chips prefer the launcher: the manifests pull the shared
+`:prod` image tag and the cluster-wide `rankfm-prod-cfg` ConfigMap, both
+last-writer-wins across everyone on this cluster, and neither records the
+revision it came from.
 
 ## Build the image manually
 
@@ -143,19 +159,32 @@ the real model size that produces both artifacts, use
 `docs/RUNBOOK_SYNTHETIC_4CHIP.md`) or `rankfm_mvai-verify-4chip.yaml` (prod
 replay dump). `docs/RUNBOOK_RUNNING_JOBS.md` covers the choice between them.
 
-### Run on a 128-chip TPU slice
+### Run on a 64- or 128-chip TPU slice
+
+The production runs are not manifests. They are the `rankfm-prod` launch config in
+`launch_configs.py`, launched with `mvai-cloud`, which builds and pushes a per-job
+image, exports prod's config into it, and submits:
 
 ```bash
-kubectl create -f recir/examples/rankfm_mvai/manifests/rankfm_mvai-128chip.yaml \
-  --context=mrs-tpu-y317h/us-central1/tpu-prod-training-cluster
+~/fbsource/fbcode/mvai_cloud/.venv/bin/mvai-cloud run \
+    --hardware tpu-v7 -j 16x8 --launch-config rankfm-prod
 ```
 
-Use `kubectl create` (not `apply`) — the JobSet YAML uses `generateName` so each
-invocation spawns a new run with an auto-suffixed name (e.g.
-`rankfm-mvai-4chip-abc12`). The 128-chip yaml pulls training batches from a
-barnfs dataporter dump mounted via the `barnfs.csi.meta.com` CSI driver at
-`/mnt/barnfs`, and writes profiles to
-`gs://mrs-tpu-y317h/tpu-profiles/${JOBSET_NAME}`.
+`-j 16x8` is 64 chips, `-j 32x8` is 128; the launch config derives the local batch
+size from the host count so the global batch is the same either way. It pulls
+training batches from a barnfs dataporter dump mounted via the
+`barnfs.csi.meta.com` CSI driver at `/mnt/barnfs`, and writes profiles under
+`gs://cq-mrs-core-shared_mrs_tpu_y317h/tpu-profiles/`.
+
+Set `mvai-cloud` up once with
+`cd ~/fbsource/fbcode/mvai_cloud && bash scripts/dev-setup.sh`. Full detail in
+`docs/RUNBOOK_128CHIP_PROD_CONFIG.md`.
+
+The manifests are submitted with `kubectl create` (not `apply`) -- their JobSet
+YAML uses `generateName`, so each invocation spawns a new run with an
+auto-suffixed name (e.g. `rankfm-mvai-4chip-abc12`).
+`rankfm_mvai-64chip.yaml` and `-128chip.yaml` still run, and are the reference
+the launch config is audited against.
 
 ## Bash helpers (submit / monitor / iterate loop)
 

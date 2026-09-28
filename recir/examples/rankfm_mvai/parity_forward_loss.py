@@ -6,7 +6,7 @@
 
 Both cells start from the same seeded model and consume the same replay batches.
 The model shape, precision, embedding backend, optimizer configuration, and static
-shape settings match ``rankfm_mvai-64chip.yaml``; only execution differs.
+shape settings match the ``rankfm-prod`` launch config; only execution differs.
 
 Required environment:
     PARITY_DEVICE=tpu

@@ -103,7 +103,7 @@ absent from it is a partial write.
 ## 6. TensorBoard in a browser
 
 ```bash
-nohup bash recir/examples/rankfm_mvai/scripts/sync_run_artifacts.sh $JS \
+setsid nohup bash recir/examples/rankfm_mvai/scripts/sync_run_artifacts.sh $JS \
     --interval 180 > /tmp/sync-$JS.log 2>&1 &
 ```
 
@@ -124,7 +124,9 @@ None of these names its own cause.
 declared here: ['use_rms_norm']`** — only reachable if you add
 `--prod_faithful`. The exported artifact is pinned to the hammer revision it
 was exported against. Re-export it and publish under a *new* ConfigMap name;
-overwriting `rankfm-prod-cfg` can change the config under a running job.
+overwriting `rankfm-prod-cfg` can change the config under a running job -- six
+manifests mount it. A `mvai-cloud run` is not exposed to this: it bakes the
+artifact into its own image.
 
 **`GeneratedBackwardFor_recir_split_2d_jagged_default returned an invalid
 gradient`** — `--seq_ro_per_sample_budget` exceeded `--max_uih_seq_len`. Config
