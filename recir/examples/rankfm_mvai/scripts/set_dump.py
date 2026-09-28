@@ -17,8 +17,10 @@ every manifest's ``sourcePath``, and rewrites the light leg's replay provider in
         --manifold manifold://mrs_recsys_gcp/tree/czheo_test/udd_fm_3d_20260824 \\
         --gcs 'gs://mrs-tpu-y317h/czheo_test/udd_fm_3d_20260824/dataporter_2:prod:dataporter:xdb.mwfs_orchestration_prod:4070:467780:v0/'
 
-The manifests keep a literal ``sourcePath`` rather than reading a variable,
-because they have to stay directly submittable with ``kubectl create -f``. The
+The remaining manifests keep a literal ``sourcePath`` rather than reading a
+variable, because they have to stay directly submittable with ``kubectl create
+-f``. (The production runs no longer do: they are ``launch_configs.py``, launched with
+``mvai-cloud run --launch-config``, and take the path from ``dump.py`` directly.) The
 light leg's provider keeps literals for a different reason: its XAR is built
 from the overlays in ``blue_reels_vdd/standalone/common_deps.sh``, which have no
 recir, so importing ``dump.py`` there is a ModuleNotFoundError on every trainer
@@ -28,8 +30,9 @@ incompletely. The shape is read rather than typed for the same reason -- a
 rotation that changes the rank count silently invalidates every comment and doc
 quoting the old one.
 
-    --check   verify dump.py, the manifests and the light provider agree, write
-              nothing, exit non-zero on drift. Takes no paths; suitable for CI.
+    --check   verify dump.py, the manifests, the light provider and the
+              launch_configs agree, write nothing, exit non-zero on drift. Takes no
+              paths; suitable for CI.
 
 Stdlib only, so it runs under plain python3 with no buck target.
 """
@@ -37,6 +40,7 @@ Stdlib only, so it runs under plain python3 with no buck target.
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import re
 import subprocess
@@ -60,6 +64,14 @@ _MANIFOLD_IN_YAML = re.compile(r"manifold://mrs_recsys_gcp/tree/[A-Za-z0-9_/]+")
 _GCS_RE = re.compile(
     r"^gs://(?P<bucket>[^/]+)/(?P<prefix>.+?)/(?P<dump>[^/]+)/(?P<xfer>dataporter_2:[^/]+)/?$"
 )
+
+
+def _load_dump_constants() -> dict[str, object]:
+    """Read dump.py without importing the package (no buck target needed)."""
+    ns: dict[str, object] = {}
+    exec(compile(_DUMP_PY.read_text(), "dump.py", "exec"), ns)
+    return ns
+
 
 # Manifests whose --max_steps means "one pass over the dump", so it has to be
 # re-derived on a rotation. Every other manifest sets --max_steps as a
@@ -108,13 +120,6 @@ def _epoch_steps(text: str, total_rows: int, name: str) -> int:
             f"of {global_batch}-row global batches"
         )
     return total_rows // global_batch
-
-
-def _load_dump_constants() -> dict[str, object]:
-    """Read dump.py without importing the package (no buck target needed)."""
-    ns: dict[str, object] = {}
-    exec(compile(_DUMP_PY.read_text(), "dump.py", "exec"), ns)
-    return ns
 
 
 def _const_int(consts: dict[str, object], name: str) -> int:
@@ -177,11 +182,12 @@ def _plan_manifests(
 ) -> list[tuple[Path, str]]:
     """Each manifest that needs rewriting, with its new text. Writes nothing.
 
-    ``_epoch_steps`` refuses rather than guesses, and a manifest it cannot read
-    a global batch out of is only discovered here. Planning every file before
-    any is written is what keeps that refusal from landing halfway through a
-    rotation -- a half-applied one is the state this whole script exists to
-    prevent.
+    The epoch manifests still have their ``--max_steps`` re-derived here.
+    ``launch_configs.py`` derives the same number from ``dump.py`` at launch
+    time, and ``_do_check`` asserts the two agree -- the manifests and the
+    launch configs are two live paths to the same run, so a rotation that
+    moved one and not the other is exactly the drift this script exists to
+    catch.
     """
     planned = []
     for path in sorted((_PKG / "manifests").glob("*.yaml")):
@@ -204,6 +210,18 @@ def _plan_replay_provider(manifold_root: str, batch_size: int) -> str | None:
     return None if updated == original else updated
 
 
+def _load_launch_configs():
+    """``launch_configs.py`` loaded by path, the same way ``mvai-cloud`` loads it."""
+    path = _PKG / "launch_configs.py"
+    spec = importlib.util.spec_from_file_location("rankfm_mvai_launch_configs", path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"cannot load launch configs from {path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
 def _do_check() -> int:
     d = _load_dump_constants()
     problems: list[str] = []
@@ -215,6 +233,30 @@ def _do_check() -> int:
     )
     stale = _plan_manifests(str(d["GCS_ROOT"]), str(d["MANIFOLD_ROOT"]), total_rows)
     problems += [f"manifest out of date with dump.py: {p.name}" for p, _ in stale]
+
+    # The epoch manifests and the launch configs are two live paths to the same
+    # run. Both derive their step count from this dump, by different means -- a
+    # regex over the yaml, and arithmetic in launch_configs.py -- so check they
+    # land on the same number. A rotation that moved one and not the other is
+    # the drift this script exists to catch, and it would otherwise show up as
+    # two runs that quietly train for different lengths.
+    launch_configs = _load_launch_configs()
+    epoch_manifest = _PKG / "manifests" / "rankfm_mvai-64chip.yaml"
+    for name, config in sorted(launch_configs.LAUNCH_CONFIGS.items()):
+        try:
+            resolved = config.resolve(hosts=16, job_name="check")
+        except ValueError as error:
+            problems.append(f"launch config {name} does not fit the dump: {error}")
+            continue
+        if name == "rankfm-prod" and epoch_manifest.is_file():
+            steps = _epoch_steps(
+                epoch_manifest.read_text(), total_rows, epoch_manifest.name
+            )
+            if steps != resolved.max_steps:
+                problems.append(
+                    f"launch config {name} says --max_steps "
+                    f"{resolved.max_steps}, {epoch_manifest.name} says {steps}"
+                )
 
     if (
         _plan_replay_provider(str(d["MANIFOLD_ROOT"]), _const_int(d, "BATCH_SIZE"))
@@ -309,9 +351,9 @@ def main() -> int:
     replay = _plan_replay_provider(manifold_root, int(meta["batch_size"]))
 
     # Nothing above this line has written anything. Every rewrite is derived
-    # first so that a refusal -- an epoch manifest with no single global batch,
-    # a renamed constant -- aborts with the tree untouched instead of leaving
-    # dump.py pointed at the new dump and some manifests still at the old one.
+    # first so that a refusal -- a renamed constant, an unreadable manifest --
+    # aborts with the tree untouched instead of leaving dump.py pointed at the
+    # new dump and some manifests still at the old one.
     _DUMP_PY.write_text(src)
     print(f"dump.py -> {dump_name} {dict(meta)}")
 

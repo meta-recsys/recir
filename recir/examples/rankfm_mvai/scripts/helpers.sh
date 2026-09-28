@@ -37,7 +37,10 @@ _RANKFM_MVAI_FBCODE_ROOT="$(cd "${_RANKFM_MVAI_PKG_DIR}/../../.." && pwd)"
 # shellcheck source=/dev/null
 source "${_RANKFM_MVAI_FBCODE_ROOT}/recir/utils/gke_helpers.sh"
 
-_GKE_DEFAULT_YAML="${_RANKFM_MVAI_PKG_DIR}/manifests/rankfm_mvai-128chip.yaml"
+# The production runs are no longer manifests -- they are `mvai-cloud run
+# --launch-config rankfm-prod`. The default here is the 4-chip verify run, which is
+# the largest thing left that a bare `rankfm_mvai_submit` should reach for.
+_GKE_DEFAULT_YAML="${_RANKFM_MVAI_PKG_DIR}/manifests/rankfm_mvai-verify-4chip.yaml"
 _GKE_FBCODE_ROOT="$_RANKFM_MVAI_FBCODE_ROOT"
 _GKE_BUILD_SCRIPT="${_RANKFM_MVAI_HELPERS_DIR}/build_image_podman.sh"
 _GKE_LOG_DIR="/tmp/ranklogs"
@@ -71,14 +74,17 @@ _gke_summarize_line() {
 }
 
 # Resolve a yaml arg: if it is a bare name (not an existing path), look for it
-# next to this helpers.sh (the rankfm_mvai dir, where the *.yaml live). This lets
-# callers pass just the filename, e.g. `rankfm_mvai_submit rankfm_mvai-helion-4chip.yaml`,
-# regardless of CWD. An empty arg or an existing path is passed through unchanged
-# (gke_submit/gke_iterate then apply the absolute _GKE_DEFAULT_YAML default).
+# in manifests/. This lets callers pass just the filename, e.g.
+# `rankfm_mvai_submit rankfm_mvai-verify-4chip.yaml`, regardless of CWD. An
+# empty arg or an existing path is passed through unchanged (gke_submit /
+# gke_iterate then apply the absolute _GKE_DEFAULT_YAML default).
+#
+# This used to probe the scripts/ dir, where no manifest has ever lived, so a
+# bare name fell through to gke_submit and failed with "Yaml not found".
 _rankfm_mvai_yaml() {
     local y="$1"
-    if [ -n "$y" ] && [ ! -f "$y" ] && [ -f "${_RANKFM_MVAI_HELPERS_DIR}/${y}" ]; then
-        echo "${_RANKFM_MVAI_HELPERS_DIR}/${y}"
+    if [ -n "$y" ] && [ ! -f "$y" ] && [ -f "${_RANKFM_MVAI_PKG_DIR}/manifests/${y}" ]; then
+        echo "${_RANKFM_MVAI_PKG_DIR}/manifests/${y}"
     else
         echo "$y"
     fi

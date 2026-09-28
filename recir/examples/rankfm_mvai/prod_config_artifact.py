@@ -545,13 +545,25 @@ def build_prod_config_live(for_parity: bool = False) -> Tuple[Any, Any]:
     return module_config, prod_config.feature_config
 
 
-def export_prod_config(out_path: str, for_parity: bool = False) -> None:
+def export_prod_config(
+    out_path: str,
+    for_parity: bool = False,
+    source_revision: str = "",
+    source_dirty: bool = False,
+) -> None:
     """Build prod's config here, convert it to the CLOUD config, and write it.
     Devserver only -- this is the side that needs the full //minimal_viable_ai.
 
     ``for_parity`` must match what :func:`build_prod_config_live` is called
     with everywhere else: the artifact is only useful if it rebuilds the same
     model the live path would, and a round-trip test pins that.
+
+    ``source_revision`` / ``source_dirty`` describe the working copy the
+    config was built from. They are optional so a hand-run export still works,
+    but the image build always passes them: the exporter reads the WORKING
+    TREE through buck, so an artifact built from uncommitted edits otherwise
+    describes a model that exists in no revision. ``load_prod_config`` logs the
+    whole provenance dict, so a pod says which tree it came from.
     """
     module_config, _feature_config = build_prod_config_live(for_parity=for_parity)
     optimizer_config = _load_prod_optimizer_config()
@@ -560,24 +572,30 @@ def export_prod_config(out_path: str, for_parity: bool = False) -> None:
         name: _table_to_dict(table)
         for name, table in module_config.embedding_tables.items()
     }
+    provenance: Dict[str, Any] = {
+        # The seq len is baked into the config, so record which one this
+        # artifact represents -- a mismatch against the dump is silent.
+        "hstu_max_seq_len": module_config.hstu_max_seq_len,
+        "num_tables": len(tables),
+        "for_parity": for_parity,
+    }
+    if source_revision:
+        provenance["source_revision"] = source_revision
+        provenance["source_dirty"] = source_dirty
     payload: Dict[str, Any] = {
         "version": ARTIFACT_VERSION,
         "module_config": _encode_module_config(module_config),
         "optimizer_config": _encode(optimizer_config, "optimizer_config"),
         "embedding_tables": tables,
         "feature_config_fields": _feature_config_primitives(_feature_config),
-        "provenance": {
-            # The seq len is baked into the config, so record which one this
-            # artifact represents -- a mismatch against the dump is silent.
-            "hstu_max_seq_len": module_config.hstu_max_seq_len,
-            "num_tables": len(tables),
-        },
+        "provenance": provenance,
     }
     torch.save(payload, out_path)
     logger.info(
         f"wrote cloud config artifact to {out_path} "
         f"({len(tables)} embedding tables, "
-        f"hstu_max_seq_len={module_config.hstu_max_seq_len})"
+        f"hstu_max_seq_len={module_config.hstu_max_seq_len}, "
+        f"provenance={provenance})"
     )
 
 
@@ -663,5 +681,22 @@ def main() -> None:
         "comparison uses (shorter sequence length, tighter hash cap) rather "
         "than prod's own values.",
     )
+    parser.add_argument(
+        "--source-revision",
+        default="",
+        help="Working-copy revision the config was built from, recorded in "
+        "the artifact's provenance. The image build passes this; omit it for "
+        "a hand-run export.",
+    )
+    parser.add_argument(
+        "--source-dirty",
+        action="store_true",
+        help="Record that the working copy had uncommitted changes.",
+    )
     args = parser.parse_args()
-    export_prod_config(args.out, for_parity=args.parity)
+    export_prod_config(
+        args.out,
+        for_parity=args.parity,
+        source_revision=args.source_revision,
+        source_dirty=args.source_dirty,
+    )

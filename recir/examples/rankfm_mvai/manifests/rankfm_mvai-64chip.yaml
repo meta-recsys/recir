@@ -124,8 +124,8 @@ spec:
                 value: "1"
               # Route HSTU attention to the recir Helion kernels. Requires SLA off,
               # which prod_config_shim already does at the config layer.
-              - name: RANKFM_MVAI_USE_HELION
-                value: "1"
+              - name: RANKFM_MVAI_ATTENTION_BACKEND
+                value: "helion"
               - name: JAX_ENABLE_X64
                 value: "1"
               # Which op builds the 82.52GiB f32[65,332800,128,8]? The XLA memory

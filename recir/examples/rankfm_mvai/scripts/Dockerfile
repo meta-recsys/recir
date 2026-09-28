@@ -9,6 +9,7 @@
 #   <context>/minimal_viable_ai/         (rsynced from fbsource/fbcode/mvai_cloud/minimal_viable_ai)
 #   <context>/mvai_cloud/                 (TPU job runtime helpers)
 #   <context>/mrs/ + <context>/hpc/      (trimmed dense_sparse DCN subset)
+#   <context>/prod_config/              (exported prod config; empty under SKIP_PROD_CONFIG=1)
 #
 # build_image_podman.sh stages this context for you.
 
@@ -122,6 +123,18 @@ COPY mvai_cloud /app/mvai_cloud
 # True). NOT the full mrs/hpc trees (those pull torchrec.fb / hpc.new chains).
 COPY mrs /app/mrs
 COPY hpc /app/hpc
+
+# Prod's xsurface config, exported on the devserver under buck (the image has
+# no //minimal_viable_ai to build it from) and staged by
+# build_image_podman.sh. The directory is EMPTY when that ran with
+# SKIP_PROD_CONFIG=1 -- COPY cannot be conditional, same as barnfs_wheel above.
+#
+# PROD_CONFIG_ARTIFACT is deliberately NOT set here. artifact_path() raises
+# when the variable is set and the file is missing, so baking it in would make
+# every SKIP_PROD_CONFIG image unusable. The launcher sets it per run, which is
+# where the --prod_faithful decision belongs anyway. Path constant lives in
+# recir/examples/rankfm_mvai/prod_config_spec.py.
+COPY prod_config /app/prod_config
 
 # Native BarnFS wheel dependencies absent from python:3.12-slim.
 # apt ignores the uppercase HTTP_PROXY that pip honors, so on a devserver it

@@ -19,6 +19,14 @@ RECIR_DIR="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 FBCODE_DIR="$(cd "${RECIR_DIR}/.." && pwd)"
 STAGING_DIR="$(mktemp -d)"
 
+# Installed before anything stages into it, so the barnfs and prod-config steps
+# below -- both of which shell out to buck2 and can fail -- do not leak the
+# temp tree.
+cleanup_staging() {
+    rm -rf "$STAGING_DIR"
+}
+trap cleanup_staging EXIT
+
 # Validate prerequisites
 for cmd in buck2 podman rsync gcloud; do
     if ! command -v "$cmd" > /dev/null 2>&1; then
@@ -74,6 +82,71 @@ else
     fi
     cp "$BARNFS_WHEEL" "$BARNFS_STAGE/"
 fi
+
+echo "--- Exporting prod config artifact ---"
+# Prod's config cannot be built inside the image: //minimal_viable_ai is not
+# staged into it. So it is exported here, on the devserver under buck, and
+# baked in -- config._load_prod_module_config reads the artifact when
+# PROD_CONFIG_ARTIFACT points at it.
+#
+# Baked rather than mounted as a ConfigMap on purpose. The ConfigMap
+# (rankfm-prod-cfg) is a single cluster-wide object shared with the parity
+# manifests, which want a DIFFERENT artifact -- whoever submits last wins, and
+# the loser gets a run built from someone else's config with no indication.
+# An artifact inside the image cannot be overwritten by another submit.
+#
+# The env var is deliberately NOT set in the Dockerfile: artifact_path() raises
+# if PROD_CONFIG_ARTIFACT is set and the file is missing, so a SKIP_PROD_CONFIG
+# image would be unusable. The launcher sets it per run, which is also where
+# the --prod_faithful decision belongs.
+#
+#   PROD_CONFIG_ARTIFACT_SRC=<path>  reuse an existing export, skip buck2
+#   SKIP_PROD_CONFIG=1               omit it; correct for synthetic and bench
+#                                    jobs, which never read it
+#
+# The "prod_config" directory and "prod_cfg.pt" filename below are duplicated
+# from PROD_CONFIG_STAGE_DIR / PROD_CONFIG_ARTIFACT_FILENAME in
+# recir/examples/rankfm_mvai/prod_config_spec.py -- bash cannot import it, and
+# the Dockerfile's COPY repeats them again. tests/test_prod_config_spec.py
+# asserts all three agree, so a rename fails a test rather than being found by
+# grep.
+PROD_CFG_STAGE="${STAGING_DIR}/prod_config"
+mkdir -p "$PROD_CFG_STAGE"
+PROD_CONFIG_INCLUDED=true
+PROD_CONFIG_REV=""
+if [ "${SKIP_PROD_CONFIG:-0}" = "1" ]; then
+    PROD_CONFIG_INCLUDED=false
+    echo "SKIP_PROD_CONFIG=1: building without the prod config artifact."
+    echo "  --prod_faithful against this image will fail to find it."
+elif [ -n "${PROD_CONFIG_ARTIFACT_SRC:-}" ]; then
+    if [ ! -f "$PROD_CONFIG_ARTIFACT_SRC" ]; then
+        echo "ERROR: PROD_CONFIG_ARTIFACT_SRC=$PROD_CONFIG_ARTIFACT_SRC does not exist" >&2
+        exit 1
+    fi
+    echo "using the artifact from PROD_CONFIG_ARTIFACT_SRC: $PROD_CONFIG_ARTIFACT_SRC"
+    cp "$PROD_CONFIG_ARTIFACT_SRC" "$PROD_CFG_STAGE/prod_cfg.pt"
+else
+    PROD_CONFIG_REV="$(sl --cwd "$FBCODE_DIR" id -i 2>/dev/null)" || PROD_CONFIG_REV=""
+    PROD_CONFIG_REV="${PROD_CONFIG_REV:-unknown}"
+    PROD_CFG_DIRTY_ARG=""
+    if [ -n "$(sl --cwd "$FBCODE_DIR" status -n minimal_viable_ai hammer 2>/dev/null)" ]; then
+        PROD_CFG_DIRTY_ARG="--source-dirty"
+    fi
+    if ! (
+        cd "$FBCODE_DIR"
+        buck2 run //recir/examples/rankfm_mvai:export_prod_config -- \
+            --out "${PROD_CFG_STAGE}/prod_cfg.pt" \
+            --source-revision "$PROD_CONFIG_REV" \
+            ${PROD_CFG_DIRTY_ARG}
+    ); then
+        echo "ERROR: could not export prod's config." >&2
+        echo "  Reuse an earlier export:" >&2
+        echo "    PROD_CONFIG_ARTIFACT_SRC=/tmp/prod_cfg.pt $0" >&2
+        echo "  Or omit it, which is correct for synthetic and bench jobs:" >&2
+        echo "    SKIP_PROD_CONFIG=1 $0" >&2
+        exit 1
+    fi
+fi
 for dir in /var/facebook/x509_identities /var/facebook/credentials; do
     if [ ! -d "$dir" ]; then
         echo "Error: $dir not found." >&2
@@ -92,11 +165,6 @@ export NO_PROXY=localhost,127.0.0.1,.fbcdn.net,.facebook.com,.tfbnw.net
 export https_proxy="${HTTPS_PROXY}"
 export http_proxy="${HTTP_PROXY}"
 export no_proxy="${NO_PROXY}"
-
-cleanup_staging() {
-    rm -rf "$STAGING_DIR"
-}
-trap cleanup_staging EXIT
 
 echo "Staging build context..."
 RSYNC_EXCLUDES=(
@@ -246,6 +314,8 @@ BUILD_REV="$BUILD_REV" \
 BUILD_DIRTY="$BUILD_DIRTY" \
 BUILD_TAG="$IMAGE_TAG" \
 BUILD_BARNFS="$BARNFS_INCLUDED" \
+BUILD_PROD_CONFIG="$PROD_CONFIG_INCLUDED" \
+BUILD_PROD_CONFIG_REV="$PROD_CONFIG_REV" \
 BUILD_OUT="${STAGING_DIR}/recir/BUILD_INFO.json" \
 python3 -c '
 import datetime, json, os
@@ -262,6 +332,8 @@ with open(os.environ["BUILD_OUT"], "w") as f:
             "built_by": os.environ.get("USER", "unknown"),
             "dirty_files": dirty,
             "barnfs": os.environ["BUILD_BARNFS"] == "true",
+            "prod_config": os.environ["BUILD_PROD_CONFIG"] == "true",
+            "prod_config_revision": os.environ["BUILD_PROD_CONFIG_REV"],
         },
         f,
         indent=2,
@@ -330,6 +402,44 @@ else:
     raise SystemExit('barnfs is importable in an image built with SKIP_BARNFS=1')
 "
 fi
+
+# The artifact describes the model every --prod_faithful run builds, and until
+# now nothing checked it: an export that picked up a parity or replay shim
+# carries a different sequence length and produces a run whose numbers are
+# quietly not prod's. The runbook says to eyeball the exporter's output for
+# 3554; assert it at build time instead.
+if [ "$PROD_CONFIG_INCLUDED" = true ]; then
+    PROD_CONFIG_CHECK="
+from recir.examples.rankfm_mvai.prod_config_spec import (
+    PROD_CONFIG_ARTIFACT_CONTAINER_PATH,
+    PROD_CONFIG_EXPECTED_SEQ_LEN,
+)
+from recir.examples.rankfm_mvai.prod_config_artifact import load_prod_config
+_mc, _fc = load_prod_config(PROD_CONFIG_ARTIFACT_CONTAINER_PATH)
+if _mc.hstu_max_seq_len != PROD_CONFIG_EXPECTED_SEQ_LEN:
+    raise SystemExit(
+        f'prod config artifact has hstu_max_seq_len={_mc.hstu_max_seq_len}, '
+        f'expected {PROD_CONFIG_EXPECTED_SEQ_LEN}. The export picked up a '
+        f'parity or replay shim, so it describes a different model than '
+        f'production.'
+    )
+print(f'prod config artifact: OK ({len(_mc.embedding_tables)} tables, '
+      f'hstu_max_seq_len={_mc.hstu_max_seq_len})')
+"
+else
+    PROD_CONFIG_CHECK="
+import os
+from recir.examples.rankfm_mvai.prod_config_spec import (
+    PROD_CONFIG_ARTIFACT_CONTAINER_PATH,
+)
+if os.path.exists(PROD_CONFIG_ARTIFACT_CONTAINER_PATH):
+    raise SystemExit(
+        'a prod config artifact is present in an image built with '
+        'SKIP_PROD_CONFIG=1'
+    )
+print('prod config artifact: absent, as built (SKIP_PROD_CONFIG=1)')
+"
+fi
 podman run --rm \
     -e TORCH_ENABLE_BARNFS=ON \
     -e MODEL_TYPE_NAME=asset://ai.model.type/infra_mrs_research \
@@ -361,6 +471,7 @@ print('torchrec.distributed: OK')
 import hammer.v3; print('hammer.v3: OK')
 import minimal_viable_ai; print('minimal_viable_ai: OK')
 import mvai_cloud.gke.runtime.tensorboard_uploader; print('mvai_cloud runtime: OK')
+import mvai_cloud.gke.runtime.pod_diagnostics; print('mvai_cloud pod_diagnostics: OK')
 from minimal_viable_ai.core.trainer.trainer import RecTrainer  # noqa: F401
 print('minimal_viable_ai.RecTrainer: OK')
 from generative_recommenders.common import HammerKernel; print('generative_recommenders: OK')
@@ -375,6 +486,7 @@ print('rankfm_mvai.train entry import: OK')
 # missing staged dep fails the BUILD here, not at parity run time.
 import recir.examples.rankfm_mvai.parity_forward_loss  # noqa: F401
 print('rankfm_mvai.parity_forward_loss import: OK')
+${PROD_CONFIG_CHECK}
 print()
 print('All imports OK!')
 "
