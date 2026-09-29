@@ -22,11 +22,12 @@ Covers the four things that can break silently:
    byte-for-byte, so ``parity_forward_loss``'s eager cell stays a valid reference.
 """
 
+from unittest import TestCase
+
 import hammer.v2.ops.hstu_preprocess_and_attention as hpa
 import recir.ops.helion_hstu_attention_op as hop
 import torch
 from functorch import make_fx
-from later.unittest import TestCase
 from recir.ops.helion.jagged_hstu_attention import (
     clear_traced_sigs,
     get_traced_bwd_sigs,

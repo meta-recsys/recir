@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-# (c) Meta Platforms, Inc. and affiliates. Confidential and proprietary.
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-3-Clause license found in the
+# LICENSE file in the root directory of this source tree.
 
 
 """Tests for splitting an EmbeddingCollection by per-table placement.
@@ -12,9 +16,9 @@ invariants the split relies on, not just that it runs.
 """
 
 from dataclasses import dataclass
+from unittest import TestCase
 
 import torch
-from later.unittest import TestCase
 from recir.embedding.split_collection import (
     assert_replicated_half_is_unplanned,
     partition_by_sharding,

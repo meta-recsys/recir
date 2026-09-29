@@ -4,9 +4,6 @@
 # This source code is licensed under the BSD-3-Clause license found in the
 # LICENSE file in the root directory of this source tree.
 
-# (c) Meta Platforms, Inc. and affiliates. Confidential and proprietary.
-
-
 """Shared DLRMv3 model definitions and helpers for XLA and EC sharding tests."""
 
 from typing import Any, Dict, List, Optional, Tuple

@@ -4,8 +4,6 @@
 # This source code is licensed under the BSD-3-Clause license found in the
 # LICENSE file in the root directory of this source tree.
 
-# (c) Meta Platforms, Inc. and affiliates. Confidential and proprietary.
-
 # pyre-ignore-all-errors
 
 """Shared test utilities for GSPMD and shard_map XLA compilation tests.

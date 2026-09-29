@@ -2226,7 +2226,7 @@ def partition_data_parallel(
     """Partition the graph into a data parallel graph.
 
     Inputs are FQN-keyed dicts so callers without a live ``nn.Module`` (e.g.
-    a bundle-runtime consumer that loads safetensors at MAST start) can drive
+    a bundle-runtime consumer that loads safetensors at job start) can drive
     partitioning directly.  ``named_states`` maps each parameter FQN to its
     optimizer state dict; ``step`` may be an int scalar, a tensor, or ``None``
     depending on the optimizer flavor.

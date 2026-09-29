@@ -1,8 +1,13 @@
 #!/usr/bin/env python3
-# (c) Meta Platforms, Inc. and affiliates. Confidential and proprietary.
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-3-Clause license found in the
+# LICENSE file in the root directory of this source tree.
 
 
 from typing import cast
+from unittest import TestCase
 
 import torch
 import torch.nn as nn
@@ -14,7 +19,6 @@ from hammer.v3.modules.core.features.types import FeatureType
 from hammer.v3.modules.mot.features import InputActionFeatures, MetadataFeatures
 from hammer.v3.modules.mot.preprocessors.mot_preprocessor import MoTPreprocessor
 from hammer.v3.modules.recblock import _inputs_to_feature_bundle
-from later.unittest import TestCase
 from recir.ops.fake.mot_preprocessor import (
     patch_mot_preprocessor_for_tracing,
     TraceableMoTPreprocessor,

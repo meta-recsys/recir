@@ -338,7 +338,7 @@ class ParallelMode(ABC):
         Partition a single device graph to a distributed graph.
 
         Inputs are FQN-keyed dicts so callers without a live ``nn.Module``
-        (e.g. a bundle-runtime consumer that loads safetensors at MAST start)
+        (e.g. a bundle-runtime consumer that loads safetensors at job start)
         can drive partitioning directly.  ``named_states`` maps each parameter
         FQN to its optimizer state dict; ``step`` may be an int scalar, a
         tensor, or ``None`` depending on the optimizer flavor.
@@ -1168,7 +1168,7 @@ class DataParallel(ParallelMode):
     ) -> None:
         """Consume the trace-scoped plan produced by :meth:`shard_params`.
 
-        Reproduces D110785277's FSDP-on-XLA behavior via the typed
+        Reproduces the original FSDP-on-XLA behavior via the typed
         ``recir_state_layout`` spec: (1) tag each sharded weight/buffer and
         optimizer-state placeholder with an :class:`FSDPWeightShardSpec`, and
         (2) substitute the /P per-process store into ``params_and_buffers`` /

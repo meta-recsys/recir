@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-# (c) Meta Platforms, Inc. and affiliates. Confidential and proprietary.
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-3-Clause license found in the
+# LICENSE file in the root directory of this source tree.
 
 # pyre-strict
 
@@ -25,9 +29,9 @@ backward was not, which is why a difference in it could sit unnoticed.
 """
 
 from typing import cast
+from unittest import TestCase
 
 import torch
-from later.unittest import TestCase
 from pyre_extensions import none_throws
 from recir.torchax import tensor
 from torch._decomp.decompositions import native_layer_norm_backward as ref_bwd

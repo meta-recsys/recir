@@ -6,8 +6,7 @@
 
 """Workaround for JAX cuda12 plugin path lookup on Buck RE workers.
 
-After the 2026-05-14 buckification of `jax-cuda12-pjrt==0.8.0`
-(D105037371 / D105037374), the `xla_cuda_plugin.so` PJRT plugin shared
+After the 2026-05-14 buckification of `jax-cuda12-pjrt==0.8.0`, the `xla_cuda_plugin.so` PJRT plugin shared
 library is shipped as a `pypi_source_library` resource colocated with the
 SYMLINK of `jax_plugins/xla_cuda12/__init__.py` in the buck link-tree.
 

@@ -1,4 +1,8 @@
-# (c) Meta Platforms, Inc. and affiliates. Confidential and proprietary.
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-3-Clause license found in the
+# LICENSE file in the root directory of this source tree.
 
 """Standalone perf benchmark: TensorCore ring-shift vs SparseCore lookup (fwd).
 
@@ -8,7 +12,7 @@ shape, three non-pooling sharded embedding-lookup implementations:
   * ``ra2a``  -- TensorCore ``lax.ragged_all_to_all`` baseline.
   * ``fused`` -- TensorCore fused ring-shift Pallas kernel
                  (``ringshift_embedding_lookup``).
-  * ``sc``    -- the existing SparseCore solution (D108080994 / DLRMv3): the raw
+  * ``sc``    -- the existing SparseCore solution (DLRMv3): the raw
                  ``@SparseDenseMatmulOp`` custom call emitted by
                  ``recir.examples.dlrmv3.sparsecore_ops.sc_matmul_fwd`` (NOT jte's
                  ``tpu_sparse_dense_matmul`` primitive), in the non-pooling
@@ -258,7 +262,7 @@ def run_fwd_tc(mesh, cfg, tag) -> tuple[float, float]:
 
 
 # ---------------------------------------------------------------------------
-# SparseCore arm (the existing D108080994 / DLRMv3 solution).
+# SparseCore arm (the existing DLRMv3 solution).
 #
 # Compute = recir.examples.dlrmv3.sparsecore_ops.sc_matmul_fwd (the raw
 # @SparseDenseMatmulOp custom call), distributed via shard_map. jte is used ONLY
@@ -376,7 +380,7 @@ def _sc_make_global_csr(csr_inputs, mesh):
 
 
 def run_sc_fwd(cfg, tag) -> float:
-    """SparseCore forward perf via the D108080994 emission (``sc_matmul_fwd``).
+    """SparseCore forward perf via the DLRMv3 emission (``sc_matmul_fwd``).
 
     Compute uses ``recir.examples.dlrmv3.sparsecore_ops.sc_matmul_fwd`` (the raw
     ``@SparseDenseMatmulOp`` custom call) -- NOT jte's ``tpu_sparse_dense_matmul``

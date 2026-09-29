@@ -1,15 +1,19 @@
-# (c) Meta Platforms, Inc. and affiliates. Confidential and proprietary.
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-3-Clause license found in the
+# LICENSE file in the root directory of this source tree.
 
 # pyre-strict
 
 from types import SimpleNamespace
 from typing import Any
+from unittest import TestCase
 from unittest.mock import patch
 
 import jax.numpy as jnp
 import numpy as np
 from jax.sharding import PartitionSpec as P
-from later.unittest import TestCase
 from recir.torchax.gspmd_context import current_gspmd_mesh_context, gspmd_mesh_context
 from recir.torchax.ops import jseq_embedding
 

@@ -128,7 +128,7 @@ Compare medians of `ra2a` vs `fused` for the headline speedup.
 ## SparseCore vs TensorCore (forward)
 
 `ringshift_bench.py` can also benchmark the **existing SparseCore solution**
-(D108080994 / DLRMv3): the raw `@SparseDenseMatmulOp` custom call emitted by
+(DLRMv3): the raw `@SparseDenseMatmulOp` custom call emitted by
 `recir.examples.dlrmv3.sparsecore_ops.sc_matmul_fwd` (NOT jte's
 `tpu_sparse_dense_matmul` primitive), driven in the non-pooling "sequence token
 trick" mode (valency=1, one id per output row) and distributed across all cores

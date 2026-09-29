@@ -4,8 +4,6 @@
 # This source code is licensed under the BSD-3-Clause license found in the
 # LICENSE file in the root directory of this source tree.
 
-# (c) Meta Platforms, Inc. and affiliates. Confidential and proprietary.
-
 import os
 from contextlib import contextmanager
 
