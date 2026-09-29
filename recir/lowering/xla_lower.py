@@ -11,6 +11,7 @@ import functools
 import gc
 import logging
 import os
+import weakref
 from typing import Any, Callable, Generator, List, Optional, Tuple
 
 import jax  # @manual
@@ -115,6 +116,66 @@ def _cached_reshard(target: Any) -> Any:
         fn = jax.jit(lambda x: x, out_shardings=target)
         _RESHARD_JIT_CACHE[target] = fn
     return fn
+
+
+# index -> (weakref to the torch input, its _version, its data_ptr, device copy)
+_StateInputCache = dict[int, Tuple[Any, int, int, Any]]
+
+
+def _reuse_unchanged_state_input(
+    cache: _StateInputCache,
+    index: int,
+    tensor: Any,
+    is_batch_input: bool,
+    is_frozen_parameter: bool,
+    convert: Callable[[], Any],
+) -> Any:
+    """Return the cached device copy of an unchanged frozen parameter.
+
+    Frozen parameters are never outputs of the train step, so the device-state
+    fast path keeps handing their host tensors to every call and each call
+    re-uploads them (multi-GB per device for split-vocab embeddings). Cache only
+    parameters identified as frozen while tracing: mutable buffers and trainable
+    state may be changed through storage aliases that do not update ``_version``.
+    The identity, version, and storage checks provide additional invalidation for
+    ordinary PyTorch mutations. Donated inputs are deleted by the call and are
+    therefore always re-converted.
+    """
+    if (
+        not is_frozen_parameter
+        or is_batch_input
+        or not isinstance(tensor, torch.Tensor)
+        or tensor.is_meta
+        or tensor.requires_grad
+        or tensor.is_inference()
+        or _AOT_TOPOLOGY.get() is not None
+    ):
+        # A slot commonly transitions from its first-call host tensor to a JAX
+        # device-state output. Do not keep the superseded device buffer alive.
+        cache.pop(index, None)
+        return convert()
+    # Remove the entry before a miss conversion so a multi-GB stale buffer can
+    # be released before its replacement is allocated.
+    entry = cache.pop(index, None)
+    if entry is not None:
+        if (
+            entry[0]() is tensor
+            and entry[1] == tensor._version
+            and entry[2] == tensor.data_ptr()
+            and not entry[3].is_deleted()
+        ):
+            cache[index] = entry
+            return entry[3]
+    del entry
+    device_copy = convert()
+    if isinstance(device_copy, jax.Array):
+        cache[index] = (
+            weakref.ref(tensor),
+            tensor._version,
+            tensor.data_ptr(),
+            device_copy,
+        )
+    return device_copy
 
 
 @contextlib.contextmanager
@@ -319,6 +380,7 @@ class _XLAModule(torch.nn.Module):
         # Guard so RECIR_DUMP_GRAPHS dumps each subgraph's FX + XLA graph once.
         self._dumped_graphs: bool = False
         self._logged_memory_analysis: bool = False
+        self._state_input_cache: _StateInputCache = {}
 
     def _log_compiled_memory_analysis(self) -> None:
         if self._logged_memory_analysis or self._jax_compiled is None:
@@ -1118,6 +1180,9 @@ class _XLAModule(torch.nn.Module):
         is_batch: List[bool] = [
             n.meta.get("is_batch_input", False) for n in placeholders
         ]
+        is_frozen_parameter: List[bool] = [
+            n.meta.get("is_frozen_parameter", False) for n in placeholders
+        ]
         # Per-placeholder batch_dim. Without _propagate_batch_input_meta this
         # would be 0 for everything with the propagation pass, intermediate FX nodes
         # crossing graph breaks land here with their actual batch axis
@@ -1323,15 +1388,25 @@ class _XLAModule(torch.nn.Module):
                 )
             )
             jax_args = tuple(
-                self._to_sharded_jax(
+                _reuse_unchanged_state_input(
+                    self._state_input_cache,
+                    j,
                     a,
-                    runtime_mesh,
                     is_batch[j],
-                    per_input_batch_dim[j],
-                    is_fsdp_tensor=is_fsdp_sharded[j],
-                    batch_axis_resource=runtime_batch_axis_resource,
-                    fsdp_axis_name=_GSPMD_FSDP_AXIS,
-                    fsdp_host_shard_count=(fsdp_axis_size // len(_get_local_devices())),
+                    is_frozen_parameter[j],
+                    functools.partial(
+                        self._to_sharded_jax,
+                        a,
+                        runtime_mesh,
+                        is_batch[j],
+                        per_input_batch_dim[j],
+                        is_fsdp_tensor=is_fsdp_sharded[j],
+                        batch_axis_resource=runtime_batch_axis_resource,
+                        fsdp_axis_name=_GSPMD_FSDP_AXIS,
+                        fsdp_host_shard_count=(
+                            fsdp_axis_size // len(_get_local_devices())
+                        ),
+                    ),
                 )
                 for j, a in enumerate(run_args)
             )
