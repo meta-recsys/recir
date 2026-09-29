@@ -36,6 +36,19 @@ class _ToyModel(nn.Module):
         return self.linear(x).sum()
 
 
+class _FrozenStateModel(nn.Module):
+    running: torch.Tensor
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.frozen = nn.Parameter(torch.ones(4), requires_grad=False)
+        self.trainable = nn.Parameter(torch.ones(4))
+        self.register_buffer("running", torch.ones(4))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return ((self.frozen + self.trainable + self.running) * x).sum()
+
+
 def _toy_train_step(
     model: nn.Module, opt: torch.optim.Optimizer, x: torch.Tensor
 ) -> None:
@@ -83,6 +96,28 @@ class TraceReturnsGmAndFlatStateTest(unittest.TestCase):
         self.assertIsInstance(ctx, _TraceContext)
         self.assertIs(ctx.mod, model)
         self.assertEqual(ctx.opts, [opt])
+
+    def test_trace_and_compile_mark_only_frozen_parameters_as_cacheable(self) -> None:
+        model = _FrozenStateModel()
+        opt = torch.optim.SGD([model.trainable], lr=0.01, foreach=True)
+        x = torch.randn(4)
+
+        gm, flat_state = recir.trace(_toy_train_step, model, opt, x)
+        compiled = recir.compile_from_gm(
+            gm,
+            flat_state,
+            parallel_mode=_PassthroughParallel(),
+            backend=_NoopBackend(),
+        )
+        state_meta = {
+            node.meta.get("fqn"): node.meta.get("is_frozen_parameter", False)
+            for node in compiled.gm.graph.nodes
+            if node.op == "placeholder" and node.meta.get("fqn") is not None
+        }
+
+        self.assertTrue(state_meta["frozen"])
+        self.assertFalse(state_meta["trainable"])
+        self.assertFalse(state_meta["running"])
 
 
 def _two_optimizer_train_step(
