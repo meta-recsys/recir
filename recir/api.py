@@ -3003,7 +3003,7 @@ def invalidate_device_state(compiled_fn: Callable[..., Any]) -> None:
     compiled_obj = compiled_fn.__dict__.get(COMPILED_OBJECT_KEY, None)
     if compiled_obj is None:
         return
-    compiled_obj.state_manager.device_state = None
+    compiled_obj.state_manager.invalidate_device_state()
 
 
 # Pull through the ``GraphPatch`` type alias so consumers don't need to import

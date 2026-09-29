@@ -118,17 +118,78 @@ def _cached_reshard(target: Any) -> Any:
     return fn
 
 
-# index -> (weakref to the torch input, its _version, its data_ptr, device copy)
-_StateInputCache = dict[int, Tuple[Any, int, int, Any]]
+# Cache entry: weakref, _version, data_ptr, conversion layout, device copy.
+_StateInputCacheEntry = Tuple[Any, int, int, Any, Any]
+_StateInputCache = dict[Any, _StateInputCacheEntry]
+
+
+def _state_input_cache_entry_matches(
+    entry: _StateInputCacheEntry,
+    tensor: torch.Tensor,
+    cache_layout: Any,
+) -> bool:
+    return (
+        entry[0]() is tensor
+        and entry[1] == tensor._version
+        and entry[2] == tensor.data_ptr()
+        and entry[3] == cache_layout
+        and not entry[4].is_deleted()
+    )
+
+
+def _state_input_cache_slot_namespace(key: Any) -> Any:
+    """Return a lowered executable's identity token from a cache key."""
+    return key[0] if isinstance(key, tuple) and len(key) == 2 else None
+
+
+def _state_input_cache_slots_can_share(
+    cache: _StateInputCache,
+    destination: Any,
+    source: Any,
+    device_copy: Any,
+) -> bool:
+    """Whether sharing would avoid aliasing two args of one executable."""
+    destination_namespace = _state_input_cache_slot_namespace(destination)
+    source_namespace = _state_input_cache_slot_namespace(source)
+    if destination_namespace is None or destination_namespace is source_namespace:
+        return False
+    return not any(
+        _state_input_cache_slot_namespace(key) is destination_namespace
+        and entry[4] is device_copy
+        for key, entry in cache.items()
+    )
+
+
+def _find_shared_state_input(
+    cache: _StateInputCache,
+    destination: Any,
+    tensor: torch.Tensor,
+    cache_layout: Any,
+) -> Optional[_StateInputCacheEntry]:
+    """Find a reusable copy in another module and purge stale aliases."""
+    shared_entry = None
+    for source, candidate in list(cache.items()):
+        cached_tensor = candidate[0]()
+        if cached_tensor is None or candidate[4].is_deleted():
+            cache.pop(source, None)
+        elif cached_tensor is tensor:
+            if candidate[1] != tensor._version or candidate[2] != tensor.data_ptr():
+                cache.pop(source, None)
+            elif candidate[3] == cache_layout and _state_input_cache_slots_can_share(
+                cache, destination, source, candidate[4]
+            ):
+                shared_entry = candidate
+    return shared_entry
 
 
 def _reuse_unchanged_state_input(
     cache: _StateInputCache,
-    index: int,
+    index: Any,
     tensor: Any,
     is_batch_input: bool,
     is_frozen_parameter: bool,
     convert: Callable[[], Any],
+    cache_layout: Any = None,
 ) -> Any:
     """Return the cached device copy of an unchanged frozen parameter.
 
@@ -157,22 +218,28 @@ def _reuse_unchanged_state_input(
     # Remove the entry before a miss conversion so a multi-GB stale buffer can
     # be released before its replacement is allocated.
     entry = cache.pop(index, None)
-    if entry is not None:
-        if (
-            entry[0]() is tensor
-            and entry[1] == tensor._version
-            and entry[2] == tensor.data_ptr()
-            and not entry[3].is_deleted()
-        ):
-            cache[index] = entry
-            return entry[3]
+    if entry is not None and _state_input_cache_entry_matches(
+        entry, tensor, cache_layout
+    ):
+        cache[index] = entry
+        return entry[4]
     del entry
+
+    # Multiple lowered modules can consume one tied/shared parameter. Reuse a
+    # matching device copy instead of retaining one multi-GB copy per module.
+    # Purge dead or stale aliases while scanning so they cannot pin old buffers.
+    shared_entry = _find_shared_state_input(cache, index, tensor, cache_layout)
+    if shared_entry is not None:
+        cache[index] = shared_entry
+        return shared_entry[4]
+
     device_copy = convert()
     if isinstance(device_copy, jax.Array):
         cache[index] = (
             weakref.ref(tensor),
             tensor._version,
             tensor.data_ptr(),
+            cache_layout,
             device_copy,
         )
     return device_copy
@@ -380,7 +447,15 @@ class _XLAModule(torch.nn.Module):
         # Guard so RECIR_DUMP_GRAPHS dumps each subgraph's FX + XLA graph once.
         self._dumped_graphs: bool = False
         self._logged_memory_analysis: bool = False
+        self._state_input_cache_namespace: object = object()
         self._state_input_cache: _StateInputCache = {}
+
+    def _bind_state_input_cache(self, cache: _StateInputCache) -> None:
+        """Use the device-state manager's cache for this lowered module."""
+        if self._state_input_cache is cache:
+            return
+        self._state_input_cache.clear()
+        self._state_input_cache = cache
 
     def _log_compiled_memory_analysis(self) -> None:
         if self._logged_memory_analysis or self._jax_compiled is None:
@@ -1387,10 +1462,23 @@ class _XLAModule(torch.nn.Module):
                     fsdp_axis_size,
                 )
             )
-            jax_args = tuple(
-                _reuse_unchanged_state_input(
+
+            runtime_fsdp_host_shard_count = fsdp_axis_size // len(_get_local_devices())
+            runtime_cache_mesh = (
+                tuple(runtime_mesh.axis_names),
+                tuple(runtime_mesh.devices.flat),
+                runtime_fsdp_host_shard_count,
+            )
+
+            def _convert_run_arg(j: int, a: Any) -> Any:
+                cache_layout = (
+                    runtime_cache_mesh,
+                    is_fsdp_sharded[j],
+                    per_input_fsdp_dim[j],
+                )
+                return _reuse_unchanged_state_input(
                     self._state_input_cache,
-                    j,
+                    (self._state_input_cache_namespace, j),
                     a,
                     is_batch[j],
                     is_frozen_parameter[j],
@@ -1403,13 +1491,12 @@ class _XLAModule(torch.nn.Module):
                         is_fsdp_tensor=is_fsdp_sharded[j],
                         batch_axis_resource=runtime_batch_axis_resource,
                         fsdp_axis_name=_GSPMD_FSDP_AXIS,
-                        fsdp_host_shard_count=(
-                            fsdp_axis_size // len(_get_local_devices())
-                        ),
+                        fsdp_host_shard_count=runtime_fsdp_host_shard_count,
                     ),
+                    cache_layout,
                 )
-                for j, a in enumerate(run_args)
-            )
+
+            jax_args = tuple(_convert_run_arg(j, a) for j, a in enumerate(run_args))
             # First call materializes and stashes the compiled
             # executable so AOT serializers can pick it up (and so
             # subsequent calls bypass JAX's internal compile cache

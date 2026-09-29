@@ -17,6 +17,7 @@ from recir.lowering.xla_lower import (
     _GSPMD_FSDP_AXIS,
     _gspmd_mesh,
     _jax_to_torch,
+    _StateInputCache,
     _XLAModule,
 )
 
@@ -24,11 +25,29 @@ logger: logging.Logger = logging.getLogger(__name__)
 
 
 class XLADeviceStateManager(DeviceStateManager):
-    @staticmethod
-    def _set_keep_jax_output(gm: torch.nn.Module, value: bool) -> None:
+    def __init__(self, torch_device: Optional[torch.device] = None) -> None:
+        super().__init__(
+            torch_device if torch_device is not None else torch.device("cpu")
+        )
+        self._state_input_cache: _StateInputCache = {}
+
+    def _configure_xla_modules(
+        self, gm: torch.nn.Module, *, keep_jax_output: bool
+    ) -> None:
         for m in gm.modules():
             if isinstance(m, _XLAModule):
-                m.keep_jax_output = value
+                m._bind_state_input_cache(self._state_input_cache)
+                m.keep_jax_output = keep_jax_output
+
+    def _bind_state_input_cache(self, gm: torch.nn.Module) -> None:
+        for m in gm.modules():
+            if isinstance(m, _XLAModule):
+                m._bind_state_input_cache(self._state_input_cache)
+
+    def invalidate_device_state(self) -> None:
+        """Discard manager-owned state and lowered-module input copies."""
+        super().invalidate_device_state()
+        self._state_input_cache.clear()
 
     @staticmethod
     def _convert_flat_state_to_jax(
@@ -103,7 +122,7 @@ class XLADeviceStateManager(DeviceStateManager):
         )
         mesh, batch_axis_resource, _ = _gspmd_mesh(devices, fsdp_axis_size)
         fsdp_host_shard_count = fsdp_axis_size // len(_get_local_devices())
-        self.device_state = [
+        new_device_state = [
             _XLAModule._to_sharded_jax(
                 leaf,
                 mesh,
@@ -117,6 +136,12 @@ class XLADeviceStateManager(DeviceStateManager):
             )
             for i, leaf in enumerate(flat_state)
         ]
+        # Build the replacement completely before releasing the old state, so
+        # a failed conversion leaves the prefill retryable. Once successful,
+        # discard any frozen-input copies derived from the prior host state.
+        self._bind_state_input_cache(gm)
+        self.invalidate_device_state()
+        self.device_state = new_device_state
 
     def prepare_inputs(
         self,
@@ -164,10 +189,10 @@ class XLADeviceStateManager(DeviceStateManager):
             # path (last_train_step, or the first multi-device call) returns
             # flat_state and may legitimately have device_state is None.
             assert device_state is not None
-            self._set_keep_jax_output(gm, True)
+            self._configure_xla_modules(gm, keep_jax_output=True)
             return device_state + user_inps
         else:
-            self._set_keep_jax_output(gm, False)
+            self._configure_xla_modules(gm, keep_jax_output=False)
             return flat_state + user_inps
 
     def commit_step_state(
@@ -182,7 +207,10 @@ class XLADeviceStateManager(DeviceStateManager):
         if not self._used_fast_path:
             self._copy_state_into(flat_state, updated_flat)
         if last_train_step:
-            self.device_state = None
+            # Release both cache layers only after the host mirror is current.
+            # If execution or the host copy raises, the pre-call device state
+            # and frozen-input copies remain available for a retry.
+            self.invalidate_device_state()
         else:
             self.device_state = updated_flat[: len(flat_state)]
 
