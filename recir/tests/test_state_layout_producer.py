@@ -10,7 +10,7 @@
 These exercise ``DataParallel.apply_state_layout`` in isolation -- no full
 trace: a tiny ``fx.Graph`` with placeholders carrying ``node.meta["fqn"]`` and a
 hand-built ``_StateLayoutPlan`` stand in for what ``shard_params`` would stash
-during a real trace. ``apply_state_layout`` must reproduce D110785277's
+during a real trace. ``apply_state_layout`` must reproduce the original
 FSDP-on-XLA behavior via the typed ``recir_state_layout`` spec: tag the
 fqn-matched placeholders with an ``FSDPWeightShardSpec`` and substitute the /P
 per-process store into ``params_and_buffers`` (rebuilt into ``flat_state``

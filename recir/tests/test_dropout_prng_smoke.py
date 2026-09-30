@@ -18,13 +18,13 @@ PROD_CONFIG_OVERRIDES.md C4 asks for does not exist yet.
 """
 
 import re
+from unittest import TestCase
 
 import jax
 import jax.numpy as jnp
 import torch
 import torch.fx as fx
 import torch.nn.functional as F
-from later.unittest import TestCase
 from recir.region_transforms.dropout_prng import DropoutPRNGTransform
 from recir.torchax.ops.jrandom import _jbernoulli_keyed
 from torch.fx.experimental.proxy_tensor import make_fx

@@ -6,7 +6,7 @@
 
 
 """Tests for code that survives the v7.1 module_override / gm_transformation
-deletion in D106331621.
+deletion.
 
 These two test classes were relocated out of the deleted
 ``test_transformation.py`` because they cover still-live code:

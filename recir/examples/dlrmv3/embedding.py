@@ -616,7 +616,7 @@ class _TorchRecSharder(EmbeddingCollectionSharder):
 
 
 class CPUTorchRecBackend(EmbeddingBackend):
-    """Original D101506286 approach: torchrec DMP ROW_WISE on CPU via gloo."""
+    """Original approach: torchrec DMP ROW_WISE on CPU via gloo."""
 
     def init_pg(self) -> tuple[int, int]:
         jax_rank = jax.process_index()

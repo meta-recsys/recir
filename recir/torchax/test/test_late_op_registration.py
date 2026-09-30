@@ -23,8 +23,9 @@ op, and it reproduced only when something else happened to construct the
 Environment early — turning on AMP, in the case that found it.
 """
 
+from unittest import TestCase
+
 import torch
-from later.unittest import TestCase
 from recir.torchax import tensor
 from recir.torchax.ops import ops_registry
 

@@ -1,4 +1,8 @@
-# (c) Meta Platforms, Inc. and affiliates. Confidential and proprietary.
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-3-Clause license found in the
+# LICENSE file in the root directory of this source tree.
 
 
 """Optimized Pallas FlashAttention kernel for TPU with target attention mask.
@@ -8,7 +12,7 @@ API targeting TPU.  It supports both varlen (FA3) and 4D (FA4) formats.  Both
 forward (inference) and backward (training) passes are implemented as Pallas
 kernels and wired through ``jax.custom_vjp``.
 
-Key optimizations over the baseline (D96262305):
+Key optimizations over the baseline implementation:
   P0: ``interpret`` defaults to False — runs on TPU hardware, not CPU-emulated.
   P1: Head dimension folded into the Pallas grid — one ``pallas_call`` per
       sequence instead of one per (batch, head) pair.

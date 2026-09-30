@@ -91,7 +91,7 @@ class XLAGSPMDBackend(_XLABackendBase):
                 "GSPMD inflates input shapes by num_processes before tracing, "
                 "baking global literals into the FX graph that IterGraphModule's "
                 "unlowered setup_gm/cleanup_gm cannot handle at per-host runtime. "
-                "Set uses_iter_graph=False (the new default after D106027480) or "
+                "Set uses_iter_graph=False (now the default) or "
                 "use a non-GSPMD parallel mode."
             )
 

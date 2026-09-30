@@ -11,7 +11,7 @@ R5 makes ``_XLAModule._jit_shard_map`` consume the typed ``recir_state_layout``
 meta (via ``get_state_layout``) produced by ``DataParallel`` / ``ParallelMode``
 (R4), replacing the old ``is_fsdp_sharded`` bool. These tests assert that, given
 placeholders tagged with an ``FSDPWeightShardSpec``, ``_jit_shard_map`` builds
-the shard_map in/out ``PartitionSpec``s that D110785277 produced:
+the shard_map in/out ``PartitionSpec``s that the original FSDP-on-XLA path produced:
 
   * FSDP-weight and batch inputs -> ``P("torch_dist")`` (Shard(0)); everything
     else replicated ``P()``.

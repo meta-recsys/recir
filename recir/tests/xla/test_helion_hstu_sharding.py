@@ -21,14 +21,13 @@ also pin the derivation itself.
 """
 
 from typing import Any, Dict, List, Tuple
-from unittest import mock
+from unittest import mock, TestCase
 
 import jax  # @manual
 import jax.numpy as jnp
 import recir.ops.helion.jagged_hstu_attention as jhstu
 import torch
 from jax.sharding import Mesh
-from later.unittest import TestCase
 
 # 2 spoofed CPU devices (see the BUCK env). b_local = 4 rows per device: 3 real
 # + 1 PRT pad row. Per-sample budget 5 => l_local = 4 * 5 = 20, L = 40.

@@ -1,4 +1,8 @@
-# (c) Meta Platforms, Inc. and affiliates. Confidential and proprietary.
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-3-Clause license found in the
+# LICENSE file in the root directory of this source tree.
 """Runtime patches for the pip-installed torchrec used by the TPU bench image.
 
 apply_seq_a2a_int64_patch: fix an int32 offset overflow in torchrec's ROW_WISE

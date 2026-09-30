@@ -1,4 +1,10 @@
 #!/usr/bin/env bash
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-3-Clause license found in the
+# LICENSE file in the root directory of this source tree.
+
 # Shared bash helpers for submitting and monitoring GKE TPU JobSets. Sourced by
 # recir/tests/helpers.sh and recir/examples/rankfm_mvai/helpers.sh -- not meant to be
 # sourced directly.
