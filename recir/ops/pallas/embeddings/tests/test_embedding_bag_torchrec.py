@@ -1,7 +1,5 @@
 # (c) Meta Platforms, Inc. and affiliates. Confidential and proprietary.
 
-# pyre-unsafe
-
 """CPU parity between the pooled (EBC) layer and ``torchrec.EmbeddingBagCollection``.
 
 This is the reference the real-TPU correctness harness diffs against, so it is
@@ -95,9 +93,10 @@ def _sharded_gather(
     zeroed to match the kernel's output, though :func:`pool_per_rank` routes
     them to its trash segment and does not rely on that.
     """
-    world_size = sharded_table.shape[0]
-    emb = sharded_table[ids % world_size, ids // world_size]
     valid = jnp.arange(ids.shape[0]) < id_count
+    world_size = sharded_table.shape[0]
+    safe_ids = jnp.where(valid, ids, 0)
+    emb = sharded_table[safe_ids % world_size, safe_ids // world_size]
     return jnp.where(valid[:, None], emb, 0.0)
 
 
@@ -214,6 +213,24 @@ class EmbeddingBagTorchrecParityTest(unittest.TestCase):
 
     def test_mean_forward_and_table_grad(self) -> None:
         self._check("mean")
+
+    def test_out_of_range_padding_ids_are_ignored(self) -> None:
+        poisoned_ids = self.ids.copy()
+        for rank, lengths in enumerate(_BAG_LENGTHS):
+            poisoned_ids[rank, int(lengths.sum()) :] = _VOCAB + 100
+        expected = _jax_forward(
+            jnp.array(self.sharded_table),
+            jnp.array(self.ids),
+            jnp.array(_BAG_LENGTHS),
+            "sum",
+        )
+        actual = _jax_forward(
+            jnp.array(self.sharded_table),
+            jnp.array(poisoned_ids),
+            jnp.array(_BAG_LENGTHS),
+            "sum",
+        )
+        np.testing.assert_array_equal(np.array(actual), np.array(expected))
 
     def test_hot_row_gradient_accumulates(self) -> None:
         """Row 7 is looked up 3x on rank 0; its grad must be the sum of all three.
