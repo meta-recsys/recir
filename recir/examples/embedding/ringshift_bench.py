@@ -57,11 +57,18 @@ import jax.numpy as jnp
 import numpy as np
 from jax.experimental.multihost_utils import sync_global_devices
 from recir.ops.pallas.embeddings.ringshift import (
+    _POOLING_IMPL_ENV,
     ringshift_embedding_lookup,
+    ringshift_embedding_lookup_reference,
     ringshift_embedding_lookup_reference_jax,
 )
 
 _TILE = 128
+
+# Agreement bound between the two pooled reductions. They differ only in
+# summation ORDER, so the gap is pure f32 rounding over bags of up to a few
+# thousand rows; anything above this is a real bug, not accumulation noise.
+_EBC_REL_TOL = 1e-4
 
 # SparseCores per JAX device. jte's num_sparsecores_per_device() raises
 # ValueError on device kinds it doesn't recognise (e.g. "TPU7x"); fall back to
@@ -259,6 +266,161 @@ def run_fwd_tc(mesh, cfg, tag) -> tuple[float, float]:
     ra2a_median = None if ref_times is None else statistics.median(ref_times)
     # pyrefly: ignore [bad-return]
     return ra2a_median, statistics.median(fused_times)
+
+
+def _make_bag_lengths(mesh, num_bags, local_id_count, seed, *, distribution):
+    """Per-rank bag lengths that sum EXACTLY to this rank's valid id count.
+
+    Derived from ``local_id_count`` rather than recomputed, so the two can not
+    drift: the pooled API rejects a separately-supplied count precisely because
+    ``bag_lengths`` already determines it.
+
+    Lengths are jagged (and, under ``skewed``, heavy-tailed) so the benchmark
+    exercises the case the reduction actually has to handle. Some bags land on
+    zero, which is the empty-bag path.
+    """
+    P = jax.sharding.PartitionSpec
+    heavy_tailed = distribution == "skewed"
+
+    @functools.partial(
+        jax.shard_map,
+        mesh=mesh,
+        in_specs=(P("x"),),
+        out_specs=P("x"),
+        check_vma=False,
+    )
+    def make(count):
+        rank = jax.lax.axis_index("x")
+        key = jax.random.fold_in(jax.random.PRNGKey(seed + 1), rank)
+        w = (
+            jax.random.exponential(key, (num_bags,))
+            if heavy_tailed
+            else jax.random.uniform(key, (num_bags,))
+        )
+        w = w / jnp.sum(w)
+        total = count[0].astype(jnp.int32)
+        lengths = jnp.floor(w * total.astype(jnp.float32)).astype(jnp.int32)
+        # Floor can only undershoot, so the remainder is non-negative and the
+        # sum is exact -- which the op asserts on.
+        lengths = lengths.at[-1].add(total - jnp.sum(lengths))
+        return lengths[None, :]
+
+    return make(local_id_count)
+
+
+def run_ebc_tc(mesh, cfg, tag) -> tuple[float, float]:
+    """Pooled (EBC) forward perf: XLA reduction vs in-kernel reduction.
+
+    Returns ``(xla_median_ms, kernel_median_ms)``.
+
+    Both environment-selected arms are traced in ONE process against the SAME
+    inputs, then alternate through the same ``_time_jit`` path. Two separate
+    jobs would differ in slice, neighbours and thermal state, and a 10%
+    difference between implementations is well inside that noise.
+    """
+    local_ids, local_id_count = _make_inputs(
+        mesh,
+        cfg.world_size,
+        cfg.max_local_ids,
+        cfg.v_local,
+        cfg.seed,
+        distribution=cfg.distribution,
+    )
+    local_table = _make_table(
+        mesh, cfg.v_local, cfg.dim, cfg.seed, random=cfg.random_table
+    )
+    bag_lengths = _make_bag_lengths(
+        mesh, cfg.num_bags, local_id_count, cfg.seed, distribution=cfg.distribution
+    )
+    jax.block_until_ready((local_ids, local_table, bag_lengths))
+    args = (local_ids, local_table, bag_lengths)
+    _log(tag, f"ebc inputs ready (num_bags={cfg.num_bags} pooling={cfg.pooling})")
+
+    def _arm(impl):
+        def call(ids, table, bags):
+            # This Python scope runs while JAX traces this arm. Restoring the
+            # process environment afterwards cannot change the compiled graph.
+            previous = os.environ.get(_POOLING_IMPL_ENV)
+            os.environ[_POOLING_IMPL_ENV] = impl
+            try:
+                return ringshift_embedding_lookup(
+                    ids,
+                    None,  # derived from bag_lengths when pooling is on
+                    table,
+                    mesh=mesh,
+                    axis_name="x",
+                    recv_capacity=cfg.recv_capacity,
+                    splitter="globalpad",
+                    exchange_bf16=cfg.exchange_bf16,
+                    pooling=cfg.pooling,
+                    bag_lengths=bags,
+                )
+            finally:
+                if previous is None:
+                    os.environ.pop(_POOLING_IMPL_ENV, None)
+                else:
+                    os.environ[_POOLING_IMPL_ENV] = previous
+
+        return jax.jit(call)
+
+    xla, kernel = _arm("xla"), _arm("fused_kernel")
+
+    # Agreement first: a timing for a wrong kernel is worse than no timing.
+    #
+    # NOT bitwise-equal, unlike the fused-vs-ra2a check elsewhere in this file.
+    # Both arms sum the same rows, but the kernel accumulates in wave/sorted
+    # order while XLA accumulates in caller order, and f32 addition is not
+    # associative. Requiring equality here would fail for a correct kernel.
+    out_xla = jax.block_until_ready(xla(*args))
+    out_kernel = jax.block_until_ready(kernel(*args))
+
+    # Independent oracle, at the SAME scale the timings are taken at.
+    #
+    # The arms-agree check below is relative: it cannot catch a mistake both
+    # make, and the likeliest such mistake is one inherited from the shared
+    # host-side prep (segment ids, sort permutation, per-peer padding). The
+    # numpy reference shares no code with either arm -- it is a double loop
+    # over (rank, id), no segment_sum, no kernel, no permutation.
+    #
+    # Cheap enough to leave on: a Python loop over W x max_local_ids ids costs
+    # seconds against a job that already waited in a queue. It is skipped on
+    # multi-host, where the oracle would need the whole global table gathered
+    # onto one process.
+    if cfg.check_reference and jax.process_count() == 1:
+        want = ringshift_embedding_lookup_reference(
+            np.asarray(jax.device_get(local_ids)),
+            None,
+            np.asarray(jax.device_get(local_table)),
+            cfg.world_size,
+            cfg.pooling,
+            np.asarray(jax.device_get(bag_lengths)),
+        )
+        want64 = np.asarray(want, dtype=np.float64)
+        oracle_scale = max(float(np.max(np.abs(want64))), 1e-12)
+        for label, got in (("xla", out_xla), ("kernel", out_kernel)):
+            got64 = np.asarray(jax.device_get(got), dtype=np.float64)
+            ref_rel = float(np.max(np.abs(got64 - want64)) / oracle_scale)
+            _log(tag, f"ebc vs oracle [{label}]: max_rel_diff={ref_rel:.3e}")
+            if ref_rel > _EBC_REL_TOL:
+                raise SystemExit(
+                    f"[{tag}] {label} disagrees with the numpy oracle: "
+                    f"{ref_rel:.3e} > {_EBC_REL_TOL:.0e}"
+                )
+    elif cfg.check_reference:
+        _log(tag, "ebc vs oracle: skipped (multi-host; oracle needs global table)")
+    scale = jnp.maximum(jnp.max(jnp.abs(out_xla)), 1e-6)
+    rel = float(jnp.max(jnp.abs(out_kernel - out_xla)) / scale)
+    _log(tag, f"ebc agreement: max_rel_diff={rel:.3e}")
+    if rel > _EBC_REL_TOL:
+        raise SystemExit(
+            f"[{tag}] pooled arms disagree: max_rel_diff={rel:.3e} > "
+            f"{_EBC_REL_TOL:.0e} -- refusing to report timings"
+        )
+
+    xla_times = _time_jit(tag, "ebc_xla", xla, args, cfg.warmup, cfg.iters)
+    kernel_times = _time_jit(tag, "ebc_kernel", kernel, args, cfg.warmup, cfg.iters)
+    _trace_region(tag, cfg, "ebc_kernel", kernel, args)
+    return statistics.median(xla_times), statistics.median(kernel_times)
 
 
 # ---------------------------------------------------------------------------
@@ -563,7 +725,23 @@ def run_bwd(mesh, cfg, tag) -> None:
 
 def _parse_args(argv=None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--mode", choices=("fwd", "bwd"), default="fwd")
+    p.add_argument("--mode", choices=("fwd", "bwd", "ebc"), default="fwd")
+    p.add_argument(
+        "--num-bags",
+        type=int,
+        default=1024,
+        help="pooled (--mode ebc) bags per rank = local batch x features",
+    )
+    p.add_argument(
+        "--pooling", choices=("sum", "mean"), default="sum", help="--mode ebc only"
+    )
+    p.add_argument(
+        "--no-check-reference",
+        dest="check_reference",
+        action="store_false",
+        default=True,
+        help="skip the --mode ebc numpy-oracle check (single-host only anyway)",
+    )
     p.add_argument(
         "--backend",
         choices=("tc", "sc", "all"),
@@ -689,6 +867,30 @@ def main(argv=None) -> None:
         f"max_local_ids={cfg.max_local_ids} recv_capacity={cfg.recv_capacity} "
         f"distribution={cfg.distribution} backend={cfg.backend} ===",
     )
+
+    if cfg.mode == "ebc":
+        xla_median, kernel_median = run_ebc_tc(mesh, cfg, tag)
+        speedup = xla_median / kernel_median if kernel_median else float("nan")
+        valid_ids_per_rank = (
+            cfg.max_local_ids
+            if cfg.distribution == "uniform"
+            else (cfg.max_local_ids * 4) // 5
+        )
+        average_bag_len = (
+            valid_ids_per_rank / cfg.num_bags if cfg.num_bags else float("nan")
+        )
+        _log(
+            tag,
+            # 3 decimals: at sub-millisecond medians `.1f` rounds 0.700 and
+            # 0.634 to "0.7" and "0.6", which reads as a 17% gap when it is 10%.
+            f"=== RESULT ebc: world_size={world_size} dim={cfg.dim} "
+            f"num_bags={cfg.num_bags} bag_len={average_bag_len:.3f} "
+            f"distribution={cfg.distribution} pooling={cfg.pooling} "
+            f"v_local={cfg.v_local} max_local_ids={cfg.max_local_ids} "
+            f"xla={xla_median:.3f}ms "
+            f"kernel={kernel_median:.3f}ms speedup={speedup:.3f}x ===",
+        )
+        return
 
     if cfg.mode == "bwd":
         # SparseCore backward is out of scope here; bwd is TensorCore-only.
