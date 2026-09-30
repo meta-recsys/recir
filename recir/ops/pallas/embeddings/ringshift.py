@@ -103,6 +103,26 @@ _SKIP_PREFETCH: bool = os.environ.get("RECIR_RINGSHIFT_SKIP_PREFETCH") == "1"
 # directly before attributing per-phase time.
 _LOG_LOAD: bool = os.environ.get("RECIR_RINGSHIFT_LOG_LOAD") == "1"
 
+
+# Pooled-reduction implementation. Read when the public function is traced so
+# separate jitted callables in one process can deliberately compile different
+# arms. The selected value is then fixed in the compiled program.
+_POOLING_IMPL_ENV = "RECIR_RINGSHIFT_POOLING_IMPL"
+_POOLING_IMPLS: tuple[str, ...] = ("fused_kernel", "xla")
+
+
+def _pooling_impl_from_env(pooling: str) -> str:
+    """Return ``none``, ``fused_kernel``, or ``xla`` at compile time."""
+    if pooling == "none":
+        return "none"
+    pooling_impl = os.environ.get(_POOLING_IMPL_ENV, "fused_kernel")
+    if pooling_impl not in _POOLING_IMPLS:
+        raise ValueError(
+            f"{_POOLING_IMPL_ENV}={pooling_impl!r} is not one of {_POOLING_IMPLS}"
+        )
+    return pooling_impl
+
+
 # --- Table-shard VMEM staging budget (large-hash-size support) -------------
 # The fused kernel gathers embedding rows from this rank's table shard
 # (``[v_local, D]``). Historically it staged the WHOLE shard into a VMEM
@@ -2016,13 +2036,14 @@ def ringshift_embedding_lookup(
         pooling: ``"none"`` (default -- sequence / EC behavior, one row per id),
             ``"sum"`` or ``"mean"`` (EBC behavior, one row per bag). The
             reduction is fused into the wave kernel (Phase 4), so the pooled
-            path never materializes the ``[max_local_ids, D]`` per-id array.
+            path never materializes the ``[max_local_ids, D]`` per-id array by
+            default. Set ``RECIR_RINGSHIFT_POOLING_IMPL=xla`` before tracing to
+            select the validation path that reduces the per-id output in XLA.
         bag_lengths: ``[world_size, num_bags]`` int32 -- required iff
             ``pooling != "none"``, rejected otherwise. Ids must be laid out
             bag-major within each rank (the standard KJT jagged layout: bag 0's
             ids first, then bag 1's, ...), and ``bag_lengths.sum(axis=1)`` must
             equal ``looked_up_id_count``.
-
     Returns:
         ``[world_size, max_local_ids, D]`` f32 embeddings in caller order when
         ``pooling == "none"``; ``[world_size, num_bags, D]`` f32 pooled vectors
@@ -2037,31 +2058,55 @@ def ringshift_embedding_lookup(
     the per-id one.
     """
     _check_pooling(pooling, bag_lengths, looked_up_id_count)
-    if pooling == "none":
+    pooling_impl = _pooling_impl_from_env(pooling)
+    if pooling_impl == "none":
         assert looked_up_id_count is not None  # narrowed by _check_pooling
     else:
         # Single source of truth: bag_lengths fully determines the valid id
         # count, so deriving it here makes a mismatch structurally impossible.
         assert bag_lengths is not None  # narrowed by _check_pooling
         looked_up_id_count = jnp.sum(bag_lengths, axis=-1).astype(jnp.int32)
-    # Pooling now happens INSIDE the custom_vjp boundary, so the op's cotangent
-    # is per bag and `_bwd` owns the fan-out. Previously it sat outside and
-    # autodiff composed the two VJPs for free; moving it in is what the fused
-    # path requires, and doing it while the reduction is still the known-good
-    # host-side one isolates the plumbing change from any kernel change.
-    return _ringshift_with_grad(  # pyre-ignore[29]
-        looked_up_ids,
-        looked_up_id_count,
-        local_embedding_table,
-        bag_lengths,
-        mesh,
-        axis_name,
-        recv_capacity,
-        interpret,
-        splitter,
-        exchange_bf16,
-        pooling,
-    )
+
+    if pooling_impl in ("none", "xla"):
+        # Both paths ask the kernel for per-id rows. The XLA path reduces those
+        # rows below; the no-pooling path returns them directly.
+        out = _ringshift_with_grad(  # pyre-ignore[29]
+            looked_up_ids,
+            looked_up_id_count,
+            local_embedding_table,
+            None,
+            mesh,
+            axis_name,
+            recv_capacity,
+            interpret,
+            splitter,
+            exchange_bf16,
+            "none",
+        )
+        if pooling_impl == "none":
+            return out
+        assert bag_lengths is not None  # narrowed by _check_pooling
+        return jax.vmap(functools.partial(pool_per_rank, pooling=pooling))(
+            out, bag_lengths
+        )
+    elif pooling_impl == "fused_kernel":
+        # Pooling happens inside the custom_vjp boundary, so `_bwd` owns the
+        # fan-out from each bag gradient to its per-id gradients.
+        return _ringshift_with_grad(  # pyre-ignore[29]
+            looked_up_ids,
+            looked_up_id_count,
+            local_embedding_table,
+            bag_lengths,
+            mesh,
+            axis_name,
+            recv_capacity,
+            interpret,
+            splitter,
+            exchange_bf16,
+            pooling,
+        )
+    else:
+        raise AssertionError(f"unreachable pooling implementation: {pooling_impl!r}")
 
 
 def _block_to_mod_ids(
@@ -2762,8 +2807,8 @@ def _ringshift_forward_impl(
     interpret: bool,
     splitter: str,
     exchange_bf16: bool,
-    pooling: str,
-    bag_lengths: jax.Array | None,
+    pooling_in_fused_kernel: str,
+    bag_lengths_in_fused_kernel: jax.Array | None,
 ) -> jax.Array:
     """Internal: forward-only impl of the ringshift kernel (no custom_vjp).
 
@@ -2786,7 +2831,7 @@ def _ringshift_forward_impl(
             interpret=interpret,
             splitter=splitter,
             exchange_bf16=exchange_bf16,
-            pooling=pooling,
+            pooling=pooling_in_fused_kernel,
             bag_lengths=None if bags is None else bags[0],
         )
         return out[None, ...]
@@ -2800,7 +2845,12 @@ def _ringshift_forward_impl(
     )
     # Bound to a tuple so the whole call fits on the suppressed line: the
     # pyrefly directive only covers the line immediately after it.
-    args = (looked_up_ids, looked_up_id_count, local_embedding_table, bag_lengths)
+    args = (
+        looked_up_ids,
+        looked_up_id_count,
+        local_embedding_table,
+        bag_lengths_in_fused_kernel,
+    )
     # pyrefly: ignore [bad-argument-count, bad-return]
     return sharded(*args)
 
@@ -2865,25 +2915,26 @@ def _ringshift_backward_impl(
 # API :func:`ringshift_embedding_lookup` preserves the existing keyword-only
 # signature; this inner function exists only because custom_vjp can't take
 # static kwargs directly.
-# ``bag_lengths`` sits in a DIFFERENTIABLE position (index 3) even though it is
-# int32 and receives a ``None`` gradient: it is a traced array, so it cannot be
-# a ``nondiff_argnum``. Adding it therefore shifts every static argument right
-# by one, and ``_bwd`` must return a 4-tuple. Those two edits plus ``pooling``
-# in ``_bwd``'s parameter list have to move together -- getting any one of them
-# wrong fails silently rather than raising.
+# ``bag_lengths_in_fused_kernel`` sits in a DIFFERENTIABLE position (index 3)
+# even though it is int32 and receives a ``None`` gradient: it is a traced
+# array, so it cannot be a ``nondiff_argnum``. Adding it therefore shifts every
+# static argument right by one, and ``_bwd`` must return a 4-tuple. Those two
+# edits plus ``pooling_in_fused_kernel`` in ``_bwd``'s parameter list have to
+# move together -- getting any one of them wrong fails silently rather than
+# raising.
 @functools.partial(jax.custom_vjp, nondiff_argnums=(4, 5, 6, 7, 8, 9, 10))
 def _ringshift_with_grad(
     looked_up_ids: jax.Array,
     looked_up_id_count: jax.Array,
     local_embedding_table: jax.Array,
-    bag_lengths: jax.Array | None,
+    bag_lengths_in_fused_kernel: jax.Array | None,
     mesh: jax.sharding.Mesh,
     axis_name: str,
     recv_capacity: int,
     interpret: bool,
     splitter: str,
     exchange_bf16: bool,
-    pooling: str,
+    pooling_in_fused_kernel: str,
 ) -> jax.Array:
     return _ringshift_forward_impl(
         looked_up_ids,
@@ -2895,8 +2946,8 @@ def _ringshift_with_grad(
         interpret=interpret,
         splitter=splitter,
         exchange_bf16=exchange_bf16,
-        pooling=pooling,
-        bag_lengths=bag_lengths,
+        pooling_in_fused_kernel=pooling_in_fused_kernel,
+        bag_lengths_in_fused_kernel=bag_lengths_in_fused_kernel,
     )
 
 
@@ -2904,14 +2955,14 @@ def _ringshift_with_grad_fwd(
     looked_up_ids,
     looked_up_id_count,
     local_embedding_table,
-    bag_lengths,
+    bag_lengths_in_fused_kernel,
     mesh,
     axis_name,
     recv_capacity,
     interpret,
     splitter,
     exchange_bf16,
-    pooling,
+    pooling_in_fused_kernel,
 ):
     """Forward + save residuals for backward.
 
@@ -2937,8 +2988,8 @@ def _ringshift_with_grad_fwd(
         interpret=interpret,
         splitter=splitter,
         exchange_bf16=exchange_bf16,
-        pooling=pooling,
-        bag_lengths=bag_lengths,
+        pooling_in_fused_kernel=pooling_in_fused_kernel,
+        bag_lengths_in_fused_kernel=bag_lengths_in_fused_kernel,
     )
     # local_embedding_table.shape is the user-facing 3-tuple
     # (world_size, v_local, D); strip the rank axis for the per-device
@@ -2950,13 +3001,13 @@ def _ringshift_with_grad_fwd(
             f"[world_size, v_local, D], got shape {full_shape}"
         )
     per_device_shape = (int(full_shape[1]), int(full_shape[2]))
-    # ``bag_lengths`` joins the residuals because the pooled backward has to
-    # fan the per-bag gradient back out to one row per id before the existing
-    # per-id driver can consume it.
+    # ``bag_lengths_in_fused_kernel`` joins the residuals because the fused
+    # pooled backward has to fan the per-bag gradient back out to one row per
+    # id before the existing per-id driver can consume it.
     residuals = (
         looked_up_ids,
         looked_up_id_count,
-        bag_lengths,
+        bag_lengths_in_fused_kernel,
         per_device_shape,
     )
     return out, residuals
@@ -2969,37 +3020,46 @@ def _ringshift_with_grad_bwd(
     interpret,
     splitter,
     exchange_bf16,
-    pooling,
+    pooling_in_fused_kernel,
     residuals,
     grad_out,
 ):
     """Backward: compute grad_local_embedding_table.
 
     Returns gradients matching the differentiable input signature
-    (looked_up_ids, looked_up_id_count, local_embedding_table, bag_lengths).
-    The three int32 inputs get None gradients; only the table is differentiated.
+    (looked_up_ids, looked_up_id_count, local_embedding_table,
+    bag_lengths_in_fused_kernel). The three int32 inputs get None gradients;
+    only the table is differentiated.
 
     Note the parameter order: ``jax.custom_vjp`` passes the ``nondiff_argnums``
     first, in their declared order, then the residuals, then the cotangent. So
-    ``pooling`` -- the last static argument -- lands just before ``residuals``.
+    ``pooling_in_fused_kernel`` -- the last static argument -- lands just before
+    ``residuals``.
     """
-    looked_up_ids, looked_up_id_count, bag_lengths, table_shape = residuals
+    (
+        looked_up_ids,
+        looked_up_id_count,
+        bag_lengths_in_fused_kernel,
+        table_shape,
+    ) = residuals
 
-    if pooling != "none":
+    if pooling_in_fused_kernel != "none":
         # The op now returns [W, num_bags, D], so the cotangent arrives per bag.
         # Expand it to one row per id, in caller order, which is what the
         # existing per-id backward driver expects -- it is then reached
         # completely unchanged (staged plan V1a).
-        assert bag_lengths is not None  # narrowed by _check_pooling
+        assert bag_lengths_in_fused_kernel is not None
         max_local_ids = looked_up_ids.shape[-1]
         grad_out = jax.vmap(
             functools.partial(
                 fan_out_pooled_grad,
                 max_local_ids=max_local_ids,
-                pooling=pooling,
+                pooling=pooling_in_fused_kernel,
             )
-        )(grad_out, bag_lengths)
-        looked_up_id_count = jnp.sum(bag_lengths, axis=-1).astype(jnp.int32)
+        )(grad_out, bag_lengths_in_fused_kernel)
+        looked_up_id_count = jnp.sum(bag_lengths_in_fused_kernel, axis=-1).astype(
+            jnp.int32
+        )
 
     grad_table = _ringshift_backward_impl(
         grad_out,
