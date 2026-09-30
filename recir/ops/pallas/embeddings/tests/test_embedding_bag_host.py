@@ -7,12 +7,8 @@
 
 """CPU-runnable tests for the pooled (EBC) layer over the ringshift EC kernel.
 
-Pooling is exposed as a ``pooling`` mode on the existing lookup entry points
-rather than as a parallel set of functions, and it is a pure-JAX post-pass over
-the kernel's per-id output (see section F1 of ``ringshift``). That makes its
-entire surface -- forward, backward, jagged/empty bags, padding, argument
-validation -- testable here without a TPU. Only the fused Pallas kernel itself
-is real-TPU only.
+This file tests the shared primitives and the pure-XLA pooling reference without
+executing the real-TPU-only fused kernel.
 
 Expected values are hand-computed inline rather than derived from a second
 implementation, so a bug in the reference cannot hide a bug in the code.
@@ -20,7 +16,9 @@ implementation, so a bug in the reference cannot hide a bug in the code.
 
 from __future__ import annotations
 
+import os
 import unittest
+from unittest import mock
 
 import jax
 import jax.numpy as jnp
@@ -28,6 +26,8 @@ import numpy as np
 from recir.ops.pallas.embeddings.ringshift import (
     _bucketize_and_sort,
     _pad_per_peer_2d,
+    _POOLING_IMPL_ENV,
+    _pooling_impl_from_env,
     _round_up_tile,
     _TILE_INT32,
     apply_pooling_divisor,
@@ -655,3 +655,28 @@ class PooledCustomVjpPlumbingTest(unittest.TestCase):
             table,
         )
         self.assertEqual(out.shape, (self.W, self.NUM_BAGS, self.DIM))
+
+
+class PoolingImplEnvironmentTest(unittest.TestCase):
+    def test_no_pooling_returns_none_mode_without_reading_env(self) -> None:
+        with mock.patch.dict(os.environ, {_POOLING_IMPL_ENV: "invalid"}, clear=False):
+            self.assertEqual(_pooling_impl_from_env("none"), "none")
+
+    def test_defaults_to_fused_kernel(self) -> None:
+        with mock.patch.dict(os.environ):
+            os.environ.pop(_POOLING_IMPL_ENV, None)
+            self.assertEqual(_pooling_impl_from_env("sum"), "fused_kernel")
+
+    def test_explicit_values(self) -> None:
+        for pooling_impl in ("fused_kernel", "xla"):
+            with mock.patch.dict(
+                os.environ, {_POOLING_IMPL_ENV: pooling_impl}, clear=False
+            ):
+                self.assertEqual(_pooling_impl_from_env("sum"), pooling_impl)
+
+    def test_unknown_value_is_rejected(self) -> None:
+        with (
+            mock.patch.dict(os.environ, {_POOLING_IMPL_ENV: "auto"}, clear=False),
+            self.assertRaisesRegex(ValueError, _POOLING_IMPL_ENV),
+        ):
+            _pooling_impl_from_env("sum")
