@@ -44,6 +44,7 @@ _ENUM_NAME_KEY: str = "name"
 _CLASS_TAG: str = "__class__"
 _DEFAULTS_KEY: str = "__defaults__"
 _NAMEDTUPLE_TAG: str = "__namedtuple__"
+_TORCH_DTYPE_TAG: str = "__torch_dtype__"
 
 # Reached with importlib rather than imported: a plain import would break every
 # in-image run, where there is no mvai_cloud package. The BUCK deps are held in
@@ -218,6 +219,9 @@ def _encode(value: Any, path: str) -> Any:
         }
     if isinstance(value, _PRIMITIVE):
         return value
+    if isinstance(value, torch.dtype):
+        # e.g. torch.float16 -> "float16"; same attribute on either side.
+        return {_TORCH_DTYPE_TAG: str(value).removeprefix("torch.")}
     if isinstance(value, type):
         return {_CLASS_TAG: _image_path(value)}
     if _is_namedtuple(value):
@@ -337,6 +341,8 @@ def _decode(node: Any, path: str = "payload") -> Any:
             return cls(**{k: _decode(v, f"{path}.{k}") for k, v in carried.items()})
         if _CLASS_TAG in node:
             return _resolve(node[_CLASS_TAG])
+        if _TORCH_DTYPE_TAG in node:
+            return getattr(torch, node[_TORCH_DTYPE_TAG])
         return {k: _decode(v, f"{path}[{k!r}]") for k, v in node.items()}
     if isinstance(node, tuple):
         return tuple(_decode(v, f"{path}[{i}]") for i, v in enumerate(node))
