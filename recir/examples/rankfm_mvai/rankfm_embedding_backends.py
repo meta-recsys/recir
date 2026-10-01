@@ -23,7 +23,7 @@ Selected at runtime via ``RankFMConfig.embedding_backend``
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import jax
 import torch
@@ -104,6 +104,7 @@ def build_eager_overrides(
     device: torch.device,
     batch_size: int = TEST_BATCH_SIZE,
     num_processes: int = 1,
+    sparse_arch_getter: Callable[[nn.Module], nn.Module] = rankfm_sparse_arch,
 ) -> List[Any]:
     """Dispatchers that graph-break back to the real eager ``ECSparseArch``.
 
@@ -135,7 +136,7 @@ def build_eager_overrides(
         SparseArchDispatcher(
             cached_output=cached_output,
             input_kjt_keys=input_kjt.keys(),
-            sparse_arch_getter=rankfm_sparse_arch,
+            sparse_arch_getter=sparse_arch_getter,
             override_id=1,
         ),
     ]
