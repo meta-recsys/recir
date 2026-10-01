@@ -24,6 +24,7 @@ import os
 from typing import Any, Dict, get_args, List, Optional, Tuple
 
 import torch
+from recir.examples.rankfm_mvai.prod_config_spec import PROD_CONFIG_EXPECTED_SEQ_LEN
 
 logger: logging.Logger = logging.getLogger(__name__)
 
@@ -662,6 +663,27 @@ def load_prod_optimizer_config(path: str) -> Any:
     payload = torch.load(path)
     _check_version(payload, path)
     return _decode(payload["optimizer_config"], "optimizer_config")
+
+
+def check(path: str) -> str:
+    """The image build's check of a baked artifact (ProdConfigSpec.check_module).
+
+    Raises unless the artifact describes production's model; an export that
+    picked up a parity or replay shim carries a different sequence length and
+    produces a run whose numbers are quietly not prod's.
+    """
+    module_config, _feature_config = load_prod_config(path)
+    if module_config.hstu_max_seq_len != PROD_CONFIG_EXPECTED_SEQ_LEN:
+        raise ValueError(
+            f"prod config artifact has hstu_max_seq_len="
+            f"{module_config.hstu_max_seq_len}, expected "
+            f"{PROD_CONFIG_EXPECTED_SEQ_LEN}. The export picked up a parity or "
+            f"replay shim, so it describes a different model than production."
+        )
+    return (
+        f"{len(module_config.embedding_tables)} tables, "
+        f"hstu_max_seq_len={module_config.hstu_max_seq_len}"
+    )
 
 
 def artifact_path() -> Optional[str]:

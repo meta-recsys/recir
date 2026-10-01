@@ -125,6 +125,7 @@ class RankfmProdLaunchConfigTest(unittest.TestCase):
 
     def test_max_steps_is_one_pass_over_the_dump(self) -> None:
         resolved = self.launch_config.resolve(hosts=16, job_name="JOB")
+        assert resolved.global_batch is not None
         self.assertEqual(
             launch_configs.TOTAL_ROWS // resolved.global_batch, resolved.max_steps
         )
@@ -135,10 +136,13 @@ class RankfmProdLaunchConfigTest(unittest.TestCase):
 
     def test_local_batch_is_a_whole_multiple_of_the_dump_stride(self) -> None:
         for hosts in (8, 16, 32):
-            resolved = self.launch_config.resolve(hosts=hosts, job_name="JOB")
+            local_batch_size = self.launch_config.resolve(
+                hosts=hosts, job_name="JOB"
+            ).local_batch_size
+            assert local_batch_size is not None  # the trainer_spec derives it
             self.assertEqual(
                 0,
-                resolved.local_batch_size % dump.BATCH_SIZE,
+                local_batch_size % dump.BATCH_SIZE,
                 f"{hosts} hosts would train on a subsample of each file",
             )
 
@@ -192,6 +196,7 @@ class RankfmProdLaunchConfigTest(unittest.TestCase):
             description="x",
             name="bad",
             entrypoint="e",
+            trainer_spec=launch_configs.RANKFM_TRAINER_SPEC,
             global_batch=32768,
             trainer_flags={"max_stpes": 5},
             env={},
@@ -204,6 +209,61 @@ class RankfmProdLaunchConfigTest(unittest.TestCase):
         with self.assertRaises(ValueError) as caught:
             launch_configs.get("does-not-exist")
         self.assertIn("rankfm-prod", str(caught.exception))
+
+
+class NoTrainerSpecLaunchConfigTest(unittest.TestCase):
+    """A launch config whose entry point has its own CLI and no dataset.
+
+    No trainer_spec, so no dataset-derived --local_batch_size / --max_steps, no
+    flag check, and no host-count constraint.
+    """
+
+    def _config(self, **flags: object) -> launch_configs.LaunchConfig:
+        return launch_configs.LaunchConfig(
+            description="x",
+            name="other",
+            entrypoint="some.other.entry",
+            trainer_spec=None,
+            trainer_flags=flags,
+            env={"A": "{job_name}"},
+        )
+
+    def test_flags_pass_through_as_written(self) -> None:
+        resolved = self._config(steps=5, verbose=None).resolve(hosts=1, job_name="JOB")
+        self.assertEqual(["--steps", "5", "--verbose"], list(resolved.entrypoint_args))
+        self.assertIsNone(resolved.local_batch_size)
+        self.assertIsNone(resolved.global_batch)
+        self.assertIsNone(resolved.max_steps)
+
+    def test_any_host_count_resolves(self) -> None:
+        # 17 would fail the rankfm dump's checks.
+        for hosts in (1, 17):
+            self.assertEqual(
+                hosts, self._config().resolve(hosts=hosts, job_name="J").hosts
+            )
+
+    def test_env_reaches_the_job_spec(self) -> None:
+        resolved = self._config().resolve(hosts=1, job_name="JOB")
+        self.assertIsNone(resolved.prod_config)
+        self.assertEqual({"A": "JOB"}, dict(resolved.env))
+        self.assertIn("some.other.entry", resolved.summary())
+
+    def test_global_batch_goes_with_a_trainer_spec(self) -> None:
+        for spec, global_batch in (
+            (launch_configs.RANKFM_TRAINER_SPEC, None),
+            (None, 32768),
+        ):
+            with self.subTest(trainer_spec=spec, global_batch=global_batch):
+                with self.assertRaises(ValueError):
+                    launch_configs.LaunchConfig(
+                        description="x",
+                        name="x",
+                        entrypoint="e",
+                        trainer_spec=spec,
+                        global_batch=global_batch,
+                        trainer_flags={},
+                        env={},
+                    )
 
 
 class OverrideFlagNameTest(unittest.TestCase):
@@ -318,7 +378,7 @@ class ProdConfigSpecTest(unittest.TestCase):
 
     def test_prod_config_asks_for_the_baked_artifact(self) -> None:
         resolved = launch_configs.get("rankfm-prod").resolve(hosts=16, job_name="JOB")
-        self.assertTrue(resolved.prod_config)
+        self.assertIs(launch_configs.RANKFM_PROD_CONFIG, resolved.prod_config)
 
     def test_prod_config_mounts_the_dump_dump_py_names(self) -> None:
         resolved = launch_configs.get("rankfm-prod").resolve(hosts=16, job_name="JOB")
