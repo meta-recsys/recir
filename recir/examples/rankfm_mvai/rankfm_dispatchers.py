@@ -954,8 +954,10 @@ def capture_sparse_arch_io(
         preproc_output = recblock.preprocessor_stack(sample_input)
         try:
             recblock.tokenizer_stack(preproc_output)
-        except (RuntimeError, AttributeError):
-            pass
+        except (RuntimeError, AttributeError) as e:
+            # Expected for downstream tokenizers (see docstring), but it is also
+            # the only trace of a failure inside the sparse arch itself.
+            logger.info(f"capture_sparse_arch_io: tokenizer stack raised {e!r}")
     for handle in handles:
         handle.remove()
 
