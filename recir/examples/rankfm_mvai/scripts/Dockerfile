@@ -124,8 +124,9 @@ COPY mvai_cloud /app/mvai_cloud
 COPY mrs /app/mrs
 COPY hpc /app/hpc
 
-# Prod's xsurface config, exported on the devserver under buck (the image has
-# no //minimal_viable_ai to build it from) and staged by
+# The launch config's prod config (rankfm's xsurface config by default),
+# exported on the devserver under buck (the image has no //minimal_viable_ai
+# to build it from) and staged by
 # build_image_podman.sh. The directory is EMPTY when that ran with
 # SKIP_PROD_CONFIG=1 -- COPY cannot be conditional, same as barnfs_wheel above.
 #
