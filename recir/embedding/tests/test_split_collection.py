@@ -22,6 +22,7 @@ import torch
 from recir.embedding.split_collection import (
     assert_replicated_half_is_unplanned,
     partition_by_sharding,
+    replicate_embedding_collection,
     ReplicatedEmbeddingCollection,
     split_embedding_collection,
 )
@@ -152,3 +153,28 @@ class SplitCollection(TestCase):
         assert_replicated_half_is_unplanned(
             _Plan({"ec.sharded": object()}), split, "ec"
         )
+
+
+class ReplicateCollection(TestCase):
+    def test_retypes_in_place_and_keeps_the_live_tables(self) -> None:
+        parent = torch.nn.Module()
+        ec = _collection(["a", "b"])
+        parent.ec = ec
+        tables = dict(ec.embeddings.items())
+
+        replicated = replicate_embedding_collection(parent, "ec")
+
+        self.assertIs(parent.ec, replicated)
+        self.assertIs(type(replicated), ReplicatedEmbeddingCollection)
+        for name, table in tables.items():
+            self.assertIs(
+                replicated.embeddings[name],
+                table,
+                "the table was copied rather than moved; its weights would fork",
+            )
+
+    def test_rejects_a_non_collection(self) -> None:
+        parent = torch.nn.Module()
+        parent.ec = torch.nn.Linear(2, 2)
+        with self.assertRaises(TypeError):
+            replicate_embedding_collection(parent, "ec")
