@@ -199,6 +199,29 @@ def split_embedding_collection(
     return split
 
 
+def replicate_embedding_collection(
+    parent: nn.Module,
+    attr: str,
+    cls: type[_CollectionT] = ReplicatedEmbeddingCollection,
+) -> _CollectionT:
+    """Retype ``parent.<attr>`` to ``cls`` in place, keeping its live tables.
+
+    For a whole collection that must stay out of the sharding planner (see
+    ``ReplicatedEmbeddingCollection``); ``cls`` may be a subclass of it that
+    overrides ``forward``.
+    """
+    source = getattr(parent, attr)
+    if not isinstance(source, EmbeddingCollection):
+        raise TypeError(
+            f"{attr} is {type(source).__name__}, not an EmbeddingCollection"
+        )
+    replicated = _sub_collection(
+        source, [c.name for c in source.embedding_configs()], cls
+    )
+    setattr(parent, attr, replicated)
+    return replicated
+
+
 def assert_replicated_half_is_unplanned(
     plan: object,
     split: SplitEmbeddingCollection,
