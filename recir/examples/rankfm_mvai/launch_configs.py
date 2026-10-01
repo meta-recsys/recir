@@ -392,6 +392,26 @@ _RANKFM_PROD = LaunchConfig(
 )
 
 
+_COSCALING_SMOKE_PROD_CONFIG = ProdConfigSpec(
+    export_target="//recir/examples/coscaling_mvai/smoke:export_artifact",
+    check_module="recir.examples.coscaling_mvai.smoke.artifact",
+)
+_COSCALING_SMOKE = LaunchConfig(
+    description="CoScaling recir smoke: compile + a few steps, checked against eager.",
+    name="coscaling-smoke",
+    entrypoint="recir.examples.coscaling_mvai.smoke.tpu_smoke",
+    # A smoke on the artifact's one batch: no dataset, configured through env.
+    trainer_spec=None,
+    trainer_flags={},
+    env={
+        "JAX_ENABLE_X64": "1",
+        "PYTHONFAULTHANDLER": "1",
+        "COSCALING_STEPS": "5",
+    },
+    prod_config=_COSCALING_SMOKE_PROD_CONFIG,
+)
+
+
 # Every launch config the CLI can name. Add yours here.
 #
 # Derive from an existing one rather than copying it, so a change to the base
@@ -407,7 +427,7 @@ _RANKFM_PROD = LaunchConfig(
 # Worth adding one for a setup that will be re-run, handed over, or used as a
 # baseline. A one-off is better served by `-- --seq_len_cap 2048`.
 LAUNCH_CONFIGS: dict[str, LaunchConfig] = {
-    config.name: config for config in (_RANKFM_PROD,)
+    config.name: config for config in (_RANKFM_PROD, _COSCALING_SMOKE)
 }
 
 
