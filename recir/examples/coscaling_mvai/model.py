@@ -15,7 +15,7 @@ Two changes over the GPU module, neither of which touches the math:
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple, TYPE_CHECKING
 
 import torch
 from hammer.ops.bf16_train_utils import set_autocast_factory
@@ -24,11 +24,7 @@ from hammer.v3.models.udd_fm_v3.coscaling.coscaling_config import CoScalingModul
 from hammer.v3.models.udd_fm_v3.coscaling.coscaling_train_v3 import (
     BlueReelsVDDCoScalingTrainV3,
 )
-from hammer.v3.models.udd_fm_v3.tests.parity.parity_common import _materialize_meta
-from minimal_viable_ai.core.ranking_common.configs import (
-    MTMLROOFeatureConfig,
-    MTMLROOTrainBatch,
-)
+from minimal_viable_ai.core.ranking_common.configs import MTMLROOTrainBatch
 from recir.embedding.split_collection import (
     replicate_embedding_collection,
     ReplicatedEmbeddingCollection,
@@ -37,6 +33,10 @@ from recir.examples.rankfm_mvai.rankfm_model_utils import _ec_sparse_arch_on
 from recir.torchax.amp import hammer_autocast_factory
 from torch._subclasses.fake_tensor import is_fake
 from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor
+
+if TYPE_CHECKING:
+    # Annotation only: the image's slimmed fork does not define it.
+    from minimal_viable_ai.core.ranking_common.configs import MTMLROOFeatureConfig
 
 logger: logging.Logger = logging.getLogger(__name__)
 
@@ -91,12 +91,17 @@ class CoScalingRecirModule(BlueReelsVDDCoScalingTrainV3):
         )
         self._recir_ro_kjt_keys: List[str] = []
         self._recir_nro_kjt_keys: List[str] = []
+        self._recir_unary_kjt_keys: List[str] = []
 
     def set_recir_kjt_keys(
-        self, ro_kjt_keys: List[str], nro_kjt_keys: List[str]
+        self,
+        ro_kjt_keys: Sequence[str],
+        nro_kjt_keys: Sequence[str],
+        unary_kjt_keys: Sequence[str] = (),
     ) -> None:
         self._recir_ro_kjt_keys = list(ro_kjt_keys)
         self._recir_nro_kjt_keys = list(nro_kjt_keys)
+        self._recir_unary_kjt_keys = list(unary_kjt_keys)
 
     # pyrefly: ignore [bad-override]
     def forward(
@@ -115,9 +120,6 @@ class CoScalingRecirModule(BlueReelsVDDCoScalingTrainV3):
         all_labels: Dict[str, torch.Tensor],
         loss_denom_source: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-        # The unary features and loss_denom_source are accepted only to match
-        # flatten_batch: CoScaling reads no unary features, and without padding
-        # its per-task mean already runs over the real global candidates.
         batch = MTMLROOTrainBatch(
             supervision_label=supervision_label_t.t().contiguous(),
             supervision_weight=supervision_weight_t.t().contiguous(),
@@ -133,18 +135,49 @@ class CoScalingRecirModule(BlueReelsVDDCoScalingTrainV3):
                 values=nro_id_list_values,
                 lengths=nro_id_list_lengths,
             ),
+            unary_features=KeyedJaggedTensor(
+                keys=self._recir_unary_kjt_keys,
+                values=unary_values,
+                lengths=unary_lengths,
+            ),
             num_candidates=num_candidates,
+            all_labels=all_labels,
             ro_embedding_features=None,
             nro_embedding_features=None,
-            all_labels=all_labels,
+            request_id=None,
+            score_time=None,
             B_NRO=nro_float_features.size(0),
         )
-        return super().forward(batch)
+        loss_norm_denom = (
+            loss_denom_source.sum() if loss_denom_source is not None else None
+        )
+        return super().forward(batch, loss_norm_denom=loss_norm_denom)
+
+
+def _materialize_meta(module: torch.nn.Module, device: torch.device) -> int:
+    """Replace meta params/buffers with real storage; returns how many."""
+    n_meta = 0
+    for submod in module.modules():
+        for name, param in list(submod.named_parameters(recurse=False)):
+            if param.device.type == "meta":
+                new = torch.empty(param.shape, dtype=param.dtype, device=device)
+                torch.nn.init.normal_(new, 0.0, 0.02)
+                submod.register_parameter(
+                    name, torch.nn.Parameter(new, requires_grad=param.requires_grad)
+                )
+                n_meta += 1
+        for name, buf in list(submod.named_buffers(recurse=False)):
+            if buf is not None and buf.device.type == "meta":
+                submod.register_buffer(
+                    name, torch.zeros(buf.shape, dtype=buf.dtype, device=device)
+                )
+                n_meta += 1
+    return n_meta
 
 
 def build_model(
     module_config: CoScalingModuleConfig,
-    feature_config: MTMLROOFeatureConfig,
+    feature_config: MTMLROOFeatureConfig | Any,
 ) -> CoScalingRecirModule:
     """Build the recir CoScaling module on CPU with pure PyTorch kernels."""
     device = torch.device("cpu")
