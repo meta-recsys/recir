@@ -84,10 +84,16 @@ else
 fi
 
 echo "--- Exporting prod config artifact ---"
-# Prod's config cannot be built inside the image: //minimal_viable_ai is not
-# staged into it. So it is exported here, on the devserver under buck, and
-# baked in -- config._load_prod_module_config reads the artifact when
-# PROD_CONFIG_ARTIFACT points at it.
+# A model's prod config cannot be built inside the image: //minimal_viable_ai
+# is not staged into it. So it is exported here, on the devserver under buck,
+# and baked in; the entry point reads it from PROD_CONFIG_ARTIFACT (rankfm:
+# config._load_prod_module_config).
+#
+# Which model's: PROD_CONFIG_EXPORT_TARGET is the exporter (a python_binary
+# taking --out / --source-revision / --source-dirty) and
+# PROD_CONFIG_CHECK_MODULE the module whose check(path) validates the result
+# inside the built image. mvai-cloud sets both from the launch config's
+# ProdConfigSpec; the defaults are rankfm's.
 #
 # Baked rather than mounted as a ConfigMap on purpose. The ConfigMap
 # (rankfm-prod-cfg) is a single cluster-wide object shared with the parity
@@ -110,6 +116,8 @@ echo "--- Exporting prod config artifact ---"
 # the Dockerfile's COPY repeats them again. tests/test_prod_config_spec.py
 # asserts all three agree, so a rename fails a test rather than being found by
 # grep.
+PROD_CONFIG_EXPORT_TARGET="${PROD_CONFIG_EXPORT_TARGET:-//recir/examples/rankfm_mvai:export_prod_config}"
+PROD_CONFIG_CHECK_MODULE="${PROD_CONFIG_CHECK_MODULE:-recir.examples.rankfm_mvai.prod_config_artifact}"
 PROD_CFG_STAGE="${STAGING_DIR}/prod_config"
 mkdir -p "$PROD_CFG_STAGE"
 PROD_CONFIG_INCLUDED=true
@@ -117,7 +125,7 @@ PROD_CONFIG_REV=""
 if [ "${SKIP_PROD_CONFIG:-0}" = "1" ]; then
     PROD_CONFIG_INCLUDED=false
     echo "SKIP_PROD_CONFIG=1: building without the prod config artifact."
-    echo "  --prod_faithful against this image will fail to find it."
+    echo "  An entry point that reads PROD_CONFIG_ARTIFACT will fail to find it."
 elif [ -n "${PROD_CONFIG_ARTIFACT_SRC:-}" ]; then
     if [ ! -f "$PROD_CONFIG_ARTIFACT_SRC" ]; then
         echo "ERROR: PROD_CONFIG_ARTIFACT_SRC=$PROD_CONFIG_ARTIFACT_SRC does not exist" >&2
@@ -134,12 +142,13 @@ else
     fi
     if ! (
         cd "$FBCODE_DIR"
-        buck2 run //recir/examples/rankfm_mvai:export_prod_config -- \
+        echo "  $PROD_CONFIG_EXPORT_TARGET"
+        buck2 run "$PROD_CONFIG_EXPORT_TARGET" -- \
             --out "${PROD_CFG_STAGE}/prod_cfg.pt" \
             --source-revision "$PROD_CONFIG_REV" \
             ${PROD_CFG_DIRTY_ARG}
     ); then
-        echo "ERROR: could not export prod's config." >&2
+        echo "ERROR: could not export the prod config ($PROD_CONFIG_EXPORT_TARGET)." >&2
         echo "  Reuse an earlier export:" >&2
         echo "    PROD_CONFIG_ARTIFACT_SRC=/tmp/prod_cfg.pt $0" >&2
         echo "  Or omit it, which is correct for synthetic and bench jobs:" >&2
@@ -147,6 +156,7 @@ else
         exit 1
     fi
 fi
+echo ""
 for dir in /var/facebook/x509_identities /var/facebook/credentials; do
     if [ ! -d "$dir" ]; then
         echo "Error: $dir not found." >&2
@@ -316,6 +326,7 @@ BUILD_TAG="$IMAGE_TAG" \
 BUILD_BARNFS="$BARNFS_INCLUDED" \
 BUILD_PROD_CONFIG="$PROD_CONFIG_INCLUDED" \
 BUILD_PROD_CONFIG_REV="$PROD_CONFIG_REV" \
+BUILD_PROD_CONFIG_TARGET="$PROD_CONFIG_EXPORT_TARGET" \
 BUILD_OUT="${STAGING_DIR}/recir/BUILD_INFO.json" \
 python3 -c '
 import datetime, json, os
@@ -334,6 +345,11 @@ with open(os.environ["BUILD_OUT"], "w") as f:
             "barnfs": os.environ["BUILD_BARNFS"] == "true",
             "prod_config": os.environ["BUILD_PROD_CONFIG"] == "true",
             "prod_config_revision": os.environ["BUILD_PROD_CONFIG_REV"],
+            "prod_config_export_target": (
+                os.environ["BUILD_PROD_CONFIG_TARGET"]
+                if os.environ["BUILD_PROD_CONFIG"] == "true"
+                else ""
+            ),
         },
         f,
         indent=2,
@@ -403,28 +419,19 @@ else:
 "
 fi
 
-# The artifact describes the model every --prod_faithful run builds, and until
-# now nothing checked it: an export that picked up a parity or replay shim
-# carries a different sequence length and produces a run whose numbers are
-# quietly not prod's. The runbook says to eyeball the exporter's output for
-# 3554; assert it at build time instead.
+# The artifact describes the model the run builds, and a wrong one fails
+# quietly: the run trains a different model. Each model's check module asserts
+# what identifies it (rankfm: prod's sequence length), here at build time.
 if [ "$PROD_CONFIG_INCLUDED" = true ]; then
     PROD_CONFIG_CHECK="
+import importlib
 from recir.examples.rankfm_mvai.prod_config_spec import (
     PROD_CONFIG_ARTIFACT_CONTAINER_PATH,
-    PROD_CONFIG_EXPECTED_SEQ_LEN,
 )
-from recir.examples.rankfm_mvai.prod_config_artifact import load_prod_config
-_mc, _fc = load_prod_config(PROD_CONFIG_ARTIFACT_CONTAINER_PATH)
-if _mc.hstu_max_seq_len != PROD_CONFIG_EXPECTED_SEQ_LEN:
-    raise SystemExit(
-        f'prod config artifact has hstu_max_seq_len={_mc.hstu_max_seq_len}, '
-        f'expected {PROD_CONFIG_EXPECTED_SEQ_LEN}. The export picked up a '
-        f'parity or replay shim, so it describes a different model than '
-        f'production.'
-    )
-print(f'prod config artifact: OK ({len(_mc.embedding_tables)} tables, '
-      f'hstu_max_seq_len={_mc.hstu_max_seq_len})')
+_summary = importlib.import_module('${PROD_CONFIG_CHECK_MODULE}').check(
+    PROD_CONFIG_ARTIFACT_CONTAINER_PATH
+)
+print(f'prod config artifact: OK ({_summary})')
 "
 else
     PROD_CONFIG_CHECK="
