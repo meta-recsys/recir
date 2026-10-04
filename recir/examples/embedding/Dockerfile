@@ -19,9 +19,14 @@ RUN pip install "jax[tpu]"
 # (the SC-vs-TC comparison). Mirrors recir/examples/dlrmv3/Dockerfile.
 RUN pip install jax-tpu-embedding
 
-# Copy and install recir.
+# The package initializer imports torch even though these TPU runners use JAX.
+# Install the CPU wheel explicitly so the subsequent editable install does not
+# pull the much larger CUDA dependency set.
+RUN pip install --index-url https://download.pytorch.org/whl/cpu torch
+
+# Copy and install recir. Runtime dependencies are installed explicitly above.
 COPY . /app/recir
-RUN pip install -e "/app/recir"
+RUN pip install --no-deps -e "/app/recir"
 
 ENV PYTHONPATH="/app/recir:${PYTHONPATH}"
 ENV PYTHONUNBUFFERED=1

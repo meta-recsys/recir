@@ -32,8 +32,11 @@ import jax.numpy as jnp
 import numpy as np
 from jax.experimental.multihost_utils import sync_global_devices
 from recir.ops.pallas.embeddings.ringshift import (
+    _POOLING_IMPL_ENV,
     _use_dma_gather,
+    pool_per_rank,
     ringshift_embedding_lookup,
+    ringshift_embedding_lookup_reference,
     ringshift_embedding_lookup_reference_jax,
 )
 
@@ -373,6 +376,201 @@ class RingshiftFwdCorrectnessTest(unittest.TestCase):
             self.skipTest(f"Need 256 logical devices, have {len(all_devices)}")
         devices = all_devices[::2]
         self._run_correctness_with_devices(world_size=128, devices=devices)
+
+
+class RingshiftEbcCorrectnessTest(unittest.TestCase):
+    """Pooled (EBC) correctness on real TPU, against INDEPENDENT references.
+
+    The benchmark already checks that the two pooled implementations agree with
+    each other. That is a relative check: it cannot catch a mistake both make,
+    and more importantly it cannot catch one they inherit from the shared
+    host-side prep (segment ids, sort permutation, per-peer padding), which is
+    the part with the most index arithmetic.
+
+    So both arms are checked here against references that share no code with
+    them:
+
+      * forward -- the numpy oracle (``ringshift_embedding_lookup_reference``),
+        a plain double loop over (rank, id). No segment_sum, no kernel, no
+        permutation.
+      * gradient -- ``ringshift_embedding_lookup_reference_jax`` composed with
+        ``pool_per_rank``, differentiated by autodiff. That path never enters
+        the Pallas kernel, so it is an independent check of Phase 4's
+        hand-written ``custom_vjp`` -- which nothing else exercises, on any
+        machine.
+
+    Single host only. The oracle needs the whole global table on the host, and
+    a W=32 shard set is both large and spread across processes.
+    """
+
+    WORLD_SIZE = 4
+    DIM = 16
+    V_LOCAL = 64
+    MAX_LOCAL_IDS = 256
+    NUM_BAGS = 32
+    # Bags hold ~8 f32 rows, so the arms differ from the oracle only by
+    # summation order. Far above that rounding, far below any index bug.
+    RTOL = 1e-5
+
+    def _log(self, msg: str) -> None:
+        if jax.process_index() == 0:
+            print(f"[EBC_CORRECTNESS] {msg}", file=sys.stderr, flush=True)
+
+    def _bag_lengths(self, counts: np.ndarray) -> np.ndarray:
+        """Hand-built so the interesting cases are guaranteed, not hoped for.
+
+        A random split would *probably* produce an empty bag; this makes the
+        empty, singleton and hot cases certain, and keeps the layout identical
+        across runs so a failure is reproducible.
+        """
+        out = np.zeros((self.WORLD_SIZE, self.NUM_BAGS), dtype=np.int32)
+        for r in range(self.WORLD_SIZE):
+            total = int(counts[r])
+            lengths = np.zeros(self.NUM_BAGS, dtype=np.int32)
+            lengths[0] = 0  # empty bag: divisor clamp + trash-segment path
+            lengths[1] = 1  # singleton: pooling must be a no-op on it
+            spread = self.NUM_BAGS - 3
+            base = (total - 1) // (spread + 4)  # leave a surplus for the hot bag
+            lengths[2 : 2 + spread] = base
+            lengths[-1] = total - int(lengths.sum())  # hot bag takes the rest
+            assert lengths[-1] >= 0, (total, base)
+            assert int(lengths.sum()) == total
+            out[r] = lengths
+        return out
+
+    def _inputs(self, mesh):
+        local_ids, local_id_count = _make_skewed_inputs_on_device(
+            mesh, self.WORLD_SIZE, self.MAX_LOCAL_IDS, self.V_LOCAL, seed=5
+        )
+        P = jax.sharding.PartitionSpec
+
+        @functools.partial(
+            jax.shard_map, mesh=mesh, in_specs=(), out_specs=P("x"), check_vma=False
+        )
+        def make_table():
+            rank = jax.lax.axis_index("x")
+            key = jax.random.fold_in(jax.random.PRNGKey(11), rank)
+            return jax.random.normal(
+                key, (1, self.V_LOCAL, self.DIM), dtype=jnp.float32
+            )
+
+        # pyrefly: ignore [missing-argument]
+        table = make_table()
+        jax.block_until_ready((local_ids, local_id_count, table))
+        bags = jnp.asarray(
+            self._bag_lengths(np.asarray(jax.device_get(local_id_count)))
+        )
+        return local_ids, local_id_count, table, bags
+
+    def _rel(self, got, want) -> float:
+        want = np.asarray(want, dtype=np.float64)
+        got = np.asarray(got, dtype=np.float64)
+        # A floor of 1 makes this an atol+rtol-style check: zero-valued bags
+        # cannot borrow tolerance from a large value elsewhere in the output.
+        scale = np.maximum(np.abs(want), 1.0)
+        return float(np.max(np.abs(got - want) / scale))
+
+    def test_w4_ebc_correctness(self) -> None:
+        """Both pooled arms vs the numpy oracle (forward) and a non-kernel VJP."""
+        all_devices = jax.devices()
+        if len(all_devices) < self.WORLD_SIZE:
+            self.skipTest(f"Need {self.WORLD_SIZE} devices, have {len(all_devices)}")
+        if jax.process_count() > 1:
+            self.skipTest("single-host only: the oracle needs the global table")
+
+        mesh = jax.sharding.Mesh(np.array(all_devices[: self.WORLD_SIZE]), ("x",))
+        ids, count, table, bags = self._inputs(mesh)
+        recv_capacity = self.MAX_LOCAL_IDS + 128
+        self._log(
+            f"=== W={self.WORLD_SIZE} D={self.DIM} v_local={self.V_LOCAL} "
+            f"num_bags={self.NUM_BAGS} ==="
+        )
+
+        ids_np = np.asarray(jax.device_get(ids))
+        table_np = np.asarray(jax.device_get(table))
+        bags_np = np.asarray(jax.device_get(bags))
+
+        def arm(pooling: str, impl: str, t):
+            previous = os.environ.get(_POOLING_IMPL_ENV)
+            os.environ[_POOLING_IMPL_ENV] = impl
+            try:
+                return ringshift_embedding_lookup(
+                    ids,
+                    None,
+                    t,
+                    mesh=mesh,
+                    axis_name="x",
+                    recv_capacity=recv_capacity,
+                    splitter="globalpad",
+                    pooling=pooling,
+                    bag_lengths=bags,
+                )
+            finally:
+                if previous is None:
+                    os.environ.pop(_POOLING_IMPL_ENV, None)
+                else:
+                    os.environ[_POOLING_IMPL_ENV] = previous
+
+        failures = []
+        for pooling in ("sum", "mean"):
+            # ---- forward vs the numpy oracle -------------------------------
+            want = ringshift_embedding_lookup_reference(
+                ids_np, None, table_np, self.WORLD_SIZE, pooling, bags_np
+            )
+            for impl in ("xla", "fused_kernel"):
+                got = jax.device_get(
+                    jax.jit(functools.partial(arm, pooling, impl))(table)
+                )
+                rel = self._rel(got, want)
+                ok = rel <= self.RTOL
+                self._log(
+                    f"fwd  {pooling:4s} {impl:6s}: max_rel_diff={rel:.3e} "
+                    f"{'PASS' if ok else 'FAIL'}"
+                )
+                if not ok:
+                    failures.append(f"fwd/{pooling}/{impl}={rel:.3e}")
+
+            # ---- gradient vs a reference path that never enters the kernel --
+            # Random cotangent, not ones: an all-ones cotangent makes many index
+            # mistakes invisible, because every bag then contributes equally.
+            cot = jax.random.normal(
+                jax.random.PRNGKey(13),
+                (self.WORLD_SIZE, self.NUM_BAGS, self.DIM),
+                dtype=jnp.float32,
+            )
+
+            def ref_loss(t, pooling=pooling, cot=cot):
+                per_id = ringshift_embedding_lookup_reference_jax(
+                    ids, count, t, mesh=mesh, axis_name="x"
+                )
+                pooled = jax.vmap(functools.partial(pool_per_rank, pooling=pooling))(
+                    per_id, bags
+                )
+                return jnp.sum(pooled * cot)
+
+            want_grad = jax.device_get(jax.jit(jax.grad(ref_loss))(table))
+            for impl in ("xla", "fused_kernel"):
+
+                def arm_loss(t, pooling=pooling, impl=impl, cot=cot):
+                    return jnp.sum(arm(pooling, impl, t) * cot)
+
+                got_grad = jax.device_get(jax.jit(jax.grad(arm_loss))(table))
+                rel = self._rel(got_grad, want_grad)
+                ok = rel <= self.RTOL
+                self._log(
+                    f"grad {pooling:4s} {impl:6s}: max_rel_diff={rel:.3e} "
+                    f"{'PASS' if ok else 'FAIL'}"
+                )
+                if not ok:
+                    failures.append(f"grad/{pooling}/{impl}={rel:.3e}")
+
+        self._log(
+            f"=== RESULT ebc_correctness: {'PASS' if not failures else 'FAIL'} "
+            f"rtol={self.RTOL:.0e} {' '.join(failures)} ==="
+        )
+        self.assertEqual(
+            failures, [], f"pooled arms disagree with reference: {failures}"
+        )
 
 
 if __name__ == "__main__":

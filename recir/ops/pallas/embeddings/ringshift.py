@@ -2053,9 +2053,10 @@ def ringshift_embedding_lookup(
     :func:`jax.custom_vjp`-registered helper (:func:`_ringshift_with_grad`)
     so ``jax.grad`` / ``jax.value_and_grad`` / ``optax`` compose correctly.
     The backward pass uses the dedicated
-    :func:`_ringshift_embedding_lookup_backward_local` driver. Pooling adds no
-    ``custom_vjp`` of its own -- ``segment_sum``'s built-in VJP composes with
-    the per-id one.
+    :func:`_ringshift_embedding_lookup_backward_local` driver. The XLA pooling
+    path composes ``segment_sum``'s built-in VJP with the per-id VJP; the fused
+    path pools inside the custom-VJP boundary and explicitly fans each bag's
+    cotangent back out to its member ids.
     """
     _check_pooling(pooling, bag_lengths, looked_up_id_count)
     pooling_impl = _pooling_impl_from_env(pooling)
@@ -2070,7 +2071,7 @@ def ringshift_embedding_lookup(
     if pooling_impl in ("none", "xla"):
         # Both paths ask the kernel for per-id rows. The XLA path reduces those
         # rows below; the no-pooling path returns them directly.
-        out = _ringshift_with_grad(  # pyre-ignore[29]
+        out = _ringshift_with_grad(
             looked_up_ids,
             looked_up_id_count,
             local_embedding_table,
@@ -2092,7 +2093,7 @@ def ringshift_embedding_lookup(
     elif pooling_impl == "fused_kernel":
         # Pooling happens inside the custom_vjp boundary, so `_bwd` owns the
         # fan-out from each bag gradient to its per-id gradients.
-        return _ringshift_with_grad(  # pyre-ignore[29]
+        return _ringshift_with_grad(
             looked_up_ids,
             looked_up_id_count,
             local_embedding_table,
