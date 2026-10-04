@@ -33,6 +33,7 @@ from recir.ops.pallas.embeddings import (
 | `manifests/w4-ebc-parity-dump.yaml`         | JobSet manifest for that dump.                                |
 | `test_embedding_bag_tpu_vs_torchrec_with_tpu_input.sh` | Runs the complete TPU artifact + CPU TorchRec comparison workflow. |
 | `run_correctness.sh`                        | Builds/pushes the current TPU image, then runs every correctness suite or one named suite. |
+| `run_perf.sh`                               | Builds/pushes the current TPU image, then runs every performance suite or one named suite. |
 
 Run the complete TPU correctness matrix, or select one suite:
 
@@ -46,13 +47,60 @@ The image build/push is enabled by default so a correctness run cannot silently
 exercise stale code from the registry. Use `--skip-image-build` only for an
 intentional rerun against the image that is already published.
 
+Run the complete EBC performance matrix, or select one suite:
+
+```sh
+./run_perf.sh
+./run_perf.sh ebc-w16
+./run_perf.sh --skip-image-build ebc-w4
+```
+
+The performance runner follows the same rule: it builds and pushes the current
+image once by default. Use `--skip-image-build` only for an intentional rerun
+against the image that is already published. Each of `ebc-w4`, `ebc-w16`,
+`ebc-w32`, `ebc-w64`, and `ebc-w128` runs
+`torchrec.EmbeddingBagCollection` on the host at the shape parsed from the TPU
+log and reports TorchRec/fused speedup. The XLA pooled arm is retained as an
+additional same-TPU reference, not as the baseline.
+
+The full flow is also available as copy-pasteable individual steps. This W=4
+example can be changed to W16 or W32 by substituting the manifest and log name.
+Run these commands from this directory:
+
+```sh
+# 1. Build and publish the TPU image.
+./build_image_podman.sh
+
+# 2. Submit the manifest, locate JAX process 0, tail it to RESULT, and archive
+#    the rank-0 log as bench_logs/w4-ebc-perf-latest.log.
+./run_microbench.sh manifests/w4-ebc-perf.yaml
+
+# 3. Time the TorchRec EBC baseline at the exact shape recorded in that log.
+cd ../../..
+buck2 run fbcode//recir/examples/embedding:ringshift_ebc_torchrec_bench -- \
+  --tpu-log recir/examples/embedding/bench_logs/w4-ebc-perf-latest.log 2>&1 | \
+  tee -a recir/examples/embedding/bench_logs/w4-ebc-perf-latest.log
+```
+
+The final line has the existing benchmark result shape and names the baseline
+explicitly:
+
+```
+[BENCH_EBC_TORCHREC] === RESULT ebc_vs_torchrec: baseline=torchrec.EmbeddingBagCollection torchrec=...ms(CPU) fused=...ms(TPU) speedup=...x xla=...ms(TPU,reference) shape=(world_size=4,dim=128,num_bags=1024,bag_len=6.399,distribution=skewed,pooling=sum) ===
+```
+
+`bag_len` is the average valid IDs per bag. The generated bags remain jagged;
+`distribution=skewed` controls both the heavy-tailed bag lengths and the hot-peer
+ID ownership pattern. Because TorchRec runs on the host CPU and the fused arm
+runs on TPU, this is the requested end-to-end implementation baseline, not a
+same-device kernel-only comparison.
+
 ## torchrec EBC parity (two stages)
 
 The pooled kernel's headline reference is torchrec's `EmbeddingBagCollection`,
-but torchrec needs torch and this image installs only `jax[tpu]`, so the two
-cannot meet in one process. Stage 1 runs on TPU and prints an artifact carrying
-both the inputs and the fused results; stage 2 replays it against torchrec on
-CPU:
+but the TPU image does not install torchrec, so the two cannot meet in one
+process. Stage 1 runs on TPU and prints an artifact carrying both the inputs and
+the fused results; stage 2 replays it against torchrec on CPU:
 
 ```sh
 ./test_embedding_bag_tpu_vs_torchrec_with_tpu_input.sh
@@ -154,13 +202,15 @@ A passing correctness run prints:
 [CORRECTNESS_W32] === RESULT: max_diff=0.000000e+00 ===
 ```
 
-A perf run prints per-iter timings followed by:
+A W=4 TPU-stage perf run prints per-iter timings followed by:
 
 ```
-[W=32] === RESULT: ra2a=[..., ..., ...] fused=[..., ..., ...]
+[BENCH_EBC_W4_D128_Q8192_skewed] === RESULT ebc: ... xla=...ms kernel=...ms speedup=...x ===
 ```
 
-Compare medians of `ra2a` vs `fused` for the headline speedup.
+The local TorchRec stage then prints the `ebc_vs_torchrec` headline shown above.
+Use its TorchRec/fused ratio as the headline speedup; XLA is an additional TPU
+reference point.
 
 ## SparseCore vs TensorCore (forward)
 
