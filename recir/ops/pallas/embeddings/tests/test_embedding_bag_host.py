@@ -7,8 +7,10 @@
 
 """CPU-runnable tests for the pooled (EBC) layer over the ringshift EC kernel.
 
-This file tests the shared primitives and the pure-XLA pooling reference without
-executing the real-TPU-only fused kernel.
+The production entry point defaults to fused Pallas pooling. A compile-time
+environment setting selects the XLA post-reduction reference. This file tests
+the shared primitives and everything in both paths that can be checked without
+executing the real-TPU-only kernel.
 
 Expected values are hand-computed inline rather than derived from a second
 implementation, so a bug in the reference cannot hide a bug in the code.
@@ -680,3 +682,56 @@ class PoolingImplEnvironmentTest(unittest.TestCase):
             self.assertRaisesRegex(ValueError, _POOLING_IMPL_ENV),
         ):
             _pooling_impl_from_env("sum")
+
+
+class PoolingImplParityTest(unittest.TestCase):
+    """Both environment-selected implementations trace and differentiate.
+
+    Values cannot be compared here -- the fused path only runs on a real TPU --
+    so this pins down their output and gradient shapes on CPU.
+    """
+
+    W = 1  # single CPU device; the kernel is traced, never executed
+    MAX_LOCAL_IDS = 4
+    V_LOCAL = 4
+    DIM = 2
+    NUM_BAGS = 2
+
+    def _call(self, table: jax.Array, pooling_impl: str) -> jax.Array:
+        with mock.patch.dict(
+            os.environ, {_POOLING_IMPL_ENV: pooling_impl}, clear=False
+        ):
+            return ringshift_embedding_lookup(
+                jnp.zeros((self.W, self.MAX_LOCAL_IDS), jnp.int32),
+                None,
+                table,
+                mesh=jax.sharding.Mesh(np.array(jax.devices()[: self.W]), ("rank",)),
+                axis_name="rank",
+                recv_capacity=_TILE_INT32,
+                pooling="sum",
+                bag_lengths=jnp.ones((self.W, self.NUM_BAGS), jnp.int32),
+            )
+
+    def _table(self) -> jax.Array:
+        return jnp.zeros((self.W, self.V_LOCAL, self.DIM), jnp.float32)
+
+    def test_both_impls_give_the_same_forward_shape(self) -> None:
+        shapes = {
+            impl: jax.eval_shape(
+                lambda t, i=impl: self._call(t, i), self._table()
+            ).shape
+            for impl in ("xla", "fused_kernel")
+        }
+        self.assertEqual(shapes["xla"], (self.W, self.NUM_BAGS, self.DIM))
+        self.assertEqual(shapes["xla"], shapes["fused_kernel"])
+
+    def test_both_impls_give_the_same_gradient_shape(self) -> None:
+        grads = {
+            impl: jax.eval_shape(
+                jax.grad(lambda t, i=impl: jnp.sum(self._call(t, i))), self._table()
+            )
+            for impl in ("xla", "fused_kernel")
+        }
+        self.assertEqual(grads["xla"].shape, (self.W, self.V_LOCAL, self.DIM))
+        self.assertEqual(grads["xla"].shape, grads["fused_kernel"].shape)
+        self.assertEqual(grads["xla"].dtype, grads["fused_kernel"].dtype)

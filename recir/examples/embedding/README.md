@@ -29,6 +29,43 @@ from recir.ops.pallas.embeddings import (
 | `manifests/w4-bwd-suite.yaml`               | JobSet manifest for the full W=4 backward unittest suite (6 tests, single host). |
 | `manifests/w32-bwd-correctness.yaml`        | JobSet manifest for backward correctness at W=32 (multi-host). |
 | `manifests/w{32,64,128}-bwd-perf.yaml`      | JobSet manifests for fwd+bwd multi-iter perf at each W (multi-host). |
+| `ringshift_ebc_parity_dump.py`              | TPU half of the torchrec EBC parity check: runs the fused pooled op and emits a self-describing artifact. See below. |
+| `manifests/w4-ebc-parity-dump.yaml`         | JobSet manifest for that dump.                                |
+| `test_embedding_bag_tpu_vs_torchrec_with_tpu_input.sh` | Runs the complete TPU artifact + CPU TorchRec comparison workflow. |
+| `run_correctness.sh`                        | Builds/pushes the current TPU image, then runs every correctness suite or one named suite. |
+
+Run the complete TPU correctness matrix, or select one suite:
+
+```sh
+./run_correctness.sh
+./run_correctness.sh ebc-w4
+./run_correctness.sh --skip-image-build ebc-w4
+```
+
+The image build/push is enabled by default so a correctness run cannot silently
+exercise stale code from the registry. Use `--skip-image-build` only for an
+intentional rerun against the image that is already published.
+
+## torchrec EBC parity (two stages)
+
+The pooled kernel's headline reference is torchrec's `EmbeddingBagCollection`,
+but torchrec needs torch and this image installs only `jax[tpu]`, so the two
+cannot meet in one process. Stage 1 runs on TPU and prints an artifact carrying
+both the inputs and the fused results; stage 2 replays it against torchrec on
+CPU:
+
+```sh
+./test_embedding_bag_tpu_vs_torchrec_with_tpu_input.sh
+```
+
+The artifact travels as framed base64 in the job log (the pod FS is ephemeral
+and the image has no `gsutil`), and it carries its own inputs, so the two halves
+share no fixture and cannot drift apart. Stage 2 skips when the env var is
+unset, and its log-parsing half is covered by CPU tests that always run.
+
+This differs from `w4-ebc-correctness`, which diffs against the in-repo numpy
+oracle: that one is faster to iterate on, this one is what deliverable 1.2 asks
+for.
 
 ## Build the image
 

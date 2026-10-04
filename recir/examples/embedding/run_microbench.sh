@@ -8,12 +8,18 @@
 # Microbench runner that mirrors recir/examples/rankfm/run_tpu_bench.sh's
 # log-capture, for the ringshift_bench microbench manifests (manifests/*.yaml).
 # Submits the JobSet and saves the FULL worker-0-0 stdout (where rank-0 prints
-# [RS_LOAD] and the RESULT fwd=... line) to an in-repo log file that survives
+# [RS_LOAD] and the headline RESULT line) to an in-repo log file that survives
 # pod auto-cleanup. Does NOT build the image (rebuild via build_image_podman.sh).
+#
+# Works for every --mode the bench exposes (fwd / bwd / ebc) and for the
+# correctness runners: the poll keys off the shared `=== RESULT` prefix rather
+# than one mode's spelling. No trailing space -- the correctness tests print
+# `=== RESULT:` with a colon, the bench modes `=== RESULT ebc:` with a space.
 #
 # Usage:
 #   cd <fbcode>
 #   ./recir/examples/embedding/run_microbench.sh manifests/rankfm-550k.yaml
+#   MAX_POLLS=3 ./recir/examples/embedding/run_microbench.sh manifests/rankfm-550k.yaml
 #
 # Logs land in recir/examples/embedding/bench_logs/<name>-<ts>.log.
 set -uo pipefail
@@ -37,44 +43,73 @@ TS="$(date +%Y%m%d-%H%M%S)"
 NAME="$(basename "${YAML}" .yaml)"
 LOG="${LOG_DIR}/${NAME}-${TS}.log"
 LATEST="${LOG_DIR}/${NAME}-latest.log"
+MAX_POLLS="${MAX_POLLS:-60}"
+
+if ! [[ "${MAX_POLLS}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "ERROR: MAX_POLLS must be a positive integer, got: ${MAX_POLLS}" >&2
+    exit 2
+fi
 
 cd "${FBCODE_ROOT}" || exit 1
 # helpers.sh exports CTX/NS + HTTPS_PROXY and the gateway kube context.
+HELPERS="${FBCODE_ROOT}/recir/examples/rankfm_mvai/scripts/helpers.sh"
+if [ ! -f "${HELPERS}" ]; then
+    echo "ERROR: TPU JobSet helper not found: ${HELPERS}" >&2
+    exit 1
+fi
 # shellcheck source=/dev/null
-source "${FBCODE_ROOT}/recir/examples/rankfm_mvai/helpers.sh"
+source "${HELPERS}"
 
 {
     echo "=== microbench run: ${NAME} @ ${TS} ==="
     echo "yaml: ${YAML}"
-    JS="$(kubectl create -f "${YAML}" --context="${CTX}" -n "${NS}" \
-        -o jsonpath='{.metadata.name}' 2>&1 | tail -1)"
-    echo "jobset: ${JS}"
 } | tee "${LOG}"
 
-JS="$(grep '^jobset: ' "${LOG}" | tail -1 | awk '{print $2}')"
-if [ -z "${JS}" ]; then
-    echo "ERROR: submit failed" | tee -a "${LOG}"; exit 1
+submit_output="$(kubectl create -f "${YAML}" --context="${CTX}" -n "${NS}" \
+    -o jsonpath='{.metadata.name}' 2>&1)"
+submit_rc=$?
+if [ "${submit_rc}" -ne 0 ]; then
+    echo "${submit_output}" | tee -a "${LOG}" >&2
+    echo "ERROR: submit failed (exit ${submit_rc})" | tee -a "${LOG}" >&2
+    exit "${submit_rc}"
 fi
+JS="$(echo "${submit_output}" | tail -1)"
+echo "jobset: ${JS}" | tee -a "${LOG}"
 
 # Poll: scan ALL workers for the process-0 output. On GKE TPU, JAX process 0
 # (device 0, where [RS_LOAD] + RESULT print) lands on a RANDOM worker pod, NOT
 # worker-0-0 -- so dumping only worker-0-0 misses them. The manifest's trailing
 # `sleep` keeps pods alive so we can grab the full log before cleanup.
-for i in $(seq 1 60); do
+found=""
+result_failed=false
+for i in $(seq 1 "${MAX_POLLS}"); do
     sleep 20
     pods="$(kubectl get pods --context="${CTX}" -n "${NS}" \
         -l "jobset.sigs.k8s.io/jobset-name=${JS}" -o name 2>/dev/null | sed 's|pod/||')"
     [ -z "${pods}" ] && { echo "poll ${i}: no pods yet"; continue; }
-    found=""
     for n in ${pods}; do
         full="$(kubectl logs "${n}" --context="${CTX}" -n "${NS}" 2>/dev/null)"
-        if echo "${full}" | grep -qE "RESULT fwd"; then
+        # Keyed on the headline, which only the JAX process-0 pod prints --
+        # a marker echoed by the manifest's shell would match every worker.
+        # Wait for BENCH_EXIT too, so a parity artifact printed after RESULT
+        # cannot be archived before the producer has finished writing it.
+        if echo "${full}" | grep -q "=== RESULT" && \
+                echo "${full}" | grep -q "BENCH_EXIT="; then
             { echo "----- BEGIN process-0 worker (${n}) -----"; echo "${full}";
               echo "----- END ${n} -----"; } >> "${LOG}"
             found="${n}"
             echo "DONE -> ${LOG}"
             echo "  RS_LOAD: $(echo "${full}" | grep '\[RS_LOAD\]' | head -1)"
-            echo "  RESULT : $(echo "${full}" | grep 'RESULT fwd' | head -1)"
+            # --mode ebc gates its timings on the two reductions agreeing.
+            # Surface that line too: a speedup is only meaningful once it holds.
+            agree="$(echo "${full}" | grep 'agreement:' | head -1)"
+            [ -n "${agree}" ] && echo "  AGREE  : ${agree}"
+            echo "${full}" | grep '=== RESULT' | sed 's/^/  RESULT : /'
+            bench_exit="$(echo "${full}" | grep 'BENCH_EXIT=' | tail -1 | cut -d= -f2)"
+            if [ "${bench_exit}" != "0" ] || \
+                    echo "${full}" | grep '=== RESULT' | grep -q 'FAIL'; then
+                result_failed=true
+            fi
             break
         fi
     done
@@ -84,3 +119,12 @@ done
 
 ln -sf "${LOG}" "${LATEST}"
 echo "log: ${LOG}"
+
+if [ -z "${found}" ]; then
+    echo "ERROR: no RESULT found after ${MAX_POLLS} polls" | tee -a "${LOG}" >&2
+    exit 1
+fi
+if [ "${result_failed}" = true ]; then
+    echo "ERROR: test reported a failing RESULT" | tee -a "${LOG}" >&2
+    exit 1
+fi
