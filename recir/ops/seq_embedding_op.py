@@ -26,21 +26,45 @@ The DP (replicated) table path does NOT use a custom op -- it calls plain
 meta-tolerant custom op is needed.
 
 ``ringshift_embedding`` contract:
-  ringshift_embedding(ids, lengths, weight, padding_idx=-1) -> activations
+  ringshift_embedding(
+      ids, lengths, weight, padding_idx=-1, pooling="none"
+  ) -> activations
     ids:     int32 [R, C]      ids reshaped to [W, max_local_ids] (leading axis =
                                mesh axis). The in-graph backend passes [W, T_local]
                                (one row per chip; T_local = per-chip token total).
-    lengths: int32 [R]         valid count per row (entries past it are padding,
-                               dropped from the ring-shift traffic). The in-graph
-                               backend passes full counts (no padding).
     weight:  [vocab, D]        embedding table; row-wise (FSDP/block) sharded by
                                recir's GSPMD lowering. BF16 tables use FP32 inside
                                the TPU kernel and cast the result/gradient back.
     padding_idx: int           nonnegative row whose gradient is suppressed, or
                                -1 for no padding row (matching ``F.embedding``).
-    returns: [R, C, D]         per-position embeddings in ``weight.dtype``.
+    pooling: str               "none" (sequence, the default and the unchanged
+                               behaviour), or "sum"/"mean" (EBC).
 
-Only ``weight`` is differentiable; ``ids``/``lengths`` get ``None`` gradients.
+  lengths and the return shape depend on pooling:
+    pooling="none"   lengths int32 [R]     valid count per row; entries past it
+                                           are padding and are dropped from the
+                                           ring-shift traffic
+                     returns  f32 [R, C, D]
+    pooling="sum"    lengths int32 [R, K]  row r's C ids cut into K consecutive
+      or "mean"                            bags; bag k holds lengths[r, k] of
+                                           them, so the row sums to C
+                     returns  f32 [R, K, D]
+
+``ids`` has ONE layout for both modes: a flat per-row id stream. Pooling only
+adds structure to ``lengths`` -- where the cuts fall -- and correspondingly
+gains an axis on the output.
+
+This mirrors ``KeyedJaggedTensor`` (flat values plus lengths), which is also
+what torchrec feeds ``nn.EmbeddingBag``, and what the kernel consumes. A padded
+[bags, max_bag] rectangle would need a static bag width nothing here can derive,
+would be compacted straight back to this layout before reaching the kernel, and
+would move max_bag/avg_bag times more ids to do it.
+
+Bags do not cross rows. Row r is one chip's tokens, so its bags are that chip's
+samples, and the reduction never needs data from another chip.
+
+Only ``weight`` is differentiable; ``ids``/``lengths``/``padding_idx``/
+``pooling`` get ``None`` gradients.
 The CPU/GPU fallback is a plain ``F.embedding`` so the op is correct off-TPU and
 opaque to ``make_fx`` (CompositeExplicitAutograd), matching the HSTU op.
 
@@ -58,11 +82,11 @@ _LIB = torch.library.Library("recir", "FRAGMENT")
 
 _SCHEMA = (
     "ringshift_embedding(Tensor ids, Tensor lengths, Tensor weight, "
-    "int padding_idx=-1) -> Tensor"
+    'int padding_idx=-1, str pooling="none") -> Tensor'
 )
 _BWD_SCHEMA = (
     "ringshift_embedding_backward(Tensor grad_out, Tensor ids, Tensor lengths, "
-    "Tensor weight, int padding_idx=-1) -> Tensor"
+    'Tensor weight, int padding_idx=-1, str pooling="none") -> Tensor'
 )
 
 _LIB.define(_SCHEMA)
@@ -97,17 +121,92 @@ def _shard_batch0_backward(ctx, grad_out: torch.Tensor) -> torch.Tensor:  # noqa
 torch.library.register_autograd("recir::shard_batch0", _shard_batch0_backward)
 
 
+def _fwd_ref(
+    ids: torch.Tensor,
+    lengths: torch.Tensor,
+    weight: torch.Tensor,
+    padding_idx: int,
+    pooling: str,
+) -> torch.Tensor:
+    """Reference forward, shared by the CPU fallback and its backward.
+
+    ``pooling="none"`` keeps one row per id (sequence). Otherwise each row's
+    ids are cut into consecutive bags by ``lengths`` and each bag is reduced --
+    ``nn.EmbeddingBag`` semantics for flat values plus offsets.
+
+    Shapes (matching the contract at the top of this module)::
+
+        ids      [R, C]        R rows, C ids each
+        lengths  [R]           pooling="none": valid slots, rest is padding
+                 [R, K]        pooled: the cut points, summing to C per row
+        weight   [vocab, D]
+        returns  [R, C, D]     pooling="none"
+                 [R, K, D]     pooled
+
+        emb      [R, C, D]     F.embedding
+        seg      [R, C]        which bag each id falls in, via searchsorted
+        out      [R, K, D]     scatter-add of emb into seg
+    """
+    if pooling not in ("none", "sum", "mean"):
+        raise ValueError(f"unknown pooling mode: {pooling!r}")
+
+    emb = F.embedding(
+        ids.long(),
+        weight,
+        padding_idx=None if padding_idx < 0 else padding_idx,
+    )
+    if pooling == "none":
+        return emb
+    mean_lengths = lengths
+    if padding_idx >= 0:
+        valid = (ids != padding_idx).to(emb.dtype).unsqueeze(-1)
+        emb = emb * valid
+        if pooling == "mean":
+            mean_lengths = _reduce_into_bags(valid, lengths, "sum").squeeze(-1)
+    return _reduce_into_bags(emb, lengths, pooling, mean_lengths=mean_lengths)
+
+
+def _reduce_into_bags(
+    emb: torch.Tensor,
+    lengths: torch.Tensor,
+    pooling: str,
+    *,
+    mean_lengths: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Sum ``emb`` [R, C, D] into [R, K, D] along the cuts given by lengths.
+
+    ``searchsorted`` over the inclusive scan gives each id its bag in one
+    batched op: the number of bag ends at or before position c IS c's bag
+    index. Ids past the row's total land on index K, one past the last bag --
+    hence the extra slot, which is allocated, scattered into, and dropped. That
+    slot only receives anything if a row's lengths sum to less than C; keeping
+    it means such a row degrades to ignoring its tail rather than corrupting
+    the last bag.
+    """
+    rows, cols, dim = emb.shape
+    n_bags = lengths.shape[-1]
+    ends = lengths.cumsum(-1)
+    positions = torch.arange(cols, device=emb.device).expand(rows, cols)
+    seg = torch.searchsorted(ends.contiguous(), positions.contiguous(), right=True)
+
+    out = torch.zeros(rows, n_bags + 1, dim, dtype=emb.dtype, device=emb.device)
+    out = out.scatter_add(1, seg.unsqueeze(-1).expand(rows, cols, dim), emb)
+    out = out[:, :n_bags, :]
+    if pooling == "mean":
+        # Clamp so an empty bag yields a zero row rather than a NaN.
+        divisor = lengths if mean_lengths is None else mean_lengths
+        out = out / divisor.clamp(min=1).unsqueeze(-1).to(out.dtype)
+    return out
+
+
 def _fwd_fallback(
     ids: torch.Tensor,
     lengths: torch.Tensor,
     weight: torch.Tensor,
     padding_idx: int = -1,
+    pooling: str = "none",
 ) -> torch.Tensor:
-    return F.embedding(
-        ids.long(),
-        weight,
-        padding_idx=None if padding_idx < 0 else padding_idx,
-    )
+    return _fwd_ref(ids, lengths, weight, padding_idx, pooling)
 
 
 def _bwd_fallback(
@@ -116,14 +215,14 @@ def _bwd_fallback(
     lengths: torch.Tensor,
     weight: torch.Tensor,
     padding_idx: int = -1,
+    pooling: str = "none",
 ) -> torch.Tensor:
+    # Differentiating the reference forward, so the pooled backward (fan the bag
+    # gradient back out to its members, scaled for mean) is derived rather than
+    # written twice.
     wd = weight.detach().requires_grad_(True)
     with torch.enable_grad():
-        out = F.embedding(
-            ids.long(),
-            wd,
-            padding_idx=None if padding_idx < 0 else padding_idx,
-        )
+        out = _fwd_ref(ids, lengths, wd, padding_idx, pooling)
         (grad_weight,) = torch.autograd.grad(out, (wd,), grad_out)
     return grad_weight
 
@@ -140,9 +239,15 @@ def _fwd_meta(
     lengths: torch.Tensor,
     weight: torch.Tensor,
     padding_idx: int = -1,
+    pooling: str = "none",
 ) -> torch.Tensor:
+    if pooling not in ("none", "sum", "mean"):
+        raise ValueError(f"unknown pooling mode: {pooling!r}")
     d = weight.shape[1]
-    return ids.new_empty((*ids.shape, d), dtype=weight.dtype)
+    # Sequence keeps one row per id; pooling replaces the id axis with the bag
+    # axis, whose length is only knowable from lengths.
+    shape = (*ids.shape, d) if pooling == "none" else (*lengths.shape, d)
+    return ids.new_empty(shape, dtype=weight.dtype)
 
 
 @torch.library.register_fake("recir::ringshift_embedding_backward")
@@ -152,24 +257,33 @@ def _bwd_meta(
     lengths: torch.Tensor,
     weight: torch.Tensor,
     padding_idx: int = -1,
+    pooling: str = "none",
 ) -> torch.Tensor:
     return torch.empty_like(weight)
 
 
 # pyre-ignore[2]: variadic ctx/inputs for torch autograd registration.
 def _setup_context(ctx, inputs, output) -> None:  # noqa
-    ids, lengths, weight, padding_idx = inputs
+    ids, lengths, weight, padding_idx, pooling = inputs
     ctx.save_for_backward(ids, lengths, weight)
     ctx.padding_idx = padding_idx
+    # A str is not a tensor, so it rides on ctx rather than save_for_backward.
+    ctx.pooling = pooling
 
 
 # pyre-ignore[2,3]
 def _backward(ctx, grad_out):  # noqa
     ids, lengths, weight = ctx.saved_tensors
     grad_weight = torch.ops.recir.ringshift_embedding_backward(
-        grad_out, ids, lengths, weight, ctx.padding_idx
+        grad_out,
+        ids,
+        lengths,
+        weight,
+        ctx.padding_idx,
+        ctx.pooling,
     )
-    return None, None, grad_weight, None
+    # One entry per forward input. The non-tensor options get no gradients.
+    return None, None, grad_weight, None, None
 
 
 torch.library.register_autograd(
