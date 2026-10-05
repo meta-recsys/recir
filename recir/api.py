@@ -832,8 +832,17 @@ def _resolve_trace_batch_ratio(
 
 
 def _tag_batch_inputs(
-    gm: fx.GraphModule, num_state_tensors: int, input_batch_dim: int
+    gm: fx.GraphModule,
+    num_state_tensors: int,
+    input_batch_dim: int,
+    frozen_parameter_fqns: set[str],
 ) -> None:
+    """Tag runtime input roles, including parameters safe for device reuse.
+
+    Only non-trainable model parameters are marked frozen. Buffers and
+    optimizer state remain uncached because storage-alias writes can bypass a
+    tensor's PyTorch version counter.
+    """
     tensor_idx = 0
     for node in gm.graph.nodes:
         if node.op != "placeholder":
@@ -845,6 +854,9 @@ def _tag_batch_inputs(
             node.meta["is_state_input"] = is_state
             node.meta["is_batch_input"] = is_batch
             node.meta["is_weight"] = not is_batch
+            node.meta["is_frozen_parameter"] = (
+                is_state and node.meta.get("fqn") in frozen_parameter_fqns
+            )
             if is_batch:
                 node.meta["batch_dim"] = input_batch_dim
             tensor_idx += 1
@@ -852,6 +864,7 @@ def _tag_batch_inputs(
             node.meta["is_state_input"] = False
             node.meta["is_batch_input"] = False
             node.meta["is_weight"] = False
+            node.meta["is_frozen_parameter"] = False
 
 
 def _compute_state_fqns(structure: Any) -> List[str]:
@@ -1083,6 +1096,11 @@ def _finalize_graph(
         gm,
         sum(isinstance(value, torch.Tensor) for value in flat_state),
         input_batch_dim,
+        {
+            fqn
+            for fqn, parameter in mod.named_parameters(remove_duplicate=False)
+            if not parameter.requires_grad
+        },
     )
     # Propagate batch-input meta through ops so intermediate FX nodes that
     # become subgraph boundaries (after segment_and_lower) inherit
@@ -1726,6 +1744,11 @@ def trace(  # noqa: C901 — orchestration: dispatches on parallel_mode flavor (
         local_result.gm,
         sum(isinstance(value, torch.Tensor) for value in flat_state),
         input_batch_dim,
+        {
+            fqn
+            for fqn, parameter in local_result.params.items()
+            if not parameter.requires_grad
+        },
     )
     # Propagate batch-input meta through ops so intermediate FX nodes that
     # become subgraph boundaries (after later partition/lower) inherit
