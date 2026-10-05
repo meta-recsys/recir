@@ -183,19 +183,20 @@ class AddStateTest(unittest.TestCase):
 
 
 class InvalidateDeviceStateTest(unittest.TestCase):
-    def test_discards_cached_state_from_compiled_function(self) -> None:
-        state_manager = SimpleNamespace(device_state=[object()])
+    def test_delegates_to_device_state_manager(self) -> None:
+        state_manager = MagicMock()
 
         def compiled_function() -> None:
             pass
 
         compiled_function.__dict__[COMPILED_OBJECT_KEY] = SimpleNamespace(
-            state_manager=state_manager
+            gm=torch.fx.symbolic_trace(torch.nn.Identity()),
+            state_manager=state_manager,
         )
 
         invalidate_device_state(compiled_function)
 
-        self.assertIsNone(state_manager.device_state)
+        state_manager.invalidate_device_state.assert_called_once_with()
 
 
 class PrepareCompiledTest(unittest.TestCase):

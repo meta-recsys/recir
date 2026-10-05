@@ -44,6 +44,10 @@ class DeviceStateManager:
     ) -> List[Any]:
         return flat_state + user_inps
 
+    def invalidate_device_state(self) -> None:
+        """Discard device-resident state owned by this manager."""
+        self.device_state = None
+
     def commit_step_state(
         self,
         flat_state: List[torch.Tensor],
