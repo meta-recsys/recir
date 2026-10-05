@@ -25,7 +25,7 @@ per-feature per-host PRT-padded input sizes and handing them to
 from __future__ import annotations
 
 import logging
-from typing import Callable, cast, Dict, List, Sequence, Tuple
+from typing import Callable, Dict, List, Sequence, Tuple
 
 import jax
 import torch
@@ -52,6 +52,20 @@ from torchrec.modules.embedding_configs import BaseEmbeddingConfig, EmbeddingCon
 from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor
 
 logger: logging.Logger = logging.getLogger(__name__)
+
+
+def _sequence_configs_only(
+    table_configs: Sequence[BaseEmbeddingConfig],
+) -> List[EmbeddingConfig]:
+    """Narrow to sequence configs, refusing pooled ones with a named error."""
+    pooled = [tc.name for tc in table_configs if not isinstance(tc, EmbeddingConfig)]
+    if pooled:
+        raise ValueError(
+            f"SparseCore has no pooled-lookup path, but these tables are pooled: "
+            f"{pooled}. Pooling is only implemented on the ring-shift path "
+            f"(embedding_backend='in_graph')."
+        )
+    return [tc for tc in table_configs if isinstance(tc, EmbeddingConfig)]
 
 
 class SparseCoreEmbeddingBackend(EmbeddingBackend):
@@ -113,7 +127,7 @@ class SparseCoreEmbeddingBackend(EmbeddingBackend):
             raise ValueError(f"JAX backend expects CPU host state, got {device}.")
 
         _, _, _, jax_ec = init_sc_embedding_variables(
-            table_configs=cast(List[EmbeddingConfig], table_configs),
+            table_configs=_sequence_configs_only(table_configs),
             feature_padded_input_sizes=self._feature_padded_input_sizes,
             world_size=world_size,
             embedding_lr=sparse_config.lr,

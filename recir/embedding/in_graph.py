@@ -90,7 +90,11 @@ from recir.meta_tensor_init import (
     mark_meta_uniform_init,
     table_init_stream_id,
 )
-from torchrec.modules.embedding_configs import BaseEmbeddingConfig, data_type_to_dtype
+from torchrec.modules.embedding_configs import (
+    BaseEmbeddingConfig,
+    data_type_to_dtype,
+    PoolingType,
+)
 from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor
 
 logger: logging.Logger = logging.getLogger(__name__)
@@ -100,6 +104,14 @@ _PREFIX: str = "seq_sparse_input_break"
 
 SHARDED_TABLE_PREFIX: str = "_sharded_tables"
 DP_TABLE_PREFIX: str = "_dp_tables"
+
+
+def _pooling_of(cfg: BaseEmbeddingConfig) -> str:
+    """Map a torchrec table config to the ring-shift pooling argument."""
+    pooling = getattr(cfg, "pooling", None)
+    if pooling is None or pooling is PoolingType.NONE:
+        return "none"
+    return pooling.value.lower()
 
 
 def table_name_from_param(name: str) -> str | None:
@@ -170,6 +182,7 @@ class InGraphSparseArch(nn.Module):
         self._break_input_kjt_keys: List[str] = []
         self._feature_to_table: Dict[str, str] = {}
         self._table_sharding: Dict[str, TableSharding] = {}
+        self._table_pooling: Dict[str, str] = {}
         self._sharded_tables: nn.ParameterDict = nn.ParameterDict()
         self._dp_tables: nn.ParameterDict = nn.ParameterDict()
 
@@ -186,6 +199,13 @@ class InGraphSparseArch(nn.Module):
             for f in tc.feature_names:
                 self._feature_to_table[f] = tc.name
             self._table_sharding[tc.name] = sharding
+            pooling = _pooling_of(tc)
+            if pooling != "none" and sharding is not TableSharding.ROWWISE:
+                raise ValueError(
+                    f"table {tc.name!r} is pooled ({pooling}) but its TablePlan "
+                    f"selects {sharding.value}; pooling needs ROWWISE sharding"
+                )
+            self._table_pooling[tc.name] = pooling
             dtype = data_type_to_dtype(tc.data_type)
             if sharding is TableSharding.ROWWISE and dtype != torch.float32:
                 logger.warning(
@@ -291,6 +311,9 @@ class InGraphSparseArch(nn.Module):
         big_lengths: Dict[str, List[torch.Tensor]] = {}
         big_seqs: Dict[str, List[int]] = {}
         big_feat_keys: Dict[str, List[str]] = {}
+        pooled_ids: Dict[str, List[torch.Tensor]] = {}
+        pooled_lengths: Dict[str, List[torch.Tensor]] = {}
+        pooled_feat_keys: Dict[str, List[str]] = {}
         for i, key in enumerate(keys):
             ids = ids_2d[i]  # [W, T_local]
             k_lengths = lengths_1d[i]  # [B]
@@ -300,10 +323,15 @@ class InGraphSparseArch(nn.Module):
             if table_name is None:
                 continue
             if self._table_sharding[table_name] is TableSharding.ROWWISE:
-                big_ids.setdefault(table_name, []).append(ids)
-                big_lengths.setdefault(table_name, []).append(k_lengths)
-                big_seqs.setdefault(table_name, []).append(seq)
-                big_feat_keys.setdefault(table_name, []).append(key)
+                if self._table_pooling[table_name] == "none":
+                    big_ids.setdefault(table_name, []).append(ids)
+                    big_lengths.setdefault(table_name, []).append(k_lengths)
+                    big_seqs.setdefault(table_name, []).append(seq)
+                    big_feat_keys.setdefault(table_name, []).append(key)
+                else:
+                    pooled_ids.setdefault(table_name, []).append(ids)
+                    pooled_lengths.setdefault(table_name, []).append(k_lengths)
+                    pooled_feat_keys.setdefault(table_name, []).append(key)
             else:
                 # FSDP or REPLICATED table
                 flat_ids = ids.reshape(-1).long()
@@ -355,6 +383,37 @@ class InGraphSparseArch(nn.Module):
                 a = torch.ops.recir.shard_batch0(a)
                 off += seq
                 result[key] = JaggedTensor(values=a, lengths=k_lengths)
+
+        # Pooled delta: ids stay flat; lengths become aligned per-chip bag cuts.
+        for table_name, ids_list in pooled_ids.items():
+            lengths_list = pooled_lengths[table_name]
+            feature_keys = pooled_feat_keys[table_name]
+            weight = self._sharded_tables[table_name]
+            dim = weight.shape[1]
+            world = ids_list[0].shape[0]
+            bags = lengths_list[0].shape[0]
+            if bags % world:
+                raise ValueError(
+                    f"pooled table {table_name!r}: batch {bags} is not divisible "
+                    f"by the {world} chips its ids are laid out over"
+                )
+            bags_local = bags // world
+            ids_cat = torch.cat(ids_list, dim=1)
+            bag_lengths = torch.cat(
+                [lengths.reshape(world, bags_local) for lengths in lengths_list],
+                dim=1,
+            )
+            act = torch.ops.recir.ringshift_embedding(
+                ids_cat,
+                bag_lengths,
+                weight,
+                pooling=self._table_pooling[table_name],
+            ).reshape(world, len(ids_list), bags_local, dim)
+            for index, (key, k_lengths) in enumerate(zip(feature_keys, lengths_list)):
+                values = torch.ops.recir.shard_batch0(act[:, index].reshape(-1, dim))
+                result[key] = JaggedTensor(
+                    values=values, lengths=torch.ones_like(k_lengths)
+                )
         return result
 
     def enable_input_break(self, override_id: int, input_kjt_keys: List[str]) -> None:
