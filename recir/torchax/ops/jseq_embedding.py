@@ -29,6 +29,7 @@ Data layout:
     across ranks; masked downstream.
 """
 
+import functools
 import os
 from typing import Any, cast, Tuple
 
@@ -42,6 +43,7 @@ from recir.ops.pallas.embeddings import (
     ringshift_embedding_lookup_block_backward_local,
     ringshift_embedding_lookup_block_local,
 )
+from recir.ops.pallas.embeddings.ringshift import fan_out_pooled_grad
 from recir.torchax.gspmd_context import current_gspmd_mesh_context
 from recir.torchax.ops.decorators import op
 
@@ -180,11 +182,180 @@ def _prep_local(
     return ids_dist.reshape(max_local_ids), count, batch, seq, dim
 
 
+def _pooled_lookup_local_impl(
+    ids: Any,
+    lengths: Any,
+    weight: Any,
+    padding_idx: int,
+    pooling: str,
+    world_size: int,
+) -> Any:
+    """Run pooled lookup on one device inside an active manual mesh."""
+    local_ids = ids.reshape(-1).astype(jnp.int32)
+    bag_lengths = lengths.reshape(-1).astype(jnp.int32)
+    dim = weight.shape[1]
+    out = ringshift_embedding_lookup_block_local(
+        local_ids,
+        None,
+        weight.astype(jnp.float32),
+        axis_name=_AXIS,
+        world_size=world_size,
+        recv_capacity=_RECV_CAPACITY,
+        exchange_bf16=_EXCHANGE_BF16,
+        pooling=pooling,
+        bag_lengths=bag_lengths,
+    )
+    return out.reshape(*lengths.shape, dim).astype(weight.dtype)
+
+
+@functools.partial(jax.custom_vjp, nondiff_argnums=(3, 4, 5))
+def _pooled_lookup_local(
+    ids: Any,
+    lengths: Any,
+    weight: Any,
+    padding_idx: int,
+    pooling: str,
+    world_size: int,
+) -> Any:
+    return _pooled_lookup_local_impl(
+        ids, lengths, weight, padding_idx, pooling, world_size
+    )
+
+
+def _pooled_lookup_local_fwd(
+    ids: Any,
+    lengths: Any,
+    weight: Any,
+    padding_idx: int,
+    pooling: str,
+    world_size: int,
+) -> Tuple[Any, Tuple[Any, Any, Any]]:
+    out = _pooled_lookup_local_impl(
+        ids, lengths, weight, padding_idx, pooling, world_size
+    )
+    return out, (ids, lengths, weight)
+
+
+def _pooled_lookup_local_bwd(
+    padding_idx: int,
+    pooling: str,
+    world_size: int,
+    residuals: Tuple[Any, Any, Any],
+    grad_out: Any,
+) -> Tuple[None, None, Any]:
+    ids, lengths, weight = residuals
+    grad_weight = _pooled_backward_local(
+        grad_out,
+        ids,
+        lengths,
+        weight,
+        padding_idx,
+        pooling,
+        world_size,
+    )
+    return None, None, grad_weight
+
+
+_pooled_lookup_local.defvjp(_pooled_lookup_local_fwd, _pooled_lookup_local_bwd)
+
+
+def _pooled_lookup(
+    ids: Any,
+    lengths: Any,
+    weight: Any,
+    pooling: str,
+    padding_idx: int = -1,
+) -> Any:
+    """Pooled forward: flat per-rank ids plus bag lengths to pooled rows."""
+    manual_world_size = _manual_world_size()
+    if manual_world_size is not None:
+        return _pooled_lookup_local(
+            ids, lengths, weight, padding_idx, pooling, manual_world_size
+        )
+
+    mesh, batch_resource, world_size, _hybrid = _ringshift_mesh_layout()
+    rows = ids.shape[0]
+    if rows != mesh.size:
+        raise ValueError(
+            "pooled ids must have one row per device (axis 0 is the mesh axis): "
+            f"got {rows} rows for mesh size {mesh.size}"
+        )
+
+    def _per_device(local_ids: Any, local_lengths: Any, local_weight: Any) -> Any:
+        return _pooled_lookup_local(
+            local_ids,
+            local_lengths,
+            local_weight,
+            padding_idx,
+            pooling,
+            world_size,
+        )
+
+    return jax.shard_map(
+        _per_device,
+        mesh=mesh,
+        in_specs=(
+            P(batch_resource, None),
+            P(batch_resource, None),
+            P(_AXIS, None),
+        ),
+        out_specs=P(batch_resource, None, None),
+        check_vma=False,
+        # pyrefly: ignore [bad-argument-count]
+    )(ids, lengths, weight)
+
+
+def _pooled_backward_local(
+    grad_out: Any,
+    ids: Any,
+    lengths: Any,
+    weight: Any,
+    padding_idx: int,
+    pooling: str,
+    world_size: int,
+) -> Any:
+    """Fan a bag gradient back to ids, then use the existing table backward."""
+    local_ids = ids.reshape(-1).astype(jnp.int32)
+    bag_lengths = lengths.reshape(-1).astype(jnp.int32)
+    dim = weight.shape[1]
+    cotangent = fan_out_pooled_grad(
+        grad_out.reshape(-1, dim).astype(jnp.float32),
+        bag_lengths,
+        max_local_ids=local_ids.shape[0],
+        pooling=pooling,
+    )
+    cotangent = cast(
+        jax.Array,
+        jnp.where(local_ids[:, None] == padding_idx, 0, cotangent),
+    )
+    count = jnp.sum(bag_lengths).astype(jnp.int32)
+    grad_weight = ringshift_embedding_lookup_block_backward_local(
+        cotangent,
+        local_ids,
+        count,
+        axis_name=_AXIS,
+        world_size=world_size,
+        recv_capacity=_RECV_CAPACITY,
+        v_local=weight.shape[0],
+        embedding_dim=dim,
+        exchange_bf16=_EXCHANGE_BF16,
+    )
+    return grad_weight.astype(weight.dtype)
+
+
 @op(torch.ops.recir.ringshift_embedding)  # pyre-ignore[56]
 def _jringshift_embedding(
-    ids: Any, lengths: Any, weight: Any, padding_idx: int = -1
+    ids: Any,
+    lengths: Any,
+    weight: Any,
+    padding_idx: int = -1,
+    pooling: str = "none",
 ) -> Any:
+    if pooling != "none":
+        return _pooled_lookup(ids, lengths, weight, pooling, padding_idx)
+
     del padding_idx  # Forward lookup returns the stored padding row, like F.embedding.
+
     manual_world_size = _manual_world_size()
     if manual_world_size is not None:
         local_ids, count, batch, seq, dim = _prep_local(
@@ -243,7 +414,56 @@ def _jringshift_embedding_backward(
     lengths: Any,
     weight: Any,
     padding_idx: int = -1,
+    pooling: str = "none",
 ) -> Any:
+    if pooling != "none":
+        manual_world_size = _manual_world_size()
+        if manual_world_size is not None:
+            return _pooled_backward_local(
+                grad_out,
+                ids,
+                lengths,
+                weight,
+                padding_idx,
+                pooling,
+                manual_world_size,
+            )
+
+        mesh, batch_resource, world_size, hybrid = _ringshift_mesh_layout()
+
+        def _pooled_per_device(
+            local_grad_out: Any,
+            local_ids: Any,
+            local_lengths: Any,
+            local_weight: Any,
+        ) -> Any:
+            grad_weight = _pooled_backward_local(
+                local_grad_out,
+                local_ids,
+                local_lengths,
+                local_weight,
+                padding_idx,
+                pooling,
+                world_size,
+            )
+            if hybrid:
+                grad_weight = jax.lax.psum(grad_weight, _DATA_AXIS)
+            return grad_weight
+
+        return jax.shard_map(
+            _pooled_per_device,
+            mesh=mesh,
+            in_specs=(
+                P(batch_resource, None, None),
+                P(batch_resource, None),
+                P(batch_resource, None),
+                P(_AXIS, None),
+            ),
+            out_specs=P(_AXIS, None),
+            check_vma=False,
+            # pyrefly: ignore [bad-argument-count]
+        )(grad_out, ids, lengths, weight)
+
     manual_world_size = _manual_world_size()
     if manual_world_size is not None:
         local_ids, count, _batch, _seq, dim = _prep_local(

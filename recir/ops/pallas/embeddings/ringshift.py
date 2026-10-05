@@ -2183,7 +2183,7 @@ def ringshift_embedding_lookup_block(
 
 def ringshift_embedding_lookup_block_local(
     looked_up_ids: jax.Array,
-    looked_up_id_count: jax.Array,
+    looked_up_id_count: jax.Array | None,
     local_embedding_table: jax.Array,
     *,
     axis_name: str,
@@ -2192,8 +2192,16 @@ def ringshift_embedding_lookup_block_local(
     interpret: bool = False,
     splitter: str = "globalpad",
     exchange_bf16: bool = False,
+    pooling: str = "none",
+    bag_lengths: jax.Array | None = None,
 ) -> jax.Array:
     """Block-sharded lookup inside an already-bound manual ``shard_map`` axis."""
+    _check_pooling(pooling, bag_lengths, looked_up_id_count)
+    if pooling == "none":
+        assert looked_up_id_count is not None  # narrowed by _check_pooling
+    else:
+        assert bag_lengths is not None  # narrowed by _check_pooling
+        looked_up_id_count = jnp.sum(bag_lengths, axis=-1).astype(jnp.int32)
     v_local = local_embedding_table.shape[0]
     mod_ids = _block_to_mod_ids(looked_up_ids, world_size, v_local)
     return _ringshift_embedding_lookup_local(
@@ -2206,6 +2214,8 @@ def ringshift_embedding_lookup_block_local(
         interpret=interpret,
         splitter=splitter,
         exchange_bf16=exchange_bf16,
+        pooling=pooling,
+        bag_lengths=bag_lengths,
     )
 
 
