@@ -27,7 +27,7 @@ from __future__ import annotations
 import logging
 import os
 import tempfile
-from typing import Any, Callable, cast, Dict, List, Optional, Tuple
+from typing import Any, Callable, cast, Dict, List, Optional, Sequence, Tuple
 
 import jax
 import torch
@@ -62,7 +62,7 @@ from torchrec.distributed.planner import EmbeddingShardingPlanner, Topology
 from torchrec.distributed.planner.types import ParameterConstraints
 from torchrec.distributed.types import ShardingEnv, ShardingType
 from torchrec.distributed.utils import optimizer_type_to_emb_opt_type
-from torchrec.modules.embedding_configs import EmbeddingConfig
+from torchrec.modules.embedding_configs import BaseEmbeddingConfig
 from torchrec.optim.optimizers import in_backward_optimizer_filter
 from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor
 
@@ -182,7 +182,7 @@ class CPUEmbeddingBackend(EmbeddingBackend):
     def setup(
         self,
         model: nn.Module,
-        table_configs: List[EmbeddingConfig],
+        table_configs: Sequence[BaseEmbeddingConfig],
         sparse_config: OptimConfig,
         device: torch.device,
         world_size: int,
@@ -253,7 +253,7 @@ class CPUEmbeddingBackend(EmbeddingBackend):
     def _setup_dmp(
         self,
         model: nn.Module,
-        table_configs: List[EmbeddingConfig],
+        table_configs: Sequence[BaseEmbeddingConfig],
         config: OptimConfig,
         world_size: int,
     ) -> DistributedModelParallel:

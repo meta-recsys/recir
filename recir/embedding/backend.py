@@ -23,13 +23,13 @@ import enum
 import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Dict
+from typing import Dict, Sequence
 
 import torch
 import torch.nn as nn
 from minimal_viable_ai.core.model_family_api.optimizer_configs import OptimConfig
 from torchrec.distributed.types import ShardingType
-from torchrec.modules.embedding_configs import EmbeddingConfig
+from torchrec.modules.embedding_configs import BaseEmbeddingConfig
 from torchrec.optim.keyed import KeyedOptimizer
 
 logger: logging.Logger = logging.getLogger(__name__)
@@ -147,7 +147,7 @@ class EmbeddingBackend(ABC):
     def setup(
         self,
         model: nn.Module,
-        table_configs: list[EmbeddingConfig],
+        table_configs: Sequence[BaseEmbeddingConfig],
         sparse_config: OptimConfig,
         device: torch.device,
         world_size: int,

@@ -25,7 +25,7 @@ per-feature per-host PRT-padded input sizes and handing them to
 from __future__ import annotations
 
 import logging
-from typing import Callable, Dict, List, Tuple
+from typing import Callable, cast, Dict, List, Sequence, Tuple
 
 import jax
 import torch
@@ -48,7 +48,7 @@ from recir.embedding.sparsecore_ops import (
     init_sc_embedding_variables,
     SparsecoreBackedEC,
 )
-from torchrec.modules.embedding_configs import EmbeddingConfig
+from torchrec.modules.embedding_configs import BaseEmbeddingConfig, EmbeddingConfig
 from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor
 
 logger: logging.Logger = logging.getLogger(__name__)
@@ -99,7 +99,7 @@ class SparseCoreEmbeddingBackend(EmbeddingBackend):
     def setup(
         self,
         model: nn.Module,
-        table_configs: List[EmbeddingConfig],
+        table_configs: Sequence[BaseEmbeddingConfig],
         sparse_config: OptimConfig,
         device: torch.device,
         world_size: int,
@@ -113,7 +113,7 @@ class SparseCoreEmbeddingBackend(EmbeddingBackend):
             raise ValueError(f"JAX backend expects CPU host state, got {device}.")
 
         _, _, _, jax_ec = init_sc_embedding_variables(
-            table_configs=table_configs,
+            table_configs=cast(List[EmbeddingConfig], table_configs),
             feature_padded_input_sizes=self._feature_padded_input_sizes,
             world_size=world_size,
             embedding_lr=sparse_config.lr,

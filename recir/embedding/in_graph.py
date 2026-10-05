@@ -54,7 +54,7 @@ from the cached KJT).
 from __future__ import annotations
 
 import logging
-from typing import Any, Callable, Dict, List, Tuple
+from typing import Any, Callable, Dict, List, Sequence, Tuple
 
 import jax
 import recir.ops.seq_embedding_op  # noqa: F401  (defines torch.ops.recir.ringshift_embedding)
@@ -90,7 +90,7 @@ from recir.meta_tensor_init import (
     mark_meta_uniform_init,
     table_init_stream_id,
 )
-from torchrec.modules.embedding_configs import data_type_to_dtype, EmbeddingConfig
+from torchrec.modules.embedding_configs import BaseEmbeddingConfig, data_type_to_dtype
 from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor
 
 logger: logging.Logger = logging.getLogger(__name__)
@@ -152,7 +152,7 @@ class InGraphSparseArch(nn.Module):
 
     def __init__(
         self,
-        table_configs: List[EmbeddingConfig],
+        table_configs: Sequence[BaseEmbeddingConfig],
         feature_seqlens: Dict[str, int],
         world_size: int,
         table_plans: Dict[str, TablePlan],
@@ -663,7 +663,7 @@ class InGraphEmbeddingBackend(EmbeddingBackend):
     def setup(
         self,
         model: nn.Module,
-        table_configs: List[EmbeddingConfig],
+        table_configs: Sequence[BaseEmbeddingConfig],
         sparse_config: OptimConfig,
         device: torch.device,
         world_size: int,
