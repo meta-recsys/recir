@@ -42,6 +42,9 @@ import torch.distributed as dist
 import torch.nn as nn
 from recir.api import (
     _compile_and_transform,
+    _compile_graphs,
+    _GraphSpec,
+    _trace_graphs,
     compile_from_gm,
     make_compiled_runner,
     sync_device_state_to_torch,
@@ -89,6 +92,9 @@ class TBESparseConfig:
 
     use_index_dedup: bool = True
     use_separate_process_group: bool = False
+    # Called module re-traced around the embedding lookups ("" = whole model);
+    # None keeps the default, the deepest module that owns every TBE table.
+    forward_root_fqn: Optional[str] = None
 
 
 @dataclass
@@ -269,7 +275,8 @@ def compile_step(
     region_transforms: Sequence[Any] = (),
     global_loss_denom: bool = True,
     flatten_batch: FlattenBatch,
-) -> Callable[..., Any]:
+    eval_step_fn: Optional[Callable[..., Any]] = None,
+) -> Any:
     """Shared compile driver for BOTH modes (eager trace).
 
     trace(train_step_fn, model, *optimizers, *flat) ->
@@ -296,6 +303,12 @@ def compile_step(
 
     ``flatten_batch(batch, global_loss_denom=...)`` turns the model's batch type
     into the flat tensor args ``train_step_fn`` takes after the optimizers.
+
+    ``eval_step_fn(model, *flat_args)`` (optional) is compiled together with the
+    train step (``recir.compile`` of several functions), traced on the same
+    batch: the two share the model's parameters (and, on XLA, its device state).
+    Returns ``(train_runner, eval_runner)`` then. ``region_transforms`` and
+    ``pipeline_config`` apply to the train step only.
     """
     model_to_train = (
         model.module if isinstance(model, DistributedModelParallel) else model
@@ -303,6 +316,8 @@ def compile_step(
     tensor_attr_holders = _declared_tensor_attr_holders(model_to_train)
     for dispatcher in dispatchers:
         dispatcher.install_eager(model_to_train)
+    if backend is None and eval_step_fn is not None:
+        raise ValueError("eval_step_fn needs an explicit recir backend")
     if backend is None:
         if pipeline_config is not None and pipeline_config.enabled:
             raise ValueError("Pipeline scheduling requires an explicit recir backend")
@@ -321,11 +336,41 @@ def compile_step(
             _tensor_attr_holders=tensor_attr_holders,
         )
         return make_compiled_runner(compiled_obj)
+    flat_batch = flatten_batch(trace_batch, global_loss_denom=global_loss_denom)
+    if eval_step_fn is not None:
+        graphs = [
+            _GraphSpec(
+                train_step_fn,
+                (model_to_train, *optimizers, *flat_batch),
+                parallel_mode,
+                region_transforms=region_transforms,
+                tensor_attr_holders=tensor_attr_holders,
+            ),
+            _GraphSpec(
+                eval_step_fn,
+                (model_to_train, *flat_batch),
+                parallel_mode,
+                tensor_attr_holders=tensor_attr_holders,
+            ),
+        ]
+        traced = []
+        for graph_gm, graph_state in _trace_graphs(graphs):
+            for dispatcher in dispatchers:
+                graph_gm, graph_state = dispatcher.install_graph(graph_gm, graph_state)
+            traced.append((graph_gm, graph_state))
+        train_obj, eval_obj = _compile_graphs(
+            traced,
+            parallel_modes=[parallel_mode, parallel_mode],
+            backend=backend,
+            region_transforms=[region_transforms, ()],
+            pipeline_configs=[pipeline_config, None],
+        )
+        return make_compiled_runner(train_obj), make_compiled_runner(eval_obj)
     gm, flat_state = trace(
         train_step_fn,
         model_to_train,
         *optimizers,
-        *flatten_batch(trace_batch, global_loss_denom=global_loss_denom),
+        *flat_batch,
         parallel_mode=parallel_mode,
         region_transforms=region_transforms,
         _tensor_attr_holders=tensor_attr_holders,
@@ -351,7 +396,8 @@ def compile_hdp_step(
     spec: RecirCompileSpec,
     *,
     flatten_batch: FlattenBatch,
-) -> Callable[..., Any]:
+    eval_step_fn: Optional[Callable[..., Any]] = None,
+) -> Any:
     """Eager HDP_GPU compile: HybridParallel + InductorBackend via compile_step.
 
     HybridParallel(dense_style, embedding_plan) over a mesh that reuses the
@@ -403,6 +449,7 @@ def compile_hdp_step(
                 process_group=spec.tbe_process_group,
                 embedding_plan=spec.embedding_plan,
                 use_index_dedup=tbe_sparse_config.use_index_dedup,
+                forward_root_fqn=tbe_sparse_config.forward_root_fqn,
             )
 
         sparse_transform_factory = _tbe_sparse_transform_factory
@@ -434,6 +481,7 @@ def compile_hdp_step(
         region_transforms=spec.region_transforms,
         global_loss_denom=False,
         flatten_batch=flatten_batch,
+        eval_step_fn=eval_step_fn,
     )
 
 
@@ -454,6 +502,7 @@ def compile_gspmd_step(
     train_step_fn: Optional[Callable[..., Any]] = None,
     flatten_batch: FlattenBatch,
     sparse_opt: Optional[torch.optim.Optimizer] = None,
+    eval_step_fn: Optional[Callable[..., Any]] = None,
 ) -> Any:
     """Eager GSPMD_TPU compile: GSPMDParallel + XLAGSPMDBackend via compile_step.
 
@@ -497,6 +546,7 @@ def compile_gspmd_step(
         # over the padded global batch (see flatten_batch).
         global_loss_denom=True,
         flatten_batch=flatten_batch,
+        eval_step_fn=eval_step_fn,
     )
 
 
