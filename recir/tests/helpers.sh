@@ -44,7 +44,7 @@ source "${_STU_FBCODE_ROOT}/recir/utils/gke_helpers.sh"
 _GKE_DEFAULT_YAML="${_STU_HELPERS_DIR}/stu-test-4chip.yaml"
 _GKE_FBCODE_ROOT="$_STU_FBCODE_ROOT"
 # The test image is the rankfm_mvai_tpu image; reuse its build script.
-_GKE_BUILD_SCRIPT="${_STU_FBCODE_ROOT}/recir/examples/rankfm_mvai/build_image_podman.sh"
+_GKE_BUILD_SCRIPT="${_STU_FBCODE_ROOT}/recir/fb/examples/rankfm_mvai/build_image_podman.sh"
 _GKE_LOG_DIR="/tmp/stulogs"
 _GKE_POD_NOUN="test pod"
 _GKE_SUMMARY_TITLE="Per-pod test-result summary"
