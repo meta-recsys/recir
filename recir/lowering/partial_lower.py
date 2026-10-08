@@ -11,7 +11,11 @@ from contextlib import ExitStack
 from typing import Any, Callable, cast, List, Optional, Tuple
 
 import torch
-from recir.lowering.lowering_utils import segment_and_lower, strip_profiler_nodes
+from recir.lowering.lowering_utils import (
+    has_meta_kernel,
+    segment_and_lower,
+    strip_profiler_nodes,
+)
 from torch._inductor.custom_graph_pass import CustomGraphPass
 
 
@@ -418,7 +422,7 @@ def _is_inductor_compatible(node: torch.fx.Node) -> Tuple[bool, str]:
         target = node.target
         if "_c10d_functional" in target.name():
             return True, ""
-        if not target.has_kernel_for_dispatch_key(torch._C.DispatchKey.Meta):
+        if not has_meta_kernel(target):
             return False, f"{node.target} doesn't have a meta kernel registered"
     return True, ""
 
