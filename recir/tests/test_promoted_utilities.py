@@ -14,7 +14,7 @@ the top-level ``recir`` package.
 
 import unittest
 from types import SimpleNamespace
-from typing import List
+from typing import Any, Callable, List
 from unittest.mock import MagicMock, patch
 
 import recir
@@ -35,6 +35,7 @@ from recir.api import (
     replace_region,
     set_compiled_output_deferred,
 )
+from recir.region_transforms import RegionTransform
 from torch import fx
 from torch.fx.experimental.proxy_tensor import make_fx
 
@@ -206,7 +207,7 @@ class PrepareCompiledTest(unittest.TestCase):
         parallel_mode = MagicMock()
 
         with patch(
-            "recir.api._compile_via_backend", return_value=compiled_obj
+            "recir.api._compile_via_backend", return_value=[compiled_obj]
         ) as compile_backend:
             compiled_function = recir_compile(
                 parallel_mode=parallel_mode,
@@ -224,6 +225,71 @@ class PrepareCompiledTest(unittest.TestCase):
 
     def test_returns_false_for_plain_callable(self) -> None:
         self.assertFalse(prepare_compiled(lambda: None))
+
+
+class MultiFunctionCompileTest(unittest.TestCase):
+    def test_clones_stateful_region_transforms_per_function(self) -> None:
+        class _StatefulTransform(RegionTransform):
+            def __init__(self) -> None:
+                self.bound_function: Callable[..., Any] | None = None
+
+            def bind_signature(self, function: Callable[..., Any]) -> None:
+                self.bound_function = function
+
+        def train_function(model, optimizer, value):
+            return model(value)
+
+        def eval_function(model, value):
+            return model(value)
+
+        transform = _StatefulTransform()
+        model = nn.Linear(1, 1)
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.1, foreach=False)
+        traced_specs = []
+
+        def trace_graphs(specs):
+            traced_specs.extend(specs)
+            for spec in specs:
+                for graph_transform in spec.region_transforms:
+                    graph_transform.bind_signature(spec.fn)
+            return [object() for _ in specs]
+
+        compiled = [SimpleNamespace(), SimpleNamespace()]
+        with (
+            patch("recir.api._trace_graphs", side_effect=trace_graphs),
+            patch("recir.api._compile_graphs", return_value=compiled) as compile_graphs,
+        ):
+            train_step, eval_step = recir_compile(
+                parallel_mode=MagicMock(),
+                backend=MagicMock(),
+                region_transforms=[transform],
+            )(
+                train_function,
+                eval_function,
+                example_args=[
+                    (model, optimizer, torch.ones(1)),
+                    (model, torch.ones(1)),
+                ],
+            )
+
+        self.assertIsNone(transform.bound_function)
+        self.assertEqual(len(traced_specs), 2)
+        train_transform = traced_specs[0].region_transforms[0]
+        eval_transform = traced_specs[1].region_transforms[0]
+        self.assertIsNot(train_transform, eval_transform)
+        self.assertIs(train_transform.bound_function, train_function)
+        self.assertIs(eval_transform.bound_function, eval_function)
+        compiled_transforms = compile_graphs.call_args.kwargs["region_transforms"]
+        self.assertIs(compiled_transforms[0][0], train_transform)
+        self.assertIs(compiled_transforms[1][0], eval_transform)
+        self.assertIs(
+            train_step.__dict__[COMPILED_OBJECT_KEY],
+            compiled[0],
+        )
+        self.assertIs(
+            eval_step.__dict__[COMPILED_OBJECT_KEY],
+            compiled[1],
+        )
 
 
 class GetCompiledProcessStateTest(unittest.TestCase):

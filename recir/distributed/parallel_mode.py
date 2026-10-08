@@ -1312,6 +1312,10 @@ class HybridParallel(ParallelMode):
     Dense parameters use FSDP or DDP (controlled by ``dense_style``).
     Embedding parameters are sharded according to ``embedding_plan``
     (e.g., row-wise sharding splits the vocabulary across ranks).
+    ``sparse_transform_factory`` configures the training transform, which may
+    own embedding optimizer state and rewrite backward. Forward-only eval /
+    inference graphs instead reuse the module's existing tables and apply the
+    built-in forward-only sparse transform.
 
     Example::
 
