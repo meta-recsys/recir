@@ -27,7 +27,11 @@ from recir.batch_dim_propagation import (
     propagate_fsdp_sharded_meta,
 )
 from recir.distributed.sharding_spec import get_state_layout
-from recir.lowering.lowering_utils import segment_and_lower, strip_profiler_nodes
+from recir.lowering.lowering_utils import (
+    has_meta_kernel,
+    segment_and_lower,
+    strip_profiler_nodes,
+)
 from recir.lowering.op_swap import OpSwapRegistry, swap_ops
 from recir.meta_tensor_init import (
     default_embedding_init_bound,
@@ -1607,7 +1611,7 @@ def _is_xla_compatible(node: torch.fx.Node) -> Tuple[bool, str]:
             return True, ""
         if op_name.startswith("profiler::"):
             return True, ""
-        if not target.has_kernel_for_dispatch_key(torch._C.DispatchKey.Meta):
+        if not has_meta_kernel(target):
             return False, f"{target} doesn't have a meta kernel registered"
 
     # Override dispatch functions inserted by install_graph_break_dispatch

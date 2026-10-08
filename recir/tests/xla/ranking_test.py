@@ -25,6 +25,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from recir.api import compile
 from recir.backends import XLAGSPMDBackend
+from recir.lowering.lowering_utils import has_meta_kernel
 from recir.lowering.xla_lower import _XLAModule
 from recir.tests.xla.gspmd_test_utils import assert_hlo_has_collective
 from transformers import Qwen2Config, Qwen2ForCausalLM  # @manual
@@ -182,9 +183,7 @@ def _collect_ops_missing_meta_kernel(compiled_obj):
                     # _strip_profiler_nodes() and don't cause real graph breaks.
                     if node.target.name().startswith("profiler::"):
                         continue
-                    if not node.target.has_kernel_for_dispatch_key(
-                        torch._C.DispatchKey.Meta
-                    ):
+                    if not has_meta_kernel(node.target):
                         missing.append(f"  [{scope}] {node} -- {node.target}")
     return missing
 

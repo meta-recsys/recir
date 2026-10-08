@@ -60,7 +60,7 @@ _RESHARD_LIB_IMPL = torch.library.Library("recir_fsdp", "IMPL")
 _RESHARD_LIB_IMPL.impl(
     "reshard_fsdp_seq", lambda x, dep: x, "CompositeExplicitAutograd"
 )
-# Explicit Meta kernel: _is_xla_compatible gates on has_kernel_for_dispatch_key(Meta).
+# Explicit Meta kernel so the op is XLA-compatible (lowering_utils.has_meta_kernel).
 _RESHARD_LIB_IMPL.impl("reshard_fsdp_seq", lambda x, dep: x, "Meta")
 # Side-effectful so DCE/CSE keeps each per-consumer barrier distinct.
 torch.fx.node._side_effectful_functions.add(
