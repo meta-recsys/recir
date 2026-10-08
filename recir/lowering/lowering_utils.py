@@ -16,6 +16,17 @@ MIN_ATEN_OPS_TO_LOWER = 10
 logger: logging.Logger = logging.getLogger(__name__)
 
 
+def has_meta_kernel(op: torch._ops.OpOverload) -> bool:
+    """Whether ``op`` can run under FakeTensor/meta, as FakeTensorMode decides.
+
+    Uses the computed dispatch table, so composite ops (e.g. ``aten.detach``,
+    ``aten.zeros``) whose Meta behavior comes from a CompositeExplicitAutograd
+    kernel count; ``OpOverload.has_kernel_for_dispatch_key(Meta)`` only sees a
+    direct Meta registration and rejects them.
+    """
+    return torch._C._dispatch_has_computed_kernel_for_dispatch_key(op.name(), "Meta")
+
+
 def strip_profiler_nodes(gm: torch.fx.GraphModule) -> torch.fx.GraphModule:
     """Remove profiler ops before backend segmentation.
 

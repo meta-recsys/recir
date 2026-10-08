@@ -13,12 +13,11 @@
 # limitations under the License.
 
 
-"""Pure PyTorch fallbacks for fbgemm ops used by generative_recommenders.
+"""Pure PyTorch fallbacks for fbgemm jagged ops (generative_recommenders, hammer).
 
 When fbgemm_gpu is not available (e.g., on TPU), importing this module
-registers pure PyTorch implementations of the fbgemm ops that
-generative_recommenders uses internally (jagged_to_padded_dense,
-dense_to_jagged, etc.).
+registers pure PyTorch implementations of the fbgemm ops those models use
+(jagged_to_padded_dense, dense_to_jagged, etc.).
 
 The ops are registered with CompositeImplicitAutograd dispatch and also
 added to recir's SPMD_DECOMP_TABLE so that make_fx(tracing_mode="fake")
@@ -312,104 +311,29 @@ def register_fbgemm_fallbacks() -> bool:
 register_fbgemm_fallbacks()
 
 
-# ── Route jagged concat/split to recir shard-local custom ops ──────────
-# The generative_recommenders / hammer 2D-jagged concat+split helpers use
-# data-dependent masking that (a) fails make_fx tracing and (b) on TPU/GSPMD
-# materializes a replicated [total_L, D] buffer (OOM). Route them to the recir
-# custom ops, which have shard_map lowerings that keep activations
-# batch-sharded. The recir ops are each other's backward (register_autograd in
-# recir/ops/jagged_ops.py), so loss.backward() differentiates them correctly.
-
-# Kept at module scope (not inside the routing fn) so autodeps keeps the
-# gen_rec dep; the routing fn references it.
-from generative_recommenders.ops.pytorch import (  # noqa: E402
-    pt_jagged_tensors as _pt_jt,
-)
+# ── Route hammer jagged concat/split to recir shard-local custom ops ───
+# hammer's 2D-jagged concat+split PyTorch helpers use data-dependent masking
+# that (a) fails make_fx tracing and (b) on TPU/GSPMD materializes a replicated
+# [total_L, D] buffer (OOM). Route them to the recir custom ops, which have
+# shard_map lowerings that keep activations batch-sharded. The recir ops are
+# each other's backward (register_autograd in recir/ops/jagged_ops.py), so
+# loss.backward() differentiates them correctly.
+#
+# generative_recommenders needs no routing: its PyTorch concat/split are
+# static-shape and built from the fbgemm jagged ops, which the SPMD
+# decompositions above already make shard-local.
 
 
 def _route_jagged_to_recir() -> None:
-    """Monkey-patch the generative_recommenders and hammer 2D-jagged concat/split
-    leaves to the recir custom ops -- centralized here instead of importing recir
-    inside the model code.
+    """Monkey-patch hammer's 2D-jagged concat/split leaves to the recir custom
+    ops: hammer.ops.jagged.pytorch_concat_2D_jagged_jagged /
+    hammer.ops.pytorch.jagged._split_2d_jagged_no_prefix (the leaf functions
+    the dispatchers resolve as module globals at call time).
 
-    Patch targets are the leaf functions the dispatchers resolve as module-globals
-    at call time (verified call graph), so the patch actually takes effect:
-      - DlrmV3Dense (gen_rec) -> pt_jagged_tensors._concat_2D_jagged_jagged /
-        pytorch_split_2D_jagged
-      - RankFM (hammer) -> hammer.ops.jagged.pytorch_concat_2D_jagged_jagged /
-        hammer.ops.pytorch.jagged._split_2d_jagged_no_prefix
-
-    The hammer side uses a dynamic import (module name as a variable) so autodeps
-    does NOT add a static build dependency on hammer -- the dlrmv3 image is
-    OSS-only (no hammer) yet still imports this module; in the RankFM image hammer
-    is present at runtime and the patches apply.
+    hammer is imported dynamically so autodeps adds no static dependency on it
+    (OSS images do not ship hammer); without hammer this is a no-op.
     """
 
-    # ---- generative_recommenders (DlrmV3Dense) ----
-    _orig_split_2D_jagged_jagged = _pt_jt._split_2D_jagged_jagged
-
-    def _recir_concat_2D_jagged_jagged(
-        values_left: torch.Tensor,
-        values_right: torch.Tensor,
-        max_len_left: int,
-        max_len_right: int,
-        offsets_left: torch.Tensor,
-        offsets_right: torch.Tensor,
-    ) -> torch.Tensor:
-        import recir.ops.jagged_ops  # noqa: F401
-
-        return torch.ops.recir.concat_2d_jagged(
-            values_left, offsets_left, values_right, offsets_right
-        )
-
-    _pt_jt._concat_2D_jagged_jagged = _recir_concat_2D_jagged_jagged  # type: ignore[assignment]
-
-    def _recir_pytorch_split_2D_jagged(
-        max_seq_len: int,
-        values: torch.Tensor,
-        max_len_left: Optional[int],
-        max_len_right: Optional[int],
-        offsets_left: Optional[torch.Tensor],
-        offsets_right: Optional[torch.Tensor],
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        if offsets_left is None:
-            assert max_len_left is not None
-            assert offsets_right is not None
-            offsets_left = max_len_left * torch.arange(
-                offsets_right.shape[0], device=values.device
-            )
-        if offsets_right is None:
-            assert max_len_right is not None
-            assert offsets_left is not None
-            offsets_right = max_len_right * torch.arange(
-                offsets_left.shape[0], device=values.device
-            )
-        if max_len_left is not None and max_len_right is not None:
-            import recir.ops.jagged_ops  # noqa: F401
-
-            # Static output rows. For the uniform path total left/right rows
-            # equal B * max_len; matches the prior static-shape swap's shapes.
-            B = offsets_left.shape[0] - 1
-            return torch.ops.recir.split_2d_jagged(
-                values,
-                offsets_left,
-                offsets_right,
-                B * max_len_left,
-                B * max_len_right,
-            )
-        return _orig_split_2D_jagged_jagged(
-            max_seq_len=max_seq_len,
-            values=values,
-            offsets_left=offsets_left,
-            offsets_right=offsets_right,
-        )
-
-    # No torch.fx.wrap: the recir tracer is make_fx, which records the recir op
-    # regardless (and ignores fx.wrap); fx.wrap only matters for symbolic_trace,
-    # which does not run on the recir/TPU path that imports this module.
-    _pt_jt.pytorch_split_2D_jagged = _recir_pytorch_split_2D_jagged  # type: ignore[assignment]
-
-    # ---- hammer (RankFM), best-effort ----
     def _opt_import(name: str) -> Any:
         import importlib
 
