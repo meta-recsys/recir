@@ -974,7 +974,11 @@ class TBESparseEmbeddingTransform(RegionTransform):
         stochastic_rounding: bool = True,
         segments_per_feature: int = 128,
         use_index_dedup: bool = True,
+        forward_root_fqn: str | None = None,
     ) -> None:
+        """``forward_root_fqn``: the called module whose forward is re-traced
+        and rewritten (it must own every TBE table; ``""`` is the root module).
+        Defaults to the deepest such module."""
         if segments_per_feature <= 0:
             raise ValueError("TBE segments per feature must be positive.")
         self.embedding_param_fqns = embedding_param_fqns
@@ -1001,6 +1005,7 @@ class TBESparseEmbeddingTransform(RegionTransform):
         self._table_states: dict[str, _TableState] = {}
         self._optimizers: tuple[torch.optim.Optimizer, ...] = ()
         self._compiled_groups: list[_CompiledGroup] = []
+        self._requested_forward_root_fqn: str | None = forward_root_fqn
         self._forward_root_fqn: str | None = None
         self._segments_per_feature: int = segments_per_feature
         self._use_index_dedup: bool = use_index_dedup
@@ -1061,7 +1066,16 @@ class TBESparseEmbeddingTransform(RegionTransform):
         ]
         if not candidates:
             raise RuntimeError("No called module owns all TBE embedding parameters.")
-        self._forward_root_fqn = max(candidates, key=lambda fqn: fqn.count("."))
+        requested = self._requested_forward_root_fqn
+        if requested is not None:
+            if requested not in candidates:
+                raise ValueError(
+                    f"TBE forward root {requested!r} is not a called module that "
+                    f"owns all TBE embedding parameters; candidates: {candidates}"
+                )
+            self._forward_root_fqn = requested
+        else:
+            self._forward_root_fqn = max(candidates, key=lambda fqn: fqn.count("."))
         return {self._forward_root_fqn}
 
     def transform_inputs(
