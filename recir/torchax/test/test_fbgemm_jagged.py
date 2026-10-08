@@ -189,76 +189,78 @@ class RecirJaggedOpsTest(unittest.TestCase):
         )
 
 
-class RecirJaggedConcatSplitDispatchTest(unittest.TestCase):
-    """Verifies importing recir.lowering.fbgemm_fallback redirects the
-    generative_recommenders concat/split dispatch leaves to the recir custom
-    ops -- i.e. the model path actually HITS recir, not merely that the ops
-    exist. The patch targets are module-globals the dispatchers resolve at call
-    time, so the identity check here mirrors runtime resolution. (The hammer /
-    RankFM leaves are patched the same way but live in a target without a hammer
-    dep, so they are covered by the TPU bench, not this CPU test.)"""
+class GenRecJaggedConcatSplitLoweringTest(unittest.TestCase):
+    """generative_recommenders' PyTorch 2D-jagged concat/split need no routing:
+    they are static-shape and built from fbgemm jagged<->dense ops, so under
+    recir's SPMD decompositions the traced graph holds only recir's shard-local
+    jagged ops (forward and backward), and numerics match the recir ops."""
 
-    def test_gen_rec_concat_routes_to_recir(self) -> None:
-        import recir.lowering.fbgemm_fallback  # noqa: F401
+    def _trace(self) -> "Any":
         from generative_recommenders.ops.pytorch import pt_jagged_tensors
+        from recir.decompositions import SPMD_DECOMP_TABLE
+        from torch.fx.experimental.proxy_tensor import make_fx
 
-        # The leaf the gen_rec concat dispatcher resolves must now be the recir
-        # routing wrapper installed by fbgemm_fallback (defined in that module).
-        self.assertEqual(
-            pt_jagged_tensors._concat_2D_jagged_jagged.__module__,
-            "recir.lowering.fbgemm_fallback",
-        )
+        ll, lr = [2, 1, 3], [1, 2, 1]
+        max_seq_len = max(a + b for a, b in zip(ll, lr))
 
-        ol = torch.tensor([0, 2, 3, 6], dtype=torch.int64)
-        orr = torch.tensor([0, 1, 3, 4], dtype=torch.int64)
+        def step(
+            vl: torch.Tensor, vr: torch.Tensor, ol: torch.Tensor, orr: torch.Tensor
+        ) -> "Any":
+            vl = vl.detach().requires_grad_()
+            vr = vr.detach().requires_grad_()
+            merged = pt_jagged_tensors.pytorch_concat_2D_jagged(
+                values_left=vl,
+                values_right=vr,
+                max_len_left=max(ll),
+                max_len_right=max(lr),
+                offsets_left=ol,
+                offsets_right=orr,
+            )
+            left, right = pt_jagged_tensors.pytorch_split_2D_jagged(
+                max_seq_len=max_seq_len,
+                values=merged * 2.0,
+                max_len_left=None,
+                max_len_right=None,
+                offsets_left=ol,
+                offsets_right=orr,
+                total_len_left=sum(ll),
+                total_len_right=sum(lr),
+            )
+            grads = torch.autograd.grad(left.sum() + right.square().sum(), (vl, vr))
+            return merged, left, right, *grads
+
         D = 4
-        vl = torch.arange(6 * D, dtype=torch.float32).reshape(6, D)
-        vr = (torch.arange(4 * D, dtype=torch.float32) + 100.0).reshape(4, D)
-        got = pt_jagged_tensors.pytorch_concat_2D_jagged(
-            values_left=vl,
-            values_right=vr,
-            max_len_left=3,
-            max_len_right=2,
-            offsets_left=ol,
-            offsets_right=orr,
+        args = (
+            torch.randn(sum(ll), D),
+            torch.randn(sum(lr), D),
+            torch.tensor(_offsets(ll), dtype=torch.int64),
+            torch.tensor(_offsets(lr), dtype=torch.int64),
         )
-        want = torch.ops.recir.concat_2d_jagged(vl, ol, vr, orr)
-        self.assertTrue(torch.equal(got, want))
+        gm = make_fx(step, tracing_mode="fake", decomposition_table=SPMD_DECOMP_TABLE)(
+            *args
+        )
+        return gm, args
 
-    def test_gen_rec_split_routes_to_recir(self) -> None:
-        import recir.lowering.fbgemm_fallback  # noqa: F401
-        from generative_recommenders.ops.pytorch import pt_jagged_tensors
+    def test_traces_to_recir_shard_local_ops(self) -> None:
+        gm, _ = self._trace()
+        namespaces = {
+            n.target.namespace
+            for n in gm.graph.nodes
+            if n.op == "call_function" and isinstance(n.target, torch._ops.OpOverload)
+        }
+        self.assertIn("recir", namespaces)
+        self.assertNotIn("fbgemm", namespaces)
 
-        self.assertEqual(
-            pt_jagged_tensors.pytorch_split_2D_jagged.__module__,
-            "recir.lowering.fbgemm_fallback",
+    def test_numerics_match_recir_ops(self) -> None:
+        gm, (vl, vr, ol, orr) = self._trace()
+        merged, left, right, g_left, g_right = gm(vl, vr, ol, orr)
+        self.assertTrue(
+            torch.equal(merged, torch.ops.recir.concat_2d_jagged(vl, ol, vr, orr))
         )
-
-        # Uniform lengths so B*max_len == total rows (exact recir split shapes);
-        # concat then split must round-trip through the patched leaves.
-        B, ll, lr, D = 3, 2, 2, 4
-        ol = torch.arange(0, (B + 1) * ll, ll, dtype=torch.int64)
-        orr = torch.arange(0, (B + 1) * lr, lr, dtype=torch.int64)
-        vl = torch.arange(B * ll * D, dtype=torch.float32).reshape(B * ll, D)
-        vr = (torch.arange(B * lr * D, dtype=torch.float32) + 100.0).reshape(B * lr, D)
-        combined = pt_jagged_tensors.pytorch_concat_2D_jagged(
-            values_left=vl,
-            values_right=vr,
-            max_len_left=ll,
-            max_len_right=lr,
-            offsets_left=ol,
-            offsets_right=orr,
-        )
-        left, right = pt_jagged_tensors.pytorch_split_2D_jagged(
-            max_seq_len=ll + lr,
-            values=combined,
-            max_len_left=ll,
-            max_len_right=lr,
-            offsets_left=ol,
-            offsets_right=orr,
-        )
-        self.assertTrue(torch.equal(left, vl))
-        self.assertTrue(torch.equal(right, vr))
+        self.assertTrue(torch.equal(left, 2.0 * vl))
+        self.assertTrue(torch.equal(right, 2.0 * vr))
+        self.assertTrue(torch.equal(g_left, torch.full_like(vl, 2.0)))
+        self.assertTrue(torch.allclose(g_right, 8.0 * vr))
 
 
 class RecirJaggedOpsMakeFxTest(unittest.TestCase):

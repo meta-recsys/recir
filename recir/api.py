@@ -9,7 +9,7 @@ import logging
 import os
 from collections import OrderedDict
 from contextlib import contextmanager, ExitStack, nullcontext
-from copy import copy
+from copy import copy, deepcopy
 from dataclasses import dataclass, field
 from functools import partial, wraps
 from typing import (
@@ -53,6 +53,7 @@ from recir.distributed.parallel_mode import (
 )
 from recir.distributed.sharding_spec import FSDPWeightShardSpec, get_state_layout
 from recir.lowering.device_state import DeviceStateManager
+from recir.passes.pass_registry import default_registry as default_pass_registry
 from recir.pipeline import build_pipeline, is_pipeline_pending, PipelineConfig
 from recir.region_transforms import (
     _apply_region_transforms,
@@ -348,6 +349,11 @@ class _CompiledResult:
     flat_state: List[torch.Tensor]
     state_manager: DeviceStateManager
     process_state: Optional[CompiledProcessState] = None
+    # GSPMD placements decided when this graph sharded the module; graphs
+    # compiled together with it (``recir.compile`` of several functions)
+    # reuse them.
+    sharded_parameter_fqns: frozenset[str] = frozenset()
+    optimizer_state_only_sharded_keys: frozenset[tuple[str, str]] = frozenset()
     # Transforms added by the sub-path (e.g. ``_compile_data_parallel_v2``
     # adds ``SparseEmbeddingTransform``).  Their ``finalize_compiled_graph``
     # is invoked by ``_compile_and_transform`` alongside the caller-supplied
@@ -881,20 +887,28 @@ def _compute_state_fqns(structure: Any) -> List[str]:
         return []
 
 
-def _is_fsdp_sharded_leaf(fqn: str, leaf: Any, sharded_keys: set[str]) -> bool:
-    return fqn in sharded_keys and isinstance(leaf, torch.Tensor) and leaf.ndim >= 1
+def _is_fsdp_sharded_leaf(
+    fqn: str, leaf: Any, sharded_parameter_fqns: set[str]
+) -> bool:
+    return (
+        fqn in sharded_parameter_fqns
+        and isinstance(leaf, torch.Tensor)
+        and leaf.ndim >= 1
+    )
 
 
 def _build_fsdp_sharded_flags(
     params_and_buffers: Dict[str, Any],
     named_states: Dict[str, Any],
-    sharded_keys: set[str],
+    sharded_parameter_fqns: set[str],
     optimizer_state_only_sharded_keys: frozenset[tuple[str, str]] = frozenset(),
 ) -> list[bool]:
     """Return per-tensor FSDP flags in the same pytree order as flat_state."""
     params_buffers_flags = {
         fqn: pytree.tree_map(
-            lambda leaf, fqn=fqn: _is_fsdp_sharded_leaf(fqn, leaf, sharded_keys),
+            lambda leaf, fqn=fqn: _is_fsdp_sharded_leaf(
+                fqn, leaf, sharded_parameter_fqns
+            ),
             value,
         )
         for fqn, value in params_and_buffers.items()
@@ -903,7 +917,9 @@ def _build_fsdp_sharded_flags(
     for fqn, state in named_states.items():
         if not isinstance(state, dict):
             named_state_flags[fqn] = pytree.tree_map(
-                lambda leaf, fqn=fqn: _is_fsdp_sharded_leaf(fqn, leaf, sharded_keys),
+                lambda leaf, fqn=fqn: _is_fsdp_sharded_leaf(
+                    fqn, leaf, sharded_parameter_fqns
+                ),
                 state,
             )
             continue
@@ -911,7 +927,7 @@ def _build_fsdp_sharded_flags(
         for state_key, state_value in state.items():
             state_flags[state_key] = pytree.tree_map(
                 lambda leaf, fqn=fqn, state_key=state_key: (
-                    _is_fsdp_sharded_leaf(fqn, leaf, sharded_keys)
+                    _is_fsdp_sharded_leaf(fqn, leaf, sharded_parameter_fqns)
                     or (
                         (fqn, state_key) in optimizer_state_only_sharded_keys
                         and isinstance(leaf, torch.Tensor)
@@ -1339,10 +1355,28 @@ def _make_hybrid_sparse_transform(
     parallel_mode: HybridParallel,
     embedding_param_fqns: set[str],
     mod: nn.Module,
+    forward_only: bool = False,
 ) -> RegionTransform:
-    factory = parallel_mode.sparse_transform_factory
-    if factory is not None:
-        transform = factory(embedding_param_fqns, parallel_mode.mesh, mod)
+    if forward_only:
+        # Eval / inference has no embedding backward or optimizer state. Reuse
+        # the tables already installed on the module by the training transform
+        # (for example, TBE table views) and rewrite only their forward lookups.
+        return SparseEmbeddingTransform(
+            embedding_param_fqns=embedding_param_fqns,
+            mesh=parallel_mode.mesh,
+            mod=mod,
+            embedding_plan=parallel_mode.embedding_plan,
+            forward_only=True,
+        )
+
+    # The configurable factory owns the training transform: it may create
+    # optimizer-backed table state and rewrite both embedding forward and
+    # backward. It must not be invoked for the forward-only branch above.
+    training_transform_factory = parallel_mode.sparse_transform_factory
+    if training_transform_factory is not None:
+        transform = training_transform_factory(
+            embedding_param_fqns, parallel_mode.mesh, mod
+        )
         if not isinstance(transform, RegionTransform):
             raise TypeError(
                 "HybridParallel sparse_transform_factory must return a "
@@ -1354,6 +1388,7 @@ def _make_hybrid_sparse_transform(
         mesh=parallel_mode.mesh,
         mod=mod,
         embedding_plan=parallel_mode.embedding_plan,
+        forward_only=False,
     )
 
 
@@ -1398,7 +1433,306 @@ def _get_trace_ctx(gm: fx.GraphModule) -> _TraceContext:
     return cast(_TraceContext, ctx)
 
 
-def trace(  # noqa: C901 — orchestration: dispatches on parallel_mode flavor (DP/HybridParallel vs GSPMD vs None); splitting the branches into helpers would obscure the shared post-trace tagging.
+_TraceResult = Tuple[fx.GraphModule, List[torch.Tensor]]
+
+
+@dataclass
+class _PreparedDataParallelTrace:
+    """A DP/Hybrid trace after setup and before shared parameter sharding."""
+
+    spec: "_GraphSpec"
+    parallel_mode: Union[DataParallel, HybridParallel]
+    mod: nn.Module
+    optimizers: List[torch.optim.Optimizer]
+    mesh: Any
+    dp_style: DataParallelStyle
+    embedding_param_fqns: Optional[set[str]]
+    transforms: List[RegionTransform]
+    internal_transforms: List[RegionTransform]
+    regather_transform: Optional[RegatherTransform]
+    embedding_param_indices: Optional[set[int]]
+    params_and_buffers: Dict[str, Any]
+    parameter_fqns: set[str]
+    fake_mode: FakeTensorMode
+    discovery: Optional[_RegionDiscovery]
+    trace_args: Tuple[Any, ...]
+    trace_kwargs: Dict[str, Any]
+
+
+def _trace_module_and_optimizers(
+    spec: "_GraphSpec",
+) -> Tuple[nn.Module, List[torch.optim.Optimizer]]:
+    mod: Optional[nn.Module] = None
+    optimizers: List[torch.optim.Optimizer] = []
+    for arg in pytree.arg_tree_leaves(*spec.args, **spec.kwargs):
+        if isinstance(arg, nn.Module) and mod is None:
+            mod = arg
+        if isinstance(arg, torch.optim.Optimizer):
+            optimizers.append(arg)
+    assert mod is not None, "recir.trace requires an nn.Module in the arguments"
+    return mod, optimizers
+
+
+def _prepare_data_parallel_trace(
+    spec: "_GraphSpec",
+) -> _PreparedDataParallelTrace:
+    """Perform all DP/Hybrid setup that must precede shared sharding."""
+    parallel_mode = spec.parallel_mode
+    assert isinstance(parallel_mode, (DataParallel, HybridParallel))
+    mod, optimizers = _trace_module_and_optimizers(spec)
+    transforms = list(spec.region_transforms)
+
+    if isinstance(parallel_mode, HybridParallel):
+        mesh = parallel_mode.mesh
+        dp_style = parallel_mode.dense_style
+        fqns = parallel_mode.embedding_plan.param_fqns
+        embedding_param_fqns = fqns if fqns else None
+    else:
+        mesh = parallel_mode.device_mesh
+        dp_style = parallel_mode.parallel_style
+        embedding_param_fqns = None
+
+    internal_transforms: List[RegionTransform] = []
+    regather_transform: Optional[RegatherTransform] = None
+    if dp_style == DataParallelStyle.FULLY_SHARD:
+        regather_skip = RegatherTransform.skip_fqns_for_recompute(
+            mod, transforms, base_skip=embedding_param_fqns
+        )
+        regather_transform = RegatherTransform(
+            skip_param_fqns=regather_skip or None,
+            forward_root_fqns=(
+                parallel_mode.dense_fsdp_module_fqns
+                if isinstance(parallel_mode, HybridParallel)
+                else None
+            ),
+        )
+        internal_transforms.append(regather_transform)
+    if isinstance(parallel_mode, HybridParallel) and embedding_param_fqns:
+        internal_transforms.append(
+            _make_hybrid_sparse_transform(
+                parallel_mode,
+                embedding_param_fqns,
+                mod,
+                forward_only=not optimizers,
+            )
+        )
+    transforms = [*internal_transforms, *transforms]
+    _bind_transform_signatures(transforms, spec.fn)
+
+    params_and_buffers: Dict[str, Any] = {
+        **dict(mod.named_parameters(remove_duplicate=False)),
+        **dict(mod.named_buffers(remove_duplicate=False)),
+    }
+    parameter_fqns = set(dict(mod.named_parameters(remove_duplicate=False)))
+    embedding_param_indices = (
+        parallel_mode._compute_embedding_param_indices(params_and_buffers)
+        if isinstance(parallel_mode, HybridParallel)
+        else None
+    )
+
+    fake_mode = FakeTensorMode(
+        allow_non_fake_inputs=True,
+        shape_env=ShapeEnv() if isinstance(parallel_mode, HybridParallel) else None,
+    )
+    input_transform = _make_trace_input_transform(
+        parallel_mode.input_batch_dim,
+        ratio=1 / (parallel_mode.num_ranks // parallel_mode.num_processes),
+        fake_mode=fake_mode,
+        dynamic_batch_dim=isinstance(parallel_mode, HybridParallel),
+    )
+    trace_args = pytree.tree_map_only(torch.Tensor, input_transform, spec.args)
+    trace_kwargs = pytree.tree_map_only(torch.Tensor, input_transform, spec.kwargs)
+    discovery = _discover_for_region_transforms(
+        transforms,
+        spec.fn,
+        trace_args,
+        trace_kwargs,
+        mod=mod,
+        fake_mode=fake_mode,
+    )
+    return _PreparedDataParallelTrace(
+        spec=spec,
+        parallel_mode=parallel_mode,
+        mod=mod,
+        optimizers=optimizers,
+        mesh=mesh,
+        dp_style=dp_style,
+        embedding_param_fqns=embedding_param_fqns,
+        transforms=transforms,
+        internal_transforms=internal_transforms,
+        regather_transform=regather_transform,
+        embedding_param_indices=embedding_param_indices,
+        params_and_buffers=params_and_buffers,
+        parameter_fqns=parameter_fqns,
+        fake_mode=fake_mode,
+        discovery=discovery,
+        trace_args=trace_args,
+        trace_kwargs=trace_kwargs,
+    )
+
+
+def _finish_data_parallel_trace(
+    prepared: _PreparedDataParallelTrace,
+    actually_sharded_fqns: set[str],
+) -> _TraceResult:
+    """Trace one prepared graph after the shared module sharding is complete."""
+    dense_sharded_param_fqns: Optional[set[str]] = None
+    replicated_param_fqns: set[str] = set()
+    if prepared.dp_style == DataParallelStyle.FULLY_SHARD:
+        dense_sharded_param_fqns = (
+            prepared.parameter_fqns & actually_sharded_fqns
+        ) - set(prepared.embedding_param_fqns or ())
+        replicated_param_fqns = prepared.parameter_fqns - actually_sharded_fqns
+        if prepared.regather_transform is not None:
+            prepared.regather_transform.skip_param_fqns.update(replicated_param_fqns)
+    _prepare_transforms_after_shard(
+        prepared.transforms, prepared.mod, prepared.optimizers
+    )
+
+    collectives_fn = collectives_insertion(prepared.dp_style, prepared.mesh)
+    parametrize_kwargs: Dict[str, Any] = {}
+    if dense_sharded_param_fqns is not None:
+        parametrize_kwargs["include_param_fqns"] = dense_sharded_param_fqns
+    elif prepared.embedding_param_fqns:
+        parametrize_kwargs["exclude_param_fqns"] = prepared.embedding_param_fqns
+
+    with ExitStack() as region_stack:
+        _enter_region_transform_contexts(
+            region_stack,
+            prepared.transforms,
+            prepared.discovery,
+            prepared.fake_mode,
+            parametrize_cm_factory=lambda root_fqn, root_mod: partial(
+                parametrize_params,
+                root_mod,
+                collectives_fn,
+                **_relative_parametrize_kwargs(root_fqn, parametrize_kwargs),
+            ),
+        )
+        if prepared.dp_style == DataParallelStyle.FULLY_SHARD:
+            outer_parametrize_fns: List[Callable[..., torch.Tensor]] = []
+            outer_exclude_fqns: Optional[set[str]] = None
+        else:
+            outer_parametrize_fns = [collectives_fn]
+            outer_exclude_fqns = prepared.embedding_param_fqns
+        outer_parametrize_fns.extend(prepared.spec.parametrize_fns)
+        if replicated_param_fqns:
+            region_stack.enter_context(
+                parametrize_params(
+                    prepared.mod,
+                    collectives_insertion(DataParallelStyle.REPLICATE, prepared.mesh),
+                    include_param_fqns=replicated_param_fqns,
+                )
+            )
+        local_result = _local_compile(
+            prepared.spec.fn,
+            *prepared.trace_args,
+            fake_mode=prepared.fake_mode,
+            _parametrize_fns=outer_parametrize_fns,
+            _exclude_param_fqns=outer_exclude_fqns,
+            _tensor_attr_holders=prepared.spec.tensor_attr_holders,
+            **prepared.trace_kwargs,
+        )
+    return _finalize_trace_result(
+        local_result,
+        input_batch_dim=prepared.spec.resolved_input_batch_dim,
+        embedding_param_indices=prepared.embedding_param_indices,
+        internal_transforms=prepared.internal_transforms,
+    )
+
+
+def _trace_without_pre_sharding(spec: "_GraphSpec") -> _TraceResult:
+    """Trace a GSPMD or non-parallel graph, which has no pre-trace shard phase."""
+    mod, _ = _trace_module_and_optimizers(spec)
+    transforms = list(spec.region_transforms)
+    _bind_transform_signatures(transforms, spec.fn)
+    fake_mode = FakeTensorMode(allow_non_fake_inputs=True)
+    trace_args = spec.args
+    trace_kwargs = spec.kwargs
+    trace_batch_ratio = _resolve_trace_batch_ratio(spec.parallel_mode)
+    if trace_batch_ratio is not None and trace_batch_ratio != 1:
+        input_transform = _make_trace_input_transform(
+            spec.resolved_input_batch_dim,
+            ratio=trace_batch_ratio,
+            fake_mode=fake_mode,
+        )
+        trace_args = pytree.tree_map_only(torch.Tensor, input_transform, trace_args)
+        trace_kwargs = pytree.tree_map_only(torch.Tensor, input_transform, trace_kwargs)
+    discovery = _discover_for_region_transforms(
+        transforms,
+        spec.fn,
+        trace_args,
+        trace_kwargs,
+        mod=mod,
+        fake_mode=fake_mode,
+    )
+    with ExitStack() as region_stack:
+        _enter_region_transform_contexts(
+            region_stack,
+            transforms,
+            discovery,
+            fake_mode,
+        )
+        local_result = _local_compile(
+            spec.fn,
+            *trace_args,
+            fake_mode=fake_mode,
+            _stateless_func_wrapper=gradients_tagging,
+            _parametrize_fns=list(spec.parametrize_fns) or None,
+            _tensor_attr_holders=spec.tensor_attr_holders,
+            **trace_kwargs,
+        )
+    return _finalize_trace_result(
+        local_result,
+        input_batch_dim=spec.resolved_input_batch_dim,
+    )
+
+
+def _finalize_trace_result(
+    local_result: _LocalCompiledResult,
+    *,
+    input_batch_dim: int,
+    embedding_param_indices: Optional[set[int]] = None,
+    internal_transforms: Sequence[RegionTransform] = (),
+) -> _TraceResult:
+    flat_state = pytree.tree_leaves(
+        [
+            {**local_result.params, **local_result.buffers},
+            local_result.named_states,
+        ]
+    )
+    _tag_batch_inputs(
+        local_result.gm,
+        sum(isinstance(value, torch.Tensor) for value in flat_state),
+        input_batch_dim,
+        {
+            fqn
+            for fqn, parameter in local_result.params.items()
+            if not parameter.requires_grad
+        },
+    )
+    propagate_batch_input_meta(local_result.gm)
+    ctx = _TraceContext(
+        mod=local_result.mod,
+        opts=local_result.opts,
+        params=local_result.params,
+        buffers=local_result.buffers,
+        named_states=local_result.named_states,
+        state_fqns=_compute_state_fqns(
+            [
+                {**local_result.params, **local_result.buffers},
+                local_result.named_states,
+            ]
+        ),
+        input_batch_dim=input_batch_dim,
+        embedding_param_indices=embedding_param_indices,
+        internal_transforms=list(internal_transforms),
+    )
+    _set_trace_ctx(local_result.gm, ctx)
+    return local_result.gm, flat_state
+
+
+def trace(
     callable_: Callable[..., Any],
     *args: Any,
     region_transforms: Sequence[RegionTransform] = (),
@@ -1473,305 +1807,26 @@ def trace(  # noqa: C901 — orchestration: dispatches on parallel_mode flavor (
     Returns:
         ``(gm, flat_state)``.
     """
-    region_transforms_list = list(region_transforms)
-
-    # Pre-extract mod (and all opts for the DP/HybridParallel branch's
-    # pre-trace ``shard_params`` call); ``_local_compile`` re-extracts both
-    # itself. Multi-opt setups (sparse + dense partition) pass >1 Optimizer.
-    mod: Optional[nn.Module] = None
-    opts: List[torch.optim.Optimizer] = []
-    for arg in pytree.arg_tree_leaves(*args, **kwargs):
-        if isinstance(arg, nn.Module) and mod is None:
-            mod = arg
-        if isinstance(arg, torch.optim.Optimizer):
-            opts.append(arg)
-    assert mod is not None, "recir.trace requires an nn.Module in the arguments"
-    _mod: nn.Module = mod
-
-    # Dispatch on parallel_mode flavor for the trace setup.
-    embedding_param_indices: Optional[set[int]] = None
-    internal_transforms: list[RegionTransform] = []
-    if isinstance(parallel_mode, (DataParallel, HybridParallel)):
-        # DataParallel / HybridParallel v2: parametrization-based collective
-        # insertion (no DTensor partitioner downstream).  Mirrors the body
-        # of the legacy-path ``_compile_data_parallel_v2`` helper,
-        # restructured so the post-trace tagging / context-stash steps are
-        # shared with the GSPMD branch below.
-
-        # Extract mesh and DP style from the parallel mode.
-        if isinstance(parallel_mode, HybridParallel):
-            mesh = parallel_mode.mesh
-            dp_style = parallel_mode.dense_style
-        else:
-            mesh = parallel_mode.device_mesh
-            dp_style = parallel_mode.parallel_style
-        world_size: int = parallel_mode.num_ranks
-
-        # Resolve embedding param FQNs from the plan (HybridParallel only).
-        embedding_param_fqns: Optional[set[str]] = None
-        if isinstance(parallel_mode, HybridParallel):
-            fqns = parallel_mode.embedding_plan.param_fqns
-            embedding_param_fqns = fqns if fqns else None
-
-        # Build transforms list (RegatherTransform for FULLY_SHARD + caller
-        # region_transforms).  Embedding params are excluded from the
-        # regather so that the post-trace row-wise embedding rewrite owns
-        # them.
-        dp_transforms: list[RegionTransform] = []
-        regather_transform: Optional[RegatherTransform] = None
-        if dp_style == DataParallelStyle.FULLY_SHARD:
-            # Per-op regather skips embedding params (owned by the row-wise
-            # rewrite) and any param already covered by a RecomputeTransform;
-            # RegatherTransform owns that policy (keeps api.py transform-blind).
-            regather_skip = RegatherTransform.skip_fqns_for_recompute(
-                _mod, region_transforms_list, base_skip=embedding_param_fqns
-            )
-            regather_transform = RegatherTransform(
-                skip_param_fqns=regather_skip or None,
-                forward_root_fqns=(
-                    parallel_mode.dense_fsdp_module_fqns
-                    if isinstance(parallel_mode, HybridParallel)
-                    else None
-                ),
-            )
-            internal_transforms.append(regather_transform)
-        if isinstance(parallel_mode, HybridParallel) and embedding_param_fqns:
-            internal_transforms.append(
-                _make_hybrid_sparse_transform(parallel_mode, embedding_param_fqns, _mod)
-            )
-        dp_transforms.extend(internal_transforms)
-        if region_transforms_list:
-            dp_transforms.extend(region_transforms_list)
-        _bind_transform_signatures(dp_transforms, callable_)
-
-        # Extract params_and_buffers BEFORE shard_params so the FQN order
-        # matches the placeholder ordering ``_local_compile`` will emit.
-        # Embedding indices computed from this snapshot map to placeholder
-        # positions in the traced graph.
-        params_and_buffers: Dict[str, Any] = {
-            **dict(_mod.named_parameters(remove_duplicate=False)),
-            **dict(_mod.named_buffers(remove_duplicate=False)),
-        }
-        parameter_fqns = set(dict(_mod.named_parameters(remove_duplicate=False)))
-        if isinstance(parallel_mode, HybridParallel):
-            embedding_param_indices = parallel_mode._compute_embedding_param_indices(
-                params_and_buffers
-            )
-
-        # HybridParallel-only ShapeEnv: custom ops with data-dependent output
-        # shapes (``recir_torchrec::kjt_split_per_feature``,
-        # ``recir_preproc::mot_preprocessor_forward``) mint fresh SymInts via
-        # ``torch.library.get_ctx().new_dynamic_size()`` from their fake
-        # kernels; without a ShapeEnv those calls raise
-        # ``DynamicOutputShapeException``.
-        fake_mode: FakeTensorMode = FakeTensorMode(
-            allow_non_fake_inputs=True,
-            shape_env=ShapeEnv() if isinstance(parallel_mode, HybridParallel) else None,
-        )
-
-        # Convert every input through the shared FakeTensorMode and resize it
-        # when one process owns multiple devices. HybridParallel currently has
-        # one process per GPU, so its ratio is 1: no resize occurs, but this
-        # call still keeps input_batch_dim symbolic for candidate/jagged inputs.
-        input_transform = _make_trace_input_transform(
-            parallel_mode.input_batch_dim,
-            ratio=1 / (world_size // parallel_mode.num_processes),
-            fake_mode=fake_mode,
-            dynamic_batch_dim=isinstance(parallel_mode, HybridParallel),
-        )
-        args = pytree.tree_map_only(torch.Tensor, input_transform, args)
-        kwargs = pytree.tree_map_only(torch.Tensor, input_transform, kwargs)
-        discovery = _discover_for_region_transforms(
-            dp_transforms,
-            callable_,
-            args,
-            kwargs,
-            mod=_mod,
-            fake_mode=fake_mode,
-        )
-
-        # Shard params on the module and optimizer states.  Mutates the dict
-        # and the module in-place; also updates each ``opt.state`` so that
-        # parameter -> state mappings remain valid post-shard.
-        sharded_keys = parallel_mode.shard_params(_mod, params_and_buffers, opts)
-        sharded_param_fqns: Optional[set[str]] = None
-        replicated_param_fqns: set[str] = set()
-        if (
-            isinstance(parallel_mode, (DataParallel, HybridParallel))
-            and dp_style == DataParallelStyle.FULLY_SHARD
-        ):
-            sharded_param_fqns = (parameter_fqns & sharded_keys) - set(
-                embedding_param_fqns or ()
-            )
-            replicated_param_fqns = parameter_fqns - sharded_keys
-            if regather_transform is not None:
-                regather_transform.skip_param_fqns.update(replicated_param_fqns)
-        _prepare_transforms_after_shard(dp_transforms, _mod, opts)
-
-        # Apply region transforms AFTER sharding, with parametrization.  The
-        # traced forward includes allgather ops from ``collectives_insertion``
-        # so each per-parameter region encompasses allgather + chain +
-        # compute.  Embedding params (if any) are excluded from collectives
-        # — they use AllToAll inserted post-trace, not allgather.
-        collectives_fn = collectives_insertion(dp_style, mesh)
-        parametrize_kwargs: Dict[str, Any] = {}
-        if sharded_param_fqns is not None:
-            parametrize_kwargs["include_param_fqns"] = sharded_param_fqns
-        elif embedding_param_fqns:
-            parametrize_kwargs["exclude_param_fqns"] = embedding_param_fqns
-        with ExitStack() as region_stack:
-            _enter_region_transform_contexts(
-                region_stack,
-                dp_transforms,
-                discovery,
-                fake_mode,
-                parametrize_cm_factory=lambda root_fqn, root_mod: partial(
-                    parametrize_params,
-                    root_mod,
-                    collectives_fn,
-                    **_relative_parametrize_kwargs(root_fqn, parametrize_kwargs),
-                ),
-            )
-            # Whether the OUTER trace must parametrize dense params with
-            # ``collectives_fn`` depends on the dense style, NOT merely on
-            # whether region transforms exist:
-            #   * FULLY_SHARD always adds ``RegatherTransform``, which bakes the
-            #     dense allgather collectives into its ``gm_fwd``; re-applying
-            #     here would double-allgather, so pass [].
-            #   * REPLICATE has NO dense region transform (HybridParallel only
-            #     adds the embedding-scoped ``SparseEmbeddingTransform``), so the
-            #     dense-grad all_reduce must be inserted by parametrizing dense
-            #     params in the outer trace. Embedding params are excluded so
-            #     they keep their all_to_all path (``None`` when no embeddings).
-            if dp_style == DataParallelStyle.FULLY_SHARD:
-                _outer_parametrize_fns: List[Callable[..., torch.Tensor]] = []
-                _outer_exclude_fqns: Optional[set[str]] = None
-            else:
-                _outer_parametrize_fns = [collectives_fn]
-                _outer_exclude_fqns = embedding_param_fqns
-            # User-supplied parametrize fns (e.g. QAT fake-quant) are
-            # appended AFTER collectives so the chain is
-            # ``user_fn(collectives_fn(raw))`` -- collectives run first so
-            # QAT sees the gathered full-precision weight.
-            if _parametrize_fns:
-                _outer_parametrize_fns = [
-                    *_outer_parametrize_fns,
-                    *_parametrize_fns,
-                ]
-            if replicated_param_fqns:
-                region_stack.enter_context(
-                    parametrize_params(
-                        _mod,
-                        collectives_insertion(DataParallelStyle.REPLICATE, mesh),
-                        include_param_fqns=replicated_param_fqns,
-                    )
-                )
-            local_result = _local_compile(
-                callable_,
-                *args,
-                fake_mode=fake_mode,
-                _parametrize_fns=_outer_parametrize_fns,
-                _exclude_param_fqns=_outer_exclude_fqns,
-                _tensor_attr_holders=_tensor_attr_holders,
-                **kwargs,
-            )
-    else:
-        # GSPMDParallel or no parallel_mode: legacy trace path.  Expand
-        # per-process batch tensors to the global batch BEFORE tracing so
-        # ``inputs_embeds.shape[0]`` resolves to the global batch and
-        # HuggingFace's modeling code bakes the correct literal into
-        # ``expand`` / ``view`` / ``reshape`` calls.  Otherwise GSPMD lowering
-        # inflates placeholders to global shape post-trace but consumer
-        # literals still reference the per-host shape -> JAX broadcast
-        # mismatch.  Mirrors the pre-trace transform in :func:`_compile_gspmd`.
-        _bind_transform_signatures(region_transforms_list, callable_)
-        fake_mode = FakeTensorMode(allow_non_fake_inputs=True)
-        trace_batch_ratio = _resolve_trace_batch_ratio(parallel_mode)
-        if trace_batch_ratio is not None and trace_batch_ratio != 1:
-            input_transform = _make_trace_input_transform(
-                input_batch_dim,
-                ratio=trace_batch_ratio,
-                fake_mode=fake_mode,
-            )
-            args = pytree.tree_map_only(torch.Tensor, input_transform, args)
-            kwargs = pytree.tree_map_only(torch.Tensor, input_transform, kwargs)
-
-        discovery = _discover_for_region_transforms(
-            region_transforms_list,
-            callable_,
-            args,
-            kwargs,
-            mod=_mod,
-            fake_mode=fake_mode,
-        )
-        with ExitStack() as region_stack:
-            _enter_region_transform_contexts(
-                region_stack,
-                region_transforms_list,
-                discovery,
-                fake_mode,
-            )
-            # Apply ``gradients_tagging`` during the inner trace so the
-            # resulting gm carries ``_spmd::tag_grad`` markers on every
-            # parameter gradient.  ``_compile_gspmd`` historically always
-            # passed this wrapper; without it ``compile_from_gm``'s GSPMD
-            # branch would have no grad markers to scale / erase.  Mirrors
-            # ``_local_compile(..., _stateless_func_wrapper=gradients_tagging)``
-            # in the legacy GSPMD entry point.
-            local_result = _local_compile(
-                callable_,
-                *args,
-                fake_mode=fake_mode,
-                _stateless_func_wrapper=gradients_tagging,
-                _parametrize_fns=list(_parametrize_fns) if _parametrize_fns else None,
-                _tensor_attr_holders=_tensor_attr_holders,
-                **kwargs,
-            )
-
-    flat_state = pytree.tree_leaves(
-        [
-            {**local_result.params, **local_result.buffers},
-            local_result.named_states,
-        ]
-    )
-    # Tag placeholders with is_batch_input / is_weight / batch_dim so the
-    # meta-driven branch in downstream consumers (e.g. mivilm.surgeon's
-    # ``_semantic_input_map``) can identify user-input placeholders without
-    # relying on the broken ordinal heuristic that misses opt named_states.
-    # Tensor placeholders for params, buffers, and optimizer state precede user
-    # inputs; non-tensor state leaves do not occupy tensor-placeholder slots.
-    _tag_batch_inputs(
-        local_result.gm,
-        sum(isinstance(value, torch.Tensor) for value in flat_state),
-        input_batch_dim,
-        {
-            fqn
-            for fqn, parameter in local_result.params.items()
-            if not parameter.requires_grad
-        },
-    )
-    # Propagate batch-input meta through ops so intermediate FX nodes that
-    # become subgraph boundaries (after later partition/lower) inherit
-    # is_batch_input / batch_dim — mirrors the legacy ``_finalize_graph`` flow.
-    propagate_batch_input_meta(local_result.gm)
-    ctx = _TraceContext(
-        mod=local_result.mod,
-        opts=local_result.opts,
-        params=local_result.params,
-        buffers=local_result.buffers,
-        named_states=local_result.named_states,
-        state_fqns=_compute_state_fqns(
-            [
-                {**local_result.params, **local_result.buffers},
-                local_result.named_states,
-            ]
-        ),
+    spec = _GraphSpec(
+        callable_,
+        args,
+        parallel_mode,
         input_batch_dim=input_batch_dim,
-        embedding_param_indices=embedding_param_indices,
-        internal_transforms=internal_transforms,
+        kwargs=kwargs,
+        region_transforms=region_transforms,
+        tensor_attr_holders=_tensor_attr_holders,
+        parametrize_fns=_parametrize_fns or (),
     )
-    _set_trace_ctx(local_result.gm, ctx)
-    return local_result.gm, flat_state
+    if not isinstance(parallel_mode, (DataParallel, HybridParallel)):
+        return _trace_without_pre_sharding(spec)
+
+    prepared = _prepare_data_parallel_trace(spec)
+    actually_sharded_fqns = parallel_mode.shard_params(
+        prepared.mod,
+        prepared.params_and_buffers,
+        prepared.optimizers,
+    )
+    return _finish_data_parallel_trace(prepared, actually_sharded_fqns)
 
 
 def compile_from_gm(  # noqa: C901 — orchestration: stages 4-8 of the pipeline are intentionally laid out inline so the # Stage N comments stay readable; refactor would split the pipeline across helpers.
@@ -1782,6 +1837,8 @@ def compile_from_gm(  # noqa: C901 — orchestration: stages 4-8 of the pipeline
     backend: "Backend",
     region_transforms: Sequence[RegionTransform] = (),
     pipeline_config: Optional[PipelineConfig] = None,
+    _sharded_by: Optional[_CompiledResult] = None,
+    _shard_optimizers: Optional[Sequence[torch.optim.Optimizer]] = None,
 ) -> _CompiledResult:
     """Stages 4-10: continue the pipeline from a pre-traced gm.
 
@@ -1847,6 +1904,12 @@ def compile_from_gm(  # noqa: C901 — orchestration: stages 4-8 of the pipeline
             transform's ``finalize_compiled_graph(gm)`` is invoked after
             partition (stage 4 in code-order, but conceptually stage 4 of
             the pipeline).
+        _sharded_by: set by :func:`_compile_graphs` for every graph after
+            the first, which already sharded the module: reuse its placements
+            instead of sharding again.
+        _shard_optimizers: all optimizers owned by graphs compiled together.
+            The first GSPMD graph shards them with the module even when that
+            graph itself is forward-only.
 
     Returns:
         A :class:`_CompiledResult` ready for runtime use via
@@ -1887,7 +1950,7 @@ def compile_from_gm(  # noqa: C901 — orchestration: stages 4-8 of the pipeline
     #     placeholders.  GSPMD needs no DTensor partition pass, so after
     #     sharding we scale + erase the autograd-emitted ``_spmd::tag_grad``
     #     markers so XLA lowering can proceed.
-    sharded_keys: set[str] = set()
+    sharded_parameter_fqns: set[str] = set()
     optimizer_state_only_sharded_keys: frozenset[tuple[str, str]] = frozenset()
     fsdp_base_state: Optional[Tuple[Any, ...]] = None
     fsdp_state_flags: Optional[list[bool]] = None
@@ -1921,12 +1984,22 @@ def compile_from_gm(  # noqa: C901 — orchestration: stages 4-8 of the pipeline
         # parameters), then re-extract named_states by walking the
         # now-sharded module.  GSPMD needs no DTensor partition pass.
         params_and_buffers = {**ctx.params, **ctx.buffers}
-        sharded_keys = parallel_mode.shard_params(ctx.mod, params_and_buffers, ctx.opts)
-        optimizer_state_only_sharded_keys = getattr(
-            parallel_mode,
-            "optimizer_state_only_sharded_keys",
-            frozenset(),
-        )
+        if _sharded_by is None:
+            sharded_parameter_fqns = parallel_mode.shard_params(
+                ctx.mod,
+                params_and_buffers,
+                ctx.opts if _shard_optimizers is None else _shard_optimizers,
+            )
+            optimizer_state_only_sharded_keys = getattr(
+                parallel_mode,
+                "optimizer_state_only_sharded_keys",
+                frozenset(),
+            )
+        else:
+            sharded_parameter_fqns = set(_sharded_by.sharded_parameter_fqns)
+            optimizer_state_only_sharded_keys = (
+                _sharded_by.optimizer_state_only_sharded_keys
+            )
         rebuilt_named_states: Dict[str, Any] = {}
         _opts = ctx.opts
         if ctx.named_states:
@@ -2034,11 +2107,11 @@ def compile_from_gm(  # noqa: C901 — orchestration: stages 4-8 of the pipeline
     # for the GSPMD branch above — the DP/HybridParallel branch consumes
     # the parametrized gm directly and does not need placeholder-level
     # FSDP tagging.
-    if sharded_keys or optimizer_state_only_sharded_keys:
+    if sharded_parameter_fqns or optimizer_state_only_sharded_keys:
         fsdp_state_flags = _build_fsdp_sharded_flags(
             params_and_buffers,
             named_states,
-            sharded_keys,
+            sharded_parameter_fqns,
             optimizer_state_only_sharded_keys,
         )
         fsdp_base_state = tuple(flat_state)
@@ -2080,6 +2153,9 @@ def compile_from_gm(  # noqa: C901 — orchestration: stages 4-8 of the pipeline
         inspect.Parameter.POSITIONAL_OR_KEYWORD,
         inspect.Parameter.POSITIONAL_ONLY,
     )
+    # Pass ordering/"apply once" bookkeeping is per graph; reset it so one
+    # process can compile several graphs (e.g. a train and an eval step).
+    default_pass_registry.reset()
     for opt_pass in backend.optimize_passes:
         try:
             sig_params = inspect.signature(opt_pass).parameters.values()
@@ -2135,61 +2211,206 @@ def compile_from_gm(  # noqa: C901 — orchestration: stages 4-8 of the pipeline
         flat_state=flat_state,
         state_manager=sm,
         process_state=process_state,
+        sharded_parameter_fqns=frozenset(sharded_parameter_fqns),
+        optimizer_state_only_sharded_keys=frozenset(optimizer_state_only_sharded_keys),
     )
 
 
+def _bind_to_current_module_state(ctx: _TraceContext) -> None:
+    """Point the trace's params/buffers at the module's current tensors, which
+    a later trace or compile may have replaced (sharding, TBE lowering)."""
+    params = dict(ctx.mod.named_parameters(remove_duplicate=False))
+    buffers = dict(ctx.mod.named_buffers(remove_duplicate=False))
+    ctx.params = {fqn: params[fqn] for fqn in ctx.params}
+    ctx.buffers = {fqn: buffers[fqn] for fqn in ctx.buffers}
+
+
+@dataclass
+class _GraphSpec:
+    """One graph for :func:`_trace_graphs`: ``fn(*args, **kwargs)`` traced as
+    :func:`trace` would trace it."""
+
+    fn: Callable[..., Any]
+    args: Tuple[Any, ...]
+    parallel_mode: Optional[ParallelMode]
+    input_batch_dim: Optional[int] = None
+    kwargs: Dict[str, Any] = field(default_factory=dict)
+    region_transforms: Sequence[RegionTransform] = ()
+    tensor_attr_holders: Sequence[Any] = ()
+    parametrize_fns: Sequence[Callable[..., torch.Tensor]] = ()
+
+    @property
+    def resolved_input_batch_dim(self) -> int:
+        if self.input_batch_dim is not None:
+            return self.input_batch_dim
+        if self.parallel_mode is not None:
+            return self.parallel_mode.input_batch_dim
+        return 0
+
+
+def _trace_graphs(specs: Sequence[_GraphSpec]) -> List[_TraceResult]:
+    """Trace several graphs over ONE module that will share its parameters
+    (e.g. a train step and a forward-only eval step).
+
+    The module is sharded once, for all of them: DataParallel / HybridParallel
+    shard before tracing, so every graph finishes its pre-shard setup, the
+    module is sharded with every graph's optimizers, then each is traced.
+    GSPMD shards at compile time (:func:`_compile_graphs`). Each returned
+    ``(gm, flat_state)`` may be rewritten (graph dispatchers) before compiling.
+    """
+    mods = {
+        id(arg): arg
+        for spec in specs
+        for arg in pytree.arg_tree_leaves(*spec.args, **spec.kwargs)
+        if isinstance(arg, nn.Module)
+    }
+    if len(mods) != 1:
+        raise ValueError("graphs compiled together must take the same module")
+    trace_results: List[Optional[_TraceResult]] = [None] * len(specs)
+    prepared_traces: List[Tuple[int, _PreparedDataParallelTrace]] = []
+    for trace_index, spec in enumerate(specs):
+        if isinstance(spec.parallel_mode, (DataParallel, HybridParallel)):
+            prepared_traces.append((trace_index, _prepare_data_parallel_trace(spec)))
+        else:
+            trace_results[trace_index] = _trace_without_pre_sharding(spec)
+
+    if prepared_traces:
+        canonical_preparation = prepared_traces[0][1]
+        all_optimizers: List[torch.optim.Optimizer] = []
+        for _, prepared in prepared_traces:
+            all_optimizers.extend(
+                optimizer
+                for optimizer in prepared.optimizers
+                if all(optimizer is not existing for existing in all_optimizers)
+            )
+        actually_sharded_fqns = canonical_preparation.parallel_mode.shard_params(
+            next(iter(mods.values())),
+            canonical_preparation.params_and_buffers,
+            all_optimizers,
+        )
+        canonical_state = canonical_preparation.params_and_buffers
+        for trace_index, prepared in prepared_traces:
+            prepared.params_and_buffers.update(
+                {fqn: canonical_state[fqn] for fqn in prepared.params_and_buffers}
+            )
+            trace_results[trace_index] = _finish_data_parallel_trace(
+                prepared, actually_sharded_fqns
+            )
+
+    traced: List[_TraceResult] = []
+    for result in trace_results:
+        assert result is not None
+        traced.append(result)
+    return traced
+
+
+def _compile_graphs(
+    traced: Sequence[_TraceResult],
+    *,
+    parallel_modes: Sequence[ParallelMode],
+    backend: "Backend",
+    region_transforms: Optional[Sequence[Sequence[RegionTransform]]] = None,
+    pipeline_configs: Optional[Sequence[Optional[PipelineConfig]]] = None,
+) -> List[_CompiledResult]:
+    """Compile graphs from :func:`_trace_graphs`; they share one set of
+    parameters. Each graph binds to the module's tensors as they are when it
+    compiles, after every trace-time rewrite (e.g. TBE lowering) and any
+    earlier graph's compile-time sharding; the first graph does the GSPMD
+    sharding and every later one reuses its placements. On backends
+    with device-resident state (XLA) the graphs also share one device state,
+    so each sees the others' updates without a host round trip. Wrap each
+    result with :func:`make_compiled_runner` and run them independently.
+    """
+    count = len(traced)
+    transforms = region_transforms or [()] * count
+    pipelines = pipeline_configs or [None] * count
+    if not len(parallel_modes) == len(transforms) == len(pipelines) == count:
+        raise ValueError("need one entry per traced graph")
+    all_optimizers: List[torch.optim.Optimizer] = []
+    for gm, _ in traced:
+        for optimizer in _get_trace_ctx(gm).opts:
+            if all(optimizer is not existing for existing in all_optimizers):
+                all_optimizers.append(optimizer)
+    compiled: List[_CompiledResult] = []
+    for (gm, flat_state), mode, graph_transforms, pipeline in zip(
+        traced, parallel_modes, transforms, pipelines
+    ):
+        _bind_to_current_module_state(_get_trace_ctx(gm))
+        compiled.append(
+            compile_from_gm(
+                gm,
+                flat_state,
+                parallel_mode=mode,
+                backend=backend,
+                region_transforms=graph_transforms,
+                pipeline_config=pipeline,
+                _sharded_by=compiled[0] if compiled else None,
+                _shard_optimizers=all_optimizers,
+            )
+        )
+    shared_device_state: Dict[str, Any] = {}
+    for result in compiled:
+        result.state_manager.share_device_state(
+            shared_device_state, result.gm, result.flat_state
+        )
+    return compiled
+
+
 def _compile_via_backend(
-    func: Callable[..., Any],
+    calls: Sequence[Tuple[Callable[..., Any], Tuple[Any, ...], Dict[str, Any]]],
     parallel_mode: ParallelMode,
     backend: "Backend",
     *,
     eager_preproc: Sequence[Callable[[nn.Module], None]],
     region_transforms: Optional[List[RegionTransform]],
     _parametrize_fns: Sequence[Callable[..., torch.Tensor]] = (),
-    args: Tuple[Any, ...],
-    kwargs: Dict[str, Any],
-) -> _CompiledResult:
-    """Internal: drive the new v7.1 trace + compile_from_gm pipeline.
-
-    Centralises the eager_preproc → trace → compile_from_gm call sequence so
-    :func:`compile` doesn't have to duplicate it.  Used only when the user
-    passes ``backend=`` to :func:`compile`.
+) -> List[_CompiledResult]:
+    """Internal: drive the trace + compile_from_gm pipeline for ``(func, args,
+    kwargs)`` calls over one module, compiled together (one call is the usual
+    single-function compile). Used only when the user passes ``backend=`` to
+    :func:`compile`.
     """
     rt = list(region_transforms or ())
+    graph_region_transforms = [rt] if len(calls) == 1 else [deepcopy(rt) for _ in calls]
 
-    # Stage 0: apply eager pre-trace hooks to every nn.Module argument.
+    # Stage 0: apply eager pre-trace hooks to every nn.Module argument, once.
     # Multi-module signatures (e.g. model + loss module, teacher/student)
     # all need preprocessing -- not just the first one encountered.
-    if eager_preproc:
-        for arg in pytree.arg_tree_leaves(*args, **kwargs):
-            if isinstance(arg, nn.Module):
-                for hook in eager_preproc:
-                    hook(arg)
+    modules = {
+        id(arg): arg
+        for _, args, kwargs in calls
+        for arg in pytree.arg_tree_leaves(*args, **kwargs)
+        if isinstance(arg, nn.Module)
+    }
+    for module in modules.values():
+        for hook in eager_preproc:
+            hook(module)
 
-    # Stage 2: trace.  Propagate the parallel mode's batch dim so placeholder
-    # meta tagging matches what stages 4-10 will later assume.  Also pass the
-    # parallel mode itself so the trace can expand per-process tensors to the
-    # global batch when the mode is GSPMD-like -- avoids the HF Gemma3 /
-    # Llama / Qwen ``shape[0]``-baked-as-int problem that surfaces post-GSPMD
-    # at JAX broadcast time.  Mirrors the per-host -> global transform that
-    # ``_compile_gspmd`` performs on the legacy partition-only path.
-    gm, flat_state = trace(
-        func,
-        *args,
-        region_transforms=rt,
-        input_batch_dim=parallel_mode.input_batch_dim,
-        parallel_mode=parallel_mode,
-        _parametrize_fns=list(_parametrize_fns) if _parametrize_fns else None,
-        **kwargs,
+    # Stage 2: trace (sharding the module once for all calls). The parallel
+    # mode drives the pre-trace setup, e.g. GSPMD expands per-process tensors
+    # to the global batch so modeling code that bakes ``shape[0]`` as an int
+    # sees the global size.
+    traced = _trace_graphs(
+        [
+            _GraphSpec(
+                func,
+                args,
+                parallel_mode,
+                input_batch_dim=parallel_mode.input_batch_dim,
+                kwargs=kwargs,
+                region_transforms=graph_rt,
+                parametrize_fns=_parametrize_fns,
+            )
+            for (func, args, kwargs), graph_rt in zip(calls, graph_region_transforms)
+        ]
     )
 
     # Stages 4-10.
-    return compile_from_gm(
-        gm,
-        flat_state,
-        parallel_mode=parallel_mode,
+    return _compile_graphs(
+        traced,
+        parallel_modes=[parallel_mode] * len(calls),
         backend=backend,
-        region_transforms=rt,
+        region_transforms=graph_region_transforms,
     )
 
 
@@ -2309,17 +2530,17 @@ def _compile_data_parallel_v2(
     #    It also updates each opt's state + param_groups so that
     #    parameter -> state mappings remain valid after sparse Parameter
     #    identity swaps.
-    sharded_keys = parallel_mode.shard_params(_mod, params_and_buffers, opts)
-    sharded_param_fqns: Optional[set[str]] = None
+    sharded_parameter_fqns = parallel_mode.shard_params(_mod, params_and_buffers, opts)
+    dense_sharded_param_fqns: Optional[set[str]] = None
     replicated_param_fqns: set[str] = set()
     if (
         isinstance(parallel_mode, (DataParallel, HybridParallel))
         and dp_style == DataParallelStyle.FULLY_SHARD
     ):
-        sharded_param_fqns = (parameter_fqns & sharded_keys) - set(
+        dense_sharded_param_fqns = (parameter_fqns & sharded_parameter_fqns) - set(
             embedding_param_fqns or ()
         )
-        replicated_param_fqns = parameter_fqns - sharded_keys
+        replicated_param_fqns = parameter_fqns - sharded_parameter_fqns
         if regather_transform is not None:
             regather_transform.skip_param_fqns.update(replicated_param_fqns)
     _prepare_transforms_after_shard(transforms, _mod, opts)
@@ -2331,8 +2552,8 @@ def _compile_data_parallel_v2(
     #    AllToAll (inserted in step 9), not allgather.
     collectives_fn = collectives_insertion(dp_style, mesh)
     parametrize_kwargs: Dict[str, Any] = {}
-    if sharded_param_fqns is not None:
-        parametrize_kwargs["include_param_fqns"] = sharded_param_fqns
+    if dense_sharded_param_fqns is not None:
+        parametrize_kwargs["include_param_fqns"] = dense_sharded_param_fqns
     elif embedding_param_fqns:
         parametrize_kwargs["exclude_param_fqns"] = embedding_param_fqns
     with ExitStack() as region_stack:
@@ -2491,7 +2712,7 @@ def _compile_gspmd(
     # The graph retains global shapes; runtime inputs are local shards
     # (_to_sharded_jax bridges the gap). Sharding before _finalize_graph
     # means flat_state is built from already-sharded tensors.
-    sharded_keys = parallel_mode.shard_params(
+    sharded_parameter_fqns = parallel_mode.shard_params(
         local_result.mod, params_and_buffers, local_result.opts
     )
     optimizer_state_only_sharded_keys = parallel_mode.optimizer_state_only_sharded_keys
@@ -2507,11 +2728,11 @@ def _compile_gspmd(
     result.gm.meta["gspmd_fsdp_axis_size"] = parallel_mode.fsdp_axis_size
     # Set is_fsdp_sharded on placeholder nodes so _jit_gspmd knows
     # which inputs are local shards.
-    if sharded_keys or optimizer_state_only_sharded_keys:
+    if sharded_parameter_fqns or optimizer_state_only_sharded_keys:
         is_sharded = _build_fsdp_sharded_flags(
             params_and_buffers,
             local_result.named_states,
-            sharded_keys,
+            sharded_parameter_fqns,
             optimizer_state_only_sharded_keys,
         )
         is_sharded = _align_fsdp_sharded_flags(
@@ -2531,7 +2752,7 @@ def _compile_gspmd(
         )
         logger.info(
             "FSDP: %d sharded keys, %d sharded placeholders, flat_state=%d entries",
-            len(sharded_keys),
+            len(sharded_parameter_fqns),
             sum(
                 1
                 for n in result.gm.graph.nodes
@@ -2643,8 +2864,21 @@ def compile(  # noqa: C901 — orchestration: stages 0-9 + legacy DP/GSPMD wirin
     backend: Optional["Backend"] = None,
     eager_preproc: Sequence[Callable[[nn.Module], None]] = (),
     _parametrize_fns: Sequence[Callable[..., torch.Tensor]] = (),
-) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+) -> Callable[..., Any]:
     r"""Compile and optimize a callable, which can be a train step within a training loop.
+
+    Several functions over the same module (e.g. a train step and an eval
+    step) can be compiled together so they share its parameters -- sharded
+    once, one set of state, one device state on XLA::
+
+        train_step, eval_step = recir.compile(parallel_mode=mode, backend=be)(
+            train_fn, eval_fn, example_args=[(model, opt, batch), (model, batch)]
+        )
+
+    They are compiled immediately from ``example_args`` (not on first call),
+    then each runner runs independently. A function that takes no optimizer
+    compiles forward-only. ``region_transforms`` apply to every function; each
+    graph gets its own copy so signature-bound transform state stays isolated.
 
     This is the public top-level entry point for the recir compile pipeline.
     Extracts the :class:`nn.Module` + :class:`torch.optim.Optimizer` from the
@@ -2816,47 +3050,51 @@ def compile(  # noqa: C901 — orchestration: stages 0-9 + legacy DP/GSPMD wirin
             ShardMap) that own stages 5-8.
     """
 
-    def inner(func: Callable[..., Any]) -> Callable[..., Any]:
+    def compile_calls(
+        calls: Sequence[Tuple[Callable[..., Any], Tuple[Any, ...], Dict[str, Any]]],
+    ) -> List[_CompiledResult]:
+        mode: ParallelMode = DataParallel() if parallel_mode is None else parallel_mode
+        if backend is not None:
+            return _compile_via_backend(
+                calls,
+                mode,
+                backend,
+                eager_preproc=eager_preproc,
+                region_transforms=region_transforms,
+                _parametrize_fns=_parametrize_fns,
+            )
+        if len(calls) > 1:
+            raise ValueError("compiling several functions together needs backend=")
+        if _parametrize_fns:
+            raise ValueError(
+                "recir.compile(_parametrize_fns=...) requires "
+                "backend= to be set (the legacy partition-only "
+                "path does not forward user parametrize fns)."
+            )
+        ((func, args, kwargs),) = calls
+        if eager_preproc:
+            for arg in pytree.arg_tree_leaves(*args, **kwargs):
+                if isinstance(arg, nn.Module):
+                    for hook in eager_preproc:
+                        hook(arg)
+        return [
+            _compile_and_transform(
+                func,
+                mode,
+                *args,
+                region_transforms=region_transforms,
+                **kwargs,
+            )
+        ]
+
+    def make_wrapper(func: Callable[..., Any]) -> Callable[..., Any]:
         def ensure_compiled(
             args: Tuple[Any, ...], kwargs: Dict[str, Any]
         ) -> _CompiledResult:
             compiled_obj = wrapper.__dict__.get(COMPILED_OBJECT_KEY, None)
-            if compiled_obj is not None:
-                return compiled_obj
-            mode: ParallelMode = (
-                DataParallel() if parallel_mode is None else parallel_mode
-            )
-            if backend is not None:
-                compiled_obj = _compile_via_backend(
-                    func,
-                    mode,
-                    backend,
-                    eager_preproc=eager_preproc,
-                    region_transforms=region_transforms,
-                    _parametrize_fns=_parametrize_fns,
-                    args=args,
-                    kwargs=kwargs,
-                )
-            else:
-                if _parametrize_fns:
-                    raise ValueError(
-                        "recir.compile(_parametrize_fns=...) requires "
-                        "backend= to be set (the legacy partition-only "
-                        "path does not forward user parametrize fns)."
-                    )
-                if eager_preproc:
-                    for arg in pytree.arg_tree_leaves(*args, **kwargs):
-                        if isinstance(arg, nn.Module):
-                            for hook in eager_preproc:
-                                hook(arg)
-                compiled_obj = _compile_and_transform(
-                    func,
-                    mode,
-                    *args,
-                    region_transforms=region_transforms,
-                    **kwargs,
-                )
-            wrapper.__dict__[COMPILED_OBJECT_KEY] = compiled_obj
+            if compiled_obj is None:
+                (compiled_obj,) = compile_calls([(func, args, kwargs)])
+                wrapper.__dict__[COMPILED_OBJECT_KEY] = compiled_obj
             return compiled_obj
 
         @wraps(func)
@@ -2907,6 +3145,30 @@ def compile(  # noqa: C901 — orchestration: stages 0-9 + legacy DP/GSPMD wirin
 
         wrapper.__dict__[PREPARE_COMPILED_ATTR] = prepare_compiled
         return wrapper
+
+    def inner(
+        func: Callable[..., Any],
+        *more_funcs: Callable[..., Any],
+        example_args: Optional[Sequence[Tuple[Any, ...]]] = None,
+    ) -> Any:
+        funcs = (func, *more_funcs)
+        wrappers = [make_wrapper(f) for f in funcs]
+        if example_args is None:
+            if more_funcs:
+                raise ValueError(
+                    "compiling several functions together needs example_args= "
+                    "(one argument tuple per function); they compile now, not on "
+                    "first call"
+                )
+            return wrappers[0]
+        if len(example_args) != len(funcs):
+            raise ValueError("example_args= needs one argument tuple per function")
+        compiled = compile_calls(
+            [(f, tuple(args), {}) for f, args in zip(funcs, example_args)]
+        )
+        for wrapper, compiled_obj in zip(wrappers, compiled):
+            wrapper.__dict__[COMPILED_OBJECT_KEY] = compiled_obj
+        return tuple(wrappers) if more_funcs else wrappers[0]
 
     return inner
 

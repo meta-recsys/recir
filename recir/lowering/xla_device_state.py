@@ -6,7 +6,7 @@
 
 import logging
 import time
-from typing import Any, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import torch
 from recir.lowering.device_state import DeviceStateManager
@@ -25,11 +25,63 @@ logger: logging.Logger = logging.getLogger(__name__)
 
 
 class XLADeviceStateManager(DeviceStateManager):
+    """Keep XLA state resident and optionally share it across compiled graphs."""
+
+    _shared: Optional[Dict[str, Any]] = None
+    _shared_keys: List[str]
+    _shared_host: List[torch.Tensor]
+
     def __init__(self, torch_device: Optional[torch.device] = None) -> None:
         super().__init__(
             torch_device if torch_device is not None else torch.device("cpu")
         )
         self._state_input_cache: _StateInputCache = {}
+
+    def share_device_state(
+        self,
+        store: Dict[str, Any],
+        compiled: torch.nn.Module,
+        flat_state: List[torch.Tensor],
+    ) -> None:
+        state_fqns = self.state_fqns
+        if state_fqns is None or len(state_fqns) != len(flat_state):
+            return
+        # A graph left entirely in torch (too small to lower) reads host tensors.
+        if not any(isinstance(m, _XLAModule) for m in compiled.modules()):
+            return
+        local = self.device_state
+        self._shared = store
+        self._shared_keys = list(state_fqns)
+        self._shared_host = flat_state
+        if local is not None:
+            self.device_state = local
+
+    @property
+    def device_state(self) -> Optional[List[Any]]:
+        shared = self._shared
+        if shared is None:
+            return self._device_state
+        if not any(key in shared for key in self._shared_keys):
+            return None
+        # A leaf no graph has made resident yet is its host tensor, which the
+        # XLA call converts like on the slow path.
+        return [
+            shared.get(key, host)
+            for key, host in zip(self._shared_keys, self._shared_host)
+        ]
+
+    @device_state.setter
+    def device_state(self, value: Optional[List[Any]]) -> None:
+        shared = self._shared
+        if shared is None:
+            self._device_state = value
+            return
+        if value is None:
+            for key in self._shared_keys:
+                shared.pop(key, None)
+            return
+        for key, array in zip(self._shared_keys, value):
+            shared[key] = array
 
     def _configure_xla_modules(
         self, gm: torch.nn.Module, *, keep_jax_output: bool

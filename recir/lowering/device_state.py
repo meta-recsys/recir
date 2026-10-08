@@ -4,7 +4,7 @@
 # This source code is licensed under the BSD-3-Clause license found in the
 # LICENSE file in the root directory of this source tree.
 
-from typing import Any, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence
 
 import torch
 from torch import fx
@@ -17,7 +17,7 @@ class DeviceStateManager:
     """Manages device-resident state between train steps."""
 
     def __init__(self, torch_device: torch.device = _CPU_DEVICE) -> None:
-        self.device_state: Optional[List[Any]] = None
+        self._device_state: Optional[List[Any]] = None
         self._used_fast_path: bool = False
         self.torch_device: torch.device = torch_device
         # FQNs (fully-qualified names) aligned 1:1 with flat_state, populated at
@@ -34,6 +34,25 @@ class DeviceStateManager:
         # logging). No effect for the base manager (whose outputs are already
         # torch); honored by XLADeviceStateManager.
         self.keep_output_jax: bool = False
+
+    @property
+    def device_state(self) -> Optional[List[Any]]:
+        return self._device_state
+
+    @device_state.setter
+    def device_state(self, value: Optional[List[Any]]) -> None:
+        self._device_state = value
+
+    def share_device_state(
+        self,
+        store: Dict[str, Any],
+        compiled: torch.nn.Module,
+        flat_state: List[torch.Tensor],
+    ) -> None:
+        """Share resident state with the other graphs compiled together with
+        this one (``recir.api.compile_together``). No-op here: these graphs
+        read and write the module tensors directly."""
+        return
 
     def prepare_inputs(
         self,
