@@ -62,11 +62,6 @@ from recir.examples.rankfm_mvai.rankfm_model_utils import (
     build_model_from_config,
     resolve_attention_backend,
 )
-from recir.examples.rankfm_mvai.train_common import (
-    ensure_gloo_process_group,
-    force_cpu_barrier,
-    resolve_dist_env,
-)
 from recir.examples.rankfm_mvai.xsurface_helpers import (
     _resolve_nro_per_sample,
     make_padding_region_transforms,
@@ -82,6 +77,11 @@ from recir.training.compile import (
 )
 from recir.training.optim import prime_optimizer_state
 from recir.training.setup import setup_dense_optimizer_and_warmup
+from recir.training.tpu_runtime import (
+    ensure_gloo_process_group,
+    force_cpu_barrier,
+    resolve_dist_env,
+)
 
 logger: logging.Logger = logging.getLogger(__name__)
 
