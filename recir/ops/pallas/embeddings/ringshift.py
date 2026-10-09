@@ -396,6 +396,22 @@ def _peer_id_by_cumsum(exclusive_offsets: jax.Array, n: int) -> jax.Array:
     return jnp.cumsum(delta)
 
 
+def _peer_broadcast(per_peer: jax.Array, starts: jax.Array, n: int) -> jax.Array:
+    """:func:`_peer_id_by_cumsum` for an arbitrary per-peer value, not just the id.
+
+    ``per_peer[peer_id]`` gives the same ``[n]`` array but lowers to a lookup
+    into a length-``world_size`` table with a length-n index vector, which on
+    TPU costs an order of magnitude more than the scan. ``starts`` is the
+    position each peer's slice begins at; empty peers and out-of-range starts
+    behave as they do there.
+    """
+    jumps = jnp.diff(per_peer.astype(jnp.int32), prepend=jnp.zeros((1,), jnp.int32))
+    delta = (
+        jnp.zeros((n,), jnp.int32).at[starts.astype(jnp.int32)].add(jumps, mode="drop")
+    )
+    return jnp.cumsum(delta)
+
+
 def _pad_per_peer(
     sorted_row: jax.Array,
     send_counts_real: jax.Array,
@@ -417,10 +433,15 @@ def _pad_per_peer(
     real_offsets = jnp.cumsum(send_counts_real) - send_counts_real
     padded_offsets = jnp.cumsum(send_counts_padded) - send_counts_padded
     pos = jnp.arange(max_padded, dtype=jnp.int32)
-    peer_id = _peer_id_by_cumsum(padded_offsets, max_padded)
-    local_pad_pos = pos - padded_offsets[peer_id]
-    is_real = local_pad_pos < send_counts_real[peer_id]
-    src_pos = jnp.clip(real_offsets[peer_id] + local_pad_pos, 0, max_local_ids - 1)
+    local_pad_pos = pos - _peer_broadcast(padded_offsets, padded_offsets, max_padded)
+    is_real = local_pad_pos < _peer_broadcast(
+        send_counts_real, padded_offsets, max_padded
+    )
+    src_pos = jnp.clip(
+        _peer_broadcast(real_offsets, padded_offsets, max_padded) + local_pad_pos,
+        0,
+        max_local_ids - 1,
+    )
     return jnp.where(is_real, sorted_row[src_pos], pad_value).astype(jnp.int32)
 
 
@@ -460,10 +481,15 @@ def _pad_per_peer_2d(
     real_offsets = jnp.cumsum(send_counts_real) - send_counts_real
     padded_offsets = jnp.cumsum(send_counts_padded) - send_counts_padded
     pos = jnp.arange(max_padded, dtype=jnp.int32)
-    peer_id = _peer_id_by_cumsum(padded_offsets, max_padded)
-    local_pad_pos = pos - padded_offsets[peer_id]
-    is_real = local_pad_pos < send_counts_real[peer_id]
-    src_pos = jnp.clip(real_offsets[peer_id] + local_pad_pos, 0, max_local_ids - 1)
+    local_pad_pos = pos - _peer_broadcast(padded_offsets, padded_offsets, max_padded)
+    is_real = local_pad_pos < _peer_broadcast(
+        send_counts_real, padded_offsets, max_padded
+    )
+    src_pos = jnp.clip(
+        _peer_broadcast(real_offsets, padded_offsets, max_padded) + local_pad_pos,
+        0,
+        max_local_ids - 1,
+    )
     gathered = sorted_rows_2d[src_pos]  # [max_padded, D]
     return jnp.where(is_real[:, None], gathered, 0).astype(sorted_rows_2d.dtype)
 
@@ -487,9 +513,12 @@ def _unpad_per_peer(
     total_real = jnp.sum(send_counts_real)
     pos = jnp.arange(max_local_ids, dtype=jnp.int32)
     in_real = pos < total_real
-    peer_id = _peer_id_by_cumsum(real_offsets, max_local_ids)
-    local_real_pos = pos - real_offsets[peer_id]
-    padded_src = jnp.clip(padded_offsets[peer_id] + local_real_pos, 0, max_padded - 1)
+    local_real_pos = pos - _peer_broadcast(real_offsets, real_offsets, max_local_ids)
+    padded_src = jnp.clip(
+        _peer_broadcast(padded_offsets, real_offsets, max_local_ids) + local_real_pos,
+        0,
+        max_padded - 1,
+    )
     gathered = out_padded[padded_src]
     return jnp.where(in_real[:, None], gathered, 0).astype(out_padded.dtype)
 
