@@ -13,7 +13,9 @@ from typing import Literal, overload
 
 import torch
 import torch.distributed as dist
+import torch.fx as fx
 from recir.api import compile, sync_device_state_to_torch
+from recir.backends.base import Backend
 from recir.backends.inductor import InductorBackend
 from recir.distributed.parallel_mode import HybridParallel
 from recir.ops.fake.kjt import patch_ebc_for_tracing
@@ -111,6 +113,14 @@ class _Model(nn.Module):
             lengths=lengths,
         )
         return self.ebc(features).values()
+
+
+class _EagerBackend(Backend):
+    """Runs the compiled FX graph as is. The TBE graph does not lower through
+    Inductor yet (see the tbe_inductor tests)."""
+
+    def dispatch(self, gm: fx.GraphModule) -> nn.Module:
+        return gm
 
 
 def _fake_mesh() -> DeviceMesh:
@@ -439,6 +449,102 @@ class EmbeddingBagCollectionDistributedTest(DTensorTestBase):
             use_inductor=True,
             sharding_case="table_wise",
         )
+
+    @skip_if_lt_x_gpu(2)
+    @with_comms
+    def test_tbe_eval_graph_shares_train_parameters(self) -> None:
+        self._run_two_rank_train_and_eval(eval_first=False)
+
+    @skip_if_lt_x_gpu(2)
+    @with_comms
+    def test_tbe_eval_graph_listed_first_shares_train_parameters(self) -> None:
+        # Eval is traced before the train trace swaps in the TBE tables, so it
+        # must be rebound to them at compile time.
+        self._run_two_rank_train_and_eval(eval_first=True)
+
+    def _run_two_rank_train_and_eval(self, eval_first: bool) -> None:
+        """Train and forward-only eval graphs compiled together read the same
+        rank-local (TBE-lowered) tables, and training continues after eval."""
+        torch.manual_seed(0)
+        device = torch.device(f"cuda:{self.rank}")
+        reference = _Model(device, _UNEVEN_NUM_EMBEDDINGS)
+        compiled = deepcopy(reference)
+        self.assertEqual(patch_ebc_for_tracing(compiled), 1)
+        compiled_optimizer = _TracingRowWiseAdagrad(list(compiled.parameters()))
+        reference_optimizer = RowWiseAdagrad(reference.parameters(), lr=0.1, eps=1.0e-8)
+        embedding_plan = _sharding_plan(
+            compiled, "mixed", table_wise_owner_rank=1, world_size=self.world_size
+        )
+
+        def train_fn(
+            model: nn.Module,
+            optimizer: torch.optim.Optimizer,
+            values: torch.Tensor,
+            lengths: torch.Tensor,
+            coefficient: torch.Tensor,
+        ) -> torch.Tensor:
+            output = model(values, lengths)
+            (output * coefficient).sum().backward()
+            optimizer.step()
+            return output.detach()
+
+        def eval_fn(
+            model: nn.Module, values: torch.Tensor, lengths: torch.Tensor
+        ) -> torch.Tensor:
+            with torch.no_grad():
+                return model(values, lengths)
+
+        values, lengths, coefficient = _rank_batch(self.rank, device, 0)
+        functions = [train_fn, eval_fn]
+        example_args = [
+            (compiled, compiled_optimizer, values, lengths, coefficient),
+            (compiled, values, lengths),
+        ]
+        order = [1, 0] if eval_first else [0, 1]
+        runners = compile(
+            parallel_mode=HybridParallel(
+                dense_style="replicate",
+                embedding_plan=embedding_plan,
+                sparse_transform_factory=_tbe_sparse_transform_factory(embedding_plan),
+            ),
+            backend=_EagerBackend(),
+        )(*(functions[i] for i in order), example_args=[example_args[i] for i in order])
+        train_step, eval_step = (runners[order.index(i)] for i in (0, 1))
+
+        def train(iteration: int) -> None:
+            values, lengths, coefficient = _rank_batch(self.rank, device, iteration)
+            compiled_optimizer.zero_grad()
+            actual = train_step(
+                compiled, compiled_optimizer, values, lengths, coefficient
+            )
+            reference_optimizer.zero_grad()
+            torch.testing.assert_close(actual, reference(values, lengths).detach())
+            losses = []
+            for rank in range(self.world_size):
+                rank_values, rank_lengths, rank_coefficient = _rank_batch(
+                    rank, device, iteration
+                )
+                losses.append(
+                    (reference(rank_values, rank_lengths) * rank_coefficient).sum()
+                )
+            torch.stack(losses).sum().backward()
+            reference_optimizer.step()
+
+        def evaluate(iteration: int) -> None:
+            values, lengths, _ = _rank_batch(self.rank, device, iteration)
+            torch.testing.assert_close(
+                eval_step(compiled, values, lengths),
+                reference(values, lengths).detach(),
+                atol=1.0e-5,
+                rtol=1.0e-5,
+            )
+
+        train(0)
+        evaluate(1)
+        train(1)
+        evaluate(0)
+        train(0)
+        evaluate(1)
 
     def _run_two_rank_training(
         self,
