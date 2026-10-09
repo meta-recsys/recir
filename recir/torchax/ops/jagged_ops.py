@@ -232,6 +232,23 @@ def _segment_id_by_cumsum(boundaries: Any, n: int) -> Any:
     return jnp.cumsum(delta)
 
 
+def _segment_broadcast(per_segment: Any, starts: Any, n: int) -> Any:
+    """``_segment_id_by_cumsum`` for an arbitrary per-segment value, not just the id.
+
+    ``per_segment[segment_id]`` gives the same ``[n]`` array but lowers to a
+    lookup into a length-B table with a length-n index vector, which on TPU runs
+    about two orders of magnitude below a scan. ``starts`` is the position each
+    segment begins at; out-of-range and duplicate entries behave as they do
+    there.
+    """
+    values = per_segment.astype(jnp.int32)
+    jumps = jnp.diff(values, prepend=jnp.zeros((1,), jnp.int32))
+    delta = (
+        jnp.zeros((n,), jnp.int32).at[starts.astype(jnp.int32)].add(jumps, mode="drop")
+    )
+    return jnp.cumsum(delta)
+
+
 def _jax_concat_2d_jagged(
     values_left: Any,
     offsets_left: Any,
@@ -241,51 +258,48 @@ def _jax_concat_2d_jagged(
 ) -> Any:
     """Per-sample interleave: combined[b] = cat(left[b], right[b]).
 
-    Each output row must be gathered from either the left or the right values,
-    depending on which sample (batch index) and intra-sample offset it maps to.
-    The combined offsets (offsets_left + offsets_right) are the monotonically
-    increasing prefix sums of the per-sample combined lengths, so a flat output
-    position's sample is the bucket it falls into -- which is exactly what
-    searchsorted computes (and it works under jit, unlike a data-dependent
-    Python loop over samples).
+    Each output row comes from either the left or the right values, decided by
+    which sample it falls in and how far into that sample it sits. Indexing
+    dominates this op on TPU, so the per-sample quantities are built by
+    ``_segment_broadcast`` instead of looked up per position, and the operands
+    share one index space so the left/right choice applies to the source index
+    before a single fetch rather than to two fetched rows.
     """
     batch_size = offsets_left.shape[0] - 1
     combined_offsets = offsets_left + offsets_right  # cumulative, [batch_size + 1]
     lengths_left = offsets_left[1:] - offsets_left[:-1]  # [batch_size]
+    starts = combined_offsets[:batch_size]
     positions = jnp.arange(out_total)
-    # Sample (batch) index each flat output position belongs to. Vectorized
-    # segment-id (cumsum over boundary markers) instead of searchsorted, which
-    # would lower to a serial binary-search while loop on TPU.
-    batch_idx = _segment_id_by_cumsum(combined_offsets[1:batch_size], out_total)
-    intra_offset = positions - combined_offsets[batch_idx]  # offset within the sample
-    is_left = intra_offset < lengths_left[batch_idx]
-    # Guard against an empty side: when one operand has 0 rows (e.g. an empty
-    # left jagged tensor, or a per-device shard that received no rows under
-    # shard_map), ``values.shape[0] - 1`` is -1 and the gather of a size-1
-    # slice from a zero-length dim is out of range。
-    if values_left.shape[0] == 0:
-        gathered_left = jnp.zeros(
-            (out_total,) + values_left.shape[1:], dtype=values_left.dtype
-        )
+
+    # pos_* are per output position; the arrays they broadcast from are per
+    # sample, so the two are never a plural apart.
+    pos_sample_start = _segment_broadcast(starts, starts, out_total)
+    pos_left_len = _segment_broadcast(lengths_left, starts, out_total)
+    pos_left_off = _segment_broadcast(offsets_left[:batch_size], starts, out_total)
+    pos_right_off = _segment_broadcast(offsets_right[:batch_size], starts, out_total)
+
+    intra_offset = positions - pos_sample_start  # offset within the sample
+    is_left = intra_offset < pos_left_len
+
+    # A shard may legitimately receive 0 rows, which contribute no index space.
+    n_left = values_left.shape[0]
+    if n_left == 0:
+        combined = values_right
+    elif values_right.shape[0] == 0:
+        combined = values_left
     else:
-        source_left = jnp.clip(
-            offsets_left[batch_idx] + intra_offset, 0, values_left.shape[0] - 1
-        )
-        gathered_left = values_left[source_left]
-    if values_right.shape[0] == 0:
-        gathered_right = jnp.zeros(
-            (out_total,) + values_right.shape[1:], dtype=values_right.dtype
-        )
+        combined = jnp.concatenate([values_left, values_right], axis=0)
+
+    if combined.shape[0] == 0:
+        out = jnp.zeros((out_total,) + values_left.shape[1:], dtype=values_left.dtype)
     else:
-        source_right = jnp.clip(
-            offsets_right[batch_idx] + (intra_offset - lengths_left[batch_idx]),
-            0,
-            values_right.shape[0] - 1,
+        source: Any = jnp.where(
+            is_left,
+            pos_left_off + intra_offset,
+            n_left + pos_right_off + (intra_offset - pos_left_len),
         )
-        gathered_right = values_right[source_right]
-    out = jnp.where(
-        _bcast_mask(is_left, gathered_left.ndim), gathered_left, gathered_right
-    )
+        out = combined[jnp.clip(source, 0, combined.shape[0] - 1)]
+
     valid = positions < combined_offsets[batch_size]
     # pyrefly: ignore [missing-attribute, no-matching-overload]
     return jnp.where(_bcast_mask(valid, out.ndim), out, 0)
