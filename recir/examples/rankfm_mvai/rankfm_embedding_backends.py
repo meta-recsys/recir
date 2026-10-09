@@ -28,7 +28,6 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import jax
 import torch
 import torch.nn as nn
-from minimal_viable_ai.core.model_family_api.optimizer_configs import OptimConfig
 from recir.embedding.backend import EmbeddingBackend, table_plans_from_embedding_tables
 from recir.embedding.cpu import CPUEmbeddingBackend, SparseArchDispatcher
 from recir.embedding.in_graph import (
@@ -44,6 +43,7 @@ from recir.examples.rankfm_mvai.rankfm_dispatchers import (
     PreprocessorDispatcher,
     TEST_BATCH_SIZE,
 )
+from recir.training.optim import OptimConfig
 
 logger: logging.Logger = logging.getLogger(__name__)
 
