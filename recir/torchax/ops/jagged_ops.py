@@ -45,18 +45,24 @@ def _jax_jagged_to_padded_dense_impl(
     """Pure-JAX jagged->padded-dense gather (per-device kernel for the shard_map lowerings)."""
     seq_offsets = offsets[0]
     max_len: int = int(max_lengths[0])
-    b: int = seq_offsets.shape[0] - 1
     starts = seq_offsets[:-1]
     lengths = seq_offsets[1:] - seq_offsets[:-1]
-    col = jnp.arange(max_len)
-    mask = col[None, :] < lengths[:, None]
-    flat_idx = (starts[:, None] + col[None, :]).clip(0, max(values.shape[0] - 1, 0))
-    if values.ndim == 1:
-        gathered = values[flat_idx.reshape(-1)].reshape(b, max_len)
-        return jnp.where(mask, gathered, jnp.asarray(padding_value, dtype=values.dtype))
-    gathered = values[flat_idx.reshape(-1)].reshape(b, max_len, values.shape[-1])
+    mask = jnp.arange(max_len)[None, :] < lengths[:, None]
+    tail = values.shape[1:]
+    # dynamic_slice clamps a start that would overrun, which shifts a sequence
+    # rather than reading past the end. The padding is masked out.
+    padded = jnp.pad(values, [(0, max_len)] + [(0, 0)] * len(tail))
+
+    def _row(start: Any) -> Any:
+        return jax.lax.dynamic_slice(
+            padded, (start,) + (0,) * len(tail), (max_len,) + tail
+        )
+
+    gathered = jax.vmap(_row)(starts.astype(jnp.int32))
     return jnp.where(
-        mask[:, :, None], gathered, jnp.asarray(padding_value, dtype=values.dtype)
+        _bcast_mask(mask, gathered.ndim),
+        gathered,
+        jnp.asarray(padding_value, dtype=values.dtype),
     )
 
 

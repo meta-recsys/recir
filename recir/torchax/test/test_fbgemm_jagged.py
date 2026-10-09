@@ -546,5 +546,87 @@ class RecirConcatJaggedEdgeCaseTest(unittest.TestCase):
             self._assert_matches_oracle([3], [2], d)
 
 
+class RecirJaggedToPaddedDenseEdgeCaseTest(unittest.TestCase):
+    """Sequences whose ``max_len`` window runs past the end of ``values``.
+
+    ``_jax_jagged_to_padded_dense_impl`` takes each output row as one slice, and
+    a slice start that would overrun is clamped rather than refused -- which
+    shifts a sequence instead of reading off the end, so it corrupts rows the
+    mask keeps. The padding exists to make that unreachable. A non-zero
+    ``padding_value`` is used throughout so a leaked pad cannot pass as padding.
+    """
+
+    def _assert_matches_oracle(self, lens: list[int], max_len: int, d: int) -> None:
+        """Compare against a row-per-sequence padded-dense oracle at width d."""
+        import jax.numpy as jnp
+        import numpy as np
+        from recir.torchax.ops.jagged_ops import _jax_jagged_to_padded_dense_impl
+
+        off = np.array(_offsets(lens), dtype=np.int32)
+        total = int(off[-1])
+        shp = (total,) if d == 1 else (total, d)
+        values = (np.arange(int(np.prod(shp)), dtype=np.float32) + 1.0).reshape(shp)
+
+        pad = -7.0
+        oracle = np.full((len(lens), max_len) + shp[1:], pad, dtype=np.float32)
+        for i, length in enumerate(lens):
+            keep = min(length, max_len)
+            oracle[i, :keep] = values[off[i] : off[i] + keep]
+
+        out = _jax_jagged_to_padded_dense_impl(
+            jnp.asarray(values), [jnp.asarray(off)], [max_len], pad
+        )
+        self.assertEqual(np.asarray(out).shape, oracle.shape)
+        np.testing.assert_allclose(np.asarray(out), oracle)
+
+    def test_last_sequence_window_overruns(self) -> None:
+        for d in (1, 4):
+            self._assert_matches_oracle([3, 2], 3, d)
+
+    def test_trailing_empty_sequences_start_at_the_end(self) -> None:
+        for d in (1, 4):
+            self._assert_matches_oracle([3, 0, 0], 3, d)
+
+    def test_max_len_exceeds_the_whole_array(self) -> None:
+        for d in (1, 4):
+            self._assert_matches_oracle([1, 2], 8, d)
+
+    def test_length_exceeds_max_len(self) -> None:
+        for d in (1, 4):
+            self._assert_matches_oracle([6, 2], 3, d)
+
+    def test_all_sequences_empty(self) -> None:
+        for d in (1, 4):
+            self._assert_matches_oracle([0, 0, 0], 3, d)
+
+    def test_leading_empty_sequence(self) -> None:
+        for d in (1, 4):
+            self._assert_matches_oracle([0, 3, 1], 4, d)
+
+    def test_single_sequence(self) -> None:
+        for d in (1, 4):
+            self._assert_matches_oracle([4], 4, d)
+
+    def test_lowers_to_one_slice_per_sequence(self) -> None:
+        # The point of the rewrite: a slice per sequence, not an index per
+        # output element. Fancy indexing gives slice_sizes 1 and B*max_len
+        # indices, which costs ~100x more for the same bytes.
+        import jax
+        import jax.numpy as jnp
+        import numpy as np
+        from recir.torchax.ops.jagged_ops import _jax_jagged_to_padded_dense_impl
+
+        offsets = jnp.asarray(np.array([0, 2, 5, 7], dtype=np.int32))
+        values = jnp.asarray(np.ones((7, 16), dtype=np.float32))
+        text = (
+            jax.jit(lambda v, o: _jax_jagged_to_padded_dense_impl(v, [o], [4], 0.0))
+            .lower(values, offsets)
+            .as_text()
+        )
+        gathers = [ln for ln in text.splitlines() if "stablehlo.gather" in ln]
+        self.assertEqual(len(gathers), 1)
+        self.assertIn("slice_sizes = array<i64: 4, 16>", gathers[0])
+
+
 if __name__ == "__main__":
     unittest.main()
