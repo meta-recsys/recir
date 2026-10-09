@@ -70,7 +70,6 @@ import recir.torchax.ops.jseq_embedding  # noqa: F401
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from minimal_viable_ai.core.model_family_api.optimizer_configs import OptimConfig
 from recir.eager_dispatch import (
     install_graph_break_dispatch,
     mark_input,
@@ -90,6 +89,7 @@ from recir.meta_tensor_init import (
     mark_meta_uniform_init,
     table_init_stream_id,
 )
+from recir.training.optim import OptimConfig
 from torchrec.modules.embedding_configs import (
     BaseEmbeddingConfig,
     data_type_to_dtype,

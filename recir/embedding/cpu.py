@@ -27,16 +27,13 @@ from __future__ import annotations
 import logging
 import os
 import tempfile
-from typing import Any, Callable, cast, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, cast, Dict, List, Optional, Sequence, Tuple, Type
 
 import jax
 import torch
 import torch.distributed as dist
 import torch.nn as nn
-from minimal_viable_ai.core.model_family_api.model_family import (
-    optim_type_to_optim_class,
-)
-from minimal_viable_ai.core.model_family_api.optimizer_configs import OptimConfig
+import torchrec
 from recir.eager_dispatch import install_graph_break_dispatch
 from recir.embedding._sparse_arch_stub import (
     DummySparseArch,
@@ -55,8 +52,9 @@ from recir.embedding.split_collection import (
     split_embedding_collection,
     SplitEmbeddingCollection,
 )
+from recir.training.optim import OptimConfig
 from torchrec.distributed.embedding import EmbeddingCollectionSharder
-from torchrec.distributed.embedding_types import EmbeddingComputeKernel
+from torchrec.distributed.embedding_types import EmbeddingComputeKernel, OptimType
 from torchrec.distributed.model_parallel import DistributedModelParallel
 from torchrec.distributed.planner import EmbeddingShardingPlanner, Topology
 from torchrec.distributed.planner.types import ParameterConstraints
@@ -67,6 +65,30 @@ from torchrec.optim.optimizers import in_backward_optimizer_filter
 from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor
 
 logger: logging.Logger = logging.getLogger(__name__)
+
+
+# From minimal_viable_ai.core.model_family_api.model_family (torchrec-only).
+def optim_type_to_optim_class(optim_type: OptimType) -> Type[torch.optim.Optimizer]:
+    # Unforunately not all fbgemm optimizers have native pytorch support, fallback if necessary
+    # native pytorch optimizers may not accept kwargs like "max_gradient"
+    if optim_type == OptimType.SGD:
+        return torchrec.optim.SGD
+    elif optim_type == OptimType.LARS_SGD:
+        return torchrec.optim.LarsSGD
+    elif optim_type == OptimType.LAMB:
+        return torchrec.optim.LAMB
+    elif optim_type == OptimType.PARTIAL_ROWWISE_LAMB:
+        return torchrec.optim.PartialRowWiseLAMB
+    elif optim_type == OptimType.ADAM:
+        return torchrec.optim.Adam
+    elif optim_type == OptimType.PARTIAL_ROWWISE_ADAM:
+        return torchrec.optim.PartialRowWiseAdam
+    elif optim_type == OptimType.ADAGRAD:
+        return torchrec.optim.Adagrad
+    elif optim_type == OptimType.ROWWISE_ADAGRAD:
+        return torchrec.optim.RowWiseAdagrad
+    raise ValueError(f"Invalid OptimType {optim_type}")
+
 
 # Tables with fewer than this many rows per rank get TABLE_WISE sharding
 # (avoids slicing tiny tables too thin for fbgemm's CPU FUSED path).
