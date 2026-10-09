@@ -27,7 +27,7 @@ from typing import Dict, Sequence
 
 import torch
 import torch.nn as nn
-from minimal_viable_ai.core.model_family_api.optimizer_configs import OptimConfig
+from recir.training.optim import OptimConfig
 from torchrec.distributed.types import ShardingType
 from torchrec.modules.embedding_configs import BaseEmbeddingConfig
 from torchrec.optim.keyed import KeyedOptimizer
