@@ -54,7 +54,7 @@ from torchrec.modules.embedding_modules import (
     reorder_inverse_indices,
 )
 from torchrec.sparse.jagged_tensor import (
-    _cuda_to_cpu_safe,
+    _safe_tolist,
     JaggedTensor,
     KeyedJaggedTensor,
     KeyedTensor,
@@ -89,7 +89,7 @@ def _register_kjt_split_op() -> None:
         per_key_offsets = offsets[::stride]
         # Citrine C6: batch the data-dependent boundaries into one D2H sync.
         host_offsets: List[int] = (
-            _cuda_to_cpu_safe(per_key_offsets).tolist()
+            _safe_tolist(per_key_offsets)
             if per_key_offsets.is_cuda
             else per_key_offsets.tolist()
         )
@@ -163,7 +163,7 @@ def _kjt_split_per_feature_with_offsets_impl(
     value_count_tensor = lengths.reshape(num_keys, stride_per_key[0]).sum(dim=1)
     # Citrine C6: batch the data-dependent value counts into one D2H sync.
     value_counts: List[int] = (
-        _cuda_to_cpu_safe(value_count_tensor).tolist()
+        _safe_tolist(value_count_tensor)
         if value_count_tensor.is_cuda
         else value_count_tensor.tolist()
     )
