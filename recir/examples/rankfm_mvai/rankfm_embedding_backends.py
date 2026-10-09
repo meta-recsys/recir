@@ -11,7 +11,7 @@ xsurface. This module supplies everything model-specific:
 
   * ``RANKFM_EMBEDDING_PARAM_PREFIX`` / ``rankfm_sparse_arch`` -- where the
     ``ECSparseArch`` and its embedding params sit inside ``BlueReelsVDDTrainV3``.
-  * ``rankfm_sparse_optimizer`` -- hammer's LR-buffered optimizer factory.
+  * ``rankfm_sparse_optimizer`` -- recir.training's LR-buffered optimizer factory.
   * a ``get_override`` per backend -- derives the traced shapes from one eager
     preprocessor + tokenizer pass and returns the tracing dispatchers. The
     dispatchers themselves live in ``rankfm_dispatchers``.
@@ -66,17 +66,13 @@ def rankfm_sparse_optimizer(
     sparse_config: OptimConfig,
     device: torch.device,
 ) -> Tuple[torch.optim.Optimizer, torch.Tensor]:
-    """hammer's LR-buffered optimizer over the in-graph table params.
+    """recir.training's LR-buffered optimizer over the in-graph table params.
 
-    Imported lazily: ``recir_core`` pulls the full UDD config chain at import
-    time, and the in_graph backend must stay network-free to import.
+    Imported lazily: the in_graph backend must stay network-free to import.
     """
-    from recir.training.compile import LR_SPARSE_BUFFER
-    from recir.training.setup import _build_lr_buffered_optimizer
+    from recir.training.setup import build_sparse_lr_buffered_optimizer
 
-    return _build_lr_buffered_optimizer(
-        model, params, sparse_config, LR_SPARSE_BUFFER, device
-    )
+    return build_sparse_lr_buffered_optimizer(model, params, sparse_config, device)
 
 
 class CPURankFMBackend(CPUEmbeddingBackend):

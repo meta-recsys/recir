@@ -54,13 +54,19 @@ else:
 from minimal_viable_ai.core.trainer.job_resolver import JobResolver
 from minimal_viable_ai.core.trainer.trainer import RecTrainer
 
+# Shared bootstrap (gr::batched_complete_cumsum, runs on import) + dist/metric
+# helpers, kept identical with the CPU-eager entry (train_cpu_eager.py).
+from recir.training.tpu_runtime import (
+    force_cpu_barrier,
+    init_jax_distributed,
+    resolve_dist_env,
+    setup_logging,
+    shutdown,
+)
+
 from .config import build_model_family_config, build_trainer_config, parse_cli
 from .model_family import RankFMMvaiModelFamily
 from .task_partition import build_cls_reg_partition
-
-# Shared bootstrap (gr::batched_complete_cumsum, runs on import) + dist/metric
-# helpers, kept identical with the CPU-eager entry (train_cpu_eager.py).
-from .train_common import force_cpu_barrier, resolve_dist_env, setup_logging
 from .train_pipeline import RecirXLATrainPipelineProvider
 from .xsurface_helpers import _is_jax_profiling_enabled
 
@@ -155,29 +161,7 @@ def main() -> None:
     # RANKFM_DUP_TARGETS is set.
     leak_probe.install(leak_probe.from_env())
 
-    # Multi-host (e.g. 128-chip): must call jax.distributed.initialize() before
-    # any JAX op so the PJRT plugin reads the coordinator address + process index
-    # from TPU runtime metadata; without it each pod is jax.process_count()==1 and
-    # the cross-pod GSPMD collective deadlocks.
-    #
-    # Single-host (1 pod, e.g. the 2x2x1 one-shard run): do NOT call it.
-    # jax.distributed.initialize() is for MULTI-process coordination; on a lone
-    # pod it mis-initializes the runtime in a way that makes the subsequent eager
-    # get_override CPU forward raise (a caught error -> "Sparse arch forward hook
-    # did not fire"). jax auto-detects the local chips without it (the CPU-eager
-    # entry, which never calls it, builds get_override cleanly -- the proof).
-    # WORLD_SIZE is preserved when provided, otherwise derived from the
-    # launcher-provided TPU process addresses.
-    single_host = int(os.environ.get("WORLD_SIZE", "1")) == 1
-    if not single_host:
-        jax.distributed.initialize()
-    logger.info(
-        f"[DIST] JAX state: "
-        f"process_count={jax.process_count()}, "
-        f"device_count={jax.device_count()}, "
-        f"local_device_count={jax.local_device_count()}, "
-        f"process_index={jax.process_index()}"
-    )
+    init_jax_distributed()
 
     trainer_cfg, model_args = parse_cli()
     logger.info(f"Trainer config: {trainer_cfg}")
@@ -187,7 +171,7 @@ def main() -> None:
     # / embedding backend need it -- see _init_gloo_pg.
     _init_gloo_pg()
     # Route torch.distributed.barrier onto CPU before any gloo collective runs
-    # (the metric all-gather at report time). See train_common.force_cpu_barrier.
+    # (the metric all-gather at report time). See tpu_runtime.force_cpu_barrier.
     force_cpu_barrier()
 
     # Inject the rankfm CLI knobs onto the family class (the base RecModelFamily
@@ -266,17 +250,7 @@ def main() -> None:
         job_resolver=JobResolver(),
     ).train()
 
-    # Cleanup. JAX's PJRT runtime + libtpu workers + any gloo collective thread
-    # keep the process alive after train() returns, so the JobSet pod never
-    # reaches Completed. Shut both down, then force-exit.
-    if dist.is_initialized():
-        dist.destroy_process_group()
-    try:
-        jax.distributed.shutdown()
-    except Exception as e:  # noqa: BLE001 -- best-effort cleanup
-        logger.warning(f"jax.distributed.shutdown() raised (non-fatal): {e}")
-    logger.info("Cleanup complete; exiting.")
-    os._exit(0)
+    shutdown()
 
 
 if __name__ == "__main__":

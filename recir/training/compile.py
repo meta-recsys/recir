@@ -123,6 +123,27 @@ class RecirCompileSpec:
     num_processes: int = 1
     loss_reduction: str = "sum"
     region_transforms: List[Any] = field(default_factory=list)
+    # Params whose FQN contains this substring are row-sharded over all chips
+    # (e.g. recir.embedding.in_graph.SHARDED_TABLE_PREFIX); None = all replicated.
+    fsdp_table_substr: Optional[str] = None
+
+
+def create_tbe_process_group(
+    tbe_sparse_config: Optional[TBESparseConfig], world_size: int
+) -> Optional[ProcessGroup]:
+    """The dedicated TBE process group when ``use_separate_process_group`` is set
+    and there is more than one rank, else None. Keep a strong reference to it:
+    c10d holds non-default process groups weakly."""
+    if (
+        tbe_sparse_config is not None
+        and tbe_sparse_config.use_separate_process_group
+        and world_size > 1
+    ):
+        group = dist.new_group(group_desc="recir_tbe")
+        if not isinstance(group, ProcessGroup):
+            raise RuntimeError("Every rank must join the dedicated TBE process group.")
+        return group
+    return None
 
 
 def build_default_pg_mesh(device_type: str, size: int, rank: int) -> DeviceMesh:
@@ -432,6 +453,7 @@ def compile_gspmd_step(
     *,
     train_step_fn: Optional[Callable[..., Any]] = None,
     flatten_batch: FlattenBatch,
+    sparse_opt: Optional[torch.optim.Optimizer] = None,
 ) -> Any:
     """Eager GSPMD_TPU compile: GSPMDParallel + XLAGSPMDBackend via compile_step.
 
@@ -445,6 +467,10 @@ def compile_gspmd_step(
     (SparseCore / FBGEMM-fused DMP) and fires off-GM via its backward hook.
     Returns ``runner(model, dense_opt, *flat_args) -> (losses, named)``.
 
+    ``sparse_opt`` (the in_graph embedding backend's optimizer, whose tables are
+    parameters inside the program) also steps in the GM; the runner then takes
+    ``(model, dense_opt, sparse_opt, *flat_args)``.
+
     The XLAGSPMDBackend import is function-local so importing this module pulls no
     XLA backend / torchax code (the GPU path never reaches it).
     """
@@ -456,11 +482,12 @@ def compile_gspmd_step(
         loss_reduction=spec.loss_reduction,
         num_ranks=spec.num_ranks,
         num_processes=spec.num_processes,
+        fsdp_table_substr=spec.fsdp_table_substr,
     )
     return compile_step(
         step_fn,
         model,
-        (dense_opt,),
+        (dense_opt,) if sparse_opt is None else (dense_opt, sparse_opt),
         trace_batch,
         parallel_mode=parallel_mode,
         backend=XLAGSPMDBackend(),

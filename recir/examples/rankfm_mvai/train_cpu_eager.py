@@ -63,13 +63,17 @@ else:
 from minimal_viable_ai.core.trainer.job_resolver import JobResolver
 from minimal_viable_ai.core.trainer.trainer import RecTrainer
 
+# Shared bootstrap (gr::batched_complete_cumsum, runs on import) + dist/metric
+# helpers, kept identical with the TPU entry (train.py).
+from recir.training.tpu_runtime import (
+    force_cpu_barrier,
+    resolve_dist_env,
+    setup_logging,
+)
+
 from .config import build_model_family_config, build_trainer_config, parse_cli
 from .model_family import RankFMMvaiModelFamily
 from .task_partition import build_cls_reg_partition
-
-# Shared bootstrap (gr::batched_complete_cumsum, runs on import) + dist/metric
-# helpers, kept identical with the TPU entry (train.py).
-from .train_common import force_cpu_barrier, resolve_dist_env, setup_logging
 from .train_pipeline import EagerCPUTrainPipelineProvider
 
 logger: logging.Logger = logging.getLogger(__name__)
@@ -103,7 +107,7 @@ def main() -> None:
 
     resolve_dist_env()
     # Route torch.distributed.barrier onto CPU before any gloo collective runs
-    # (the metric all-gather at report time). See train_common.force_cpu_barrier.
+    # (the metric all-gather at report time). See tpu_runtime.force_cpu_barrier.
     force_cpu_barrier()
 
     # Inject the rankfm CLI knobs onto the family class.
