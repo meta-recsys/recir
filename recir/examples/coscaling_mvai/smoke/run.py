@@ -18,15 +18,6 @@ import torch.nn as nn
 from recir.examples.rankfm_mvai import train_common  # usort: skip
 
 from hammer.v3.models.udd_fm_v3.coscaling.coscaling_config import CoScalingModuleConfig
-from hammer.v3.models.udd_fm_v3.recir_core import (
-    compile_gspmd_step,
-    LR_ITER_BUFFER,
-    recir_train_step,
-    RecirCompileSpec,
-    RecirMode,
-    run_step_and_sync,
-    setup_dense_optimizer_and_warmup,
-)
 from hammer.v3.models.udd_fm_v3.recir_core.trace_sample import flatten_batch
 from hammer.v3.modules.mot.preprocessors.mot_preprocessor import MoTPreprocessor
 from recir.examples.coscaling_mvai.backends import (
@@ -40,6 +31,15 @@ from recir.examples.rankfm_mvai.xsurface_helpers import (
 )
 from recir.region_transforms.dropout_prng import DropoutPRNGTransform
 from recir.region_transforms.padding import compute_padded_shape
+from recir.training.compile import (
+    compile_gspmd_step,
+    LR_ITER_BUFFER,
+    recir_train_step,
+    RecirCompileSpec,
+    RecirMode,
+    run_step_and_sync,
+)
+from recir.training.setup import setup_dense_optimizer_and_warmup
 
 logger: logging.Logger = logging.getLogger(__name__)
 
@@ -239,11 +239,14 @@ def run_smoke(
         dispatchers,
         spec,
         train_step_fn=_coscaling_train_step,
+        flatten_batch=flatten_batch,
     )
 
     step_losses: List[torch.Tensor] = []
     for step in range(num_steps):
-        losses, _named = run_step_and_sync(runner, model, dense_opt, batch)
+        losses, _named = run_step_and_sync(
+            runner, model, dense_opt, batch, flatten_batch=flatten_batch
+        )
         losses = losses.detach().clone()
         logger.info("[coscaling] step %d loss=%.6f", step, float(losses.sum()))
         if not bool(torch.isfinite(losses).all()):

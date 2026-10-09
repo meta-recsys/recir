@@ -25,18 +25,18 @@ from hammer.v3.models.udd_fm_v3.parity.digest import (
     parse_digest,
 )
 from hammer.v3.models.udd_fm_v3.parity.step_digest import _trim_inputs, arm
-from hammer.v3.models.udd_fm_v3.recir_core.compile import (
+from recir.api import compile_from_gm, make_compiled_runner, trace
+from recir.examples.rankfm_mvai.debug_digest_op import debug_digest
+from recir.region_transforms.base import RegionTransform
+from recir.tests.test_utils import _NoopBackend, _PassthroughParallel
+from recir.training.compile import (
     _declared_tensor_attr_holders,
     LR_DENSE_BUFFER,
     LR_ITER_BUFFER,
     recir_train_step,
     WARMUP_ATTR,
 )
-from hammer.v3.models.udd_fm_v3.recir_core.optim import WarmupController
-from recir.api import compile_from_gm, make_compiled_runner, trace
-from recir.examples.rankfm_mvai.debug_digest_op import debug_digest
-from recir.region_transforms.base import RegionTransform
-from recir.tests.test_utils import _NoopBackend, _PassthroughParallel
+from recir.training.optim import WarmupController
 from torchrec.optim.warmup import WarmupPolicy, WarmupStage
 
 

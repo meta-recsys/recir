@@ -65,10 +65,7 @@ from hammer.v3.models.udd_fm_v3.parity.digest import (
     compare_tensors,
     dump_tensors,
 )
-from hammer.v3.models.udd_fm_v3.recir_core import (
-    flatten_batch,
-    setup_dense_optimizer_and_warmup,
-)
+from hammer.v3.models.udd_fm_v3.recir_core import flatten_batch
 from hammer.v3.models.udd_fm_v3.udd_fm_config import BlueReelsVDDModuleConfig
 from later.unittest import TestCase
 from minimal_viable_ai.core.model_family_api.configs import LocationType
@@ -117,6 +114,7 @@ from recir.examples.rankfm_mvai.prod_config_artifact import (
 )
 from recir.examples.rankfm_mvai.rankfm_embedding_backends import build_embedding_backend
 from recir.examples.rankfm_mvai.rankfm_model_utils import build_model_from_config
+from recir.training.setup import setup_dense_optimizer_and_warmup
 from torchrec.distributed.train_pipeline import TrainPipelineBase
 from torchrec.modules.embedding_modules import EmbeddingCollection
 from torchrec.optim.keyed import CombinedOptimizer, KeyedOptimizerWrapper
