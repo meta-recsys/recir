@@ -474,5 +474,77 @@ class RecirJaggedOpsMultiDeviceJitTest(unittest.TestCase):
             np.testing.assert_allclose(np.asarray(right), vr)
 
 
+class RecirConcatJaggedEdgeCaseTest(unittest.TestCase):
+    """Empty and zero-length operands for ``_jax_concat_2d_jagged`` -- shapes a
+    shard_map shard can legitimately receive. An operand with no rows contributes
+    no index space and is skipped rather than concatenated, so it takes a branch
+    the common path never reaches. ``test_concat_split_numerics_multidevice_jit``
+    keeps every sample non-empty and both operands populated, so it passes clean
+    through a bug there: mis-selecting which operand survives fails only
+    ``test_empty_left_operand``."""
+
+    def _assert_matches_oracle(self, la: list[int], lb: list[int], d: int) -> None:
+        """Compare against a per-sample cat(left[i], right[i]) oracle at width d."""
+        import jax.numpy as jnp
+        import numpy as np
+        from recir.torchax.ops.jagged_ops import _jax_concat_2d_jagged
+
+        ol = np.array(_offsets(la), dtype=np.int32)
+        orr = np.array(_offsets(lb), dtype=np.int32)
+        tl, tr = int(ol[-1]), int(orr[-1])
+        shp_l = (tl,) if d == 1 else (tl, d)
+        shp_r = (tr,) if d == 1 else (tr, d)
+        vl = np.arange(int(np.prod(shp_l)), dtype=np.float32).reshape(shp_l)
+        vr = (np.arange(int(np.prod(shp_r)), dtype=np.float32) + 1000.0).reshape(shp_r)
+
+        parts = []
+        for i in range(len(la)):
+            parts.append(vl[ol[i] : ol[i + 1]])
+            parts.append(vr[orr[i] : orr[i + 1]])
+        oracle = np.concatenate(parts, axis=0)
+
+        out = _jax_concat_2d_jagged(
+            jnp.asarray(vl),
+            jnp.asarray(ol),
+            jnp.asarray(vr),
+            jnp.asarray(orr),
+            tl + tr,
+        )
+        self.assertEqual(np.asarray(out).shape, oracle.shape)
+        np.testing.assert_allclose(np.asarray(out), oracle)
+
+    def test_empty_left_operand(self) -> None:
+        for d in (1, 4):
+            self._assert_matches_oracle([0, 0, 0], [2, 1, 2], d)
+
+    def test_empty_right_operand(self) -> None:
+        for d in (1, 4):
+            self._assert_matches_oracle([1, 3, 2], [0, 0, 0], d)
+
+    def test_both_operands_empty(self) -> None:
+        for d in (1, 4):
+            self._assert_matches_oracle([0, 0], [0, 0], d)
+
+    def test_zero_length_samples(self) -> None:
+        for d in (1, 4):
+            self._assert_matches_oracle([2, 0, 3, 0], [0, 1, 0, 2], d)
+
+    def test_samples_empty_on_both_sides(self) -> None:
+        # Combined length 0 repeats a segment start, so the per-sample jumps
+        # land on one index. They telescope, so the scan still resolves to the
+        # last segment starting at or before each position.
+        for d in (1, 4):
+            self._assert_matches_oracle([2, 0, 3], [1, 0, 2], d)
+            self._assert_matches_oracle([2, 0, 0, 3], [1, 0, 0, 2], d)
+
+    def test_leading_and_trailing_empty_samples(self) -> None:
+        for d in (1, 4):
+            self._assert_matches_oracle([0, 2, 0], [0, 3, 0], d)
+
+    def test_single_sample(self) -> None:
+        for d in (1, 4):
+            self._assert_matches_oracle([3], [2], d)
+
+
 if __name__ == "__main__":
     unittest.main()
