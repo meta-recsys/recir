@@ -5,20 +5,13 @@
 # LICENSE file in the root directory of this source tree.
 
 
-"""Shared bootstrap + helpers for the rankfm_mvai entrypoints.
+"""Shared bootstrap + helpers for recir TPU entrypoints (rankfm_mvai, DLRMv3).
 
-Both ``train.py`` (recir XLA-GSPMD TPU run) and ``train_cpu_eager.py`` (the
-matched-config CPU-eager reference) import from here so they agree EXACTLY on:
+Entrypoints import from here so they agree EXACTLY on:
   * the gr::batched_complete_cumsum bootstrap (module-level, runs on import),
   * dist-env resolution (RANK/WORLD_SIZE/MASTER_*) for the gloo PG,
+  * jax.distributed initialization and process shutdown,
   * the CPU barrier shim for the metric all-gather.
-
-The cls/reg task partition lives in ``task_partition.py`` -- a leaf module, so it
-stays importable (and unit-testable) without this module's gr-op bootstrap.
-
-Keeping these in one place guarantees the CPU baseline and the TPU run differ
-only where they must (compile vs eager, jax.distributed.initialize), not in
-incidental setup.
 """
 
 from __future__ import annotations
@@ -26,9 +19,11 @@ from __future__ import annotations
 import datetime
 import logging
 import os
-from typing import Any, List, Optional, Tuple
+from typing import Any, cast, List, Optional, Tuple
 
-import fbgemm_gpu  # noqa: F401 -- force C++ op registration before fallback
+# The package __init__ is generated; pyre only resolves its submodules.
+import fbgemm_gpu  # noqa: F401 -- force C++ op registration before fallback  # pyre-ignore[21]
+import jax
 import recir.lowering.fbgemm_fallback  # noqa: F401 -- registers SPMD_DECOMP_TABLE entries
 import torch
 import torch.distributed as dist
@@ -158,5 +153,45 @@ def force_cpu_barrier() -> None:
         work = dist.all_reduce(torch.zeros(1), group=pg, async_op=async_op)
         return work if async_op else None
 
-    c10d.barrier = _cpu_barrier
-    dist.barrier = _cpu_barrier
+    c10d.barrier = cast(Any, _cpu_barrier)
+    dist.barrier = cast(Any, _cpu_barrier)
+
+
+def init_jax_distributed() -> None:
+    # Multi-host (e.g. 128-chip): must call jax.distributed.initialize() before
+    # any JAX op so the PJRT plugin reads the coordinator address + process index
+    # from TPU runtime metadata; without it each pod is jax.process_count()==1 and
+    # the cross-pod GSPMD collective deadlocks.
+    #
+    # Single-host (1 pod, e.g. the 2x2x1 one-shard run): do NOT call it.
+    # jax.distributed.initialize() is for MULTI-process coordination; on a lone
+    # pod it mis-initializes the runtime in a way that makes the subsequent eager
+    # get_override CPU forward raise (a caught error -> "Sparse arch forward hook
+    # did not fire"). jax auto-detects the local chips without it (the CPU-eager
+    # entry, which never calls it, builds get_override cleanly -- the proof).
+    # WORLD_SIZE is preserved when provided, otherwise derived from the
+    # launcher-provided TPU process addresses.
+    single_host = int(os.environ.get("WORLD_SIZE", "1")) == 1
+    if not single_host:
+        jax.distributed.initialize()
+    logger.info(
+        f"[DIST] JAX state: "
+        f"process_count={jax.process_count()}, "
+        f"device_count={jax.device_count()}, "
+        f"local_device_count={jax.local_device_count()}, "
+        f"process_index={jax.process_index()}"
+    )
+
+
+def shutdown() -> None:
+    # Cleanup. JAX's PJRT runtime + libtpu workers + any gloo collective thread
+    # keep the process alive after training returns, so the JobSet pod never
+    # reaches Completed. Shut both down, then force-exit.
+    if dist.is_initialized():
+        dist.destroy_process_group()
+    try:
+        jax.distributed.shutdown()
+    except Exception as e:  # noqa: BLE001 -- best-effort cleanup
+        logger.warning(f"jax.distributed.shutdown() raised (non-fatal): {e}")
+    logger.info("Cleanup complete; exiting.")
+    os._exit(0)

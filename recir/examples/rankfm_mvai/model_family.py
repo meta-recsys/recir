@@ -44,7 +44,6 @@ import recir.torchax.ops.jhstu_attention  # noqa: F401
 import torch
 import torch.distributed as dist
 import torch.nn as nn
-import torch.utils._pytree as pytree
 
 if TYPE_CHECKING:
     from recir.embedding.backend import SparseOptimizerRuntime
@@ -61,18 +60,8 @@ from hammer.v3.models.udd_fm_v3.udd_fm_config import BlueReelsVDDModuleConfig
 from hammer.v3.models.udd_fm_v3.udd_fm_family import BlueReelsVDDModelFamily
 from minimal_viable_ai.core.dataloader.dataloader_configs import DataSourceConfig
 from minimal_viable_ai.core.model_family_api.optimizer_configs import RecOptimizerConfig
-from recir.api import (
-    COMPILED_OBJECT_KEY,
-    sync_device_state_to_torch,
-    sync_named_state_to_torch,
-)
-from recir.backends import XLAGSPMDBackend
-from recir.distributed.parallel_mode import GSPMDParallel
+from recir.embedding.in_graph import SHARDED_TABLE_PREFIX
 from recir.examples.rankfm_mvai.budgeted_sampling import install_budgeted_sampling
-from recir.examples.rankfm_mvai.checkpointable import (
-    HostStateBuffers,
-    logical_replay_rank,
-)
 from recir.examples.rankfm_mvai.config import RankFMModelArgs, RankFMTrainerConfig
 from recir.examples.rankfm_mvai.data_pipe import (
     BatchReplayPipe,
@@ -99,41 +88,19 @@ from recir.region_transforms.dropout_prng import DropoutPRNGTransform
 from recir.region_transforms.padding import compute_padded_shape
 from recir.training.compile import (
     compile_gspmd_step,
-    compile_step,
     IN_GRAPH_METRICS_ATTR,
-    in_graph_metrics_enabled,
     LR_ITER_BUFFER,
     recir_train_step,
     RecirCompileSpec,
     RecirMode,
 )
-from recir.training.compiled_module import RecirCompiledModuleBase
+from recir.training.compiled_module import RecirGSPMDCompiledModuleBase
 from recir.training.optim import WarmupController
 from recir.training.setup import setup_dense_optimizer_and_warmup
+from recir.training.tpu_checkpoint import logical_replay_rank
 from torch.utils.data import IterableDataset
 
 logger: logging.Logger = logging.getLogger(__name__)
-
-# Per-step device->host state sync (sync_device_state_to_torch) skips state
-# entries whose FQN contains any of these substrings. The on-device embedding
-# tables (InGraphSparseArch's "_sharded_tables" / "_dp_tables" module dicts) are
-# GBs each and are kept resident in the cached JAX device_state across steps, so
-# mirroring them to host every step is O(table-size) waste (D2H copy + layout
-# transpose) that dominates the step at large hash sizes. Dense params / LR /
-# metric buffers don't match and still sync. Full sync (skip_fqns=None) is used
-# before checkpointing/inspecting the tables (flush_host_state(full=True)).
-_EMB_SYNC_SKIP_FQNS: Tuple[str, ...] = ("_sharded_tables", "_dp_tables")
-
-# The only state the training loop needs mirrored host-ward between
-# checkpoints: the warmup controller's LR buffers, which
-# ``snapshot_metrics._lr_tensor`` reads for the learning_rate/* curves. Named
-# after the module buffers (recir/training/compile.py LR_*_BUFFER); the
-# WarmupController holds the same tensors under its own attribute names.
-_LR_SYNC_ONLY_FQNS: Tuple[str, ...] = (
-    "_lr_dense_buffer",
-    "_lr_sparse_buffer",
-    "_lr_iter_buffer",
-)
 
 
 def _udd_fm_v3_train_step(
@@ -252,7 +219,7 @@ def _in_graph_metric_states(
     return emit_keys(compute_metric_states(prediction, label, weight))
 
 
-class RecirXLACompiledModule(RecirCompiledModuleBase):
+class RecirXLACompiledModule(RecirGSPMDCompiledModuleBase):
     """Self-compiling GSPMD/TPU recir train module (built by RankFMMvaiModelFamily).
 
     Owns the recir construction for the TPU cell, so the family stays focused on
@@ -431,12 +398,9 @@ class RecirXLACompiledModule(RecirCompiledModuleBase):
             # per-rank gradient contributions without another world-size division.
             loss_reduction="mean",
             region_transforms=region_transforms,
+            fsdp_table_substr=SHARDED_TABLE_PREFIX if emb_opt is not None else None,
         )
         self._model.train(True)
-
-    @property
-    def dense_opt(self) -> torch.optim.Optimizer:
-        return self._dense_opt
 
     def _build_compiled_step(self, first_batch: Any) -> Any:
         # Trace with the family-provided synthetic/replay batch, not the incoming
@@ -466,31 +430,17 @@ class RecirXLACompiledModule(RecirCompiledModuleBase):
             )
         else:
             # in_graph backend: trace the dense optimizer AND the dedicated
-            # embedding optimizer into the single GSPMD program. compile_gspmd_step
-            # hard-wires a single optimizer, so use the shared multi-optimizer
-            # driver compile_step directly, with a GSPMDParallel that knows the
-            # in-graph FSDP table prefix.
-            from recir.embedding.in_graph import SHARDED_TABLE_PREFIX
-
-            emb_opt = self._emb_opt
-            assert emb_opt is not None
-            parallel_mode = GSPMDParallel(
-                "replicate",
-                loss_reduction=self._spec.loss_reduction,
-                num_ranks=self._num_ranks,
-                num_processes=self._num_processes,
-                fsdp_table_substr=SHARDED_TABLE_PREFIX,
-            )
-            compiled_step = compile_step(
-                arm(_udd_fm_v3_train_step_two_opt, self._padding_spec),
+            # embedding optimizer into the single GSPMD program, with the
+            # in-graph tables row-sharded (spec.fsdp_table_substr).
+            compiled_step = compile_gspmd_step(
                 self._model,
-                (self._dense_opt, emb_opt),
+                self._dense_opt,
                 self._trace_batch,
-                parallel_mode=parallel_mode,
-                backend=XLAGSPMDBackend(),
-                dispatchers=self._dispatchers,
-                region_transforms=self._spec.region_transforms,
+                self._dispatchers,
+                self._spec,
+                train_step_fn=arm(_udd_fm_v3_train_step_two_opt, self._padding_spec),
                 flatten_batch=flatten_batch,
+                sparse_opt=self._emb_opt,
             )
 
         if self._attention_backend == "helion":
@@ -529,130 +479,6 @@ class RecirXLACompiledModule(RecirCompiledModuleBase):
                 *flatten_batch(batch, global_loss_denom=True),
             )
         return (self._model, self._dense_opt, self._emb_opt, *flatten_batch(batch))
-
-    def flat_step_args(self, batch: Any) -> List[Any]:
-        return pytree.arg_tree_leaves(*self._step_args(batch))
-
-    def _run_step(
-        self, compiled_step: Any, batch: Any
-    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-        result: Tuple[torch.Tensor, Dict[str, torch.Tensor]] = compiled_step(
-            *self._step_args(batch)
-        )
-        if self._emb_opt is None:
-            sync_device_state_to_torch(compiled_step)
-        return result
-
-    @property
-    def in_graph_metrics(self) -> bool:
-        return in_graph_metrics_enabled(self._model)
-
-    def flush_host_state(self, full: bool = False) -> None:
-        """Mirror device-resident state back to torch for host consumers (e.g.
-        before checkpointing).
-
-        By default the GB-scale embedding tables are skipped (kept resident on
-        device -- see _EMB_SYNC_SKIP_FQNS); pass full=True before checkpointing
-        to also mirror them (skip_fqns=None). The table host params must already
-        have real storage (see checkpointable.HostStateBuffers) or the
-        copy_ is a silent no-op.
-        """
-        compiled_step = self._compiled_step
-        if compiled_step is not None:
-            skip_fqns = None if full else _EMB_SYNC_SKIP_FQNS
-            sync_device_state_to_torch(compiled_step, skip_fqns=skip_fqns)
-
-    def sync_lr_to_host(self) -> None:
-        """Refresh only the LR buffers ``snapshot_metrics._lr_tensor`` reads."""
-        compiled_step = self._compiled_step
-        if compiled_step is not None:
-            sync_named_state_to_torch(compiled_step, _LR_SYNC_ONLY_FQNS)
-
-    def enable_output_pipelining(self) -> bool:
-        manager = self._state_manager()
-        if manager is None:
-            return False
-        manager.keep_output_jax = True
-        return True
-
-    def materialize_output(self, output: Any) -> Any:
-        manager = self._state_manager()
-        if manager is None:
-            return output
-        return manager.materialize_output(output)
-
-    def _state_manager(self) -> Any:
-        compiled_step = self._compiled_step
-        if compiled_step is None:
-            return None
-        compiled_obj = cast(Any, compiled_step).__dict__.get(COMPILED_OBJECT_KEY)
-        return None if compiled_obj is None else compiled_obj.state_manager
-
-    def prepare_for_restore(self) -> None:
-        """Compile, then build the run's host buffers so dcp.load can write into them."""
-        if self._compiled_step is None:
-            self._compiled_step = self._build_compiled_step(self._trace_batch)
-        self._host_buffers()
-
-    def _host_buffers(self) -> Any:
-        buffers = self._host_state_buffers
-        if buffers is None:
-            compiled_obj = cast(Any, self._compiled_step).__dict__.get(
-                COMPILED_OBJECT_KEY
-            )
-            if compiled_obj is None:
-                raise RuntimeError(
-                    "host state buffers need a compiled step; call "
-                    "prepare_for_restore after the force-compile"
-                )
-            buffers = HostStateBuffers(
-                compiled_obj.flat_state,
-                compiled_obj.state_manager.state_fqns or [],
-                self._model,
-                [self._dense_opt, self._emb_opt],
-                _EMB_SYNC_SKIP_FQNS,
-            )
-            buffers.build()
-            self._host_state_buffers = buffers
-        return buffers
-
-    def finalize_restore(self) -> None:
-        """Seed device state from the freshly loaded host buffers."""
-        compiled_step = self._compiled_step
-        if compiled_step is None:
-            return
-        compiled_obj = cast(Any, compiled_step).__dict__.get(COMPILED_OBJECT_KEY)
-        if compiled_obj is None:
-            return
-        compiled_obj.state_manager.prefill_device_state_from_host(
-            compiled_obj.gm, compiled_obj.flat_state
-        )
-
-    def make_checkpointable(self) -> Any:
-        """Return a DCP Stateful view of this module (see checkpointable.py).
-
-        Duck-typed hook: mvai_cloud's CheckpointManager uses this if present, so
-        the recir/JAX-specific checkpoint logic stays out of the shared framework.
-        """
-        from recir.embedding.in_graph import DP_TABLE_PREFIX, SHARDED_TABLE_PREFIX
-
-        from .checkpointable import gather_shard_order, RecirCheckpointable
-
-        return RecirCheckpointable(
-            self,
-            num_processes=self._num_processes,
-            sharded_prefixes=(SHARDED_TABLE_PREFIX,),
-            table_prefixes=(SHARDED_TABLE_PREFIX, DP_TABLE_PREFIX),
-            warmup=self._warmup,
-            host_buffers=self._host_buffers,
-            dense_optimizer=self._dense_opt,
-            embedding_optimizer=self._emb_opt,
-            shard_order=(
-                gather_shard_order(self._num_processes)
-                if self._num_processes > 1
-                else None
-            ),
-        )
 
 
 class RankFMMvaiModelFamily(BlueReelsVDDModelFamily):
