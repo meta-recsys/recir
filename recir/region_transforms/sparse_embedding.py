@@ -495,6 +495,14 @@ def _node_argument(
     return node.kwargs.get(name, default)
 
 
+# Same schema; autograd dispatches the forward-only variant when no input
+# requires grad (e.g. an eval graph traced under no_grad).
+_EMBEDDING_BAG_OPS: Tuple[torch._ops.OpOverload, ...] = (
+    torch.ops.aten._embedding_bag.default,
+    torch.ops.aten._embedding_bag_forward_only.default,
+)
+
+
 def _embedding_bag_mode(node: fx.Node) -> int:
     """Validate the shared native/TBE pooling contract and return its mode."""
     unsupported = (
@@ -580,6 +588,7 @@ class SparseEmbeddingTransform(RegionTransform):
         mesh: DeviceMesh,
         mod: Optional[nn.Module] = None,
         embedding_plan: Optional[EmbeddingShardingPlan] = None,
+        forward_only: bool = False,
     ) -> None:
         """
         Args:
@@ -602,7 +611,10 @@ class SparseEmbeddingTransform(RegionTransform):
                 shapes in ``placeholder.meta["val"]``. Table-wise lowering
                 requires the pre-shard module because an empty non-owner
                 parameter does not encode the global table size.
+            forward_only: the traced graph has no backward (eval /
+                inference): only the forward lookups are rewritten.
         """
+        self.forward_only: bool = forward_only
         self.embedding_param_fqns: Set[str] = embedding_param_fqns
         self.mesh: DeviceMesh = mesh
         self.world_size: int = mesh.size()
@@ -700,42 +712,43 @@ class SparseEmbeddingTransform(RegionTransform):
             raise NotImplementedError(
                 "Table-wise sharding currently supports pooled EBC lookups only."
             )
-        bwd_nodes = self._rewrite_backward_embeddings(gm, forward_indices_meta)
         pooled_forward_meta = self._rewrite_forward_embedding_bags(
             gm, row_wise_weight_nodes, concrete_param_tensors
-        )
-        pooled_bwd_nodes = self._rewrite_backward_embedding_bags(
-            gm, pooled_forward_meta
         )
         table_wise_forward_meta = self._rewrite_forward_table_wise_embedding_bags(
             gm,
             table_wise_weight_nodes,
             concrete_param_tensors,
         )
-        table_wise_bwd_nodes = self._rewrite_backward_table_wise_embedding_bags(
-            gm,
-            table_wise_forward_meta,
-            concrete_param_tensors,
-        )
-
-        if forward_indices_meta:
-            assert bwd_nodes, (
-                f"SparseEmbeddingTransform: rewrote "
-                f"{len(forward_indices_meta)} forward embedding(s) but found "
-                f"no corresponding aten.embedding_dense_backward nodes"
+        # A forward-only graph (eval / inference) has no embedding backward.
+        if not self.forward_only:
+            bwd_nodes = self._rewrite_backward_embeddings(gm, forward_indices_meta)
+            pooled_bwd_nodes = self._rewrite_backward_embedding_bags(
+                gm, pooled_forward_meta
             )
-        if pooled_forward_meta and pooled_bwd_nodes != set(pooled_forward_meta):
-            raise RuntimeError(
-                "SparseEmbeddingTransform requires one backward per forward "
-                "embedding_bag node."
+            table_wise_bwd_nodes = self._rewrite_backward_table_wise_embedding_bags(
+                gm,
+                table_wise_forward_meta,
+                concrete_param_tensors,
             )
-        if table_wise_forward_meta and table_wise_bwd_nodes != set(
-            table_wise_forward_meta
-        ):
-            raise RuntimeError(
-                "SparseEmbeddingTransform requires one backward per table-wise "
-                "embedding_bag node."
-            )
+            if forward_indices_meta:
+                assert bwd_nodes, (
+                    f"SparseEmbeddingTransform: rewrote "
+                    f"{len(forward_indices_meta)} forward embedding(s) but found "
+                    f"no corresponding aten.embedding_dense_backward nodes"
+                )
+            if pooled_forward_meta and pooled_bwd_nodes != set(pooled_forward_meta):
+                raise RuntimeError(
+                    "SparseEmbeddingTransform requires one backward per forward "
+                    "embedding_bag node."
+                )
+            if table_wise_forward_meta and table_wise_bwd_nodes != set(
+                table_wise_forward_meta
+            ):
+                raise RuntimeError(
+                    "SparseEmbeddingTransform requires one backward per table-wise "
+                    "embedding_bag node."
+                )
         if forward_indices_meta or pooled_forward_meta or table_wise_forward_meta:
             gm.graph.eliminate_dead_code()
             rewritten_pooled = set(pooled_forward_meta) | set(table_wise_forward_meta)
@@ -764,7 +777,7 @@ class SparseEmbeddingTransform(RegionTransform):
         for pooled_node in list(gm.graph.nodes):
             if (
                 pooled_node.op != "call_function"
-                or pooled_node.target != torch.ops.aten._embedding_bag.default
+                or pooled_node.target not in _EMBEDDING_BAG_OPS
                 or pooled_node.args[0] not in embedding_weight_nodes
             ):
                 continue
@@ -1113,7 +1126,7 @@ class SparseEmbeddingTransform(RegionTransform):
             node
             for node in gm.graph.nodes
             if node.op == "call_function"
-            and node.target == torch.ops.aten._embedding_bag.default
+            and node.target in _EMBEDDING_BAG_OPS
             and node.args[0] in embedding_weight_nodes
         ]
         result: Dict[fx.Node, _PooledEmbeddingMeta] = {}

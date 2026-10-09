@@ -53,6 +53,7 @@ from recir.distributed.parallel_mode import (
 )
 from recir.distributed.sharding_spec import FSDPWeightShardSpec, get_state_layout
 from recir.lowering.device_state import DeviceStateManager
+from recir.passes.pass_registry import default_registry as default_pass_registry
 from recir.pipeline import build_pipeline, is_pipeline_pending, PipelineConfig
 from recir.region_transforms import (
     _apply_region_transforms,
@@ -2080,6 +2081,9 @@ def compile_from_gm(  # noqa: C901 — orchestration: stages 4-8 of the pipeline
         inspect.Parameter.POSITIONAL_OR_KEYWORD,
         inspect.Parameter.POSITIONAL_ONLY,
     )
+    # Pass ordering/"apply once" bookkeeping is per graph; reset it so one
+    # process can compile several graphs (e.g. a train and an eval step).
+    default_pass_registry.reset()
     for opt_pass in backend.optimize_passes:
         try:
             sig_params = inspect.signature(opt_pass).parameters.values()
