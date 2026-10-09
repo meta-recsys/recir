@@ -35,15 +35,6 @@ import jax  # @manual
 import torch
 import torch.distributed as dist
 from hammer.v3.models.udd_fm_v3.parity.step_digest import arm
-from hammer.v3.models.udd_fm_v3.recir_core import (
-    compile_gspmd_step,
-    RecirCompileSpec,
-    RecirMode,
-    run_step_and_sync,
-    setup_dense_optimizer_and_warmup,
-)
-from hammer.v3.models.udd_fm_v3.recir_core.compile import compile_step
-from hammer.v3.models.udd_fm_v3.recir_core.optim import prime_optimizer_state
 from hammer.v3.models.udd_fm_v3.recir_core.trace_sample import flatten_batch
 from hammer.v3.models.udd_fm_v3.udd_fm_train_v3 import BlueReelsVDDTrainV3
 from hammer.v3.modules.recblock import _inputs_to_feature_bundle
@@ -82,6 +73,15 @@ from recir.examples.rankfm_mvai.xsurface_helpers import (
     prepare_override_build_sample,
 )
 from recir.lowering.fbgemm_fallback import _batched_complete_cumsum_impl
+from recir.training.compile import (
+    compile_gspmd_step,
+    compile_step,
+    RecirCompileSpec,
+    RecirMode,
+    run_step_and_sync,
+)
+from recir.training.optim import prime_optimizer_state
+from recir.training.setup import setup_dense_optimizer_and_warmup
 
 logger: logging.Logger = logging.getLogger(__name__)
 
@@ -410,10 +410,13 @@ def _compiled_step(
             # Armed, so the step exports ``grad/<param>`` for the diff
             # below. Inert unless PARITY_DIGEST_KINDS includes "grad".
             train_step_fn=arm(_udd_fm_v3_train_step),
+            flatten_batch=flatten_batch,
         )
 
         def _run_one(run_batch: Any) -> Tuple[torch.Tensor, Any]:
-            return run_step_and_sync(runner, model, dense_opt, run_batch)
+            return run_step_and_sync(
+                runner, model, dense_opt, run_batch, flatten_batch=flatten_batch
+            )
 
     else:
         parallel_mode = GSPMDParallel(
@@ -435,6 +438,7 @@ def _compiled_step(
             backend=XLAGSPMDBackend(),
             dispatchers=dispatchers,
             region_transforms=region_transforms,
+            flatten_batch=flatten_batch,
         )
 
         # pyre-ignore

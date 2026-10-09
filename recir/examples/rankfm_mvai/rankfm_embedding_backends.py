@@ -71,8 +71,8 @@ def rankfm_sparse_optimizer(
     Imported lazily: ``recir_core`` pulls the full UDD config chain at import
     time, and the in_graph backend must stay network-free to import.
     """
-    from hammer.v3.models.udd_fm_v3.recir_core.compile import LR_SPARSE_BUFFER
-    from hammer.v3.models.udd_fm_v3.recir_core.setup import _build_lr_buffered_optimizer
+    from recir.training.compile import LR_SPARSE_BUFFER
+    from recir.training.setup import _build_lr_buffered_optimizer
 
     return _build_lr_buffered_optimizer(
         model, params, sparse_config, LR_SPARSE_BUFFER, device

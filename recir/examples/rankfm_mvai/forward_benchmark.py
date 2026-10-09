@@ -37,13 +37,6 @@ import jax  # @manual
 import recir.lowering.fbgemm_fallback  # noqa: F401 -- registers SPMD_DECOMP entries
 import torch
 import torch.distributed as dist
-from hammer.v3.models.udd_fm_v3.recir_core import (
-    compile_gspmd_step,
-    RecirCompileSpec,
-    RecirMode,
-    setup_dense_optimizer_and_warmup,
-)
-from hammer.v3.models.udd_fm_v3.recir_core.compile import compile_step
 from hammer.v3.models.udd_fm_v3.recir_core.trace_sample import flatten_batch
 from hammer.v3.models.udd_fm_v3.udd_fm_train_v3 import BlueReelsVDDTrainV3
 from recir.backends import XLAGSPMDBackend
@@ -74,6 +67,13 @@ from recir.examples.rankfm_mvai.xsurface_helpers import (
     prepare_override_build_sample,
 )
 from recir.lowering.fbgemm_fallback import _batched_complete_cumsum_impl
+from recir.training.compile import (
+    compile_gspmd_step,
+    compile_step,
+    RecirCompileSpec,
+    RecirMode,
+)
+from recir.training.setup import setup_dense_optimizer_and_warmup
 
 logger: logging.Logger = logging.getLogger(__name__)
 
@@ -395,6 +395,7 @@ def _compile_forward_runner(
             backend=XLAGSPMDBackend(),
             dispatchers=dispatchers,
             region_transforms=region_transforms,
+            flatten_batch=flatten_batch,
         )
     else:
         spec = RecirCompileSpec(
@@ -412,6 +413,7 @@ def _compile_forward_runner(
             dispatchers,
             spec,
             train_step_fn=_udd_fm_v3_forward_step,
+            flatten_batch=flatten_batch,
         )
     return runner, model, dense_opt
 
