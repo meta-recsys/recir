@@ -307,15 +307,18 @@ def _dedup_grads_by_id(
     # Padding is routed to a sentinel bucket (world_size) so it sorts last and is
     # dropped from send_counts.
     dest = jnp.where(is_valid, looked_up_ids % world_size, world_size).astype(jnp.int32)
-    row = (looked_up_ids // world_size).astype(jnp.int32)
 
     # --- Step 2: sort by (dest, id) so identical ids sit next to each other ---
     # (primary key = dest, secondary key = id; lexsort's LAST arg is primary).
     order = jnp.lexsort((looked_up_ids, dest)).astype(jnp.int32)
-    sorted_dest = dest[order]
     sorted_ids = looked_up_ids[order]
-    sorted_row = row[order]
     sorted_valid = is_valid[order]
+    # dest and row are elementwise in looked_up_ids, so they commute with the
+    # permutation and cost an op here instead of a gather each.
+    sorted_dest = jnp.where(sorted_valid, sorted_ids % world_size, world_size).astype(
+        jnp.int32
+    )
+    sorted_row = (sorted_ids // world_size).astype(jnp.int32)
     # Zero out padding grads so they add nothing when we sum groups.
     sorted_grad = jnp.where(sorted_valid[:, None], grad_out[order], 0)
 
