@@ -56,21 +56,6 @@ from hammer.v3.models.udd_fm_v3.parity.step_digest import (
     compute_padding_spec,
     watch_params,
 )
-from hammer.v3.models.udd_fm_v3.recir_core import (
-    compile_gspmd_step,
-    LR_ITER_BUFFER,
-    recir_train_step,
-    RecirCompiledModuleBase,
-    RecirCompileSpec,
-    RecirMode,
-    setup_dense_optimizer_and_warmup,
-    WarmupController,
-)
-from hammer.v3.models.udd_fm_v3.recir_core.compile import (
-    compile_step,
-    IN_GRAPH_METRICS_ATTR,
-    in_graph_metrics_enabled,
-)
 from hammer.v3.models.udd_fm_v3.recir_core.trace_sample import flatten_batch
 from hammer.v3.models.udd_fm_v3.udd_fm_config import BlueReelsVDDModuleConfig
 from hammer.v3.models.udd_fm_v3.udd_fm_family import BlueReelsVDDModelFamily
@@ -112,6 +97,19 @@ from recir.examples.rankfm_mvai.xsurface_helpers import (
 )
 from recir.region_transforms.dropout_prng import DropoutPRNGTransform
 from recir.region_transforms.padding import compute_padded_shape
+from recir.training.compile import (
+    compile_gspmd_step,
+    compile_step,
+    IN_GRAPH_METRICS_ATTR,
+    in_graph_metrics_enabled,
+    LR_ITER_BUFFER,
+    recir_train_step,
+    RecirCompileSpec,
+    RecirMode,
+)
+from recir.training.compiled_module import RecirCompiledModuleBase
+from recir.training.optim import WarmupController
+from recir.training.setup import setup_dense_optimizer_and_warmup
 from torch.utils.data import IterableDataset
 
 logger: logging.Logger = logging.getLogger(__name__)
@@ -129,7 +127,7 @@ _EMB_SYNC_SKIP_FQNS: Tuple[str, ...] = ("_sharded_tables", "_dp_tables")
 # The only state the training loop needs mirrored host-ward between
 # checkpoints: the warmup controller's LR buffers, which
 # ``snapshot_metrics._lr_tensor`` reads for the learning_rate/* curves. Named
-# after the module buffers (hammer recir_core/compile.py LR_*_BUFFER); the
+# after the module buffers (recir/training/compile.py LR_*_BUFFER); the
 # WarmupController holds the same tensors under its own attribute names.
 _LR_SYNC_ONLY_FQNS: Tuple[str, ...] = (
     "_lr_dense_buffer",
@@ -464,6 +462,7 @@ class RecirXLACompiledModule(RecirCompiledModuleBase):
                 self._dispatchers,
                 self._spec,
                 train_step_fn=arm(_udd_fm_v3_train_step, self._padding_spec),
+                flatten_batch=flatten_batch,
             )
         else:
             # in_graph backend: trace the dense optimizer AND the dedicated
@@ -491,6 +490,7 @@ class RecirXLACompiledModule(RecirCompiledModuleBase):
                 backend=XLAGSPMDBackend(),
                 dispatchers=self._dispatchers,
                 region_transforms=self._spec.region_transforms,
+                flatten_batch=flatten_batch,
             )
 
         if self._attention_backend == "helion":

@@ -800,7 +800,7 @@ def _source_fingerprint() -> str:
     hammer = os.path.normpath(os.path.join(module_dir, "..", "..", "..", "hammer"))
     files = [
         os.path.abspath(__file__),
-        os.path.join(udd_fm_v3_dir, "recir_core", "compile.py"),
+        os.path.join(module_dir, "..", "..", "training", "compile.py"),
         os.path.join(udd_fm_v3_dir, "parity", "digest.py"),
         os.path.join(hammer, "v2", "modules", "hstu_common.py"),
         os.path.join(hammer, "v2", "modules", "hstu_truncate.py"),
