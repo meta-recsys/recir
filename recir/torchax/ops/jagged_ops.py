@@ -315,10 +315,11 @@ def _jax_split_2d_jagged(
     """Inverse of _jax_concat_2d_jagged: recover the left and right jagged tensors.
 
     For each output row we need the sample it belongs to so we can index back
-    into the interleaved `values` buffer. searchsorted on the per-side cumulative
-    offsets maps a flat output position to its sample (the same trick as the
-    forward op, and jit-safe). left[p] lives at values[p + offsets_right[sample]];
-    right[p] lives at values[p + offsets_left[sample + 1]].
+    into the interleaved `values` buffer. left[p] lives at
+    values[p + offsets_right[sample]]; right[p] lives at
+    values[p + offsets_left[sample + 1]]. Both of those per-sample values are
+    built by ``_segment_broadcast`` rather than looked up per position, for the
+    reason given there.
     """
     batch_size = offsets_left.shape[0] - 1
     # Guard against an empty input buffer
@@ -327,19 +328,19 @@ def _jax_split_2d_jagged(
         right = jnp.zeros((seq_len_b,) + values.shape[1:], dtype=values.dtype)
         return left, right
     positions_left = jnp.arange(seq_len_a)
-    batch_idx_left = _segment_id_by_cumsum(offsets_left[1:batch_size], seq_len_a)
-    left = values[
-        jnp.clip(positions_left + offsets_right[batch_idx_left], 0, values.shape[0] - 1)
-    ]
+    pos_right_off = _segment_broadcast(
+        offsets_right[:batch_size], offsets_left[:batch_size], seq_len_a
+    )
+    left = values[jnp.clip(positions_left + pos_right_off, 0, values.shape[0] - 1)]
     left = jnp.where(
         _bcast_mask(positions_left < offsets_left[batch_size], left.ndim), left, 0
     )
     positions_right = jnp.arange(seq_len_b)
-    batch_idx_right = _segment_id_by_cumsum(offsets_right[1:batch_size], seq_len_b)
+    pos_next_left_off = _segment_broadcast(
+        offsets_left[1 : batch_size + 1], offsets_right[:batch_size], seq_len_b
+    )
     right = values[
-        jnp.clip(
-            positions_right + offsets_left[batch_idx_right + 1], 0, values.shape[0] - 1
-        )
+        jnp.clip(positions_right + pos_next_left_off, 0, values.shape[0] - 1)
     ]
     right = jnp.where(
         _bcast_mask(positions_right < offsets_right[batch_size], right.ndim), right, 0
