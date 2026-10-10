@@ -16,7 +16,7 @@ RUN pip install --upgrade pip
 RUN pip install "jax[tpu]"
 
 # SparseCore embedding lookup (jte) for the ringshift_bench --backend sc/all arm
-# (the SC-vs-TC comparison). Mirrors recir/examples/dlrmv3/Dockerfile.
+# (the SC-vs-TC comparison).
 RUN pip install jax-tpu-embedding
 
 # The package initializer imports torch even though these TPU runners use JAX.
