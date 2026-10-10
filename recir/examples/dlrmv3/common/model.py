@@ -168,6 +168,9 @@ class DlrmV3TrainModule(nn.Module):
         # valid when a region transform re-traces the embedding lookup alone.
         rows = int(uih_lengths.shape[0])
         tokens = int(uih_seq.shape[0])
+        # TPU Mosaic cannot vectorize sharded int64 count tensors; sequence
+        # lengths are bounded by the static batch geometry and fit in int32.
+        uih_lengths = uih_lengths.to(torch.int32)
 
         def full(n: int) -> torch.Tensor:
             return uih_lengths.new_full((rows,), n)
