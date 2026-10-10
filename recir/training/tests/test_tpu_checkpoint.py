@@ -13,7 +13,7 @@ import torch.distributed.checkpoint as dcp
 import torch.utils._pytree as pytree
 from recir.api import _compute_state_fqns
 from recir.distributed.data_parallel import DataParallelStyle, shard_params_and_states
-from recir.examples.rankfm_mvai.checkpointable import (
+from recir.training.tpu_checkpoint import (
     EMBEDDING_OPTIMIZER_STATE_KEY,
     host_ordinal_from_device_positions,
     HostStateBuffers,
@@ -827,19 +827,19 @@ class HostOrdinalFromDevicePositionsTest(unittest.TestCase):
 
 class LogicalReplayRankTest(unittest.TestCase):
     @patch(
-        "recir.examples.rankfm_mvai.checkpointable.fsdp_host_ordinal",
+        "recir.training.tpu_checkpoint.fsdp_host_ordinal",
         return_value=7,
     )
     def test_multi_host_tpu_uses_stable_fsdp_ordinal(self, ordinal: MagicMock) -> None:
         self.assertEqual(logical_replay_rank(0, 16, ["tpu"] * 64), 7)
         ordinal.assert_called_once_with(16)
 
-    @patch("recir.examples.rankfm_mvai.checkpointable.fsdp_host_ordinal")
+    @patch("recir.training.tpu_checkpoint.fsdp_host_ordinal")
     def test_multi_device_cpu_keeps_gloo_rank(self, ordinal: MagicMock) -> None:
         self.assertEqual(logical_replay_rank(3, 4, ["cpu"] * 4), 3)
         ordinal.assert_not_called()
 
-    @patch("recir.examples.rankfm_mvai.checkpointable.fsdp_host_ordinal")
+    @patch("recir.training.tpu_checkpoint.fsdp_host_ordinal")
     def test_single_host_tpu_keeps_gloo_rank(self, ordinal: MagicMock) -> None:
         self.assertEqual(logical_replay_rank(0, 1, ["tpu"] * 4), 0)
         ordinal.assert_not_called()
@@ -847,7 +847,7 @@ class LogicalReplayRankTest(unittest.TestCase):
     def test_rank_remapping_keeps_stream_with_logical_ordinal(self) -> None:
         platforms = ["tpu"] * 64
         with patch(
-            "recir.examples.rankfm_mvai.checkpointable.fsdp_host_ordinal",
+            "recir.training.tpu_checkpoint.fsdp_host_ordinal",
             return_value=2,
         ):
             source_stream = logical_replay_rank(7, 16, platforms)

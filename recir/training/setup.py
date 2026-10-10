@@ -147,6 +147,18 @@ def _build_lr_buffered_optimizer(
     return opt, lr_buffer
 
 
+def build_sparse_lr_buffered_optimizer(
+    model: torch.nn.Module,
+    params: List[torch.nn.Parameter],
+    cfg: OptimConfig,
+    device: torch.device,
+) -> tuple[torch.optim.Optimizer, torch.Tensor]:
+    """``_build_lr_buffered_optimizer`` under ``LR_SPARSE_BUFFER``: the
+    optimizer of embedding tables that train inside the compiled step (e.g.
+    the recir.embedding in_graph backend's ``sparse_optimizer_builder``)."""
+    return _build_lr_buffered_optimizer(model, params, cfg, LR_SPARSE_BUFFER, device)
+
+
 def setup_dense_optimizer_and_warmup(
     model: torch.nn.Module,
     dense_params: List[torch.nn.Parameter],

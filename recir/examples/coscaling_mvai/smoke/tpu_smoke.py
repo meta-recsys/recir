@@ -26,11 +26,11 @@ jax.config.update("jax_enable_x64", True)
 
 from recir.examples.coscaling_mvai.smoke.artifact import load_artifact  # usort: skip
 from recir.examples.coscaling_mvai.smoke.run import run_smoke
-from recir.examples.rankfm_mvai import train_common
+from recir.training import tpu_runtime
 
 
 def main() -> None:
-    train_common.setup_logging()
+    tpu_runtime.setup_logging()
     artifact = load_artifact(os.environ["PROD_CONFIG_ARTIFACT"])
     run_smoke(
         artifact.module_config,

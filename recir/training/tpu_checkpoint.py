@@ -5,7 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 
-"""Checkpoint helpers for the recir in_graph (TensorCore) TPU model.
+"""TPU checkpoint support for RecIR GSPMD models with in-graph embeddings.
 
 The in_graph embedding tables live as torch ``nn.Parameter``s, so the whole
 checkpoint can stay in the ``torch.distributed.checkpoint`` (DCP) world. But the
