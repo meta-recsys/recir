@@ -53,3 +53,27 @@ def materialize_recir_parameters(
         materialized_parameters[id(param)] = materialized_parameter
         parent._parameters[attr] = materialized_parameter
     return uninitialized_meta_params
+
+
+def materialize_recir_buffers(
+    model: torch.nn.Module, device: torch.device
+) -> list[str]:
+    """Move buffers to ``device``. Returns the FQNs of meta buffers, which are
+    left as uninitialized ``torch.empty`` for the caller to reject."""
+    meta_buffers: list[str] = []
+    for fqn, buf in list(model.named_buffers()):
+        if buf is None:
+            continue
+        if buf.device.type == "meta":
+            meta_buffers.append(fqn)
+        atoms = fqn.split(".")
+        parent: torch.nn.Module = model
+        for atom in atoms[:-1]:
+            parent = getattr(parent, atom)
+        attr = atoms[-1]
+        parent._buffers[attr] = (
+            buf.to(device)
+            if buf.device.type != "meta"
+            else torch.empty(buf.shape, device=device, dtype=buf.dtype)
+        )
+    return meta_buffers

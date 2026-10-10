@@ -28,7 +28,7 @@ from recir.examples.coscaling_mvai.smoke.config import (  # usort: skip
     DEFAULT_BATCH_PATH,
 )
 from recir.examples.coscaling_mvai.smoke.run import run_smoke
-from recir.examples.rankfm_mvai import train_common
+from recir.training import tpu_runtime
 
 
 def _env_int(name: str, default: int) -> int:
@@ -36,7 +36,7 @@ def _env_int(name: str, default: int) -> int:
 
 
 def main() -> None:
-    train_common.setup_logging()
+    tpu_runtime.setup_logging()
     max_rows = _env_int("COSCALING_MAX_ROWS", 4096)
     max_seq = _env_int("COSCALING_MAX_SEQ", 64)
     max_seq_or_none = max_seq if max_seq > 0 else None

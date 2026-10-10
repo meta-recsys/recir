@@ -15,7 +15,7 @@ import torch.nn as nn
 
 # Import for its side effects: fbgemm op registration, the recir fbgemm
 # lowerings and the gr::batched_complete_cumsum decomposition.
-from recir.examples.rankfm_mvai import train_common  # usort: skip
+from recir.training import tpu_runtime  # usort: skip
 
 from hammer.v3.models.udd_fm_v3.coscaling.coscaling_config import CoScalingModuleConfig
 from hammer.v3.models.udd_fm_v3.recir_core.trace_sample import flatten_batch
@@ -149,8 +149,8 @@ def run_smoke(
     # comparison below.
     precision = os.environ.get("COSCALING_MATMUL_PRECISION", "highest")
     jax.config.update("jax_default_matmul_precision", precision)
-    train_common.resolve_dist_env()
-    train_common.ensure_gloo_process_group()
+    tpu_runtime.resolve_dist_env()
+    tpu_runtime.ensure_gloo_process_group()
     device = torch.device("cpu")
     # One process; the compiled step spans every JAX device (recir builds its
     # mesh from jax.devices()), e.g. 8 on a 2x2x1 tpu7x host.
