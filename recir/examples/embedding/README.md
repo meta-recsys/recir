@@ -216,7 +216,7 @@ reference point.
 
 `ringshift_bench.py` can also benchmark the **existing SparseCore solution**
 (DLRMv3): the raw `@SparseDenseMatmulOp` custom call emitted by
-`recir.examples.dlrmv3.sparsecore_ops.sc_matmul_fwd` (NOT jte's
+`recir.embedding.sparsecore_custom_call.sc_matmul_fwd` (NOT jte's
 `tpu_sparse_dense_matmul` primitive), driven in the non-pooling "sequence token
 trick" mode (valency=1, one id per output row) and distributed across all cores
 via `shard_map` so it triggers the SparseCore all-to-all. `jax_tpu_embedding`

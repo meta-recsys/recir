@@ -14,7 +14,7 @@ shape, three non-pooling sharded embedding-lookup implementations:
                  (``ringshift_embedding_lookup``).
   * ``sc``    -- the existing SparseCore solution (DLRMv3): the raw
                  ``@SparseDenseMatmulOp`` custom call emitted by
-                 ``recir.examples.dlrmv3.sparsecore_ops.sc_matmul_fwd`` (NOT jte's
+                 ``recir.embedding.sparsecore_custom_call.sc_matmul_fwd`` (NOT jte's
                  ``tpu_sparse_dense_matmul`` primitive), in the non-pooling
                  "sequence token trick" mode (valency=1, one id per output row),
                  distributed across all cores via ``shard_map`` so it triggers the
@@ -73,10 +73,10 @@ _EBC_REL_TOL = 1e-4
 # SparseCores per JAX device. jte's num_sparsecores_per_device() raises
 # ValueError on device kinds it doesn't recognise (e.g. "TPU7x"); fall back to
 # 4 (the value jte uses internally for TPU v5/v6/v7), matching the DLRMv3
-# SparseCore backend (recir/examples/dlrmv3/embedding.py).
+# SparseCore backend (recir/embedding/sparsecore_ops.py).
 _NUM_SC_PER_DEVICE_FALLBACK = 4
 
-# jte CSR padding sentinel (INT32_MAX); matches sparsecore_ops._PAD_VALUE.
+# jte CSR padding sentinel (INT32_MAX); matches sparsecore_custom_call._PAD_VALUE.
 _SC_PAD_VALUE = 2147483647
 
 
@@ -426,7 +426,7 @@ def run_ebc_tc(mesh, cfg, tag) -> tuple[float, float]:
 # ---------------------------------------------------------------------------
 # SparseCore arm (the existing DLRMv3 solution).
 #
-# Compute = recir.examples.dlrmv3.sparsecore_ops.sc_matmul_fwd (the raw
+# Compute = recir.embedding.sparsecore_custom_call.sc_matmul_fwd (the raw
 # @SparseDenseMatmulOp custom call), distributed via shard_map. jte is used ONLY
 # for host CSR preprocessing + specs + SC-laid-out table init. Both sc_matmul_fwd
 # and jte are jax-only (no torch/torchrec) and imported lazily, so the TC arms
@@ -544,7 +544,7 @@ def _sc_make_global_csr(csr_inputs, mesh):
 def run_sc_fwd(cfg, tag) -> float:
     """SparseCore forward perf via the DLRMv3 emission (``sc_matmul_fwd``).
 
-    Compute uses ``recir.examples.dlrmv3.sparsecore_ops.sc_matmul_fwd`` (the raw
+    Compute uses ``recir.embedding.sparsecore_custom_call.sc_matmul_fwd`` (the raw
     ``@SparseDenseMatmulOp`` custom call) -- NOT jte's ``tpu_sparse_dense_matmul``
     primitive. jte is used only for host-side CSR preprocessing + feature/table
     specs + SC-laid-out table init.
@@ -565,9 +565,9 @@ def run_sc_fwd(cfg, tag) -> float:
     build_sc_backward) and embedding_torchtpu.py (_stack_kernel_params).
     """
     jte_embedding, jte_spec, jte_stacking, jte_utils = _sc_lazy_jte()
-    # sparsecore_ops is jax-only (no torch/torchrec); lazy-import keeps the tc
+    # sparsecore_custom_call is jax-only (no torch/torchrec); lazy-import keeps the tc
     # arm + buck build clean. Resolved at runtime via the editable recir install.
-    from recir.examples.dlrmv3.sparsecore_ops import sc_matmul_fwd
+    from recir.embedding.sparsecore_custom_call import sc_matmul_fwd
 
     num_sc = _sc_num_sc_per_device(jte_utils)
     global_dev = jax.device_count()

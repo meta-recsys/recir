@@ -22,7 +22,6 @@ import torch.nn as nn
 from recir.api import sync_device_state_to_torch
 from recir.backends import XLAGSPMDBackend
 from recir.distributed.parallel_mode import GSPMDParallel
-from recir.examples.dlrmv3.jax_embedding import compile_with_jax_embedding
 from recir.lowering.xla_lower import _XLAModule
 from recir.tests.xla.dlrmv3_test_utils import (
     create_dlrmv3_wrapper,
@@ -35,6 +34,7 @@ from recir.tests.xla.dlrmv3_test_utils import (
     STATIC_UIH_LEN,
 )
 from recir.tests.xla.gspmd_test_utils import _iter_subgraphs, DestroyPGMixin
+from recir.training.compile import compile_step
 from torch.testing._internal.common_distributed import skip_if_lt_x_gpu
 from torch.testing._internal.common_utils import run_tests
 from torch.testing._internal.distributed._tensor.common_dtensor import (
@@ -62,6 +62,10 @@ except OSError:
 DENSE_LR = 0.01
 EMBEDDING_LR = 0.1
 _JAX_PORT_OFFSET = 2000
+
+
+def _flat_batch(batch: tuple, *, global_loss_denom: bool) -> tuple:
+    return tuple(batch)
 
 
 class TestEmbeddingCollectionSharder(EmbeddingCollectionSharder):
@@ -272,13 +276,12 @@ class TestDLRMv3ECRWTest(DestroyPGMixin, DTensorTestBase):
                 loss.backward()
                 opt.step()
 
-            train_step = compile_with_jax_embedding(
-                test_dmp.module,
+            train_step = compile_step(
                 train_step_fn,
                 test_dmp.module,
-                test_dense_opt,
-                *local_batch,
-                dispatcher=sparse_dispatcher,
+                (test_dense_opt,),
+                local_batch,
+                dispatchers=(sparse_dispatcher,),
                 parallel_mode=GSPMDParallel(
                     "replicate",
                     loss_reduction="sum",
@@ -286,6 +289,7 @@ class TestDLRMv3ECRWTest(DestroyPGMixin, DTensorTestBase):
                     num_processes=world_size,
                 ),
                 backend=XLAGSPMDBackend(dump_hlo=True),
+                flatten_batch=_flat_batch,
             )
 
             for _ in range(num_iters):
