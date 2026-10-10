@@ -19,7 +19,6 @@ import torch.nn as nn
 from recir.api import sync_device_state_to_torch
 from recir.backends import XLAGSPMDBackend
 from recir.distributed.parallel_mode import GSPMDParallel
-from recir.examples.dlrmv3.jax_embedding import compile_with_jax_embedding
 from recir.lowering.xla_lower import _XLAModule
 from recir.tests.xla.dlrmv3_test_utils import (
     create_dlrmv3_wrapper,
@@ -33,6 +32,11 @@ from recir.tests.xla.dlrmv3_test_utils import (
     STATIC_UIH_LEN,
 )
 from recir.tests.xla.gspmd_test_utils import _iter_subgraphs, assert_hlo_has_collective
+from recir.training.compile import compile_step
+
+
+def _flat_batch(batch: tuple, *, global_loss_denom: bool) -> tuple:
+    return tuple(batch)
 
 
 class TestDLRMv3XLA(unittest.TestCase):
@@ -73,16 +77,12 @@ class TestDLRMv3XLA(unittest.TestCase):
             loss.backward()
             opt.step()
 
-        train_step = compile_with_jax_embedding(
-            wrapper,
+        train_step = compile_step(
             train_step_fn,
             wrapper,
-            opt,
-            uih_values,
-            uih_lengths,
-            cand_values,
-            cand_lengths,
-            dispatcher=DlrmV3SparseDispatcher(dummy),
+            (opt,),
+            (uih_values, uih_lengths, cand_values, cand_lengths),
+            dispatchers=(DlrmV3SparseDispatcher(dummy),),
             parallel_mode=GSPMDParallel(
                 "replicate",
                 loss_reduction="sum",
@@ -90,6 +90,7 @@ class TestDLRMv3XLA(unittest.TestCase):
                 num_processes=1,
             ),
             backend=XLAGSPMDBackend(dump_hlo=dump_hlo),
+            flatten_batch=_flat_batch,
         )
 
         for _ in range(num_steps):
@@ -167,16 +168,12 @@ class TestDLRMv3XLA(unittest.TestCase):
             loss.backward()
             opt.step()
 
-        train_step = compile_with_jax_embedding(
-            wrapper,
+        train_step = compile_step(
             train_step_fn,
             wrapper,
-            opt,
-            uih_values,
-            uih_lengths,
-            cand_values,
-            cand_lengths,
-            dispatcher=DlrmV3SparseDispatcher(dummy),
+            (opt,),
+            (uih_values, uih_lengths, cand_values, cand_lengths),
+            dispatchers=(DlrmV3SparseDispatcher(dummy),),
             parallel_mode=GSPMDParallel(
                 "replicate",
                 loss_reduction="sum",
@@ -184,6 +181,7 @@ class TestDLRMv3XLA(unittest.TestCase):
                 num_processes=1,
             ),
             backend=XLAGSPMDBackend(),
+            flatten_batch=_flat_batch,
         )
 
         for _ in range(num_iters):

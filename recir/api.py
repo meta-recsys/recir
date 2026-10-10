@@ -2774,7 +2774,7 @@ def make_compiled_runner(compiled_obj: Any) -> Callable[..., Any]:
 
     Builds the standard "prepare_inputs -> gm(*flat_inps) -> commit_step_state"
     runtime adapter that every recir orchestrator (``recir.compile``,
-    :func:`recir.examples.dlrmv3.jax_embedding.compile_with_jax_embedding`,
+    :func:`recir.training.compile.compile_step`,
     the rankfm trainer, custom dispatchers in tests) emits after stage 10.
     The wrapper:
 
