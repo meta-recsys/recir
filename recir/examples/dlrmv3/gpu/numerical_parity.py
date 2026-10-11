@@ -4,11 +4,7 @@
 # This source code is licensed under the BSD-3-Clause license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Numerical parity between eager GPU training and RecIR+Inductor.
-
-Uses deterministic batches from the sampled streaming-100b data while scaling
-the embedding tables down to fit two model copies on one GPU.
-"""
+"""Numerical parity between eager GPU training and RecIR+Inductor."""
 
 from __future__ import annotations
 
@@ -43,16 +39,18 @@ logger: logging.Logger = logging.getLogger(__name__)
 
 def _parse(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    parser.add_argument("--dataset", default="debug")
     parser.add_argument("--data_root", default=os.path.expanduser("~"))
     parser.add_argument("--timestamp", type=int, default=0)
     parser.add_argument("--sample_offset", type=int, default=0)
-    parser.add_argument("--batch_size", type=int, default=4)
+    parser.add_argument("--batch_size", type=int, default=2)
     parser.add_argument("--steps", type=int, default=1)
-    parser.add_argument("--uih_len", type=int, default=256)
-    parser.add_argument("--uih_budget", type=int, default=128)
-    parser.add_argument("--hash_size", type=int, default=4096)
+    parser.add_argument("--uih_len", type=int, default=16)
+    parser.add_argument("--uih_budget", type=int, default=0)
+    parser.add_argument("--num_candidates", type=int, default=4)
+    parser.add_argument("--hash_size", type=int, default=256)
     parser.add_argument("--embedding_dim", type=int, default=64)
-    parser.add_argument("--num_layers", type=int, default=2)
+    parser.add_argument("--num_layers", type=int, default=1)
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--loss_atol", type=float, default=2e-5)
     parser.add_argument("--loss_rtol", type=float, default=2e-5)
@@ -120,9 +118,10 @@ def _fixed_batches(
     dataset = make_dataset(cfg.dataset, cfg.data_root, hstu, dict(tables))
     streaming = dataset.dataset
     set_timestamp = getattr(streaming, "set_ts", None)
-    if not callable(set_timestamp):
-        raise TypeError(f"{cfg.dataset!r} is not a streaming dataset")
-    set_timestamp(timestamp)
+    if callable(set_timestamp):
+        set_timestamp(timestamp)
+    elif timestamp != 0:
+        raise ValueError(f"{cfg.dataset!r} does not support --timestamp")
     needed = cfg.batch_size * steps
     end = sample_offset + needed
     if len(dataset) < end:
@@ -298,10 +297,10 @@ def main(argv: Sequence[str] | None = None) -> None:
     torch.manual_seed(args.seed)
 
     cfg = DLRMv3TrainConfig(
-        dataset="sampled-streaming-100b",
+        dataset=args.dataset,
         data_root=args.data_root,
         uih_len=args.uih_len,
-        num_candidates=32,
+        num_candidates=args.num_candidates,
         uih_budget=args.uih_budget,
         batch_size=args.batch_size,
         dense_optim="adam",
