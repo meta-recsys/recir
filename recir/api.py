@@ -37,7 +37,6 @@ import torch.nn as nn
 import torch.utils._pytree as pytree
 from functorch import make_fx
 from recir.batch_dim_propagation import propagate_batch_input_meta
-from recir.compile_utils import _enable_compile
 from recir.decompositions import DEDUP_TARGETS, SPMD_DECOMP_TABLE
 from recir.distributed.data_parallel import (
     collectives_insertion,
@@ -63,6 +62,7 @@ from recir.region_transforms import (
     RegionTransform,
     SparseEmbeddingTransform,
 )
+from recir.utils.compile import _enable_compile
 from torch import fx
 from torch._dynamo.source import LocalSource
 from torch._subclasses.fake_tensor import FakeTensorMode

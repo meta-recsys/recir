@@ -1,8 +1,8 @@
 # Recir FX Device Pipeline Design
 
 This document explains the pipeline implemented by
-[`pipeline.py`](pipeline.py) and the ready-made plans in
-[`pipeline_strategies.py`](pipeline_strategies.py).
+[`pipeline.py`](../recir/pipeline.py) and the ready-made plans in
+[`pipeline_strategies.py`](../recir/pipeline_strategies.py).
 
 The pipeline overlaps work from different batches across a linear sequence of
 FX graph stages. Graph partitioning decides **what belongs to each stage**;

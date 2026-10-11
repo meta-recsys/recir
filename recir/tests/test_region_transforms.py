@@ -16,7 +16,6 @@ import torch
 import torch.fx as fx
 import torch.nn as nn
 from functorch import make_fx
-from recir.graph_utils import OP
 from recir.region_transforms import (
     _apply_region_transforms,
     _discover_called_modules,
@@ -28,6 +27,7 @@ from recir.region_transforms import (
     RegatherTransform,
     RegionTransform,
 )
+from recir.utils.graph import OP
 from torch._subclasses.fake_tensor import FakeTensorMode
 from torch.testing._internal.common_utils import run_tests
 

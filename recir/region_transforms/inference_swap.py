@@ -60,13 +60,13 @@ from typing import Any
 
 import torch
 import torch.fx as fx
-from recir.graph_utils import OP, rebuild_graph
 from recir.region_transforms.base import RegionTransform
 from recir.region_transforms.core import (
     _compute_region_io,
     _extract_subgraph,
     _replace_region,
 )
+from recir.utils.graph import OP, rebuild_graph
 
 logger: logging.Logger = logging.getLogger(__name__)
 
