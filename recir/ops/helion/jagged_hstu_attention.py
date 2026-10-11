@@ -614,7 +614,7 @@ def hstu_ragged_attention_bwd_jax_fn(
 #
 # PRECONDITION -- BATCH ALIGNMENT (load-bearing, guarded by `_assert_batch_aligned`):
 # each device's `l_local = L/world_size` token block must be EXACTLY its
-# `b_local = B/world_size` WHOLE sequences. rankfm_mvai's packing satisfies this; if
+# `b_local = B/world_size` WHOLE sequences. The caller's packing must satisfy this; if
 # a future config breaks it the shard-local run SILENTLY mis-attends across device
 # boundaries. `_assert_batch_aligned` makes that a hard assert on the CPU/test path
 # (under jit the lengths are tracers and cannot be checked).
@@ -630,8 +630,8 @@ def hstu_ragged_attention_bwd_jax_fn(
 # PRT PAD ROWS -- dropped, not attended (`_PAD_SEQS_PER_DEVICE`):
 # recir's PaddingRegionTransform gives each chip dummy rows past its real ones, and
 # `pad_jagged_lengths` dumps that chip's ENTIRE token deficit into them -- real rows
-# keep their real lengths, the dummies absorb `budget - sum(real)`. For udd_fm_v3
-# that is one trailing row per device carrying ~70-100k tokens against a ~4.1k
+# keep their real lengths, the dummies absorb `budget - sum(real)`. In a large
+# recommendation model that can be one trailing row per device carrying many tokens against a ~4.1k
 # per-sample budget, so the wrapper slices it off before building `local_offsets`.
 #
 # That drop is a COST optimization, not a correctness requirement: under
@@ -650,7 +650,7 @@ _AXIS = "torch_dist"
 # Trailing PRT pad rows per device -- DERIVED at configure time, never assumed.
 # `padded_bs//W - real_bs//W`, latched by `set_pad_seqs_per_device`. It is NOT a
 # fixed 1: `compute_padded_shape` rounds to the PRT's OWN modulus `nd`, and
-# rankfm_mvai passes `nd = lcm(num_ranks, sc_modulus * num_processes)` -- with the
+# a SparseCore-aware caller may pass `nd = lcm(num_ranks, sc_modulus * num_processes)`; with the
 # JAX SparseCore backend's `sc_modulus = local_dev * num_sc` that is `W * num_sc`,
 # so an already-`nd`-aligned batch gets `num_sc` pad rows per device, not one.
 # Both failure directions are severe and neither is caught by
@@ -669,8 +669,7 @@ def set_pad_seqs_per_device(real_bs: int, padded_bs: int, world_size: int) -> in
     """Derive and latch the per-device PRT pad-row count from the real/padded batch.
 
     Call POST-trace and PRE-``warm_traced_hstu_kernels``, from the site that knows
-    both sizes -- for rankfm_mvai that is ``global_bs`` and
-    ``compute_padded_shape(global_bs, padded_num_devices)`` (see ``model_family``).
+    both the real and padded global batch sizes.
     ``padded_bs == real_bs`` (padding disabled) correctly yields 0.
 
     ``real_bs`` must be ``world_size``-aligned: ``pad_jagged_lengths`` gives chip
@@ -1121,8 +1120,8 @@ def warm_traced_hstu_kernels(world_size: int) -> None:
     ``set_pad_seqs_per_device`` to have run, since the warm must synthesize the POST
     pad-row-drop shapes.
 
-    Warms one kernel per distinct ``(l_local, H, D, b_local, dtype)`` (for udd_fm,
-    L1 + L2). ``N`` stays out of the dedup key but its max is used as the per-sample
+    Warms one kernel per distinct ``(l_local, H, D, b_local, dtype)``. ``N``
+    stays out of the dedup key but its max is used as the per-sample
     cap, so each warm goes through ``sample_sharded_hstu_*_jax`` on a one-device mesh
     and exercises the runtime CALL SITE -- pad-row drop, ``local_offsets`` ending
     short of ``l_local``, Mosaic call inside a ``shard_map`` -- not just the shapes.

@@ -39,7 +39,7 @@ class _OptimConfigGroup(Protocol):
 
 
 class RecOptimizerConfig(Protocol):
-    """Dense + sparse optimizer configs (minimal_viable_ai's satisfies it)."""
+    """Dense and sparse optimizer configuration contract."""
 
     @property
     def dense(self) -> _OptimConfigGroup: ...

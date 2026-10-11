@@ -67,7 +67,7 @@ from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor
 logger: logging.Logger = logging.getLogger(__name__)
 
 
-# From minimal_viable_ai.core.model_family_api.model_family (torchrec-only).
+# Map TorchRec optimizer identifiers to their concrete implementations.
 def optim_type_to_optim_class(optim_type: OptimType) -> Type[torch.optim.Optimizer]:
     # Unforunately not all fbgemm optimizers have native pytorch support, fallback if necessary
     # native pytorch optimizers may not accept kwargs like "max_gradient"

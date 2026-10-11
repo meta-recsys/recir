@@ -1973,7 +1973,7 @@ def _aten_bitwise_right_shift(input: Any, other: Any) -> Any:
 # indices/updates are batch-sharded on the scatter (token) dim is partitioned by
 # ALL-GATHERING the indices and the per-token grad up to the global token set and
 # then doing one global scatter -- i.e. it all-reduces the huge [N_global, D]
-# activation grad (17.8GB / ~87ms per table in the rankfm 128-way DP run) instead
+# activation grad (17.8GB / ~87ms per table in a 128-way DP run) instead
 # of the small [num_weights, D] table grad. To force the cheap order (per-device
 # LOCAL scatter-add, then ONE all-reduce of [num_weights, D]) we make the
 # per-device locality explicit with shard_map + psum.

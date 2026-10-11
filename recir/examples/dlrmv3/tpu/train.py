@@ -35,7 +35,7 @@ if __name__ == "__main__" and os.environ.get("TORCH_DEVICE_BACKEND_AUTOLOAD") !=
     os.environ["TORCH_DEVICE_BACKEND_AUTOLOAD"] = "0"
     os.execvpe(sys.orig_argv[0], sys.orig_argv, os.environ)
 
-# 64-bit JAX, as rankfm_mvai runs: recir.training's in-graph warmup compares the
+# 64-bit JAX: recir.training's in-graph warmup compares the
 # int64 iteration counter against int64 stage bounds.
 os.environ.setdefault("JAX_ENABLE_X64", "1")
 
@@ -87,7 +87,7 @@ class DLRMv3TPUModule(RecirGSPMDCompiledModuleBase):
     """The compiled DLRMv3 train step, plus the eval step compiled together with
     it (sharing the model's parameters and device state). Host syncs,
     checkpoint restore and the DCP view (``make_checkpointable``) come from
-    ``RecirGSPMDCompiledModuleBase``, as in rankfm_mvai."""
+    ``RecirGSPMDCompiledModuleBase``."""
 
     def __init__(
         self,
@@ -160,9 +160,7 @@ class DLRMv3TPUModule(RecirGSPMDCompiledModuleBase):
         return super()._run_step(compiled_step, batch)
 
     def _push_sparse_lr(self) -> None:
-        """Send the warmup's current sparse LR into the cpu backend's fused
-        (in-backward) optimizer before the step's backward, as rankfm's eager
-        leg does: the fused update runs inside backward."""
+        """Send the current sparse LR into the CPU backend's fused optimizer."""
         if self._fused_opt is None or self._sparse_lr_buffer is None:
             return
         lr = float(self._sparse_lr_buffer.item())
@@ -222,7 +220,7 @@ class TPUTrainer:
         assert isinstance(setup.model, DlrmV3TrainModule)
         model = setup.model
         sparse_rt = setup.sparse_runtime
-        # One warmup controller for both sides, as rankfm_mvai: the in_graph
+        # One warmup controller for both sides: the in_graph
         # sparse optimizer reads its own LR buffer; the cpu backend's fused
         # optimizer gets a plain one that DLRMv3TPUModule pushes before each step.
         sparse_lr_buffer = sparse_rt.lr_buffer
@@ -244,8 +242,8 @@ class TPUTrainer:
             num_ranks=jax.device_count(),
             num_processes=self.world,
             loss_reduction="mean",
-            # Dropout draws key off the in-graph warmup counter (jax.random
-            # cannot run inside the traced step), as rankfm_mvai does.
+            # Dropout draws its key from the in-graph warmup counter because
+            # jax.random cannot run inside the traced step.
             region_transforms=[DropoutPRNGTransform(counter_fqn=LR_ITER_BUFFER)],
             # in_graph tables are row-sharded over all chips; nothing else is.
             fsdp_table_substr=(
@@ -290,8 +288,7 @@ def _save(train: DLRMv3TPUModule, path: str) -> None:
 
 
 def _load(train: DLRMv3TPUModule, path: str) -> int:
-    """Restore in place (as rankfm_mvai's checkpoint manager does); returns the
-    restored step, i.e. the warmup iteration."""
+    """Restore in place and return the warmup iteration."""
     train.prepare_for_restore()
     dcp.load({"train": train.make_checkpointable()}, checkpoint_id=path)
     train.finalize_restore()
@@ -312,7 +309,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:  # noqa: C901
     if (cfg.ckpt_dir or cfg.resume_from) and not isinstance(
         trainer.backend, InGraphEmbeddingBackend
     ):
-        # RecirCheckpointable covers the in_graph backend (as in rankfm_mvai);
+        # RecirCheckpointable covers the in_graph backend;
         # the cpu backend's torchrec fused optimizer state is not part of it.
         raise NotImplementedError("checkpointing needs --embedding_backend in_graph")
 

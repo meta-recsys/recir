@@ -222,8 +222,8 @@ def _concat_2d_jagged_cpu(
 ) -> torch.Tensor:
     """CPU fallback: per-sample interleave concat via searchsorted+index_select.
 
-    Self-contained (no hammer/generative_recommenders import) to avoid a BUCK
-    dependency cycle with the dispatchers that route into this op.
+    Self-contained to avoid a dependency cycle with dispatchers that route
+    into this op.
     """
     # A globally-empty side has nothing to interleave; the combined jagged is
     # just the other side (per-sample order is preserved by the offset sums).
@@ -259,8 +259,8 @@ def _split_2d_jagged_cpu(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """CPU fallback: inverse interleave split via searchsorted+index_select.
 
-    Self-contained (no hammer import) to avoid a BUCK dependency cycle with the
-    dispatcher that routes into this op.
+    Self-contained to avoid a dependency cycle with the dispatcher that routes
+    into this op.
     """
     n = offsets_left.shape[0] - 1
     pa = torch.arange(seq_len_a, device=values.device)

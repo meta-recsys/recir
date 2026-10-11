@@ -1,3 +1,4 @@
+# Set IMAGE=<registry>/ringshift_tpu:<tag> and render with envsubst before applying.
 # W=128 pooled EBC benchmark. The TPU stage compares the fused pooled kernel
 # with the XLA pooled implementation on identical inputs in one process. The
 # host-side runner then times torchrec.EmbeddingBagCollection at the shape
@@ -9,9 +10,9 @@ apiVersion: jobset.x-k8s.io/v1alpha2
 kind: JobSet
 metadata:
   generateName: ringshift-w128-ebc-
-  namespace: ns-mrs-core-shared
+  namespace: default
   labels:
-    kueue.x-k8s.io/queue-name: lq-training
+    kueue.x-k8s.io/queue-name: ${QUEUE_NAME}
     x.tpu.cloud.google.com/slice-autoprovisioning: "async"
 spec:
   replicatedJobs:
@@ -34,7 +35,7 @@ spec:
             serviceAccountName: default
             containers:
             - name: bench
-              image: us-central1-docker.pkg.dev/mrs-tpu-y317h/recml/ringshift_tpu:latest
+              image: ${IMAGE}
               imagePullPolicy: Always
               env:
               - name: PYTHONUNBUFFERED

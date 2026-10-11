@@ -491,7 +491,7 @@ class HostArrayAssemblyTest(unittest.TestCase):
 
     Assembling the global array as ``[jax.device_put(shard, dev) for dev in
     local_devices]`` + ``make_array_from_single_device_arrays`` costs a full JAX
-    dispatch per local device. On a 128-chip rankfm_mvai step that was 98 host
+    dispatch per local device. On a 128-chip step that was 98 host
     tensors x 8 local devices = 784 dispatches, 157 ms/step, for 15 ms of actual
     H2D. ``make_array_from_process_local_data`` reaches a single
     ``xc.batched_device_put`` covering all of this host's shards instead.

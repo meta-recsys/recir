@@ -22,7 +22,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-VENV_DIR="${VENV_DIR:-$HOME/.venvs/rankagi_mivilm}"
+VENV_DIR="${VENV_DIR:-$SCRIPT_DIR/.venv}"
 GENERATIVE_RECOMMENDERS_DIR="${GENERATIVE_RECOMMENDERS_DIR:-$HOME/generative-recommenders}"
 
 echo "===================================================="
@@ -32,14 +32,9 @@ echo "  Venv:   $VENV_DIR"
 echo "  Repo:   $GENERATIVE_RECOMMENDERS_DIR"
 echo "===================================================="
 
-# --- 1. Validate venv ---
+# --- 1. Create or reuse a virtual environment ---
 if [ ! -d "$VENV_DIR" ]; then
-    echo ""
-    echo "ERROR: Venv not found at $VENV_DIR"
-    echo "Please run the mivilm setup first:"
-    echo "  ./post_train/launch_ddro_training_for_mivilm.sh setup"
-    echo ""
-    exit 1
+    python3 -m venv "$VENV_DIR"
 fi
 
 # shellcheck disable=SC1091
@@ -70,7 +65,7 @@ else
 fi
 
 # Install generative_recommenders in editable mode without strict deps
-# (fbgemm_gpu and torchrec are already present from the mivilm setup).
+# (fbgemm_gpu and torchrec are already installed above).
 pip install -e "$GENERATIVE_RECOMMENDERS_DIR" --no-deps --quiet
 
 # Install missing runtime deps that generative_recommenders needs

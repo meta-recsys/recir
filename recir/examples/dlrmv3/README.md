@@ -23,9 +23,9 @@ tensors (static-shape PyTorch concat/split, Triton kernels as custom ops).
 
 ## Token-budget batch layout
 
-recir compiles static shapes. Like rankfm (`recir.region_transforms.padding`),
-the batch keeps every sample's real history length and makes only the totals
-static (`common/model.py:FeatureLayout`, `common/data.py:TokenBudgetCollate`):
+recir compiles static shapes. The batch keeps every sample's real history
+length and makes only the totals static (`common/model.py:FeatureLayout`,
+`common/data.py:TokenBudgetCollate`):
 
 - The batch is one block per chip (TPU) or per rank (GPU): `--batch_size` real
   rows plus dummy rows.

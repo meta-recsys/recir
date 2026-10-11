@@ -14,10 +14,6 @@ Tests that recir's @compile() with DataParallel correctly handles SDPA models
 on multiple GPUs. recir uses collectives_insertion (parametrization-based) so
 activations flow as plain local tensors and SDPA's multi-output placement
 issue does not arise.
-
-Run:
-  buck2 test @fbcode//mode/opt -c 'fbcode.enable_gpu_sections=true' \\
-      -c 'hpc_comms.use_nccl=2.27' fbcode//recir/tests:test_sdpa_data_parallel
 """
 
 from copy import deepcopy

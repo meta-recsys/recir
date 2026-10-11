@@ -8,8 +8,6 @@
 """
 Tests for PaddingRegionTransform — custom ops, auto-discovery,
 bind_signature validation, and the transform_inputs path.
-
-buck test fbcode//recir/tests:test_padding_region_transform
 """
 
 import unittest
@@ -1057,7 +1055,7 @@ class BsIdxCountArgIntegrationTest(unittest.TestCase):
     def test_pair_padded_bs_uses_padded_bs_times_max_count(self) -> None:
         """pair_padded_bs = padded_bs * max_count = 20 * 11 = 220.
 
-        Override-build (rankfm) uses ``padded_ro_bs * num_candidates_per_sample``
+        Override construction uses ``padded_ro_bs * num_candidates_per_sample``
         for ``padded_nro_bs``; PRT mirrors that so trace-time pair shape and
         runtime pair shape agree.
         """

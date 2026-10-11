@@ -5,7 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 
-"""Shared bootstrap + helpers for recir TPU entrypoints (rankfm_mvai, DLRMv3).
+"""Shared bootstrap and helpers for recir TPU entrypoints.
 
 Entrypoints import from here so they agree EXACTLY on:
   * the gr::batched_complete_cumsum bootstrap (module-level, runs on import),
@@ -128,7 +128,7 @@ def ensure_gloo_process_group() -> Tuple[int, int]:
 def force_cpu_barrier() -> None:
     """Route torch.distributed.barrier() onto CPU instead of the TPU accelerator.
 
-    The udd_fm metric set (NE/CTR/MSE) syncs cross-rank at report time:
+    Some metric sets sync cross-rank at report time:
     torchmetrics Metric.compute() -> gather_all_tensors() -> torch.distributed
     .barrier(group). Recent torch makes the barrier device-aware via
     torch._C._get_accelerator(), which on this image returns the

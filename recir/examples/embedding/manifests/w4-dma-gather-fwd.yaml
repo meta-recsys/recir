@@ -1,3 +1,4 @@
+# Set IMAGE=<registry>/ringshift_tpu:<tag> and render with envsubst before applying.
 # W=4 single-host correctness for the HBM per-row DMA-gather forward path.
 # Uses a large per-shard table (v_local=64K, D=128 f32 -> 32MB > the 16MB VMEM
 # budget) so the kernel gathers rows directly from the HBM shard instead of the
@@ -8,7 +9,7 @@ apiVersion: jobset.x-k8s.io/v1alpha2
 kind: JobSet
 metadata:
   generateName: ringshift-w4-dma-fwd-
-  namespace: ns-mrs-core-shared
+  namespace: default
 spec:
   replicatedJobs:
   - name: worker
@@ -23,7 +24,7 @@ spec:
           spec:
             containers:
             - name: bench
-              image: us-central1-docker.pkg.dev/mrs-tpu-y317h/recml/ringshift_tpu:dma-gather
+              image: ${IMAGE}
               imagePullPolicy: Always
               env:
               - name: PYTHONUNBUFFERED

@@ -96,7 +96,7 @@ class HelionHstuShardingTest(TestCase):
 
     def test_pad_seqs_is_derived_from_the_padded_and_real_batch(self) -> None:
         # NOT a fixed 1: compute_padded_shape rounds to the PRT's own modulus, and
-        # rankfm passes lcm(num_ranks, sc_modulus * num_processes) -- which the JAX
+        # a SparseCore-aware caller passes lcm(num_ranks, sc_modulus * num_processes), which the JAX
         # SparseCore backend makes world_size * num_sparsecores_per_device, so an
         # already-aligned batch gets num_sc pad rows per device.
         self.assertEqual(

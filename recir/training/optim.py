@@ -21,7 +21,7 @@ are captured inside the compiled GM.
 mutation against the 0-d LR buffers, without the KeyedOptimizer layout.
 
 Depends only on torch, recir and torchrec. Optimizer configs are read through
-the ``OptimConfig`` protocol (minimal_viable_ai's ``OptimConfig`` satisfies it).
+the ``OptimConfig`` protocol.
 """
 
 import logging

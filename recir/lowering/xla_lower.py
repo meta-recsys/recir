@@ -1861,7 +1861,7 @@ def partial_lower_xla(
     gm = _strip_mark_boundary_nodes(gm)
     # Re-propagate is_batch_input/batch_dim. The first pass runs at trace
     # time in ``recir.api._finalize_graph`` / ``recir.trace`` before any
-    # post-trace mutation (e.g. mivilm surgery splicing new subgraphs in).
+    # post-trace mutation (for example, surgery that splices in new subgraphs).
     # Surgery-inserted nodes inherit only the component's traced meta -- no
     # ``is_batch_input`` tag -- so without re-propagation they become
     # replicated subgraph placeholders after ``segment_and_lower`` and
@@ -1869,11 +1869,9 @@ def partial_lower_xla(
     # of the graph carries global shapes -> JAX broadcast-shape mismatch
     # (e.g. ``[4096,1,128]`` vs ``[128,1,128]``).
     #
-    # As of v7.1, ``mivilm.core.surgeon.surgery`` re-tags after every
-    # splice (see ``_retag_after_splice`` there), so the GPU/Inductor path
-    # is also covered without needing a parallel hook here.  This call is
-    # kept as belt-and-suspenders for any non-mivilm caller that mutates
-    # the gm before reaching ``partial_lower_xla``;
+    # External surgery integrations may re-tag after every splice, but this
+    # call also covers any caller that mutates the graph before reaching
+    # ``partial_lower_xla``;
     # ``propagate_batch_input_meta`` is idempotent (skips already-tagged
     # nodes) so re-running is free for the surgery-tagged callers.
     propagate_batch_input_meta(gm)

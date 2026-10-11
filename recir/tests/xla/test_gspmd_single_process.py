@@ -51,8 +51,8 @@ class TestSingleProcessMultiDevice(unittest.TestCase):
         _aten_embedding_dense_backward shard_map+psum op), NOT GSPMD's
         gather-the-[N_global, D]-activation-then-global-scatter pattern.
 
-        Regression test for the rankfm DP-replicated embedding all-reduce
-        bottleneck (see HANDOVER_dense_embedding_allreduce.md). Requires that
+        Regression test for a DP-replicated embedding all-reduce bottleneck.
+        Requires that
         aten.embedding_dense_backward is preserved through the GSPMD lowering
         (it is kept out of recir.torchax.decompositions.DECOMPOSITIONS).
         """

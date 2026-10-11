@@ -27,7 +27,7 @@ A single ``=== RESULT fwd: ra2a=… fused=… sc=… ===`` line carries the head
 medians. ``--mode bwd`` covers the TensorCore arms only (SC is forward-only
 here).
 
-Example (rankfm-scale forward SC-vs-TC, 128 shards, multi-host JobSet)::
+Example (large-scale forward SC-vs-TC, 128 shards, multi-host JobSet)::
 
     python3 -m recir.examples.embedding.ringshift_bench \
         --mode fwd --backend all --world-size 128 --dim 256 --v-local 8192 \
@@ -98,7 +98,7 @@ def _make_inputs(mesh, world_size, max_local_ids, v_local, seed, *, distribution
     """Per-rank padded query ids + valid count.
 
     ``distribution="uniform"``: each id's owner ~ uniform over peers
-    (rankfm-representative; per-pair traffic ~ max_local_ids/world_size).
+    (balanced traffic; per-pair traffic ~ max_local_ids/world_size).
     ``distribution="skewed"``: ~75% of ids target one hot peer (stress pattern;
     a single per-pair count approaches max_local_ids).
     """
@@ -815,7 +815,7 @@ def _parse_args(argv=None) -> argparse.Namespace:
         action="store_true",
         default=False,
         help="ring-shift fused arm: exchange the embedding all-to-all in bf16 "
-        "(halves cross-host ICI bytes; mirrors rankfm RECIR_RINGSHIFT_EXCHANGE_BF16).",
+        "(halves cross-host ICI bytes).",
     )
     p.add_argument(
         "--trace-dir",
