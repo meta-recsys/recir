@@ -10,7 +10,12 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 from typing import Any, Dict, Iterable, Mapping, Sequence, Tuple
+
+# Optimizer state includes int64 step counters and bounds. Configure JAX before
+# importing it so CPU and TPU lowering preserve those values.
+os.environ.setdefault("JAX_ENABLE_X64", "1")
 
 import jax
 import torch
@@ -41,6 +46,7 @@ class _DeterministicConfig(DLRMv3TrainConfig):
 
 def _parse(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--dataset", default="debug")
     parser.add_argument("--steps", type=int, default=3)
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--fp32", action="store_true")
@@ -186,9 +192,10 @@ def _real_batches(
     )
     streaming = dataset.dataset
     set_timestamp = getattr(streaming, "set_ts", None)
-    if not callable(set_timestamp):
-        raise TypeError(f"{trainer.cfg.dataset!r} is not a streaming dataset")
-    set_timestamp(args.timestamp)
+    if callable(set_timestamp):
+        set_timestamp(args.timestamp)
+    elif args.timestamp != 0:
+        raise ValueError(f"{trainer.cfg.dataset!r} does not support --timestamp")
     chips = args.target_chips or trainer.geom.local_chips
     samples_per_step = trainer.cfg.batch_size * chips
     needed = samples_per_step * args.steps
@@ -350,18 +357,18 @@ def main(argv: Sequence[str] | None = None) -> None:
     state_atol = args.state_atol
     if state_atol is None:
         state_atol = 1e-4 if args.fp32 else 1e-3
-    uses_real_data = bool(args.batch_file or args.export_batches)
+    uses_dataset_batches = args.dataset != "debug"
     config = _DeterministicConfig(
-        dataset="sampled-streaming-100b" if uses_real_data else "debug",
-        uih_len=256 if uses_real_data else 16,
-        uih_budget=128 if uses_real_data else 0,
-        num_candidates=32 if uses_real_data else 4,
+        dataset=args.dataset,
+        uih_len=256 if uses_dataset_batches else 16,
+        uih_budget=128 if uses_dataset_batches else 0,
+        num_candidates=32 if uses_dataset_batches else 4,
         batch_size=2,
         dense_optim="adam",
         sparse_optim="rowwise_adagrad",
         embedding_dim=64,
-        num_layers=2 if uses_real_data else 1,
-        hash_size=4096 if uses_real_data else 256,
+        num_layers=2 if uses_dataset_batches else 1,
+        hash_size=4096 if uses_dataset_batches else 256,
         seed=args.seed,
     )
     compiled_trainer = _trainer(config, args, sharding)
@@ -375,11 +382,12 @@ def main(argv: Sequence[str] | None = None) -> None:
         )
         return
     eager_trainer = _trainer(config, args, sharding)
-    batches = (
-        _load_batches(args.batch_file)
-        if args.batch_file
-        else [_batch(compiled_trainer, args.seed + 1)] * args.steps
-    )
+    if args.batch_file:
+        batches = _load_batches(args.batch_file)
+    elif uses_dataset_batches:
+        batches = _real_batches(compiled_trainer, args)
+    else:
+        batches = [_batch(compiled_trainer, args.seed + 1)] * args.steps
     if len(batches) != args.steps:
         raise ValueError(f"batch file has {len(batches)} batches, need {args.steps}")
 

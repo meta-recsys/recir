@@ -12,6 +12,25 @@ dlrmv3/
   tpu/      GSPMD + XLA via torchax, embedding tables inside the program (in_graph)
 ```
 
+## Tested software stack
+
+| Component | Tested version |
+| --- | --- |
+| Python | 3.12 |
+| PyTorch | 2.10.x |
+| TorchRec | 1.4.x |
+| FBGEMM | 1.5.x (`fbgemm-gpu` or `fbgemm-gpu-cpu`) |
+| JAX / JAXlib | 0.8–0.10 |
+| generative-recommenders | current public package |
+
+Install the extra matching the target environment:
+
+```bash
+python -m pip install -e ".[dlrm-cpu]"  # CPU smoke / JAX CPU control
+python -m pip install -e ".[dlrm-gpu]"  # CUDA + Inductor + FBGEMM TBE
+python -m pip install -e ".[dlrm-tpu]"  # JAX TPU + libtpu
+```
+
 Both trainers trace the full step (forward, backward, optimizers, LR warmup)
 into one graph with `recir.training` (`compile_hdp_step` on GPU,
 `compile_gspmd_step` on TPU), and support train, eval (NE / accuracy / GAUC), DCP
@@ -50,12 +69,36 @@ For the real datasets, run generative-recommenders'
 `dlrm_v3/preprocess_public_data.py` and pass the directory that contains
 `data/` as `--data_root`.
 
+The `debug` dataset is generated locally and requires no download. Use it for
+installation smoke tests and deterministic numerical parity.
+
+## CPU smoke test
+
+The TPU entrypoint can run through JAX's CPU backend with embeddings on the
+host. This checks the complete capture and training path without GPU or TPU
+hardware:
+
+```bash
+JAX_PLATFORMS=cpu python -m recir.examples.dlrmv3.tpu.train \
+  --dataset debug \
+  --batch_size 4 \
+  --num_workers 0 \
+  --num_train_batches 6 \
+  --embedding_dim 64 \
+  --num_layers 1 \
+  --uih_len 16 \
+  --num_candidates 4 \
+  --hash_size 1000 \
+  --embedding_backend cpu \
+  --log_every 1
+```
+
+The first execution compiles the train and eval graphs. A successful run logs
+the compile duration followed by finite per-step losses.
+
 ## GPU
 
 ```bash
-pip install torch torchrec fbgemm-gpu generative-recommenders gin-config pandas tensorboard
-pip install -e /path/to/recir
-
 # 8 GPUs, KuaiRand-1K
 torchrun --nproc_per_node=8 -m recir.examples.dlrmv3.gpu.train \
   --dataset kuairand-1k --data_root /data --batch_size 64 \
@@ -83,6 +126,20 @@ torchrun --nproc_per_node=1 -m recir.examples.dlrmv3.gpu.train --dataset debug \
   --embedding_dim 64 --num_layers 2 --hash_size 1000 --row_wise_min_rows 500
 ```
 
+### GPU numerical parity
+
+This compares eager PyTorch and RecIR+Inductor from identical initial state and
+deterministic `debug` batches. It checks losses, outputs, parameters, and
+optimizer state after every step:
+
+```bash
+python -m recir.examples.dlrmv3.gpu.numerical_parity \
+  --dataset debug --steps 3 --fp32
+```
+
+Use `torchrun --nproc_per_node=<N>` with `--rank_consistency` to validate that
+dense state and losses remain consistent across ranks.
+
 ## TPU
 
 Build the image and launch a GKE JobSet (see `tpu/manifests/`):
@@ -91,6 +148,11 @@ Build the image and launch a GKE JobSet (see `tpu/manifests/`):
 IMAGE=<registry>/dlrmv3_tpu:latest ./recir/examples/dlrmv3/tpu/build_image.sh
 IMAGE=<registry>/dlrmv3_tpu:latest envsubst < recir/examples/dlrmv3/tpu/manifests/dlrmv3-4chip.yaml | kubectl create -f -
 ```
+
+The manifests contain no project-specific image or namespace. Set `IMAGE` to
+an image readable by the target cluster. The 4-chip manifest is the reference
+smoke test; the 128-chip manifest exercises the same code path at multi-host
+scale.
 
 - `--batch_size` is per chip.
 - torch runs on the host CPU, and the step is lowered to one GSPMD program
@@ -115,3 +177,69 @@ JAX_PLATFORMS=cpu python -m recir.examples.dlrmv3.tpu.train --dataset debug \
   --batch_size 4 --num_train_batches 6 --embedding_dim 64 --num_layers 2 \
   --hash_size 1000 --embedding_backend cpu
 ```
+
+### TPU numerical parity
+
+On a TPU host, compare eager CPU execution with RecIR GSPMD using deterministic
+debug batches:
+
+```bash
+python -m recir.examples.dlrmv3.tpu.numerical_parity \
+  --dataset debug --steps 3 --fp32 --sharding rowwise
+```
+
+The command reports per-step gradient, loss, output, and state gaps and ends
+with `TPU numerical parity passed` when every tensor is within the requested
+`--atol`, `--rtol`, and `--state_atol` thresholds.
+
+## Expected behavior
+
+A healthy training run has three visible phases:
+
+1. dataset construction and batch-shape reporting;
+2. one-time graph capture and backend compilation; and
+3. repeated `epoch ... step ... loss ... (... ms/step)` progress lines.
+
+The first step includes compilation and should not be used for throughput
+measurement. Use multiple warm steps before comparing performance.
+
+## Checkpoints and evaluation
+
+Both trainers can periodically evaluate and write distributed checkpoints:
+
+```bash
+--eval_every 500 --num_eval_batches 20 \
+--ckpt_dir /checkpoints/dlrmv3 --ckpt_every 1000 \
+--tb_dir /logs/dlrmv3
+```
+
+Resume with `--resume_from <checkpoint>`. GPU checkpoints cover dense and
+planned sparse state. TPU checkpoints support the default `in_graph` embedding
+backend; the host CPU embedding backend does not currently save its fused
+TorchRec optimizer state.
+
+## Troubleshooting
+
+### Import or ABI errors
+
+Use the versions in the tested-stack table. TorchRec and FBGEMM wheels are
+compiled against specific PyTorch releases; mixing arbitrary versions commonly
+fails during import.
+
+### TPU process sees only local devices
+
+Multi-host JobSets must provide the standard JAX TPU environment, including
+worker addresses and indexed completion ranks. Start with the supplied
+manifests before adapting them to another scheduler.
+
+### Compilation fails on a changed batch shape
+
+Keep `batch_size`, `uih_len`, `uih_budget`, `num_candidates`, table shapes, and
+the number of devices stable for a compiled runner. Use a separate runner for a
+different shape bucket.
+
+### Loss or parity mismatch
+
+First rerun the corresponding parity tool with `--fp32` and the `debug`
+dataset. Then compare the reported loss, output, gradient, parameter, and
+optimizer-state gaps to identify the first diverging state transition.
