@@ -52,7 +52,7 @@ fi
 
 cd "${FBCODE_ROOT}" || exit 1
 # helpers.sh exports CTX/NS + HTTPS_PROXY and the gateway kube context.
-HELPERS="${FBCODE_ROOT}/recir/examples/rankfm_mvai/scripts/helpers.sh"
+HELPERS="${FBCODE_ROOT}/recir/fb/examples/rankfm_mvai/scripts/helpers.sh"
 if [ ! -f "${HELPERS}" ]; then
     echo "ERROR: TPU JobSet helper not found: ${HELPERS}" >&2
     exit 1
