@@ -6,7 +6,7 @@
 
 import os
 
-from recir.graph_utils import dump_graphs_to_files
+from recir.utils.graph import dump_graphs_to_files
 from torch.testing._internal.common_utils import run_tests  # noqa: TCH001
 from torch.testing._internal.distributed._tensor.common_dtensor import DTensorTestBase
 

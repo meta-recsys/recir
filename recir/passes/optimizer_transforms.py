@@ -12,10 +12,10 @@ from typing import Any, cast, DefaultDict, List, Optional, Set, Tuple, Union
 
 import torch
 import torch.fx as fx
-from recir.graph_utils import find_node, get_output, OP
 from recir.iter_graph_module import IterGraphModule
 from recir.passes.comm_fusion import CommBlock, get_all_comm_blocks, schedule_comm_wait
 from recir.passes.pass_registry import graph_optimization_pass
+from recir.utils.graph import find_node, get_output, OP
 from torch.utils import _pytree as pytree
 from torch.utils._pytree import tree_flatten, tree_unflatten
 

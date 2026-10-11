@@ -29,6 +29,8 @@ import torch.distributed._functional_collectives as funcol
 import torch.fx as fx
 import torch.nn as nn
 from functorch import make_fx
+from recir.embedding.tbe.local import LocalTBEGroup, LocalTBETable, nobag_tbe_offsets
+from recir.embedding.tbe.ops import get_permute_2d_sparse_data_op
 from recir.pipeline import mark_pipeline_region
 from recir.pipeline_strategies import PipelineRegion
 from recir.region_transforms.base import RegionTransform
@@ -42,8 +44,6 @@ from recir.region_transforms.sparse_collectives import (
 )
 from recir.region_transforms.sparse_embedding import _embedding_bag_mode
 from recir.sharding_plan import EmbeddingShardingPlan, EmbeddingShardingType
-from recir.tbe.local import LocalTBEGroup, LocalTBETable, nobag_tbe_offsets
-from recir.tbe.ops import get_permute_2d_sparse_data_op
 from torch._subclasses.fake_tensor import unset_fake_temporarily
 from torch.distributed import ProcessGroup
 from torch.distributed.tensor import DeviceMesh

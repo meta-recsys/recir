@@ -16,10 +16,10 @@ import torch
 import torch.fx as fx
 import torch.nn as nn
 import torch.utils._pytree as pytree
-from recir.graph_utils import OP
 from recir.region_transforms.base import RegionTransform
 from recir.region_transforms.core import _extract_subgraph, _replace_region
 from recir.region_transforms.recompute import RecomputeTransform
+from recir.utils.graph import OP
 
 
 _RINGSHIFT_EMBEDDING_SCHEMA = "recir::ringshift_embedding"
