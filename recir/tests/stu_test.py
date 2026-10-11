@@ -652,8 +652,7 @@ class STUBenchmark(unittest.TestCase):
                                      (use a ``gs://`` path on TPU to retrieve it)
       ``STU_BENCH_DUMP_COST=1``      log compiled ``cost_analysis()`` once
 
-    Run on a TPU slice by overriding the JobSet ``command`` (see
-    ``recir/tests/helpers.sh`` / ``stu-test-4chip.yaml``), e.g.::
+    Run on a TPU slice by invoking the benchmark test in a suitable JobSet::
 
         STU_BENCH=1 STU_BENCH_STEPS=50 \\
             python3 -u -m unittest recir.tests.stu_test.STUBenchmark.test_stu_latency

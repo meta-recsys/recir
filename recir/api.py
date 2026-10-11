@@ -1310,8 +1310,8 @@ def _compile_and_transform(
 # ---------------------------------------------------------------------------
 #
 # These two functions split the legacy ``_compile_and_transform`` pipeline at
-# the partition boundary so surgical orchestrators (e.g.
-# ``mivilm.surgeon.compile``) can splice graph-level edits between the local
+# the partition boundary so external graph-surgery orchestrators can splice
+# graph-level edits between the local
 # trace (stage 2) and partition (stage 5).
 #
 # ``trace()`` runs stages 0 + 2 (eager pre-trace context + ``make_fx``) and
@@ -1756,7 +1756,7 @@ def trace(
     After tracing this also runs :func:`_tag_batch_inputs` +
     :func:`propagate_batch_input_meta` so every placeholder carries
     ``is_batch_input`` / ``is_weight`` / ``batch_dim`` metadata.  This makes
-    the meta-driven branch in mivilm's ``_semantic_input_map`` work without
+    external semantic input mapping work without
     falling back to the (broken) ordinal heuristic that misidentifies
     optimizer-state placeholders (e.g. Adam's 0-dim ``step`` scalar) as
     user inputs.
@@ -2774,8 +2774,8 @@ def make_compiled_runner(compiled_obj: Any) -> Callable[..., Any]:
 
     Builds the standard "prepare_inputs -> gm(*flat_inps) -> commit_step_state"
     runtime adapter that every recir orchestrator (``recir.compile``,
-    :func:`recir.training.compile.compile_step`,
-    the rankfm trainer, custom dispatchers in tests) emits after stage 10.
+    :func:`recir.training.compile.compile_step`, and custom dispatchers in
+    tests) emits after stage 10.
     The wrapper:
 
     * pops ``last_train_step`` from ``kwargs`` (default ``False``);
@@ -3040,8 +3040,8 @@ def compile(  # noqa: C901 — orchestration: stages 0-9 + legacy DP/GSPMD wirin
         state sync + flat-state threading + gm forward).
 
     See Also:
-        :func:`trace`: stages 0-2 alone, exposed so surgical orchestrators
-            (e.g. ``mivilm.surgeon.compile``) can splice graph-level edits
+        :func:`trace`: stages 0-2 alone, exposed so graph-surgery orchestrators
+            can splice graph-level edits
             between the local trace and partition.
         :func:`compile_from_gm`: stages 3-9 alone, takes a pre-traced gm
             from :func:`trace` and drives partition / optimize / dispatch.

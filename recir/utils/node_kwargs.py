@@ -9,11 +9,9 @@
 
 The plain ``node.kwargs = {...}`` pattern is fine for raw arg patching but
 silently leaves ``node.meta['val']`` (the FakeTensor seen by downstream
-passes and the export-time gates) out of sync.  In particular, mutating a
-``device`` kwarg without also re-faking the ``val`` causes the
-``_validate_kwargs_meta_consistency`` gate in
-:mod:`recir.bundle_export._gates` to fire on what is otherwise a legal
-edit.
+passes and serialization checks) out of sync. In particular, mutating a
+``device`` kwarg without also re-faking the ``val`` can make an otherwise legal
+edit fail metadata consistency validation.
 
 :func:`update_kwargs` performs the kwargs merge AND, when the new kwargs
 include a ``device`` entry, refreshes ``node.meta['val']`` to point at a

@@ -196,8 +196,7 @@ def recir_train_step(
 
     LR binding: every optimizer reaching here was built by
     ``build_torch_optimizer`` (including the in_graph ``emb_opt`` -- the backend
-    only calls an injected builder, and RankFM injects hammer's own
-    ``_build_lr_buffered_optimizer``), so each one's group['lr'] already IS the
+    only calls an injected builder), so each one's group['lr'] already IS the
     matching 0-d buffer and make_fx traces the lifted proxy rather than a baked
     constant.
 
@@ -237,12 +236,8 @@ def recir_train_step(
         k: (v.detach() if isinstance(v, torch.Tensor) else v)
         for k, v in named_tensors.items()
     }
-    # The hook, not an import: it is supplied by whoever turns the feature on
-    # (rankfm_mvai model_family). recir_core is linked into every hammer
-    # udd_fm_v3 binary, and reaching into the example package for it -- by
-    # import or by buck dep -- dragged the torchrec metrics chain in with it and
-    # pushed those binaries past the linker's +/-2GB PC-relative range
-    # (python_relocation_overflow).
+    # The hook is supplied by the caller rather than imported here, which keeps
+    # optional model and metrics dependencies out of the core compile target.
     metrics_fn = getattr(mod, IN_GRAPH_METRICS_ATTR, None)
     if metrics_fn is not None:
         detached_named.update(
@@ -509,8 +504,8 @@ def compile_gspmd_step(
     Builds the GSPMD parallel mode + XLA backend and delegates to
     ``compile_step`` with the preproc + sparse-arch graph ``dispatchers`` (which
     turn the eager sparse arch / preprocessor into XLA-lowerable custom ops via
-    install_eager + install_graph; built by the family's ``backend.get_override``,
-    ported from rankfm's ``_compile_with_xsurface_dispatchers``). Passes the
+    install_eager + install_graph; built by the family's
+    ``backend.get_override``). Passes the
     SINGLE ``dense_opt`` to the shared ``recir_train_step`` -- only the dense opt
     steps in the GM; the sparse embedding update is owned by the embedding backend
     (SparseCore / FBGEMM-fused DMP) and fires off-GM via its backward hook.

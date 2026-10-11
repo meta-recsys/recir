@@ -1,3 +1,4 @@
+# Set IMAGE=<registry>/ringshift_tpu:<tag> and render with envsubst before applying.
 # W=32 pooled (EBC) A/B: XLA reduction vs in-kernel reduction (Phase 4).
 #
 # Both arms are selected via RECIR_RINGSHIFT_POOLING_IMPL and traced in ONE
@@ -14,7 +15,7 @@
 #
 # Multi-host slice scaffolding (kueue queue, slice-autoprovisioning,
 # inject-slice-selector, Indexed completion, slice-topology annotation,
-# tolerations, init timeouts) mirrors rankfm-scale-perf.yaml so GKE provisions a
+# tolerations, init timeouts) mirrors the large-scale JobSet template so GKE provisions a
 # single coordinated 4x4x8 (128-chip / 256-core) v7x slice and injects the
 # multi-host TPU env (TPU_WORKER_HOSTNAMES) -- without this each pod sees only its
 # local 8 devices and the test skips. jax.distributed init is auto-detected from
@@ -24,9 +25,9 @@ apiVersion: jobset.x-k8s.io/v1alpha2
 kind: JobSet
 metadata:
   generateName: ringshift-w32-ebc-
-  namespace: ns-mrs-core-shared
+  namespace: default
   labels:
-    kueue.x-k8s.io/queue-name: lq-training
+    kueue.x-k8s.io/queue-name: ${QUEUE_NAME}
     x.tpu.cloud.google.com/slice-autoprovisioning: "async"
 spec:
   replicatedJobs:
@@ -49,7 +50,7 @@ spec:
             serviceAccountName: default
             containers:
             - name: bench
-              image: us-central1-docker.pkg.dev/mrs-tpu-y317h/recml/ringshift_tpu:latest
+              image: ${IMAGE}
               imagePullPolicy: Always
               env:
               - name: PYTHONUNBUFFERED

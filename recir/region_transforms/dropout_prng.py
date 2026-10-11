@@ -46,9 +46,9 @@ class DropoutPRNGTransform(RegionTransform):
     Args:
         counter_fqn: FQN of a 0-d integer buffer registered on the model and
             advanced in-graph once per step (a torch op, so ``make_fx`` records
-            it). recir does not own this name -- the caller supplies it. For the
-            udd_fm_v3 path it is ``LR_ITER_BUFFER`` ("_lr_iter_buffer"), the LR
-            warmup counter, which is already advanced by ``add_(1)``.
+        it). recir does not own this name; the caller supplies it. A learning
+            rate warmup counter is a suitable choice when it already advances
+            once per step.
         base_seed: fixed rather than host-random, so a rerun reproduces the same
             masks and step N depends only on (seed, iteration, call site).
     """

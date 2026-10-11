@@ -7,22 +7,17 @@
 
 set -euo pipefail
 
-# Build + push the ringshift TPU image to GCR.
+# Build + push the ringshift TPU image.
 # Run from the OSS recir checkout (where setup.py lives at the top).
-#
-# Image is pulled by the JobSet manifests under ./manifests/ at run time.
 
-PROJECT_ID=mrs-tpu-y317h
-REGION=us-central1
-REPO=recml
+: "${IMAGE:?set IMAGE=<registry>/<name>:<tag>}"
 IMAGE_NAME=ringshift_tpu
-IMAGE_PATH="${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO}/${IMAGE_NAME}:latest"
 RECIR_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 
 echo "============================================"
 echo "  Building ringshift TPU image"
 echo "  Context: ${RECIR_DIR}"
-echo "  Image: ${IMAGE_PATH}"
+echo "  Image: ${IMAGE}"
 echo "============================================"
 
 cd "$RECIR_DIR"
@@ -44,10 +39,10 @@ print(\"All imports OK!\")
 
 echo ""
 echo "--- Tagging and pushing ---"
-docker tag "${IMAGE_NAME}:latest" "${IMAGE_PATH}"
-docker push "${IMAGE_PATH}"
+docker tag "${IMAGE_NAME}:latest" "${IMAGE}"
+docker push "${IMAGE}"
 
 echo ""
 echo "============================================"
-echo "  BUILD COMPLETE: ${IMAGE_PATH}"
+echo "  BUILD COMPLETE: ${IMAGE}"
 echo "============================================"

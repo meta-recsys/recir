@@ -1,13 +1,16 @@
-# (c) Meta Platforms, Inc. and affiliates. Confidential and proprietary.
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-3-Clause license found in the
+# LICENSE file in the root directory of this source tree.
 
 """TPU half of the torchrec EBC parity check: run the fused op, emit an artifact.
 
 torchrec needs torch, which this image does not have (the Dockerfile installs
 ``jax[tpu]`` and nothing from the torch side), so the two cannot meet in one
-process. The task's own description of deliverable 1.2 is the two-stage flow
-implemented here: run the fused kernel on TPU, copy the output back to CPU, and
-diff it against a torchrec ``EmbeddingBagCollection`` run on the same inputs and
-weights.
+process. This module implements a two-stage flow: run the fused kernel on TPU,
+copy the output back to CPU, and compare it with a torchrec
+``EmbeddingBagCollection`` run on the same inputs and weights.
 
 The CPU half is
 ``recir/ops/pallas/embeddings/tests/test_embedding_bag_tpu_vs_torchrec_with_tpu_input.py``,
@@ -16,13 +19,10 @@ carries the inputs as well as the outputs, so the two halves share no fixture
 module and cannot drift apart. Adding a case here needs no change on the CPU
 side.
 
-Transport is base64 in the job log rather than a filesystem: the pod FS is
-ephemeral, the image has no ``gsutil`` or ``gcsfs``, and ``run_microbench.sh``
-already captures the full rank-0 log to ``bench_logs/``. The payload is ~170 KB.
-If an object store becomes reachable from the pod, only :func:`_emit` changes.
-
-Run via ``manifests/w4-ebc-parity-dump.yaml``; single host, because the CPU half
-needs the whole global table and a multi-host shard set is spread over processes.
+Transport is base64 in the job log rather than a filesystem so the output works
+with ephemeral containers and without object-store tooling. The payload is
+approximately 170 KB. Run on a single host because the CPU half needs the whole
+global table and a multi-host shard set is spread over processes.
 """
 
 from __future__ import annotations

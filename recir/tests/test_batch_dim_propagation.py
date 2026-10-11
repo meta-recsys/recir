@@ -537,7 +537,7 @@ class IndexingScatterPropagationTest(unittest.TestCase):
     select / index / index_select / index_put / scatter_add previously broke
     propagation, so the [B*S, D] activation tensors lost their batch tag and
     GSPMD replicated them -- inserting an all-reduce over the FULL GLOBAL
-    buffer for each (rankfm bench: ~154 all-reduces of f32[276640,512],
+    buffer for each (a large-model benchmark had ~154 all-reduces of f32[276640,512],
     ~473ms/step, ~45% of the step). These tests pin the propagation so the
     activations stay sharded and those collectives disappear.
     """
@@ -818,7 +818,7 @@ class StackCatPropagationTest(unittest.TestCase):
     They shared one rule -- "batch_dim unchanged" -- which is right for cat and
     wrong for stack. A per-task ``stack`` of [batch] vectors then claimed the
     INSERTED task axis was the batch axis, and _jit_gspmd sharded the task count
-    across the mesh. In the udd_fm graph that surfaced as jax refusing to split
+    across the mesh. In a multitask recommendation graph that surfaced as JAX refusing to split
     a 105-long axis 8 ways; with a task count that divides the mesh it would
     instead have sharded tasks silently and computed the loss over a slice of
     them on each device.

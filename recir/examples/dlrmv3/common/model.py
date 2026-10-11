@@ -11,7 +11,7 @@ reading data. ``DlrmHSTU`` supports that when given static max lengths and
 KJTs that carry ``length_per_key``; this module builds those from a
 token-budget batch and calls ``DlrmHSTU`` unchanged.
 
-Token-budget layout (the rankfm / ``recir.region_transforms.padding`` scheme):
+Token-budget layout (compatible with ``recir.region_transforms.padding``):
 the batch is ``num_blocks`` blocks (one per chip on TPU, one per rank on GPU),
 each holding ``b`` real rows plus ``d`` dummy rows. Real rows keep their real
 UIH lengths; every UIH sequence key has exactly ``b * uih_budget`` tokens per

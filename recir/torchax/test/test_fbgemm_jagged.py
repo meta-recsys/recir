@@ -9,7 +9,7 @@
 
 Focus: the scatter-free (gather) ``dense_to_jagged`` lowering in
 ``recir.lowering.fbgemm_fallback`` -- the ``recir @compile`` /
-``SPMD_DECOMP_TABLE`` path used by the rankfm TPU training bench. It replaced an
+``SPMD_DECOMP_TABLE`` path used by large TPU training graphs. It replaced an
 XLA scatter-add that dominated TPU step time. We verify it against an independent
 oracle and via a jagged->padded->jagged round trip (the forward + backward
 pattern exercised in training), plus the opt-in uniform fast path.
@@ -415,8 +415,8 @@ class RecirJaggedOpsMultiDeviceJitTest(unittest.TestCase):
         self.assertEqual(tuple(out.shape), (total_l,))  # jagged 1D
 
     def test_concat_split_numerics_multidevice_jit(self) -> None:
-        """Numerics for the concat/split lowerings on the path the RankFM TPU
-        bench actually uses: multi-device shard_map under jax.jit, with
+        """Numerics for the concat/split lowerings on the production path:
+        multi-device shard_map under jax.jit, with
         NON-UNIFORM per-sample lengths.
 
         Each sample's left/right lengths differ (la=[1,3,2], lb=[2,1,2]), and the

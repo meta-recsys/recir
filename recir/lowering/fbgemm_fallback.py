@@ -13,7 +13,7 @@
 # limitations under the License.
 
 
-"""Pure PyTorch fallbacks for fbgemm jagged ops (generative_recommenders, hammer).
+"""Pure PyTorch fallbacks for fbgemm jagged ops.
 
 When fbgemm_gpu is not available (e.g., on TPU), importing this module
 registers pure PyTorch implementations of the fbgemm ops those models use
@@ -28,7 +28,7 @@ Usage:
 """
 
 import logging
-from typing import Any, List, Optional, Sequence, Tuple
+from typing import List, Optional, Sequence
 
 import torch
 from recir.decompositions import SPMD_DECOMP_TABLE
@@ -309,95 +309,3 @@ def register_fbgemm_fallbacks() -> bool:
 
 # Auto-register on import
 register_fbgemm_fallbacks()
-
-
-# ── Route hammer jagged concat/split to recir shard-local custom ops ───
-# hammer's 2D-jagged concat+split PyTorch helpers use data-dependent masking
-# that (a) fails make_fx tracing and (b) on TPU/GSPMD materializes a replicated
-# [total_L, D] buffer (OOM). Route them to the recir custom ops, which have
-# shard_map lowerings that keep activations batch-sharded. The recir ops are
-# each other's backward (register_autograd in recir/ops/jagged_ops.py), so
-# loss.backward() differentiates them correctly.
-#
-# generative_recommenders needs no routing: its PyTorch concat/split are
-# static-shape and built from the fbgemm jagged ops, which the SPMD
-# decompositions above already make shard-local.
-
-
-def _route_jagged_to_recir() -> None:
-    """Monkey-patch hammer's 2D-jagged concat/split leaves to the recir custom
-    ops: hammer.ops.jagged.pytorch_concat_2D_jagged_jagged /
-    hammer.ops.pytorch.jagged._split_2d_jagged_no_prefix (the leaf functions
-    the dispatchers resolve as module globals at call time).
-
-    hammer is imported dynamically so autodeps adds no static dependency on it
-    (OSS images do not ship hammer); without hammer this is a no-op.
-    """
-
-    def _opt_import(name: str) -> Any:
-        import importlib
-
-        try:
-            return importlib.import_module(name)
-        except ImportError:
-            return None
-
-    _h_jagged = _opt_import("hammer.ops.jagged")
-    _h_pt_jagged = _opt_import("hammer.ops.pytorch.jagged")
-    if _h_jagged is None or _h_pt_jagged is None:
-        return
-
-    _orig_concat = _h_jagged.pytorch_concat_2D_jagged_jagged
-
-    def _recir_pytorch_concat_2D_jagged_jagged(
-        max_seq_len_left: int,
-        offsets_left: torch.Tensor,
-        values_left: torch.Tensor,
-        max_seq_len_right: int,
-        offsets_right: torch.Tensor,
-        values_right: torch.Tensor,
-        is_replace: bool = False,
-        n_prefix_from_right: int = 0,
-    ) -> torch.Tensor:
-        # recir concat handles the plain interleave only; defer the replace /
-        # prefix variants to the original implementation.
-        if is_replace or n_prefix_from_right != 0:
-            return _orig_concat(
-                max_seq_len_left,
-                offsets_left,
-                values_left,
-                max_seq_len_right,
-                offsets_right,
-                values_right,
-                is_replace,
-                n_prefix_from_right,
-            )
-        import recir.ops.jagged_ops  # noqa: F401
-
-        return torch.ops.recir.concat_2d_jagged(
-            values_left, offsets_left, values_right, offsets_right
-        )
-
-    _h_jagged.pytorch_concat_2D_jagged_jagged = _recir_pytorch_concat_2D_jagged_jagged
-
-    def _recir_split_2d_jagged_no_prefix(
-        values: torch.Tensor,
-        offsets_left: torch.Tensor,
-        offsets_right: torch.Tensor,
-        seq_len_a: Optional[int] = None,
-        seq_len_b: Optional[int] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        import recir.ops.jagged_ops  # noqa: F401
-
-        if seq_len_a is None:
-            seq_len_a = int(offsets_left[-1].item())
-        if seq_len_b is None:
-            seq_len_b = int(values.shape[0]) - seq_len_a
-        return torch.ops.recir.split_2d_jagged(
-            values, offsets_left, offsets_right, seq_len_a, seq_len_b
-        )
-
-    _h_pt_jagged._split_2d_jagged_no_prefix = _recir_split_2d_jagged_no_prefix
-
-
-_route_jagged_to_recir()

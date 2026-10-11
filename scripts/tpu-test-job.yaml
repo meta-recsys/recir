@@ -15,7 +15,8 @@ spec:
           spec:
             containers:
             - name: tpu-test
-              image: us-central1-docker.pkg.dev/mrs-tpu-y317h/recml/recml_base_image:latest
+              # Render with IMAGE=<registry>/<image>:<tag> envsubst before use.
+              image: ${IMAGE}
               command:
               - python3
               - -c

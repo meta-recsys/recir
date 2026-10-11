@@ -30,7 +30,7 @@ from torchrec.distributed.types import ShardingType
 
 
 class EmbeddingTable(Protocol):
-    """The table fields read here (minimal_viable_ai's EmbeddingTable satisfies it)."""
+    """The table fields required by the embedding planner."""
 
     @property
     def num_embeddings(self) -> int: ...

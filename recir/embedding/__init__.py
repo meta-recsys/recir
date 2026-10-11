@@ -24,9 +24,7 @@ Three backends share the ``EmbeddingBackend`` ABC from ``backend.py``:
 All three are model-agnostic. A model binds them to its own architecture by
 passing the seam callables the constructors take (``embedding_param_prefix``,
 ``sparse_arch_getter``, ``sparse_optimizer_builder``) and by subclassing to add
-a model-specific ``get_override`` where tracing overrides are needed. See
-``recir/examples/rankfm_mvai/rankfm_embedding_backends.py`` for a worked
-binding.
+a model-specific ``get_override`` where tracing overrides are needed.
 
 Import the concrete backends from their own submodules rather than from here,
 so a binary that only needs one does not link torchrec.distributed.* (heavy)
