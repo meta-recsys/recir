@@ -6,7 +6,7 @@
 # LICENSE file in the root directory of this source tree.
 
 # Shared bash helpers for submitting and monitoring GKE TPU JobSets. Sourced by
-# recir/tests/helpers.sh and recir/examples/rankfm_mvai/helpers.sh -- not meant to be
+# recir/tests/helpers.sh and recir/fb/examples/rankfm_mvai/helpers.sh -- not meant to be
 # sourced directly.
 #
 # A wrapper helpers.sh should:
