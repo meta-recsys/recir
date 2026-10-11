@@ -16,8 +16,7 @@ Such an object goes on mutating the pre-trace tensor while the graph reads a
 placeholder nothing writes, so the update never enters the graph and the state
 freezes at its seed value for the entire run.
 
-That is not hypothetical: it silently froze the learning rate on every TPU run
-of rankfm_mvai for months.
+This previously froze a caller's learning rate at its initial value.
 
 The caller names the objects to rewire; nothing is discovered. Declaring one
 whose tensors are not module state raises rather than quietly doing nothing,

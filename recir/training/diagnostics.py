@@ -13,8 +13,8 @@ that got baked into the graph. Used to verify that:
   * the optimizer step(s) actually traced into the GM (not elided), and
   * dense-gradient all_reduce / embedding all_to_all collectives are present.
 
-These run once (caller-gated) after the first compiled forward. Nothing
-here depends on minimal_viable_ai.models.* -- only torch + recir.
+These run once (caller-gated) after the first compiled forward and depend only
+on torch and recir.
 """
 
 import logging

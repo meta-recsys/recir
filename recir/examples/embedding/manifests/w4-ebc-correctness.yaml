@@ -1,3 +1,4 @@
+# Set IMAGE=<registry>/ringshift_tpu:<tag> and render with envsubst before applying.
 # W=4 pooled (EBC) CORRECTNESS: both arms vs INDEPENDENT references.
 #
 # The perf manifest only checks the two arms against each other, which cannot
@@ -15,7 +16,7 @@ apiVersion: jobset.x-k8s.io/v1alpha2
 kind: JobSet
 metadata:
   generateName: ringshift-w4-ebc-corr-
-  namespace: ns-mrs-core-shared
+  namespace: default
 spec:
   replicatedJobs:
   - name: worker
@@ -30,7 +31,7 @@ spec:
           spec:
             containers:
             - name: bench
-              image: us-central1-docker.pkg.dev/mrs-tpu-y317h/recml/ringshift_tpu:latest
+              image: ${IMAGE}
               imagePullPolicy: Always
               env:
               - name: PYTHONUNBUFFERED

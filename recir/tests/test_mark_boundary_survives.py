@@ -12,7 +12,7 @@ Plants a marker via attach_markers, runs the model through trace -> finalize
 that recir.find_markers can still locate it on the final gm.
 
 This guards against DCE / pass regressions that would silently strip
-graph-composition markers used by mivilm surgery.
+graph-composition markers used by external surgery integrations.
 """
 
 import unittest

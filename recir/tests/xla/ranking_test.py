@@ -49,7 +49,7 @@ class DDROWrapper(nn.Module):
     """Minimal ranking model: Qwen2 CausalLM -> per-item scores -> DDRO loss.
 
     Replicates the forward logic of DDROModelWrapper + compute_scores_from_logits
-    + RankingLossVectorized without any mivilm or external dependencies.
+    + RankingLossVectorized without external model-framework dependencies.
 
     The forward path is fully traceable by torch.fx / make_fx:
       1. Flatten [batch, items, seq] -> [batch*items, seq] for LLM forward

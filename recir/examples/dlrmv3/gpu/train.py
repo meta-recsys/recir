@@ -130,7 +130,7 @@ class _Compiled:
 
 class _Checkpoint:
     """DCP save / load through ``recir.training``'s ``RecirCheckpointAdapter``
-    (as udd_fm_v3): plan-sharded tables and their sparse optimizer state are
+    plan-sharded tables and their sparse optimizer state are
     saved as ShardedTensors, everything else replicated."""
 
     def __init__(

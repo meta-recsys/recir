@@ -14,7 +14,7 @@ Defines the ``recir::*`` ops used by ``InGraphSparseArch``
     ``recir/torchax/ops/jseq_embedding.py``) INSIDE the single compiled GSPMD
     program, so the cross-host all-to-all is scheduled with the outer
     data-parallel collectives and does NOT deadlock (unlike the graph-break
-    path). Mirrors ``hammer.ops.pytorch.hstu_attn_op``.
+    path).
   * ``fsdp_embedding`` -- FSDP (Shard(0)) dense lookup; the TPU lowering does an
     explicit all-gather (fwd) + reduce-scatter (bwd) of the table.
   * ``shard_batch0`` -- identity hint that pins an activation batch-sharded.

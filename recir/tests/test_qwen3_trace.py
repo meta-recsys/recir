@@ -11,14 +11,7 @@
 Validates that Qwen3ForCausalLM can be fully traced by recir's make_fx-based
 @compile() without graph breaks.
 
-CPU make_fx tests:
-  buck2 run @//mode/opt -c python.package_style=inplace \\
-      -- fbcode//recir/tests:test_qwen3_make_fx
-
-GPU DDP tests:
-  buck2 test @fbcode//mode/opt -c 'fbcode.enable_gpu_sections=true' \\
-      -c 'hpc_comms.use_nccl=2.27' fbcode//recir/tests:test_qwen3_trace \\
-      -- --exact 'fbcode//recir/tests:test_qwen3_trace - test_qwen3_full_graph_trace (recir.tests.test_qwen3_trace.TestQwen3Trace)'
+The make_fx tests run on CPU. Full-graph DDP coverage requires CUDA.
 """
 
 import unittest

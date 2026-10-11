@@ -12,7 +12,7 @@ RUN apt-get update && \
 
 RUN pip install --upgrade pip
 
-# Versions pinned as in recir/fb/examples/rankfm_mvai/scripts/Dockerfile:
+# Versions are pinned to a mutually compatible stack:
 # - torch 2.10 / fbgemm-gpu-cpu 1.5: newest pair in fbgemm's torch compatibility
 #   table. fbgemm 1.4's jagged ops lack the meta kernels recir's fake-tensor
 #   trace needs; unpinned, pip pulls an fbgemm built against a torch nightly ABI.

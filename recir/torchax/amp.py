@@ -110,19 +110,13 @@ def autocast(
         yield
 
 
-def hammer_autocast_factory(
+def jax_autocast_factory(
     device_type: Any,
     *,
     dtype: torch.dtype = torch.bfloat16,
     enabled: bool = True,
 ) -> "contextlib.AbstractContextManager[None]":
-    """Backend factory for ``hammer.ops.bf16_train_utils.set_autocast_factory``.
-
-    recir installs this on the TPU/JAX build so the shared ``hammer.autocast()``
-    call sites route to torchax AMP (``torch.autocast("cuda", ...)`` is inert on
-    the torchax path, which has no CUDA tensors). ``hammer.autocast`` already maps
-    ``enabled=False`` to a no-op before reaching here; the guard is defensive.
-    """
+    """Autocast factory that routes shared call sites through torchax AMP."""
     if not enabled:
         return contextlib.nullcontext()
     return autocast(device_type, dtype=dtype)

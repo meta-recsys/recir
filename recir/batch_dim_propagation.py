@@ -267,8 +267,7 @@ def _output_batch_dim_for(
     #
     # Sharing cat's rule here (returning input_batch_dim unchanged) mislabels
     # the INSERTED axis as the batch one. That is how a per-task stack of
-    # [batch] vectors -- stack([select_31, ...]) -> f32[15, 10400] in the udd_fm
-    # graph -- ends up claiming batch_dim=0 on its 15/90/105-long task axis. It
+    # [batch] vectors can end up claiming batch_dim=0 on their task axis. It
     # then reaches a graph break, _jit_gspmd builds P('torch_dist', None) from
     # the tag, and jax rejects it: "array axis 0 is partitioned 8 times, but the
     # dimension size is 105". Worse when the task count HAPPENS to divide the
@@ -369,7 +368,7 @@ def _output_batch_dim_for(
     # These ops drive the HSTU jagged<->dense marshalling. Without batch_dim
     # propagation here, the [B*S, D] activation tensors lose their batch tag,
     # so _jit_gspmd marks them REPLICATED and GSPMD inserts an all-reduce
-    # over the FULL GLOBAL buffer for each one (rankfm bench: ~154 all-reduces
+    # over the FULL GLOBAL buffer for each one (a large-model benchmark had ~154 all-reduces
     # of f32[276640,512] = ~473ms/step, ~45% of the step). Keeping the tag
     # lets the activations stay sharded [B*S/world, D] with no collective.
 

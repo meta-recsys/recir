@@ -399,7 +399,7 @@ class SeqInGraphTraceTest(unittest.TestCase):
     def test_fsdp_meta_init_traces(self) -> None:
         """Regression: an FSDP table with on_device_init=True (meta weight) must
         TRACE cleanly. Plain aten.embedding raised 'FakeTensor Device Propagation
-        ... meta, cpu' (job rankfm-64chip-bench-78zf7); routing the lookup through
+        ... meta, cpu'; routing the lookup through
         recir.fsdp_embedding (meta-tolerant fake) fixes it. The weight stays meta
         (on-device init preserved for FSDP)."""
         module, kjt, _ = _build_module_and_kjt(big=_SPARSE_FSDP, on_device_init=True)
@@ -515,7 +515,7 @@ class TableStorageDtypeTest(unittest.TestCase):
 
     This backend used to allocate every table float32 whatever the config said,
     while TorchRec allocated them narrow. That is not a layout detail: for a
-    production udd_fm_v3 table stored FP16, the representable step at a weight
+    production table stored FP16, the representable step at a weight
     of 0.06 is 3.05e-5 and one optimizer step moves 2.98e-5, so the update does
     not fit and round-to-nearest drops or doubles it. The eager leg's largest
     single-step update on four such tables came back as exactly 2^-15
@@ -572,8 +572,7 @@ class RowWiseKeepsFloat32Test(unittest.TestCase):
 
     The exemption costs nothing numerically. Row-wise is where the sparse
     optimizer lives, and its per-step update sits two orders of magnitude above
-    the FP16 grid -- all three such tables in udd_fm_v3 already matched the
-    eager leg at 1.000/1.000/0.994 while stored float32. The tables that need
+    the FP16 grid. The tables that need
     narrow storage are the REPLICATED ones on the dense optimizer, whose update
     lands at roughly one ULP.
     """
