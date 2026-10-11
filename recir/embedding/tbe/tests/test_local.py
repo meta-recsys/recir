@@ -9,7 +9,7 @@ import unittest
 from unittest.mock import patch
 
 import torch
-from recir.tbe.local import LocalTBEGroup, LocalTBETable
+from recir.embedding.tbe.local import LocalTBEGroup, LocalTBETable
 
 
 class LocalTBEGroupTest(unittest.TestCase):

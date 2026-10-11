@@ -12,8 +12,8 @@ from functools import wraps
 from typing import Any, Callable, DefaultDict, Iterable, Set, Union
 
 import torch.fx as fx
-from recir.graph_utils import dump_graphs_to_files
 from recir.iter_graph_module import IterGraphModule
+from recir.utils.graph import dump_graphs_to_files
 
 
 logger: logging.Logger = logging.getLogger("graph_optimization")
