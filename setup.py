@@ -9,6 +9,35 @@ import os
 
 from setuptools import find_packages, setup
 
+_XLA_REQUIREMENTS = [
+    "jax>=0.8.0,<0.11",
+    "jaxlib>=0.8.0,<0.11",
+    "flax>=0.10.5",
+    "optax>=0.2.5",
+]
+
+_DLRM_COMMON_REQUIREMENTS = [
+    "generative-recommenders",
+    "gin-config",
+    "pandas",
+    "pybind11",
+    "tensorboard",
+    "torch==2.10.*",
+    "torchrec==1.4.*",
+    "triton",
+]
+
+_DLRM_CPU_REQUIREMENTS = _DLRM_COMMON_REQUIREMENTS + [
+    "fbgemm-gpu-cpu==1.5.*",
+    *_XLA_REQUIREMENTS,
+]
+
+_DLRM_GPU_REQUIREMENTS = _DLRM_COMMON_REQUIREMENTS + [
+    "fbgemm-gpu==1.5.*",
+]
+
+_DLRM_TPU_REQUIREMENTS = _DLRM_CPU_REQUIREMENTS + ["libtpu"]
+
 _readme = os.path.join(os.path.dirname(os.path.abspath(__file__)), "README.md")
 long_description = open(_readme).read() if os.path.exists(_readme) else ""
 
@@ -33,24 +62,20 @@ setup(
             "test.*",
             "*.benchmarks",
             "*.benchmarks.*",
+            "recir.fb",
+            "recir.fb.*",
         ],
     ),
-    python_requires=">=3.10",
+    python_requires=">=3.12",
     install_requires=[
         "torch>=2.4",
     ],
     extras_require={
         "xla": [
-            "jax>=0.8.0",
-            "jaxlib>=0.8.0",
-            "flax>=0.10.5",
-            "optax>=0.2.5",
+            *_XLA_REQUIREMENTS,
         ],
         "tpu": [
-            "jax>=0.8.0",
-            "jaxlib>=0.8.0",
-            "flax>=0.10.5",
-            "optax>=0.2.5",
+            *_XLA_REQUIREMENTS,
             "libtpu",
         ],
         "rec": [
@@ -60,13 +85,11 @@ setup(
             "expecttest>=0.3.0",
             "parameterized>=0.9.0",
         ],
+        "dlrm-cpu": _DLRM_CPU_REQUIREMENTS,
+        "dlrm-gpu": _DLRM_GPU_REQUIREMENTS,
+        "dlrm-tpu": _DLRM_TPU_REQUIREMENTS,
         "all": [
-            "jax>=0.8.0",
-            "jaxlib>=0.8.0",
-            "flax>=0.10.5",
-            "optax>=0.2.5",
-            "libtpu",
-            "torchrec",
+            *_DLRM_TPU_REQUIREMENTS,
             "expecttest>=0.3.0",
             "parameterized>=0.9.0",
         ],
