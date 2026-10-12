@@ -11,9 +11,7 @@ from recir.api import (  # noqa: F401
     extract_subgraph,
     find_markers,
     GraphPatch,
-    materialize_compiled_output,
     replace_region,
-    set_compiled_output_deferred,
     trace,
 )
 from recir.backend import BackendType  # noqa: F401
@@ -47,6 +45,10 @@ from recir.pipeline_strategies import (  # noqa: F401
     sdd_pipeline_plan,
     semi_sync_pipeline_config,
     semi_sync_pipeline_plan,
+)
+from recir.runtime import (  # noqa: F401
+    materialize_compiled_output,
+    set_compiled_output_deferred,
 )
 from recir.sharding_plan import (  # noqa: F401
     EmbeddingShardingPlan,
