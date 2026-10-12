@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 import os
+from collections import OrderedDict
 from collections.abc import Callable, Generator, Sequence
 from contextlib import contextmanager, ExitStack, nullcontext
 from copy import copy
@@ -26,11 +27,21 @@ from functorch import make_fx
 from recir.decompositions import SPMD_DECOMP_TABLE
 from recir.distributed.data_parallel import parametrize_params
 from recir.distributed.parallel_mode import GSPMDParallel, ParallelMode
+from recir.region_transforms import (
+    _apply_region_transforms,
+    _discover_called_modules,
+    _find_forward_roots,
+    RegionTransform,
+)
 from recir.utils.compile import _enable_compile
 from torch._dynamo.source import LocalSource
 from torch._subclasses.fake_tensor import FakeTensorMode
 from torch.export.unflatten import _assign_attr, _AttrKind
-from torch.fx.experimental.symbolic_shapes import DimDynamic, StatelessSymbolicContext
+from torch.fx.experimental.symbolic_shapes import (
+    DimDynamic,
+    ShapeEnv,
+    StatelessSymbolicContext,
+)
 from torch.fx.graph import _PyTreeCodeGen, _PyTreeInfo, CodeGen
 from torch.fx.graph_module import _del_attr, _get_attr
 from torch.nn.utils import stateless
@@ -191,6 +202,136 @@ def _tag_batch_inputs(
             node.meta["is_batch_input"] = False
             node.meta["is_weight"] = False
             node.meta["is_frozen_parameter"] = False
+
+
+@dataclass
+class _RegionDiscovery:
+    """Result of `_discover_for_region_transforms`.
+
+    Holds the called-module map (used to find forward roots) built by running
+    the train step under FakeTensorMode hooks.
+    """
+
+    called_modules: OrderedDict[str, tuple[nn.Module, tuple[Any, ...], dict[str, Any]]]
+
+
+def _discover_for_region_transforms(
+    transforms: Sequence[RegionTransform],
+    func: Callable[..., Any],
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+    *,
+    mod: nn.Module | None = None,
+    fake_mode: FakeTensorMode | None = None,
+) -> _RegionDiscovery | None:
+    """Run `_discover_called_modules` to find the forward roots.
+
+    Returns ``None`` (no-op) when ``transforms`` is empty.  When ``mod`` is
+    not provided the first :class:`nn.Module` in ``args``/``kwargs`` is used.
+    """
+    if not transforms:
+        return None
+    if mod is None:
+        for arg in pytree.arg_tree_leaves(*args, **kwargs):
+            if isinstance(arg, nn.Module):
+                mod = arg
+                break
+        assert mod is not None, (
+            "region_transforms requires an nn.Module in the arguments"
+        )
+    # Inputs may already be FakeTensors produced by the trace's batch
+    # transform. Reuse that mode when supplied; FakeTensorMode does not permit
+    # tensors allocated by a different active mode.
+    discovery_mode = fake_mode or FakeTensorMode(
+        allow_non_fake_inputs=True, shape_env=ShapeEnv()
+    )
+    shape_env = discovery_mode.shape_env
+    ignore_fresh_symbols = (
+        shape_env.ignore_fresh_unbacked_symbols()
+        if shape_env is not None
+        else nullcontext()
+    )
+    with _enable_compile(), ignore_fresh_symbols:
+        called_modules = _discover_called_modules(
+            mod,
+            discovery_mode,
+            func,
+            *args,
+            **kwargs,
+        )
+    return _RegionDiscovery(called_modules=called_modules)
+
+
+def _relative_parametrize_kwargs(
+    root_fqn: str, parametrize_kwargs: dict[str, Any]
+) -> dict[str, Any]:
+    if not root_fqn:
+        return parametrize_kwargs
+    prefix = f"{root_fqn}."
+    return {
+        key: {fqn[len(prefix) :] for fqn in fqns if fqn.startswith(prefix)}
+        for key, fqns in parametrize_kwargs.items()
+    }
+
+
+def _enter_region_transform_contexts(
+    region_stack: ExitStack,
+    transforms: Sequence[RegionTransform],
+    discovery: _RegionDiscovery | None,
+    fake_mode: FakeTensorMode,
+    *,
+    parametrize_cm_factory: (
+        Callable[[str, nn.Module], Callable[[], Any]] | None
+    ) = None,
+) -> None:
+    """Enter `_apply_region_transforms` once per forward root on `region_stack`.
+
+    No-op when ``discovery`` is None or ``transforms`` is empty.
+    ``parametrize_cm_factory(root_fqn, root_mod)`` returns a context-manager factory
+    used during the per-root trace inside ``_apply_region_transforms``;
+    pass ``None`` when no parametrization is needed (e.g. GSPMD path).
+    """
+    if discovery is None or not transforms:
+        return
+    default_roots = {
+        fqn: (root_mod, root_fake_args, root_fake_kwargs)
+        for fqn, root_mod, root_fake_args, root_fake_kwargs in _find_forward_roots(
+            discovery.called_modules
+        )
+    }
+    transforms_by_root: OrderedDict[str, list[RegionTransform]] = OrderedDict()
+    root_data = dict(default_roots)
+    for transform in transforms:
+        selected = transform.select_forward_root_fqns(discovery.called_modules)
+        root_fqns = default_roots.keys() if selected is None else selected
+        for fqn in root_fqns:
+            if fqn not in discovery.called_modules:
+                raise ValueError(
+                    f"Region transform selected an uncalled module FQN: {fqn!r}."
+                )
+            root_data[fqn] = discovery.called_modules[fqn]
+            transforms_by_root.setdefault(fqn, []).append(transform)
+
+    for fqn in sorted(
+        transforms_by_root, key=lambda name: name.count("."), reverse=True
+    ):
+        root_mod, root_fake_args, root_fake_kwargs = root_data[fqn]
+        cm_factories = (
+            [parametrize_cm_factory(fqn, root_mod)]
+            if parametrize_cm_factory is not None
+            else []
+        )
+        region_stack.enter_context(
+            _apply_region_transforms(
+                root_mod,
+                root_fake_args,
+                discovery.called_modules,
+                transforms_by_root[fqn],
+                fake_mode,
+                _parametrize_cm_factories=cm_factories,
+                fake_kwargs=root_fake_kwargs,
+            )
+        )
 
 
 def _maybe_dump_fx_graph(gm: torch.fx.GraphModule) -> None:
