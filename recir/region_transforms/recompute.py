@@ -16,9 +16,9 @@ from typing import Any, Callable
 import torch
 import torch.fx as fx
 import torch.nn as nn
-from recir.graph_utils import OP
 from recir.region_transforms.base import RegionTransform
 from recir.region_transforms.core import _extract_subgraph, _replace_region
+from recir.utils.graph import OP
 
 logger: logging.Logger = logging.getLogger(__name__)
 

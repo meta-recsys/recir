@@ -51,11 +51,11 @@ from collections.abc import Callable, Iterable
 
 import torch.fx as fx
 import torch.utils._pytree as pytree
-from recir.graph_utils import OP, rebuild_graph
 from recir.region_transforms.inference_swap import (
     _graph_output_node,
     apply_inference_swaps,
 )
+from recir.utils.graph import OP, rebuild_graph
 
 logger: logging.Logger = logging.getLogger(__name__)
 

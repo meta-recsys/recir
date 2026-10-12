@@ -7,7 +7,6 @@
 from typing import Optional, Union
 
 from recir.backend import BackendType
-from recir.graph_utils import dump_graphs_to_files
 from recir.iter_graph_module import IterGraphModule
 from recir.lowering.device_state import DeviceStateManager
 from recir.lowering.partial_lower import partial_lower
@@ -20,6 +19,7 @@ from recir.passes import (
     remove_copy_from_optimizer,
     schedule_comm_wait,
 )
+from recir.utils.graph import dump_graphs_to_files
 from torch import fx
 
 
@@ -89,7 +89,6 @@ class GraphModuleTransformation:
     def __call__(self, gm: fx.GraphModule) -> Union[IterGraphModule, fx.GraphModule]:
         if self.dump_graphs:
             graph_folder = dump_graphs_to_files(
-                # pyrefly: ignore [bad-argument-type]
                 {"before_transformation_gm": gm.print_readable(False)}
             )
             enable_graph_optimization_dump(graph_folder)
@@ -104,7 +103,6 @@ class GraphModuleTransformation:
 
             if self.dump_graphs:
                 dump_graphs_to_files(
-                    # pyrefly: ignore [bad-argument-type]
                     {"transformed_gm": gm.print_readable(False)},
                     graph_folder,  # type: ignore[possibly-undefined]
                 )
@@ -120,7 +118,6 @@ class GraphModuleTransformation:
 
         if self.dump_graphs:
             dump_graphs_to_files(
-                # pyrefly: ignore [bad-argument-type]
                 {
                     "iter_graph_setup_gm": iter_gm.setup_gm.print_readable(False),
                     "iter_graph_main_gm": iter_gm.main_gm.print_readable(False),

@@ -5,6 +5,13 @@
 
 # pyre-strict
 
-from recir.tbe.local import LocalTBEGroup, LocalTBETable
+"""Public rank-local TBE API."""
 
-__all__ = ["LocalTBEGroup", "LocalTBETable"]
+from recir.embedding.tbe.implementation import (
+    LocalTBEGroup,
+    LocalTBETable,
+    nobag_tbe_offsets,
+)
+
+
+__all__ = ["LocalTBEGroup", "LocalTBETable", "nobag_tbe_offsets"]

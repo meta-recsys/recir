@@ -7,6 +7,7 @@
 import logging
 import os
 import tempfile
+from collections.abc import Mapping
 from enum import Enum
 from typing import Callable, cast, Dict, Iterable, List, Set
 
@@ -142,7 +143,7 @@ def rebuild_graph(gm: fx.GraphModule, remove_dead_code: bool = True) -> None:
     gm.recompile()
 
 
-def dump_graphs_to_files(graphs: Dict[str, fx.GraphModule], folder: str = "") -> str:
+def dump_graphs_to_files(graphs: Mapping[str, object], folder: str = "") -> str:
     if not folder:
         folder = tempfile.mkdtemp()
 
