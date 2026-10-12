@@ -96,7 +96,7 @@ def _to_caller_flattened_graph_module(gm: torch.fx.GraphModule) -> torch.fx.Grap
 
 
 @contextmanager
-def _rematerialize_optimizer(
+def _rematerialize_optimizer(  # noqa: C901 -- rewiring and restoration are one transaction
     opt: torch.optim.Optimizer,
     named_states: dict[str, Any],
     params: dict[str, nn.Parameter],
@@ -270,7 +270,7 @@ class _LocalCompiledResult:
     constants: dict[str, torch.Tensor]
 
 
-def _local_compile(
+def _local_compile(  # noqa: C901 -- tracing transaction is intentionally cohesive
     func: Callable[..., Any],
     *args: Any,
     fake_mode: FakeTensorMode,
