@@ -55,11 +55,7 @@ from recir.process_state import (
     _compute_state_fqns,
     CompiledProcessState,
 )
-from recir.region_transforms import (
-    RegatherTransform,
-    RegionTransform,
-    SparseEmbeddingTransform,
-)
+from recir.region_transforms import RegatherTransform, RegionTransform
 from recir.runtime import (  # noqa: F401 -- compatibility re-exports
     COMPILED_OBJECT_KEY,
     get_compiled_process_state,
@@ -73,18 +69,26 @@ from recir.runtime import (  # noqa: F401 -- compatibility re-exports
     sync_named_state_to_torch,
 )
 from recir.tracing import (  # noqa: F401 -- compatibility re-exports
+    _bind_transform_signatures,
     _discover_for_region_transforms,
     _enter_region_transform_contexts,
+    _get_trace_ctx,
     _local_compile,
     _LocalCompiledResult,
+    _make_hybrid_sparse_transform,
     _make_trace_input_transform,
+    _prepare_transforms_after_shard,
     _RegionDiscovery,
     _relative_parametrize_kwargs,
     _rematerialize_optimizer,
     _rematerialize_tensor_attrs,
     _resolve_trace_batch_ratio,
+    _set_trace_ctx,
     _tag_batch_inputs,
     _to_caller_flattened_graph_module,
+    _TRACE_CTX_ATTR,
+    _TraceContext,
+    _TraceResult,
 )
 from torch import fx
 from torch._subclasses.fake_tensor import FakeTensorMode
@@ -237,116 +241,6 @@ def _compile_and_transform(
 # partition, optimize_passes, IterGraph wrap, dispatch) using the trace
 # context recovered from the gm, the explicit ``parallel_mode``, and the
 # explicit ``backend``.
-
-
-# Marker attribute used to stash trace context on a graph module.
-_TRACE_CTX_ATTR = "_recir_trace_ctx"
-
-
-@dataclass
-class _TraceContext:
-    """Per-trace bundle stashed on ``gm._recir_trace_ctx``.
-
-    Holds the references that :func:`compile_from_gm` needs to drive the
-    post-trace stages: the original module, optimizer, parameter / buffer /
-    optimizer-state dicts, and any embedding-specific data computed during
-    the v2 trace (used by :func:`rewrite_sparse_embeddings`).
-    """
-
-    mod: nn.Module
-    opts: List[torch.optim.Optimizer]
-    params: Dict[str, nn.Parameter]
-    buffers: Dict[str, torch.Tensor]
-    named_states: Dict[str, Any]
-    state_fqns: List[str]
-    input_batch_dim: int
-    embedding_param_indices: Optional[set[int]] = None
-    internal_transforms: List[RegionTransform] = field(default_factory=list)
-
-
-def _make_hybrid_sparse_transform(
-    parallel_mode: HybridParallel,
-    embedding_param_fqns: set[str],
-    mod: nn.Module,
-    forward_only: bool = False,
-) -> RegionTransform:
-    if forward_only:
-        # Eval / inference has no embedding backward or optimizer state. Reuse
-        # the tables already installed on the module by the training transform
-        # (for example, TBE table views) and rewrite only their forward lookups.
-        return SparseEmbeddingTransform(
-            embedding_param_fqns=embedding_param_fqns,
-            mesh=parallel_mode.mesh,
-            mod=mod,
-            embedding_plan=parallel_mode.embedding_plan,
-            forward_only=True,
-        )
-
-    # The configurable factory owns the training transform: it may create
-    # optimizer-backed table state and rewrite both embedding forward and
-    # backward. It must not be invoked for the forward-only branch above.
-    training_transform_factory = parallel_mode.sparse_transform_factory
-    if training_transform_factory is not None:
-        transform = training_transform_factory(
-            embedding_param_fqns, parallel_mode.mesh, mod
-        )
-        if not isinstance(transform, RegionTransform):
-            raise TypeError(
-                "HybridParallel sparse_transform_factory must return a "
-                f"RegionTransform, got {type(transform).__name__}."
-            )
-        return transform
-    return SparseEmbeddingTransform(
-        embedding_param_fqns=embedding_param_fqns,
-        mesh=parallel_mode.mesh,
-        mod=mod,
-        embedding_plan=parallel_mode.embedding_plan,
-        forward_only=False,
-    )
-
-
-def _prepare_transforms_after_shard(
-    transforms: Sequence[RegionTransform],
-    mod: nn.Module,
-    opts: Sequence[torch.optim.Optimizer],
-) -> None:
-    for transform in transforms:
-        transform.prepare_after_shard(mod, opts)
-
-
-def _bind_transform_signatures(
-    transforms: Sequence[RegionTransform],
-    callable_: Callable[..., Any],
-) -> None:
-    for transform in transforms:
-        bind = getattr(transform, "bind_signature", None)
-        if bind is not None:
-            bind(callable_)
-
-
-def _set_trace_ctx(gm: fx.GraphModule, ctx: _TraceContext) -> None:
-    """Attach ``ctx`` to ``gm`` so :func:`compile_from_gm` can recover it.
-
-    Stored as a Python attribute (not a buffer), so it survives
-    ``gm.recompile()`` but is not serialized by ``torch.save``.
-    """
-    setattr(gm, _TRACE_CTX_ATTR, ctx)
-
-
-def _get_trace_ctx(gm: fx.GraphModule) -> _TraceContext:
-    """Recover the trace context stashed by :func:`trace`."""
-    ctx = getattr(gm, _TRACE_CTX_ATTR, None)
-    if ctx is None:
-        raise RuntimeError(
-            "recir.compile_from_gm requires a gm produced by recir.trace "
-            "(missing trace context attribute). If you mutated the gm via "
-            "extract/replace_region, the stash is preserved automatically; "
-            "if you built the gm from scratch you must call recir.trace first."
-        )
-    return cast(_TraceContext, ctx)
-
-
-_TraceResult = Tuple[fx.GraphModule, List[torch.Tensor]]
 
 
 @dataclass
