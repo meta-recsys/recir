@@ -35,8 +35,8 @@ import unittest
 from typing import List
 
 import torch
-from recir.iter_graph_module import IterGraphModule
 from recir.lowering.lowering_utils import segment_and_lower
+from recir.passes.iter_graph_module import IterGraphModule
 
 
 class _PassthroughSubgraphModule(torch.nn.Module):

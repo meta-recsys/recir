@@ -6,8 +6,7 @@
 
 from typing import Optional, Union
 
-from recir.backend import BackendType
-from recir.iter_graph_module import IterGraphModule
+from recir.backends.types import BackendType
 from recir.lowering.device_state import DeviceStateManager
 from recir.lowering.partial_lower import partial_lower
 from recir.lowering.xla_device_state import XLADeviceStateManager
@@ -19,6 +18,7 @@ from recir.passes import (
     remove_copy_from_optimizer,
     schedule_comm_wait,
 )
+from recir.passes.iter_graph_module import IterGraphModule
 from recir.utils.graph import dump_graphs_to_files
 from torch import fx
 

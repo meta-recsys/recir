@@ -16,6 +16,7 @@ the v7.1 surface lands.
 from recir.backends.base import Backend, GraphPatch
 from recir.backends.inductor import InductorBackend
 from recir.backends.torchtpu import TorchTPUBackend
+from recir.backends.types import BackendType
 from recir.backends.xla import (
     XLADynamoBridgeBackend,
     XLAGSPMDBackend,
@@ -24,6 +25,7 @@ from recir.backends.xla import (
 
 __all__ = [
     "Backend",
+    "BackendType",
     "GraphPatch",
     "InductorBackend",
     "TorchTPUBackend",

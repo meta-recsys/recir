@@ -38,6 +38,7 @@ import torch.distributed.checkpoint as dcp
 import torch.nn as nn
 from generative_recommenders.common import HammerKernel
 from recir.distributed.data_parallel import materialize_embedding_weight
+from recir.distributed.sharding_plan import EmbeddingShardingPlan
 from recir.examples.dlrmv3.common.config import DLRMv3TrainConfig, parse_config
 from recir.examples.dlrmv3.common.data import (
     make_dataset,
@@ -55,13 +56,11 @@ from recir.examples.dlrmv3.common.model import (
     EMBEDDING_COLLECTION_FQN,
 )
 from recir.examples.dlrmv3.common.steps import eval_step, flatten_batch
-from recir.meta_tensor_init import default_embedding_init_bound
 from recir.pipeline import is_pipeline_pending, PipelineConfig
 from recir.pipeline_strategies import (
     embedding_steady_state_pipeline_config,
     sdd_pipeline_config,
 )
-from recir.sharding_plan import EmbeddingShardingPlan
 from recir.training.compile import (
     compile_hdp_step,
     create_tbe_process_group,
@@ -77,6 +76,7 @@ from recir.training.materialization import (
     materialize_recir_parameters,
 )
 from recir.training.setup import RecirOptimizerBundle, setup_dual_optimizers_and_warmup
+from recir.utils.meta_tensor_init import default_embedding_init_bound
 from torch.utils.data import DataLoader
 from torchrec.distributed.embedding_types import OptimType
 from torchrec.distributed.types import ShardingType

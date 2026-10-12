@@ -36,8 +36,8 @@ import operator
 import threading
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+import recir.ops.marker  # noqa: F401 -- register recir::mark_boundary
 import torch
-from recir.ops import marker as _marker  # noqa: F401
 from torch import fx
 from torch.fx.node import has_side_effect
 

@@ -21,7 +21,7 @@ from dataclasses import dataclass
 from typing import List, Protocol, Set, Tuple
 
 import torch
-from recir.sharding_plan import EmbeddingShardingPlan
+from recir.distributed.sharding_plan import EmbeddingShardingPlan
 from recir.training.compile import (
     LR_DENSE_BUFFER,
     LR_ITER_BUFFER,

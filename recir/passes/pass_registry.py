@@ -12,7 +12,7 @@ from functools import wraps
 from typing import Any, Callable, DefaultDict, Iterable, Set, Union
 
 import torch.fx as fx
-from recir.iter_graph_module import IterGraphModule
+from recir.passes.iter_graph_module import IterGraphModule
 from recir.utils.graph import dump_graphs_to_files
 
 

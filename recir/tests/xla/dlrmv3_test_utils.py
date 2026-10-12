@@ -21,7 +21,7 @@ from generative_recommenders.modules.dlrm_hstu import (
     SequenceEmbedding,
 )
 from generative_recommenders.ops.jagged_tensors import concat_2D_jagged
-from recir.eager_dispatch import install_graph_break_dispatch, mark_output_with_bwd
+from recir.ops.eager_dispatch import install_graph_break_dispatch, mark_output_with_bwd
 from torchrec.modules.embedding_configs import EmbeddingConfig
 from torchrec.modules.embedding_modules import EmbeddingCollection
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
@@ -461,7 +461,7 @@ class DummyPreprocess(nn.Module):
     EmbeddingCollection. The shapes are derived from the static batch
     dimensions and model config.
 
-    Wraps each output tensor with :func:`recir.eager_dispatch.mark_output_with_bwd`
+    Wraps each output tensor with :func:`recir.ops.eager_dispatch.mark_output_with_bwd`
     which plants a forward/backward marker pair into the make_fx-traced FX
     graph.  The post-trace orchestrator (:class:`DlrmV3SparseDispatcher` or
     :class:`recir.examples.dlrmv3.jax_embedding.JAXEmbeddingDispatcher`) then

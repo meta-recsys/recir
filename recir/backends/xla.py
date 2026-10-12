@@ -12,8 +12,8 @@ from __future__ import annotations
 import functools
 from typing import Any, ClassVar, Optional, Sequence, TYPE_CHECKING
 
-from recir.backend import BackendType
 from recir.backends.base import Backend, GraphPatch
+from recir.backends.types import BackendType
 from recir.lowering.device_state import DeviceStateManager
 from recir.lowering.xla_device_state import XLADeviceStateManager
 from recir.lowering.xla_lower import partial_lower_xla

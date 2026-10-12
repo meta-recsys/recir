@@ -16,6 +16,7 @@ import torch
 import torch.fx as fx
 import torch.nn as nn
 from functorch import make_fx
+from recir.distributed.sharding_plan import EmbeddingShardingPlan, EmbeddingShardingType
 from recir.embedding.tbe.local import LocalTBEGroup
 from recir.lowering.partial_lower import _InductorModule, partial_lower
 from recir.ops.fake.kjt import patch_ebc_for_tracing
@@ -29,7 +30,6 @@ from recir.region_transforms.tbe_sparse_embedding import (
     _LookupSite,
     TBESparseEmbeddingTransform,
 )
-from recir.sharding_plan import EmbeddingShardingPlan, EmbeddingShardingType
 from torch._dynamo.source import LocalSource
 from torch._subclasses.fake_tensor import FakeTensorMode
 from torch.distributed import ProcessGroup

@@ -16,7 +16,7 @@ data-parallel tables are replicated (excluded from the plan).
 The plan's FQN set is what downstream optimizer setup reads to split params into
 sparse vs dense (see ``setup._partition_params``).
 
-Framework-agnostic: torch + recir.sharding_plan + the EmbeddingTable config.
+Framework-agnostic: torch + recir.distributed.sharding_plan + the EmbeddingTable config.
 """
 
 from __future__ import annotations
@@ -25,7 +25,7 @@ import logging
 from typing import Any, Dict, Mapping, Optional, Protocol, Set
 
 import torch
-from recir.sharding_plan import EmbeddingShardingPlan, EmbeddingShardingType
+from recir.distributed.sharding_plan import EmbeddingShardingPlan, EmbeddingShardingType
 from torchrec.distributed.types import ShardingType
 
 

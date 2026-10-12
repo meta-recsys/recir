@@ -31,19 +31,19 @@ import torch.library
 import torch.nn as nn
 import torch.utils._pytree as pytree
 from recir.distributed.batch_dim_utils import BatchDimAnalyzer
-from recir.meta_tensor_init import (
+from recir.distributed.sharding_plan import EmbeddingShardingPlan
+
+# v1's ``_rewrite_row_wise_embeddings`` (used by ``partition_data_parallel``
+# in the bundle_runtime path) reuses the row-wise embedding decomposition
+# that now lives in ``recir/region_transforms/sparse_embedding.py``.
+from recir.region_transforms.sparse_embedding import decomposed_row_wise_embedding
+from recir.utils.meta_tensor_init import (
     copy_meta_init_attrs,
     default_embedding_init_bound,
     get_meta_init_spec,
     initialize_tensor_from_meta_init,
     mark_meta_zero_init,
 )
-
-# v1's ``_rewrite_row_wise_embeddings`` (used by ``partition_data_parallel``
-# in the bundle_runtime path) reuses the row-wise embedding decomposition
-# that now lives in ``recir/region_transforms/sparse_embedding.py``.
-from recir.region_transforms.sparse_embedding import decomposed_row_wise_embedding
-from recir.sharding_plan import EmbeddingShardingPlan
 from torch.distributed.tensor import DeviceMesh, DTensor, Replicate, Shard
 from torch.distributed.tensor._dtensor_spec import DTensorSpec
 from torch.distributed.tensor._op_schema import (

@@ -30,7 +30,6 @@ from typing import Callable, Dict, List, Sequence, Tuple
 import jax
 import torch
 import torch.nn as nn
-from recir.eager_dispatch import install_graph_break_dispatch
 from recir.embedding._sparse_arch_stub import (
     DummySparseArch,
     sparse_arch_marker_prefix,
@@ -47,6 +46,7 @@ from recir.embedding.sparsecore_ops import (
     init_sc_embedding_variables,
     SparsecoreBackedEC,
 )
+from recir.ops.eager_dispatch import install_graph_break_dispatch
 from recir.training.optim import OptimConfig
 from torchrec.modules.embedding_configs import BaseEmbeddingConfig, EmbeddingConfig
 from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor

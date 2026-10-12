@@ -131,7 +131,7 @@ class IterGraph(fx.Graph):
             return super().inserting_before(n)
         return self._insert_context("inserting_before", n)
 
-    def _forward_subgraph_inputs(
+    def _forward_subgraph_inputs(  # noqa: C901 -- graph boundary rewrite transaction
         self, subgraph: List[fx.Node], graph: fx.Graph, erase_node: bool
     ) -> int:
         """Turn the inputs of a subgraph into the extra output of the entire graph.

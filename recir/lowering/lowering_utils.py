@@ -32,7 +32,7 @@ def strip_profiler_nodes(gm: torch.fx.GraphModule) -> torch.fx.GraphModule:
 
     Their opaque handles cannot cross lowered subgraph boundaries.
     """
-    from recir.iter_graph_module import IterGraph
+    from recir.passes.iter_graph_module import IterGraph
 
     changed = False
     for node in reversed(list(gm.graph.nodes)):
@@ -210,7 +210,7 @@ def lower_subgraph_nodes(
     # See ``IterGraphModule.add_subgraph_module`` for the helper that
     # propagates the registration to all three sub-GMs so the call_module
     # node we splice in below resolves under any of them.
-    from recir.iter_graph_module import IterGraph, IterGraphModule
+    from recir.passes.iter_graph_module import IterGraph, IterGraphModule
 
     if isinstance(gm, IterGraphModule):
         gm.add_subgraph_module(subgraph_name, module)

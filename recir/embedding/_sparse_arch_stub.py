@@ -29,7 +29,7 @@ from typing import Dict, List
 
 import torch
 import torch.nn as nn
-from recir.eager_dispatch import mark_input, mark_output_with_bwd
+from recir.ops.eager_dispatch import mark_input, mark_output_with_bwd
 from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor
 
 SPARSE_ARCH_MARKER_PREFIX = "recir.embedding.sparse_arch"
@@ -72,7 +72,7 @@ def swap_sparse_arch(
 class DummySparseArch(nn.Module):
     """Replacement for the real sparse arch that returns cached embeddings.
 
-    Wraps input KJT components in :func:`recir.eager_dispatch.mark_input` and
+    Wraps input KJT components in :func:`recir.ops.eager_dispatch.mark_input` and
     outputs in :func:`mark_output_with_bwd` so the post-trace orchestrator can
     find the markers and wire runtime dispatch to the real lookup.
 

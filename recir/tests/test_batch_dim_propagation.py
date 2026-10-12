@@ -26,7 +26,7 @@ intentional boundaries where the batch axis is reduced away:
 import unittest
 
 import torch
-from recir.batch_dim_propagation import (
+from recir.compiler.batch_dim import (
     propagate_batch_input_meta,
     propagate_fsdp_sharded_meta,
 )

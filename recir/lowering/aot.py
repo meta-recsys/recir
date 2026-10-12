@@ -54,8 +54,8 @@ from typing import Any, Iterable, Iterator, List, Tuple
 import torch
 import torch.fx as fx
 from jax.experimental import serialize_executable  # @manual
-from recir.iter_graph_module import IterGraphModule
 from recir.lowering.xla_lower import _XLAModule
+from recir.passes.iter_graph_module import IterGraphModule
 
 
 logger: logging.Logger = logging.getLogger(__name__)
