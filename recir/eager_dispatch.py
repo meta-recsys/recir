@@ -37,6 +37,7 @@ import threading
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import torch
+from recir.ops import marker as _marker  # noqa: F401
 from torch import fx
 from torch.fx.node import has_side_effect
 
