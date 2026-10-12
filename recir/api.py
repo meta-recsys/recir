@@ -79,19 +79,17 @@ from recir.runtime import (  # noqa: F401 -- compatibility re-exports
 from recir.tracing import (  # noqa: F401 -- compatibility re-exports
     _local_compile,
     _LocalCompiledResult,
+    _make_trace_input_transform,
     _rematerialize_optimizer,
     _rematerialize_tensor_attrs,
+    _resolve_trace_batch_ratio,
+    _tag_batch_inputs,
     _to_caller_flattened_graph_module,
 )
 from recir.utils.compile import _enable_compile
 from torch import fx
-from torch._dynamo.source import LocalSource
 from torch._subclasses.fake_tensor import FakeTensorMode
-from torch.fx.experimental.symbolic_shapes import (
-    DimDynamic,
-    ShapeEnv,
-    StatelessSymbolicContext,
-)
+from torch.fx.experimental.symbolic_shapes import ShapeEnv
 
 logger: logging.Logger = logging.getLogger(__name__)
 
@@ -137,169 +135,6 @@ class _CompiledResult:
     # is invoked by ``_compile_and_transform`` alongside the caller-supplied
     # ``region_transforms``, in a single consolidated loop.
     internal_transforms: List["RegionTransform"] = field(default_factory=list)
-
-
-def _make_trace_input_transform(
-    input_batch_dim: int,
-    ratio: float,
-    fake_mode: FakeTensorMode,
-    dynamic_batch_dim: bool = False,
-) -> Callable[[torch.Tensor], torch.Tensor]:
-    """Create a transform that fakeifies inputs and optionally resizes a dimension.
-
-    Every tensor is converted with ``fake_mode``. When ``dynamic_batch_dim``
-    is set, ``input_batch_dim`` remains symbolic even when no resize is needed.
-    For ratio > 1 (e.g., GSPMD: local → global batch), ``repeat`` expands.
-    For ratio < 1 (e.g., v2 XLA path: multi-device local → per-device batch),
-    ``narrow`` shrinks. For ratio == 1 only the FakeTensor conversion occurs.
-    """
-
-    input_index = 0
-
-    def _to_fake(arg: torch.Tensor) -> torch.Tensor:
-        nonlocal input_index
-        if not dynamic_batch_dim or arg.ndim <= input_batch_dim:
-            return fake_mode.from_tensor(arg)
-        symbolic_context = StatelessSymbolicContext(
-            dynamic_sizes=[
-                DimDynamic.DYNAMIC
-                if dimension == input_batch_dim
-                else DimDynamic.STATIC
-                for dimension in range(arg.ndim)
-            ]
-        )
-        source = LocalSource(f"recir_batch_input_{input_index}")
-        input_index += 1
-        return fake_mode.from_tensor(
-            arg,
-            static_shapes=False,
-            source=source,
-            symbolic_context=symbolic_context,
-        )
-
-    def _get_full_batch_arg(arg: torch.Tensor) -> torch.Tensor:
-        # Return the fake input untouched in two no-op cases:
-        #   * No mini-batch dim to expand/shrink: 0-d scalar tensors (or any
-        #     tensor whose rank is <= input_batch_dim). Indexing the missing
-        #     dim below would otherwise IndexError.
-        #   * ratio == 1 (documented no-op). Skipping here is also what keeps
-        #     dynamic shapes alive: falling through to ``int(curr_batch *
-        #     ratio)`` would emit an equality guard that specializes the batch
-        #     SymInt to its trace-time value, silently freezing the per-batch
-        #     (candidate) dimension on the single-device-per-process path.
-        if arg.ndim <= input_batch_dim or ratio == 1:
-            return _to_fake(arg)
-        # Integer expand (ratio > 1 and integer-valued).
-        if isinstance(ratio, int) or (
-            isinstance(ratio, float) and ratio > 1.0 and ratio.is_integer()
-        ):
-            fake_arg = _to_fake(arg)
-            n = int(ratio)
-            repeat_dims = [1] * arg.ndim
-            repeat_dims[input_batch_dim] = n
-            return fake_arg.repeat(repeat_dims)
-        # Integer fraction shrink (ratio = 1/N, N integer >= 2).
-        if isinstance(ratio, float) and 0 < ratio < 1.0:
-            inv = 1.0 / ratio
-            if inv.is_integer():
-                n = int(inv)
-                fake_arg = _to_fake(arg)
-                target_batch = fake_arg.shape[input_batch_dim] // n
-                return fake_arg.narrow(input_batch_dim, 0, target_batch)
-        # Any other ratio (non-integer and non-1/N) could only be applied via
-        # ``int(curr_batch * ratio)``, which specializes the batch SymInt and
-        # silently breaks dynamic shapes. No current caller produces such a
-        # ratio (HDP/DP -> 1/N; GSPMD -> integer num_processes), so reject it
-        # instead of specializing behind the caller's back.
-        raise AssertionError(
-            f"_make_trace_input_transform: unsupported batch ratio {ratio!r}; "
-            "expected 1, a positive integer, or 1/N for integer N >= 2."
-        )
-
-    return _get_full_batch_arg
-
-
-def _resolve_trace_batch_ratio(
-    parallel_mode: Optional[ParallelMode],
-) -> Optional[float]:
-    """Determine the per-host -> trace batch ratio for ``parallel_mode``.
-
-    Returns ``None`` when ``parallel_mode`` doesn't request a pre-trace
-    batch transform (e.g., when ``parallel_mode`` is ``None`` or an
-    unrecognized mode).
-
-    For GSPMD-style modes (the partition is a no-op; XLA inflates
-    placeholder shardings at compile time), the trace should see global
-    batch shapes so HuggingFace's modeling code bakes the correct
-    Python-int literals into ``expand``/``view`` calls.  The ratio is
-    ``num_processes`` (per-host -> per-process global; for single-host
-    runs ``num_processes == 1`` and the transform is a no-op).
-
-    For ``DataParallel`` / ``HybridParallel`` driven through the new
-    ``trace`` + ``compile_from_gm`` pipeline, the DTensor partition step
-    re-shards user-input placeholders back to per-process shapes, so the
-    trace must start from the global batch for the runtime per-process
-    inputs to match.  This mirrors the per-host -> global transform that
-    the legacy :func:`_compile_data_parallel` applies inline on its own
-    path; without it, ``partition_data_parallel`` narrows the placeholder
-    to ``per_host_batch // num_processes`` and runtime invocation hits an
-    ``aten.mm`` shape mismatch (e.g. ``(N, 10) @ (10/num_processes, K)``).
-    """
-    if parallel_mode is None:
-        return None
-    # Use isinstance only when the parallel-mode classes are import-safe.
-    # Avoid a hard import at module load to keep recir importable in
-    # environments where the XLA/distributed deps are missing.
-    if isinstance(parallel_mode, GSPMDParallel):
-        # GSPMD: partition is a no-op; XLA lowering inflates placeholders
-        # to the global batch via _to_sharded_jax + _jit_gspmd shardings.
-        # Tracing with the global batch makes baked Python-int literals
-        # (HF Gemma3 / Llama / Qwen modeling code) consistent with the
-        # GSPMD runtime shape.
-        return float(parallel_mode.num_processes)
-    # DataParallel / HybridParallel: the v2 parametrization-based trace path
-    # (in :func:`trace`) applies its own per-process -> per-device batch
-    # transform via ``1/(world_size // num_processes)``.  Returning ``None``
-    # here keeps the GSPMD-only contract of this helper explicit and
-    # preserves the original behavior for plain
-    # ``recir.compile(parallel_mode=DataParallel(), ...)``.
-    return None
-
-
-def _tag_batch_inputs(
-    gm: fx.GraphModule,
-    num_state_tensors: int,
-    input_batch_dim: int,
-    frozen_parameter_fqns: set[str],
-) -> None:
-    """Tag runtime input roles, including parameters safe for device reuse.
-
-    Only non-trainable model parameters are marked frozen. Buffers and
-    optimizer state remain uncached because storage-alias writes can bypass a
-    tensor's PyTorch version counter.
-    """
-    tensor_idx = 0
-    for node in gm.graph.nodes:
-        if node.op != "placeholder":
-            continue
-        val = node.meta.get("val", None)
-        if isinstance(val, torch.Tensor):
-            is_state = tensor_idx < num_state_tensors
-            is_batch = not is_state and val.dim() > 0
-            node.meta["is_state_input"] = is_state
-            node.meta["is_batch_input"] = is_batch
-            node.meta["is_weight"] = not is_batch
-            node.meta["is_frozen_parameter"] = (
-                is_state and node.meta.get("fqn") in frozen_parameter_fqns
-            )
-            if is_batch:
-                node.meta["batch_dim"] = input_batch_dim
-            tensor_idx += 1
-        else:
-            node.meta["is_state_input"] = False
-            node.meta["is_batch_input"] = False
-            node.meta["is_weight"] = False
-            node.meta["is_frozen_parameter"] = False
 
 
 def _finalize_graph(
