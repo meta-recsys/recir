@@ -46,13 +46,12 @@ from recir.api import (
     _GraphSpec,
     _trace_graphs,
     compile_from_gm,
-    make_compiled_runner,
-    sync_device_state_to_torch,
     trace,
 )
 from recir.backends.inductor import InductorBackend
 from recir.distributed.parallel_mode import GSPMDParallel, HybridParallel
 from recir.pipeline import PipelineConfig
+from recir.runtime import make_compiled_runner, sync_device_state_to_torch
 from recir.sharding_plan import EmbeddingShardingPlan
 from torch.distributed import ProcessGroup
 from torch.distributed.distributed_c10d import _get_default_group, _world
