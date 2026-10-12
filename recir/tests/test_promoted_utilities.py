@@ -18,7 +18,7 @@ from typing import Any, Callable, List
 from unittest.mock import MagicMock, patch
 
 import recir
-import recir.compilation as recir_compilation
+import recir.compiler.compilation as recir_compilation
 import torch
 import torch.nn as nn
 from recir.api import (
@@ -28,10 +28,8 @@ from recir.api import (
     find_markers,
     replace_region,
 )
-from recir.distributed.sharding_spec import FSDPWeightShardSpec
-from recir.process_state import _build_compiled_process_state
-from recir.region_transforms import RegionTransform
-from recir.runtime import (
+from recir.compiler.process_state import _build_compiled_process_state
+from recir.compiler.runtime import (
     COMPILED_OBJECT_KEY,
     get_compiled_process_state,
     invalidate_device_state,
@@ -40,6 +38,8 @@ from recir.runtime import (
     prepare_compiled,
     set_compiled_output_deferred,
 )
+from recir.distributed.sharding_spec import FSDPWeightShardSpec
+from recir.region_transforms import RegionTransform
 from torch import fx
 from torch.fx.experimental.proxy_tensor import make_fx
 

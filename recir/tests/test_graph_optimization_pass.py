@@ -25,9 +25,9 @@ from unittest.mock import MagicMock
 
 import torch
 import torch.nn as nn
-from recir.gm_transformation import GraphModuleTransformation
-from recir.iter_graph_module import IterGraphModule
 from recir.passes import default_registry, graph_optimization_pass
+from recir.passes.gm_transformation import GraphModuleTransformation
+from recir.passes.iter_graph_module import IterGraphModule
 from torch.testing._internal.distributed._tensor.common_dtensor import DTensorTestBase
 
 

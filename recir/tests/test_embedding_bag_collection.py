@@ -18,10 +18,10 @@ from recir.api import compile, sync_device_state_to_torch
 from recir.backends.base import Backend
 from recir.backends.inductor import InductorBackend
 from recir.distributed.parallel_mode import HybridParallel
+from recir.distributed.sharding_plan import EmbeddingShardingPlan, EmbeddingShardingType
 from recir.ops.fake.kjt import patch_ebc_for_tracing
 from recir.region_transforms.base import RegionTransform
 from recir.region_transforms.tbe_sparse_embedding import TBESparseEmbeddingTransform
-from recir.sharding_plan import EmbeddingShardingPlan, EmbeddingShardingType
 from torch import nn
 from torch.distributed.distributed_c10d import _get_default_group, _world
 from torch.distributed.tensor import DeviceMesh

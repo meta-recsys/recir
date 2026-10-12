@@ -197,7 +197,7 @@ class GenRecJaggedConcatSplitLoweringTest(unittest.TestCase):
 
     def _trace(self) -> "Any":
         from generative_recommenders.ops.pytorch import pt_jagged_tensors
-        from recir.decompositions import SPMD_DECOMP_TABLE
+        from recir.ops.decompositions import SPMD_DECOMP_TABLE
         from torch.fx.experimental.proxy_tensor import make_fx
 
         ll, lr = [2, 1, 3], [1, 2, 1]

@@ -14,7 +14,7 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 import torch.utils._pytree as pytree
-from recir.backend import BackendType
+from recir.backends.types import BackendType
 from recir.distributed.data_parallel import (
     DataParallelStyle,
     OptOrOpts,
@@ -23,13 +23,13 @@ from recir.distributed.data_parallel import (
     shard_params_and_states,
     shard_params_by_plan,
 )
+from recir.distributed.sharding_plan import EmbeddingShardingPlan
 from recir.distributed.sharding_spec import FSDPWeightShardSpec, set_state_layout
 from recir.lowering.xla_lower import (
     _AOT_TOPOLOGY,
     _get_global_devices,
     _get_local_devices,
 )
-from recir.sharding_plan import EmbeddingShardingPlan
 from torch.distributed.tensor import DeviceMesh
 from torch.fx import GraphModule
 
@@ -1319,7 +1319,7 @@ class HybridParallel(ParallelMode):
 
     Example::
 
-        from recir.sharding_plan import EmbeddingShardingPlan, EmbeddingShardingType
+        from recir.distributed.sharding_plan import EmbeddingShardingPlan, EmbeddingShardingType
 
         plan = EmbeddingShardingPlan(sharding_map={
             "emb.weight": EmbeddingShardingType.ROW_WISE,

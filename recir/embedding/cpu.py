@@ -34,7 +34,6 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 import torchrec
-from recir.eager_dispatch import install_graph_break_dispatch
 from recir.embedding._sparse_arch_stub import (
     DummySparseArch,
     sparse_arch_marker_prefix,
@@ -52,6 +51,7 @@ from recir.embedding.split_collection import (
     split_embedding_collection,
     SplitEmbeddingCollection,
 )
+from recir.ops.eager_dispatch import install_graph_break_dispatch
 from recir.training.optim import OptimConfig
 from torchrec.distributed.embedding import EmbeddingCollectionSharder
 from torchrec.distributed.embedding_types import EmbeddingComputeKernel, OptimType

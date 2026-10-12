@@ -70,11 +70,6 @@ import recir.torchax.ops.jseq_embedding  # noqa: F401
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from recir.eager_dispatch import (
-    install_graph_break_dispatch,
-    mark_input,
-    mark_output_with_bwd,
-)
 from recir.embedding.backend import (
     EmbeddingBackend,
     EmbeddingSetupResult,
@@ -84,12 +79,17 @@ from recir.embedding.backend import (
     TablePlan,
     TableSharding,
 )
-from recir.meta_tensor_init import (
+from recir.ops.eager_dispatch import (
+    install_graph_break_dispatch,
+    mark_input,
+    mark_output_with_bwd,
+)
+from recir.training.optim import OptimConfig
+from recir.utils.meta_tensor_init import (
     default_embedding_init_bound,
     mark_meta_uniform_init,
     table_init_stream_id,
 )
-from recir.training.optim import OptimConfig
 from torchrec.modules.embedding_configs import (
     BaseEmbeddingConfig,
     data_type_to_dtype,

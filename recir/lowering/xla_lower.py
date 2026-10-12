@@ -21,8 +21,8 @@ import numpy as np
 import recir.torchax as torchax
 import torch
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
-from recir.backend import BackendType
-from recir.batch_dim_propagation import (
+from recir.backends.types import BackendType
+from recir.compiler.batch_dim import (
     propagate_batch_input_meta,
     propagate_fsdp_sharded_meta,
 )
@@ -33,13 +33,13 @@ from recir.lowering.lowering_utils import (
     strip_profiler_nodes,
 )
 from recir.lowering.op_swap import OpSwapRegistry, swap_ops
-from recir.meta_tensor_init import (
+from recir.torchax.gspmd_context import gspmd_mesh_context
+from recir.torchax.ops.mappings import t2j
+from recir.utils.meta_tensor_init import (
     default_embedding_init_bound,
     get_meta_init_spec,
     get_meta_init_stream_id,
 )
-from recir.torchax.gspmd_context import gspmd_mesh_context
-from recir.torchax.ops.mappings import t2j
 
 try:
     from jax import shard_map

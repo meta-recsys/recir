@@ -12,7 +12,7 @@ import unittest
 import torch
 import torch.nn as nn
 from functorch import make_fx
-from recir.backend import BackendType
+from recir.backends.types import BackendType
 from recir.lowering.xla_lower import _XLAModule, partial_lower_xla
 
 
@@ -502,8 +502,8 @@ class TestPartialLowerXLA(unittest.TestCase):
         ``_record_function_exit`` mirror is erased before the
         ``_record_function_enter_new`` mirror in all three graphs.
         """
-        from recir.iter_graph_module import IterGraphModule
         from recir.lowering.lowering_utils import strip_profiler_nodes
+        from recir.passes.iter_graph_module import IterGraphModule
 
         # Build a tiny graph with a paired enter/exit profiler block
         # wrapping an aten op (mirrors what the trace emits when user

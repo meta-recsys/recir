@@ -13,7 +13,7 @@ import torch
 # Pull through the ``GraphPatch`` type alias so consumers don't need to import
 # from ``recir.backends`` if they only want the type.
 from recir.backends.base import GraphPatch  # noqa: E402, F401
-from recir.compilation import (  # noqa: F401 -- compatibility re-exports
+from recir.compiler.compilation import (  # noqa: F401 -- compatibility re-exports
     _bind_to_current_module_state,
     _compile_and_transform,
     _compile_data_parallel_v2,
@@ -26,17 +26,8 @@ from recir.compilation import (  # noqa: F401 -- compatibility re-exports
     compile,
     compile_from_gm,
 )
-# ---------------------------------------------------------------------------
-# v7.1 public surface: graph manipulation primitives
-# ---------------------------------------------------------------------------
-
-
-# Re-exports so callers can write ``from recir.api import ...`` or
-# ``recir.find_markers`` interchangeably.
-from recir.ops.marker import find_markers  # noqa: E402, F401
-from recir.process_state import CompiledProcessState  # noqa: E402, F401
-from recir.region_transforms import extract_subgraph, replace_region  # noqa: E402, F401
-from recir.runtime import (  # noqa: F401 -- compatibility re-exports
+from recir.compiler.process_state import CompiledProcessState  # noqa: E402, F401
+from recir.compiler.runtime import (  # noqa: F401 -- compatibility re-exports
     COMPILED_OBJECT_KEY,
     get_compiled_process_state,
     invalidate_device_state,
@@ -48,7 +39,7 @@ from recir.runtime import (  # noqa: F401 -- compatibility re-exports
     sync_device_state_to_torch,
     sync_named_state_to_torch,
 )
-from recir.tracing import (  # noqa: F401 -- compatibility re-exports
+from recir.compiler.tracing import (  # noqa: F401 -- compatibility re-exports
     _bind_transform_signatures,
     _discover_for_region_transforms,
     _enter_region_transform_contexts,
@@ -79,6 +70,15 @@ from recir.tracing import (  # noqa: F401 -- compatibility re-exports
     _TraceResult,
     trace,
 )
+# ---------------------------------------------------------------------------
+# v7.1 public surface: graph manipulation primitives
+# ---------------------------------------------------------------------------
+
+
+# Re-exports so callers can write ``from recir.api import ...`` or
+# ``recir.find_markers`` interchangeably.
+from recir.ops.marker import find_markers  # noqa: E402, F401
+from recir.region_transforms import extract_subgraph, replace_region  # noqa: E402, F401
 from torch import fx
 from torch._subclasses.fake_tensor import FakeTensorMode
 

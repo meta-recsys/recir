@@ -24,8 +24,8 @@ import torch.fx as fx
 import torch.nn as nn
 import torch.utils._pytree as pytree
 from functorch import make_fx
-from recir.batch_dim_propagation import propagate_batch_input_meta
-from recir.decompositions import SPMD_DECOMP_TABLE
+from recir.compiler.batch_dim import propagate_batch_input_meta
+from recir.compiler.process_state import _compute_state_fqns
 from recir.distributed.data_parallel import (
     collectives_insertion,
     DataParallelStyle,
@@ -38,7 +38,7 @@ from recir.distributed.parallel_mode import (
     HybridParallel,
     ParallelMode,
 )
-from recir.process_state import _compute_state_fqns
+from recir.ops.decompositions import SPMD_DECOMP_TABLE
 from recir.region_transforms import (
     _apply_region_transforms,
     _discover_called_modules,

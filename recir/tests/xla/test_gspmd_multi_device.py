@@ -23,8 +23,8 @@ import os
 import torch
 from parameterized import parameterized
 from recir.api import compile
-from recir.backend import BackendType
 from recir.backends import XLAGSPMDBackend, XLAShardMapBackend
+from recir.backends.types import BackendType
 from recir.distributed.parallel_mode import DataParallel, GSPMDParallel
 from recir.tests.xla.gspmd_test_utils import (
     _run_single_rank_baseline,

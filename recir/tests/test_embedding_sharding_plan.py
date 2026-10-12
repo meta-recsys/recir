@@ -11,7 +11,7 @@ from unittest.mock import MagicMock
 
 import torch
 from recir.distributed.data_parallel import DataParallelStyle, shard_params_by_plan
-from recir.sharding_plan import EmbeddingShardingPlan, EmbeddingShardingType
+from recir.distributed.sharding_plan import EmbeddingShardingPlan, EmbeddingShardingType
 from torch import nn
 from torch.distributed.tensor import DeviceMesh
 

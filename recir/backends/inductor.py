@@ -12,9 +12,9 @@ from __future__ import annotations
 from typing import Any, Sequence, TYPE_CHECKING
 
 from recir.backends.base import Backend, GraphPatch
-from recir.iter_graph_module import IterGraphModule
 from recir.lowering.partial_lower import partial_lower
 from recir.passes import remove_copy_from_optimizer
+from recir.passes.iter_graph_module import IterGraphModule
 from recir.pipeline import PipelinedGraphModule, SteadyStateGraphModule
 from torch import fx, nn
 

@@ -14,8 +14,8 @@ from typing import Any
 
 import torch
 import torch.utils._pytree as pytree
+from recir.compiler.process_state import CompiledProcessState
 from recir.pipeline import is_pipeline_pending
-from recir.process_state import CompiledProcessState
 
 
 # Note that the Python convention of __dict__ requires the key to be str.

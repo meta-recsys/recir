@@ -33,24 +33,8 @@ if TYPE_CHECKING:
 import torch
 import torch.nn as nn
 import torch.utils._pytree as pytree
-from recir.batch_dim_propagation import propagate_batch_input_meta
-from recir.decompositions import DEDUP_TARGETS
-from recir.distributed.data_parallel import (
-    collectives_insertion,
-    DataParallelStyle,
-    gradients_tagging,
-    parametrize_params,
-)
-from recir.distributed.parallel_mode import (
-    DataParallel,
-    GSPMDParallel,
-    HybridParallel,
-    ParallelMode,
-)
-from recir.lowering.device_state import DeviceStateManager
-from recir.passes.pass_registry import default_registry as default_pass_registry
-from recir.pipeline import build_pipeline, PipelineConfig
-from recir.process_state import (
+from recir.compiler.batch_dim import propagate_batch_input_meta
+from recir.compiler.process_state import (
     _align_fsdp_sharded_flags,
     _annotate_fsdp_state_input_sharding,
     _annotate_fsdp_state_output_sharding,
@@ -59,9 +43,8 @@ from recir.process_state import (
     _compute_state_fqns,
     CompiledProcessState,
 )
-from recir.region_transforms import RegatherTransform, RegionTransform
-from recir.runtime import COMPILED_OBJECT_KEY, PREPARE_COMPILED_ATTR
-from recir.tracing import (
+from recir.compiler.runtime import COMPILED_OBJECT_KEY, PREPARE_COMPILED_ATTR
+from recir.compiler.tracing import (
     _bind_transform_signatures,
     _discover_for_region_transforms,
     _enter_region_transform_contexts,
@@ -78,6 +61,23 @@ from recir.tracing import (
     _TraceContext,
     _TraceResult,
 )
+from recir.distributed.data_parallel import (
+    collectives_insertion,
+    DataParallelStyle,
+    gradients_tagging,
+    parametrize_params,
+)
+from recir.distributed.parallel_mode import (
+    DataParallel,
+    GSPMDParallel,
+    HybridParallel,
+    ParallelMode,
+)
+from recir.lowering.device_state import DeviceStateManager
+from recir.ops.decompositions import DEDUP_TARGETS
+from recir.passes.pass_registry import default_registry as default_pass_registry
+from recir.pipeline import build_pipeline, PipelineConfig
+from recir.region_transforms import RegatherTransform, RegionTransform
 from torch import fx
 from torch._subclasses.fake_tensor import FakeTensorMode
 from torch.fx.experimental.symbolic_shapes import ShapeEnv
@@ -538,7 +538,7 @@ def compile_from_gm(  # noqa: C901 — orchestration: stages 4-8 of the pipeline
     if use_iter_graph:
         # Local import to avoid pulling IterGraphModule into the
         # module-import path for callers that don't use this path.
-        from recir.iter_graph_module import IterGraphModule
+        from recir.passes.iter_graph_module import IterGraphModule
 
         gm = cast(fx.GraphModule, IterGraphModule(gm))
 
@@ -589,7 +589,7 @@ def compile_from_gm(  # noqa: C901 — orchestration: stages 4-8 of the pipeline
 
     # Stage 7: freeze cross-iteration rewrites and initialize extra-output state.
     if use_iter_graph:
-        from recir.iter_graph_module import IterGraphModule
+        from recir.passes.iter_graph_module import IterGraphModule
 
         cast(IterGraphModule, gm).finalize_setup()
 

@@ -39,10 +39,10 @@ import jax  # @manual
 import torch
 import torch.nn as nn
 from functorch import make_fx
-from recir.backend import BackendType
-from recir.iter_graph_module import IterGraphModule
+from recir.backends.types import BackendType
 from recir.lowering.aot import _key, aot_load_prebuilt_into, aot_prebuild_and_serialize
 from recir.lowering.xla_lower import _XLAModule, partial_lower_xla
+from recir.passes.iter_graph_module import IterGraphModule
 
 
 class _TinyMLP(nn.Module):

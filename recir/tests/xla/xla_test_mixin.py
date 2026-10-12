@@ -7,8 +7,8 @@
 import os
 from contextlib import contextmanager
 
-from recir.backend import BackendType
-from recir.gm_transformation import GraphModuleTransformation
+from recir.backends.types import BackendType
+from recir.passes.gm_transformation import GraphModuleTransformation
 
 
 @contextmanager

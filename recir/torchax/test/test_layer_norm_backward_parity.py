@@ -137,7 +137,7 @@ class LayerNormBackwardParityTest(TestCase):
 class FusedKernelVsReferenceDecompositionTest(TestCase):
     """The two implementations the parity legs actually run.
 
-    recir/decompositions.py maps aten.native_layer_norm_backward.default to
+    recir/ops/decompositions.py maps aten.native_layer_norm_backward.default to
     torch._decomp.decompositions.native_layer_norm_backward, so the compiled
     leg runs the REFERENCE DECOMPOSITION (mean/sub/mul/rsqrt, lowered op by op)
     while the eager leg runs the fused kernel. Same mathematics, two

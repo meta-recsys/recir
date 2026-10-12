@@ -22,8 +22,8 @@ import logging
 from typing import Any, Callable, List, Optional, Tuple
 
 import torch
-from recir.decompositions import SPMD_DECOMP_TABLE
 from recir.lowering.lowering_utils import segment_and_lower
+from recir.ops.decompositions import SPMD_DECOMP_TABLE
 from torch._decomp import get_decompositions
 
 logger: logging.Logger = logging.getLogger(__name__)

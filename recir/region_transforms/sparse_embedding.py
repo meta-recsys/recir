@@ -24,6 +24,7 @@ import torch.distributed._functional_collectives as funcol
 import torch.fx as fx
 import torch.nn as nn
 from functorch import make_fx
+from recir.distributed.sharding_plan import EmbeddingShardingPlan, EmbeddingShardingType
 from recir.region_transforms.base import RegionTransform
 from recir.region_transforms.sparse_collectives import (
     declare_split_invariants,
@@ -31,7 +32,6 @@ from recir.region_transforms.sparse_collectives import (
     route_table_wise_jagged,
     route_table_wise_rows,
 )
-from recir.sharding_plan import EmbeddingShardingPlan, EmbeddingShardingType
 from torch.distributed.tensor import DeviceMesh
 
 

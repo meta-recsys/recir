@@ -27,8 +27,8 @@ import jax
 import recir.lowering.fbgemm_fallback  # noqa: F401 -- registers SPMD_DECOMP_TABLE entries
 import torch
 import torch.distributed as dist
-from recir.decompositions import SPMD_DECOMP_TABLE
 from recir.lowering.fbgemm_fallback import _batched_complete_cumsum_impl
+from recir.ops.decompositions import SPMD_DECOMP_TABLE
 
 logger: logging.Logger = logging.getLogger(__name__)
 

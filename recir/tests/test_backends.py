@@ -12,7 +12,6 @@ import unittest
 from unittest import mock
 
 import torch
-from recir.backend import BackendType
 from recir.backends import (
     Backend,
     InductorBackend,
@@ -20,11 +19,12 @@ from recir.backends import (
     XLAGSPMDBackend,
     XLAShardMapBackend,
 )
+from recir.backends.types import BackendType
 from recir.distributed.parallel_mode import DataParallel, GSPMDParallel
-from recir.iter_graph_module import IterGraphModule
 from recir.lowering.device_state import DeviceStateManager
 from recir.lowering.xla_device_state import XLADeviceStateManager
 from recir.passes import remove_copy_from_optimizer
+from recir.passes.iter_graph_module import IterGraphModule
 
 
 class InductorBackendTest(unittest.TestCase):

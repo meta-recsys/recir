@@ -41,12 +41,16 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 from recir.backends.inductor import InductorBackend
-from recir.compilation import _compile_and_transform, _compile_graphs, compile_from_gm
+from recir.compiler.compilation import (
+    _compile_and_transform,
+    _compile_graphs,
+    compile_from_gm,
+)
+from recir.compiler.runtime import make_compiled_runner, sync_device_state_to_torch
+from recir.compiler.tracing import _GraphSpec, _trace_graphs, trace
 from recir.distributed.parallel_mode import GSPMDParallel, HybridParallel
+from recir.distributed.sharding_plan import EmbeddingShardingPlan
 from recir.pipeline import PipelineConfig
-from recir.runtime import make_compiled_runner, sync_device_state_to_torch
-from recir.sharding_plan import EmbeddingShardingPlan
-from recir.tracing import _GraphSpec, _trace_graphs, trace
 from torch.distributed import ProcessGroup
 from torch.distributed.distributed_c10d import _get_default_group, _world
 from torch.distributed.tensor import DeviceMesh
