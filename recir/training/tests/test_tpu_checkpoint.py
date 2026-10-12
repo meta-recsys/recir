@@ -11,8 +11,8 @@ import torch
 import torch.distributed as dist
 import torch.distributed.checkpoint as dcp
 import torch.utils._pytree as pytree
-from recir.api import _compute_state_fqns
 from recir.distributed.data_parallel import DataParallelStyle, shard_params_and_states
+from recir.process_state import _compute_state_fqns
 from recir.training.tpu_checkpoint import (
     EMBEDDING_OPTIMIZER_STATE_KEY,
     host_ordinal_from_device_positions,
