@@ -7,8 +7,9 @@ import torch
 import torch.nn as nn
 import torch.utils._pytree as pytree
 from functorch import make_fx
-from recir.api import _enable_compile, _rematerialize_optimizer
 from recir.eager_dispatch import install_graph_break_dispatch, mark_output_with_bwd
+from recir.tracing import _rematerialize_optimizer
+from recir.utils.compile import _enable_compile
 from torch._subclasses.fake_tensor import FakeTensorMode
 from torch.nn.utils import stateless
 
