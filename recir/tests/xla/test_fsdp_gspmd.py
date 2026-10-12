@@ -20,12 +20,7 @@ import torch.nn as nn
 import torch.utils._pytree as pytree
 from jax.sharding import Mesh, PartitionSpec as P  # @manual
 from parameterized import parameterized
-from recir.api import (
-    _annotate_fsdp_state_output_sharding,
-    _build_fsdp_sharded_flags,
-    compile_from_gm,
-    trace,
-)
+from recir.api import compile_from_gm, trace
 from recir.backend import BackendType
 from recir.backends.base import Backend
 from recir.distributed.parallel_mode import (
@@ -35,6 +30,10 @@ from recir.distributed.parallel_mode import (
     GSPMDParallel,
 )
 from recir.lowering.xla_lower import _XLAModule
+from recir.process_state import (
+    _annotate_fsdp_state_output_sharding,
+    _build_fsdp_sharded_flags,
+)
 
 # IMPORTANT: must run BEFORE any `import jax` so the cuda plugin path patch
 # is in effect when jax.devices() / jax.* first triggers plugin discovery.

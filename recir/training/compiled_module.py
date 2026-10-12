@@ -32,12 +32,12 @@ import torch
 import torch.nn as nn
 import torch.utils._pytree as pytree
 from pyre_extensions import none_throws
-from recir.api import (
+from recir.pipeline import is_pipeline_pending, PipelineConfig
+from recir.runtime import (
     COMPILED_OBJECT_KEY,
     sync_device_state_to_torch,
     sync_named_state_to_torch,
 )
-from recir.pipeline import is_pipeline_pending, PipelineConfig
 from recir.training.compile import in_graph_metrics_enabled
 from recir.training.diagnostics import dump_compiled_gm
 from recir.training.optim import WarmupController
