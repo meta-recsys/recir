@@ -14,7 +14,7 @@ from unittest.mock import MagicMock, patch
 import torch
 import torch.fx as fx
 import torch.nn as nn
-from recir.backend import BackendType
+from recir.backends.types import BackendType
 from recir.distributed.data_parallel import partition_value
 from recir.distributed.parallel_mode import DataParallel
 from recir.lowering.device_state import DeviceStateManager

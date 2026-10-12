@@ -32,7 +32,7 @@ find it, and raises::
     RuntimeError: Node <name> target <name> references nonexistent
     attribute <name>
 
-(at ``recir/iter_graph_module.py:493`` -- the ``super().lint()`` call).
+(at ``recir/passes/iter_graph_module.py:493`` -- the ``super().lint()`` call).
 
 Commit 17 adds ``IterGraphModule.add_subgraph_module`` which
 propagates the attribute to all three sub-GMs (setup / main /
@@ -49,7 +49,6 @@ from typing import List
 from unittest import mock
 
 import torch
-from recir.iter_graph_module import IterGraphModule
 from recir.lowering.lowering_utils import create_subgraph_module, segment_and_lower
 from recir.lowering.partial_lower import (
     _prune_control_deps_to_frontier,
@@ -57,6 +56,7 @@ from recir.lowering.partial_lower import (
     _StreamSyncOrderingGraphPass,
     partial_lower,
 )
+from recir.passes.iter_graph_module import IterGraphModule
 from torch._inductor.fx_passes.control_dependencies import control_deps
 from torch._subclasses.fake_tensor import FakeTensorMode
 from torch.fx.experimental.symbolic_shapes import ShapeEnv

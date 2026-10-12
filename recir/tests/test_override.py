@@ -14,7 +14,7 @@ from copy import deepcopy
 
 import torch
 from functorch import make_fx
-from recir.eager_dispatch import _dispatch_bwd, install_graph_break_dispatch
+from recir.ops.eager_dispatch import _dispatch_bwd, install_graph_break_dispatch
 from recir.tests.eager_test_utils import (
     run_graph,
     ToyDense,

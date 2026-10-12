@@ -31,7 +31,7 @@ import logging
 from typing import List, Optional, Sequence
 
 import torch
-from recir.decompositions import SPMD_DECOMP_TABLE
+from recir.ops.decompositions import SPMD_DECOMP_TABLE
 
 logger: logging.Logger = logging.getLogger(__name__)
 

@@ -64,7 +64,7 @@ def gm_from_compiled(compiled_step: Callable[..., Any]) -> Optional[Any]:
     None if recir isn't importable or the wrapper hasn't compiled yet.
     """
     try:
-        from recir.api import COMPILED_OBJECT_KEY
+        from recir.compiler.runtime import COMPILED_OBJECT_KEY
     except ImportError:
         logger.warning("[recir gm dump] cannot import COMPILED_OBJECT_KEY")
         return None

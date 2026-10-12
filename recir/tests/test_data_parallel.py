@@ -17,8 +17,9 @@ import torch.distributed._functional_collectives as funcol
 import torch.fx as fx
 import torch.nn as nn
 from parameterized import parameterized
-from recir.api import _local_compile, compile
+from recir.api import compile
 from recir.backends.base import Backend
+from recir.compiler.tracing import _local_compile
 from recir.distributed.data_parallel import (
     _clone_param_chains_for_backward,
     _register_parametrization,
@@ -36,14 +37,14 @@ from recir.distributed.data_parallel import (
     shard_params_by_plan,
 )
 from recir.distributed.parallel_mode import DataParallel, HybridParallel
-from recir.meta_tensor_init import get_meta_init_spec
+from recir.distributed.sharding_plan import EmbeddingShardingPlan, EmbeddingShardingType
 from recir.passes import insert_weight_free_nodes
 from recir.region_transforms import RegatherTransform
 from recir.region_transforms.sparse_embedding import (
     decomposed_row_wise_embedding,
     decomposed_table_wise_embedding_bag,
 )
-from recir.sharding_plan import EmbeddingShardingPlan, EmbeddingShardingType
+from recir.utils.meta_tensor_init import get_meta_init_spec
 from torch._subclasses.fake_tensor import FakeTensorMode
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.tensor import DeviceMesh

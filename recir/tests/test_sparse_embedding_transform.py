@@ -27,12 +27,12 @@ from unittest.mock import MagicMock
 import torch
 import torch.fx as fx
 import torch.nn as nn
+from recir.distributed.sharding_plan import EmbeddingShardingPlan, EmbeddingShardingType
 from recir.region_transforms.sparse_embedding import (
     decomposed_row_wise_embedding_bag,
     decomposed_row_wise_embedding_bag_backward,
     SparseEmbeddingTransform,
 )
-from recir.sharding_plan import EmbeddingShardingPlan, EmbeddingShardingType
 from torch.distributed.tensor import DeviceMesh
 
 

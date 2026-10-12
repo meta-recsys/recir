@@ -24,7 +24,7 @@ import numpy as np
 import torch
 from jax.sharding import Mesh
 from recir.lowering.xla_lower import _XLAModule
-from recir.meta_tensor_init import (
+from recir.utils.meta_tensor_init import (
     mark_meta_uniform_init,
     mark_meta_zero_init,
     table_init_stream_id,

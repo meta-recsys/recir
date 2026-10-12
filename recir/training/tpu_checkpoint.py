@@ -363,7 +363,7 @@ def _param_leaf_indices(state_fqns: Sequence[str]) -> Dict[str, int]:
     """Map a params/buffers FQN to its ``flat_state`` index.
 
     ``state_fqns`` entries are pytree keypaths over ``[params_buffers,
-    named_states]`` (``recir.process_state._compute_state_fqns``), so a
+    named_states]`` (``recir.compiler.process_state._compute_state_fqns``), so a
     params/buffers leaf is exactly ``[0]['<fqn>']``. Optimizer state for the
     same parameter lives under ``[1]['<fqn>']['<state>']`` and must not match.
     """

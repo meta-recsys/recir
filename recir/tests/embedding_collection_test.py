@@ -29,7 +29,7 @@ import torch
 from generative_recommenders.common import set_dev_mode
 from recir.api import compile
 from recir.distributed.parallel_mode import DataParallel
-from recir.ec import TracableEmbeddingCollection
+from recir.embedding.ec import TracableEmbeddingCollection
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.testing._internal.common_distributed import skip_if_lt_x_gpu

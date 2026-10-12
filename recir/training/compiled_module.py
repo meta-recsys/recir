@@ -32,7 +32,7 @@ import torch
 import torch.nn as nn
 import torch.utils._pytree as pytree
 from pyre_extensions import none_throws
-from recir.api import (
+from recir.compiler.runtime import (
     COMPILED_OBJECT_KEY,
     sync_device_state_to_torch,
     sync_named_state_to_torch,

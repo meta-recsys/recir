@@ -27,7 +27,7 @@ import unittest
 
 import torch
 import torch.nn as nn
-from recir.api import _rematerialize_tensor_attrs
+from recir.compiler.tracing import _rematerialize_tensor_attrs
 
 
 class _Holder:

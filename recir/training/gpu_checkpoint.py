@@ -13,7 +13,7 @@ from typing import Any, Dict, Mapping, Optional, Tuple
 
 import torch
 from recir.distributed.data_parallel import materialize_embedding_weight
-from recir.sharding_plan import EmbeddingShardingPlan
+from recir.distributed.sharding_plan import EmbeddingShardingPlan
 from recir.training.optim import WarmupController
 from recir.training.setup import RecOptimizerConfig
 from torch.distributed._shard.sharded_tensor import (

@@ -94,7 +94,7 @@ mark_boundary.register_autograd(
 
 
 # Pin mark_boundary against fx eliminate_dead_code. The graph-break dispatch
-# (recir/eager_dispatch.py) consumes these boundary markers OFF-graph -- the
+# (recir/ops/eager_dispatch.py) consumes these boundary markers OFF-graph -- the
 # embedding backward fires as a side effect -- so to fx DCE they look dead and
 # get pruned before the sparse dispatcher can wire its ``::bwd::`` markers,
 # freezing the embedding tables on the compiled path. Registered here, at the

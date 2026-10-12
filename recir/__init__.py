@@ -6,17 +6,11 @@
 
 from recir.api import (  # noqa: F401
     add_state,
-    compile,
-    compile_from_gm,
     extract_subgraph,
     find_markers,
     GraphPatch,
-    materialize_compiled_output,
     replace_region,
-    set_compiled_output_deferred,
-    trace,
 )
-from recir.backend import BackendType  # noqa: F401
 from recir.backends import (  # noqa: F401
     Backend,
     InductorBackend,
@@ -24,10 +18,21 @@ from recir.backends import (  # noqa: F401
     XLAGSPMDBackend,
     XLAShardMapBackend,
 )
+from recir.backends.types import BackendType  # noqa: F401
+from recir.compiler.compilation import compile, compile_from_gm  # noqa: F401
+from recir.compiler.runtime import (  # noqa: F401
+    materialize_compiled_output,
+    set_compiled_output_deferred,
+)
+from recir.compiler.tracing import trace  # noqa: F401
 from recir.distributed.parallel_mode import (  # noqa: F401
     DataParallel,
     HybridParallel,
     ParallelMode,
+)
+from recir.distributed.sharding_plan import (  # noqa: F401
+    EmbeddingShardingPlan,
+    EmbeddingShardingType,
 )
 from recir.ops.marker import attach_markers, mark_boundary  # noqa: F401
 from recir.pipeline import (  # noqa: F401
@@ -47,8 +52,4 @@ from recir.pipeline_strategies import (  # noqa: F401
     sdd_pipeline_plan,
     semi_sync_pipeline_config,
     semi_sync_pipeline_plan,
-)
-from recir.sharding_plan import (  # noqa: F401
-    EmbeddingShardingPlan,
-    EmbeddingShardingType,
 )

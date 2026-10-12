@@ -16,7 +16,7 @@ import triton  # @manual
 import triton.language as tl  # @manual
 from functorch import make_fx
 from jax.experimental import pallas as pl  # @manual
-from recir.backend import BackendType
+from recir.backends.types import BackendType
 from recir.lowering.op_swap import OpSwapRegistry, swap_ops
 from recir.lowering.xla_lower import _XLAModule, partial_lower_xla
 from recir.torchax import interop

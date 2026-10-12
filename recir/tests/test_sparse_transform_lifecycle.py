@@ -15,8 +15,8 @@ import torch
 import torch.nn as nn
 from recir.api import _make_hybrid_sparse_transform, _prepare_transforms_after_shard
 from recir.distributed.parallel_mode import HybridParallel
+from recir.distributed.sharding_plan import EmbeddingShardingPlan, EmbeddingShardingType
 from recir.region_transforms import RegionTransform, SparseEmbeddingTransform
-from recir.sharding_plan import EmbeddingShardingPlan, EmbeddingShardingType
 from torch.distributed.tensor import DeviceMesh
 
 

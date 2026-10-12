@@ -37,7 +37,7 @@ import jax
 import torch
 import torch.fx as fx
 from jax.sharding import PartitionSpec as P
-from recir.backend import BackendType
+from recir.backends.types import BackendType
 from recir.distributed.sharding_spec import FSDPWeightShardSpec, set_state_layout
 from recir.lowering.xla_lower import _XLAModule
 

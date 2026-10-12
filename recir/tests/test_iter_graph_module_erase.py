@@ -48,7 +48,7 @@ import unittest
 from typing import Callable, cast
 
 import torch
-from recir.iter_graph_module import IterGraph, IterGraphModule
+from recir.passes.iter_graph_module import IterGraph, IterGraphModule
 
 
 def _make_iter_gm(graph: torch.fx.Graph) -> IterGraphModule:

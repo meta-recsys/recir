@@ -28,7 +28,7 @@ import logging
 from typing import Any, Dict, List, Mapping, Optional, Protocol, Sequence, Tuple
 
 import torch
-from recir.meta_tensor_init import mark_meta_zero_init
+from recir.utils.meta_tensor_init import mark_meta_zero_init
 from torchrec.distributed.embedding_types import OptimType
 from torchrec.optim.clipping import GradientClipping
 from torchrec.optim.warmup import _lr_stages, WarmupPolicy, WarmupStage

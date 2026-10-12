@@ -11,7 +11,7 @@ from enum import Enum
 from typing import Any, cast, Optional
 
 import torch
-from recir.sharding_plan import EmbeddingShardingType
+from recir.distributed.sharding_plan import EmbeddingShardingType
 from recir.training.embedding_plan import (
     build_embedding_plan,
     DEFAULT_ROW_WISE_MIN_ROWS,

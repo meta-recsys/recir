@@ -7,7 +7,7 @@
 
 """Forward-propagate is_batch_input/batch_dim across an FX graph.
 
-`_tag_batch_inputs` (in `recir/api.py`) only marks top-level placeholders with
+`_tag_batch_inputs` (in `recir/compiler/tracing.py`) only marks top-level placeholders with
 `is_batch_input` / `batch_dim`. After `segment_and_lower` cuts the gm at every
 graph break, intermediate FX nodes that cross subgraph boundaries become NEXT
 subgraph's placeholders. Without `is_batch_input` tags on those intermediate
@@ -31,7 +31,7 @@ import torch
 from torch import fx
 
 
-def _output_batch_dim_for(
+def _output_batch_dim_for(  # noqa: C901 -- centralized operator semantics table
     target: Any, input_batch_dim: int, node: fx.Node
 ) -> Optional[int]:
     """Compute the output batch_dim of `node` given an input batch_dim.
@@ -567,7 +567,9 @@ def _reduce_passthrough(node: fx.Node, input_batch_dim: int) -> Optional[int]:
     return input_batch_dim - shift
 
 
-def _output_batch_dim_for_positional(node: fx.Node) -> Optional[int]:
+def _output_batch_dim_for_positional(  # noqa: C901 -- positional operator semantics
+    node: fx.Node,
+) -> Optional[int]:
     """Per-arg batch_dim handling for matmul-family ops.
 
     For mm/matmul(A, B) with A (M, K) x B (K, N) -> (M, N):
@@ -631,7 +633,9 @@ def _output_batch_dim_for_positional(node: fx.Node) -> Optional[int]:
     return None
 
 
-def propagate_batch_input_meta(gm: fx.GraphModule) -> None:
+def propagate_batch_input_meta(  # noqa: C901 -- graph metadata propagation
+    gm: fx.GraphModule,
+) -> None:
     import logging as _lg
 
     _logger = _lg.getLogger(__name__)
