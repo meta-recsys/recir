@@ -17,7 +17,7 @@ import torch.distributed._functional_collectives as funcol
 import torch.fx as fx
 import torch.nn as nn
 from parameterized import parameterized
-from recir.api import _local_compile, compile
+from recir.api import compile
 from recir.backends.base import Backend
 from recir.distributed.data_parallel import (
     _clone_param_chains_for_backward,
@@ -44,6 +44,7 @@ from recir.region_transforms.sparse_embedding import (
     decomposed_table_wise_embedding_bag,
 )
 from recir.sharding_plan import EmbeddingShardingPlan, EmbeddingShardingType
+from recir.tracing import _local_compile
 from torch._subclasses.fake_tensor import FakeTensorMode
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.tensor import DeviceMesh
