@@ -18,6 +18,7 @@ from typing import Any, Callable, List
 from unittest.mock import MagicMock, patch
 
 import recir
+import recir.compilation as recir_compilation
 import torch
 import torch.nn as nn
 from recir.api import (
@@ -262,8 +263,8 @@ class PrepareCompiledTest(unittest.TestCase):
         backend = MagicMock()
         parallel_mode = MagicMock()
 
-        with patch(
-            "recir.api._compile_via_backend", return_value=[compiled_obj]
+        with patch.object(
+            recir_compilation, "_compile_via_backend", return_value=[compiled_obj]
         ) as compile_backend:
             compiled_function = recir_compile(
                 parallel_mode=parallel_mode,
@@ -312,8 +313,10 @@ class MultiFunctionCompileTest(unittest.TestCase):
 
         compiled = [SimpleNamespace(), SimpleNamespace()]
         with (
-            patch("recir.api._trace_graphs", side_effect=trace_graphs),
-            patch("recir.api._compile_graphs", return_value=compiled) as compile_graphs,
+            patch.object(recir_compilation, "_trace_graphs", side_effect=trace_graphs),
+            patch.object(
+                recir_compilation, "_compile_graphs", return_value=compiled
+            ) as compile_graphs,
         ):
             train_step, eval_step = recir_compile(
                 parallel_mode=MagicMock(),
