@@ -23,19 +23,22 @@ import torch.nn as nn
 from recir.api import (
     add_state,
     compile as recir_compile,
-    COMPILED_OBJECT_KEY,
     extract_subgraph,
     find_markers,
-    get_compiled_process_state,
-    invalidate_device_state,
-    materialize_compiled_output,
-    prepare_compiled,
     replace_region,
-    set_compiled_output_deferred,
 )
 from recir.distributed.sharding_spec import FSDPWeightShardSpec
 from recir.process_state import _build_compiled_process_state
 from recir.region_transforms import RegionTransform
+from recir.runtime import (
+    COMPILED_OBJECT_KEY,
+    get_compiled_process_state,
+    invalidate_device_state,
+    make_compiled_runner,
+    materialize_compiled_output,
+    prepare_compiled,
+    set_compiled_output_deferred,
+)
 from torch import fx
 from torch.fx.experimental.proxy_tensor import make_fx
 
@@ -181,6 +184,59 @@ class AddStateTest(unittest.TestCase):
             indices.append(add_state(gm, flat_state, f"state_{i}", torch.zeros(2, 2)))
         self.assertEqual(indices, [0, 1, 2])
         self.assertEqual(len(flat_state), 3)
+
+
+class MakeCompiledRunnerTest(unittest.TestCase):
+    def test_prepares_commits_and_materializes_runtime_state(self) -> None:
+        class _RuntimeGraph(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.last_iter = False
+
+            def forward(
+                self,
+                state: torch.Tensor,
+                value: torch.Tensor,
+                last_iter: bool = False,
+            ) -> tuple[torch.Tensor, torch.Tensor]:
+                self.last_iter = last_iter
+                return value + 1, state + 1
+
+        graph = _RuntimeGraph()
+        state = torch.tensor(2)
+        value = torch.tensor(5)
+        flat_state = [state]
+        materialized = object()
+        state_manager = MagicMock()
+        state_manager.prepare_inputs.return_value = [state, value]
+        state_manager.defers_output.return_value = False
+        state_manager.materialize_output.return_value = materialized
+        compiled_obj = SimpleNamespace(
+            gm=graph,
+            flat_state=flat_state,
+            state_manager=state_manager,
+        )
+
+        runner = make_compiled_runner(compiled_obj)
+        result = runner(value, last_train_step=True)
+
+        self.assertIs(result, materialized)
+        self.assertIs(runner.__dict__[COMPILED_OBJECT_KEY], compiled_obj)
+        self.assertTrue(graph.last_iter)
+        prepare_args = state_manager.prepare_inputs.call_args.args
+        self.assertIs(prepare_args[0], graph)
+        self.assertIs(prepare_args[1], flat_state)
+        self.assertEqual(len(prepare_args[2]), 1)
+        self.assertIs(prepare_args[2][0], value)
+        self.assertTrue(prepare_args[3])
+        commit_args = state_manager.commit_step_state.call_args.args
+        self.assertIs(commit_args[0], flat_state)
+        torch.testing.assert_close(commit_args[1][0], state + 1)
+        self.assertTrue(commit_args[2])
+        state_manager.materialize_output.assert_called_once()
+        torch.testing.assert_close(
+            state_manager.materialize_output.call_args.args[0], value + 1
+        )
 
 
 class InvalidateDeviceStateTest(unittest.TestCase):
