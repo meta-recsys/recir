@@ -6,13 +6,10 @@
 
 from recir.api import (  # noqa: F401
     add_state,
-    compile,
-    compile_from_gm,
     extract_subgraph,
     find_markers,
     GraphPatch,
     replace_region,
-    trace,
 )
 from recir.backend import BackendType  # noqa: F401
 from recir.backends import (  # noqa: F401
@@ -22,6 +19,7 @@ from recir.backends import (  # noqa: F401
     XLAGSPMDBackend,
     XLAShardMapBackend,
 )
+from recir.compilation import compile, compile_from_gm  # noqa: F401
 from recir.distributed.parallel_mode import (  # noqa: F401
     DataParallel,
     HybridParallel,
@@ -54,3 +52,4 @@ from recir.sharding_plan import (  # noqa: F401
     EmbeddingShardingPlan,
     EmbeddingShardingType,
 )
+from recir.tracing import trace  # noqa: F401
