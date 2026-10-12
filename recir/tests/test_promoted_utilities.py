@@ -21,13 +21,11 @@ import recir
 import torch
 import torch.nn as nn
 from recir.api import (
-    _build_compiled_process_state,
     add_state,
     compile as recir_compile,
     COMPILED_OBJECT_KEY,
     extract_subgraph,
     find_markers,
-    FSDPWeightShardSpec,
     get_compiled_process_state,
     invalidate_device_state,
     materialize_compiled_output,
@@ -35,6 +33,8 @@ from recir.api import (
     replace_region,
     set_compiled_output_deferred,
 )
+from recir.distributed.sharding_spec import FSDPWeightShardSpec
+from recir.process_state import _build_compiled_process_state
 from recir.region_transforms import RegionTransform
 from torch import fx
 from torch.fx.experimental.proxy_tensor import make_fx
