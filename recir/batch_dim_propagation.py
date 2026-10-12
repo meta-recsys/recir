@@ -7,7 +7,7 @@
 
 """Forward-propagate is_batch_input/batch_dim across an FX graph.
 
-`_tag_batch_inputs` (in `recir/api.py`) only marks top-level placeholders with
+`_tag_batch_inputs` (in `recir/tracing.py`) only marks top-level placeholders with
 `is_batch_input` / `batch_dim`. After `segment_and_lower` cuts the gm at every
 graph break, intermediate FX nodes that cross subgraph boundaries become NEXT
 subgraph's placeholders. Without `is_batch_input` tags on those intermediate
