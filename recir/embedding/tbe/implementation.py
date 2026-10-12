@@ -29,7 +29,7 @@ from fbgemm_gpu.tbe.config.embedding_config import (
     EmbeddingLocation,
     PoolingMode,
 )
-from recir.tbe.ops import register_tbe_group, TBEFunction
+from recir.embedding.tbe.ops import register_tbe_group, TBEFunction
 
 
 @dataclass(frozen=True)

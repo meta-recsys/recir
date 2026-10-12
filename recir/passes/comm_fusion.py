@@ -11,9 +11,9 @@ from typing import Any, cast, Dict, List, Optional, Set, Tuple, Union
 
 import torch
 import torch.fx as fx
-from recir.graph_utils import CommType
 from recir.iter_graph_module import IterGraphModule
 from recir.passes.pass_registry import graph_optimization_pass
+from recir.utils.graph import CommType
 from torch._subclasses.fake_tensor import FakeTensor, FakeTensorMode
 from torch.fx.passes.shape_prop import TensorMetadata
 from torch.utils._pytree import tree_flatten, tree_unflatten
