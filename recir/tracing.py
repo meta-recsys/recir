@@ -24,13 +24,26 @@ import torch.fx as fx
 import torch.nn as nn
 import torch.utils._pytree as pytree
 from functorch import make_fx
+from recir.batch_dim_propagation import propagate_batch_input_meta
 from recir.decompositions import SPMD_DECOMP_TABLE
-from recir.distributed.data_parallel import parametrize_params
-from recir.distributed.parallel_mode import GSPMDParallel, HybridParallel, ParallelMode
+from recir.distributed.data_parallel import (
+    collectives_insertion,
+    DataParallelStyle,
+    gradients_tagging,
+    parametrize_params,
+)
+from recir.distributed.parallel_mode import (
+    DataParallel,
+    GSPMDParallel,
+    HybridParallel,
+    ParallelMode,
+)
+from recir.process_state import _compute_state_fqns
 from recir.region_transforms import (
     _apply_region_transforms,
     _discover_called_modules,
     _find_forward_roots,
+    RegatherTransform,
     RegionTransform,
     SparseEmbeddingTransform,
 )
@@ -443,6 +456,325 @@ def _get_trace_ctx(gm: fx.GraphModule) -> _TraceContext:
 
 
 _TraceResult = tuple[fx.GraphModule, list[torch.Tensor]]
+
+
+@dataclass
+class _GraphSpec:
+    """One graph for :func:`_trace_graphs`: ``fn(*args, **kwargs)`` traced as
+    :func:`trace` would trace it."""
+
+    fn: Callable[..., Any]
+    args: tuple[Any, ...]
+    parallel_mode: ParallelMode | None
+    input_batch_dim: int | None = None
+    kwargs: dict[str, Any] = field(default_factory=dict)
+    region_transforms: Sequence[RegionTransform] = ()
+    tensor_attr_holders: Sequence[Any] = ()
+    parametrize_fns: Sequence[Callable[..., torch.Tensor]] = ()
+
+    @property
+    def resolved_input_batch_dim(self) -> int:
+        if self.input_batch_dim is not None:
+            return self.input_batch_dim
+        if self.parallel_mode is not None:
+            return self.parallel_mode.input_batch_dim
+        return 0
+
+
+@dataclass
+class _PreparedDataParallelTrace:
+    """A DP/Hybrid trace after setup and before shared parameter sharding."""
+
+    spec: _GraphSpec
+    parallel_mode: DataParallel | HybridParallel
+    mod: nn.Module
+    optimizers: list[torch.optim.Optimizer]
+    mesh: Any
+    dp_style: DataParallelStyle
+    embedding_param_fqns: set[str] | None
+    transforms: list[RegionTransform]
+    internal_transforms: list[RegionTransform]
+    regather_transform: RegatherTransform | None
+    embedding_param_indices: set[int] | None
+    params_and_buffers: dict[str, Any]
+    parameter_fqns: set[str]
+    fake_mode: FakeTensorMode
+    discovery: _RegionDiscovery | None
+    trace_args: tuple[Any, ...]
+    trace_kwargs: dict[str, Any]
+
+
+def _trace_module_and_optimizers(
+    spec: _GraphSpec,
+) -> tuple[nn.Module, list[torch.optim.Optimizer]]:
+    mod: nn.Module | None = None
+    optimizers: list[torch.optim.Optimizer] = []
+    for arg in pytree.arg_tree_leaves(*spec.args, **spec.kwargs):
+        if isinstance(arg, nn.Module) and mod is None:
+            mod = arg
+        if isinstance(arg, torch.optim.Optimizer):
+            optimizers.append(arg)
+    assert mod is not None, "recir.trace requires an nn.Module in the arguments"
+    return mod, optimizers
+
+
+def _prepare_data_parallel_trace(
+    spec: _GraphSpec,
+) -> _PreparedDataParallelTrace:
+    """Perform all DP/Hybrid setup that must precede shared sharding."""
+    parallel_mode = spec.parallel_mode
+    assert isinstance(parallel_mode, (DataParallel, HybridParallel))
+    mod, optimizers = _trace_module_and_optimizers(spec)
+    transforms = list(spec.region_transforms)
+
+    if isinstance(parallel_mode, HybridParallel):
+        mesh = parallel_mode.mesh
+        dp_style = parallel_mode.dense_style
+        fqns = parallel_mode.embedding_plan.param_fqns
+        embedding_param_fqns = fqns if fqns else None
+    else:
+        mesh = parallel_mode.device_mesh
+        dp_style = parallel_mode.parallel_style
+        embedding_param_fqns = None
+
+    internal_transforms: list[RegionTransform] = []
+    regather_transform: RegatherTransform | None = None
+    if dp_style == DataParallelStyle.FULLY_SHARD:
+        regather_skip = RegatherTransform.skip_fqns_for_recompute(
+            mod, transforms, base_skip=embedding_param_fqns
+        )
+        regather_transform = RegatherTransform(
+            skip_param_fqns=regather_skip or None,
+            forward_root_fqns=(
+                parallel_mode.dense_fsdp_module_fqns
+                if isinstance(parallel_mode, HybridParallel)
+                else None
+            ),
+        )
+        internal_transforms.append(regather_transform)
+    if isinstance(parallel_mode, HybridParallel) and embedding_param_fqns:
+        internal_transforms.append(
+            _make_hybrid_sparse_transform(
+                parallel_mode,
+                embedding_param_fqns,
+                mod,
+                forward_only=not optimizers,
+            )
+        )
+    transforms = [*internal_transforms, *transforms]
+    _bind_transform_signatures(transforms, spec.fn)
+
+    params_and_buffers: dict[str, Any] = {
+        **dict(mod.named_parameters(remove_duplicate=False)),
+        **dict(mod.named_buffers(remove_duplicate=False)),
+    }
+    parameter_fqns = set(dict(mod.named_parameters(remove_duplicate=False)))
+    embedding_param_indices = (
+        parallel_mode._compute_embedding_param_indices(params_and_buffers)
+        if isinstance(parallel_mode, HybridParallel)
+        else None
+    )
+
+    fake_mode = FakeTensorMode(
+        allow_non_fake_inputs=True,
+        shape_env=ShapeEnv() if isinstance(parallel_mode, HybridParallel) else None,
+    )
+    input_transform = _make_trace_input_transform(
+        parallel_mode.input_batch_dim,
+        ratio=1 / (parallel_mode.num_ranks // parallel_mode.num_processes),
+        fake_mode=fake_mode,
+        dynamic_batch_dim=isinstance(parallel_mode, HybridParallel),
+    )
+    trace_args = pytree.tree_map_only(torch.Tensor, input_transform, spec.args)
+    trace_kwargs = pytree.tree_map_only(torch.Tensor, input_transform, spec.kwargs)
+    discovery = _discover_for_region_transforms(
+        transforms,
+        spec.fn,
+        trace_args,
+        trace_kwargs,
+        mod=mod,
+        fake_mode=fake_mode,
+    )
+    return _PreparedDataParallelTrace(
+        spec=spec,
+        parallel_mode=parallel_mode,
+        mod=mod,
+        optimizers=optimizers,
+        mesh=mesh,
+        dp_style=dp_style,
+        embedding_param_fqns=embedding_param_fqns,
+        transforms=transforms,
+        internal_transforms=internal_transforms,
+        regather_transform=regather_transform,
+        embedding_param_indices=embedding_param_indices,
+        params_and_buffers=params_and_buffers,
+        parameter_fqns=parameter_fqns,
+        fake_mode=fake_mode,
+        discovery=discovery,
+        trace_args=trace_args,
+        trace_kwargs=trace_kwargs,
+    )
+
+
+def _finish_data_parallel_trace(
+    prepared: _PreparedDataParallelTrace,
+    actually_sharded_fqns: set[str],
+) -> _TraceResult:
+    """Trace one prepared graph after the shared module sharding is complete."""
+    dense_sharded_param_fqns: set[str] | None = None
+    replicated_param_fqns: set[str] = set()
+    if prepared.dp_style == DataParallelStyle.FULLY_SHARD:
+        dense_sharded_param_fqns = (
+            prepared.parameter_fqns & actually_sharded_fqns
+        ) - set(prepared.embedding_param_fqns or ())
+        replicated_param_fqns = prepared.parameter_fqns - actually_sharded_fqns
+        if prepared.regather_transform is not None:
+            prepared.regather_transform.skip_param_fqns.update(replicated_param_fqns)
+    _prepare_transforms_after_shard(
+        prepared.transforms, prepared.mod, prepared.optimizers
+    )
+
+    collectives_fn = collectives_insertion(prepared.dp_style, prepared.mesh)
+    parametrize_kwargs: dict[str, Any] = {}
+    if dense_sharded_param_fqns is not None:
+        parametrize_kwargs["include_param_fqns"] = dense_sharded_param_fqns
+    elif prepared.embedding_param_fqns:
+        parametrize_kwargs["exclude_param_fqns"] = prepared.embedding_param_fqns
+
+    with ExitStack() as region_stack:
+        _enter_region_transform_contexts(
+            region_stack,
+            prepared.transforms,
+            prepared.discovery,
+            prepared.fake_mode,
+            parametrize_cm_factory=lambda root_fqn, root_mod: partial(
+                parametrize_params,
+                root_mod,
+                collectives_fn,
+                **_relative_parametrize_kwargs(root_fqn, parametrize_kwargs),
+            ),
+        )
+        if prepared.dp_style == DataParallelStyle.FULLY_SHARD:
+            outer_parametrize_fns: list[Callable[..., torch.Tensor]] = []
+            outer_exclude_fqns: set[str] | None = None
+        else:
+            outer_parametrize_fns = [collectives_fn]
+            outer_exclude_fqns = prepared.embedding_param_fqns
+        outer_parametrize_fns.extend(prepared.spec.parametrize_fns)
+        if replicated_param_fqns:
+            region_stack.enter_context(
+                parametrize_params(
+                    prepared.mod,
+                    collectives_insertion(DataParallelStyle.REPLICATE, prepared.mesh),
+                    include_param_fqns=replicated_param_fqns,
+                )
+            )
+        local_result = _local_compile(
+            prepared.spec.fn,
+            *prepared.trace_args,
+            fake_mode=prepared.fake_mode,
+            _parametrize_fns=outer_parametrize_fns,
+            _exclude_param_fqns=outer_exclude_fqns,
+            _tensor_attr_holders=prepared.spec.tensor_attr_holders,
+            **prepared.trace_kwargs,
+        )
+    return _finalize_trace_result(
+        local_result,
+        input_batch_dim=prepared.spec.resolved_input_batch_dim,
+        embedding_param_indices=prepared.embedding_param_indices,
+        internal_transforms=prepared.internal_transforms,
+    )
+
+
+def _trace_without_pre_sharding(spec: _GraphSpec) -> _TraceResult:
+    """Trace a GSPMD or non-parallel graph, which has no pre-trace shard phase."""
+    mod, _ = _trace_module_and_optimizers(spec)
+    transforms = list(spec.region_transforms)
+    _bind_transform_signatures(transforms, spec.fn)
+    fake_mode = FakeTensorMode(allow_non_fake_inputs=True)
+    trace_args = spec.args
+    trace_kwargs = spec.kwargs
+    trace_batch_ratio = _resolve_trace_batch_ratio(spec.parallel_mode)
+    if trace_batch_ratio is not None and trace_batch_ratio != 1:
+        input_transform = _make_trace_input_transform(
+            spec.resolved_input_batch_dim,
+            ratio=trace_batch_ratio,
+            fake_mode=fake_mode,
+        )
+        trace_args = pytree.tree_map_only(torch.Tensor, input_transform, trace_args)
+        trace_kwargs = pytree.tree_map_only(torch.Tensor, input_transform, trace_kwargs)
+    discovery = _discover_for_region_transforms(
+        transforms,
+        spec.fn,
+        trace_args,
+        trace_kwargs,
+        mod=mod,
+        fake_mode=fake_mode,
+    )
+    with ExitStack() as region_stack:
+        _enter_region_transform_contexts(
+            region_stack,
+            transforms,
+            discovery,
+            fake_mode,
+        )
+        local_result = _local_compile(
+            spec.fn,
+            *trace_args,
+            fake_mode=fake_mode,
+            _stateless_func_wrapper=gradients_tagging,
+            _parametrize_fns=list(spec.parametrize_fns) or None,
+            _tensor_attr_holders=spec.tensor_attr_holders,
+            **trace_kwargs,
+        )
+    return _finalize_trace_result(
+        local_result,
+        input_batch_dim=spec.resolved_input_batch_dim,
+    )
+
+
+def _finalize_trace_result(
+    local_result: _LocalCompiledResult,
+    *,
+    input_batch_dim: int,
+    embedding_param_indices: set[int] | None = None,
+    internal_transforms: Sequence[RegionTransform] = (),
+) -> _TraceResult:
+    flat_state = pytree.tree_leaves(
+        [
+            {**local_result.params, **local_result.buffers},
+            local_result.named_states,
+        ]
+    )
+    _tag_batch_inputs(
+        local_result.gm,
+        sum(isinstance(value, torch.Tensor) for value in flat_state),
+        input_batch_dim,
+        {
+            fqn
+            for fqn, parameter in local_result.params.items()
+            if not parameter.requires_grad
+        },
+    )
+    propagate_batch_input_meta(local_result.gm)
+    ctx = _TraceContext(
+        mod=local_result.mod,
+        opts=local_result.opts,
+        params=local_result.params,
+        buffers=local_result.buffers,
+        named_states=local_result.named_states,
+        state_fqns=_compute_state_fqns(
+            [
+                {**local_result.params, **local_result.buffers},
+                local_result.named_states,
+            ]
+        ),
+        input_batch_dim=input_batch_dim,
+        embedding_param_indices=embedding_param_indices,
+        internal_transforms=list(internal_transforms),
+    )
+    _set_trace_ctx(local_result.gm, ctx)
+    return local_result.gm, flat_state
 
 
 def _maybe_dump_fx_graph(gm: torch.fx.GraphModule) -> None:
