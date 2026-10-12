@@ -119,6 +119,10 @@ Read [the design document](docs/design.md) for the capture pipeline, graph
 invariants, state model, distributed execution, embedding architecture, and
 current limitations.
 
+Additional implementation notes cover the
+[FX device pipeline](docs/pipeline_design.md) and
+[cross-iteration steady-state scheduling](docs/cross_iteration_steady_state_scheduling.md).
+
 ## Repository layout
 
 ```text

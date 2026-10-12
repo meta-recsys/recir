@@ -10,7 +10,7 @@ from unittest.mock import patch
 
 import torch
 from functorch import make_fx
-from recir.tbe.local import LocalTBEGroup, LocalTBETable
+from recir.embedding.tbe.local import LocalTBEGroup, LocalTBETable
 
 
 class LocalTBETraceTest(unittest.TestCase):
