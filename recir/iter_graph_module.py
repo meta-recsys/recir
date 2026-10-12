@@ -10,7 +10,7 @@ import logging
 from typing import Any, Callable, cast, Dict, Iterator, List, Optional, Set, Tuple, Type
 
 import torch.nn as nn
-from recir.graph_utils import clone_subgraph, get_output, is_leaf_subgraph
+from recir.utils.graph import clone_subgraph, get_output, is_leaf_subgraph
 from torch import fx
 from torch.fx.graph import _PyTreeCodeGen, PythonCode
 from torch.fx.node import Argument

@@ -16,6 +16,7 @@ import torch
 import torch.fx as fx
 import torch.nn as nn
 from functorch import make_fx
+from recir.embedding.tbe.local import LocalTBEGroup
 from recir.lowering.partial_lower import _InductorModule, partial_lower
 from recir.ops.fake.kjt import patch_ebc_for_tracing
 from recir.pipeline import build_pipeline, PipelinedGraphModule, SteadyStateGraphModule
@@ -29,7 +30,6 @@ from recir.region_transforms.tbe_sparse_embedding import (
     TBESparseEmbeddingTransform,
 )
 from recir.sharding_plan import EmbeddingShardingPlan, EmbeddingShardingType
-from recir.tbe.local import LocalTBEGroup
 from torch._dynamo.source import LocalSource
 from torch._subclasses.fake_tensor import FakeTensorMode
 from torch.distributed import ProcessGroup
@@ -1158,7 +1158,8 @@ class TBESparseEmbeddingTransformTest(unittest.TestCase):
             raise AssertionError(f"Expected FX offsets node, got {type(offsets)}.")
         self.assertEqual(offsets.meta["val"].shape, (17,))
         self.assertEqual(
-            sum("recir.tbe_backward_update" in target for target in targets), 1
+            sum("recir.tbe_backward_update" in target for target in targets),
+            1,
         )
         all_to_all_nodes = [
             node
