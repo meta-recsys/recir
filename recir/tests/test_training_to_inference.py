@@ -24,7 +24,6 @@ from collections.abc import Callable
 import torch
 import torch.fx as fx
 import torch.nn as nn
-from recir.graph_utils import OP
 from recir.region_transforms.inference_swap import deterministic_argmax
 from recir.region_transforms.training_to_inference import (
     fabricate_inference_graph,
@@ -33,6 +32,7 @@ from recir.region_transforms.training_to_inference import (
     strip_collectives,
     strip_grad_tags,
 )
+from recir.utils.graph import OP
 from torch.fx.experimental.proxy_tensor import make_fx
 
 

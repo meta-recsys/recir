@@ -21,9 +21,9 @@ import torch.fx as fx
 import torch.nn as nn
 import torch.utils._pytree as pytree
 from functorch import make_fx
-from recir.compile_utils import _enable_compile
-from recir.graph_utils import rebuild_graph
 from recir.region_transforms.base import RegionTransform
+from recir.utils.compile import _enable_compile
+from recir.utils.graph import rebuild_graph
 from torch._guards import detect_fake_mode
 from torch._subclasses.fake_tensor import FakeTensorMode
 from torch.fx._pytree import tree_flatten_spec

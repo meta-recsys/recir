@@ -14,7 +14,7 @@ import logging
 
 import torch
 import torch.fx as fx
-from recir.graph_utils import OP, rebuild_graph
+from recir.utils.graph import OP, rebuild_graph
 
 # Defines torch.ops.recir.bernoulli_keyed, which this transform inserts.
 import recir.ops.random_op  # noqa: F401  # isort: skip

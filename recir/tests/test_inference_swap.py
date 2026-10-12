@@ -21,7 +21,6 @@ from typing import Any, Callable
 import torch
 import torch.fx as fx
 import torch.nn as nn
-from recir.graph_utils import OP
 from recir.region_transforms.base import RegionTransform
 from recir.region_transforms.inference_swap import (
     apply_inference_swaps,
@@ -29,6 +28,7 @@ from recir.region_transforms.inference_swap import (
     identity_passthrough,
     InferenceSwapTransform,
 )
+from recir.utils.graph import OP
 from torch.fx.experimental.proxy_tensor import make_fx
 
 
