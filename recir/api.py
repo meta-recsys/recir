@@ -6,8 +6,7 @@
 
 import inspect
 import logging
-from collections import OrderedDict
-from contextlib import ExitStack, nullcontext
+from contextlib import ExitStack
 from copy import deepcopy
 from dataclasses import dataclass, field
 from functools import partial, wraps
@@ -57,9 +56,6 @@ from recir.process_state import (
     CompiledProcessState,
 )
 from recir.region_transforms import (
-    _apply_region_transforms,
-    _discover_called_modules,
-    _find_forward_roots,
     RegatherTransform,
     RegionTransform,
     SparseEmbeddingTransform,
@@ -77,16 +73,19 @@ from recir.runtime import (  # noqa: F401 -- compatibility re-exports
     sync_named_state_to_torch,
 )
 from recir.tracing import (  # noqa: F401 -- compatibility re-exports
+    _discover_for_region_transforms,
+    _enter_region_transform_contexts,
     _local_compile,
     _LocalCompiledResult,
     _make_trace_input_transform,
+    _RegionDiscovery,
+    _relative_parametrize_kwargs,
     _rematerialize_optimizer,
     _rematerialize_tensor_attrs,
     _resolve_trace_batch_ratio,
     _tag_batch_inputs,
     _to_caller_flattened_graph_module,
 )
-from recir.utils.compile import _enable_compile
 from torch import fx
 from torch._subclasses.fake_tensor import FakeTensorMode
 from torch.fx.experimental.symbolic_shapes import ShapeEnv
@@ -172,136 +171,6 @@ def _finalize_graph(
         [params_and_buffers, named_states]
     )
     return result
-
-
-@dataclass
-class _RegionDiscovery:
-    """Result of `_discover_for_region_transforms`.
-
-    Holds the called-module map (used to find forward roots) built by running
-    the train step under FakeTensorMode hooks.
-    """
-
-    called_modules: OrderedDict[str, Tuple[nn.Module, Tuple[Any, ...], Dict[str, Any]]]
-
-
-def _discover_for_region_transforms(
-    transforms: List[RegionTransform],
-    func: Callable[..., Any],
-    args: Tuple[Any, ...],
-    kwargs: Dict[str, Any],
-    *,
-    mod: Optional[nn.Module] = None,
-    fake_mode: Optional[FakeTensorMode] = None,
-) -> Optional[_RegionDiscovery]:
-    """Run `_discover_called_modules` to find the forward roots.
-
-    Returns ``None`` (no-op) when ``transforms`` is empty.  When ``mod`` is
-    not provided the first :class:`nn.Module` in ``args``/``kwargs`` is used.
-    """
-    if not transforms:
-        return None
-    if mod is None:
-        for arg in pytree.arg_tree_leaves(*args, **kwargs):
-            if isinstance(arg, nn.Module):
-                mod = arg
-                break
-        assert mod is not None, (
-            "region_transforms requires an nn.Module in the arguments"
-        )
-    # Inputs may already be FakeTensors produced by the trace's batch
-    # transform. Reuse that mode when supplied; FakeTensorMode does not permit
-    # tensors allocated by a different active mode.
-    discovery_mode = fake_mode or FakeTensorMode(
-        allow_non_fake_inputs=True, shape_env=ShapeEnv()
-    )
-    shape_env = discovery_mode.shape_env
-    ignore_fresh_symbols = (
-        shape_env.ignore_fresh_unbacked_symbols()
-        if shape_env is not None
-        else nullcontext()
-    )
-    with _enable_compile(), ignore_fresh_symbols:
-        called_modules = _discover_called_modules(
-            mod,
-            discovery_mode,
-            func,
-            *args,
-            **kwargs,
-        )
-    return _RegionDiscovery(called_modules=called_modules)
-
-
-def _relative_parametrize_kwargs(
-    root_fqn: str, parametrize_kwargs: Dict[str, Any]
-) -> Dict[str, Any]:
-    if not root_fqn:
-        return parametrize_kwargs
-    prefix = f"{root_fqn}."
-    return {
-        key: {fqn[len(prefix) :] for fqn in fqns if fqn.startswith(prefix)}
-        for key, fqns in parametrize_kwargs.items()
-    }
-
-
-def _enter_region_transform_contexts(
-    region_stack: ExitStack,  # pyre-ignore
-    transforms: List[RegionTransform],
-    discovery: Optional[_RegionDiscovery],
-    fake_mode: FakeTensorMode,
-    *,
-    parametrize_cm_factory: Optional[
-        Callable[[str, nn.Module], Callable[[], Any]]
-    ] = None,
-) -> None:
-    """Enter `_apply_region_transforms` once per forward root on `region_stack`.
-
-    No-op when ``discovery`` is None or ``transforms`` is empty.
-    ``parametrize_cm_factory(root_fqn, root_mod)`` returns a context-manager factory
-    used during the per-root trace inside ``_apply_region_transforms``;
-    pass ``None`` when no parametrization is needed (e.g. GSPMD path).
-    """
-    if discovery is None or not transforms:
-        return
-    default_roots = {
-        fqn: (root_mod, root_fake_args, root_fake_kwargs)
-        for fqn, root_mod, root_fake_args, root_fake_kwargs in _find_forward_roots(
-            discovery.called_modules
-        )
-    }
-    transforms_by_root: OrderedDict[str, list[RegionTransform]] = OrderedDict()
-    root_data = dict(default_roots)
-    for transform in transforms:
-        selected = transform.select_forward_root_fqns(discovery.called_modules)
-        root_fqns = default_roots.keys() if selected is None else selected
-        for fqn in root_fqns:
-            if fqn not in discovery.called_modules:
-                raise ValueError(
-                    f"Region transform selected an uncalled module FQN: {fqn!r}."
-                )
-            root_data[fqn] = discovery.called_modules[fqn]
-            transforms_by_root.setdefault(fqn, []).append(transform)
-
-    for fqn in sorted(
-        transforms_by_root, key=lambda name: name.count("."), reverse=True
-    ):
-        root_mod, root_fake_args, root_fake_kwargs = root_data[fqn]
-        cm_factories = (
-            [parametrize_cm_factory(fqn, root_mod)]
-            if parametrize_cm_factory is not None
-            else []
-        )
-        region_stack.enter_context(
-            _apply_region_transforms(
-                root_mod,
-                root_fake_args,
-                discovery.called_modules,
-                transforms_by_root[fqn],
-                fake_mode,
-                _parametrize_cm_factories=cm_factories,
-                fake_kwargs=root_fake_kwargs,
-            )
-        )
 
 
 def _compile_and_transform(
