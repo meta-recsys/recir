@@ -92,10 +92,12 @@ from recir.tracing import (  # noqa: F401 -- compatibility re-exports
     _tag_batch_inputs,
     _to_caller_flattened_graph_module,
     _TRACE_CTX_ATTR,
+    _trace_graphs,
     _trace_module_and_optimizers,
     _trace_without_pre_sharding,
     _TraceContext,
     _TraceResult,
+    trace,
 )
 from torch import fx
 from torch._subclasses.fake_tensor import FakeTensorMode
@@ -248,103 +250,6 @@ def _compile_and_transform(
 # partition, optimize_passes, IterGraph wrap, dispatch) using the trace
 # context recovered from the gm, the explicit ``parallel_mode``, and the
 # explicit ``backend``.
-
-
-def trace(
-    callable_: Callable[..., Any],
-    *args: Any,
-    region_transforms: Sequence[RegionTransform] = (),
-    input_batch_dim: int = 0,
-    parallel_mode: Optional[ParallelMode] = None,
-    _parametrize_fns: Optional[Sequence[Callable[..., torch.Tensor]]] = None,
-    _tensor_attr_holders: Sequence[Any] = (),
-    **kwargs: Any,
-) -> Tuple[fx.GraphModule, List[torch.Tensor]]:
-    """Stage 2 standalone: trace ``callable_`` into an FX graph module.
-
-    Wraps :func:`_local_compile` plus the ``region_transforms`` bind +
-    discovery + per-root context setup that the legacy paths perform
-    pre-trace.  Returns ``(gm, flat_state)`` where ``flat_state`` is 1:1 with
-    the first ``len(flat_state)`` placeholders of the gm.
-
-    The returned gm has an internal ``_recir_trace_ctx`` attribute holding the
-    references (``mod``, ``opt``, ``params``, ``buffers``, ``named_states``)
-    that :func:`compile_from_gm` uses to drive the post-trace stages.
-
-    After tracing this also runs :func:`_tag_batch_inputs` +
-    :func:`propagate_batch_input_meta` so every placeholder carries
-    ``is_batch_input`` / ``is_weight`` / ``batch_dim`` metadata.  This makes
-    external semantic input mapping work without
-    falling back to the (broken) ordinal heuristic that misidentifies
-    optimizer-state placeholders (e.g. Adam's 0-dim ``step`` scalar) as
-    user inputs.
-
-    Args:
-        callable_: the function to trace (typically a ``train_step``).
-        *args: positional arguments to ``callable_``.  Must include an
-            :class:`nn.Module` (and optionally a :class:`torch.optim.Optimizer`).
-        region_transforms: optional :class:`RegionTransform` sequence applied
-            to scope-rewrite sub-regions of the forward graph during tracing.
-            Their ``bind_signature(callable_)`` is called once before the
-            outer trace and their ``_apply_region_transforms`` ExitStack
-            wrappers are entered around the trace itself.
-        input_batch_dim: the batch dimension on user-input tensors.  Stored on
-            each user-input placeholder as ``meta["batch_dim"]`` by
-            :func:`_tag_batch_inputs`.  Defaults to ``0`` (matches
-            :class:`DataParallel` and most :class:`GSPMDParallel` setups).
-        parallel_mode: optional :class:`ParallelMode` driving the pre-trace
-            setup.  Three flavors are recognized:
-
-              * :class:`DataParallel` / :class:`HybridParallel`: trace via
-                autograd-emitted parametrization (``parametrize_params`` +
-                ``collectives_insertion``) so the resulting gm has the
-                allgather / reduce-scatter ops baked in.  Inputs are shrunk
-                from per-process to per-device shape via the
-                ``1/(world_size // num_processes)`` batch transform.
-                ``shard_params`` runs BEFORE tracing so the gm captures
-                sharded parameter shapes.  For :class:`HybridParallel`, the
-                embedding parameters are excluded from collectives at trace
-                time and rewritten post-trace by
-                :func:`compile_from_gm` via :func:`rewrite_sparse_embeddings`.
-              * :class:`GSPMDParallel`: expand per-process batch tensors to
-                the global batch (HuggingFace-style modeling code bakes
-                ``inputs_embeds.shape[0]`` as a Python int; without this
-                pre-trace expansion the literal becomes stale once GSPMD
-                lowering inflates placeholders to global shape).  Trace
-                under :func:`gradients_tagging` so the gm carries
-                ``_spmd::tag_grad`` markers consumed by
-                :func:`compile_from_gm`'s GSPMD branch.
-              * ``None``: trace as-is (legacy behavior for callers that
-                don't request a parallelism strategy).
-        _tensor_attr_holders: objects attached to the module that mutate module
-            state from inside the traced step (e.g. an LR schedule controller
-            holding the 0-d LR buffers).  See
-            :func:`_rematerialize_tensor_attrs`.
-        **kwargs: keyword arguments to ``callable_``.
-
-    Returns:
-        ``(gm, flat_state)``.
-    """
-    spec = _GraphSpec(
-        callable_,
-        args,
-        parallel_mode,
-        input_batch_dim=input_batch_dim,
-        kwargs=kwargs,
-        region_transforms=region_transforms,
-        tensor_attr_holders=_tensor_attr_holders,
-        parametrize_fns=_parametrize_fns or (),
-    )
-    if not isinstance(parallel_mode, (DataParallel, HybridParallel)):
-        return _trace_without_pre_sharding(spec)
-
-    prepared = _prepare_data_parallel_trace(spec)
-    actually_sharded_fqns = parallel_mode.shard_params(
-        prepared.mod,
-        prepared.params_and_buffers,
-        prepared.optimizers,
-    )
-    return _finish_data_parallel_trace(prepared, actually_sharded_fqns)
 
 
 def compile_from_gm(  # noqa: C901 — orchestration: stages 4-8 of the pipeline are intentionally laid out inline so the # Stage N comments stay readable; refactor would split the pipeline across helpers.
@@ -741,62 +646,6 @@ def _bind_to_current_module_state(ctx: _TraceContext) -> None:
     buffers = dict(ctx.mod.named_buffers(remove_duplicate=False))
     ctx.params = {fqn: params[fqn] for fqn in ctx.params}
     ctx.buffers = {fqn: buffers[fqn] for fqn in ctx.buffers}
-
-
-def _trace_graphs(specs: Sequence[_GraphSpec]) -> List[_TraceResult]:
-    """Trace several graphs over ONE module that will share its parameters
-    (e.g. a train step and a forward-only eval step).
-
-    The module is sharded once, for all of them: DataParallel / HybridParallel
-    shard before tracing, so every graph finishes its pre-shard setup, the
-    module is sharded with every graph's optimizers, then each is traced.
-    GSPMD shards at compile time (:func:`_compile_graphs`). Each returned
-    ``(gm, flat_state)`` may be rewritten (graph dispatchers) before compiling.
-    """
-    mods = {
-        id(arg): arg
-        for spec in specs
-        for arg in pytree.arg_tree_leaves(*spec.args, **spec.kwargs)
-        if isinstance(arg, nn.Module)
-    }
-    if len(mods) != 1:
-        raise ValueError("graphs compiled together must take the same module")
-    trace_results: List[Optional[_TraceResult]] = [None] * len(specs)
-    prepared_traces: List[Tuple[int, _PreparedDataParallelTrace]] = []
-    for trace_index, spec in enumerate(specs):
-        if isinstance(spec.parallel_mode, (DataParallel, HybridParallel)):
-            prepared_traces.append((trace_index, _prepare_data_parallel_trace(spec)))
-        else:
-            trace_results[trace_index] = _trace_without_pre_sharding(spec)
-
-    if prepared_traces:
-        canonical_preparation = prepared_traces[0][1]
-        all_optimizers: List[torch.optim.Optimizer] = []
-        for _, prepared in prepared_traces:
-            all_optimizers.extend(
-                optimizer
-                for optimizer in prepared.optimizers
-                if all(optimizer is not existing for existing in all_optimizers)
-            )
-        actually_sharded_fqns = canonical_preparation.parallel_mode.shard_params(
-            next(iter(mods.values())),
-            canonical_preparation.params_and_buffers,
-            all_optimizers,
-        )
-        canonical_state = canonical_preparation.params_and_buffers
-        for trace_index, prepared in prepared_traces:
-            prepared.params_and_buffers.update(
-                {fqn: canonical_state[fqn] for fqn in prepared.params_and_buffers}
-            )
-            trace_results[trace_index] = _finish_data_parallel_trace(
-                prepared, actually_sharded_fqns
-            )
-
-    traced: List[_TraceResult] = []
-    for result in trace_results:
-        assert result is not None
-        traced.append(result)
-    return traced
 
 
 def _compile_graphs(
