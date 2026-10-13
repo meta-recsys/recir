@@ -329,29 +329,26 @@ def _dedup_grads_by_id(
 
     # --- Step 4: sum each id-group's gradient vectors ---
     # group_id counts up by 1 at each group start, so all lookups of one id share
-    # a group_id; scatter-add their grads by group_id, then read the sum back.
+    # a group_id; scatter-add their grads by group_id. Group g's sum lands at slot
+    # g, and g is also the slot step 5 packs that group's representative into (the
+    # two are the same cumsum), so this buffer IS the packed output -- reading the
+    # sums back out and re-scattering the representatives would spend two full
+    # [max_local_ids, D] passes rebuilding it.
     group_id = jnp.clip(
         jnp.cumsum(is_group_start.astype(jnp.int32)) - 1, 0, max_local_ids - 1
     )
-    grad_by_group = (
+    compact_grad = (
         jnp.zeros((max_local_ids, grad_out.shape[1]), dtype=grad_out.dtype)
         .at[group_id]
         .add(sorted_grad)
     )
-    group_grad = grad_by_group[group_id]  # summed grad at every position
 
     # --- Step 5: keep only the representatives, packed to the front per dest ---
     # Each representative moves to slot = number of representatives before it;
     # non-representatives are scattered out of bounds (dropped).
-    packed_pos = jnp.cumsum(is_group_start.astype(jnp.int32)) - 1
-    dst = jnp.where(is_group_start, packed_pos, max_local_ids)  # OOB -> dropped
+    dst = jnp.where(is_group_start, group_id, max_local_ids)  # OOB -> dropped
     compact_row = (
         jnp.zeros((max_local_ids,), jnp.int32).at[dst].set(sorted_row, mode="drop")
-    )
-    compact_grad = (
-        jnp.zeros((max_local_ids, grad_out.shape[1]), grad_out.dtype)
-        .at[dst]
-        .set(group_grad, mode="drop")
     )
     rep_dest = jnp.where(is_group_start, sorted_dest, world_size)
     send_counts = _count_per_peer(rep_dest, world_size)
