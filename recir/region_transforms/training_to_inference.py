@@ -49,8 +49,10 @@ from __future__ import annotations
 import logging
 from collections.abc import Callable, Iterable
 
+import torch
 import torch.fx as fx
 import torch.utils._pytree as pytree
+from recir.ops.marker import mark_boundary
 from recir.region_transforms.inference_swap import (
     _graph_output_node,
     apply_inference_swaps,
@@ -68,6 +70,48 @@ OutputSelector = Callable[[fx.GraphModule], list[fx.Node]]
 # collective is gone).
 _DEFAULT_COLLECTIVE_NAMES: tuple[str, ...] = ("all_reduce", "wait_tensor")
 _GRAD_TAG_NAME: str = "tag_grad"
+
+# Marker-name prefix used by :func:`mark_inference_output`.  The ``::output::``
+# suffix mirrors RecIR's existing forward-marker convention (eager_dispatch).
+_INFERENCE_OUTPUT_PREFIX: str = "recir_inference_output"
+
+
+def mark_inference_output(t: torch.Tensor, idx: int = 0) -> torch.Tensor:
+    """Tag ``t`` as an inference output so fabrication can find it post-trace.
+
+    Identity at runtime (reuses ``torch.ops.recir.mark_boundary``, a clone).
+    The tag is the robust replacement for op-name substring matching: plant it
+    on the real prediction tensor in the model's forward, then select it with
+    :func:`marked_inference_outputs`.  It survives ``make_fx`` and stays in the
+    graph even when the training step discards the prediction (only the loss is
+    used), which is exactly the DLRMv3 case.
+    """
+    return mark_boundary(t, f"{_INFERENCE_OUTPUT_PREFIX}::output::{idx}")
+
+
+def marked_inference_outputs(
+    prefix: str = _INFERENCE_OUTPUT_PREFIX,
+) -> OutputSelector:
+    """Selector: every :func:`mark_inference_output` marker node, in graph order.
+
+    Returns the marker nodes themselves (identity ops) as the inference outputs;
+    the forward-cone prune then keeps only the prediction subgraph feeding them.
+    """
+
+    def _selector(gm: fx.GraphModule) -> list[fx.Node]:
+        outputs: list[fx.Node] = []
+        for node in gm.graph.nodes:
+            if (
+                node.op == OP.CALL_FUNCTION
+                and node.target is torch.ops.recir.mark_boundary.default
+                and len(node.args) >= 2
+                and isinstance(node.args[1], str)
+                and node.args[1].startswith(prefix)
+            ):
+                outputs.append(node)
+        return outputs
+
+    return _selector
 
 
 def inputs_to_ops(name_substrings: Iterable[str]) -> OutputSelector:

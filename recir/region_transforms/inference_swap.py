@@ -102,6 +102,44 @@ def identity_passthrough(region_gm: fx.GraphModule) -> Callable[..., Any]:
     return _apply
 
 
+def dtype_cast_matcher(dtype: torch.dtype = torch.bfloat16) -> OpMatcher:
+    """Op matcher for dtype-cast nodes whose target dtype is ``dtype``.
+
+    Pair with :func:`identity_passthrough` in ``custom_op_matchers`` to strip
+    training-only casts (e.g. the bf16 autocast DLRMv3 applies only when
+    ``not is_inference``) from the inference cone, so the fabricated graph runs
+    in the original (fp32) dtype that serving expects::
+
+        fabricate_inference_graph(
+            gm,
+            inference_outputs=marked_inference_outputs(),
+            custom_op_matchers=[(dtype_cast_matcher(), identity_passthrough)],
+        )
+
+    Only casts *to* ``dtype`` are matched; the inverse cast back to the original
+    dtype becomes a no-op (same-dtype cast) once the bf16 region is gone.
+    """
+    cast_targets: tuple[object, ...] = (
+        torch.ops.aten._to_copy.default,
+        torch.ops.aten.to.dtype,
+        torch.ops.aten.to.dtype_layout,
+        torch.ops.prims.convert_element_type.default,
+    )
+
+    def _matches(node: fx.Node) -> bool:
+        if node.op != OP.CALL_FUNCTION or node.target not in cast_targets:
+            return False
+        target_dtype = node.kwargs.get("dtype")
+        if target_dtype is None:
+            for arg in node.args[1:]:
+                if isinstance(arg, torch.dtype):
+                    target_dtype = arg
+                    break
+        return target_dtype is dtype
+
+    return _matches
+
+
 def _expose_input_factory(index: int) -> RegionFactory:
     """Factory that returns the region input at ``index`` (used by pruning)."""
 

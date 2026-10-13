@@ -25,6 +25,7 @@ from recir.region_transforms.dropout_prng import DropoutPRNGTransform
 from recir.region_transforms.inference_swap import (
     apply_inference_swaps,
     deterministic_argmax,
+    dtype_cast_matcher,
     identity_passthrough,
     InferenceSwapTransform,
 )
@@ -48,6 +49,7 @@ __all__ = [
     "InferenceSwapTransform",
     "apply_inference_swaps",
     "deterministic_argmax",
+    "dtype_cast_matcher",
     "identity_passthrough",
     "fabricate_inference_graph",
     "inputs_to_ops",
