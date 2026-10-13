@@ -106,5 +106,132 @@ class MiscTest(unittest.TestCase):
             self.assertEqual(a.shape[0], 4)
 
 
+class EmbeddingBagSegmentSumTest(unittest.TestCase):
+    """``_aten__embedding_bag`` passes ``indices_are_sorted=True`` to segment_sum.
+
+    That is a promise to the compiler, not a rewrite: if ``segment_ids`` were
+    ever unsorted the reduction would silently scatter into the wrong bags
+    rather than fail. The promise holds because ``searchsorted`` is monotone in
+    its query and ``clip`` preserves that, so this asserts the property
+    directly as well as checking the sums.
+    """
+
+    def test_segment_ids_are_sorted_and_sums_are_correct(self) -> None:
+        import jax.numpy as jnp
+        import numpy as np
+        import torch
+        from recir.torchax.ops.jaten import _aten__embedding_bag
+
+        rng = np.random.default_rng(3)
+        for n, num_bags, d in ((83200, 650, 16), (4096, 64, 8), (64, 8, 4)):
+            # multinomial gives ragged bags including empty ones
+            sizes = rng.multinomial(n, np.ones(num_bags) / num_bags)
+            off = np.concatenate([[0], np.cumsum(sizes)]).astype(np.int64)
+            weight = rng.standard_normal((500, d)).astype(np.float32)
+            idx = rng.integers(0, 500, size=n).astype(np.int64)
+
+            bag_offsets = jnp.asarray(off[:num_bags])
+            positions = jnp.arange(n, dtype=bag_offsets.dtype)
+            seg = jnp.clip(
+                jnp.searchsorted(bag_offsets, positions, side="right") - 1,
+                0,
+                num_bags - 1,
+            )
+            self.assertTrue(bool(jnp.all(jnp.diff(seg) >= 0)))
+
+            # All three modes carry indices_are_sorted=True, so all three are
+            # checked; mode 2 (max) reduces differently and would not be caught
+            # by the sum path.
+            for mode_id, mode_name in ((0, "sum"), (1, "mean"), (2, "max")):
+                out = np.asarray(
+                    _aten__embedding_bag(
+                        jnp.asarray(weight),
+                        jnp.asarray(idx),
+                        jnp.asarray(off[:num_bags]),
+                        mode=mode_id,
+                    )[0]
+                )
+                ref = np.asarray(
+                    torch.nn.functional.embedding_bag(
+                        torch.from_numpy(idx),
+                        torch.from_numpy(weight),
+                        torch.from_numpy(off[:num_bags]),
+                        mode=mode_name,
+                    )
+                )
+                # Empty bags are defined as 0 for sum/mean; max leaves them at
+                # the identity, which torch reports as 0 too.
+                np.testing.assert_allclose(
+                    out, ref, rtol=1e-5, atol=1e-5, err_msg=f"mode={mode_name}"
+                )
+
+
+class ZZTwoLevelSearchsorted(unittest.TestCase):
+    def test_matches_jnp_searchsorted(self) -> None:
+        import jax.numpy as jnp
+        import numpy as np
+        from recir.torchax.ops.jaten import (
+            _searchsorted,
+            _SEARCHSORTED_VECTORIZE_MAX_BINS,
+        )
+
+        cap = _SEARCHSORTED_VECTORIZE_MAX_BINS
+        rng = np.random.default_rng(17)
+        cases = [
+            ("prod shape", 32896, 313540),
+            ("just over cap", cap + 1, 1000),
+            ("exact power of two", 65536, 5000),
+            ("odd length", 20011, 777),
+        ]
+        for name, L, N in cases:
+            for dt in (np.int32, np.uint32, np.float32):
+                for side in ("left", "right"):
+                    base = np.sort(rng.integers(0, 4 * L, size=L)).astype(dt)
+                    # queries: in-range, below all, above all, and exact hits
+                    q = rng.integers(-5, 4 * L + 5, size=N).astype(dt)
+                    q[:50] = base[rng.integers(0, L, size=50)]  # exact matches
+                    if np.issubdtype(dt, np.signedinteger):
+                        q[50:60] = -1
+                    q[60:70] = 4 * L + 100
+                    # A query equal to the dtype max collides with the padding
+                    # sentinel; side="right" counted the pad before the clamp.
+                    q[70:80] = (
+                        np.iinfo(dt).max
+                        if np.issubdtype(dt, np.integer)
+                        else np.finfo(dt).max
+                    )
+                    a, v = jnp.asarray(base), jnp.asarray(q)
+                    got = np.asarray(_searchsorted(a, v, side))
+                    ref = np.asarray(jnp.searchsorted(a, v, side=side))
+                    bad = int((got != ref).sum())
+                    if bad:
+                        i = int(np.flatnonzero(got != ref)[0])
+                        print(
+                            f"  MISMATCH {name} {dt.__name__} {side}: n={bad} first@{i} got={got[i]} ref={ref[i]}"
+                        )
+                    self.assertEqual(bad, 0, f"{name}/{dt.__name__}/{side}")
+            print(f"  ok {name:20s} L={L:6d} N={N:6d}  (6 dtype x side combos)")
+
+    def test_duplicate_heavy_and_degenerate(self) -> None:
+        import jax.numpy as jnp
+        import numpy as np
+        from recir.torchax.ops.jaten import _searchsorted
+
+        rng = np.random.default_rng(23)
+        L, N = 32896, 4096
+        for name, base in (
+            ("all equal", np.full(L, 7, np.int32)),
+            ("two values", np.sort(rng.integers(0, 2, size=L)).astype(np.int32)),
+            ("heavy dupes", np.sort(rng.integers(0, 16, size=L)).astype(np.int32)),
+        ):
+            for side in ("left", "right"):
+                q = rng.integers(-2, 20, size=N).astype(np.int32)
+                a, v = jnp.asarray(base), jnp.asarray(q)
+                got = np.asarray(_searchsorted(a, v, side))
+                ref = np.asarray(jnp.searchsorted(a, v, side=side))
+                self.assertEqual(int((got != ref).sum()), 0, f"{name}/{side}")
+            print(f"  ok {name}")
+
+
 if __name__ == "__main__":
     unittest.main()
