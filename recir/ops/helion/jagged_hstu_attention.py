@@ -462,6 +462,60 @@ def _bwd_dv_impl(
     return dv
 
 
+def _bwd_dkv_impl(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    dout: torch.Tensor,
+    seq_offsets: torch.Tensor,
+    num_targets: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """dK and dV in one pass over the kv-outer/q-inner tile grid."""
+    H = hl.specialize(q.size(1))
+    D = hl.specialize(q.size(2))
+    num_sequences = seq_offsets.size(0) - 1
+    dk = torch.empty_like(k)  # tail zeroed by ``_zero_unvisited_tail``; see _fwd_impl.
+    dv = torch.empty_like(k)
+
+    for seq_idx in hl.grid(num_sequences):
+        start = seq_offsets[seq_idx]
+        end = seq_offsets[seq_idx + 1]
+        cap = end - num_targets[seq_idx]
+
+        for tile_kv in hl.tile(start, end):
+            k_blk = k[tile_kv, :, :].transpose(0, 1)  # [H, tile_kv, D]
+            v_blk = v[tile_kv, :, :].transpose(0, 1)  # [H, tile_kv, D]
+            acc_dk = hl.zeros([H, tile_kv, D], dtype=torch.float32)
+            acc_dv = hl.zeros([H, tile_kv, D], dtype=torch.float32)
+
+            for tile_q in hl.tile(start, end):
+                q_blk = q[tile_q, :, :].transpose(0, 1)  # [H, tile_q, D]
+                do_blk = dout[tile_q, :, :].transpose(0, 1)  # [H, tile_q, D]
+
+                # The one shared matmul: S^T = alpha * K @ Q^T  [H, tkv, tq]
+                s_t = torch.bmm(k_blk, q_blk.transpose(-2, -1))
+
+                n_idx = tile_kv.index.unsqueeze(1)
+                m_idx = tile_q.index.unsqueeze(0)
+                keep_t = ((m_idx >= n_idx) & (n_idx < cap)) | (m_idx == n_idx)
+
+                # dV += P^T @ (attn_scale dO), P^T = silu(S^T)
+                p_t = torch.where(keep_t[None, :, :], F.silu(s_t), 0.0)
+                acc_dv = acc_dv + torch.bmm(p_t.to(dout.dtype), do_blk)
+
+                # dK += dS^T @ (alpha Q), dS^T = (V @ dO_s^T) * silu'(S^T)
+                dp_t = torch.bmm(v_blk, do_blk.transpose(-2, -1))
+                sig = torch.sigmoid(s_t)
+                silu_grad = sig * (1.0 + s_t * (1.0 - sig))
+                ds_t = torch.where(keep_t[None, :, :], dp_t * silu_grad, 0.0)
+                acc_dk = acc_dk + torch.bmm(ds_t.to(q.dtype), q_blk)
+
+            dk[tile_kv, :, :] = acc_dk.transpose(0, 1).to(dk.dtype)
+            dv[tile_kv, :, :] = acc_dv.transpose(0, 1).to(dv.dtype)
+
+    return dk, dv
+
+
 # ---------------------------------------------------------------------------
 # Compiled kernels (one module-level object per kind).
 # ---------------------------------------------------------------------------
@@ -472,7 +526,9 @@ def _bwd_dv_impl(
 # into the PyCodeCache module key for backends caching shape-specific state (Pallas);
 # before it, the jax_fn export collapsed distinct widths onto the first-compiled
 # module because the jagged kernel emits byte-identical source for every width.
-def _make_kernel(impl: Callable[..., torch.Tensor]) -> Any:
+def _make_kernel(
+    impl: Callable[..., torch.Tensor | tuple[torch.Tensor, torch.Tensor]],
+) -> Any:
     return helion.kernel(
         backend="pallas",
         static_shapes=True,
@@ -484,6 +540,7 @@ jagged_hstu_attention: Any = _make_kernel(_fwd_impl)
 jagged_hstu_attention_bwd_dq: Any = _make_kernel(_bwd_dq_impl)
 jagged_hstu_attention_bwd_dk: Any = _make_kernel(_bwd_dk_impl)
 jagged_hstu_attention_bwd_dv: Any = _make_kernel(_bwd_dv_impl)
+jagged_hstu_attention_bwd_dkv: Any = _make_kernel(_bwd_dkv_impl)
 
 
 # ---------------------------------------------------------------------------
@@ -589,10 +646,9 @@ def hstu_ragged_attention_bwd_jax_fn(
     k_f = k * alpha
     nt = _num_targets_or_zeros(num_targets, batch, seq_offsets)
 
-    # dV: (alpha q, k, dO_s); dQ: (q, alpha k, v, dO_s); dK: (alpha q, k, v, dO_s).
-    dv = jagged_hstu_attention_bwd_dv.jax_fn(q_f, k, dout_s, seq_offsets, nt)
+    # dK+dV: (alpha q, k, v, dO_s); dQ: (q, alpha k, v, dO_s).
+    dk, dv = jagged_hstu_attention_bwd_dkv.jax_fn(q_f, k, v, dout_s, seq_offsets, nt)
     dq = jagged_hstu_attention_bwd_dq.jax_fn(q, k_f, v, dout_s, seq_offsets, nt)
-    dk = jagged_hstu_attention_bwd_dk.jax_fn(q_f, k, v, dout_s, seq_offsets, nt)
     return (
         _zero_unvisited_tail(dq, seq_offsets),
         _zero_unvisited_tail(dk, seq_offsets),
