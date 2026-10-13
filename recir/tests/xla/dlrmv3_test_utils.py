@@ -22,6 +22,7 @@ from generative_recommenders.modules.dlrm_hstu import (
 )
 from generative_recommenders.ops.jagged_tensors import concat_2D_jagged
 from recir.ops.eager_dispatch import install_graph_break_dispatch, mark_output_with_bwd
+from recir.region_transforms.training_to_inference import mark_inference_output
 from torchrec.modules.embedding_configs import EmbeddingConfig
 from torchrec.modules.embedding_modules import EmbeddingCollection
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
@@ -146,6 +147,11 @@ class DlrmV3Dense(nn.Module):
         super().__init__()
         self.model = model
         self.emb_keys = emb_keys
+        # When True, tag the multitask predictions with an inference-output
+        # marker so a training-step trace can be fabricated into an inference
+        # graph (see recir.region_transforms.training_to_inference).  Off by
+        # default so training / JAX / serving callers are unaffected.
+        self._mark_inference_outputs: bool = False
 
     def forward(
         self,
@@ -236,12 +242,17 @@ class DlrmV3Dense(nn.Module):
             ],
             task_configs=model._multitask_configs,
         )
-        _, _, _, mt_losses = model._multitask_module(
+        mt_preds, _, _, mt_losses = model._multitask_module(
             encoded_user_embeddings=candidates_user_embeddings,
             item_embeddings=candidates_item_embeddings,
             supervision_labels=supervision_labels,
             supervision_weights=supervision_weights,
         )
+        # ``mt_preds`` (slot 0) is the serving prediction (per-task sigmoid
+        # probs); training discards it and keeps only ``mt_losses``.  Tag it so
+        # a training-step trace can be fabricated into an inference graph.
+        if self._mark_inference_outputs:
+            mt_preds = mark_inference_output(mt_preds)
         aux_losses: Dict[str, torch.Tensor] = {}
         if not model._is_inference and model.training:
             for i, task in enumerate(model._multitask_configs):
