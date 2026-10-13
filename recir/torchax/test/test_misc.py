@@ -166,5 +166,72 @@ class EmbeddingBagSegmentSumTest(unittest.TestCase):
                 )
 
 
+class ZZTwoLevelSearchsorted(unittest.TestCase):
+    def test_matches_jnp_searchsorted(self) -> None:
+        import jax.numpy as jnp
+        import numpy as np
+        from recir.torchax.ops.jaten import (
+            _searchsorted,
+            _SEARCHSORTED_VECTORIZE_MAX_BINS,
+        )
+
+        cap = _SEARCHSORTED_VECTORIZE_MAX_BINS
+        rng = np.random.default_rng(17)
+        cases = [
+            ("prod shape", 32896, 313540),
+            ("just over cap", cap + 1, 1000),
+            ("exact power of two", 65536, 5000),
+            ("odd length", 20011, 777),
+        ]
+        for name, L, N in cases:
+            for dt in (np.int32, np.uint32, np.float32):
+                for side in ("left", "right"):
+                    base = np.sort(rng.integers(0, 4 * L, size=L)).astype(dt)
+                    # queries: in-range, below all, above all, and exact hits
+                    q = rng.integers(-5, 4 * L + 5, size=N).astype(dt)
+                    q[:50] = base[rng.integers(0, L, size=50)]  # exact matches
+                    if np.issubdtype(dt, np.signedinteger):
+                        q[50:60] = -1
+                    q[60:70] = 4 * L + 100
+                    # A query equal to the dtype max collides with the padding
+                    # sentinel; side="right" counted the pad before the clamp.
+                    q[70:80] = (
+                        np.iinfo(dt).max
+                        if np.issubdtype(dt, np.integer)
+                        else np.finfo(dt).max
+                    )
+                    a, v = jnp.asarray(base), jnp.asarray(q)
+                    got = np.asarray(_searchsorted(a, v, side))
+                    ref = np.asarray(jnp.searchsorted(a, v, side=side))
+                    bad = int((got != ref).sum())
+                    if bad:
+                        i = int(np.flatnonzero(got != ref)[0])
+                        print(
+                            f"  MISMATCH {name} {dt.__name__} {side}: n={bad} first@{i} got={got[i]} ref={ref[i]}"
+                        )
+                    self.assertEqual(bad, 0, f"{name}/{dt.__name__}/{side}")
+            print(f"  ok {name:20s} L={L:6d} N={N:6d}  (6 dtype x side combos)")
+
+    def test_duplicate_heavy_and_degenerate(self) -> None:
+        import jax.numpy as jnp
+        import numpy as np
+        from recir.torchax.ops.jaten import _searchsorted
+
+        rng = np.random.default_rng(23)
+        L, N = 32896, 4096
+        for name, base in (
+            ("all equal", np.full(L, 7, np.int32)),
+            ("two values", np.sort(rng.integers(0, 2, size=L)).astype(np.int32)),
+            ("heavy dupes", np.sort(rng.integers(0, 16, size=L)).astype(np.int32)),
+        ):
+            for side in ("left", "right"):
+                q = rng.integers(-2, 20, size=N).astype(np.int32)
+                a, v = jnp.asarray(base), jnp.asarray(q)
+                got = np.asarray(_searchsorted(a, v, side))
+                ref = np.asarray(jnp.searchsorted(a, v, side=side))
+                self.assertEqual(int((got != ref).sum()), 0, f"{name}/{side}")
+            print(f"  ok {name}")
+
+
 if __name__ == "__main__":
     unittest.main()
