@@ -88,6 +88,24 @@ def _dropout_op_targets() -> tuple[object, ...]:
     )
 
 
+def _identity_passthrough_apply(*inputs: Any) -> Any:
+    """Return the region's first input unchanged.
+
+    MODULE-LEVEL on purpose. This ends up as a ``call_function`` target in the
+    fabricated inference graph, and pickling a GraphModule pickles its node
+    targets by qualified name. As a closure (``identity_passthrough.<locals>.
+    _apply``) it has no importable path, so ``torch.save`` of a graph containing
+    it fails with::
+
+        ObjNotFoundError: <function identity_passthrough.<locals>._apply> was not
+        found as recir.region_transforms.inference_swap.identity_passthrough.
+        <locals>._apply
+
+    The closure captured nothing, so hoisting it is behaviour-preserving.
+    """
+    return inputs[0]
+
+
 def identity_passthrough(region_gm: fx.GraphModule) -> Callable[..., Any]:
     """Replacement factory: return the region's first input unchanged.
 
@@ -96,10 +114,7 @@ def identity_passthrough(region_gm: fx.GraphModule) -> Callable[..., Any]:
     semantic for "skip this tail tower and publish its upstream activations".
     """
 
-    def _apply(*inputs: Any) -> Any:
-        return inputs[0]
-
-    return _apply
+    return _identity_passthrough_apply
 
 
 def dtype_cast_matcher(dtype: torch.dtype = torch.bfloat16) -> OpMatcher:

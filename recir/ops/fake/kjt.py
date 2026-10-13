@@ -86,7 +86,11 @@ def _register_kjt_split_op() -> None:
         offsets: ``per_key_offsets[k] = offsets[k * stride]``.  Per-key value
         range is ``values[per_key_offsets[k]:per_key_offsets[k+1]]``.
         """
-        per_key_offsets = offsets[::stride]
+        # The graph may carry the stride captured during training. Derive the
+        # runtime value from the actual offsets so serving requests with a
+        # different batch size split correctly.
+        runtime_stride = (offsets.numel() - 1) // num_keys
+        per_key_offsets = offsets[::runtime_stride]
         # Citrine C6: batch the data-dependent boundaries into one D2H sync.
         host_offsets: List[int] = (
             _cuda_to_cpu_safe(per_key_offsets).tolist()
@@ -129,6 +133,30 @@ def _register_kjt_split_op() -> None:
             torch._check_is_size(sz)
             out.append(values.new_empty(sz))
         return out
+
+    @torch.library.custom_op("recir_torchrec::kjt_lengths_per_feature", mutates_args=())
+    def kjt_lengths_per_feature(
+        offsets: torch.Tensor,
+        num_keys: int,
+    ) -> List[torch.Tensor]:
+        """Split KJT lengths per feature using the runtime request stride."""
+        runtime_stride = (offsets.numel() - 1) // num_keys
+        flat_lengths = offsets[1:] - offsets[:-1]
+        return [
+            flat_lengths[k * runtime_stride : (k + 1) * runtime_stride].clone()
+            for k in range(num_keys)
+        ]
+
+    @kjt_lengths_per_feature.register_fake
+    def _(
+        offsets: torch.Tensor,
+        num_keys: int,
+    ) -> List[torch.Tensor]:
+        ctx = torch.library.get_ctx()
+        runtime_stride = ctx.new_dynamic_size()
+        torch._check_is_size(runtime_stride)
+        torch._check(runtime_stride > 0)
+        return [offsets.new_empty(runtime_stride) for _ in range(num_keys)]
 
     split_bags = torch.library.custom_op(
         "recir_torchrec::kjt_split_per_feature_with_offsets", mutates_args=()
@@ -243,15 +271,24 @@ def _traceable_ec_forward(
         "variable_stride_per_key KJTs are not supported by the traceable EC forward"
     )
     keys: List[str] = features.keys()
-    stride: int = features.stride()
     num_keys: int = len(keys)
     flat_lengths: torch.Tensor = features.lengths()
+    # Derive stride from a traced tensor dimension. KJT.stride() is a Python
+    # integer and make_fx would otherwise bake the training batch size into the
+    # inference graph, making a graph captured at batch N fail at serving batch 1.
+    stride = flat_lengths.size(0) // num_keys
 
     per_key_indices: List[torch.Tensor] = (
         torch.ops.recir_torchrec.kjt_split_per_feature(
             features.values(),
             features.offsets(),
             stride,
+            num_keys,
+        )
+    )
+    per_key_lengths: List[torch.Tensor] = (
+        torch.ops.recir_torchrec.kjt_lengths_per_feature(
+            features.offsets(),
             num_keys,
         )
     )
@@ -267,7 +304,7 @@ def _traceable_ec_forward(
             kjt_idx = key_to_idx[feat_name]
             indices = per_key_indices[kjt_idx]
             lookup = emb_module(indices)
-            feat_lengths = flat_lengths[kjt_idx * stride : (kjt_idx + 1) * stride]
+            feat_lengths = per_key_lengths[kjt_idx]
             out[emb_name] = JaggedTensor(values=lookup, lengths=feat_lengths)
     return out
 
