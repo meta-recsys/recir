@@ -199,6 +199,30 @@ class DedupGradsByIdTest(unittest.TestCase):
         np.testing.assert_allclose(np.array(compact_grad).sum(), 0.0)
 
 
+class CountPerPeerTest(unittest.TestCase):
+    """``_count_per_peer`` at the sizes the other tests do not reach.
+
+    The rest of the suite runs at ``n`` of about six, where a count that
+    accumulated in a narrow type would still be correct. At 534430 lookups over
+    128 peers -- the shape of a 64-chip step -- an int8 or int16 accumulator
+    would silently wrap, so the counts are checked against ``jnp.bincount``
+    there as well.
+    """
+
+    def test_matches_bincount_at_production_scale(self) -> None:
+        import numpy as np
+        from recir.ops.pallas.embeddings.ringshift import _count_per_peer
+
+        rng = np.random.default_rng(0)
+        for n, w in ((534430, 128), (267540, 128), (1000, 4)):
+            # w is the padding sentinel, so it must land in no bucket.
+            dest = jnp.asarray(rng.integers(0, w + 1, size=n).astype(np.int32))
+            np.testing.assert_array_equal(
+                np.asarray(_count_per_peer(dest, w)),
+                np.asarray(jnp.bincount(dest, length=w + 1)[:w].astype(jnp.int32)),
+            )
+
+
 class RoundUpTileTest(unittest.TestCase):
     def test_round_up_tile_basic(self) -> None:
         x = jnp.array([0, 1, 127, 128, 129, 256, 257], dtype=jnp.int32)
