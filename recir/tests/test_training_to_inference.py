@@ -24,10 +24,16 @@ from collections.abc import Callable
 import torch
 import torch.fx as fx
 import torch.nn as nn
-from recir.region_transforms.inference_swap import deterministic_argmax
+from recir.region_transforms.inference_swap import (
+    deterministic_argmax,
+    dtype_cast_matcher,
+    identity_passthrough,
+)
 from recir.region_transforms.training_to_inference import (
     fabricate_inference_graph,
     inputs_to_ops,
+    mark_inference_output,
+    marked_inference_outputs,
     select_inference_outputs,
     strip_collectives,
     strip_grad_tags,
@@ -370,3 +376,104 @@ class TestFabricateInferenceGraph(unittest.TestCase):
             out = gm(x)
             ref = torch.argmax(model.proj(x), dim=-1)
         torch.testing.assert_close(out, ref)
+
+
+# Models exercising marker-based inference-output selection (the DLRMv3 pattern:
+# the prediction is tagged but the *training* step returns only the loss).
+
+
+class PredAndLossNet(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.linear = nn.Linear(16, 4)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        pred = mark_inference_output(self.linear(x))
+        return pred.sum()  # training returns the loss; pred is otherwise unused
+
+
+class PredWithDropoutNet(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.linear = nn.Linear(16, 4)
+        self.dropout = nn.Dropout(p=0.5)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        pred = mark_inference_output(self.dropout(self.linear(x)))
+        return pred.sum()
+
+
+class MarkedInferenceOutputTest(unittest.TestCase):
+    def test_marker_selects_prediction_drops_loss(self) -> None:
+        model = PredAndLossNet()
+        x = torch.randn(4, 16)
+        gm = make_fx(model, pre_dispatch=True)(x)
+
+        fabricate_inference_graph(gm, inference_outputs=marked_inference_outputs())
+
+        # The loss reduction is dropped; the output is the marked prediction.
+        self.assertEqual(_count(gm, "sum"), 0)
+        with torch.no_grad():
+            out = gm(x)
+        torch.testing.assert_close(out[0], model.linear(x))
+
+    def test_dropout_removed_in_prediction_cone(self) -> None:
+        model = PredWithDropoutNet()
+        model.train()
+        x = torch.randn(4, 16)
+        gm = make_fx(model, pre_dispatch=True)(x)
+        self.assertGreater(_count(gm, "dropout"), 0)
+
+        fabricate_inference_graph(gm, inference_outputs=marked_inference_outputs())
+
+        self.assertEqual(_count(gm, "dropout"), 0)
+        with torch.no_grad():
+            out1 = gm(x)
+            out2 = gm(x)
+        # Deterministic (dropout gone) and equal to the eval-mode prediction.
+        torch.testing.assert_close(out1[0], out2[0])
+        torch.testing.assert_close(out1[0], model.linear(x))
+
+    def test_no_marker_selector_returns_empty(self) -> None:
+        model = Net()
+        model.train()
+        gm = make_fx(model, pre_dispatch=True)(torch.randn(4, 16))
+        self.assertEqual(marked_inference_outputs()(gm), [])
+
+
+class Bf16Net(nn.Module):
+    """Mimics DLRMv3's training-only bf16 autocast: cast in, compute, cast back."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.linear = nn.Linear(16, 4)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = self.linear(x).to(torch.bfloat16)
+        h = h * 2.0
+        pred = mark_inference_output(h.to(torch.float32))
+        return pred.sum()
+
+
+class Bf16CastMatcherTest(unittest.TestCase):
+    def _bf16_casts(self, gm: fx.GraphModule) -> int:
+        match = dtype_cast_matcher(torch.bfloat16)
+        return sum(1 for n in gm.graph.nodes if match(n))
+
+    def test_bf16_casts_stripped_restores_fp32(self) -> None:
+        model = Bf16Net()
+        x = torch.randn(4, 16)
+        gm = make_fx(model, pre_dispatch=True)(x)
+        self.assertGreater(self._bf16_casts(gm), 0)
+
+        fabricate_inference_graph(
+            gm,
+            inference_outputs=marked_inference_outputs(),
+            custom_op_matchers=[(dtype_cast_matcher(), identity_passthrough)],
+        )
+
+        # No bf16 cast remains; the prediction is the pure-fp32 computation.
+        self.assertEqual(self._bf16_casts(gm), 0)
+        with torch.no_grad():
+            out = gm(x)
+        torch.testing.assert_close(out[0], model.linear(x) * 2.0)
