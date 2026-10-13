@@ -250,8 +250,7 @@ def _bucketize_and_sort(
     sorted_ids = looked_up_ids[sort_perm]
     sorted_local_row = (sorted_ids // world_size).astype(jnp.int32)
 
-    bins = jnp.bincount(dest_rank, length=world_size + 1)
-    send_counts = bins[:world_size].astype(jnp.int32)
+    send_counts = _count_per_peer(dest_rank, world_size)
 
     return sorted_local_row, send_counts, sort_perm, reverse_perm
 
@@ -355,9 +354,7 @@ def _dedup_grads_by_id(
         .set(group_grad, mode="drop")
     )
     rep_dest = jnp.where(is_group_start, sorted_dest, world_size)
-    send_counts = jnp.bincount(rep_dest, length=world_size + 1)[:world_size].astype(
-        jnp.int32
-    )
+    send_counts = _count_per_peer(rep_dest, world_size)
     return compact_row, compact_grad, send_counts
 
 
@@ -397,6 +394,19 @@ def _peer_id_by_cumsum(exclusive_offsets: jax.Array, n: int) -> jax.Array:
         .add(1, mode="drop")
     )
     return jnp.cumsum(delta)
+
+
+def _count_per_peer(dest: jax.Array, world_size: int) -> jax.Array:
+    """``jnp.bincount(dest, length=world_size + 1)[:world_size]`` without the scatter.
+
+    ``bincount`` lowers to a scatter-add with one index per element, all
+    contending on ``world_size + 1`` slots. Comparing against each peer id and
+    reducing is the same count as a fixed-shape reduction. Ids at or above
+    ``world_size`` (the padding sentinel) match nothing and are dropped, as the
+    trailing slice does there.
+    """
+    peers = jnp.arange(world_size, dtype=dest.dtype)[:, None]
+    return (dest[None, :] == peers).sum(axis=1).astype(jnp.int32)
 
 
 def _peer_broadcast(per_peer: jax.Array, starts: jax.Array, n: int) -> jax.Array:
