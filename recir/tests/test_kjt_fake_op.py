@@ -203,6 +203,36 @@ class KjtSplitPerFeatureTest(unittest.TestCase):
             )
         self.assertEqual([tensor.numel() for tensor in out], [5, 1, 6])
 
+    def test_real_impl_uses_runtime_offsets_when_traced_stride_is_stale(self) -> None:
+        kjt = _make_kjt(
+            keys=["f0", "f1"],
+            per_key_lengths=[[2], [3]],
+            vocab_size=100,
+            seed=43,
+        )
+
+        out = torch.ops.recir_torchrec.kjt_split_per_feature(
+            kjt.values(), kjt.offsets(), 16, len(kjt.keys())
+        )
+
+        self.assertTrue(torch.equal(out[0], kjt.values()[0:2]))
+        self.assertTrue(torch.equal(out[1], kjt.values()[2:5]))
+
+    def test_real_lengths_impl_uses_runtime_stride(self) -> None:
+        kjt = _make_kjt(
+            keys=["f0", "f1"],
+            per_key_lengths=[[2], [3]],
+            vocab_size=100,
+            seed=44,
+        )
+
+        out = torch.ops.recir_torchrec.kjt_lengths_per_feature(
+            kjt.offsets(), len(kjt.keys())
+        )
+
+        torch.testing.assert_close(out[0], torch.tensor([2]))
+        torch.testing.assert_close(out[1], torch.tensor([3]))
+
     def test_fake_kernel_emits_symint_sizes(self) -> None:
         """Fake kernel produces tensors with SymInt-sized first dim."""
         with FakeTensorMode(shape_env=ShapeEnv()):
@@ -326,8 +356,8 @@ class PatchEcForTracingTest(unittest.TestCase):
         self.assertEqual(first, 1)
         self.assertEqual(second, 0)
 
-    def test_make_fx_fake_traces_patched_ec(self) -> None:
-        """Patched EC traces through make_fx(tracing_mode="fake") end-to-end."""
+    def test_make_fx_symbolic_trace_accepts_a_different_stride(self) -> None:
+        """The traced KJT split derives stride from each runtime input."""
         ec: EmbeddingCollection = _make_ec(
             table_to_features={"t0": ["f0"], "t1": ["f1"]},
             num_embeddings=16,
@@ -342,20 +372,39 @@ class PatchEcForTracingTest(unittest.TestCase):
             seed=11,
         )
 
-        def fwd(values: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
+        def fwd(
+            values: torch.Tensor, lengths: torch.Tensor
+        ) -> tuple[torch.Tensor, torch.Tensor]:
             inner_kjt = KeyedJaggedTensor(
                 keys=["f0", "f1"], values=values, lengths=lengths
             )
             out = ec(inner_kjt)
-            # Sum to a single tensor for a clean trace return.
-            return out["f0"].values().sum() + out["f1"].values().sum()
+            value_sum = out["f0"].values().sum() + out["f1"].values().sum()
+            stacked_lengths = torch.stack([out["f0"].lengths(), out["f1"].lengths()])
+            return value_sum, stacked_lengths
 
         expected = fwd(kjt.values(), kjt.lengths())
-        gm = make_fx(fwd, tracing_mode="fake", _allow_non_fake_inputs=True)(
+        gm = make_fx(fwd, tracing_mode="symbolic", _allow_non_fake_inputs=True)(
             kjt.values(), kjt.lengths()
         )
         actual = gm(kjt.values(), kjt.lengths())
         torch.testing.assert_close(actual, expected)
+        node_targets = [n.target for n in gm.graph.nodes if n.op == "call_function"]
+        self.assertIn(
+            torch.ops.recir_torchrec.kjt_lengths_per_feature.default,
+            node_targets,
+            "kjt_lengths_per_feature node should be in the traced graph",
+        )
+        single_stride_kjt = _make_kjt(
+            keys=["f0", "f1"],
+            per_key_lengths=[[2], [3]],
+            vocab_size=16,
+            seed=12,
+        )
+        torch.testing.assert_close(
+            gm(single_stride_kjt.values(), single_stride_kjt.lengths()),
+            fwd(single_stride_kjt.values(), single_stride_kjt.lengths()),
+        )
 
 
 class PatchEbcForTracingTest(unittest.TestCase):

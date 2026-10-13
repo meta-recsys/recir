@@ -33,6 +33,7 @@ already pulled transitively via parallel_mode -> xla_lower.)
 """
 
 import logging
+import os
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
@@ -74,6 +75,9 @@ IN_GRAPH_METRICS_ATTR: str = "_recir_in_graph_metrics"
 
 # ``flatten_batch(batch, global_loss_denom=...)`` -> the flat step args.
 FlattenBatch = Callable[..., Tuple[Any, ...]]
+# ``hook(train_gm, model, flat_batch)``, called once on the freshly traced train
+# graph before any graph dispatcher or backend rewrites it.
+PostTraceHook = Callable[[torch.fx.GraphModule, nn.Module, Sequence[Any]], None]
 
 
 class RecirMode(Enum):
@@ -222,6 +226,19 @@ def recir_train_step(
     batch_args: Tuple[Any, ...] = opts_and_batch[len(opts) :]
 
     all_losses, named_tensors = mod(*batch_args)
+    # Tag the prediction in the traced graph so fabricate_inference_graph can
+    # select it post-trace (identity at runtime, a mark_boundary clone). Marking
+    # here (not in the shared model forward) keeps it recir-specific and env-gated.
+    if (
+        os.environ.get("RECIR_PUBLISH_TRAINING_GRAPH") == "1"
+        and "prediction" in named_tensors
+    ):
+        from recir.region_transforms.training_to_inference import mark_inference_output
+
+        named_tensors = {
+            **named_tensors,
+            "prediction": mark_inference_output(named_tensors["prediction"]),
+        }
     loss: torch.Tensor = all_losses.sum()
     loss.backward()
     for opt in opts:
@@ -268,6 +285,7 @@ def compile_step(
     global_loss_denom: bool = True,
     flatten_batch: FlattenBatch,
     eval_step_fn: Optional[Callable[..., Any]] = None,
+    post_trace_hook: Optional[PostTraceHook] = None,
 ) -> Any:
     """Shared compile driver for BOTH modes (eager trace).
 
@@ -301,6 +319,9 @@ def compile_step(
     batch: the two share the model's parameters (and, on XLA, its device state).
     Returns ``(train_runner, eval_runner)`` then. ``region_transforms`` and
     ``pipeline_config`` apply to the train step only.
+
+    ``post_trace_hook`` only runs on the single-graph backend path (an explicit
+    ``backend`` and no ``eval_step_fn``).
     """
     model_to_train = (
         model.module if isinstance(model, DistributedModelParallel) else model
@@ -367,6 +388,8 @@ def compile_step(
         region_transforms=region_transforms,
         _tensor_attr_holders=tensor_attr_holders,
     )
+    if post_trace_hook is not None:
+        post_trace_hook(gm, model_to_train, flat_batch)
     for dispatcher in dispatchers:
         gm, flat_state = dispatcher.install_graph(gm, flat_state)
     compiled_obj = compile_from_gm(
@@ -389,6 +412,7 @@ def compile_hdp_step(
     *,
     flatten_batch: FlattenBatch,
     eval_step_fn: Optional[Callable[..., Any]] = None,
+    post_trace_hook: Optional[PostTraceHook] = None,
 ) -> Any:
     """Eager HDP_GPU compile: HybridParallel + InductorBackend via compile_step.
 
@@ -474,6 +498,7 @@ def compile_hdp_step(
         global_loss_denom=False,
         flatten_batch=flatten_batch,
         eval_step_fn=eval_step_fn,
+        post_trace_hook=post_trace_hook,
     )
 
 
