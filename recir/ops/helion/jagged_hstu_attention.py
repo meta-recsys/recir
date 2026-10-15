@@ -5,12 +5,13 @@
 
 # pyre-strict
 
-"""recir-owned, config-pinned Helion jagged HSTU attention (fwd + bwd + targets).
+"""recir-owned, config-pinned Helion jagged HSTU attention.
 
 A recir port of the official Helion example ``helion/examples/jagged_hstu_attn_2.py``
-(forward + dQ/dK/dV backward + target-aware masking). The reference, the
+(forward + dQ/dK/dV backward + target-aware masking). The causal reference, the
 ``_hstu_keep_mask``, the tiling, and the transposed dK/dV backward layout follow the
-official file; the only recir-specific adaptation is scale folding (below).
+official file; the recir-specific adaptations are scale folding and a fixed
+RankFM 256-local/256-full-tail specialization (below).
 
 Official math (per head, per sequence)::
 
@@ -61,7 +62,7 @@ recir ops' CompositeExplicitAutograd / Meta fallback, and (via its autograd,
 from __future__ import annotations
 
 import logging
-from typing import Any, Callable
+from typing import Any, Callable, Protocol
 
 import helion
 import helion.language as hl
@@ -92,6 +93,60 @@ PINNED_CONFIG: helion.Config = helion.Config(
     pallas_worklist_grouping=2,
     pallas_loop_type="emit_pipeline",
 )
+
+# RankFM's L1 stack uses this fixed semi-local attention shape.  Keep the
+# constants static: the Pallas compact-worklist builder requires the dependent
+# tile bounds below to be compile-time expressions rather than scalar kernel
+# arguments.  L2 still uses the ordinary causal kernels above.
+RANKFM_MAX_ATTN_LEN: int = 256
+RANKFM_FULL_ATTN_SIZE: int = 256
+SEMILOCAL_PINNED_CONFIG: helion.Config = helion.Config(
+    block_sizes=[256, 256, 256],
+    pallas_worklist_grouping=2,
+    pallas_loop_type="emit_pipeline",
+)
+
+
+class _TileLike(Protocol):
+    @property
+    def index(self) -> torch.Tensor: ...
+
+
+def use_semilocal_attention(max_attn_len: int, full_attn_size: int) -> bool:
+    """Select the causal or fixed RankFM semi-local kernel specialization."""
+    if max_attn_len == 0 and full_attn_size == 0:
+        return False
+    if max_attn_len == RANKFM_MAX_ATTN_LEN and full_attn_size == RANKFM_FULL_ATTN_SIZE:
+        return True
+    raise ValueError(
+        "Helion HSTU attention supports either causal attention "
+        "(max_attn_len=0, full_attn_size=0) or RankFM semi-local attention "
+        f"(max_attn_len={RANKFM_MAX_ATTN_LEN}, "
+        f"full_attn_size={RANKFM_FULL_ATTN_SIZE}); got "
+        f"max_attn_len={max_attn_len}, full_attn_size={full_attn_size}"
+    )
+
+
+def _semilocal_keep_mask(
+    tile_q: _TileLike,
+    tile_kv: _TileLike,
+    history_end: torch.Tensor,
+) -> torch.Tensor:
+    """Hammer's causal 256-local + 256-full-tail mask, including target rules."""
+    query = tile_q.index.unsqueeze(1)
+    key = tile_kv.index.unsqueeze(0)
+    # For short histories this falls before the sequence start, intentionally
+    # making every query use full causal attention over the available history.
+    full_start = history_end - RANKFM_FULL_ATTN_SIZE
+    history_key = key < history_end
+    local = (
+        (query >= key)
+        & (query - key <= RANKFM_MAX_ATTN_LEN)
+        & (query < full_start)
+        & history_key
+    )
+    full = (query >= key) & (query >= full_start) & history_key
+    return local | full | (query == key)
 
 
 # ---------------------------------------------------------------------------
@@ -516,6 +571,190 @@ def _bwd_dkv_impl(
     return dk, dv
 
 
+def _semilocal_fwd_impl(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    seq_offsets: torch.Tensor,
+    num_targets: torch.Tensor,
+) -> torch.Tensor:
+    """RankFM 256-local/256-full-tail forward, using two sparse KV ranges."""
+    H = hl.specialize(q.size(1))
+    D = hl.specialize(q.size(2))
+    num_sequences = seq_offsets.size(0) - 1
+    max_attn_len = RANKFM_MAX_ATTN_LEN
+    full_attn_size = RANKFM_FULL_ATTN_SIZE
+    out = torch.empty_like(v)
+
+    for seq_idx in hl.grid(num_sequences):
+        start = seq_offsets[seq_idx]
+        end = seq_offsets[seq_idx + 1]
+        history_end = end - num_targets[seq_idx]
+        full_start = history_end - full_attn_size
+
+        for tile_q in hl.tile(start, end):
+            q_blk = q[tile_q, :, :].transpose(0, 1)
+            acc = hl.zeros([H, tile_q, D], dtype=torch.float32)
+            local_begin = max(start, tile_q.begin - max_attn_len)
+
+            # A query tile overlapping the full-attention tail also needs the
+            # older prefix excluded by its ordinary sliding-window range.
+            # ``tile_q.end`` is exclusive, so equality is still before the tail.
+            if tile_q.end > full_start:
+                for tile_far in hl.tile(start, local_begin):
+                    k_blk = k[tile_far, :, :].transpose(0, 1)
+                    v_blk = v[tile_far, :, :].transpose(0, 1)
+                    scores = F.silu(torch.bmm(q_blk, k_blk.transpose(-2, -1)))
+                    keep = _semilocal_keep_mask(tile_q, tile_far, history_end)
+                    scores = torch.where(keep[None, :, :], scores, 0.0)
+                    acc = acc + torch.bmm(scores.to(v.dtype), v_blk)
+
+            for tile_kv in hl.tile(local_begin, min(end, tile_q.end)):
+                k_blk = k[tile_kv, :, :].transpose(0, 1)
+                v_blk = v[tile_kv, :, :].transpose(0, 1)
+                scores = F.silu(torch.bmm(q_blk, k_blk.transpose(-2, -1)))
+                keep = _semilocal_keep_mask(tile_q, tile_kv, history_end)
+                scores = torch.where(keep[None, :, :], scores, 0.0)
+                acc = acc + torch.bmm(scores.to(v.dtype), v_blk)
+
+            out[tile_q, :, :] = acc.transpose(0, 1).to(out.dtype)
+
+    return out
+
+
+def _semilocal_bwd_dq_impl(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    dout: torch.Tensor,
+    seq_offsets: torch.Tensor,
+    num_targets: torch.Tensor,
+) -> torch.Tensor:
+    """RankFM semi-local dQ, with the same two sparse KV ranges as forward."""
+    H = hl.specialize(q.size(1))
+    D = hl.specialize(q.size(2))
+    num_sequences = seq_offsets.size(0) - 1
+    max_attn_len = RANKFM_MAX_ATTN_LEN
+    full_attn_size = RANKFM_FULL_ATTN_SIZE
+    dq = torch.empty_like(q)
+
+    for seq_idx in hl.grid(num_sequences):
+        start = seq_offsets[seq_idx]
+        end = seq_offsets[seq_idx + 1]
+        history_end = end - num_targets[seq_idx]
+        full_start = history_end - full_attn_size
+
+        for tile_q in hl.tile(start, end):
+            q_blk = q[tile_q, :, :].transpose(0, 1)
+            do_blk = dout[tile_q, :, :].transpose(0, 1)
+            acc_dq = hl.zeros([H, tile_q, D], dtype=torch.float32)
+            local_begin = max(start, tile_q.begin - max_attn_len)
+
+            # ``tile_q.end`` is exclusive, so equality is still before the
+            # full-attention tail and the far-prefix mask would keep no entries.
+            if tile_q.end > full_start:
+                for tile_far in hl.tile(start, local_begin):
+                    k_blk = k[tile_far, :, :].transpose(0, 1)
+                    v_blk = v[tile_far, :, :].transpose(0, 1)
+                    s = torch.bmm(q_blk, k_blk.transpose(-2, -1))
+                    dp = torch.bmm(do_blk, v_blk.transpose(-2, -1))
+                    sig = torch.sigmoid(s)
+                    ds = dp * sig * (1.0 + s * (1.0 - sig))
+                    keep = _semilocal_keep_mask(tile_q, tile_far, history_end)
+                    ds = torch.where(keep[None, :, :], ds, 0.0)
+                    acc_dq = acc_dq + torch.bmm(ds.to(k.dtype), k_blk)
+
+            for tile_kv in hl.tile(local_begin, min(end, tile_q.end)):
+                k_blk = k[tile_kv, :, :].transpose(0, 1)
+                v_blk = v[tile_kv, :, :].transpose(0, 1)
+                s = torch.bmm(q_blk, k_blk.transpose(-2, -1))
+                dp = torch.bmm(do_blk, v_blk.transpose(-2, -1))
+                sig = torch.sigmoid(s)
+                ds = dp * sig * (1.0 + s * (1.0 - sig))
+                keep = _semilocal_keep_mask(tile_q, tile_kv, history_end)
+                ds = torch.where(keep[None, :, :], ds, 0.0)
+                acc_dq = acc_dq + torch.bmm(ds.to(k.dtype), k_blk)
+
+            dq[tile_q, :, :] = acc_dq.transpose(0, 1).to(dq.dtype)
+
+    return dq
+
+
+def _semilocal_bwd_dk_dv_impl(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    dout: torch.Tensor,
+    seq_offsets: torch.Tensor,
+    num_targets: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """RankFM semi-local fused dK/dV with KV tiles as the single writers."""
+    H = hl.specialize(q.size(1))
+    D = hl.specialize(q.size(2))
+    num_sequences = seq_offsets.size(0) - 1
+    max_attn_len = RANKFM_MAX_ATTN_LEN
+    full_attn_size = RANKFM_FULL_ATTN_SIZE
+    dk = torch.empty_like(k)
+    dv = torch.empty_like(v)
+
+    for seq_idx in hl.grid(num_sequences):
+        start = seq_offsets[seq_idx]
+        end = seq_offsets[seq_idx + 1]
+        history_end = end - num_targets[seq_idx]
+        full_start = history_end - full_attn_size
+
+        for tile_kv in hl.tile(start, end):
+            k_blk = k[tile_kv, :, :].transpose(0, 1)
+            v_blk = v[tile_kv, :, :].transpose(0, 1)
+            acc_dk = hl.zeros([H, tile_kv, D], dtype=torch.float32)
+            acc_dv = hl.zeros([H, tile_kv, D], dtype=torch.float32)
+
+            # Before the full tail, this key is visible only to its causal local
+            # query window.  The exact mask handles the two boundary tiles.
+            if tile_kv.begin < full_start:
+                for tile_local_q in hl.tile(
+                    max(start, tile_kv.begin),
+                    min(full_start, tile_kv.end + max_attn_len),
+                ):
+                    q_blk = q[tile_local_q, :, :].transpose(0, 1)
+                    do_blk = dout[tile_local_q, :, :].transpose(0, 1)
+                    s_t = torch.bmm(k_blk, q_blk.transpose(-2, -1))
+                    dp_t = torch.bmm(v_blk, do_blk.transpose(-2, -1))
+                    sig = torch.sigmoid(s_t)
+                    p_t = s_t * sig
+                    ds_t = dp_t * sig * (1.0 + s_t * (1.0 - sig))
+                    keep_t = _semilocal_keep_mask(
+                        tile_local_q, tile_kv, history_end
+                    ).transpose(0, 1)
+                    p_t = torch.where(keep_t[None, :, :], p_t, 0.0)
+                    ds_t = torch.where(keep_t[None, :, :], ds_t, 0.0)
+                    acc_dk = acc_dk + torch.bmm(ds_t.to(q.dtype), q_blk)
+                    acc_dv = acc_dv + torch.bmm(p_t.to(dout.dtype), do_blk)
+
+            # Queries in the full-attention tail (including targets) can see all
+            # history keys; target keys remain diagonal-only through the mask.
+            for tile_full_q in hl.tile(max(full_start, tile_kv.begin), end):
+                q_blk = q[tile_full_q, :, :].transpose(0, 1)
+                do_blk = dout[tile_full_q, :, :].transpose(0, 1)
+                s_t = torch.bmm(k_blk, q_blk.transpose(-2, -1))
+                dp_t = torch.bmm(v_blk, do_blk.transpose(-2, -1))
+                sig = torch.sigmoid(s_t)
+                p_t = s_t * sig
+                ds_t = dp_t * sig * (1.0 + s_t * (1.0 - sig))
+                keep_t = _semilocal_keep_mask(
+                    tile_full_q, tile_kv, history_end
+                ).transpose(0, 1)
+                p_t = torch.where(keep_t[None, :, :], p_t, 0.0)
+                ds_t = torch.where(keep_t[None, :, :], ds_t, 0.0)
+                acc_dk = acc_dk + torch.bmm(ds_t.to(q.dtype), q_blk)
+                acc_dv = acc_dv + torch.bmm(p_t.to(dout.dtype), do_blk)
+
+            dk[tile_kv, :, :] = acc_dk.transpose(0, 1).to(dk.dtype)
+            dv[tile_kv, :, :] = acc_dv.transpose(0, 1).to(dv.dtype)
+
+    return dk, dv
+
+
 # ---------------------------------------------------------------------------
 # Compiled kernels (one module-level object per kind).
 # ---------------------------------------------------------------------------
@@ -528,11 +767,13 @@ def _bwd_dkv_impl(
 # module because the jagged kernel emits byte-identical source for every width.
 def _make_kernel(
     impl: Callable[..., torch.Tensor | tuple[torch.Tensor, torch.Tensor]],
+    *,
+    config: helion.Config = PINNED_CONFIG,
 ) -> Any:
     return helion.kernel(
         backend="pallas",
         static_shapes=True,
-        config=PINNED_CONFIG,
+        config=config,
     )(impl)
 
 
@@ -541,6 +782,15 @@ jagged_hstu_attention_bwd_dq: Any = _make_kernel(_bwd_dq_impl)
 jagged_hstu_attention_bwd_dk: Any = _make_kernel(_bwd_dk_impl)
 jagged_hstu_attention_bwd_dv: Any = _make_kernel(_bwd_dv_impl)
 jagged_hstu_attention_bwd_dkv: Any = _make_kernel(_bwd_dkv_impl)
+semilocal_hstu_attention: Any = _make_kernel(
+    _semilocal_fwd_impl, config=SEMILOCAL_PINNED_CONFIG
+)
+semilocal_hstu_attention_bwd_dq: Any = _make_kernel(
+    _semilocal_bwd_dq_impl, config=SEMILOCAL_PINNED_CONFIG
+)
+semilocal_hstu_attention_bwd_dk_dv: Any = _make_kernel(
+    _semilocal_bwd_dk_dv_impl, config=SEMILOCAL_PINNED_CONFIG
+)
 
 
 # ---------------------------------------------------------------------------
@@ -587,6 +837,8 @@ def hstu_ragged_attention_fwd_jax_fn(
     seq_offsets: Any,
     num_targets: Any,
     attn_scale: Any,
+    max_attn_len: int = 0,
+    full_attn_size: int = 0,
 ) -> tuple[Any, Any]:
     """Pure-JAX forward: fold scales, run the jagged kernel directly.
 
@@ -612,7 +864,10 @@ def hstu_ragged_attention_fwd_jax_fn(
 
     nt = _num_targets_or_zeros(num_targets, batch, seq_offsets)
 
-    out = jagged_hstu_attention.jax_fn(q_scaled, k, v_scaled, seq_offsets, nt)
+    if use_semilocal_attention(max_attn_len, full_attn_size):
+        out = semilocal_hstu_attention.jax_fn(q_scaled, k, v_scaled, seq_offsets, nt)
+    else:
+        out = jagged_hstu_attention.jax_fn(q_scaled, k, v_scaled, seq_offsets, nt)
     out = _zero_unvisited_tail(out, seq_offsets)
     dummy_M = jnp.zeros((1,), dtype=jnp.float32)
     return out, dummy_M
@@ -628,8 +883,10 @@ def hstu_ragged_attention_bwd_jax_fn(
     attn_scale: Any,
     N: int,
     alpha: float,
+    max_attn_len: int = 0,
+    full_attn_size: int = 0,
 ) -> tuple[Any, Any, Any]:
-    """Pure-JAX backward: fold scales, run the 3 jagged kernels directly.
+    """Pure-JAX backward: fold scales, run the selected jagged kernels directly.
 
     Jagged ``[L, H, D]`` + ``[B+1]`` ``seq_offsets`` layout (see the forward).
     Returns ``(dq, dk, dv)`` w.r.t. the ORIGINAL q/k/v at the inputs' own ``L`` --
@@ -646,9 +903,17 @@ def hstu_ragged_attention_bwd_jax_fn(
     k_f = k * alpha
     nt = _num_targets_or_zeros(num_targets, batch, seq_offsets)
 
-    # dK+dV: (alpha q, k, v, dO_s); dQ: (q, alpha k, v, dO_s).
-    dk, dv = jagged_hstu_attention_bwd_dkv.jax_fn(q_f, k, v, dout_s, seq_offsets, nt)
-    dq = jagged_hstu_attention_bwd_dq.jax_fn(q, k_f, v, dout_s, seq_offsets, nt)
+    # Both modes fuse dK/dV over their shared transposed query ranges.
+    if use_semilocal_attention(max_attn_len, full_attn_size):
+        dq = semilocal_hstu_attention_bwd_dq.jax_fn(q, k_f, v, dout_s, seq_offsets, nt)
+        dk, dv = semilocal_hstu_attention_bwd_dk_dv.jax_fn(
+            q_f, k, v, dout_s, seq_offsets, nt
+        )
+    else:
+        dk, dv = jagged_hstu_attention_bwd_dkv.jax_fn(
+            q_f, k, v, dout_s, seq_offsets, nt
+        )
+        dq = jagged_hstu_attention_bwd_dq.jax_fn(q, k_f, v, dout_s, seq_offsets, nt)
     return (
         _zero_unvisited_tail(dq, seq_offsets),
         _zero_unvisited_tail(dk, seq_offsets),
@@ -785,32 +1050,34 @@ def clear_pad_seqs_per_device() -> None:
 # path warm the Helion kernels for exactly those shapes AFTER the trace and BEFORE
 # the first XLA lower, because Helion compile cannot nest inside the lower's tracer.
 # Only (int, dtype) tuples are stored. N is max_seq_len (the per-sequence pad
-# width), distinct from L = total ragged tokens.
-_TRACED_FWD_SIGS: set[tuple[int, int, int, int, int, torch.dtype]] = set()
-_TRACED_BWD_SIGS: set[tuple[int, int, int, int, int, torch.dtype]] = set()
+# width), distinct from L = total ragged tokens; the two attention-window ints
+# select the causal or RankFM semi-local kernel family.
+_TracedSig = tuple[int, int, int, int, int, int, int, torch.dtype]
+_TRACED_FWD_SIGS: set[_TracedSig] = set()
+_TRACED_BWD_SIGS: set[_TracedSig] = set()
 
 
 def record_traced_fwd_sig(
-    sig: tuple[int, int, int, int, int, torch.dtype],
+    sig: _TracedSig,
 ) -> None:
-    """Record a forward ``(L, H, D, B, N, dtype)`` sig seen during the trace."""
+    """Record ``(L,H,D,B,N,max_attn,full_attn,dtype)`` from the trace."""
     _TRACED_FWD_SIGS.add(sig)
 
 
 def record_traced_bwd_sig(
-    sig: tuple[int, int, int, int, int, torch.dtype],
+    sig: _TracedSig,
 ) -> None:
-    """Record a backward ``(L, H, D, B, N, dtype)`` sig seen during the trace."""
+    """Record ``(L,H,D,B,N,max_attn,full_attn,dtype)`` from the trace."""
     _TRACED_BWD_SIGS.add(sig)
 
 
-def get_traced_fwd_sigs() -> set[tuple[int, int, int, int, int, torch.dtype]]:
-    """Forward ``(L, H, D, B, N, dtype)`` sigs recorded during the make_fx trace."""
+def get_traced_fwd_sigs() -> set[_TracedSig]:
+    """Forward signatures recorded during the make_fx trace."""
     return set(_TRACED_FWD_SIGS)
 
 
-def get_traced_bwd_sigs() -> set[tuple[int, int, int, int, int, torch.dtype]]:
-    """Backward ``(L, H, D, B, N, dtype)`` sigs recorded during the make_fx trace."""
+def get_traced_bwd_sigs() -> set[_TracedSig]:
+    """Backward signatures recorded during the make_fx trace."""
     return set(_TRACED_BWD_SIGS)
 
 
@@ -886,6 +1153,8 @@ def sample_sharded_hstu_fwd_jax(
     attn_scale: Any,
     world_size: int,
     mesh: Any,
+    max_attn_len: int = 0,
+    full_attn_size: int = 0,
     run_kernel: Callable[..., Any] | None = None,
 ) -> Any:
     """Shard-local sample-sharded forward (see the section comment above).
@@ -905,7 +1174,18 @@ def sample_sharded_hstu_fwd_jax(
     from jax.sharding import PartitionSpec as P
 
     def _default_runner(q_: Any, k_: Any, v_: Any, so_: Any, nt_: Any, sc_: Any) -> Any:
-        out, _m = hstu_ragged_attention_fwd_jax_fn(N, alpha, q_, k_, v_, so_, nt_, sc_)
+        out, _m = hstu_ragged_attention_fwd_jax_fn(
+            N,
+            alpha,
+            q_,
+            k_,
+            v_,
+            so_,
+            nt_,
+            sc_,
+            max_attn_len,
+            full_attn_size,
+        )
         return out
 
     runner: Callable[..., Any] = _default_runner if run_kernel is None else run_kernel
@@ -964,6 +1244,8 @@ def sample_sharded_hstu_bwd_jax(
     alpha: float,
     world_size: int,
     mesh: Any,
+    max_attn_len: int = 0,
+    full_attn_size: int = 0,
     run_kernel: Callable[..., Any] | None = None,
 ) -> tuple[Any, Any, Any]:
     """Shard-local sample-sharded backward (see the section comment above).
@@ -982,7 +1264,17 @@ def sample_sharded_hstu_bwd_jax(
         do_: Any, q_: Any, k_: Any, v_: Any, so_: Any, nt_: Any, sc_: Any
     ) -> tuple[Any, Any, Any]:
         return hstu_ragged_attention_bwd_jax_fn(
-            do_, q_, k_, v_, so_, nt_, sc_, N, alpha
+            do_,
+            q_,
+            k_,
+            v_,
+            so_,
+            nt_,
+            sc_,
+            N,
+            alpha,
+            max_attn_len,
+            full_attn_size,
         )
 
     runner: Callable[..., Any] = _default_runner if run_kernel is None else run_kernel
@@ -1106,6 +1398,8 @@ def warmup_fwd(
     seq_offsets: torch.Tensor,
     num_targets: torch.Tensor | None = None,
     dtype: torch.dtype | None = None,
+    max_attn_len: int = 0,
+    full_attn_size: int = 0,
 ) -> None:
     """Pre-compile + run the forward the way the compiled step runs it.
 
@@ -1131,6 +1425,8 @@ def warmup_fwd(
             None,
             1,
             _warm_mesh(),
+            max_attn_len=max_attn_len,
+            full_attn_size=full_attn_size,
         )
     )
 
@@ -1142,8 +1438,10 @@ def warmup_bwd(
     seq_offsets: torch.Tensor,
     num_targets: torch.Tensor | None = None,
     dtype: torch.dtype | None = None,
+    max_attn_len: int = 0,
+    full_attn_size: int = 0,
 ) -> None:
-    """Pre-compile + run the three backward kernels the way the step runs them.
+    """Pre-compile + run the backward kernels the way the step runs them.
 
     Same FULL-group ``seq_offsets``/``num_targets`` contract as ``warmup_fwd``.
     """
@@ -1162,6 +1460,8 @@ def warmup_bwd(
             1.0,
             1,
             _warm_mesh(),
+            max_attn_len=max_attn_len,
+            full_attn_size=full_attn_size,
         )
     )
 
@@ -1176,11 +1476,13 @@ def warm_traced_hstu_kernels(world_size: int) -> None:
     ``set_pad_seqs_per_device`` to have run, since the warm must synthesize the POST
     pad-row-drop shapes.
 
-    Warms one kernel per distinct ``(l_local, H, D, b_local, dtype)``. ``N``
-    stays out of the dedup key but its max is used as the per-sample
-    cap, so each warm goes through ``sample_sharded_hstu_*_jax`` on a one-device mesh
-    and exercises the runtime CALL SITE -- pad-row drop, ``local_offsets`` ending
-    short of ``l_local``, Mosaic call inside a ``shard_map`` -- not just the shapes.
+    Warms one kernel per distinct
+    ``(l_local, H, D, b_local, max_attn_len, full_attn_size, dtype)`` (for udd_fm,
+    semi-local L1 + causal L2). ``N`` stays out of the dedup key but its max is used
+    as the per-sample cap, so each warm goes through
+    ``sample_sharded_hstu_*_jax`` on a one-device mesh and exercises the runtime
+    CALL SITE -- pad-row drop, ``local_offsets`` ending short of ``l_local``,
+    Mosaic call inside a ``shard_map`` -- not just the shapes.
 
     Each warm is best-effort: a failure logs and leaves that shape to compile lazily
     rather than hard-failing the build.
@@ -1224,18 +1526,15 @@ def warm_traced_hstu_kernels(world_size: int) -> None:
         return qkv, seq_offsets, num_targets
 
     def _distinct_shapes(
-        sigs: set[tuple[int, int, int, int, int, torch.dtype]],
-    ) -> list[tuple[int, int, int, int, int, torch.dtype]]:
-        # One warm per distinct (l_local, H, D, b_local, dtype): static_shapes keys on
-        # shape, so distinct l_local (L1/L2 differ in L) each warm their own kernel.
-        # N stays out of the dedup key (the jagged kernel runs at its own L) but its
-        # MAX is carried through: it is the per-sample cap the synthesized real rows
-        # use, so the warm runs the worst-case per-sequence range the step can hand
-        # the kernel. str(dtype) keeps the sort key orderable.
-        shapes: dict[
-            tuple[int, int, int, int, str], tuple[int, int, int, int, int, torch.dtype]
-        ] = {}
-        for L, H, D, B, N, dtype in sigs:
+        sigs: set[_TracedSig],
+    ) -> list[_TracedSig]:
+        # One warm per distinct shape, dtype, and attention mode. static_shapes keys
+        # on shape, while the mode selects a different module-level kernel. N stays
+        # out of the dedup key (the jagged kernel runs at its own L) but its MAX is
+        # carried through as the synthesized real-row cap. str(dtype) keeps the sort
+        # key orderable.
+        shapes: dict[tuple[int, int, int, int, int, int, str], _TracedSig] = {}
+        for L, H, D, B, N, max_attn_len, full_attn_size, dtype in sigs:
             assert B == _PADDED_NUM_SEQS, (
                 f"jagged HSTU sample-shard: traced num_sequences B={B} != the "
                 f"padded_bs={_PADDED_NUM_SEQS} that set_pad_seqs_per_device() "
@@ -1245,7 +1544,15 @@ def warm_traced_hstu_kernels(world_size: int) -> None:
             )
             l_local = L // ws
             b_local = B // ws
-            key = (l_local, H, D, b_local, str(dtype))
+            key = (
+                l_local,
+                H,
+                D,
+                b_local,
+                max_attn_len,
+                full_attn_size,
+                str(dtype),
+            )
             prev = shapes.get(key)
             shapes[key] = (
                 l_local,
@@ -1253,24 +1560,46 @@ def warm_traced_hstu_kernels(world_size: int) -> None:
                 D,
                 b_local,
                 N if prev is None else max(N, prev[4]),
+                max_attn_len,
+                full_attn_size,
                 dtype,
             )
         return [shapes[key] for key in sorted(shapes)]
 
-    for l_local, H, D, b_local, n_max, dtype in _distinct_shapes(get_traced_fwd_sigs()):
+    for (
+        l_local,
+        H,
+        D,
+        b_local,
+        n_max,
+        max_attn_len,
+        full_attn_size,
+        dtype,
+    ) in _distinct_shapes(get_traced_fwd_sigs()):
         try:
             qkv, seq_offsets, num_targets = _synth(l_local, H, D, b_local, n_max, dtype)
-            warmup_fwd(qkv, qkv, qkv, seq_offsets, num_targets, dtype=dtype)
+            warmup_fwd(
+                qkv,
+                qkv,
+                qkv,
+                seq_offsets,
+                num_targets,
+                dtype=dtype,
+                max_attn_len=max_attn_len,
+                full_attn_size=full_attn_size,
+            )
             logger.info(
                 "[HELION] warmed fwd kernel for per-device shape "
                 f"(l_local={l_local}, H={H}, D={D}, num_sequences={b_local}, "
-                f"max_seq_len={n_max}, dtype={dtype})"
+                f"max_seq_len={n_max}, max_attn_len={max_attn_len}, "
+                f"full_attn_size={full_attn_size}, dtype={dtype})"
             )
         except Exception as e:
             logger.error(
                 "[HELION] fwd warm FAILED for per-device shape "
                 f"(l_local={l_local}, H={H}, D={D}, num_sequences={b_local}, "
-                f"max_seq_len={n_max}, dtype={dtype}): {e}\n"
+                f"max_seq_len={n_max}, max_attn_len={max_attn_len}, "
+                f"full_attn_size={full_attn_size}, dtype={dtype}): {e}\n"
                 "  On the divide-on-B sharded (TPU) path this is effectively FATAL: "
                 "the kernel will instead compile lazily INSIDE the jax lower tracer, "
                 "which fails with 'SymIntArrayRef expected to contain only concrete "
@@ -1279,20 +1608,40 @@ def warm_traced_hstu_kernels(world_size: int) -> None:
                 "exceeds the scoped cap)."
             )
 
-    for l_local, H, D, b_local, n_max, dtype in _distinct_shapes(get_traced_bwd_sigs()):
+    for (
+        l_local,
+        H,
+        D,
+        b_local,
+        n_max,
+        max_attn_len,
+        full_attn_size,
+        dtype,
+    ) in _distinct_shapes(get_traced_bwd_sigs()):
         try:
             qkv, seq_offsets, num_targets = _synth(l_local, H, D, b_local, n_max, dtype)
-            warmup_bwd(qkv, qkv, qkv, seq_offsets, num_targets, dtype=dtype)
+            warmup_bwd(
+                qkv,
+                qkv,
+                qkv,
+                seq_offsets,
+                num_targets,
+                dtype=dtype,
+                max_attn_len=max_attn_len,
+                full_attn_size=full_attn_size,
+            )
             logger.info(
                 "[HELION] warmed bwd kernels for per-device shape "
                 f"(l_local={l_local}, H={H}, D={D}, num_sequences={b_local}, "
-                f"max_seq_len={n_max}, dtype={dtype})"
+                f"max_seq_len={n_max}, max_attn_len={max_attn_len}, "
+                f"full_attn_size={full_attn_size}, dtype={dtype})"
             )
         except Exception as e:
             logger.error(
                 "[HELION] bwd warm FAILED for per-device shape "
                 f"(l_local={l_local}, H={H}, D={D}, num_sequences={b_local}, "
-                f"max_seq_len={n_max}, dtype={dtype}): {e}\n"
+                f"max_seq_len={n_max}, max_attn_len={max_attn_len}, "
+                f"full_attn_size={full_attn_size}, dtype={dtype}): {e}\n"
                 "  On the divide-on-B sharded (TPU) path this is effectively FATAL: "
                 "the kernel will instead compile lazily INSIDE the jax lower tracer, "
                 "which fails with 'SymIntArrayRef expected to contain only concrete "
