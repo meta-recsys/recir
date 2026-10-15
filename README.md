@@ -142,9 +142,9 @@ recir/
 The overall project is made possible thanks to the joint work from many technical contributors (listed in alphabetical order):
 
 Shakhzod Ali-Zade, Qingyun Bian, Zheyuan Chen, Cao Gao,
-Daisy Shi He, Guxin Jin, Han Li, Shen Li, Chloe Liu, Dunfan Lu, Melody Lui,
-Pierson Lund, Linjian Ma, Yuheng Wang, Angela Yi, Chunxing Yin, Qunshu Zhang,
-Shengpei Zhang, and Zhao Zhu.
+Daisy Shi He, Guxin Jin, Rafay Khurram, Han Li, Shen Li, Chloe Liu, Dunfan Lu,
+Melody Lui, Pierson Lund, Linjian Ma, Yuheng Wang, Angela Yi, Chunxing Yin,
+Qunshu Zhang, Shengpei Zhang, and Zhao Zhu.
 
 ## Contributing
 
