@@ -1,0 +1,70 @@
+# DLRMv3 training on a 128-chip TPU v7x slice (32 hosts, 4x4x8).
+# IMAGE=<registry>/dlrmv3_tpu:latest envsubst < dlrmv3-128chip.yaml | kubectl create -f -
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  generateName: dlrmv3-128chip-
+  namespace: default
+spec:
+  failurePolicy:
+    maxRestarts: 0
+  replicatedJobs:
+  - name: worker
+    replicas: 1
+    template:
+      metadata:
+        labels:
+          x.tpu.google.com/inject-slice-selector: "true"
+      spec:
+        parallelism: 32
+        completions: 32
+        # Pod index -> JOB_COMPLETION_INDEX, which the trainer uses as its rank.
+        completionMode: Indexed
+        backoffLimit: 0
+        template:
+          metadata:
+            annotations:
+              cloud.google.com/gke-tpu-slice-topology: "4x4x8"
+          spec:
+            containers:
+            - name: dlrmv3
+              image: ${IMAGE}
+              imagePullPolicy: Always
+              env:
+              - name: PYTHONUNBUFFERED
+                value: "1"
+              - name: MASTER_PORT
+                value: "29500"
+              # Python stack on a fatal signal (otherwise only native frames).
+              - name: PYTHONFAULTHANDLER
+                value: "1"
+              # Let slower-starting pods reach the JAX / libtpu init barriers.
+              - name: JAX_DISTRIBUTED_INITIALIZATION_TIMEOUT
+                value: "1800"
+              - name: TPU_INIT_TIMEOUT_SECONDS
+                value: "1800"
+              - name: TPU_LIBRARY_INIT_TIMEOUT
+                value: "1800"
+              command:
+              - sh
+              - -c
+              - >-
+                python3 -u -m recir.examples.dlrmv3.tpu.train
+                --dataset debug
+                --batch_size 32
+                --num_train_batches 100
+                --embedding_backend in_graph
+                --log_every 10
+              ports:
+              - containerPort: 8471
+              resources:
+                limits:
+                  google.com/tpu: 4
+            nodeSelector:
+              cloud.google.com/gke-tpu-accelerator: tpu7x
+              cloud.google.com/gke-tpu-topology: "4x4x8"
+            tolerations:
+            - key: "google.com/tpu"
+              operator: "Exists"
+              effect: "NoSchedule"
+            restartPolicy: Never

@@ -1,0 +1,58 @@
+# Set IMAGE=<registry>/ringshift_tpu:<tag> and render with envsubst before applying.
+# W=4 single-host correctness for the HBM per-row DMA scatter-add backward path.
+# Uses a large per-shard table (v_local=64K, D=128 f32 -> 32MB > the 16MB VMEM
+# budget) so the backward kernel read-modify-writes the grad accumulator one row
+# at a time directly in HBM. The tests assert _use_dma_gather(...) is True, so a
+# PASS confirms the DMA scatter-add path was actually exercised. The repeated-
+# hot-row test is the key gate: ~4K sequential HBM RMWs into row 0 must
+# accumulate every contribution (matches jax.grad of the ra2a reference).
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  generateName: ringshift-w4-dma-bwd-
+  namespace: default
+spec:
+  replicatedJobs:
+  - name: worker
+    replicas: 1
+    template:
+      spec:
+        parallelism: 1
+        completions: 1
+        backoffLimit: 0
+        activeDeadlineSeconds: 1800
+        template:
+          spec:
+            containers:
+            - name: bench
+              image: ${IMAGE}
+              imagePullPolicy: Always
+              env:
+              - name: PYTHONUNBUFFERED
+                value: "1"
+              - name: JAX_DISTRIBUTED_INITIALIZATION_TIMEOUT
+                value: "300"
+              command:
+              - bash
+              - -c
+              - |
+                set +e
+                echo "Job Start: $(date) host: $(hostname)"
+                cd /app/recir
+                timeout 1700 python3 -u -m unittest -v \
+                  recir.examples.embedding.ringshift_bwd.RingshiftBwdW4Test.test_w4_dma_gather_base \
+                  recir.examples.embedding.ringshift_bwd.RingshiftBwdW4Test.test_w4_dma_gather_repeated_hot_row 2>&1
+                EXIT=$?
+                echo ""
+                echo "BENCH_EXIT=$EXIT"
+                echo "Job End: $(date)"
+                exit $EXIT
+              ports:
+              - containerPort: 8471
+              resources:
+                limits:
+                  google.com/tpu: 4
+            nodeSelector:
+              cloud.google.com/gke-tpu-accelerator: tpu7x
+              cloud.google.com/gke-tpu-topology: 2x2x1
+            restartPolicy: Never

@@ -1,0 +1,79 @@
+# Set IMAGE=<registry>/ringshift_tpu:<tag> and render with envsubst before applying.
+# W=16 pooled EBC benchmark. The TPU stage compares the fused pooled kernel
+# with the XLA pooled implementation on identical inputs in one process. The
+# host-side runner then times torchrec.EmbeddingBagCollection at the shape
+# recorded in this log and reports TorchRec/fused as the headline ratio.
+#
+# A 4x4x4 slice has 16 hosts and 128 logical JAX devices. Taking devices[::8]
+# selects one logical device per host for a W=16 mesh, matching the W=32
+# manifest's one-device-per-host placement.
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  generateName: ringshift-w16-ebc-
+  namespace: default
+  labels:
+    kueue.x-k8s.io/queue-name: ${QUEUE_NAME}
+    x.tpu.cloud.google.com/slice-autoprovisioning: "async"
+spec:
+  replicatedJobs:
+  - name: worker
+    replicas: 1
+    template:
+      metadata:
+        labels:
+          x.tpu.google.com/inject-slice-selector: "true"
+      spec:
+        parallelism: 16
+        completions: 16
+        completionMode: Indexed
+        backoffLimit: 0
+        template:
+          metadata:
+            annotations:
+              cloud.google.com/gke-tpu-slice-topology: "4x4x4"
+          spec:
+            serviceAccountName: default
+            containers:
+            - name: bench
+              image: ${IMAGE}
+              imagePullPolicy: Always
+              env:
+              - name: PYTHONUNBUFFERED
+                value: "1"
+              - name: RECIR_RINGSHIFT_SKIP_GATHER
+                value: "0"
+              - name: RECIR_RINGSHIFT_SKIP_DMA
+                value: "0"
+              - name: JAX_DISTRIBUTED_INITIALIZATION_TIMEOUT
+                value: "1800"
+              - name: TPU_INIT_TIMEOUT_SECONDS
+                value: "1800"
+              - name: TPU_LIBRARY_INIT_TIMEOUT
+                value: "1800"
+              command:
+              - bash
+              - -c
+              - |
+                set +e
+                echo "Job Start: $(date) host: $(hostname)"
+                cd /app/recir
+                timeout 2300 python3 -u -m recir.examples.embedding.ringshift_bench --mode ebc --world-size 16 --device-stride 8 --dim 128 --v-local 8192 --max-local-ids 8192 --num-bags 1024 --pooling sum --distribution skewed --random-table 2>&1
+                EXIT=$?
+                echo ""
+                echo "BENCH_EXIT=$EXIT"
+                echo "Job End: $(date)"
+                exit $EXIT
+              ports:
+              - containerPort: 8471
+              resources:
+                limits:
+                  google.com/tpu: 4
+            nodeSelector:
+              cloud.google.com/gke-tpu-accelerator: tpu7x
+              cloud.google.com/gke-tpu-topology: "4x4x4"
+            tolerations:
+            - key: "google.com/tpu"
+              operator: "Exists"
+              effect: "NoSchedule"
+            restartPolicy: Never

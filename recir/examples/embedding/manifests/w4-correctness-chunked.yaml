@@ -1,0 +1,61 @@
+# Set IMAGE=<registry>/ringshift_tpu:<tag> and render with envsubst before applying.
+# W=4 single-host CHUNKED-recv correctness test (FORWARD).
+#
+# Validates the chunked-recv fix numerically: runs
+# RingshiftFwdCorrectnessTest.test_w4_correctness_chunked, which uses a SMALL
+# recv_capacity (2048) so a single skewed peer's payload (~0.6*max_local_ids
+# ~= 4.9k at max_local_ids=8K) exceeds it -> the Phase-2 gather runs in multiple
+# chunks (num_chunks > 1). Asserts fused == ra2a reference (bitwise-identical).
+#
+# Single 4-chip pod (2x2x1). Rebuild the ringshift_tpu image first (the test +
+# the ringshift.py chunked-recv fix are source changes):
+#   IMAGE=<registry>/ringshift_tpu:<tag> recir/examples/embedding/build_image.sh
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  generateName: ringshift-w4-corr-chunked-
+  namespace: default
+spec:
+  replicatedJobs:
+  - name: worker
+    replicas: 1
+    template:
+      spec:
+        parallelism: 1
+        completions: 1
+        backoffLimit: 0
+        activeDeadlineSeconds: 1500
+        template:
+          spec:
+            containers:
+            - name: bench
+              image: ${IMAGE}
+              imagePullPolicy: Always
+              env:
+              - name: PYTHONUNBUFFERED
+                value: "1"
+              - name: JAX_DISTRIBUTED_INITIALIZATION_TIMEOUT
+                value: "900"
+              command:
+              - bash
+              - -c
+              - |
+                set +e
+                echo "Job Start: $(date) host: $(hostname)"
+                cd /app/recir
+                timeout 1400 python3 -u -m unittest -v \
+                  recir.examples.embedding.ringshift_fwd.RingshiftFwdCorrectnessTest.test_w4_correctness_chunked 2>&1
+                EXIT=$?
+                echo ""
+                echo "BENCH_EXIT=$EXIT"
+                echo "Job End: $(date)"
+                exit $EXIT
+              ports:
+              - containerPort: 8471
+              resources:
+                limits:
+                  google.com/tpu: 4
+            nodeSelector:
+              cloud.google.com/gke-tpu-accelerator: tpu7x
+              cloud.google.com/gke-tpu-topology: 2x2x1
+            restartPolicy: Never

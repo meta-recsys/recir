@@ -1,0 +1,63 @@
+# Set IMAGE=<registry>/ringshift_tpu:<tag> and render with envsubst before applying.
+# W=4 single-host CHUNKED-recv correctness test (BACKWARD).
+#
+# Validates the chunked-recv fix in the BACKWARD kernel: runs
+# RingshiftBwdW4Test.test_w4_chunked_recv_correctness, which sets a SMALL
+# recv_capacity (256) so the skewed per-pair payload (~0.6*MAX_LOCAL_IDS ~= 614
+# at MAX_LOCAL_IDS=1024) exceeds it -> the Phase-2 scatter runs in multiple
+# chunks. This is the path whose old single-shot scatter (loop to p3_cnt over
+# recv_capacity-sized SMEM/VMEM tiles) crashed with an OOB read on real skew.
+# Asserts jax.grad(fused) == jax.grad(ra2a) at atol=rtol=1e-4.
+#
+# Single 4-chip pod (2x2x1). Rebuild the ringshift_tpu image first (the test +
+# the ringshift.py chunked-recv fix are source changes):
+#   IMAGE=<registry>/ringshift_tpu:<tag> recir/examples/embedding/build_image.sh
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  generateName: ringshift-w4-bwd-chunked-
+  namespace: default
+spec:
+  replicatedJobs:
+  - name: worker
+    replicas: 1
+    template:
+      spec:
+        parallelism: 1
+        completions: 1
+        backoffLimit: 0
+        activeDeadlineSeconds: 1500
+        template:
+          spec:
+            containers:
+            - name: bench
+              image: ${IMAGE}
+              imagePullPolicy: Always
+              env:
+              - name: PYTHONUNBUFFERED
+                value: "1"
+              - name: JAX_DISTRIBUTED_INITIALIZATION_TIMEOUT
+                value: "300"
+              command:
+              - bash
+              - -c
+              - |
+                set +e
+                echo "Job Start: $(date) host: $(hostname)"
+                cd /app/recir
+                timeout 1400 python3 -u -m unittest -v \
+                  recir.examples.embedding.ringshift_bwd.RingshiftBwdW4Test.test_w4_chunked_recv_correctness 2>&1
+                EXIT=$?
+                echo ""
+                echo "BENCH_EXIT=$EXIT"
+                echo "Job End: $(date)"
+                exit $EXIT
+              ports:
+              - containerPort: 8471
+              resources:
+                limits:
+                  google.com/tpu: 4
+            nodeSelector:
+              cloud.google.com/gke-tpu-accelerator: tpu7x
+              cloud.google.com/gke-tpu-topology: 2x2x1
+            restartPolicy: Never

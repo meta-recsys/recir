@@ -1,0 +1,85 @@
+# Set IMAGE=<registry>/ringshift_tpu:<tag> and render with envsubst before applying.
+# W=128 multi-host fwd+bwd perf bench, devices[::2].
+# Compares fused (ringshift_embedding_lookup, splitter='globalpad') against the
+# ra2a reference; asserts bitwise-identical (max_diff == 0).
+#
+# Multi-host slice scaffolding (kueue queue, slice-autoprovisioning,
+# inject-slice-selector, Indexed completion, slice-topology annotation,
+# tolerations, init timeouts) mirrors the large-scale JobSet template so GKE provisions a
+# single coordinated 4x4x8 (128-chip / 256-core) v7x slice and injects the
+# multi-host TPU env (TPU_WORKER_HOSTNAMES) -- without this each pod sees only its
+# local 8 devices and the test skips. jax.distributed init is auto-detected from
+# the TPU runtime (no RINGSHIFT_DIST_INIT needed). The test strides devices[::8]
+# to use 1 device/host across the 32 hosts (W=32).
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  generateName: ringshift-w128-bwd-perf-
+  namespace: default
+  labels:
+    kueue.x-k8s.io/queue-name: ${QUEUE_NAME}
+    x.tpu.cloud.google.com/slice-autoprovisioning: "async"
+spec:
+  replicatedJobs:
+  - name: worker
+    replicas: 1
+    template:
+      metadata:
+        labels:
+          x.tpu.google.com/inject-slice-selector: "true"
+      spec:
+        parallelism: 32
+        completions: 32
+        completionMode: Indexed
+        backoffLimit: 0
+        template:
+          metadata:
+            annotations:
+              cloud.google.com/gke-tpu-slice-topology: "4x4x8"
+          spec:
+            serviceAccountName: default
+            containers:
+            - name: bench
+              image: ${IMAGE}
+              imagePullPolicy: Always
+              env:
+              - name: PYTHONUNBUFFERED
+                value: "1"
+              # Perf ablation knobs (0/0 = full kernel): SKIP_GATHER skips TC
+              # gather/scatter (keeps DMA); SKIP_DMA skips cross-host a2a.
+              - name: RECIR_RINGSHIFT_SKIP_GATHER
+                value: "0"
+              - name: RECIR_RINGSHIFT_SKIP_DMA
+                value: "0"
+              - name: JAX_DISTRIBUTED_INITIALIZATION_TIMEOUT
+                value: "1800"
+              - name: TPU_INIT_TIMEOUT_SECONDS
+                value: "1800"
+              - name: TPU_LIBRARY_INIT_TIMEOUT
+                value: "1800"
+              command:
+              - bash
+              - -c
+              - |
+                set +e
+                echo "Job Start: $(date) host: $(hostname)"
+                cd /app/recir
+                timeout 2300 python3 -u -m recir.examples.embedding.ringshift_bench --mode bwd --world-size 128 --device-stride 2 --dim 128 --v-local 8192 --max-local-ids 8192 --distribution skewed 2>&1
+                EXIT=$?
+                echo ""
+                echo "BENCH_EXIT=$EXIT"
+                echo "Job End: $(date)"
+                exit $EXIT
+              ports:
+              - containerPort: 8471
+              resources:
+                limits:
+                  google.com/tpu: 4
+            nodeSelector:
+              cloud.google.com/gke-tpu-accelerator: tpu7x
+              cloud.google.com/gke-tpu-topology: "4x4x8"
+            tolerations:
+            - key: "google.com/tpu"
+              operator: "Exists"
+              effect: "NoSchedule"
+            restartPolicy: Never

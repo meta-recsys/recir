@@ -1,0 +1,76 @@
+# Set IMAGE=<registry>/ringshift_tpu:<tag> and render with envsubst before applying.
+# W=4 pooled (EBC) A/B: XLA reduction vs in-kernel reduction (Phase 4).
+# Single host, 4 local chips -- run this one first; it needs no multi-host
+# slice and turns a mistake around in minutes rather than in a queue wait.
+#
+# Both arms are selected via RECIR_RINGSHIFT_POOLING_IMPL and traced in ONE
+# process against the SAME inputs; they must agree before timings are reported.
+#
+# `--random-table` is REQUIRED, not optional polish. With the default zeros
+# table XLA/Mosaic makes the gather ~free, and the gather is exactly what the
+# two arms differ by (Option B keeps two full-width row gathers that Option A
+# drops). A zeros table also makes the agreement check vacuous: summing zeros
+# in any order gives zero, so max_rel_diff==0 proves nothing.
+#
+# This run checks correctness AND perf. Before any timing it verifies both arms
+# against the numpy oracle at the same scale the timings are taken at, and
+# refuses to report medians if either disagrees. On W=32 that check is skipped
+# automatically (the oracle needs the global table on one process) and only the
+# arms-agree check remains.
+#
+# The tiny-scale unittest (w4-ebc-correctness.yaml) stays separate: it is the
+# only thing that checks the GRADIENT, and it forces empty/singleton/hot bags
+# rather than hoping a random split produces them.
+#
+# TPU-stage result: `=== RESULT ebc: ... xla=..ms kernel=..ms ... ===`.
+# `run_perf.sh ebc-w4` then times torchrec.EmbeddingBagCollection on the host
+# at the shape recorded here and emits the final TorchRec-baseline headline.
+#
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  generateName: ringshift-w4-ebc-
+  namespace: default
+spec:
+  replicatedJobs:
+  - name: worker
+    replicas: 1
+    template:
+      spec:
+        parallelism: 1
+        completions: 1
+        backoffLimit: 0
+        activeDeadlineSeconds: 1500
+        template:
+          spec:
+            containers:
+            - name: bench
+              image: ${IMAGE}
+              imagePullPolicy: Always
+              env:
+              - name: PYTHONUNBUFFERED
+                value: "1"
+              - name: JAX_DISTRIBUTED_INITIALIZATION_TIMEOUT
+                value: "900"
+              command:
+              - bash
+              - -c
+              - |
+                set +e
+                echo "Job Start: $(date) host: $(hostname)"
+                cd /app/recir
+                timeout 2300 python3 -u -m recir.examples.embedding.ringshift_bench --mode ebc --world-size 4 --dim 128 --v-local 8192 --max-local-ids 8192 --num-bags 1024 --pooling sum --distribution skewed --random-table 2>&1
+                EXIT=$?
+                echo ""
+                echo "BENCH_EXIT=$EXIT"
+                echo "Job End: $(date)"
+                exit $EXIT
+              ports:
+              - containerPort: 8471
+              resources:
+                limits:
+                  google.com/tpu: 4
+            nodeSelector:
+              cloud.google.com/gke-tpu-accelerator: tpu7x
+              cloud.google.com/gke-tpu-topology: 2x2x1
+            restartPolicy: Never

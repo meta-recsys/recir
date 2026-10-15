@@ -1,0 +1,104 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-3-Clause license found in the
+# LICENSE file in the root directory of this source tree.
+
+# Copyright 2025 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+
+import recir.torchax
+import torch
+from torch import nn
+
+from . import base_test_util
+
+
+class CustomConv1(torch.nn.Module):
+    def __init__(
+        self,
+        channels_conv1: int = 3,
+        width_conv1: int = 3,
+        channels_conv2: int = 5,
+        width_conv2: int = 5,
+        hidden_layer_size: int = 50,
+    ) -> None:
+        super().__init__()
+        self.conv1 = nn.Conv1d(1, channels_conv1, width_conv1)
+        self.conv2 = nn.Conv1d(channels_conv1, channels_conv2, width_conv2)
+        self.fc1 = nn.Linear(hidden_layer_size, 2)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # pyrefly: ignore [bad-assignment]
+        x = nn.functional.max_pool1d
+        x = nn.functional.max_pool1d(nn.functional.relu(self.conv2(x)), 2, stride=2)
+        x = torch.flatten(x, 1)
+        x = nn.functional.softmax(self.fc1(x), dim=1)
+        return x
+
+
+class CustomConv2(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        inp = 4
+        out = 16
+
+        self.conv = nn.Conv2d(inp, out, kernel_size=3, padding=1)
+
+        # This is supposed to be a squeeze and excitation block.
+        self.avg_pool = nn.AdaptiveAvgPool2d((1, 1))
+
+        self.scale = nn.Sequential(nn.Linear(out, out), nn.Sigmoid())
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.conv(x)
+
+        b = x.shape[0]
+        ap = self.avg_pool(x).view(b, -1)
+        ap = self.scale(ap)
+        ap = ap.view(b, -1, 1, 1)
+
+        return x * ap
+
+
+class ConvTest(base_test_util.TestCase):  # pyre-ignore[11]
+    def test_conv1(self) -> None:
+        env = recir.torchax.default_env()
+        m = CustomConv1()
+        arg = torch.randn((20, 1, 50))
+        res = m(arg)
+
+        jax_weights, jax_func = recir.torchax.extract_jax(m)
+        arg = env.t2j_copy(arg)
+        res2 = jax_func(jax_weights, (arg,))
+        res2_torch = env.j2t_copy(res2)
+        self.assertTrue(torch.allclose(res, res2_torch))  # pyre-ignore[16]
+
+    def test_conv2(self) -> None:
+        env = recir.torchax.default_env()
+        m = CustomConv2()
+        arg = torch.randn((20, 4, 50, 100))
+        res = m(arg)
+        jax_weights, jax_func = recir.torchax.extract_jax(m)
+        arg = env.t2j_copy(arg)
+        res2 = jax_func(jax_weights, (arg,))
+        res2_torch = env.j2t_copy(res2)
+        self.assertTrue(  # pyre-ignore[16]
+            torch.allclose(res, res2_torch, atol=1e-4, rtol=1e-4)
+        )
+
+
+if __name__ == "__main__":
+    base_test_util.main()

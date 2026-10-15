@@ -1,0 +1,67 @@
+# Set IMAGE=<registry>/ringshift_tpu:<tag> and render with envsubst before applying.
+# W=4 pooled (EBC) torchrec PARITY, stage 1 of 2: run on TPU, emit an artifact.
+#
+# torchrec needs torch and this image has only jax[tpu], so the comparison
+# cannot happen in one process. This job runs the fused kernel on real hardware
+# and prints a self-describing artifact (inputs AND outputs) as framed base64.
+#
+# Stage 2 replays it against torchrec on CPU:
+#
+#   ./run_microbench.sh manifests/w4-ebc-parity-dump.yaml
+#   buck2 test //recir/ops/pallas/embeddings/tests:test_embedding_bag_torchrec_tpu \
+#       -- --env RECIR_EBC_TPU_ARTIFACT=$PWD/bench_logs/w4-ebc-parity-dump-latest.log
+#
+# Unlike w4-ebc-correctness (which diffs against the in-repo numpy oracle), this
+# is the check deliverable 1.2 actually asks for: the fused kernel against the
+# production torchrec EmbeddingBagCollection.
+#
+# Headline: `=== RESULT ebc_parity_dump: OK ===` followed by the base64 block.
+#
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  generateName: ringshift-w4-ebc-parity-
+  namespace: default
+spec:
+  replicatedJobs:
+  - name: worker
+    replicas: 1
+    template:
+      spec:
+        parallelism: 1
+        completions: 1
+        backoffLimit: 0
+        activeDeadlineSeconds: 2400
+        template:
+          spec:
+            containers:
+            - name: bench
+              image: ${IMAGE}
+              imagePullPolicy: Always
+              env:
+              - name: PYTHONUNBUFFERED
+                value: "1"
+              - name: JAX_DISTRIBUTED_INITIALIZATION_TIMEOUT
+                value: "900"
+              command:
+              - bash
+              - -c
+              - |
+                set +e
+                echo "Job Start: $(date) host: $(hostname)"
+                cd /app/recir
+                timeout 2300 python3 -u -m recir.examples.embedding.ringshift_ebc_parity_dump 2>&1
+                EXIT=$?
+                echo ""
+                echo "BENCH_EXIT=$EXIT"
+                echo "Job End: $(date)"
+                exit $EXIT
+              ports:
+              - containerPort: 8471
+              resources:
+                limits:
+                  google.com/tpu: 4
+            nodeSelector:
+              cloud.google.com/gke-tpu-accelerator: tpu7x
+              cloud.google.com/gke-tpu-topology: 2x2x1
+            restartPolicy: Never

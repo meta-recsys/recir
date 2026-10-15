@@ -1,0 +1,62 @@
+# Set IMAGE=<registry>/ringshift_tpu:<tag> and render with envsubst before applying.
+# W=4 pooled (EBC) CORRECTNESS: both arms vs INDEPENDENT references.
+#
+# The perf manifest only checks the two arms against each other, which cannot
+# catch a mistake they share -- notably one inherited from the common host-side
+# prep (segment ids, sort permutation, per-peer padding).
+#
+# This one checks the forward against the numpy oracle (a plain double loop:
+# no segment_sum, no kernel, no permutation) and the gradient against a
+# reference path that never enters the Pallas kernel. The latter is the only
+# check anywhere of Phase 4's hand-written custom_vjp.
+#
+# Headline: `=== RESULT ebc_correctness: PASS|FAIL ... ===`
+#
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  generateName: ringshift-w4-ebc-corr-
+  namespace: default
+spec:
+  replicatedJobs:
+  - name: worker
+    replicas: 1
+    template:
+      spec:
+        parallelism: 1
+        completions: 1
+        backoffLimit: 0
+        activeDeadlineSeconds: 2400
+        template:
+          spec:
+            containers:
+            - name: bench
+              image: ${IMAGE}
+              imagePullPolicy: Always
+              env:
+              - name: PYTHONUNBUFFERED
+                value: "1"
+              - name: JAX_DISTRIBUTED_INITIALIZATION_TIMEOUT
+                value: "900"
+              command:
+              - bash
+              - -c
+              - |
+                set +e
+                echo "Job Start: $(date) host: $(hostname)"
+                cd /app/recir
+                timeout 2300 python3 -u -m unittest -v recir.examples.embedding.ringshift_fwd.RingshiftEbcCorrectnessTest 2>&1
+                EXIT=$?
+                echo ""
+                echo "BENCH_EXIT=$EXIT"
+                echo "Job End: $(date)"
+                exit $EXIT
+              ports:
+              - containerPort: 8471
+              resources:
+                limits:
+                  google.com/tpu: 4
+            nodeSelector:
+              cloud.google.com/gke-tpu-accelerator: tpu7x
+              cloud.google.com/gke-tpu-topology: 2x2x1
+            restartPolicy: Never
