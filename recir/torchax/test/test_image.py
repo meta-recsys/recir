@@ -38,6 +38,7 @@ def upsample_jit(
 ) -> jax.Array:
     tensor = recir.torchax.interop.torch_view(tensor)
     tensor = torch.nn.functional.interpolate(  # pyre-ignore[9]
+        # pyrefly: ignore [bad-argument-type]
         tensor,
         size=output_size,
         mode=method,

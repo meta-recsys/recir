@@ -723,6 +723,7 @@ def ringshift_embedding_lookup_reference(
     # For every (rank, valid id) pair, look up the embedding from the rank
     # that owns the row.
     for r in range(world_size):
+        # pyrefly: ignore [unsupported-operation]
         n = int(looked_up_id_count[r])
         for i in range(n):
             global_id = int(looked_up_ids[r, i])

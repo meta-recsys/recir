@@ -111,9 +111,11 @@ def _recir_dense_to_jagged(
         result = _jax_dense_to_jagged_forward_impl(dense, offsets, total_L)
         return result, seq_offsets
     lengths = seq_offsets[1:] - seq_offsets[:-1]  # [B]
+    # pyrefly: ignore [unsupported-operation]
     assert total_L % world_size == 0, (
         f"total_L={total_L} must be divisible by world_size={world_size} for batch-aligned sharding"
     )
+    # pyrefly: ignore [unsupported-operation]
     local_total_L = total_L // world_size
     mesh = Mesh(jax.devices(), (_DP_AXIS,))
 

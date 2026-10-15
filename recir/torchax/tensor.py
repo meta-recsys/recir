@@ -271,7 +271,11 @@ class Tensor(torch.Tensor):
 
 def debug_accuracy(func: Any, args: Any, kwargs: Any, current_output: Any) -> bool:
     args_torch, kwargs_torch, out_torch = torch_pytree.tree_map_only(
-        torch.Tensor, lambda x: x.torch(), (args, kwargs, current_output)
+        # pyrefly: ignore [missing-attribute]
+        torch.Tensor,
+        # pyrefly: ignore [missing-attribute]
+        lambda x: x.torch(),
+        (args, kwargs, current_output),
     )
 
     with mode_utils.no_dispatch(), torch._C.DisableTorchFunction():
