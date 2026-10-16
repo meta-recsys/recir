@@ -33,7 +33,11 @@ from recir.embedding.in_graph import (
 )
 from torch.fx.experimental.proxy_tensor import make_fx
 from torchrec.distributed.types import ShardingType
-from torchrec.modules.embedding_configs import DataType, EmbeddingConfig
+from torchrec.modules.embedding_configs import (
+    DataType,
+    EmbeddingBagConfig,
+    EmbeddingConfig,
+)
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
 
@@ -61,6 +65,7 @@ def _build_module_and_kjt(
     big: TablePlan = _SPARSE_ROWWISE,
     small: TablePlan = _SPARSE_REPLICATED,
     on_device_init: bool = False,
+    data_type: DataType = DataType.FP32,
 ):
     """Build a 2-table module + a matching KJT.
 
@@ -76,6 +81,7 @@ def _build_module_and_kjt(
             num_embeddings=256,
             embedding_dim=8,
             feature_names=["f0", "f1"],
+            data_type=data_type,
         ),
         EmbeddingConfig(
             name="small",
@@ -121,6 +127,20 @@ def _big_feature_ref(module, kjt, batch):
 
 
 class SeqInGraphTraceTest(unittest.TestCase):
+    def test_rowwise_fp16_storage_keeps_fp32_outputs(self) -> None:
+        for on_device_init in (False, True):
+            with self.subTest(on_device_init=on_device_init):
+                module, kjt, batch = _build_module_and_kjt(
+                    on_device_init=on_device_init, data_type=DataType.FP16
+                )
+                self.assertEqual(module._sharded_tables["big"].dtype, torch.float16)
+                if not on_device_init:
+                    for _key, output, reference in _big_feature_ref(module, kjt, batch):
+                        self.assertEqual(output.dtype, torch.float32)
+                        torch.testing.assert_close(
+                            output, reference.float(), rtol=0, atol=0
+                        )
+
     def test_ringshift_op_preserves_bf16_padding_gradient_semantics(self) -> None:
         import recir.ops.seq_embedding_op  # noqa: F401
 
@@ -563,40 +583,80 @@ class TableStorageDtypeTest(unittest.TestCase):
         self.assertEqual(out["f"].values().dtype, torch.float32)
 
 
-class RowWiseKeepsFloat32Test(unittest.TestCase):
-    """Narrow storage is NOT applied to row-wise tables.
+class RowWiseStorageDtypeTest(unittest.TestCase):
+    """Row-wise tables keep FP16 storage; the ring-shift op computes in FP32.
 
-    They go through the ring-shift Pallas kernel, which asserts a float32 table
-    (ops/pallas/embeddings/ringshift.py:2028): a narrow one does not degrade,
-    it takes the run down at the first lookup.
-
-    The exemption costs nothing numerically. Row-wise is where the sparse
-    optimizer lives, and its per-step update sits two orders of magnitude above
-    the FP16 grid. The tables that need
-    narrow storage are the REPLICATED ones on the dense optimizer, whose update
-    lands at roughly one ULP.
+    For an FP16 table the op returns FP32 activations, so per-token gradients
+    reach the FP32 per-row sum unrounded and only that sum is narrowed to FP16.
+    Dtypes the ring-shift path cannot store fall back to float32.
     """
 
     @staticmethod
-    def _table(sharding: TablePlan) -> InGraphSparseArch:
+    def _table(
+        sharding: TablePlan,
+        data_type: DataType = DataType.FP16,
+        pooled: bool = False,
+        on_device_init: bool = True,
+    ) -> InGraphSparseArch:
+        config_cls = EmbeddingBagConfig if pooled else EmbeddingConfig
         return InGraphSparseArch(
             [
-                EmbeddingConfig(
+                config_cls(
                     name="t",
                     num_embeddings=16,
                     embedding_dim=8,
                     feature_names=["f"],
-                    data_type=DataType.FP16,
+                    data_type=data_type,
                 )
             ],
             {"f": 2},
             world_size=2,
             table_plans={"t": sharding},
+            on_device_init=on_device_init,
         )
 
-    def test_row_wise_stays_float32(self) -> None:
+    def test_row_wise_fp16_is_stored_narrow(self) -> None:
         m = self._table(_SPARSE_ROWWISE)
+        self.assertEqual(m._sharded_tables["t"].dtype, torch.float16)
+
+    def test_row_wise_unsupported_dtype_falls_back_to_float32(self) -> None:
+        with self.assertLogs("recir.embedding.in_graph", level="WARNING"):
+            m = self._table(_SPARSE_ROWWISE, DataType.BF16)
         self.assertEqual(m._sharded_tables["t"].dtype, torch.float32)
+
+    def test_fp16_fake_kernel_returns_float32(self) -> None:
+        """The fake kernel must agree with the TPU lowering on the dtype."""
+        weight = torch.empty(16, 8, dtype=torch.float16, device="meta")
+        ids = torch.zeros(2, 2, dtype=torch.int64, device="meta")
+        for pooling, lengths_shape in (("none", (2,)), ("sum", (2, 1))):
+            with self.subTest(pooling=pooling):
+                lengths = torch.full(lengths_shape, 2, device="meta")
+                out = torch.ops.recir.ringshift_embedding(
+                    ids, lengths, weight, pooling=pooling
+                )
+                self.assertEqual(out.dtype, torch.float32)
+
+    def test_fp16_gradients_are_summed_before_narrowing(self) -> None:
+        """Each token's 2e-8 gradient rounds to zero in FP16. Row 1 is hit twice,
+        and its 4e-8 sum rounds to 2**-24, so it survives only if the per-token
+        gradients are summed in FP32 before the table gradient is narrowed."""
+        values = torch.tensor([1, 3, 1, 7])
+        counts = torch.bincount(values, minlength=16).to(torch.float32)
+        expected = (counts * 2e-8)[:, None].expand(16, 8).to(torch.float16)
+        for pooled in (False, True):
+            with self.subTest(pooled=pooled):
+                m = self._table(_SPARSE_ROWWISE, pooled=pooled, on_device_init=False)
+                kjt = KeyedJaggedTensor(
+                    keys=["f"], values=values, lengths=torch.tensor([2, 2])
+                )
+                out = m(kjt)["f"].values()
+                self.assertEqual(out.dtype, torch.float32)
+                (out.sum() * 2e-8).backward()
+                grad = m._sharded_tables["t"].grad
+                assert grad is not None
+                self.assertEqual(grad.dtype, torch.float16)
+                self.assertEqual(float(grad[1, 0]), 2**-24)
+                torch.testing.assert_close(grad, expected, rtol=0, atol=0)
 
     def test_replicated_still_goes_narrow(self) -> None:
         """The case the narrowing exists for must not be caught by the guard."""

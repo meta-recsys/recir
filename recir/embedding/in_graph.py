@@ -207,10 +207,13 @@ class InGraphSparseArch(nn.Module):
                 )
             self._table_pooling[tc.name] = pooling
             dtype = data_type_to_dtype(tc.data_type)
-            if sharding is TableSharding.ROWWISE and dtype != torch.float32:
+            if sharding is TableSharding.ROWWISE and dtype not in (
+                torch.float32,
+                torch.float16,
+            ):
                 logger.warning(
                     "[in_graph] table '%s': data_type=%s ignored, storing "
-                    "float32 -- the ring-shift kernel requires it",
+                    "float32 -- ring-shift storage supports float32 and float16",
                     tc.name,
                     tc.data_type,
                 )
@@ -409,11 +412,13 @@ class InGraphSparseArch(nn.Module):
                 [lengths.reshape(world, bags_local) for lengths in lengths_list],
                 dim=1,
             )
-            act = torch.ops.recir.ringshift_embedding(
-                ids_cat,
-                bag_lengths,
-                weight,
-                pooling=self._table_pooling[table_name],
+            act = _to_compute_dtype(
+                torch.ops.recir.ringshift_embedding(
+                    ids_cat,
+                    bag_lengths,
+                    weight,
+                    pooling=self._table_pooling[table_name],
+                )
             ).reshape(world, len(ids_list), bags_local, dim)
             for index, (key, k_lengths) in enumerate(zip(feature_keys, lengths_list)):
                 values = torch.ops.recir.shard_batch0(act[:, index].reshape(-1, dim))
