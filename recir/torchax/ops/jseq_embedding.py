@@ -140,6 +140,15 @@ def _manual_world_size() -> int | None:
     return world_size
 
 
+def _as_f32_or_f16(weight: Any) -> Any:
+    return weight if weight.dtype == jnp.float16 else weight.astype(jnp.float32)
+
+
+def _output_dtype(weight: Any) -> Any:
+    # Must match recir.ops.seq_embedding_op._output_dtype (the op's fake kernel).
+    return jnp.float32 if weight.dtype == jnp.float16 else weight.dtype
+
+
 def _prep_local(
     ids: Any, lengths: Any, weight: Any, world_size: int
 ) -> Tuple[Any, Any, int, int, int]:
@@ -197,7 +206,7 @@ def _pooled_lookup_local_impl(
     out = ringshift_embedding_lookup_block_local(
         local_ids,
         None,
-        weight.astype(jnp.float32),
+        _as_f32_or_f16(weight),
         axis_name=_AXIS,
         world_size=world_size,
         recv_capacity=_RECV_CAPACITY,
@@ -205,7 +214,7 @@ def _pooled_lookup_local_impl(
         pooling=pooling,
         bag_lengths=bag_lengths,
     )
-    return out.reshape(*lengths.shape, dim).astype(weight.dtype)
+    return out.reshape(*lengths.shape, dim).astype(_output_dtype(weight))
 
 
 @functools.partial(jax.custom_vjp, nondiff_argnums=(3, 4, 5))
@@ -364,13 +373,13 @@ def _jringshift_embedding(
         out = ringshift_embedding_lookup_block_local(
             local_ids,
             count,
-            weight.astype(jnp.float32),
+            _as_f32_or_f16(weight),
             axis_name=_AXIS,
             world_size=manual_world_size,
             recv_capacity=_RECV_CAPACITY,
             exchange_bf16=_EXCHANGE_BF16,
         )
-        return out.reshape(batch, seq, dim).astype(weight.dtype)
+        return out.reshape(batch, seq, dim).astype(_output_dtype(weight))
 
     mesh, batch_resource, world_size, _hybrid = _ringshift_mesh_layout()
 
@@ -385,13 +394,13 @@ def _jringshift_embedding(
         out = ringshift_embedding_lookup_block_local(
             local_ids,
             count,
-            local_weight.astype(jnp.float32),
+            _as_f32_or_f16(local_weight),
             axis_name=_AXIS,
             world_size=world_size,
             recv_capacity=_RECV_CAPACITY,
             exchange_bf16=_EXCHANGE_BF16,
         )
-        return out.reshape(batch, seq, dim).astype(local_weight.dtype)
+        return out.reshape(batch, seq, dim).astype(_output_dtype(local_weight))
 
     return jax.shard_map(
         _per_device,

@@ -1389,22 +1389,25 @@ def _ringshift_embedding_lookup_local(
     Args:
         looked_up_ids: ``[max_local_ids]`` int32 -- this rank's padded queries.
         looked_up_id_count: scalar int32 -- actual valid count.
-        local_embedding_table: ``[V_local, D]`` f32 -- this rank's shard.
+        local_embedding_table: ``[V_local, D]`` float32 or float16 -- this
+            rank's shard. FP16 inputs are converted to FP32 before Pallas.
         exchange_bf16: if True, the embedding all-to-all (Phase-3 DMA) + its HBM
             staging + the output accumulator are bf16 (halves the cross-host ICI
-            bytes, the S=4096 bottleneck). The table stays f32; the gather casts
-            f32->bf16; the final result is cast back to f32 so the public dtype
+            bytes, the S=4096 bottleneck). Gather and pooling compute in f32;
+            the exchange casts f32->bf16; the final result is cast back to f32 so the public dtype
             contract is unchanged.
 
     Returns:
         ``[max_local_ids, D]`` f32 embeddings in caller order.
     """
-    assert local_embedding_table.dtype == jnp.float32
+    if local_embedding_table.dtype not in (jnp.float32, jnp.float16):
+        raise ValueError("ringshift table storage must be float32 or float16")
     max_local_ids = looked_up_ids.shape[0]
     v_local, embedding_dim = local_embedding_table.shape
-    dtype = local_embedding_table.dtype
+    dtype = jnp.float32
+    local_embedding_table = local_embedding_table.astype(dtype)
     # Dtype of the embedding all-to-all + its staging/output buffers. bf16 halves
-    # the cross-host ICI traffic; the table (gather source) stays f32.
+    # the cross-host ICI traffic; gather and pooling remain f32.
     emb_dtype = jnp.bfloat16 if exchange_bf16 else dtype
     max_waves = world_size
 
@@ -1674,9 +1677,6 @@ def _ringshift_embedding_lookup_local(
                     pltpu.VMEM((recv_capacity, embedding_dim), dtype),
                     # emb_xfer_vmem: emb_dtype staging tile for the (bf16) DMA out.
                     pltpu.VMEM((recv_capacity, embedding_dim), emb_dtype),
-                    # table_vmem: stays f32 (gather source). Full [v_local, D] shard
-                    # in prefetch mode; a tiny unused placeholder in DMA-gather mode
-                    # (rows gathered directly from the HBM table shard instead).
                     pltpu.VMEM((table_vmem_rows, embedding_dim), dtype),
                     SMEM((recv_capacity,), jnp.int32),
                 )
@@ -1744,7 +1744,7 @@ def _ringshift_embedding_lookup_local(
         max_padded,
         world_size,
     )
-    # Cast back to the table dtype (f32) so the public output contract is
+    # Cast back to f32 so the public output contract is
     # unchanged; only the over-ICI exchange ran in bf16.
     return sorted_emb[reverse_perm].astype(dtype)
 
@@ -2038,8 +2038,8 @@ def ringshift_embedding_lookup(
             since ``bag_lengths.sum(-1)`` already determines it. See
             :func:`_check_pooling` for why the redundancy is rejected rather
             than checked.
-        local_embedding_table: ``[world_size, V_local, D]`` f32 -- table
-            shards stacked along the leading rank axis.
+        local_embedding_table: ``[world_size, V_local, D]`` float32 or
+            float16 -- table shards stacked along the leading rank axis.
         mesh: 1D JAX mesh whose only axis is ``axis_name``.
         axis_name: name of the mesh axis the leading dim is sharded on.
         recv_capacity: VMEM chunk-tile size for the local gather/scatter, NOT a
@@ -2060,9 +2060,9 @@ def ringshift_embedding_lookup(
             the steady-state default.
         exchange_bf16: if True, the cross-host embedding all-to-all (forward) and
             gradient all-to-all (backward) run in bf16, halving the ICI bytes (the
-            S=4096 bottleneck). The table stays f32, the table-grad accumulation
-            stays f32, and the public inputs/outputs stay f32 -- only the over-ICI
-            transfer + staging are bf16. Default False (exact f32 behavior).
+            S=4096 bottleneck). Table storage may be f16 or f32; table-grad
+            accumulation and outputs stay f32. Autodiff casts table gradients
+            to the input dtype. Only the over-ICI transfer + staging are bf16. Default False (exact f32 behavior).
         pooling: ``"none"`` (default -- sequence / EC behavior, one row per id),
             ``"sum"`` or ``"mean"`` (EBC behavior, one row per bag). The
             reduction is fused into the wave kernel (Phase 4), so the pooled
@@ -2857,7 +2857,8 @@ def _ringshift_forward_impl(
     recurse into the custom_vjp wrapper from inside `_fwd`. The body is the
     original public-API body (shard_map of the per-device fused kernel).
     """
-    assert local_embedding_table.dtype == jnp.float32
+    if local_embedding_table.dtype not in (jnp.float32, jnp.float16):
+        raise ValueError("ringshift table storage must be float32 or float16")
     world_size = mesh.shape[axis_name]
     P = jax.sharding.PartitionSpec
 
@@ -3050,6 +3051,7 @@ def _ringshift_with_grad_fwd(
         looked_up_id_count,
         bag_lengths_in_fused_kernel,
         per_device_shape,
+        jnp.zeros((), local_embedding_table.dtype),
     )
     return out, residuals
 
@@ -3082,6 +3084,7 @@ def _ringshift_with_grad_bwd(
         looked_up_id_count,
         bag_lengths_in_fused_kernel,
         table_shape,
+        table_dtype_marker,
     ) = residuals
 
     if pooling_in_fused_kernel != "none":
@@ -3103,7 +3106,7 @@ def _ringshift_with_grad_bwd(
         )
 
     grad_table = _ringshift_backward_impl(
-        grad_out,
+        grad_out.astype(jnp.float32),
         looked_up_ids,
         looked_up_id_count,
         table_shape,
@@ -3115,7 +3118,7 @@ def _ringshift_with_grad_bwd(
         exchange_bf16=exchange_bf16,
     )
     # One entry per differentiable input; the arity must match exactly.
-    return (None, None, grad_table, None)
+    return (None, None, grad_table.astype(table_dtype_marker.dtype), None)
 
 
 _ringshift_with_grad.defvjp(_ringshift_with_grad_fwd, _ringshift_with_grad_bwd)

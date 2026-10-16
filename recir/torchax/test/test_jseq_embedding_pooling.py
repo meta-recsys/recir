@@ -59,6 +59,17 @@ class PooledLoweringContractTest(unittest.TestCase):
         self.assertEqual(out.shape, (_ROWS, _NBAGS, _DIM))
         self.assertEqual(out.dtype, jnp.float32)
 
+    def test_fp16_table_returns_float32_and_an_fp16_gradient(self) -> None:
+        """The FP32 pooled sum is not rounded to FP16; only the table gradient is."""
+        ids, bags, _weight = _inputs()
+        weight = jnp.zeros((_VOCAB, _DIM), jnp.float16)
+        out = jax.eval_shape(lambda w: _pooled_lookup(ids, bags, w, "sum"), weight)
+        grad = jax.eval_shape(
+            jax.grad(lambda w: _pooled_lookup(ids, bags, w, "sum").sum()), weight
+        )
+        self.assertEqual(out.dtype, jnp.float32)
+        self.assertEqual(grad.dtype, jnp.float16)
+
     def test_mean_has_the_same_shape_as_sum(self) -> None:
         ids, bags, weight = _inputs()
         out = jax.eval_shape(lambda w: _pooled_lookup(ids, bags, w, "mean"), weight)
