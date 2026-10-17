@@ -41,21 +41,33 @@ runs through RecIR on both GPU and TPU using publicly available packages.
 
 ## Installation
 
-RecIR requires Python 3.12 or newer. Install from a source checkout with the
-extra matching the environment:
+RecIR requires Python 3.12 or newer. From the root of your source checkout,
+create and activate a virtual environment:
 
 ```bash
 python3.12 -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
+```
 
-# Host-only smoke test and local TPU-path debugging.
+Then run **one** of the following installation commands, choosing the extra
+that matches your environment.
+
+**CPU: host-only smoke test and local TPU-path debugging**
+
+```bash
 python -m pip install -e ".[dlrm-cpu]"
+```
 
-# CUDA training environment.
+**GPU: CUDA training**
+
+```bash
 python -m pip install -e ".[dlrm-gpu]"
+```
 
-# TPU environment.
+**TPU: training on a TPU host**
+
+```bash
 python -m pip install -e ".[dlrm-tpu]"
 ```
 

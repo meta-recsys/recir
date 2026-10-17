@@ -23,12 +23,27 @@ dlrmv3/
 | JAX / JAXlib | 0.8–0.10 |
 | generative-recommenders | current public package |
 
-Install the extra matching the target environment:
+From the repository root, with your virtual environment activated, run
+**one** of the following commands to install the extra matching your target
+environment. See the [installation guide](../../../README.md#installation)
+for virtual environment setup.
+
+**CPU smoke test / JAX CPU control**
 
 ```bash
-python -m pip install -e ".[dlrm-cpu]"  # CPU smoke / JAX CPU control
-python -m pip install -e ".[dlrm-gpu]"  # CUDA + Inductor + FBGEMM TBE
-python -m pip install -e ".[dlrm-tpu]"  # JAX TPU + libtpu
+python -m pip install -e ".[dlrm-cpu]"
+```
+
+**GPU: CUDA + Inductor + FBGEMM TBE**
+
+```bash
+python -m pip install -e ".[dlrm-gpu]"
+```
+
+**TPU: JAX TPU + libtpu**
+
+```bash
+python -m pip install -e ".[dlrm-tpu]"
 ```
 
 Both trainers trace the full step (forward, backward, optimizers, LR warmup)
