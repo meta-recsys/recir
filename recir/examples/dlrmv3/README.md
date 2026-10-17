@@ -24,9 +24,13 @@ dlrmv3/
 | generative-recommenders | current public package |
 
 From the repository root, with your virtual environment activated, run
-**one** of the following commands to install the extra matching your target
+one of the following commands to install the extra matching your target
 environment. See the [installation guide](../../../README.md#installation)
 for virtual environment setup.
+
+These extras depend on Linux packages, including the CPU option. On an
+Apple Silicon Mac, read the [macOS notes](../../../README.md#macos-apple-silicon)
+before installing.
 
 **CPU smoke test / JAX CPU control**
 
