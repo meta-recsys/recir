@@ -105,7 +105,7 @@ class ScannedModule(torch.nn.Module):
         self.layer_weights_keys = list(
             # pyrefly: ignore [missing-attribute]
             self.c.one_mod.state_dict().keys()
-        )  # pyre-ignore[16]
+        )
         self.params = torch.nn.ParameterDict(
             {self._param_name_new(k): v for k, v in weights.items()}
         )

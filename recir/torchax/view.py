@@ -113,14 +113,14 @@ class NarrowInfo(ViewInfo):
     Handles operations like tensor[1:3, :, 2:5:2].
     """
 
-    def __init__(self, slices: slice | tuple[slice]) -> None:  # pyre-ignore[24]
+    def __init__(self, slices: slice | tuple[slice]) -> None:
         """
         Args:
             slices: The slice(s) to apply to the tensor.
                 E.g. jax_array.at[slices] will return the transformed tensor.
         """
         super().__init__(ViewInfoType.NARROW)
-        self.slices: slice | tuple[slice] = slices  # pyre-ignore[24]
+        self.slices: slice | tuple[slice] = slices
 
     def __eq__(self, other: object) -> bool:
         if not isinstance(other, NarrowInfo):
@@ -258,12 +258,12 @@ class View(torch.Tensor):
             view_info: Information about the view transformation
             env: Environment for tensor operations
         """
-        shape = view_info.calculate_output_shape(parent.jax())  # pyre-ignore[16]
+        shape = view_info.calculate_output_shape(parent.jax())
         return torch.Tensor._make_wrapper_subclass(
             cls,
             shape,
             device=torch.device("meta"),
-            dtype=parent.dtype,  # pyre-ignore[16]
+            dtype=parent.dtype,
             requires_grad=False,
         )
 
@@ -307,8 +307,8 @@ class View(torch.Tensor):
         if isinstance(self.parent, View):
             self.parent.replace_source_jax(new_value)
         else:
-            assert new_value.shape == self.parent._elem.shape  # pyre-fixme[16]
-            self.parent._elem = new_value  # pyre-fixme[16]
+            assert new_value.shape == self.parent._elem.shape
+            self.parent._elem = new_value
 
     def torch(self) -> _TorchaxTensor:  # noqa: F821
         """
@@ -338,7 +338,7 @@ class View(torch.Tensor):
         from recir.torchax.tensor import Tensor
 
         if isinstance(new_values, View) or isinstance(new_values, Tensor):
-            new_values = new_values.jax()  # pyre-ignore[16]
+            new_values = new_values.jax()
 
         # Apply all view transformations to the source array
         # And store intermediate values

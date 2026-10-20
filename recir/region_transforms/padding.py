@@ -181,7 +181,7 @@ def pad_to_static(
     return x2.flatten(dim, dim + 1)
 
 
-@pad_to_static.register_fake  # pyre-ignore[56]
+@pad_to_static.register_fake
 def _pad_fake(
     x: torch.Tensor,
     target_size: int,
@@ -263,7 +263,7 @@ def pad_count_to_sum(
     return torch.cat(parts, dim=0)
 
 
-@pad_count_to_sum.register_fake  # pyre-ignore[56]
+@pad_count_to_sum.register_fake
 def _pad_count_to_sum_fake(
     x: torch.Tensor,
     target_size: int,
@@ -313,7 +313,7 @@ def unpad_grad(
     return g2.flatten(dim, dim + 1).clone()
 
 
-@unpad_grad.register_fake  # pyre-ignore[56]
+@unpad_grad.register_fake
 def _unpad_fake(
     grad: torch.Tensor,
     pad_id: int,
@@ -439,7 +439,7 @@ def pad_jagged_lengths(
     return torch.cat(parts)
 
 
-@pad_jagged_lengths.register_fake  # pyre-ignore[56]
+@pad_jagged_lengths.register_fake
 def _pad_lengths_fake(
     lengths: torch.Tensor,
     per_key_budgets: List[int],
@@ -541,7 +541,7 @@ def pad_jagged_values(
     return torch.cat(parts, dim=dim)
 
 
-@pad_jagged_values.register_fake  # pyre-ignore[56]
+@pad_jagged_values.register_fake
 def _pad_jagged_values_fake(
     values: torch.Tensor,
     lengths: torch.Tensor,
@@ -648,7 +648,7 @@ def unpad_jagged_grad(
     return torch.cat(parts, dim=dim)
 
 
-@unpad_jagged_grad.register_fake  # pyre-ignore[56]
+@unpad_jagged_grad.register_fake
 def _unpad_jagged_grad_fake(
     grad: torch.Tensor,
     pad_id: int,
@@ -1127,7 +1127,7 @@ class PaddingRegionTransform(RegionTransform):
                 pair_bs_to_padded[pair_bs_val] = jp.padded_bs
                 if jp.count_idx is not None:
                     pair_bs_to_count[pair_bs_val] = jp.count_idx
-                bs_idx_set.add(jp.bs_idx)  # pyre-ignore
+                bs_idx_set.add(jp.bs_idx)
 
         for i, t in enumerate(tensors):
             if i in self._skip_indices:
@@ -1248,7 +1248,7 @@ class PaddingRegionTransform(RegionTransform):
                 # a single-key length vector.
                 count_idx = jp.count_idx
                 assert count_idx is not None  # guaranteed by bind_signature
-                tensors[jp.bs_idx] = pad_candidate_axis_to_static(  # pyre-ignore
+                tensors[jp.bs_idx] = pad_candidate_axis_to_static(
                     tensors[jp.bs_idx],
                     original_counts[count_idx],
                     jp.padded_bs,
@@ -1256,7 +1256,7 @@ class PaddingRegionTransform(RegionTransform):
                     pad_id=pid,
                     num_processes=np_,
                 )
-                padded_bs_indices.add(jp.bs_idx)  # pyre-ignore
+                padded_bs_indices.add(jp.bs_idx)
                 pid += 1
             if jp.count_idx is not None:
                 tensors[jp.count_idx] = pad_count_to_sum(  # pyre-ignore

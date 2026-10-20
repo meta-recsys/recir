@@ -65,7 +65,7 @@ class _Model(nn.Module):
         ec = nn.Module()
         for name, n in sizes.items():
             ec.add_module(name, _Sub(n))
-        self.ec = ec  # pyre-ignore
+        self.ec = ec
 
 
 class _SharedEmbeddingContainer(nn.Module):

@@ -984,7 +984,7 @@ class TestGSPMDShardParams(unittest.TestCase):
             **dict(model.named_buffers()),
         }
         mode.shard_params(model, params_and_buffers, opt)
-        new_state = opt.state[model.weight]  # pyre-ignore[6]
+        new_state = opt.state[model.weight]
         expected_dim0 = dim // num_procs
         self.assertEqual(new_state["exp_avg"].shape[0], expected_dim0)
         self.assertEqual(new_state["exp_avg_sq"].shape[0], expected_dim0)
@@ -1098,7 +1098,6 @@ class TestGSPMDShardParams(unittest.TestCase):
             **dict(model.named_buffers()),
         }
         mode.shard_params(model, params_and_buffers, opt)
-        # pyrefly: ignore [bad-index]
         self.assertEqual(model.running_mean.shape[0], dim // num_procs)
 
 
@@ -1114,8 +1113,8 @@ class TestToShardedJaxFSDP(unittest.TestCase):
 
     def test_fsdp_weight_creates_sharded_array(self) -> None:
         """FSDP weight should produce a globally sharded JAX array."""
-        import jax  # @manual  # pyre-ignore[21]
-        from jax.sharding import Mesh  # @manual  # pyre-ignore[21]
+        import jax  # @manual
+        from jax.sharding import Mesh  # @manual
         from recir.lowering.xla_lower import _XLAModule
 
         mesh = Mesh(jax.devices(), axis_names=("torch_dist",))
@@ -1128,9 +1127,9 @@ class TestToShardedJaxFSDP(unittest.TestCase):
 
     def test_fsdp_weight_preserves_values(self) -> None:
         """FSDP weight sharding should preserve tensor values in the global array."""
-        import jax  # @manual  # pyre-ignore[21]
-        import jax.numpy as jnp  # @manual  # pyre-ignore[21]
-        from jax.sharding import Mesh  # @manual  # pyre-ignore[21]
+        import jax  # @manual
+        import jax.numpy as jnp  # @manual
+        from jax.sharding import Mesh  # @manual
         from recir.lowering.xla_lower import _XLAModule
 
         mesh = Mesh(jax.devices(), axis_names=("torch_dist",))
@@ -1160,8 +1159,8 @@ class TestToShardedJaxFSDP(unittest.TestCase):
 
     def test_non_fsdp_weight_replicated(self) -> None:
         """Without is_fsdp_tensor, tensors should be replicated."""
-        import jax  # @manual  # pyre-ignore[21]
-        from jax.sharding import Mesh  # @manual  # pyre-ignore[21]
+        import jax  # @manual
+        from jax.sharding import Mesh  # @manual
         from recir.lowering.xla_lower import _XLAModule
 
         mesh = Mesh(jax.devices(), axis_names=("torch_dist",))
@@ -1174,7 +1173,7 @@ class TestGSPMDFSDPSingleProcess(unittest.TestCase):
     """End-to-end test: GSPMDParallel('fully_shard') single-process compilation."""
 
     def setUp(self) -> None:
-        import jax  # @manual  # pyre-ignore[21]
+        import jax  # @manual
 
         self.devices = jax.devices()
         if len(self.devices) < 2:

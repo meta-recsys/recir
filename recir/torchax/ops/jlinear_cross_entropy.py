@@ -104,7 +104,7 @@ def _chunk_loss(
     return jnp.where(jnp.any(invalid), jnp.asarray(jnp.nan, jnp.float32), loss)
 
 
-@op(torch.ops.recir.xla_linear_cross_entropy)  # pyre-ignore[56]
+@op(torch.ops.recir.xla_linear_cross_entropy)
 def linear_cross_entropy_scan(
     hidden: Any,
     labels: Any,
@@ -141,7 +141,7 @@ def linear_cross_entropy_scan(
     return total_loss
 
 
-@op(torch.ops.recir.xla_linear_cross_entropy_backward)  # pyre-ignore[56]
+@op(torch.ops.recir.xla_linear_cross_entropy_backward)
 def linear_cross_entropy_scan_backward(
     grad_out: Any,
     hidden: Any,

@@ -34,7 +34,7 @@ def _device_mesh() -> Mesh:
     return Mesh(jax.devices(), (_AXIS,))
 
 
-@op(torch.ops.recir.debug_ids)  # pyre-ignore[56]
+@op(torch.ops.recir.debug_ids)
 def _jdebug_ids(x: Any, tag: str, v_local: int) -> Any:
     """Identity passthrough that prints the block-owner histogram of x.
 

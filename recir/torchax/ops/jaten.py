@@ -67,7 +67,7 @@ def op_if_present(
     return op(*targets, **kwargs)
 
 
-@op(  # pyre-ignore[56]
+@op(
     torch.ops.aten.view_copy,
     torch.ops.aten.view,
     torch.ops.aten._unsafe_view,
@@ -88,7 +88,7 @@ def _run_binary_pointwise_operator(op: Any, x: Any, y: Any) -> Any:
 
 
 @op(torch.ops.aten.add.Tensor)
-@op(torch.ops.aten.add.Scalar)  # pyre-ignore[56]
+@op(torch.ops.aten.add.Scalar)
 def _aten_add(x: Any, y: Any, *, alpha: Any = 1) -> Any:
     """if isinstance(x, jnp.ndarray) and isinstance(y, jnp.ndarray):
 
@@ -97,9 +97,7 @@ def _aten_add(x: Any, y: Any, *, alpha: Any = 1) -> Any:
     return _run_binary_pointwise_operator(lambda x, y: x + y, x, y * alpha)
 
 
-@op(  # pyre-ignore[56]
-    torch.ops.aten.copy_, is_jax_function=False, is_view_op=True, needs_env=True
-)
+@op(torch.ops.aten.copy_, is_jax_function=False, is_view_op=True, needs_env=True)
 def _aten_copy(x: Any, y: Any, memory_format: Any = None, env: Any = None) -> Any:
     if y.device.type == "cpu":
         y = env.to_xla(y)
@@ -118,19 +116,19 @@ def _aten_copy(x: Any, y: Any, memory_format: Any = None, env: Any = None) -> An
     return x
 
 
-@op(torch.ops.aten.clone)  # pyre-ignore[56]
+@op(torch.ops.aten.clone)
 def _aten_clone(x: Any, memory_format: Any = None) -> Any:
     return x
 
 
 # aten.trunc
-@op(torch.ops.aten.trunc)  # pyre-ignore[56]
+@op(torch.ops.aten.trunc)
 def _aten_trunc(x: Any) -> Any:
     res = jnp.trunc(x)
     return res.astype(x.dtype)
 
 
-@op(torch.ops.aten.index_copy)  # pyre-ignore[56]
+@op(torch.ops.aten.index_copy)
 def _aten_index_copy(x: Any, dim: Any, indexes: Any, source: Any) -> Any:
     if x.ndim == 0:
         return source
@@ -149,7 +147,7 @@ def _aten_index_copy(x: Any, dim: Any, indexes: Any, source: Any) -> Any:
 
 
 # aten.cauchy_
-@op(torch.ops.aten.cauchy_)  # pyre-ignore[56]
+@op(torch.ops.aten.cauchy_)
 def _aten_cauchy_(x: Any, median: Any = 0, sigma: Any = 1) -> Any:
     """
     Fills the input array with values drawn from a Cauchy distribution.
@@ -167,18 +165,18 @@ def _aten_cauchy_(x: Any, median: Any = 0, sigma: Any = 1) -> Any:
     return x.at[:].set(samples)
 
 
-@op(torch.ops.aten.atleast_2d)  # pyre-ignore[56]
+@op(torch.ops.aten.atleast_2d)
 def _aten_atleast_2d(inputs: Any) -> Any:
     return jnp.atleast_2d(inputs)
 
 
-@op(torch.ops.aten.atleast_1d)  # pyre-ignore[56]
+@op(torch.ops.aten.atleast_1d)
 def _aten_atleast_1d(inputs: Any) -> Any:
     return jnp.atleast_1d(inputs)
 
 
 # aten.complex
-@op(torch.ops.aten.complex)  # pyre-ignore[56]
+@op(torch.ops.aten.complex)
 def _aten_complex(real: Any, imag: Any) -> Any:
     """
     Constructs a complex array from real and imaginary parts.
@@ -194,7 +192,7 @@ def _aten_complex(real: Any, imag: Any) -> Any:
 
 
 # aten.exponential_
-@op(torch.ops.aten.exponential_)  # pyre-ignore[56]
+@op(torch.ops.aten.exponential_)
 def _aten_exponential_(x: Any, lambd: Any = 1.0) -> Any:
     """
     Fills the input array with values drawn from an exponential distribution.
@@ -212,30 +210,30 @@ def _aten_exponential_(x: Any, lambd: Any = 1.0) -> Any:
 
 
 # aten.linalg_householder_product
-@op(torch.ops.aten.linalg_householder_product)  # pyre-ignore[56]
+@op(torch.ops.aten.linalg_householder_product)
 def _aten_linalg_householder_product(input: Any, tau: Any) -> Any:
     return jax.lax.linalg.householder_product(a=input, taus=tau)
 
 
-@op(torch.ops.aten.select)  # pyre-ignore[56]
+@op(torch.ops.aten.select)
 def _aten_select(x: Any, dim: Any, indexes: Any) -> Any:
     return jax.lax.index_in_dim(x, index=indexes, axis=dim, keepdims=False)
 
 
 @op(torch.ops.aten.index_select)
-@op(torch.ops.aten.select_copy)  # pyre-ignore[56]
+@op(torch.ops.aten.select_copy)
 def _aten_index_select(x: Any, dim: Any, index: Any) -> Any:
     if x.shape == ():
         return x
     return jnp.take(x, index, dim)
 
 
-@op(torch.ops.aten.linalg_cholesky)  # pyre-ignore[56]
+@op(torch.ops.aten.linalg_cholesky)
 def _aten_cholesky(input: Any, upper: Any = False) -> Any:
     return jax.scipy.linalg.cholesky(input, lower=(not upper))
 
 
-@op(torch.ops.aten.linalg_cholesky_ex)  # pyre-ignore[56]
+@op(torch.ops.aten.linalg_cholesky_ex)
 def _aten_linalg_cholesky_ex(
     input: Any, upper: Any = False, check_errors: Any = False
 ) -> Any:
@@ -254,7 +252,7 @@ def _aten_linalg_cholesky_ex(
     return L, info
 
 
-@op(torch.ops.aten.cholesky_solve)  # pyre-ignore[56]
+@op(torch.ops.aten.cholesky_solve)
 def _aten_cholesky_solve(input: Any, input2: Any, upper: Any = False) -> Any:
     # Ensure input2 is lower triangular for cho_solve
     L = input2 if not upper else input2.T
@@ -263,7 +261,7 @@ def _aten_cholesky_solve(input: Any, input2: Any, upper: Any = False) -> Any:
     return solution
 
 
-@op(torch.ops.aten.special_zeta)  # pyre-ignore[56]
+@op(torch.ops.aten.special_zeta)
 def _aten_special_zeta(x: Any, q: Any) -> Any:
     new_dtype = mappings.t2j_dtype(torch.get_default_dtype())
     res = jax.scipy.special.zeta(x, q)
@@ -273,7 +271,7 @@ def _aten_special_zeta(x: Any, q: Any) -> Any:
 
 
 # aten.igammac
-@op(torch.ops.aten.igammac)  # pyre-ignore[56]
+@op(torch.ops.aten.igammac)
 def _aten_igammac(input: Any, other: Any) -> Any:
     if isinstance(input, jnp.ndarray):
         input = jnp.where(input < 0, jnp.nan, input)
@@ -285,7 +283,7 @@ def _aten_igammac(input: Any, other: Any) -> Any:
     return jnp.array(jax.scipy.special.gammaincc(input, other))
 
 
-@op(torch.ops.aten.mean)  # pyre-ignore[56]
+@op(torch.ops.aten.mean)
 def _aten_mean(x: Any, dim: Any = None, keepdim: Any = False) -> Any:
     if x.shape == () and dim is not None:
         dim = None  # disable dim for jax array without dim
@@ -339,7 +337,7 @@ def _searchsorted(
     return jnp.searchsorted(sorted_sequence, values, side=side, sorter=sorter)
 
 
-@op(torch.ops.aten.searchsorted.Tensor)  # pyre-ignore[56]
+@op(torch.ops.aten.searchsorted.Tensor)
 def _aten_searchsorted(
     sorted_sequence: Any,
     values: Any,
@@ -362,12 +360,12 @@ def _aten_searchsorted(
 
 
 @op(torch.ops.aten.sub.Tensor)
-@op(torch.ops.aten.sub.Scalar)  # pyre-ignore[56]
+@op(torch.ops.aten.sub.Scalar)
 def _aten_sub(x: Any, y: Any, alpha: Any = 1) -> Any:
     return _run_binary_pointwise_operator(lambda x, y: x - y, x, y * alpha)
 
 
-@op(torch.ops.aten.numpy_T)  # pyre-ignore[56]
+@op(torch.ops.aten.numpy_T)
 def _aten_numpy_T(input: Any) -> Any:
     """
     Jax implementation of torch.numpy_T.
@@ -381,30 +379,30 @@ def _aten_numpy_T(input: Any) -> Any:
     return jnp.transpose(input)
 
 
-@op(torch.ops.aten.mm)  # pyre-ignore[56]
+@op(torch.ops.aten.mm)
 def _aten_mm(x: Any, y: Any) -> Any:
     res = x @ y
     return res
 
 
-@op(torch.ops.aten.mul.Tensor, torch.ops.aten.mul.Scalar)  # pyre-ignore[56]
+@op(torch.ops.aten.mul.Tensor, torch.ops.aten.mul.Scalar)
 def _aten_mul(x: Any, y: Any) -> Any:
     return _run_binary_pointwise_operator(lambda x, y: x * y, x, y)
 
 
 @op(torch.ops.aten.silu)
-@op(torch.ops.aten.silu.default)  # pyre-ignore[56]
+@op(torch.ops.aten.silu.default)
 def _aten_silu(x: Any) -> Any:
     return jax.nn.silu(x)
 
 
-@op(torch.ops.aten.t)  # pyre-ignore[56]
+@op(torch.ops.aten.t)
 def _aten_t(x: Any) -> Any:
     return jnp.transpose(x)
 
 
 @op(torch.ops.aten.transpose)
-@op(torch.ops.aten.transpose_copy)  # pyre-ignore[56]
+@op(torch.ops.aten.transpose_copy)
 def _aten_transpose(x: Any, dim0: Any, dim1: Any) -> Any:
     if x.ndim == 0:
         return x
@@ -413,13 +411,13 @@ def _aten_transpose(x: Any, dim0: Any, dim1: Any) -> Any:
     return jnp.swapaxes(x, dim0, dim1)
 
 
-@op(torch.ops.aten.triu)  # pyre-ignore[56]
+@op(torch.ops.aten.triu)
 def _aten_triu(m: Any, k: Any = 0) -> Any:
     return jnp.triu(m, k)
 
 
 @op(torch.ops.aten.slice)
-@op(torch.ops.aten.slice_copy)  # pyre-ignore[56]
+@op(torch.ops.aten.slice_copy)
 def _aten_slice(
     self: Any, dim: Any = 0, start: Any = None, end: Any = None, step: Any = 1
 ) -> Any:
@@ -438,22 +436,22 @@ def _aten_slice(
 
 
 @op(torch.ops.aten.positive)
-@op(torch.ops.aten.detach)  # pyre-ignore[56]
+@op(torch.ops.aten.detach)
 def _aten_detach(self: Any) -> Any:
     return self
 
 
-@op(torch.ops.aten.imag)  # pyre-ignore[56]
+@op(torch.ops.aten.imag)
 def _aten_imag(x: Any) -> Any:
     return jnp.imag(x)
 
 
-@op(torch.ops.aten.isfinite)  # pyre-ignore[56]
+@op(torch.ops.aten.isfinite)
 def _aten_isfinite(x: Any) -> Any:
     return jnp.isfinite(x)
 
 
-@op(torch.ops.aten.real)  # pyre-ignore[56]
+@op(torch.ops.aten.real)
 def _aten_real(x: Any) -> Any:
     return jnp.real(x)
 
@@ -464,7 +462,7 @@ def _aten_resize_(x: Any, size: Any, interpolation: Any = "linear") -> Any:
     return jax.numpy.resize(x, new_size)
 
 
-@op(torch.ops.aten.resize_as_)  # pyre-ignore[56]
+@op(torch.ops.aten.resize_as_)
 def _aten_resize_as_(x: Any, y: Any) -> Any:
     return jax.numpy.resize(x, y.shape)
 
@@ -479,7 +477,7 @@ def repeat_interleave(repeats: Any, dim: Any = 0, *, output_size: Any = None) ->
 
 
 @op(torch.ops.aten.repeat_interleave.self_int)
-@op(torch.ops.aten.repeat_interleave.self_Tensor)  # pyre-ignore[56]
+@op(torch.ops.aten.repeat_interleave.self_Tensor)
 def repeat_interleave(self: Any, repeats: Any, dim: Any = 0) -> Any:  # noqa: F811
     total_repeat_length = None
     if isinstance(repeats, int):
@@ -488,7 +486,7 @@ def repeat_interleave(self: Any, repeats: Any, dim: Any = 0) -> Any:  # noqa: F8
     return jnp.repeat(self, repeats, dim, total_repeat_length=total_repeat_length)
 
 
-@op(torch.ops.aten.view_as_real)  # pyre-ignore[56]
+@op(torch.ops.aten.view_as_real)
 def _aten_view_as_real(x: Any) -> Any:
     real = jnp.real(x)
     im = jnp.imag(x)
@@ -496,14 +494,14 @@ def _aten_view_as_real(x: Any) -> Any:
     return res
 
 
-@op(torch.ops.aten.stack)  # pyre-ignore[56]
+@op(torch.ops.aten.stack)
 def _aten_stack(tensors: Any, dim: Any = 0) -> Any:
     return jnp.stack(tensors, dim)
 
 
 @op(torch.ops.aten._softmax)
 @op(torch.ops.aten.softmax)
-@op(torch.ops.aten.softmax.int)  # pyre-ignore[56]
+@op(torch.ops.aten.softmax.int)
 def _aten_softmax(x: Any, dim: Any, halftofloat: Any = False) -> Any:
     # Use dtype check instead of halftofloat flag
     if x.dtype in (jnp.float16, jnp.bfloat16):
@@ -546,7 +544,7 @@ def highest_precision_int_dtype(tensor1: Any, tensor2: Any) -> Any:
     )
 
 
-@op(torch.ops.aten.pow)  # pyre-ignore[56]
+@op(torch.ops.aten.pow)
 def _aten_pow(x: Any, y: Any) -> Any:
     y_orig = y
     if isinstance(y, int):
@@ -563,7 +561,7 @@ def _aten_pow(x: Any, y: Any) -> Any:
     return res
 
 
-@op(torch.ops.aten.view_as_complex)  # pyre-ignore[56]
+@op(torch.ops.aten.view_as_complex)
 def _aten_view_as_complex(input: Any) -> Any:
     if input.dtype == jnp.bfloat16:
         input = input.astype(jnp.float32)
@@ -571,7 +569,7 @@ def _aten_view_as_complex(input: Any) -> Any:
     return jax.lax.complex(x, y)
 
 
-@op(torch.ops.aten.div)  # pyre-ignore[56]
+@op(torch.ops.aten.div)
 def _aten_div(x: Any, y: Any, rounding_mode: Any = "") -> Any:
     res_dtype = None
     if _is_int(x) and _is_int(y):
@@ -597,18 +595,18 @@ def _aten_div(x: Any, y: Any, rounding_mode: Any = "") -> Any:
     return res
 
 
-@op(torch.ops.aten.true_divide)  # pyre-ignore[56]
+@op(torch.ops.aten.true_divide)
 def _aten_true_divide(x: Any, y: Any) -> Any:
     return x / y
 
 
-@op(torch.ops.aten.dist)  # pyre-ignore[56]
+@op(torch.ops.aten.dist)
 def _aten_dist(input: Any, other: Any, p: Any = 2) -> Any:
     diff = jnp.abs(jnp.subtract(input, other))
     return _aten_linalg_vector_norm(diff, ord=p)
 
 
-@op(torch.ops.aten.bmm)  # pyre-ignore[56]
+@op(torch.ops.aten.bmm)
 def _aten_bmm(x: Any, y: Any) -> Any:
     res = x @ y
     return res
@@ -628,7 +626,7 @@ def _disable_pad_idx_grad_embedding_impl(
     return output_embeds
 
 
-@_disable_pad_idx_grad_embedding_impl.defjvp  # pyre-ignore[56]
+@_disable_pad_idx_grad_embedding_impl.defjvp
 def _embedding_jvp(
     padding_idx: Any, scale_grad_by_freq: Any, sparse: Any, primals: Any, tangents: Any
 ) -> Any:
@@ -647,7 +645,7 @@ def _embedding_jvp(
 #################################################################################
 
 
-@op(torch.ops.aten.embedding)  # pyre-ignore[56]
+@op(torch.ops.aten.embedding)
 # embedding(Tensor weight, Tensor indices, SymInt padding_idx=-1, bool scale_grad_by_freq=False, bool sparse=False)
 def _aten_embedding(
     a: Any,
@@ -658,12 +656,12 @@ def _aten_embedding(
 ) -> Any:
     if padding_idx == -1:
         return jnp.take(a, w, axis=0)
-    return _disable_pad_idx_grad_embedding_impl(  # pyre-ignore[29]
+    return _disable_pad_idx_grad_embedding_impl(
         a, w, padding_idx, scale_grad_by_freq, sparse
     )
 
 
-@op(torch.ops.aten.embedding_renorm_)  # pyre-ignore[56]
+@op(torch.ops.aten.embedding_renorm_)
 def _aten_embedding_renorm_(
     weight: Any, indices: Any, max_norm: Any, norm_type: Any
 ) -> Any:
@@ -692,7 +690,7 @@ def _aten_embedding_renorm_(
 # Tensor weight, Tensor indices, Tensor offsets, bool scale_grad_by_freq=False,
 # int mode=0, bool sparse=False, Tensor? per_sample_weights=None, bool include_last_offset=False, int padding_idx=-1) -> (Tensor, Tensor, Tensor, Tensor)
 @op(torch.ops.aten._embedding_bag)
-@op(torch.ops.aten._embedding_bag_forward_only)  # pyre-ignore[56]
+@op(torch.ops.aten._embedding_bag_forward_only)
 def _aten__embedding_bag(
     weight: Any,
     indices: Any,
@@ -775,7 +773,7 @@ def _aten__embedding_bag(
     return output, offset2bag, bag_size, max_indices
 
 
-@op(torch.ops.aten._embedding_bag_backward)  # pyre-ignore[56]
+@op(torch.ops.aten._embedding_bag_backward)
 def _aten__embedding_bag_backward(
     grad: Any,
     indices: Any,
@@ -811,14 +809,14 @@ def _aten__embedding_bag_backward(
     return grad_weight
 
 
-@op(torch.ops.aten.rsqrt)  # pyre-ignore[56]
+@op(torch.ops.aten.rsqrt)
 @op_base.promote_int_input
 def _aten_rsqrt(x: Any) -> Any:
     return jax.lax.rsqrt(x)
 
 
 @op(torch.ops.aten.expand)
-@op(torch.ops.aten.expand_copy)  # pyre-ignore[56]
+@op(torch.ops.aten.expand_copy)
 def _aten_expand(x: Any, dims: Any) -> Any:
     def fix_dims(d: Any, xs: Any) -> Any:
         if d == -1:
@@ -837,12 +835,12 @@ def _aten_expand(x: Any, dims: Any) -> Any:
     return jnp.broadcast_to(x, dims)
 
 
-@op(torch.ops.aten.dot)  # pyre-ignore[56]
+@op(torch.ops.aten.dot)
 def _aten_dot(x: Any, y: Any) -> Any:
     return jnp.dot(x, y)
 
 
-@op(torch.ops.aten._to_copy)  # pyre-ignore[56]
+@op(torch.ops.aten._to_copy)
 def _aten__to_copy(self: Any, **kwargs: Any) -> Any:
     dtype = mappings.t2j_dtype(kwargs["dtype"])
     if dtype != self.dtype:
@@ -850,31 +848,31 @@ def _aten__to_copy(self: Any, **kwargs: Any) -> Any:
     return jnp.copy(self)
 
 
-@op(torch.ops.aten.empty)  # pyre-ignore[56]
+@op(torch.ops.aten.empty)
 @op_base.convert_dtype(use_default_dtype=False)
 def _aten_empty(size: Sequence[int], *, dtype: Any = None, **kwargs: Any) -> Any:
     return jnp.empty(size, dtype=dtype)
 
 
-@op(torch.ops.aten.empty_like)  # pyre-ignore[56]
+@op(torch.ops.aten.empty_like)
 @op_base.convert_dtype(use_default_dtype=False)
 def _aten_empty_like(input: Any, *, dtype: Any = None, **kwargs: Any) -> Any:
     return jnp.empty_like(input, dtype)
 
 
-@op(torch.ops.aten.ones)  # pyre-ignore[56]
+@op(torch.ops.aten.ones)
 @op_base.convert_dtype()
 def _ones(size: Sequence[int], dtype: Any = None, **kwargs: Any) -> Any:
     return jnp.ones(size, dtype)
 
 
-@op(torch.ops.aten.zeros)  # pyre-ignore[56]
+@op(torch.ops.aten.zeros)
 @op_base.convert_dtype()
 def _zeros(size: Sequence[int], dtype: Any = None, **kwargs: Any) -> Any:
     return jnp.zeros(size, dtype)
 
 
-@op(torch.ops.aten.full)  # pyre-ignore[56]
+@op(torch.ops.aten.full)
 @op_base.convert_dtype()
 def _full(
     size: Sequence[int], fill_value: Any, *, dtype: Any = None, **kwargs: Any
@@ -883,7 +881,7 @@ def _full(
     return jnp.full(size, fill_value, dtype=dtype)
 
 
-@op(torch.ops.aten.empty_permuted)  # pyre-ignore[56]
+@op(torch.ops.aten.empty_permuted)
 @op_base.convert_dtype()
 def _aten_empty_permuted(
     sizes: Any, physical_layout: Any, dtype: Any = None, **kwargs: Any
@@ -893,7 +891,7 @@ def _aten_empty_permuted(
     return jnp.empty(sizes, dtype=dtype)
 
 
-@op(torch.ops.aten.empty_strided)  # pyre-ignore[56]
+@op(torch.ops.aten.empty_strided)
 @op_base.convert_dtype()
 def _aten_empty_strided(
     sizes: Any, stride: Any, dtype: Any = None, **kwargs: Any
@@ -902,7 +900,7 @@ def _aten_empty_strided(
     return jnp.empty(sizes, dtype=dtype)
 
 
-@op(torch.ops.aten.index_put)  # pyre-ignore[56]
+@op(torch.ops.aten.index_put)
 def _aten_index_put(
     self: Any, indexes: Any, values: Any, accumulate: Any = False
 ) -> Any:
@@ -931,7 +929,7 @@ def _aten_index_put(
 
 @op(torch.ops.aten.index)
 @op(torch.ops.aten._unsafe_index)
-@op(torch.ops.aten.index.Tensor)  # pyre-ignore[56]
+@op(torch.ops.aten.index.Tensor)
 def _aten_index(self: Any, indexes: Any) -> Any:
     indexes = [slice(None, None, None) if i is None else i for i in indexes]
     indexes = tuple(indexes)
@@ -940,7 +938,7 @@ def _aten_index(self: Any, indexes: Any) -> Any:
 
 @op(torch.ops.aten.split)
 @op(torch.ops.aten.split_copy)
-@op(torch.ops.aten.split_with_sizes)  # pyre-ignore[56]
+@op(torch.ops.aten.split_with_sizes)
 def split_with_sizes(x: Any, sizes: Any, dim: Any = 0) -> Any:
     """Splits an array `x` into sub-arrays based on static sizes `sizes`.
 
@@ -970,21 +968,21 @@ def split_with_sizes(x: Any, sizes: Any, dim: Any = 0) -> Any:
 
 
 @op(torch.ops.aten.permute)
-@op(torch.ops.aten.permute_copy)  # pyre-ignore[56]
+@op(torch.ops.aten.permute_copy)
 def permute(t: Any, dims: Any) -> Any:
     # TODO: return a View instead
     return jnp.transpose(t, dims)
 
 
 @op(torch.ops.aten.unsqueeze)
-@op(torch.ops.aten.unsqueeze_copy)  # pyre-ignore[56]
+@op(torch.ops.aten.unsqueeze_copy)
 def _aten_unsqueeze(self: Any, dim: Any) -> Any:
     if dim < 0:
         dim += self.ndim + 1
     return jnp.expand_dims(self, dim)
 
 
-@op(torch.ops.aten.ne)  # pyre-ignore[56]
+@op(torch.ops.aten.ne)
 def _aten_ne(x: Any, y: Any) -> Any:
     return jnp.not_equal(x, y)
 
@@ -1010,7 +1008,7 @@ def _broadcast_indices(indices: Any, shape: Any) -> Any:
     return jnp.broadcast_to(indices, shape)
 
 
-@op(torch.ops.aten.cummax)  # pyre-ignore[56]
+@op(torch.ops.aten.cummax)
 def _aten_cummax(x: Any, dim: Any) -> Any:
     if not x.shape:
         return x, jnp.zeros_like(x, dtype=jnp.int64)
@@ -1034,7 +1032,7 @@ def _aten_cummax(x: Any, dim: Any) -> Any:
     return res["val"], res["idx"]
 
 
-@op(torch.ops.aten.cummin)  # pyre-ignore[56]
+@op(torch.ops.aten.cummin)
 def _aten_cummin(x: Any, dim: Any) -> Any:
     if not x.shape:
         return x, jnp.zeros_like(x, dtype=jnp.int64)
@@ -1058,7 +1056,7 @@ def _aten_cummin(x: Any, dim: Any) -> Any:
     return res["val"], res["idx"]
 
 
-@op(torch.ops.aten.cumsum)  # pyre-ignore[56]
+@op(torch.ops.aten.cumsum)
 def _aten_cumsum(x: Any, y: Any, dtype: Any = None) -> Any:
     if dtype:
         dtype = mappings.t2j_dtype(dtype)
@@ -1068,7 +1066,7 @@ def _aten_cumsum(x: Any, y: Any, dtype: Any = None) -> Any:
     return res
 
 
-@op(torch.ops.aten.cumprod)  # pyre-ignore[56]
+@op(torch.ops.aten.cumprod)
 def _aten_cumprod(input: Any, dim: Any, dtype: Any = None, out: Any = None) -> Any:
     if dtype:
         dtype = mappings.t2j_dtype(dtype)
@@ -1081,7 +1079,7 @@ def _aten_cumprod(input: Any, dim: Any, dtype: Any = None, out: Any = None) -> A
     return res
 
 
-@op(torch.ops.aten.native_layer_norm)  # pyre-ignore[56]
+@op(torch.ops.aten.native_layer_norm)
 def _aten_native_layer_norm(
     input: Any,
     normalized_shape: Any,
@@ -1123,14 +1121,14 @@ def _aten_native_layer_norm(
     return norm_x, mean, rstd
 
 
-@op(torch.ops.aten.matmul)  # pyre-ignore[56]
+@op(torch.ops.aten.matmul)
 def _aten_matmul(x: Any, y: Any) -> Any:
     return x @ y
 
 
 # - func: addmm(Tensor self, Tensor mat1, Tensor mat2, *, Scalar beta=1, Scalar alpha=1) -> Tensor
 @op(torch.ops.aten.addmm)
-@op(torch.ops.aten.addmv)  # pyre-ignore[56]
+@op(torch.ops.aten.addmv)
 def _aten_addmm(
     self: Any, mat1: Any, mat2: Any, *, beta: Any = 1.0, alpha: Any = 1.0
 ) -> Any:
@@ -1141,7 +1139,7 @@ def _aten_addmm(
     return self
 
 
-@op(torch.ops.aten.sparse_sampled_addmm)  # pyre-ignore[56]
+@op(torch.ops.aten.sparse_sampled_addmm)
 def _aten_sparse_addmm(
     self: Any, mat1: Any, mat2: Any, *, beta: Any = 1.0, alpha: Any = 1.0
 ) -> Any:
@@ -1152,7 +1150,7 @@ def _aten_sparse_addmm(
     return self
 
 
-@op(torch.ops.aten.addbmm.default)  # pyre-ignore[56]
+@op(torch.ops.aten.addbmm.default)
 def _aten_addbmm(
     input: Any, batch1: Any, batch2: Any, *, beta: Any = 1, alpha: Any = 1
 ) -> Any:
@@ -1164,14 +1162,14 @@ def _aten_addbmm(
     )
 
 
-@op(torch.ops.aten.gelu)  # pyre-ignore[56]
+@op(torch.ops.aten.gelu)
 def _aten_gelu(self: Any, *, approximate: Any = "none") -> Any:
     approx = approximate == "tanh"
     return jax.nn.gelu(self, approx)
 
 
 @op(torch.ops.aten.squeeze)
-@op(torch.ops.aten.squeeze_copy)  # pyre-ignore[56]
+@op(torch.ops.aten.squeeze_copy)
 def _aten_squeeze_dim(self: Any, dim: Any = None) -> Any:
     if self.ndim == 0:
         return self
@@ -1189,7 +1187,7 @@ def _aten_squeeze_dim(self: Any, dim: Any = None) -> Any:
     return jnp.squeeze(self, dim)
 
 
-@op(torch.ops.aten.bucketize)  # pyre-ignore[56]
+@op(torch.ops.aten.bucketize)
 def _aten_bucketize(
     input: Any,
     boundaries: Any,
@@ -1206,7 +1204,7 @@ def _aten_bucketize(
     return _searchsorted(boundaries, input, side).astype(return_type)
 
 
-@op(torch.ops.aten.conv2d)  # pyre-ignore[56]
+@op(torch.ops.aten.conv2d)
 def _aten_conv2d(
     input: Any,
     weight: Any,
@@ -1229,7 +1227,7 @@ def _aten_conv2d(
     )
 
 
-@op(torch.ops.aten.convolution)  # pyre-ignore[56]
+@op(torch.ops.aten.convolution)
 def _aten_convolution(
     input: Any,
     weight: Any,
@@ -1274,9 +1272,7 @@ def _aten_convolution(
             lhs_spec.append(i + 2)
             rhs_spec.append(i + 2)
             out_spec.append(i + 2)
-        return jax.lax.ConvDimensionNumbers(
-            *map(tuple, (lhs_spec, rhs_spec, out_spec))  # pyre-ignore[6]
-        )
+        return jax.lax.ConvDimensionNumbers(*map(tuple, (lhs_spec, rhs_spec, out_spec)))
 
     if transposed:
         rhs = jnp.flip(weight, range(2, 1 + num_shape_dim))
@@ -1318,12 +1314,12 @@ def _aten_convolution(
             bias = bias.reshape(tuple(shape))
         res = res + bias
 
-    res = res.reshape((*batch_dims, *res.shape[-num_shape_dim:]))  # pyre-ignore[60]
+    res = res.reshape((*batch_dims, *res.shape[-num_shape_dim:]))
     return res
 
 
 # _native_batch_norm_legit(Tensor input, Tensor? weight, Tensor? bias, Tensor(a!) running_mean, Tensor(b!) running_var, bool training, float momentum, float eps)
-@op(torch.ops.aten._native_batch_norm_legit.default)  # pyre-ignore[56]
+@op(torch.ops.aten._native_batch_norm_legit.default)
 def _aten__native_batch_norm_legit(
     input: Any,
     weight: Any,
@@ -1389,7 +1385,7 @@ def _aten__native_batch_norm_legit(
     return x_hat, saved_mean, saved_rstd
 
 
-@op(torch.ops.aten._native_batch_norm_legit_no_training)  # pyre-ignore[56]
+@op(torch.ops.aten._native_batch_norm_legit_no_training)
 def _aten__native_batch_norm_legit_no_training(
     input: Any,
     weight: Any,
@@ -1404,12 +1400,12 @@ def _aten__native_batch_norm_legit_no_training(
     )
 
 
-@op(torch.ops.aten.relu)  # pyre-ignore[56]
+@op(torch.ops.aten.relu)
 def _aten_relu(self: Any) -> Any:
     return jax.nn.relu(self)
 
 
-@op(torch.ops.aten.cat)  # pyre-ignore[56]
+@op(torch.ops.aten.cat)
 def _aten_cat(tensors: Any, dims: Any = 0) -> Any:
     # handle empty tensors as a special case.
     # torch.cat will ignore the empty tensor, while jnp.concatenate
@@ -1487,7 +1483,6 @@ def max_pool(
     if num_batch_dims == 0:
         input_shape = [1, *input_shape]
     padding = _ceil_mode_padding(
-        # pyrefly: ignore [bad-argument-type]
         padding,
         input_shape,
         # pyrefly: ignore [bad-argument-type]
@@ -1520,7 +1515,7 @@ def max_pool(
 
     assert inputs.ndim == len(dims), f"len({inputs.shape}) != len({dims})"
     if not isinstance(padding, str):
-        padding = tuple(map(tuple, padding))  # pyre-ignore[6]
+        padding = tuple(map(tuple, padding))
         assert len(padding) == len(kernel_size), (
             f"padding {padding} must specify pads for same number of dims as "
             f"kernel_size {kernel_size}"
@@ -1582,7 +1577,7 @@ def max_pool(
 
 
 @op(torch.ops.aten.max_pool2d_with_indices)
-@op(torch.ops.aten.max_pool3d_with_indices)  # pyre-ignore[56]
+@op(torch.ops.aten.max_pool3d_with_indices)
 def _aten_max_pool2d_with_indices(
     inputs: Any,
     kernel_size: Any,
@@ -1605,11 +1600,11 @@ def _aten_max_pool2d_with_indices(
 # Aten ops registered under the `xla` library.
 try:
 
-    @op(torch.ops.xla.max_pool2d_forward)  # pyre-ignore[56]
+    @op(torch.ops.xla.max_pool2d_forward)
     def _xla_max_pool2d_forward(*args: Any, **kwargs: Any) -> Any:
         return _aten_max_pool2d_with_indices(*args, **kwargs)[0]
 
-    @op(torch.ops.xla.aot_mark_sharding)  # pyre-ignore[56]
+    @op(torch.ops.xla.aot_mark_sharding)
     def _xla_aot_mark_sharding(t: Any, mesh: str, partition_spec: str) -> Any:
         import ast
 
@@ -1624,7 +1619,7 @@ try:
             t, NamedSharding(jmesh, P(*partition_spec_eval))
         )
 
-    @op(torch.ops.xla.einsum_linear_forward)  # pyre-ignore[56]
+    @op(torch.ops.xla.einsum_linear_forward)
     def _xla_einsum_linear_forward(input: Any, weight: Any, bias: Any) -> Any:
         with jax.named_scope("einsum_linear_forward"):
             product = jax.numpy.einsum("...n,mn->...m", input, weight)
@@ -1638,7 +1633,7 @@ except AttributeError:
 # TODO add more ops
 
 
-@op(torch.ops.aten.min)  # pyre-ignore[56]
+@op(torch.ops.aten.min)
 def _aten_min(x: Any, dim: Any = None, keepdim: Any = False) -> Any:
     if dim is not None:
         return _with_reduction_scalar(jnp.min, x, dim, keepdim), _with_reduction_scalar(
@@ -1648,7 +1643,7 @@ def _aten_min(x: Any, dim: Any = None, keepdim: Any = False) -> Any:
         return _with_reduction_scalar(jnp.min, x, dim, keepdim)
 
 
-@op(torch.ops.aten.mode)  # pyre-ignore[56]
+@op(torch.ops.aten.mode)
 def _aten_mode(
     input: Any, dim: Any = -1, keepdim: Any = False, *, out: Any = None
 ) -> Any:
@@ -1666,29 +1661,29 @@ def _aten_mode(
     return mode, indices
 
 
-@op(torch.ops.aten.amin)  # pyre-ignore[56]
+@op(torch.ops.aten.amin)
 def _aten_amin(x: Any, dim: Any = None, keepdim: Any = False) -> Any:
     return _with_reduction_scalar(jnp.amin, x, dim, keepdim)
 
 
-@op(torch.ops.aten.argmin)  # pyre-ignore[56]
+@op(torch.ops.aten.argmin)
 def _aten_argmin(self: Any, dim: Any = None, keepdim: Any = False) -> Any:
     return _with_reduction_scalar(jnp.argmin, self, dim, keepdim)
 
 
-@op(torch.ops.aten.sin)  # pyre-ignore[56]
+@op(torch.ops.aten.sin)
 @op_base.promote_int_input
 def _aten_sin(x: Any) -> Any:
     return jnp.sin(x)
 
 
-@op(torch.ops.aten.sym_size)  # pyre-ignore[56]
+@op(torch.ops.aten.sym_size)
 def _aten_sym_size(x: Any, dim: Any) -> Any:
     return x.shape[dim]
 
 
 @op(torch.ops.aten.var.correction)
-@op(torch.ops.prims.var)  # pyre-ignore[56]
+@op(torch.ops.prims.var)
 def _aten_var(
     x: Any,
     dim: Any = None,
@@ -1700,7 +1695,7 @@ def _aten_var(
     return jnp.var(x, axis=dim, ddof=correction, keepdims=keepdim)
 
 
-@op(torch.ops.prims.broadcast_in_dim)  # pyre-ignore[56]
+@op(torch.ops.prims.broadcast_in_dim)
 def _prims_broadcast_in_dim(t: Any, shape: Any, broadcast_dimensions: Any) -> Any:
     return jax.lax.broadcast_in_dim(t, shape, broadcast_dimensions=broadcast_dimensions)
 
@@ -1709,7 +1704,7 @@ def _prims_broadcast_in_dim(t: Any, shape: Any, broadcast_dimensions: Any) -> An
 # func: native_group_norm(Tensor input, Tensor? weight, Tensor? bias, SymInt N, SymInt C, SymInt HxW, int group, float eps) -> (Tensor, Tensor, Tensor)
 
 
-@op(torch.ops.aten.native_group_norm)  # pyre-ignore[56]
+@op(torch.ops.aten.native_group_norm)
 def _aten_native_group_norm(
     input: Any,
     weight: Any,
@@ -1777,7 +1772,7 @@ def _aten_native_group_norm(
     return output, mean, rstd
 
 
-@op(torch.ops.aten.linalg_vector_norm)  # pyre-ignore[56]
+@op(torch.ops.aten.linalg_vector_norm)
 def _aten_linalg_vector_norm(
     self: Any, ord: Any = 2, dim: Any = None, keepdim: Any = False, dtype: Any = None
 ) -> Any:
@@ -1832,10 +1827,10 @@ def _aten_linalg_vector_norm(
     else:  # General case (e.g., ord = 1, ord = 3)
         result = _with_reduction_scalar(
             jnp.sum,
-            jnp.abs(self) ** ord,  # pyre-ignore[58]
+            jnp.abs(self) ** ord,
             dim,
             keepdim,
-        ) ** (1.0 / ord)  # pyre-ignore[58]
+        ) ** (1.0 / ord)
 
     # (Optional) dtype conversion
     if dtype is not None:
@@ -1848,7 +1843,7 @@ def _aten_linalg_vector_norm(
 
 
 # aten.reflection_pad1d
-@op(torch.ops.aten.reflection_pad1d)  # pyre-ignore[56]
+@op(torch.ops.aten.reflection_pad1d)
 def _aten_reflection_pad1d(input: Any, padding: Any) -> Any:
     rank = len(input.shape)
     pad_size = [(0, 0)] * rank
@@ -1857,20 +1852,20 @@ def _aten_reflection_pad1d(input: Any, padding: Any) -> Any:
 
 
 # aten.alias
-@op(torch.ops.aten.alias)  # pyre-ignore[56]
+@op(torch.ops.aten.alias)
 def _aten_alias(self: Any, *args: Any) -> Any:
     return self
 
 
 # aten.sinh
-@op(torch.ops.aten.sinh)  # pyre-ignore[56]
+@op(torch.ops.aten.sinh)
 @op_base.promote_int_input
 def _aten_sinh(self: Any) -> Any:
     return jnp.sinh(self)
 
 
 # aten.native_layer_norm_backward
-@op(torch.ops.aten.native_layer_norm_backward)  # pyre-ignore[56]
+@op(torch.ops.aten.native_layer_norm_backward)
 def _aten_native_layer_norm_backward(
     grad_out: Any,
     input: Any,
@@ -1930,7 +1925,7 @@ def _aten_native_layer_norm_backward(
 
 
 # aten.atanh
-@op(torch.ops.aten.atanh)  # pyre-ignore[56]
+@op(torch.ops.aten.atanh)
 @op_base.promote_int_input
 def _aten_atanh(self: Any) -> Any:
     res = jnp.arctanh(self)
@@ -1938,27 +1933,27 @@ def _aten_atanh(self: Any) -> Any:
 
 
 # aten.bincount
-@op(torch.ops.aten.bincount)  # pyre-ignore[56]
+@op(torch.ops.aten.bincount)
 def _aten_bincount(input: Any, weights: Any = None, minlength: Any = 0) -> Any:
     return jnp.bincount(input, weights, minlength)
 
 
 # aten.bitwise_not
-@op(torch.ops.aten.bitwise_not)  # pyre-ignore[56]
+@op(torch.ops.aten.bitwise_not)
 def _aten_bitwise_not(self: Any) -> Any:
     return ~self
 
 
 # aten.bitwise_left_shift
 @op(torch.ops.aten.__lshift__)
-@op(torch.ops.aten.bitwise_left_shift)  # pyre-ignore[56]
+@op(torch.ops.aten.bitwise_left_shift)
 def _aten_bitwise_left_shift(input: Any, other: Any) -> Any:
     return jnp.left_shift(input, other)
 
 
 # aten.bitwise_right_shift
 @op(torch.ops.aten.__rshift__)
-@op(torch.ops.aten.bitwise_right_shift)  # pyre-ignore[56]
+@op(torch.ops.aten.bitwise_right_shift)
 def _aten_bitwise_right_shift(input: Any, other: Any) -> Any:
     return jnp.right_shift(input, other)
 
@@ -1988,7 +1983,7 @@ def _aten_bitwise_right_shift(input: Any, other: Any) -> Any:
 _DP_AXIS = "torch_dist"
 
 
-@op(torch.ops.aten.embedding_dense_backward)  # pyre-ignore[56]
+@op(torch.ops.aten.embedding_dense_backward)
 def _aten_embedding_dense_backward(
     grad_output: Any,
     indices: Any,
@@ -2008,7 +2003,6 @@ def _aten_embedding_dense_backward(
         return c.at[idx_flat].add(1.0)
 
     def _scale(gw: Any, counts: Any) -> Any:
-        # pyrefly: ignore [missing-attribute]
         inv = jnp.where(counts > 0, 1.0 / counts, 0.0).astype(gw.dtype)
         return gw * inv[:, None]
 
@@ -2058,7 +2052,7 @@ def _aten_embedding_dense_backward(
 
 
 # aten.sum
-@op(torch.ops.aten.sum)  # pyre-ignore[56]
+@op(torch.ops.aten.sum)
 def _aten_sum(
     self: Any, dim: Any = None, keepdim: Any = False, dtype: Any = None
 ) -> Any:
@@ -2068,7 +2062,7 @@ def _aten_sum(
 
 
 # aten.sqrt
-@op(torch.ops.aten.sqrt)  # pyre-ignore[56]
+@op(torch.ops.aten.sqrt)
 @op_base.promote_int_input
 def _aten_sqrt(self: Any) -> Any:
     return jnp.sqrt(self)
@@ -2082,7 +2076,7 @@ def _aten_tan(self: Any) -> Any:
 
 
 # aten.tanh
-@op(torch.ops.aten.tanh)  # pyre-ignore[56]
+@op(torch.ops.aten.tanh)
 @op_base.promote_int_input
 def _aten_tanh(self: Any) -> Any:
     res = jnp.tanh(self)
@@ -2090,13 +2084,13 @@ def _aten_tanh(self: Any) -> Any:
 
 
 # aten.ceil
-@op(torch.ops.aten.ceil)  # pyre-ignore[56]
+@op(torch.ops.aten.ceil)
 def _aten_ceil(self: Any) -> Any:
     return jnp.ceil(self).astype(self.dtype)
 
 
 # aten.asin
-@op(torch.ops.aten.asin)  # pyre-ignore[56]
+@op(torch.ops.aten.asin)
 @op_base.promote_int_input
 def _aten_asin(self: Any) -> Any:
     res = jnp.arcsin(self)
@@ -2104,7 +2098,7 @@ def _aten_asin(self: Any) -> Any:
 
 
 # aten.minimum
-@op(torch.ops.aten.minimum)  # pyre-ignore[56]
+@op(torch.ops.aten.minimum)
 def _aten_minimum(self: Any, other: Any) -> Any:
     return jnp.minimum(self, other)
 
@@ -2140,7 +2134,7 @@ def _scatter_index(dim: Any, index: Any) -> Any:
 
 
 # aten.scatter_add
-@op(torch.ops.aten.scatter_add)  # pyre-ignore[56]
+@op(torch.ops.aten.scatter_add)
 def _aten_scatter_add(input: Any, dim: Any, index: Any, src: Any) -> Any:
     """JAX implementation of scatter, mimicking torch.scatter behavior"""
 
@@ -2149,7 +2143,7 @@ def _aten_scatter_add(input: Any, dim: Any, index: Any, src: Any) -> Any:
 
 
 # aten.masked_scatter
-@op(torch.ops.aten.masked_scatter)  # pyre-ignore[56]
+@op(torch.ops.aten.masked_scatter)
 def _aten_masked_scatter(self: Any, mask: Any, source: Any) -> Any:
     broadcast_shape = jnp.broadcast_shapes(self.shape, mask.shape)
 
@@ -2169,7 +2163,7 @@ def _aten_masked_scatter(self: Any, mask: Any, source: Any) -> Any:
     return final_arr
 
 
-@op(torch.ops.aten.masked_select)  # pyre-ignore[56]
+@op(torch.ops.aten.masked_select)
 def _aten_masked_select(self: Any, mask: Any, *args: Any, **kwargs: Any) -> Any:
     broadcast_shape = jnp.broadcast_shapes(self.shape, mask.shape)
 
@@ -2189,26 +2183,26 @@ def _aten_masked_select(self: Any, mask: Any, *args: Any, **kwargs: Any) -> Any:
 
 
 # aten.sign
-@op(torch.ops.aten.sign)  # pyre-ignore[56]
+@op(torch.ops.aten.sign)
 def _aten_sign(x: Any) -> Any:
     return jnp.sign(x)
 
 
 # aten.signbit
-@op(torch.ops.aten.signbit)  # pyre-ignore[56]
+@op(torch.ops.aten.signbit)
 def _aten_signbit(x: Any) -> Any:
     return jnp.signbit(x)
 
 
 # aten.sigmoid
-@op(torch.ops.aten.sigmoid)  # pyre-ignore[56]
+@op(torch.ops.aten.sigmoid)
 @op_base.promote_int_input
 def _aten_sigmoid(x: Any) -> Any:
     return jax.nn.sigmoid(x)
 
 
 # implement aten.asinh in jax
-@op(torch.ops.aten.asinh)  # pyre-ignore[56]
+@op(torch.ops.aten.asinh)
 @op_base.promote_int_input
 def _aten_asinh(self: Any) -> Any:
     res = jnp.arcsinh(self)
@@ -2216,7 +2210,7 @@ def _aten_asinh(self: Any) -> Any:
 
 
 # aten.atan
-@op(torch.ops.aten.atan)  # pyre-ignore[56]
+@op(torch.ops.aten.atan)
 @op_base.promote_int_input
 def _aten_atan(self: Any) -> Any:
     res = jnp.arctan(self)
@@ -2224,7 +2218,7 @@ def _aten_atan(self: Any) -> Any:
 
 
 @op(torch.ops.aten.scatter_reduce)
-@op(torch.ops.aten.scatter)  # pyre-ignore[56]
+@op(torch.ops.aten.scatter)
 def _aten_scatter_reduce(
     input: Any,
     dim: Any,
@@ -2273,7 +2267,7 @@ def _aten_scatter_reduce(
 
 
 # aten.acos
-@op(torch.ops.aten.acos)  # pyre-ignore[56]
+@op(torch.ops.aten.acos)
 @op_base.promote_int_input
 def _aten_acos(self: Any) -> Any:
     return jnp.arccos(self)
@@ -2285,14 +2279,14 @@ def _aten_acos(self: Any) -> Any:
 
 
 # aten.gt
-@op(torch.ops.aten.gt)  # pyre-ignore[56]
+@op(torch.ops.aten.gt)
 def _aten_gt(self: Any, other: Any) -> Any:
     return self > other
 
 
 # aten.sym_stride
 # aten.lt
-@op(torch.ops.aten.lt)  # pyre-ignore[56]
+@op(torch.ops.aten.lt)
 def _aten_lt(self: Any, other: Any) -> Any:
     return self < other
 
@@ -2344,7 +2338,7 @@ def pool(
 
     assert inputs.ndim == len(dims), f"len({inputs.shape}) != len({dims})"
     if not isinstance(padding, str):
-        padding = tuple(map(tuple, padding))  # pyre-ignore[6]
+        padding = tuple(map(tuple, padding))
         assert len(padding) == len(window_shape), (
             f"padding {padding} must specify pads for same number of dims as "
             f"window_shape {window_shape}"
@@ -2360,7 +2354,7 @@ def pool(
 
 
 @op(torch.ops.aten._adaptive_avg_pool2d)
-@op(torch.ops.aten._adaptive_avg_pool3d)  # pyre-ignore[56]
+@op(torch.ops.aten._adaptive_avg_pool3d)
 def adaptive_avg_pool2or3d(
     input: jnp.ndarray, output_size: tuple[int, int]
 ) -> jnp.ndarray:
@@ -2505,7 +2499,7 @@ def adaptive_avg_pool2or3d(
 
 @op(torch.ops.aten.avg_pool1d)
 @op(torch.ops.aten.avg_pool2d)
-@op(torch.ops.aten.avg_pool3d)  # pyre-ignore[56]
+@op(torch.ops.aten.avg_pool3d)
 def _aten_avg_pool(
     inputs: Any,
     kernel_size: Any,
@@ -2601,15 +2595,15 @@ def _generate_indices(dims: Any, skip_dim_indices: Any = None) -> Any:
 
 # aten.sym_numel
 # aten.reciprocal
-@op(torch.ops.aten.reciprocal)  # pyre-ignore[56]
+@op(torch.ops.aten.reciprocal)
 def _aten_reciprocal(a: Any) -> Any:
     if _is_int(a):
-        return (1 / a).astype(jnp.dtype("float32"))  # pyre-ignore[16]
+        return (1 / a).astype(jnp.dtype("float32"))
     return 1 / a
 
 
 # aten.select_scatter
-@op(torch.ops.aten.select_scatter)  # pyre-ignore[56]
+@op(torch.ops.aten.select_scatter)
 def _aten_select_scatter(input: Any, src: Any, dim: Any, index: Any) -> Any:
     input_indexes = []
     if dim < 0:
@@ -2622,7 +2616,7 @@ def _aten_select_scatter(input: Any, src: Any, dim: Any, index: Any) -> Any:
     return input.at[tuple(input_indexes)].set(src)
 
 
-@op(torch.ops.aten.scatter.src)  # pyre-ignore[56]
+@op(torch.ops.aten.scatter.src)
 def _aten_scatter_src(
     input: Any, dim: Any, index: Any, src: Any, reduce: Any = None
 ) -> Any:
@@ -2630,7 +2624,7 @@ def _aten_scatter_src(
     return input.at[input_index].set(src[source_indexes])
 
 
-@op(torch.ops.aten.scatter.value)  # pyre-ignore[56]
+@op(torch.ops.aten.scatter.value)
 def _aten_scatter(
     input: Any, dim: Any, index: Any, src: Any, reduce: Any = None
 ) -> Any:
@@ -2639,7 +2633,7 @@ def _aten_scatter(
 
 
 # aten.acosh
-@op(torch.ops.aten.acosh)  # pyre-ignore[56]
+@op(torch.ops.aten.acosh)
 @op_base.promote_int_input
 def _aten_acosh(self: Any) -> Any:
     return jnp.arccosh(self)
@@ -2649,13 +2643,13 @@ def _aten_acosh(self: Any) -> Any:
 # aten.col2im
 # aten.avg_pool3d
 # aten.round
-@op(torch.ops.aten.round)  # pyre-ignore[56]
+@op(torch.ops.aten.round)
 def _aten_round(input: Any, decimals: Any = 0) -> Any:
     return jnp.round(input, decimals)
 
 
 # aten.max
-@op(torch.ops.aten.max)  # pyre-ignore[56]
+@op(torch.ops.aten.max)
 def _aten_max(self: Any, dim: Any = None, keepdim: Any = False) -> Any:
     if dim is not None:
         return _with_reduction_scalar(
@@ -2666,19 +2660,19 @@ def _aten_max(self: Any, dim: Any = None, keepdim: Any = False) -> Any:
 
 
 # aten.maximum
-@op(torch.ops.aten.maximum)  # pyre-ignore[56]
+@op(torch.ops.aten.maximum)
 def _aten_maximum(self: Any, other: Any) -> Any:
     return jnp.maximum(self, other)
 
 
 # aten.abs
-@op(torch.ops.aten.abs)  # pyre-ignore[56]
+@op(torch.ops.aten.abs)
 def _aten_abs(self: Any) -> Any:
     return jnp.abs(self)
 
 
 # generate aten.amax only
-@op(torch.ops.aten.amax)  # pyre-ignore[56]
+@op(torch.ops.aten.amax)
 def _aten_amax(self: Any, dim: Any = None, keepdim: Any = False) -> Any:
     return _with_reduction_scalar(jnp.amax, self, dim, keepdim)
 
@@ -2699,7 +2693,7 @@ def _with_reduction_scalar(jax_func: Any, self: Any, dim: Any, keepdim: Any) -> 
 
 
 # aten.any
-@op(torch.ops.aten.any)  # pyre-ignore[56]
+@op(torch.ops.aten.any)
 def _aten_any(self: Any, dim: Any = None, keepdim: Any = False) -> Any:
     return _with_reduction_scalar(jnp.any, self, dim, keepdim)
 
@@ -2707,7 +2701,7 @@ def _aten_any(self: Any, dim: Any = None, keepdim: Any = False) -> Any:
 # aten.arange
 @op(torch.ops.aten.arange.start_step)
 @op(torch.ops.aten.arange.start)
-@op(torch.ops.aten.arange.default)  # pyre-ignore[56]
+@op(torch.ops.aten.arange.default)
 @op_base.convert_dtype(use_default_dtype=False)
 def _aten_arange(
     start: Any,
@@ -2729,7 +2723,7 @@ def _aten_arange(
 
 
 # aten.argmax
-@op(torch.ops.aten.argmax)  # pyre-ignore[56]
+@op(torch.ops.aten.argmax)
 def _aten_argmax(self: Any, dim: Any = None, keepdim: Any = False) -> Any:
     return _with_reduction_scalar(jnp.argmax, self, dim, keepdim)
 
@@ -2749,7 +2743,7 @@ def _strided_index(sizes: Any, strides: Any, storage_offset: Any = None) -> Any:
 
 # aten.as_strided
 @op(torch.ops.aten.as_strided)
-@op(torch.ops.aten.as_strided_copy)  # pyre-ignore[56]
+@op(torch.ops.aten.as_strided_copy)
 def _aten_as_strided(
     x: Any, sizes: Any, strides: Any, storage_offset: Any = None
 ) -> Any:
@@ -2758,7 +2752,7 @@ def _aten_as_strided(
     return flattened[ind]
 
 
-@op(torch.ops.aten.as_strided_scatter)  # pyre-ignore[56]
+@op(torch.ops.aten.as_strided_scatter)
 def _aten_as_strided_scatter(
     x: Any, src: Any, sizes: Any, strides: Any, storage_offset: Any
 ) -> Any:
@@ -2769,32 +2763,32 @@ def _aten_as_strided_scatter(
 
 
 # aten.atan2
-@op(torch.ops.aten.atan2)  # pyre-ignore[56]
+@op(torch.ops.aten.atan2)
 @op_base.promote_int_input
 def _aten_atan2(input: Any, other: Any) -> Any:
     return jnp.arctan2(input, other)
 
 
 # aten.bitwise_and
-@op(torch.ops.aten.bitwise_and)  # pyre-ignore[56]
+@op(torch.ops.aten.bitwise_and)
 def _aten_bitwise_and(self: Any, other: Any) -> Any:
     return self & other
 
 
 # aten.bitwise_or
-@op(torch.ops.aten.bitwise_or)  # pyre-ignore[56]
+@op(torch.ops.aten.bitwise_or)
 def _aten_bitwise_or(self: Any, other: Any) -> Any:
     return self | other
 
 
 # aten.bitwise_xor
-@op(torch.ops.aten.bitwise_xor)  # pyre-ignore[56]
+@op(torch.ops.aten.bitwise_xor)
 def _aten_bitwise_xor(self: Any, other: Any) -> Any:
     return self ^ other
 
 
 # aten.broadcast_tensors
-@op(torch.ops.aten.broadcast_tensors)  # pyre-ignore[56]
+@op(torch.ops.aten.broadcast_tensors)
 def _aten_broadcast_tensors(*tensors: Any) -> Any:
     def _get_broadcast_shape(shapes: Any) -> Any:
         """
@@ -2868,25 +2862,25 @@ def _aten_broadcast_tensors(*tensors: Any) -> Any:
 
 
 # aten.broadcast_to
-@op(torch.ops.aten.broadcast_to)  # pyre-ignore[56]
+@op(torch.ops.aten.broadcast_to)
 def _aten_broadcast_to(input: Any, shape: Any) -> Any:
     return jnp.broadcast_to(input, shape)
 
 
 # aten.clamp
 @op(torch.ops.aten.clamp.default)
-@op(torch.ops.aten.clamp.Tensor)  # pyre-ignore[56]
+@op(torch.ops.aten.clamp.Tensor)
 def _aten_clamp(self: Any, min: Any = None, max: Any = None) -> Any:
     return jnp.clip(self, min, max)
 
 
-@op(torch.ops.aten.clamp_min)  # pyre-ignore[56]
+@op(torch.ops.aten.clamp_min)
 def _aten_clamp_min(input: Any, min: Any) -> Any:
     return jnp.clip(input, min=min)
 
 
 # aten.constant_pad_nd
-@op(torch.ops.aten.constant_pad_nd)  # pyre-ignore[56]
+@op(torch.ops.aten.constant_pad_nd)
 def _aten_constant_pad_nd(input: Any, padding: Any, value: Any = 0) -> Any:
     # NOTE: Torch padding is flat and reversed: (1, 1, 2, 2)
     #  means last dim get padded 1 in front and 1 in back;
@@ -2901,7 +2895,7 @@ def _aten_constant_pad_nd(input: Any, padding: Any, value: Any = 0) -> Any:
     return jax.lax.pad(input, padding_value=value_casted, padding_config=pad_dim)
 
 
-@op(torch.ops.aten.convolution_backward.default)  # pyre-ignore[56]
+@op(torch.ops.aten.convolution_backward.default)
 def _aten_convolution_backward(
     grad_output: Any,
     input: Any,
@@ -2943,17 +2937,17 @@ def _aten_convolution_backward(
     )
 
 
-@op(torch.ops.aten.lift_fresh_copy)  # pyre-ignore[56]
+@op(torch.ops.aten.lift_fresh_copy)
 def _aten_lift_fresh_copy(x: Any) -> Any:
     return jnp.copy(x)
 
 
-@op(torch.ops.aten.copy)  # pyre-ignore[56]
+@op(torch.ops.aten.copy)
 def _aten_copy_no_inplace(self: Any, src: Any) -> Any:
     return jnp.broadcast_to(src, self.shape).astype(self.dtype)
 
 
-@op(torch.ops.aten._cdist_forward)  # pyre-ignore[56]
+@op(torch.ops.aten._cdist_forward)
 def _aten_cdist_forward(x1: Any, x2: Any, p: Any, compute_mode: Any = "") -> Any:
     # x1 is B x P x M
     # x2 is B x Q x M
@@ -2963,14 +2957,14 @@ def _aten_cdist_forward(x1: Any, x2: Any, p: Any, compute_mode: Any = "") -> Any
     return jnp.linalg.norm(x1 - x2, ord=p, axis=-1)
 
 
-@op(torch.ops.aten._pdist_forward)  # pyre-ignore[56]
+@op(torch.ops.aten._pdist_forward)
 def _aten__pdist_forward(x: Any, p: Any = 2) -> Any:
     pairwise_dists = _aten_cdist_forward(x, x, p)
     condensed_dists = pairwise_dists[jnp.triu_indices(pairwise_dists.shape[0], k=1)]
     return condensed_dists
 
 
-@op(torch.ops.aten.cholesky_inverse)  # pyre-ignore[56]
+@op(torch.ops.aten.cholesky_inverse)
 def _aten_cholesky_inverse(input: Any, upper: Any = False) -> Any:
     t = jnp.matrix_transpose(input)
     if "complex" in str(input.dtype):
@@ -2979,27 +2973,27 @@ def _aten_cholesky_inverse(input: Any, upper: Any = False) -> Any:
 
 
 # aten.cos
-@op(torch.ops.aten.cos)  # pyre-ignore[56]
+@op(torch.ops.aten.cos)
 @op_base.promote_int_input
 def _aten_cos(input: Any) -> Any:
     return jnp.cos(input)
 
 
 # aten.cosh
-@op(torch.ops.aten.cosh)  # pyre-ignore[56]
+@op(torch.ops.aten.cosh)
 @op_base.promote_int_input
 def _aten_cosh(input: Any) -> Any:
     return jnp.cosh(input)
 
 
-@op(torch.ops.aten.diag)  # pyre-ignore[56]
+@op(torch.ops.aten.diag)
 def _aten_diag(input: Any, diagonal: Any = 0) -> Any:
     return jnp.diag(input, diagonal)
 
 
 # aten.diagonal
 @op(torch.ops.aten.diagonal)
-@op(torch.ops.aten.diagonal_copy)  # pyre-ignore[56]
+@op(torch.ops.aten.diagonal_copy)
 def _aten_diagonal(input: Any, offset: Any = 0, dim1: Any = 0, dim2: Any = 1) -> Any:
     return jnp.diagonal(input, offset, dim1, dim2)
 
@@ -3025,7 +3019,7 @@ def diag_indices_with_offset(
     return [indices1, indices2]
 
 
-@op(torch.ops.aten.diagonal_scatter)  # pyre-ignore[56]
+@op(torch.ops.aten.diagonal_scatter)
 def _aten_diagonal_scatter(
     input: Any, src: Any, offset: Any = 0, dim1: Any = 0, dim2: Any = 1
 ) -> Any:
@@ -3048,44 +3042,44 @@ def _aten_diagonal_scatter(
 
 
 # aten.diagflat
-@op(torch.ops.aten.diagflat)  # pyre-ignore[56]
+@op(torch.ops.aten.diagflat)
 def _aten_diagflat(input: Any, offset: Any = 0) -> Any:
     return jnp.diagflat(jnp.array(input), offset)
 
 
-@op(torch.ops.aten.movedim)  # pyre-ignore[56]
+@op(torch.ops.aten.movedim)
 def _aten_movedim(input: Any, source: Any, destination: Any) -> Any:
     return jnp.moveaxis(input, source, destination)
 
 
 # aten.eq
-@op(torch.ops.aten.eq)  # pyre-ignore[56]
+@op(torch.ops.aten.eq)
 def _aten_eq(input1: Any, input2: Any) -> Any:
     return input1 == input2
 
 
 # aten.equal
-@op(torch.ops.aten.equal)  # pyre-ignore[56]
+@op(torch.ops.aten.equal)
 def _aten_equal(input: Any, other: Any) -> Any:
     res = jnp.array_equal(input, other)
     return bool(res)
 
 
 # aten.erf
-@op(torch.ops.aten.erf)  # pyre-ignore[56]
+@op(torch.ops.aten.erf)
 @op_base.promote_int_input
 def _aten_erf(x: Any) -> Any:
     return jax.lax.erf(x)
 
 
-@op(torch.ops.aten.erfinv)  # pyre-ignore[56]
+@op(torch.ops.aten.erfinv)
 @op_base.promote_int_input
 def _aten_erfinv(input: Any) -> Any:
     return jax.lax.erf_inv(input)
 
 
 # aten.exp
-@op(torch.ops.aten.exp)  # pyre-ignore[56]
+@op(torch.ops.aten.exp)
 def _aten_exp(input: Any) -> Any:
     res = jnp.exp(input)
     new_dtype = mappings.t2j_dtype(torch.get_default_dtype())
@@ -3095,7 +3089,7 @@ def _aten_exp(input: Any) -> Any:
 
 
 # aten.expm1
-@op(torch.ops.aten.expm1)  # pyre-ignore[56]
+@op(torch.ops.aten.expm1)
 def _aten_expm1(input: Any) -> Any:
     res = jnp.expm1(input)
     new_dtype = mappings.t2j_dtype(torch.get_default_dtype())
@@ -3105,7 +3099,7 @@ def _aten_expm1(input: Any) -> Any:
 
 
 # aten.exp2
-@op(torch.ops.aten.exp2)  # pyre-ignore[56]
+@op(torch.ops.aten.exp2)
 def _aten_exp2(input: Any) -> Any:
     res = jnp.exp2(input)
     new_dtype = mappings.t2j_dtype(torch.get_default_dtype())
@@ -3116,7 +3110,7 @@ def _aten_exp2(input: Any) -> Any:
 
 # aten.fill
 @op(torch.ops.aten.fill)
-@op(torch.ops.aten.full_like)  # pyre-ignore[56]
+@op(torch.ops.aten.full_like)
 def _aten_fill(
     x: Any,
     value: Any,
@@ -3133,7 +3127,7 @@ def _aten_fill(
 
 
 # aten.flip
-@op(torch.ops.aten.flip)  # pyre-ignore[56]
+@op(torch.ops.aten.flip)
 def _aten_flip(input: Any, dims: Any) -> Any:
     if dims is not None:
         return jnp.flip(input, tuple(dims))
@@ -3142,37 +3136,37 @@ def _aten_flip(input: Any, dims: Any) -> Any:
 
 
 # aten.floor
-@op(torch.ops.aten.floor)  # pyre-ignore[56]
+@op(torch.ops.aten.floor)
 def _aten_floor(input: Any) -> Any:
     return jnp.floor(input).astype(input.dtype)
 
 
 # aten.fmax
-@op(torch.ops.aten.fmax)  # pyre-ignore[56]
+@op(torch.ops.aten.fmax)
 def _aten_fmax(input: Any, other: Any) -> Any:
     return jnp.fmax(input, other)
 
 
 # aten.fmin
-@op(torch.ops.aten.fmin)  # pyre-ignore[56]
+@op(torch.ops.aten.fmin)
 def _aten_fmin(input: Any, other: Any) -> Any:
     return jnp.fmin(input, other)
 
 
 # aten.fmod
-@op(torch.ops.aten.fmod)  # pyre-ignore[56]
+@op(torch.ops.aten.fmod)
 def _aten_fmod(input: Any, other: Any) -> Any:
     return input - other * _aten_div(input, other, "trunc")
 
 
 # aten.frexp
-@op(torch.ops.aten.frexp)  # pyre-ignore[56]
+@op(torch.ops.aten.frexp)
 def _aten_frexp(input: Any) -> Any:
     return jnp.frexp(input)
 
 
 # aten.gather
-@op(torch.ops.aten.gather)  # pyre-ignore[56]
+@op(torch.ops.aten.gather)
 def _aten_gather(input: Any, dim: Any, index: Any) -> Any:
     if input.ndim == 0:
         return jnp.broadcast_to(input, index.shape)
@@ -3186,18 +3180,18 @@ def _aten_gather(input: Any, dim: Any, index: Any) -> Any:
 
 
 # aten.ge
-@op(torch.ops.aten.ge)  # pyre-ignore[56]
+@op(torch.ops.aten.ge)
 def _aten_ge(self: Any, other: Any) -> Any:
     return self >= other
 
 
-@op(torch.ops.aten.glu)  # pyre-ignore[56]
+@op(torch.ops.aten.glu)
 def _aten_glu(x: Any, dim: Any = -1) -> Any:
     return jax.nn.glu(x, dim)
 
 
 # aten.hardtanh
-@op(torch.ops.aten.hardtanh)  # pyre-ignore[56]
+@op(torch.ops.aten.hardtanh)
 def _aten_hardtanh(
     input: Any, min_val: Any = -1, max_val: Any = 1, inplace: Any = False
 ) -> Any:
@@ -3212,7 +3206,7 @@ def _aten_hardtanh(
 
 
 # aten.histc
-@op(torch.ops.aten.histc)  # pyre-ignore[56]
+@op(torch.ops.aten.histc)
 def _aten_histc(input: Any, bins: Any = 100, min: Any = 0, max: Any = 0) -> Any:
     # TODO(@manfei): this function might cause some uncertainty
     if min == 0 and max == 0:
@@ -3229,45 +3223,45 @@ def _aten_histc(input: Any, bins: Any = 100, min: Any = 0, max: Any = 0) -> Any:
     return hist
 
 
-@op(torch.ops.aten.hypot)  # pyre-ignore[56]
+@op(torch.ops.aten.hypot)
 def _aten_hypot(input: Any, other: Any) -> Any:
     return jnp.hypot(input, other)
 
 
-@op(torch.ops.aten.digamma)  # pyre-ignore[56]
+@op(torch.ops.aten.digamma)
 def _aten_digamma(input: Any, *, out: Any = None) -> Any:
     res = jax.scipy.special.digamma(input).astype(jnp.float32)
     # replace indices where input == 0 with -inf in res
     return jnp.where(jnp.equal(input, jnp.zeros(input.shape)), -jnp.inf, res)
 
 
-@op(torch.ops.aten.igamma)  # pyre-ignore[56]
+@op(torch.ops.aten.igamma)
 def _aten_igamma(input: Any, other: Any) -> Any:
     return jax.scipy.special.gammainc(input, other)
 
 
-@op(torch.ops.aten.lgamma)  # pyre-ignore[56]
+@op(torch.ops.aten.lgamma)
 def _aten_lgamma(input: Any, *, out: Any = None) -> Any:
     return jax.scipy.special.gammaln(input).astype(jnp.float32)
 
 
-@op(torch.ops.aten.mvlgamma)  # pyre-ignore[56]
+@op(torch.ops.aten.mvlgamma)
 def _aten_mvlgamma(input: Any, p: Any, *, out: Any = None) -> Any:
     input = input.astype(mappings.t2j_dtype(torch.get_default_dtype()))
     return jax.scipy.special.multigammaln(input, p)
 
 
-@op(torch.ops.aten.linalg_eig)  # pyre-ignore[56]
+@op(torch.ops.aten.linalg_eig)
 def _aten_linalg_eig(A: Any) -> Any:
     return jnp.linalg.eig(A)
 
 
-@op(torch.ops.aten._linalg_eigh)  # pyre-ignore[56]
+@op(torch.ops.aten._linalg_eigh)
 def _aten_linalg_eigh(A: Any, UPLO: Any = "L") -> Any:
     return jnp.linalg.eigh(A, UPLO)
 
 
-@op(torch.ops.aten.linalg_lstsq)  # pyre-ignore[56]
+@op(torch.ops.aten.linalg_lstsq)
 def _aten_linalg_lstsq(A: Any, B: Any, rcond: Any = None, driver: Any = "gelsy") -> Any:
     input_dtype = A.dtype
 
@@ -3328,7 +3322,7 @@ def _aten_linalg_lstsq(A: Any, B: Any, rcond: Any = None, driver: Any = "gelsy")
     return X, residuals, rank, singular_values
 
 
-@op(torch.ops.aten.linalg_ldl_factor_ex)  # pyre-ignore[56]
+@op(torch.ops.aten.linalg_ldl_factor_ex)
 def _aten_linalg_ldl_factor_ex(
     A: Any, hermitian: Any = False, check_errors: Any = False
 ) -> Any:
@@ -3354,7 +3348,7 @@ def _aten_linalg_ldl_factor_ex(
     return LD, pivots, info
 
 
-@op(torch.ops.aten.linalg_lu)  # pyre-ignore[56]
+@op(torch.ops.aten.linalg_lu)
 def _aten_linalg_lu(A: Any, pivot: Any = True, out: Any = None) -> Any:
     dtype = A.dtype
 
@@ -3384,7 +3378,7 @@ def _aten_linalg_lu(A: Any, pivot: Any = True, out: Any = None) -> Any:
     return P, L, U
 
 
-@op(torch.ops.aten.linalg_lu_factor_ex)  # pyre-ignore[56]
+@op(torch.ops.aten.linalg_lu_factor_ex)
 def _aten_linalg_lu_factor_ex(
     A: Any, pivot: Any = True, check_errors: Any = False
 ) -> Any:
@@ -3395,7 +3389,7 @@ def _aten_linalg_lu_factor_ex(
     return lu, pivots, info
 
 
-@op(torch.ops.aten.linalg_lu_solve)  # pyre-ignore[56]
+@op(torch.ops.aten.linalg_lu_solve)
 def _aten_linalg_lu_solve(
     LU: Any, pivots: Any, B: Any, left: Any = True, adjoint: Any = False
 ) -> Any:
@@ -3412,63 +3406,63 @@ def _aten_linalg_lu_solve(
     return x
 
 
-@op(torch.ops.aten.gcd)  # pyre-ignore[56]
+@op(torch.ops.aten.gcd)
 def _aten_gcd(input: Any, other: Any) -> Any:
     return jnp.gcd(input, other)
 
 
 # aten.lcm
-@op(torch.ops.aten.lcm)  # pyre-ignore[56]
+@op(torch.ops.aten.lcm)
 def _aten_lcm(input: Any, other: Any) -> Any:
     return jnp.lcm(input, other)
 
 
 # aten.isinf
-@op(torch.ops.aten.isinf)  # pyre-ignore[56]
+@op(torch.ops.aten.isinf)
 def _aten_isinf(input: Any) -> Any:
     return jnp.isinf(input)
 
 
 # aten.isnan
-@op(torch.ops.aten.isnan)  # pyre-ignore[56]
+@op(torch.ops.aten.isnan)
 def _aten_isnan(input: Any) -> Any:
     return jnp.isnan(input)
 
 
-@op(torch.ops.aten.le)  # pyre-ignore[56]
+@op(torch.ops.aten.le)
 def _aten_le(self: Any, other: Any) -> Any:
     return self <= other
 
 
 # aten.leaky_relu
-@op(torch.ops.aten.leaky_relu)  # pyre-ignore[56]
+@op(torch.ops.aten.leaky_relu)
 def _aten_leaky_relu(x: Any, negative_slope: Any = 0.01) -> Any:
     return jax.nn.leaky_relu(x, negative_slope)
 
 
 # aten.log
-@op(torch.ops.aten.log)  # pyre-ignore[56]
+@op(torch.ops.aten.log)
 @op_base.promote_int_input
 def _aten_log(x: Any) -> Any:
     return jnp.log(x)
 
 
 # aten.log10
-@op(torch.ops.aten.log10)  # pyre-ignore[56]
+@op(torch.ops.aten.log10)
 @op_base.promote_int_input
 def _aten_log10(x: Any) -> Any:
     return jnp.log10(x)
 
 
 # aten.log1p
-@op(torch.ops.aten.log1p)  # pyre-ignore[56]
+@op(torch.ops.aten.log1p)
 @op_base.promote_int_input
 def _aten_log1p(x: Any) -> Any:
     return jnp.log1p(x)
 
 
 # aten.log2
-@op(torch.ops.aten.log2)  # pyre-ignore[56]
+@op(torch.ops.aten.log2)
 @op_base.promote_int_input
 def _aten_log2(x: Any) -> Any:
     return jnp.log2(x)
@@ -3478,29 +3472,29 @@ def _aten_log2(x: Any) -> Any:
 # decompositions under proxy_tensor: `(x == ±inf) & ~isnan(x)` lowers to
 # `aten::logical_and_`).
 @op(torch.ops.aten.logical_and)
-@op(torch.ops.aten.logical_and_)  # pyre-ignore[56]
-@op(torch.ops.aten.__and__)  # pyre-ignore[56]
+@op(torch.ops.aten.logical_and_)
+@op(torch.ops.aten.__and__)
 def _aten_logical_and(self: Any, other: Any) -> Any:
     return jnp.logical_and(self, other)
 
 
 # aten.logical_or (incl. in-place variant for symmetry with logical_and_).
 @op(torch.ops.aten.logical_or)
-@op(torch.ops.aten.logical_or_)  # pyre-ignore[56]
-@op(torch.ops.aten.__or__)  # pyre-ignore[56]
+@op(torch.ops.aten.logical_or_)
+@op(torch.ops.aten.__or__)
 def _aten_logical_or(self: Any, other: Any) -> Any:
     return jnp.logical_or(self, other)
 
 
 # aten.logical_not (incl. in-place variant for symmetry).
-@op(torch.ops.aten.logical_not)  # pyre-ignore[56]
-@op(torch.ops.aten.logical_not_)  # pyre-ignore[56]
+@op(torch.ops.aten.logical_not)
+@op(torch.ops.aten.logical_not_)
 def _aten_logical_not(self: Any) -> Any:
     return jnp.logical_not(self)
 
 
 # aten.log_softmax
-@op(torch.ops.aten._log_softmax)  # pyre-ignore[56]
+@op(torch.ops.aten._log_softmax)
 def _aten_log_softmax(self: Any, axis: Any = -1, half_to_float: Any = False) -> Any:
     if half_to_float and self.dtype in (jnp.float16, jnp.bfloat16):
         self = self.astype(jnp.float32)
@@ -3510,19 +3504,19 @@ def _aten_log_softmax(self: Any, axis: Any = -1, half_to_float: Any = False) -> 
 
 
 # aten.logaddexp
-@op(torch.ops.aten.logaddexp)  # pyre-ignore[56]
+@op(torch.ops.aten.logaddexp)
 def _aten_logaddexp(self: Any, other: Any) -> Any:
     return jnp.logaddexp(self, other)
 
 
 # aten.logaddexp2
-@op(torch.ops.aten.logaddexp2)  # pyre-ignore[56]
+@op(torch.ops.aten.logaddexp2)
 def _aten_logaddexp2(self: Any, other: Any) -> Any:
     return jnp.logaddexp2(self, other)
 
 
 # aten.logcumsumexp
-@op(torch.ops.aten.logcumsumexp)  # pyre-ignore[56]
+@op(torch.ops.aten.logcumsumexp)
 def _aten_logcumsumexp(self: Any, dim: Any = None) -> Any:
     if self.shape == ():
         return self
@@ -3532,7 +3526,7 @@ def _aten_logcumsumexp(self: Any, dim: Any = None) -> Any:
 # aten.max_pool3d_backward
 # aten.logical_xor
 @op(torch.ops.aten.logical_xor)
-@op(torch.ops.aten.__xor__)  # pyre-ignore[56]
+@op(torch.ops.aten.__xor__)
 def _aten_logical_xor(self: Any, other: Any) -> Any:
     return jnp.logical_xor(self, other)
 
@@ -3541,17 +3535,17 @@ def _aten_logical_xor(self: Any, other: Any) -> Any:
 # aten.native_dropout
 # aten.native_group_norm_backward
 # aten.neg
-@op(torch.ops.aten.neg)  # pyre-ignore[56]
+@op(torch.ops.aten.neg)
 def _aten_neg(x: Any) -> Any:
     return -1 * x
 
 
-@op(torch.ops.aten.nextafter)  # pyre-ignore[56]
+@op(torch.ops.aten.nextafter)
 def _aten_nextafter(input: Any, other: Any, *, out: Any = None) -> Any:
     return jnp.nextafter(input, other)
 
 
-@op(torch.ops.aten.nonzero_static)  # pyre-ignore[56]
+@op(torch.ops.aten.nonzero_static)
 def _aten_nonzero_static(input: Any, size: Any, fill_value: Any = -1) -> Any:
     indices = jnp.argwhere(input)
 
@@ -3569,7 +3563,7 @@ def _aten_nonzero_static(input: Any, size: Any, fill_value: Any = -1) -> Any:
 
 
 # aten.nonzero
-@op(torch.ops.aten.nonzero)  # pyre-ignore[56]
+@op(torch.ops.aten.nonzero)
 def _aten_nonzero(x: Any, as_tuple: Any = False) -> Any:
     if jnp.ndim(x) == 0 and (as_tuple or x.item() == 0):
         return torch.empty(0, 0, dtype=torch.int64)
@@ -3584,7 +3578,7 @@ def _aten_nonzero(x: Any, as_tuple: Any = False) -> Any:
 
 
 # aten.prod
-@op(torch.ops.aten.prod)  # pyre-ignore[56]
+@op(torch.ops.aten.prod)
 def _aten_prod(
     input: Any, dim: Any = None, keepdim: Any = False, *, dtype: Any = None
 ) -> Any:
@@ -3593,7 +3587,7 @@ def _aten_prod(
     return _with_reduction_scalar(jnp.prod, input, dim, keepdim)
 
 
-@op(torch.ops.aten.put)  # pyre-ignore[56]
+@op(torch.ops.aten.put)
 def _aten_put(self: Any, index: Any, source: Any, accumulate: Any = False) -> Any:
     expanded = False
     res = None
@@ -3617,7 +3611,7 @@ def _aten_put(self: Any, index: Any, source: Any, accumulate: Any = False) -> An
 
 # aten.randperm
 # randperm.generator(SymInt n, *, Generator? generator, ScalarType? dtype=long, Layout? layout=None, Device? device=None, bool? pin_memory=None)
-@op(torch.ops.aten.randperm, needs_env=True)  # pyre-ignore[56]
+@op(torch.ops.aten.randperm, needs_env=True)
 def _aten_randperm(
     n: Any,
     *,
@@ -3656,13 +3650,13 @@ def _aten_randperm(
 
 
 # aten.remainder
-@op(torch.ops.aten.remainder)  # pyre-ignore[56]
+@op(torch.ops.aten.remainder)
 def _aten_remainder(inputs: Any, other: Any) -> Any:
     return inputs % other
 
 
 # aten.repeat
-@op(torch.ops.aten.repeat)  # pyre-ignore[56]
+@op(torch.ops.aten.repeat)
 def _aten_repeat(x: Any, reps: Any) -> Any:
     return jnp.tile(x, reps)
 
@@ -3670,13 +3664,13 @@ def _aten_repeat(x: Any, reps: Any) -> Any:
 # aten.replication_pad2d
 # aten.replication_pad3d
 # aten.roll
-@op(torch.ops.aten.roll)  # pyre-ignore[56]
+@op(torch.ops.aten.roll)
 def _aten_roll(input: Any, shifts: Any, dims: Any = None) -> Any:
     return jnp.roll(input, shifts, dims)
 
 
 # aten.slice_scatter
-@op(torch.ops.aten.slice_scatter)  # pyre-ignore[56]
+@op(torch.ops.aten.slice_scatter)
 def _aten_slice_scatter(
     input: Any,
     src: Any,
@@ -3696,7 +3690,7 @@ def _aten_slice_scatter(
 
 # aten.sort
 # torch.sort(input, dim=-1, descending=False, stable=False, *, out=None)
-@op(torch.ops.aten.sort)  # pyre-ignore[56]
+@op(torch.ops.aten.sort)
 def _aten_sort(
     a: Any, dim: Any = -1, descending: Any = False, stable: Any = False
 ) -> Any:
@@ -3712,7 +3706,7 @@ def _aten_sort(
 
 
 # aten.topk
-@op(torch.ops.aten.topk)  # pyre-ignore[56]
+@op(torch.ops.aten.topk)
 def _aten_topk(
     input: Any,
     k: Any,
@@ -3779,7 +3773,7 @@ def _aten_topk(
 
 # aten.tril_indices
 # tril_indices(int row, int col, int offset=0, *, ScalarType? dtype=long, Layout? layout=None, Device? device=None, bool? pin_memory=None)
-@op(torch.ops.aten.tril_indices)  # pyre-ignore[56]
+@op(torch.ops.aten.tril_indices)
 def _aten_tril_indices(
     row: Any,
     col: Any,
@@ -3796,7 +3790,7 @@ def _aten_tril_indices(
 
 # aten.tril_indices
 # tril_indices(int row, int col, int offset=0, *, ScalarType? dtype=long, Layout? layout=None, Device? device=None, bool? pin_memory=None)
-@op(torch.ops.aten.triu_indices)  # pyre-ignore[56]
+@op(torch.ops.aten.triu_indices)
 def _aten_triu_indices(
     row: Any,
     col: Any,
@@ -3811,7 +3805,7 @@ def _aten_triu_indices(
     return jnp.stack((a, b))
 
 
-@op(torch.ops.aten.unbind_copy)  # pyre-ignore[56]
+@op(torch.ops.aten.unbind_copy)
 def _aten_unbind(a: Any, dim: Any = 0) -> Any:
     return [
         jax.lax.index_in_dim(a, i, dim, keepdims=False) for i in range(a.shape[dim])
@@ -3822,7 +3816,7 @@ def _aten_unbind(a: Any, dim: Any = 0) -> Any:
 #
 # NOTE: Like the CUDA and CPU implementations, this implementation always sorts
 # the tensor regardless of the `sorted` argument passed to `torch.unique`.
-@op(torch.ops.aten.unique_dim)  # pyre-ignore[56]
+@op(torch.ops.aten.unique_dim)
 def _aten_unique_dim(
     input_tensor: Any,
     dim: Any,
@@ -3863,7 +3857,7 @@ def _aten_unique_dim(
 #
 # NOTE: Like the CUDA and CPU implementations, this implementation always sorts
 # the tensor regardless of the `sorted` argument passed to `torch.unique`.
-@op(torch.ops.aten._unique)  # pyre-ignore[56]
+@op(torch.ops.aten._unique)
 def _aten_unique(
     input_tensor: Any, sort: Any = True, return_inverse: Any = False
 ) -> Any:
@@ -3885,7 +3879,7 @@ def _aten_unique(
 #
 # NOTE: Like the CUDA and CPU implementations, this implementation always sorts
 # the tensor regardless of the `sorted` argument passed to `torch.unique`.
-@op(torch.ops.aten._unique2)  # pyre-ignore[56]
+@op(torch.ops.aten._unique2)
 def _aten_unique2(
     input_tensor: Any,
     sort: Any = True,
@@ -3902,7 +3896,7 @@ def _aten_unique2(
 
 
 # aten.unique_consecutive
-@op(torch.ops.aten.unique_consecutive)  # pyre-ignore[56]
+@op(torch.ops.aten.unique_consecutive)
 def _aten_unique_consecutive(
     input_tensor: Any,
     return_inverse: Any = False,
@@ -3980,14 +3974,14 @@ def _aten_unique_consecutive(
 @op(torch.ops.aten.where.self)
 @op(torch.ops.aten.where.ScalarSelf)
 @op(torch.ops.aten.where.ScalarOther)
-@op(torch.ops.aten.where.Scalar)  # pyre-ignore[56]
+@op(torch.ops.aten.where.Scalar)
 def _aten_where(condition: Any, x: Any = None, y: Any = None) -> Any:
     return jnp.where(condition, x, y)
 
 
 # aten.to.dtype
 # Tensor(a) self, ScalarType dtype, bool non_blocking=False, bool copy=False, MemoryFormat? memory_format=None
-@op(torch.ops.aten.to.dtype)  # pyre-ignore[56]
+@op(torch.ops.aten.to.dtype)
 def _aten_to_dtype(
     a: Any,
     dtype: Any,
@@ -4000,7 +3994,7 @@ def _aten_to_dtype(
     return a.astype(jaxdtype)  # pyre-ignore[61]
 
 
-@op(torch.ops.aten.to.dtype_layout)  # pyre-ignore[56]
+@op(torch.ops.aten.to.dtype_layout)
 def _aten_to_dtype_layout(
     a: Any,
     *,
@@ -4025,7 +4019,7 @@ def _aten_to_dtype_layout(
 
 
 # Tensor self, int[1]? dim=None, *, Scalar? correction=None, bool keepdim=False
-@op(torch.ops.aten.var_mean.correction)  # pyre-ignore[56]
+@op(torch.ops.aten.var_mean.correction)
 def _aten_var_mean_correction(
     tensor: Any, dim: Any = None, correction: Any = 1, keepdim: Any = False
 ) -> Any:
@@ -4041,7 +4035,7 @@ def _aten_var_mean_correction(
     return var, mean
 
 
-@op(torch.ops.aten.scalar_tensor)  # pyre-ignore[56]
+@op(torch.ops.aten.scalar_tensor)
 @op_base.convert_dtype()
 def _aten_scalar_tensor(
     s: Any,
@@ -4053,12 +4047,12 @@ def _aten_scalar_tensor(
     return jnp.array(s, dtype=dtype)
 
 
-@op(torch.ops.aten.to.device)  # pyre-ignore[56]
+@op(torch.ops.aten.to.device)
 def _aten_to_device(x: Any, device: Any, dtype: Any) -> Any:
     return x
 
 
-@op(torch.ops.aten.max_pool2d_with_indices_backward)  # pyre-ignore[56]
+@op(torch.ops.aten.max_pool2d_with_indices_backward)
 def max_pool2d_with_indices_backward_custom(
     grad_output: Any,
     self: Any,
@@ -4111,17 +4105,17 @@ def max_pool2d_with_indices_backward_custom(
     return grad_input
 
 
-@op(torch.ops.aten._local_scalar_dense)  # pyre-ignore[56]
+@op(torch.ops.aten._local_scalar_dense)
 def _aten_local_scalar_dense(x: Any) -> Any:
     return x.item()
 
 
-@op(torch.ops.aten.tensor_split.sections)  # pyre-ignore[56]
+@op(torch.ops.aten.tensor_split.sections)
 def _aten_tensor_split(ary: Any, indices_or_sections: Any, axis: Any = 0) -> Any:
     return jnp.array_split(ary, indices_or_sections, axis)
 
 
-@op(torch.ops.aten.randn, needs_env=True)  # pyre-ignore[56]
+@op(torch.ops.aten.randn, needs_env=True)
 @op_base.convert_dtype()
 def _aten_randn(
     *size: Any,
@@ -4144,7 +4138,7 @@ def _aten_randn(
     return res
 
 
-@op(torch.ops.aten.bernoulli.p, needs_env=True)  # pyre-ignore[56]
+@op(torch.ops.aten.bernoulli.p, needs_env=True)
 def _aten_bernoulli(
     self: Any,
     p: Any = 0.5,
@@ -4157,14 +4151,14 @@ def _aten_bernoulli(
     return res
 
 
-@op(torch.ops.aten.geometric, needs_env=True)  # pyre-ignore[56]
+@op(torch.ops.aten.geometric, needs_env=True)
 def geometric(self: Any, p: Any, *, generator: Any = None, env: Any = None) -> Any:
     key = env.get_and_rotate_prng_key(generator)
     res = jax.random.geometric(key, p, self.shape)
     return res
 
 
-@op(torch.ops.aten.randn_like, needs_env=True)  # pyre-ignore[56]
+@op(torch.ops.aten.randn_like, needs_env=True)
 @op_base.convert_dtype()
 def _aten_randn_like(
     x: Any,
@@ -4180,7 +4174,7 @@ def _aten_randn_like(
     return jax.random.normal(key, dtype=dtype or x.dtype, shape=x.shape)
 
 
-@op(torch.ops.aten.rand, needs_env=True)  # pyre-ignore[56]
+@op(torch.ops.aten.rand, needs_env=True)
 @op_base.convert_dtype()
 def _rand(
     *size: Any,
@@ -4203,19 +4197,19 @@ def _rand(
     return res
 
 
-@op(torch.ops.aten.outer)  # pyre-ignore[56]
+@op(torch.ops.aten.outer)
 def _aten_outer(a: Any, b: Any) -> Any:
     return jnp.outer(a, b)
 
 
-@op(torch.ops.aten.allclose)  # pyre-ignore[56]
+@op(torch.ops.aten.allclose)
 def _aten_allclose(
     input: Any, other: Any, rtol: Any = 1e-05, atol: Any = 1e-08, equal_nan: Any = False
 ) -> Any:
     return jnp.allclose(input, other, rtol, atol, equal_nan)
 
 
-@op(torch.ops.aten.native_batch_norm)  # pyre-ignore[56]
+@op(torch.ops.aten.native_batch_norm)
 def _aten_native_batch_norm(
     input: Any,
     weight: Any,
@@ -4252,7 +4246,7 @@ def _aten_native_batch_norm(
         )
 
 
-@op(torch.ops.aten.normal, needs_env=True)  # pyre-ignore[56]
+@op(torch.ops.aten.normal, needs_env=True)
 def _aten_normal(
     self: Any, mean: Any = 0, std: Any = 1, generator: Any = None, env: Any = None
 ) -> Any:
@@ -4263,12 +4257,12 @@ def _aten_normal(
 
 # TODO: not clear what this function should actually do
 # https://github.com/pytorch/pytorch/blob/d96c80649f301129219469d8b4353e52edab3b78/aten/src/ATen/native/native_functions.yaml#L7933-L7940
-@op(torch.ops.aten.lift_fresh)  # pyre-ignore[56]
+@op(torch.ops.aten.lift_fresh)
 def _aten_lift_fresh(self: Any) -> Any:
     return self
 
 
-@op(torch.ops.aten.uniform, needs_env=True)  # pyre-ignore[56]
+@op(torch.ops.aten.uniform, needs_env=True)
 def _aten_uniform(
     self: Any, from_: Any = 0, to: Any = 1, *, generator: Any = None, env: Any = None
 ) -> Any:
@@ -4332,7 +4326,7 @@ def _randint_via_bits(key: Any, size: Any, low: int, high: int) -> Any:
     return res_uint.astype(jnp.int32) + jnp.int32(int(low))
 
 
-@op(torch.ops.aten.randint, needs_env=True)  # pyre-ignore[56]
+@op(torch.ops.aten.randint, needs_env=True)
 @op_base.convert_dtype(use_default_dtype=False)
 def _aten_randint(
     *args: Any,
@@ -4362,7 +4356,7 @@ def _aten_randint(
     return res
 
 
-@op(  # pyre-ignore[56]
+@op(
     torch.ops.aten.randint_like,
     torch.ops.aten.randint.generator,
     needs_env=True,
@@ -4398,12 +4392,12 @@ def _aten_randint_like(
     return res
 
 
-@op(torch.ops.aten.dim, is_jax_function=False)  # pyre-ignore[56]
+@op(torch.ops.aten.dim, is_jax_function=False)
 def _aten_dim(self: Any) -> Any:
     return len(self.shape)
 
 
-@op(torch.ops.aten.copysign)  # pyre-ignore[56]
+@op(torch.ops.aten.copysign)
 def _aten_copysign(input: Any, other: Any, *, out: Any = None) -> Any:
     result = jnp.copysign(input, other)
     # torch.copysign(x, y) returns float32 for integer x and y,
@@ -4416,31 +4410,31 @@ def _aten_copysign(input: Any, other: Any, *, out: Any = None) -> Any:
     return result
 
 
-@op(torch.ops.aten.i0)  # pyre-ignore[56]
+@op(torch.ops.aten.i0)
 @op_base.promote_int_input
 def _aten_i0(self: Any) -> Any:
     return jax.scipy.special.i0(self)
 
 
-@op(torch.ops.aten.special_i0e)  # pyre-ignore[56]
+@op(torch.ops.aten.special_i0e)
 @op_base.promote_int_input
 def _aten_i0e(self: Any) -> Any:
     return jax.scipy.special.i0e(self)
 
 
-@op(torch.ops.aten.special_i1)  # pyre-ignore[56]
+@op(torch.ops.aten.special_i1)
 @op_base.promote_int_input
 def _aten_special_i1(self: Any) -> Any:
     return jax.scipy.special.i1(self)
 
 
-@op(torch.ops.aten.special_i1e)  # pyre-ignore[56]
+@op(torch.ops.aten.special_i1e)
 @op_base.promote_int_input
 def _aten_special_i1e(self: Any) -> Any:
     return jax.scipy.special.i1e(self)
 
 
-@op(torch.ops.aten.special_laguerre_polynomial_l)  # pyre-ignore[56]
+@op(torch.ops.aten.special_laguerre_polynomial_l)
 @op_base.promote_int_input
 def _aten_special_laguerre_polynomial_l(self: Any, n: Any) -> Any:
     # Adapted from https://github.com/pytorch/pytorch/blob/f8f41dcb24cb4f4e87a51bb04847942dd835e496/aten/src/ATen/native/Math.h#L3106-L3134
@@ -4479,7 +4473,7 @@ def _aten_special_laguerre_polynomial_l(self: Any, n: Any) -> Any:
     return vectorized(self, n.astype(jnp.int64))
 
 
-@op(torch.ops.aten.special_modified_bessel_i0)  # pyre-ignore[56]
+@op(torch.ops.aten.special_modified_bessel_i0)
 @op_base.promote_int_input
 def _aten_special_modified_bessel_i0(self: Any) -> Any:
     # Adapted from https://github.com/pytorch/pytorch/blob/f8f41dcb24cb4f4e87a51bb04847942dd835e496/aten/src/ATen/native/Math.h#L3182-L3268
@@ -4579,7 +4573,7 @@ def _aten_special_modified_bessel_i0(self: Any) -> Any:
     return jnp.piecewise(self, [self <= 8], [small, default])
 
 
-@op(torch.ops.aten.special_modified_bessel_i1)  # pyre-ignore[56]
+@op(torch.ops.aten.special_modified_bessel_i1)
 @op_base.promote_int_input
 def _aten_special_modified_bessel_i1(self: Any) -> Any:
     # Adapted from https://github.com/pytorch/pytorch/blob/f8f41dcb24cb4f4e87a51bb04847942dd835e496/aten/src/ATen/native/Math.h#L3271-L3364
@@ -4685,7 +4679,7 @@ def _aten_special_modified_bessel_i1(self: Any) -> Any:
     return jnp.piecewise(self, [self <= 8], [small, default])
 
 
-@op(torch.ops.aten.special_modified_bessel_k0)  # pyre-ignore[56]
+@op(torch.ops.aten.special_modified_bessel_k0)
 @op_base.promote_int_input
 def _aten_special_modified_bessel_k0(self: Any) -> Any:
     # Adapted from https://github.com/pytorch/pytorch/blob/f8f41dcb24cb4f4e87a51bb04847942dd835e496/aten/src/ATen/native/Math.h#L3367-L3441
@@ -4772,7 +4766,7 @@ def _aten_special_modified_bessel_k0(self: Any) -> Any:
     )
 
 
-@op(torch.ops.aten.special_modified_bessel_k1)  # pyre-ignore[56]
+@op(torch.ops.aten.special_modified_bessel_k1)
 @op_base.promote_int_input
 def _aten_special_modified_bessel_k1(self: Any) -> Any:
     # Adapted from https://github.com/pytorch/pytorch/blob/f8f41dcb24cb4f4e87a51bb04847942dd835e496/aten/src/ATen/native/Math.h#L3444-L3519
@@ -4864,20 +4858,20 @@ def _aten_special_modified_bessel_k1(self: Any) -> Any:
     )
 
 
-@op(torch.ops.aten.polygamma)  # pyre-ignore[56]
+@op(torch.ops.aten.polygamma)
 def _aten_polygamma(x: Any, n: Any) -> Any:
     if n.dtype in [jnp.int8, jnp.int16, jnp.int32, jnp.int64]:
         n = n.astype(mappings.t2j_dtype(torch.get_default_dtype()))
     return jax.lax.polygamma(jnp.float32(x), n)
 
 
-@op(torch.ops.aten.special_ndtri)  # pyre-ignore[56]
+@op(torch.ops.aten.special_ndtri)
 @op_base.promote_int_input
 def _aten_special_ndtri(self: Any) -> Any:
     return jax.scipy.special.ndtri(self)
 
 
-@op(torch.ops.aten.special_bessel_j0)  # pyre-ignore[56]
+@op(torch.ops.aten.special_bessel_j0)
 @op_base.promote_int_input
 def _aten_special_bessel_j0(self: Any) -> Any:
     # Adapted from https://github.com/pytorch/pytorch/blob/f8f41dcb24cb4f4e87a51bb04847942dd835e496/aten/src/ATen/native/Math.h#L2379-L2489
@@ -5003,7 +4997,7 @@ def _aten_special_bessel_j0(self: Any) -> Any:
     )
 
 
-@op(torch.ops.aten.special_bessel_j1)  # pyre-ignore[56]
+@op(torch.ops.aten.special_bessel_j1)
 @op_base.promote_int_input
 def _aten_special_bessel_j1(self: Any) -> Any:
     # Adapted from https://github.com/pytorch/pytorch/blob/f8f41dcb24cb4f4e87a51bb04847942dd835e496/aten/src/ATen/native/Math.h#L2491-L2597
@@ -5129,7 +5123,7 @@ def _aten_special_bessel_j1(self: Any) -> Any:
     )
 
 
-@op(torch.ops.aten.special_bessel_y0)  # pyre-ignore[56]
+@op(torch.ops.aten.special_bessel_y0)
 @op_base.promote_int_input
 def _aten_special_bessel_y0(self: Any) -> Any:
     # Adapted from https://github.com/pytorch/pytorch/blob/f8f41dcb24cb4f4e87a51bb04847942dd835e496/aten/src/ATen/native/Math.h#L2599-L2712
@@ -5252,7 +5246,7 @@ def _aten_special_bessel_y0(self: Any) -> Any:
     )
 
 
-@op(torch.ops.aten.special_bessel_y1)  # pyre-ignore[56]
+@op(torch.ops.aten.special_bessel_y1)
 @op_base.promote_int_input
 def _aten_special_bessel_y1(self: Any) -> Any:
     # Adapted from https://github.com/pytorch/pytorch/blob/f8f41dcb24cb4f4e87a51bb04847942dd835e496/aten/src/ATen/native/Math.h#L2714-L2826
@@ -5373,7 +5367,7 @@ def _aten_special_bessel_y1(self: Any) -> Any:
     )
 
 
-@op(torch.ops.aten.special_chebyshev_polynomial_t)  # pyre-ignore[56]
+@op(torch.ops.aten.special_chebyshev_polynomial_t)
 @op_base.promote_int_input
 def _aten_special_chebyshev_polynomial_t(self: Any, n: Any) -> Any:
     # Adapted from https://github.com/pytorch/pytorch/blob/f8f41dcb24cb4f4e87a51bb04847942dd835e496/aten/src/ATen/native/Math.h#L2828-L2865
@@ -5421,7 +5415,7 @@ def _aten_special_chebyshev_polynomial_t(self: Any, n: Any) -> Any:
     return vectorized(self, n.astype(jnp.int64))
 
 
-@op(torch.ops.aten.special_chebyshev_polynomial_u)  # pyre-ignore[56]
+@op(torch.ops.aten.special_chebyshev_polynomial_u)
 @op_base.promote_int_input
 def _aten_special_chebyshev_polynomial_u(self: Any, n: Any) -> Any:
     # Adapted from https://github.com/pytorch/pytorch/blob/f8f41dcb24cb4f4e87a51bb04847942dd835e496/aten/src/ATen/native/Math.h#L2872-L2913
@@ -5471,19 +5465,19 @@ def _aten_special_chebyshev_polynomial_u(self: Any, n: Any) -> Any:
     return vectorized(self, n.astype(jnp.int64))
 
 
-@op(torch.ops.aten.special_erfcx)  # pyre-ignore[56]
+@op(torch.ops.aten.special_erfcx)
 @op_base.promote_int_input
 def _aten_special_erfcx(x: Any) -> Any:
     return jnp.exp(x * x) * jax.lax.erfc(x)
 
 
-@op(torch.ops.aten.erfc)  # pyre-ignore[56]
+@op(torch.ops.aten.erfc)
 @op_base.promote_int_input
 def _aten_erfcx(x: Any) -> Any:
     return jax.lax.erfc(x)
 
 
-@op(torch.ops.aten.special_hermite_polynomial_h)  # pyre-ignore[56]
+@op(torch.ops.aten.special_hermite_polynomial_h)
 @op_base.promote_int_input
 def _aten_special_hermite_polynomial_h(self: Any, n: Any) -> Any:
     # Adapted from https://github.com/pytorch/pytorch/blob/f8f41dcb24cb4f4e87a51bb04847942dd835e496/aten/src/ATen/native/Math.h#L3036-L3061
@@ -5516,7 +5510,7 @@ def _aten_special_hermite_polynomial_h(self: Any, n: Any) -> Any:
     return vectorized(self, n.astype(jnp.int64))
 
 
-@op(torch.ops.aten.special_hermite_polynomial_he)  # pyre-ignore[56]
+@op(torch.ops.aten.special_hermite_polynomial_he)
 @op_base.promote_int_input
 def _aten_special_hermite_polynomial_he(self: Any, n: Any) -> Any:
     # Adapted from https://github.com/pytorch/pytorch/blob/f8f41dcb24cb4f4e87a51bb04847942dd835e496/aten/src/ATen/native/Math.h#L3073-L3098
@@ -5549,7 +5543,7 @@ def _aten_special_hermite_polynomial_he(self: Any, n: Any) -> Any:
     return vectorized(self, n.astype(jnp.int64))
 
 
-@op(torch.ops.aten.multinomial, needs_env=True)  # pyre-ignore[56]
+@op(torch.ops.aten.multinomial, needs_env=True)
 def _aten_multinomial(
     input: Any,
     num_samples: Any,
@@ -5583,12 +5577,12 @@ def _aten_multinomial(
 
 
 @op(torch.ops.aten.narrow)
-@op(torch.ops.aten.narrow_copy)  # pyre-ignore[56]
+@op(torch.ops.aten.narrow_copy)
 def _aten_narrow(input: Any, dim: Any, start: Any, length: Any) -> Any:
     return jax.lax.dynamic_slice_in_dim(input, start, length, axis=dim)
 
 
-@op(torch.ops.aten.flatten)  # pyre-ignore[56]
+@op(torch.ops.aten.flatten)
 def _aten_flatten(x: Any, start_dim: Any = 0, end_dim: Any = -1) -> Any:
     """
     Flattens a JAX array (similar to torch.flatten).
@@ -5606,11 +5600,11 @@ def _aten_flatten(x: Any, start_dim: Any = 0, end_dim: Any = -1) -> Any:
     if end_dim < 0:
         end_dim += len(shape)  # Handle negative indexing
 
-    new_shape = (*shape[:start_dim], -1, *shape[end_dim + 1 :])  # pyre-ignore[60]
+    new_shape = (*shape[:start_dim], -1, *shape[end_dim + 1 :])
     return jnp.reshape(x, new_shape)
 
 
-@op(torch.ops.aten.new_empty)  # pyre-ignore[56]
+@op(torch.ops.aten.new_empty)
 def _new_empty(self: Any, size: Any, **kwargs: Any) -> Any:
     dtype = kwargs.get("dtype")
     if dtype is not None:
@@ -5620,7 +5614,7 @@ def _new_empty(self: Any, size: Any, **kwargs: Any) -> Any:
     return jnp.empty(size, dtype=dtype)
 
 
-@op(torch.ops.aten.new_empty_strided)  # pyre-ignore[56]
+@op(torch.ops.aten.new_empty_strided)
 def _new_empty_strided(
     self: Any, size: Any, stride: Any, dtype: Any = None, **kwargs: Any
 ) -> Any:
@@ -5632,14 +5626,14 @@ def _new_empty_strided(
         return jnp.empty(size, dtype=jax_dtype)
 
 
-@op(torch.ops.aten._unsafe_index_put)  # pyre-ignore[56]
+@op(torch.ops.aten._unsafe_index_put)
 def _aten_unsafe_index_put(
     self: Any, indices: Any, values: Any, accumulate: Any = False
 ) -> Any:
     return _aten_index_put(self, indices, values, accumulate)
 
 
-@op(  # pyre-ignore[56]
+@op(
     torch.ops.aten.conj_physical,
     torch.ops.aten.conj,
     torch.ops.aten._conj_physical,
@@ -5649,13 +5643,13 @@ def _aten_conj_physical(self: Any) -> Any:
     return jnp.conjugate(self)
 
 
-@op(torch.ops.aten.log_sigmoid)  # pyre-ignore[56]
+@op(torch.ops.aten.log_sigmoid)
 def _aten_log_sigmoid(x: Any) -> Any:
     return jax.nn.log_sigmoid(x)
 
 
 # torch.qr
-@op_if_present("qr")  # pyre-ignore[56]
+@op_if_present("qr")
 def _aten_qr(input: Any, *args: Any, **kwargs: Any) -> Any:
     jax_mode = "reduced"
     # torch bool param 'simple=True' corresponds to jax 'reduced' mode,
@@ -5666,39 +5660,39 @@ def _aten_qr(input: Any, *args: Any, **kwargs: Any) -> Any:
 
 
 # torch.linalg.qr
-@op(torch.ops.aten.linalg_qr)  # pyre-ignore[56]
+@op(torch.ops.aten.linalg_qr)
 def _aten_linalg_qr(input: Any, *args: Any, **kwargs: Any) -> Any:
     mode = kwargs.get("mode", "reduced")
     return jax.numpy.linalg.qr(input, mode=mode)
 
 
 # torch.linalg.matrix_exp
-@op(torch.ops.aten.linalg_matrix_exp)  # pyre-ignore[56]
+@op(torch.ops.aten.linalg_matrix_exp)
 def _aten_linalg_matrix_exp(input: Any) -> Any:
     return jax.scipy.linalg.expm(input)
 
 
 # torch._linalg.slogdet
-@op(torch.ops.aten._linalg_slogdet)  # pyre-ignore[56]
+@op(torch.ops.aten._linalg_slogdet)
 def _aten__linalg_slogdet(input: Any) -> Any:
     res = jnp.linalg.slogdet(input)
     return res.sign, res.logabsdet
 
 
 # torch.linalg.svd
-@op(torch.ops.aten._linalg_svd)  # pyre-ignore[56]
+@op(torch.ops.aten._linalg_svd)
 def _aten__linalg_svd(a: Any, full_matrices: Any = False, **kwargs: Any) -> Any:
     return jnp.linalg.svd(a, full_matrices=full_matrices, **kwargs)
 
 
 # torch.linalg.pinv
-@op(torch.ops.aten.linalg_pinv.atol_rtol_tensor)  # pyre-ignore[56]
+@op(torch.ops.aten.linalg_pinv.atol_rtol_tensor)
 def _aten_linalg_pinv_atol_rtol_tensor(a: Any, rtol: Any = None, **kwargs: Any) -> Any:
     return jnp.linalg.pinv(a, rtol, hermitian=False)
 
 
 # torch.linalg.solve
-@op(torch.ops.aten._linalg_solve_ex)  # pyre-ignore[56]
+@op(torch.ops.aten._linalg_solve_ex)
 def _aten__linalg_solve_ex(a: Any, b: Any) -> Any:
     batched = False
     if b.ndim > 1 and b.shape[-1] == a.shape[-1]:
@@ -5713,7 +5707,7 @@ def _aten__linalg_solve_ex(a: Any, b: Any) -> Any:
 
 
 # torch.linalg.solve_triangular
-@op(torch.ops.aten.linalg_solve_triangular)  # pyre-ignore[56]
+@op(torch.ops.aten.linalg_solve_triangular)
 def _aten_linalg_solve_triangular(
     a: Any, b: Any, *, upper: Any = True, left: Any = True, unitriangular: Any = False
 ) -> Any:
@@ -5729,19 +5723,19 @@ def _aten_linalg_solve_triangular(
     return res
 
 
-@op(torch.ops.aten.linalg_inv_ex)  # pyre-ignore[56]
+@op(torch.ops.aten.linalg_inv_ex)
 def _aten_linalg_inv_ex(a: Any) -> Any:
     ainv = jnp.linalg.inv(a)
     info = jnp.zeros(a.shape[:-2], jnp.int32)
     return ainv, info
 
 
-@op(torch.ops.aten._linalg_check_errors)  # pyre-ignore[56]
+@op(torch.ops.aten._linalg_check_errors)
 def _aten__linalg_check_errors(*args: Any, **kwargs: Any) -> Any:
     pass
 
 
-@op(torch.ops.aten.median)  # pyre-ignore[56]
+@op(torch.ops.aten.median)
 def _aten_median(self: Any, dim: Any = None, keepdim: Any = False) -> Any:
     output = _with_reduction_scalar(
         functools.partial(jnp.quantile, q=0.5, method="lower"),
@@ -5758,7 +5752,7 @@ def _aten_median(self: Any, dim: Any = None, keepdim: Any = False) -> Any:
         return output, index
 
 
-@op(torch.ops.aten.nanmedian)  # pyre-ignore[56]
+@op(torch.ops.aten.nanmedian)
 def _aten_nanmedian(
     input: Any, dim: Any = None, keepdim: Any = False, *, out: Any = None
 ) -> Any:
@@ -5793,7 +5787,7 @@ def _get_median_index(x: Any, axis: Any = None, keepdims: Any = False) -> Any:
     return median_index
 
 
-@op_if_present("triangular_solve")  # pyre-ignore[56]
+@op_if_present("triangular_solve")
 def _aten_triangular_solve(
     b: Any,
     a: Any,
@@ -5815,7 +5809,7 @@ def _aten_triangular_solve(
 
 
 # func: _fft_c2c(Tensor self, SymInt[] dim, int normalization, bool forward) -> Tensor
-@op(torch.ops.aten._fft_c2c)  # pyre-ignore[56]
+@op(torch.ops.aten._fft_c2c)
 def _aten__fft_c2c(self: Any, dim: Any, normalization: Any, forward: Any) -> Any:
     if forward:
         norm = [
@@ -5833,7 +5827,7 @@ def _aten__fft_c2c(self: Any, dim: Any, normalization: Any, forward: Any) -> Any
         return jnp.fft.ifftn(self, axes=dim, norm=norm)
 
 
-@op(torch.ops.aten._fft_r2c)  # pyre-ignore[56]
+@op(torch.ops.aten._fft_r2c)
 def _aten__fft_r2c(self: Any, dim: Any, normalization: Any, onesided: Any) -> Any:
     norm = [
         "backward",
@@ -5846,7 +5840,7 @@ def _aten__fft_r2c(self: Any, dim: Any, normalization: Any, onesided: Any) -> An
         return jnp.fft.fftn(self, axes=dim, norm=norm)
 
 
-@op(torch.ops.aten._fft_c2r)  # pyre-ignore[56]
+@op(torch.ops.aten._fft_c2r)
 def _aten__fft_c2r(self: Any, dim: Any, normalization: Any, last_dim_size: Any) -> Any:
     norm = [
         "forward",
@@ -5860,7 +5854,7 @@ def _aten__fft_c2r(self: Any, dim: Any, normalization: Any, last_dim_size: Any) 
     return jnp.fft.irfftn(self, norm=norm, axes=dim, s=s)
 
 
-@op(torch.ops.aten._trilinear)  # pyre-ignore[56]
+@op(torch.ops.aten._trilinear)
 def _aten_trilinear(
     i1: Any,
     i2: Any,
@@ -5880,7 +5874,7 @@ def _aten_trilinear(
 
 
 @op(torch.ops.aten.max_unpool2d)
-@op(torch.ops.aten.max_unpool3d)  # pyre-ignore[56]
+@op(torch.ops.aten.max_unpool3d)
 def _aten_max_unpoolxd(
     input: Any, indices: Any, output_size: Any, stride: Any = None, padding: Any = 0
 ) -> Any:
@@ -5975,7 +5969,7 @@ def _aten_upsample(
     )
 
 
-@op(torch.ops.aten._upsample_bilinear2d_aa)  # pyre-ignore[56]
+@op(torch.ops.aten._upsample_bilinear2d_aa)
 def _aten_upsample_billinear_aa(
     input: Any,
     output_size: Any,
@@ -5996,7 +5990,7 @@ def _aten_upsample_billinear_aa(
     )
 
 
-@op(torch.ops.aten._upsample_bicubic2d_aa)  # pyre-ignore[56]
+@op(torch.ops.aten._upsample_bicubic2d_aa)
 def _aten_upsample_bicubic2d_aa(
     input: Any,
     output_size: Any,
@@ -6017,12 +6011,12 @@ def _aten_upsample_bicubic2d_aa(
     )
 
 
-@op(torch.ops.aten.polar)  # pyre-ignore[56]
+@op(torch.ops.aten.polar)
 def _aten_polar(abs: Any, angle: Any, *, out: Any = None) -> Any:
     return jax.lax.complex(abs * jnp.cos(angle), abs * jnp.sin(angle))
 
 
-@op(torch.ops.aten.cdist)  # pyre-ignore[56]
+@op(torch.ops.aten.cdist)
 def _aten_cdist(
     x1: Any,
     x2: Any,
@@ -6116,7 +6110,7 @@ def _euclidean_direct(x1: Any, x2: Any) -> Any:
     return dist
 
 
-@op(torch.ops.aten.lu_unpack)  # pyre-ignore[56]
+@op(torch.ops.aten.lu_unpack)
 def _aten_lu_unpack(
     LU_data: Any, LU_pivots: Any, unpack_data: Any = True, unpack_pivots: Any = True
 ) -> Any:
@@ -6219,7 +6213,7 @@ def _aten_lu_unpack(
     return P, L, U
 
 
-@op(torch.ops.aten.linear)  # pyre-ignore[56]
+@op(torch.ops.aten.linear)
 def linear(input: Any, weight: Any, bias: Any = None) -> Any:
     res = input @ jnp.transpose(weight)
     if bias is not None:
@@ -6227,7 +6221,7 @@ def linear(input: Any, weight: Any, bias: Any = None) -> Any:
     return res
 
 
-@op(torch.ops.aten.kthvalue)  # pyre-ignore[56]
+@op(torch.ops.aten.kthvalue)
 def kthvalue(
     input: Any, k: Any, dim: Any = None, keepdim: Any = False, *, out: Any = None
 ) -> Any:
@@ -6250,13 +6244,13 @@ def kthvalue(
     return values, indices
 
 
-@op(torch.ops.aten.take)  # pyre-ignore[56]
+@op(torch.ops.aten.take)
 def _aten_take(self: Any, index: Any) -> Any:
     return self.flatten()[index]
 
 
 # func: pad(Tensor self, SymInt[] pad, str mode="constant", float? value=None) -> Tensor
-@op(torch.ops.aten.pad)  # pyre-ignore[56]
+@op(torch.ops.aten.pad)
 def _aten_pad(self: Any, pad: Any, mode: Any = "constant", value: Any = None) -> Any:
     if not isinstance(pad, (tuple, list)) or len(pad) % 2 != 0:
         raise ValueError("Padding must be a sequence of even length.")
@@ -6303,7 +6297,7 @@ def _aten_pad(self: Any, pad: Any, mode: Any = "constant", value: Any = None) ->
         )
 
 
-@op(torch.ops.aten.is_nonzero)  # pyre-ignore[56]
+@op(torch.ops.aten.is_nonzero)
 def _aten_is_nonzero(a: Any) -> Any:
     a = jnp.squeeze(a)
     if a.shape == (0,):
@@ -6313,7 +6307,7 @@ def _aten_is_nonzero(a: Any) -> Any:
     return a.item() != 0
 
 
-@op(torch.ops.aten.logit)  # pyre-ignore[56]
+@op(torch.ops.aten.logit)
 def _aten_logit(self: jax.Array, eps: float | None = None) -> jax.Array:
     """
     Computes the logit function of the input tensor.
@@ -6335,19 +6329,19 @@ def _aten_logit(self: jax.Array, eps: float | None = None) -> jax.Array:
     return res
 
 
-@op(torch.ops.aten.floor_divide)  # pyre-ignore[56]
+@op(torch.ops.aten.floor_divide)
 def _aten_floor_divide(x: Any, y: Any) -> Any:
     res = jnp.floor_divide(x, y)
     return res
 
 
 @op(torch.ops.aten._assert_tensor_metadata)
-@op(torch.ops.aten._assert_scalar)  # pyre-ignore[56]
+@op(torch.ops.aten._assert_scalar)
 def _aten__assert_tensor_metadata(*args: Any, **kwargs: Any) -> Any:
     pass
 
 
-@op(torch.ops.aten.unfold)  # pyre-ignore[56]
+@op(torch.ops.aten.unfold)
 def _aten_unfold(x: Any, dimension: Any, size: Any, step: Any) -> Any:
     ndim = x.ndim if x.ndim > 0 else 1
     shape = x.shape if len(x.shape) > 0 else (1,)
@@ -6400,86 +6394,86 @@ def _aten_unfold(x: Any, dimension: Any, size: Any, step: Any) -> Any:
 # ============================================================
 
 
-@op(torch.ops.aten._foreach_add.Scalar)  # pyre-ignore[56]
+@op(torch.ops.aten._foreach_add.Scalar)
 def _aten_foreach_add_scalar(tensors: Any, scalar: Any) -> Any:
     return [t + scalar for t in tensors]
 
 
-@op(torch.ops.aten._foreach_add.List)  # pyre-ignore[56]
+@op(torch.ops.aten._foreach_add.List)
 def _aten_foreach_add_list(tensors1: Any, tensors2: Any, alpha: Any = 1) -> Any:
     return [x + y * alpha for x, y in zip(tensors1, tensors2)]
 
 
-@op(torch.ops.aten._foreach_sub.Scalar)  # pyre-ignore[56]
+@op(torch.ops.aten._foreach_sub.Scalar)
 def _aten_foreach_sub_scalar(tensors: Any, scalar: Any) -> Any:
     return [t - scalar for t in tensors]
 
 
-@op(torch.ops.aten._foreach_mul.Scalar)  # pyre-ignore[56]
+@op(torch.ops.aten._foreach_mul.Scalar)
 def _aten_foreach_mul_scalar(tensors: Any, scalar: Any) -> Any:
     return [t * scalar for t in tensors]
 
 
-@op(torch.ops.aten._foreach_mul.List)  # pyre-ignore[56]
+@op(torch.ops.aten._foreach_mul.List)
 def _aten_foreach_mul_list(tensors1: Any, tensors2: Any) -> Any:
     return [x * y for x, y in zip(tensors1, tensors2)]
 
 
-@op(torch.ops.aten._foreach_div.Scalar)  # pyre-ignore[56]
+@op(torch.ops.aten._foreach_div.Scalar)
 def _aten_foreach_div_scalar(tensors: Any, scalar: Any) -> Any:
     return [t / scalar for t in tensors]
 
 
-@op(torch.ops.aten._foreach_div.List)  # pyre-ignore[56]
+@op(torch.ops.aten._foreach_div.List)
 def _aten_foreach_div_list(tensors1: Any, tensors2: Any) -> Any:
     return [x / y for x, y in zip(tensors1, tensors2)]
 
 
-@op(torch.ops.aten._foreach_neg.default)  # pyre-ignore[56]
+@op(torch.ops.aten._foreach_neg.default)
 def _aten_foreach_neg(tensors: Any) -> Any:
     return [-t for t in tensors]
 
 
-@op(torch.ops.aten._foreach_sqrt.default)  # pyre-ignore[56]
+@op(torch.ops.aten._foreach_sqrt.default)
 def _aten_foreach_sqrt(tensors: Any) -> Any:
     return [jnp.sqrt(t) for t in tensors]
 
 
-@op(torch.ops.aten._foreach_reciprocal.default)  # pyre-ignore[56]
+@op(torch.ops.aten._foreach_reciprocal.default)
 def _aten_foreach_reciprocal(tensors: Any) -> Any:
     return [1.0 / t for t in tensors]
 
 
-@op(torch.ops.aten._foreach_addcdiv.Scalar)  # pyre-ignore[56]
+@op(torch.ops.aten._foreach_addcdiv.Scalar)
 def _aten_foreach_addcdiv_scalar(
     tensors1: Any, tensors2: Any, tensors3: Any, scalar: Any = 1
 ) -> Any:
     return [t1 + scalar * t2 / t3 for t1, t2, t3 in zip(tensors1, tensors2, tensors3)]
 
 
-@op(torch.ops.aten._foreach_addcmul.Scalar)  # pyre-ignore[56]
+@op(torch.ops.aten._foreach_addcmul.Scalar)
 def _aten_foreach_addcmul_scalar(
     tensors1: Any, tensors2: Any, tensors3: Any, scalar: Any = 1
 ) -> Any:
     return [t1 + scalar * t2 * t3 for t1, t2, t3 in zip(tensors1, tensors2, tensors3)]
 
 
-@op(torch.ops.aten._foreach_lerp.Scalar)  # pyre-ignore[56]
+@op(torch.ops.aten._foreach_lerp.Scalar)
 def _aten_foreach_lerp_scalar(tensors1: Any, tensors2: Any, scalar: Any) -> Any:
     return [t1 + scalar * (t2 - t1) for t1, t2 in zip(tensors1, tensors2)]
 
 
-@op(torch.ops.aten._foreach_pow.ScalarAndTensor)  # pyre-ignore[56]
+@op(torch.ops.aten._foreach_pow.ScalarAndTensor)
 def _aten_foreach_pow_scalar_and_tensor(scalar: Any, tensors: Any) -> Any:
     return [scalar**t for t in tensors]
 
 
-@op(torch.ops.aten._foreach_maximum.List)  # pyre-ignore[56]
+@op(torch.ops.aten._foreach_maximum.List)
 def _aten_foreach_maximum_list(tensors1: Any, tensors2: Any) -> Any:
     return [jnp.maximum(t1, t2) for t1, t2 in zip(tensors1, tensors2)]
 
 
-@op(torch.ops.aten._foreach_clamp_min.Scalar)  # pyre-ignore[56]
+@op(torch.ops.aten._foreach_clamp_min.Scalar)
 def _aten_foreach_clamp_min_scalar(tensors: Any, scalar: Any) -> Any:
     return [jnp.maximum(t, scalar) for t in tensors]
 

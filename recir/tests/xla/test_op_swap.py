@@ -66,7 +66,7 @@ def _triton_mul2_cuda(x: torch.Tensor) -> torch.Tensor:
         x,
         output,
         n_elements,
-        BLOCK_SIZE=1024,  # pyre-ignore[6]: constexpr
+        BLOCK_SIZE=1024,
     )
     return output
 
@@ -99,7 +99,7 @@ def _triton_add1_cuda(x: torch.Tensor) -> torch.Tensor:
         x,
         output,
         n_elements,
-        BLOCK_SIZE=1024,  # pyre-ignore[6]: constexpr
+        BLOCK_SIZE=1024,
     )
     return output
 

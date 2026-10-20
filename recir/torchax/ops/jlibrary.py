@@ -39,7 +39,7 @@ def _jit_composite_impl(composite_name: str, jaxpr_impl: Any, **jit_args: Any) -
     def composite_impl(*args: Any) -> Any:
         return jaxpr_impl(*args)
 
-    composite_impl.__name__ = composite_name  # pyre-ignore[16]
+    composite_impl.__name__ = composite_name
     composite_impl.__qualname__ = composite_name
     return jax.jit(composite_impl, **jit_args)
 
@@ -98,7 +98,7 @@ def register_torch_composite(
         # outside of the handler, we would build the jaxpr representation of the
         # module once during registration, potentially missing op registrations that
         # come after. I.e. may miss nested abstractions if we build jaxpr AoT.
-        state, jfn = recir.torchax.extract_jax(ImplWrapper())  # pyre-ignore[16]
+        state, jfn = recir.torchax.extract_jax(ImplWrapper())
 
         def jaxpr_impl(*args: Any) -> Any:  # pyre-ignore[53]
             return jfn(state, (*args,))

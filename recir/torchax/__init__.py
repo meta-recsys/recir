@@ -111,16 +111,14 @@ def extract_jax(
         # Pick the params and buffers supplied to jax_func
         params = {k: states[k] for k in jit_module.params.keys()}
         buffers = {k: states[k] for k in jit_module.buffers.keys()}
-        (params, buffers, args, kwargs) = env.j2t_iso(  # pyre-ignore[16]
-            (params, buffers, args, kwargs)
-        )
+        (params, buffers, args, kwargs) = env.j2t_iso((params, buffers, args, kwargs))
 
-        with env:  # pyre-ignore[16]
+        with env:
             res = jit_module.functional_call(
                 "forward", params, buffers, *args, **kwargs
             )
 
-        return env.t2j_iso(res)  # pyre-ignore[16]
+        return env.t2j_iso(res)
 
     return states, jax_func
 

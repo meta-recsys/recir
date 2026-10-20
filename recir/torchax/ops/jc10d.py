@@ -27,7 +27,7 @@ import torch
 from recir.torchax.ops.decorators import op
 
 
-@op(torch.ops._c10d_functional.all_gather_into_tensor)  # pyre-ignore[56]
+@op(torch.ops._c10d_functional.all_gather_into_tensor)
 def _c10d_all_gather(input: Any, group_size: int, group_name: str) -> Any:
     # tiled=True concatenates the shards along dim 0 -> [group_size*k, ...],
     # matching torch all_gather_into_tensor semantics (FSDP Shard(0)->Replicate
@@ -36,7 +36,7 @@ def _c10d_all_gather(input: Any, group_size: int, group_name: str) -> Any:
     return jax.lax.all_gather(input, "torch_dist", tiled=True)
 
 
-@op(torch.ops._c10d_functional.reduce_scatter_tensor)  # pyre-ignore[56]
+@op(torch.ops._c10d_functional.reduce_scatter_tensor)
 def _c10d_reduce_scatter(
     input: Any, reduceOp: str, group_size: int, group_name: str
 ) -> Any:
@@ -55,7 +55,7 @@ def _c10d_reduce_scatter(
     return res
 
 
-@op(torch.ops._c10d_functional.all_reduce)  # pyre-ignore[56]
+@op(torch.ops._c10d_functional.all_reduce)
 def _c10d_all_reduce(self: Any, reduceOp: str, group_name: str) -> Any:
     if reduceOp == "sum":
         res = jax.lax.psum(self, axis_name="torch_dist")
@@ -70,7 +70,7 @@ def _c10d_all_reduce(self: Any, reduceOp: str, group_name: str) -> Any:
     return res
 
 
-@op(torch.ops._c10d_functional.broadcast)  # pyre-ignore[56]
+@op(torch.ops._c10d_functional.broadcast)
 def _c10d_broadcast(self: Any, src: int, group_name: str) -> Any:
     masked = jnp.where(
         jax.lax.axis_index("torch_dist") == src,
@@ -80,7 +80,7 @@ def _c10d_broadcast(self: Any, src: int, group_name: str) -> Any:
     return jax.lax.psum(masked, "torch_dist")
 
 
-@op(torch.ops._c10d_functional.wait_tensor)  # pyre-ignore[56]
+@op(torch.ops._c10d_functional.wait_tensor)
 def _c10d_wait_tensor(tensor: Any) -> Any:
     # Async tensor is aleady `wait`ed by dispatcher
     return tensor

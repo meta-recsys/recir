@@ -260,7 +260,7 @@ def _create_fake_mesh(
                     # resolving for DTensor functional collectives.
                     unregister = getattr(_c10d, "_unregister_process_group", None)
                     if unregister is not None:
-                        unregister(group_name)  # pyre-ignore[6]
+                        unregister(group_name)
                 wrapped = ProcessGroup(FakeStore(), rank, size)
                 wrapped._register_backend(
                     torch.device(device_type),

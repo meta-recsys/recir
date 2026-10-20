@@ -68,7 +68,7 @@ torch.fx.node._side_effectful_functions.add(
 )
 
 
-@op(torch.ops.recir_fsdp.reshard_fsdp_seq.default)  # pyre-ignore[56]
+@op(torch.ops.recir_fsdp.reshard_fsdp_seq.default)
 def _reshard_fsdp_seq_lowering(x: Any, dep: Any) -> Any:
     # optimization_barrier is the primitive jax.remat uses to break XLA's CSE; the
     # tuple form makes the returned weight depend on `dep`, so the weight's backward

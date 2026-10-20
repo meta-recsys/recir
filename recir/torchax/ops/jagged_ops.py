@@ -78,16 +78,14 @@ def _jax_dense_to_jagged_forward_impl(
     if dense.ndim == 2:
         src = jnp.where(mask, dense, jnp.zeros_like(dense))
         result = jnp.zeros(total_L, dtype=dense.dtype)
-        # pyrefly: ignore [missing-attribute]
         return result.at[dest.reshape(-1)].add(src.reshape(-1))
     d: int = dense.shape[2]
     src = jnp.where(mask[:, :, None], dense, jnp.zeros_like(dense))
     result = jnp.zeros((total_L, d), dtype=dense.dtype)
-    # pyrefly: ignore [missing-attribute]
     return result.at[dest.reshape(-1), :].add(src.reshape(-1, d))
 
 
-@op(torch.ops.recir.dense_to_jagged.default)  # pyre-ignore[56]
+@op(torch.ops.recir.dense_to_jagged.default)
 def _recir_dense_to_jagged(
     dense: Any,
     offsets: List[Any],
@@ -148,7 +146,7 @@ def _recir_dense_to_jagged(
     return result, seq_offsets
 
 
-@op(torch.ops.recir.jagged_to_padded_dense.default)  # pyre-ignore[56]
+@op(torch.ops.recir.jagged_to_padded_dense.default)
 def _recir_jagged_to_padded_dense(
     values: Any,
     offsets: List[Any],
@@ -303,7 +301,6 @@ def _jax_concat_2d_jagged(
         out = combined[jnp.clip(source, 0, combined.shape[0] - 1)]
 
     valid = positions < combined_offsets[batch_size]
-    # pyrefly: ignore [missing-attribute, no-matching-overload]
     return jnp.where(_bcast_mask(valid, out.ndim), out, 0)
 
 
@@ -350,7 +347,7 @@ def _jax_split_2d_jagged(
     return left, right
 
 
-@op(torch.ops.recir.concat_2d_jagged.default)  # pyre-ignore[56]
+@op(torch.ops.recir.concat_2d_jagged.default)
 def _recir_concat_2d_jagged(
     values_left: Any,
     offsets_left: Any,
@@ -417,7 +414,7 @@ def _recir_concat_2d_jagged(
     return _with_sharding_constraint(result, out_spec)
 
 
-@op(torch.ops.recir.split_2d_jagged.default)  # pyre-ignore[56]
+@op(torch.ops.recir.split_2d_jagged.default)
 def _recir_split_2d_jagged(
     values: Any,
     offsets_left: Any,

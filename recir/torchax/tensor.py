@@ -271,7 +271,6 @@ class Tensor(torch.Tensor):
 
 def debug_accuracy(func: Any, args: Any, kwargs: Any, current_output: Any) -> bool:
     args_torch, kwargs_torch, out_torch = torch_pytree.tree_map_only(
-        # pyrefly: ignore [missing-attribute]
         torch.Tensor,
         # pyrefly: ignore [missing-attribute]
         lambda x: x.torch(),
@@ -380,7 +379,7 @@ class XLADispatchMode(torch_dispatch.TorchDispatchMode):
         with log_nested(self.env, message):
             if isinstance(func, torch._ops.OpOverloadPacket):
                 with self:
-                    return func(*args, **kwargs)  # pyre-ignore[32]
+                    return func(*args, **kwargs)
             # Only functions under these namespaces will be intercepted
             if func.namespace not in (
                 "aten",
@@ -388,7 +387,7 @@ class XLADispatchMode(torch_dispatch.TorchDispatchMode):
                 "torchvision",
                 "xla",
             ):
-                return func(*args, **kwargs)  # pyre-ignore[32]
+                return func(*args, **kwargs)
             return self.env.dispatch(func, types, args, kwargs)
 
 
@@ -477,7 +476,7 @@ class Environment(contextlib.ContextDecorator):
 
     def __init__(
         self,
-        configuration: config.Configuration | None = None,  # pyre-ignore[11]
+        configuration: config.Configuration | None = None,
     ) -> None:
         # Ensure the "jax" device is registered with PyTorch before any
         # Environment usage (deferred from import time).
@@ -511,7 +510,7 @@ class Environment(contextlib.ContextDecorator):
     @property
     def param(self) -> RuntimeProperty:
         if not hasattr(self._property, "content"):
-            self._property.content = [self._initial_content]  # pyre-ignore[16]
+            self._property.content = [self._initial_content]
         return self._property.content[-1]  # pyre-ignore[16]
 
     def manual_seed(self, key: Any) -> None:
@@ -525,7 +524,7 @@ class Environment(contextlib.ContextDecorator):
                 key = key.item()
         jax_key = jax.random.PRNGKey(key)
         new_prop = self.param.override(prng=jax_key)
-        self._property.content.append(new_prop)  # pyre-ignore[16]
+        self._property.content.append(new_prop)
 
     @property
     def prng_key(self) -> Any:
@@ -912,8 +911,8 @@ class Environment(contextlib.ContextDecorator):
         # tracers, and a stranded one turns every LATER step into an
         # UnexpectedTracerError raised from an unrelated call site.
         new_prop = self.param.override(**kwargs)
-        self._property.content.append(new_prop)  # pyre-ignore[16]
+        self._property.content.append(new_prop)
         try:
             yield
         finally:
-            self._property.content.pop()  # pyre-ignore[16]
+            self._property.content.pop()

@@ -574,7 +574,7 @@ def compile_from_gm(  # noqa: C901 — orchestration: stages 4-8 of the pipeline
         else:
             result = opt_pass(gm)
         if isinstance(result, tuple) and len(result) == 2:
-            gm, flat_state = result  # pyre-ignore[9]
+            gm, flat_state = result
         elif isinstance(result, fx.GraphModule):
             gm = result
 

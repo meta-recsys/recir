@@ -65,7 +65,7 @@ class IterGraph(fx.Graph):
         self._all_graphs: Tuple[fx.Graph, ...] = (
             self.setup_graph,
             self.cleanup_graph,
-            cast(fx.Graph, super()),  # pyre-ignore
+            cast(fx.Graph, super()),
         )
 
         self._setup_mapping: Dict[fx.Node, fx.Node] = {}
@@ -91,9 +91,7 @@ class IterGraph(fx.Graph):
     def _fx_graph_call(
         self, graph: fx.Graph, func: str, *args: Any, **kwargs: Any
     ) -> Any:
-        fx_graph: fx.Graph = (
-            graph if graph != self else cast(fx.Graph, super())  # pyre-ignore
-        )
+        fx_graph: fx.Graph = graph if graph != self else cast(fx.Graph, super())
         return getattr(fx_graph, func)(*args, **kwargs)
 
     def _insert_context(self, func: str, node: Optional[fx.Node]) -> Any:
@@ -210,7 +208,7 @@ class IterGraph(fx.Graph):
                 assert codegen.pytree_info.out_spec is not None
                 original_tree_out = tree_unflatten(
                     cast(List[Any], output.args[0]),
-                    codegen.pytree_info.out_spec,  # pyre-ignore[6]
+                    codegen.pytree_info.out_spec,
                 )
                 # Use None as a placeholder. If we use the extra-output list
                 # the list will be flatten as well and put into out_spec.
@@ -957,5 +955,5 @@ class IterGraphModule(nn.Module):
             if sub_gm is None:
                 continue
             for sub_path, mod in sub_gm.named_modules():
-                if isinstance(mod, _XLAModule):  # pyre-ignore[16]
+                if isinstance(mod, _XLAModule):
                     yield gm_name, sub_path, mod

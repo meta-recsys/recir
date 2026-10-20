@@ -31,11 +31,11 @@ class SharedWeightsModel(nn.Module):
         return x
 
 
-class SharedWeightsTest(base_test_util.TestCase):  # pyre-ignore[11]
+class SharedWeightsTest(base_test_util.TestCase):
     def test_shared_weights(self) -> None:
         env = recir.torchax.default_env()
         model = SharedWeightsModel()
-        self.assertTrue(model.head.weight is model.emb.weight)  # pyre-ignore[16]
+        self.assertTrue(model.head.weight is model.emb.weight)
 
         x = torch.randint(0, 10, (2, 5))
         res_torch = model(x)
@@ -43,8 +43,8 @@ class SharedWeightsTest(base_test_util.TestCase):  # pyre-ignore[11]
         jax_weights, jax_func = recir.torchax.extract_jax(model, dedup_parameters=True)
 
         # Verify that the JAX weights are shared
-        self.assertIn("emb.weight", jax_weights)  # pyre-ignore[16]
-        self.assertNotIn("head.weight", jax_weights)  # pyre-ignore[16]
+        self.assertIn("emb.weight", jax_weights)
+        self.assertNotIn("head.weight", jax_weights)
 
         arg = env.t2j_copy(x)
         res_jax = jax_func(jax_weights, (arg,))

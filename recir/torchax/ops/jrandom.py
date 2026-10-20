@@ -29,7 +29,7 @@ def _fold_counter(counter: Any) -> Any:
     return folded
 
 
-@op(torch.ops.recir.bernoulli_keyed)  # pyre-ignore[56]
+@op(torch.ops.recir.bernoulli_keyed)
 def _jbernoulli_keyed(
     self: Any,
     p: Any,

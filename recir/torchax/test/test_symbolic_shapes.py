@@ -43,7 +43,7 @@ class ConcatAddModel(torch.nn.Module):
         return a + b
 
 
-class SymbolicShapeTest(base_test_util.TestCase):  # pyre-ignore[11]
+class SymbolicShapeTest(base_test_util.TestCase):
     """Test possible symbolic shape computations that upstream torch export can
     emit. Seems to be currently limited to a few binary math operations where one
     operand is a symbolic variable/expr and the other is a constant integer.
@@ -70,14 +70,10 @@ class SymbolicShapeTest(base_test_util.TestCase):  # pyre-ignore[11]
         )
         module_str = str(stablehlo.mlir_module())
 
-        self.assertRegex(module_str, r"stablehlo.constant.*3")  # pyre-ignore[16]
-        self.assertRegex(
-            module_str, r"shape_assertion.*s[0-9]+ >= 3"
-        )  # pyre-ignore[16]
-        self.assertRegex(module_str, r"stablehlo.constant.*10")  # pyre-ignore[16]
-        self.assertRegex(
-            module_str, r"shape_assertion.*s[0-9]+ <= 10"
-        )  # pyre-ignore[16]
+        self.assertRegex(module_str, r"stablehlo.constant.*3")
+        self.assertRegex(module_str, r"shape_assertion.*s[0-9]+ >= 3")
+        self.assertRegex(module_str, r"stablehlo.constant.*10")
+        self.assertRegex(module_str, r"shape_assertion.*s[0-9]+ <= 10")
 
     def test_constraints_multiply(self) -> None:
         """Test a model with a slightly more complex constraint, where the input
@@ -100,12 +96,10 @@ class SymbolicShapeTest(base_test_util.TestCase):  # pyre-ignore[11]
         )
         module_str = str(stablehlo.mlir_module())
 
-        self.assertRegex(module_str, r"stablehlo.constant.*10")  # pyre-ignore[16]
-        self.assertRegex(
-            module_str, r"shape_assertion.*s[0-9]+ <= 10"
-        )  # pyre-ignore[16]
-        self.assertRegex(module_str, r"stablehlo.constant.*2")  # pyre-ignore[16]
-        self.assertRegex(module_str, r"shape_assertion.*2\*s[0-9]+")  # pyre-ignore[16]
+        self.assertRegex(module_str, r"stablehlo.constant.*10")
+        self.assertRegex(module_str, r"shape_assertion.*s[0-9]+ <= 10")
+        self.assertRegex(module_str, r"stablehlo.constant.*2")
+        self.assertRegex(module_str, r"shape_assertion.*2\*s[0-9]+")
 
     def test_constraint_indirection(self) -> None:
         """Test a model where none of the shapes are directly symbolic variables
@@ -128,10 +122,8 @@ class SymbolicShapeTest(base_test_util.TestCase):  # pyre-ignore[11]
         )
         module_str = str(stablehlo.mlir_module())
 
-        self.assertRegex(  # pyre-ignore[16]
-            module_str, r"shape_assertion.*s[0-9]+ <= 10"
-        )
-        self.assertRegex(module_str, r"shape_assertion.*2\*s[0-9]+")  # pyre-ignore[16]
+        self.assertRegex(module_str, r"shape_assertion.*s[0-9]+ <= 10")
+        self.assertRegex(module_str, r"shape_assertion.*2\*s[0-9]+")
 
 
 if __name__ == "__main__":

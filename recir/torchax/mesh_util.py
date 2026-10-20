@@ -232,7 +232,7 @@ class Mesh:
 
         def model_initializer() -> dict[str, Any]:
             with recir.torchax.default_env(), torch.device("meta"):
-                model = model_class(*init_args, **init_kwargs)  # pyre-ignore[32]
+                model = model_class(*init_args, **init_kwargs)
             return dict(model.state_dict())
 
         jitted = interop.jax_jit(

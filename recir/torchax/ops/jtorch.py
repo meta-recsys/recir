@@ -175,7 +175,7 @@ def one_hot(tensor: Any, num_classes: int = -1) -> Any:
     if num_classes == -1:
         # pyrefly: ignore [bad-assignment]
         num_classes = jnp.max(tensor) + 1
-    return jax.nn.one_hot(tensor, num_classes).astype(jnp.int64)  # pyre-ignore[6]
+    return jax.nn.one_hot(tensor, num_classes).astype(jnp.int64)
 
 
 @register_function(torch.nn.functional.pad)

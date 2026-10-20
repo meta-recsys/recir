@@ -169,7 +169,6 @@ def _set_out_spec(gm: fx.GraphModule, num_outputs: int) -> None:
         # pyre-ignore[16]: _PyTreeInfo is a NamedTuple with _replace.
         gm.graph._codegen.pytree_info = info._replace(out_spec=new_spec)
     # The generated forward reads ``self._out_spec`` directly.
-    # pyre-ignore[16]: GraphModule sets ``_out_spec`` dynamically via codegen.
     gm._out_spec = new_spec
 
 
@@ -255,7 +254,6 @@ def fabricate_inference_graph(
     gm: fx.GraphModule,
     inference_outputs: OutputSelector | list[str] | None = None,
     strip_training_collectives: bool = True,
-    # pyre-ignore[2]: forwarded verbatim to apply_inference_swaps.
     **inference_swap_kwargs: object,
 ) -> fx.GraphModule:
     """Turn a traced training-step graph into a forward-only inference graph.

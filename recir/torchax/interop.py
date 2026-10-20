@@ -216,7 +216,7 @@ def _jax_view(t: TorchValue) -> JaxValue:
     # view it as-if it's a jax land object
     if isinstance(t, torch.Tensor):
         assert isinstance(t, tensor.Tensor) or isinstance(t, tensor.View), type(t)
-        return t.jax()  # pyre-ignore[16]
+        return t.jax()
     if isinstance(t, type(torch.int32)):
         return mappings.t2j_dtype(t)
 

@@ -35,7 +35,6 @@ class _XLABackendBase(Backend):
     expected to override :meth:`validate_with`.
     """
 
-    # pyre-ignore[13]: Initialized in subclasses.
     _backend_type: ClassVar[BackendType]
 
     def __init__(self, *, dump_hlo: bool = False, **kwargs: Any) -> None:

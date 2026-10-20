@@ -254,8 +254,8 @@ def non_max_suppression_padded(
 
 def nms(boxes: Any, scores: Any, iou_threshold: Any) -> Any:
     max_output_size = boxes.shape[0]
-    boxes = boxes.reshape((1, *boxes.shape))  # pyre-ignore[60]
-    scores = scores.reshape((1, *scores.shape))  # pyre-ignore[60]
+    boxes = boxes.reshape((1, *boxes.shape))
+    scores = scores.reshape((1, *scores.shape))
     res = non_max_suppression_padded(scores, boxes, max_output_size, iou_threshold)
     return res
 

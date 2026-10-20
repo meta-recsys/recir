@@ -343,7 +343,7 @@ def _pooled_backward_local(
     return grad_weight.astype(weight.dtype)
 
 
-@op(torch.ops.recir.ringshift_embedding)  # pyre-ignore[56]
+@op(torch.ops.recir.ringshift_embedding)
 def _jringshift_embedding(
     ids: Any,
     lengths: Any,
@@ -407,7 +407,7 @@ def _jringshift_embedding(
     )(ids, lengths, weight)
 
 
-@op(torch.ops.recir.ringshift_embedding_backward)  # pyre-ignore[56]
+@op(torch.ops.recir.ringshift_embedding_backward)
 def _jringshift_embedding_backward(
     grad_out: Any,
     ids: Any,
@@ -546,13 +546,13 @@ def _jringshift_embedding_backward(
     )(grad_out, ids, lengths, weight)
 
 
-@op(torch.ops.recir.shard_batch0)  # pyre-ignore[56]
+@op(torch.ops.recir.shard_batch0)
 def _jshard_batch0(x: Any) -> Any:
     spec = P(_AXIS, *([None] * (x.ndim - 1)))
     return jax.lax.with_sharding_constraint(x, NamedSharding(_device_mesh(), spec))
 
 
-@op(torch.ops.recir.fsdp_embedding)  # pyre-ignore[56]
+@op(torch.ops.recir.fsdp_embedding)
 def _jfsdp_embedding(ids: Any, weight: Any) -> Any:
     # True FSDP forward: all-gather the Shard(0) weight inside a shard_map -- the
     # full [vocab, D] table is a transient, persistent storage stays sharded --
@@ -575,7 +575,7 @@ def _jfsdp_embedding(ids: Any, weight: Any) -> Any:
     )(weight, ids)
 
 
-@op(torch.ops.recir.fsdp_embedding_backward)  # pyre-ignore[56]
+@op(torch.ops.recir.fsdp_embedding_backward)
 def _jfsdp_embedding_backward(grad_out: Any, ids: Any, weight: Any) -> Any:
     # True FSDP backward: scatter-add the local grad into a transient full
     # [vocab, D], then reduce-scatter so each device keeps its [v_local, D] shard

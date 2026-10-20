@@ -33,7 +33,7 @@ from . import tensor
 def _to_jax(pytree: Any) -> Any:
     def to_jax_array(x: Any) -> Any:
         if isinstance(x, tensor.Tensor):
-            return x.jax()  # pyre-ignore[16]
+            return x.jax()
         elif isinstance(x, torch.Tensor):
             return jnp.asarray(x.cpu().numpy())
         return x

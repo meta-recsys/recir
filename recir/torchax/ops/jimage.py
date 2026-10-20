@@ -85,7 +85,7 @@ def interpolate_along_axis_bchw(img: Any, idxs: Any, weights: Any, axis: int) ->
     idxs = jnp.clip(idxs, 0, img.shape[axis] - 1)  # (out_size, 4)
 
     def gather_and_weight(i: Any) -> Any:  # pyre-ignore[53]
-        idx = idxs[i]  # pyre-ignore[53]
+        idx = idxs[i]
         w = weights[i]  # (4,)
 
         def gather_one(offset: Any) -> Any:  # pyre-ignore[53]

@@ -468,7 +468,7 @@ def iter_move_grads_and_optimizers(
 
     move_optim, _ = split_fused_optimizer(
         gm,
-        optim_block,  # pyre-ignore
+        optim_block,
         comm_block.outputs,
     )
 

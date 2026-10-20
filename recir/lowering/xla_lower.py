@@ -393,7 +393,7 @@ def _materialize_meta_fsdp_tensor(tensor: Any, mesh: Any) -> Any:
         shard = jax.random.uniform(key, (_rpd, *_tr), dtype=_dt, minval=-_b, maxval=_b)
         return shard.astype(_dt)
 
-    return shard_map(  # pyre-fixme[28]
+    return shard_map(
         _gen_shard,
         mesh=mesh,
         in_specs=P(_GSPMD_FSDP_AXIS),
@@ -751,7 +751,6 @@ class _XLAModule(torch.nn.Module):
             # int16 view shares the same bits, and ``ndarray.view`` to
             # the ``ml_dtypes.bfloat16`` dtype is also a zero-copy
             # reinterpretation.
-            # pyre-ignore[16]: ml_dtypes.bfloat16 is dynamically defined in the C extension.
             return t.view(torch.int16).numpy().view(ml_dtypes.bfloat16)
         return t.numpy()
 
@@ -1031,7 +1030,7 @@ class _XLAModule(torch.nn.Module):
             else:
                 out_spec_list.append(P())
         out_specs = out_treedef.unflatten(out_spec_list)
-        sharded_fn = shard_map(  # pyre-fixme[28]
+        sharded_fn = shard_map(
             jax_fn,
             mesh=mesh,
             in_specs=in_specs,
@@ -1349,7 +1348,7 @@ class _XLAModule(torch.nn.Module):
                 ndim = out_val.ndim if hasattr(out_val, "ndim") else 0
                 shard_dim = leaf.meta.get("fsdp_shard_dim", 0)
                 if ndim >= 1 and 0 <= shard_dim < ndim:
-                    partitions: list[Optional[str]] = [None] * ndim  # pyre-ignore
+                    partitions: list[Optional[str]] = [None] * ndim
                     partitions[shard_dim] = _GSPMD_FSDP_AXIS
                     out_sharding_list.append(NamedSharding(mesh, P(*partitions)))
                 else:
@@ -1569,7 +1568,7 @@ class _XLAModule(torch.nn.Module):
             assert self.compiled is not None
             result = self.compiled(*args)
             if self.xla_hlo_text is None and hasattr(self.compiled, "hlo_text"):
-                self.xla_hlo_text = self.compiled.hlo_text  # pyre-ignore[16]
+                self.xla_hlo_text = self.compiled.hlo_text
             try:
                 self._maybe_dump_graphs(tag)
             except Exception as e:  # diagnostics must never break training

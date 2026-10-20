@@ -26,7 +26,7 @@ import recir.torchax
 
 
 class TestThreading(unittest.TestCase):
-    def test_access_config_thread(reraise) -> None:  # pyre-ignore[14]
+    def test_access_config_thread(reraise) -> None:
         recir.torchax.default_env()
 
         def task() -> None:

@@ -140,7 +140,7 @@ def _build_leaf_apply(orig_fn: Any) -> Any:
 
     @classmethod  # type: ignore[misc]
     def _leaf_apply(
-        klass: type,  # pyre-fixme[24]
+        klass: type,
         *args: Any,
         **kwargs: Any,
     ) -> Any:
@@ -521,7 +521,6 @@ def _apply_region_transforms(
     _padded_kwarg_leaves, _padded_kwarg_spec = pytree.tree_flatten(padded_fake_kwargs)
     _n_pos_arg_leaves: int = len(_padded_arg_leaves)
 
-    # pyre-ignore
     def _stateless_forward(
         params_and_buffers: dict[str, Any],
         *all_args: Any,
