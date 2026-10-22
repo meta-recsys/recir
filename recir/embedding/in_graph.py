@@ -34,12 +34,12 @@ This module bundles the whole in-graph embedding path:
     on it at 64-chip) while doing the embedding lookup on TPU.
 
   * ``InGraphEmbeddingBackend`` -- the ``EmbeddingBackend`` entry point.
-    ``setup()`` swaps the model's sparse-arch ``_embedding_collection`` for
-    ``InGraphSparseArch`` and builds the sparse optimizer over the tables their
-    plan assigns to it (the table is now a normal ``nn.Parameter``). The model
-    binding locates that sparse arch via the injected ``sparse_arch_getter`` and
-    supplies the optimizer factory via ``sparse_optimizer_builder``, keeping
-    this module free of any model-specific module path or import.
+    ``setup()`` swaps the model's torchrec ``EmbeddingCollection`` (named by
+    ``embedding_collection_fqn``) for ``InGraphSparseArch`` and builds the
+    sparse optimizer over the tables their plan assigns to it (the table is now
+    a normal ``nn.Parameter``). The model binding supplies that FQN and the
+    optimizer factory via ``sparse_optimizer_builder``, keeping this module free
+    of any model-specific import.
 
 Static-shape assumption: per-sample sequence lengths may VARY, but each feature's
 TOTAL token count per chip is static (``T_local``, the same on every chip). Since
@@ -75,6 +75,7 @@ from recir.embedding.backend import (
     EmbeddingSetupResult,
     SparseOptimizerRuntime,
     SparseUpdatePlacement,
+    swap_submodule,
     TableOptimizer,
     TablePlan,
     TableSharding,
@@ -522,7 +523,7 @@ class SparseArchInputBreakDispatcher:
 
     def install_eager(self, model: nn.Module) -> None:
         # Enable graph-break-at-input mode on the InGraphSparseArch that setup()
-        # swapped into the sparse arch's _embedding_collection. No module swap -- just
+        # swapped in for the EmbeddingCollection. No module swap -- just
         # flip a flag; the arch's own forward then marks the break (see
         # InGraphSparseArch.forward's input-break branch).
         archs = [
@@ -637,9 +638,9 @@ def _seed_in_graph_tables_from_ec(
 class InGraphEmbeddingBackend(EmbeddingBackend):
     """In-graph ring-shift embedding backend.
 
-    ``sparse_arch_getter`` maps the model to the module that owns
-    ``_embedding_collection`` as a direct attribute (``setup()`` replaces it
-    with an :class:`InGraphSparseArch`). ``sparse_optimizer_builder`` builds
+    ``embedding_collection_fqn`` names the model's torchrec
+    ``EmbeddingCollection`` (``setup()`` replaces it with an
+    :class:`InGraphSparseArch`). ``sparse_optimizer_builder`` builds
     the LR-buffered optimizer over the resulting table params and returns
     ``(optimizer, lr_buffer)``. Both are injected so this module stays free
     of model-specific module paths and imports.
@@ -655,7 +656,7 @@ class InGraphEmbeddingBackend(EmbeddingBackend):
 
     def __init__(
         self,
-        sparse_arch_getter: Callable[[nn.Module], nn.Module],
+        embedding_collection_fqn: str,
         sparse_optimizer_builder: Callable[
             [nn.Module, List[nn.Parameter], OptimConfig, torch.device],
             Tuple[torch.optim.Optimizer, torch.Tensor],
@@ -663,7 +664,7 @@ class InGraphEmbeddingBackend(EmbeddingBackend):
         table_plans: Dict[str, TablePlan],
         on_device_init: bool = True,
     ) -> None:
-        self._sparse_arch_getter = sparse_arch_getter
+        self._embedding_collection_fqn = embedding_collection_fqn
         self._sparse_optimizer_builder = sparse_optimizer_builder
         self._table_plans: Dict[str, TablePlan] = dict(table_plans)
         self._feature_seqlens: Dict[str, int] = {}
@@ -740,7 +741,6 @@ class InGraphEmbeddingBackend(EmbeddingBackend):
         if world_size <= 0:
             raise ValueError(f"world_size must be positive, got {world_size}.")
 
-        sparse_arch = self._sparse_arch_getter(model)
         new_ec = InGraphSparseArch(
             table_configs=table_configs,
             feature_seqlens=self._feature_seqlens,
@@ -752,10 +752,9 @@ class InGraphEmbeddingBackend(EmbeddingBackend):
             f"InGraphEmbeddingBackend: on_device_init={self._on_device_init} "
             f"(meta param -> on-device HBM random init, no host alloc/H2D)"
         )
-        # nn.Module.__getattr__ is typed Module | Tensor; this is the EC.
-        old_ec: Any = sparse_arch._embedding_collection
+        old_ec: Any = model.get_submodule(self._embedding_collection_fqn)
         _seed_in_graph_tables_from_ec(old_ec, new_ec)
-        sparse_arch._embedding_collection = new_ec
+        swap_submodule(model, self._embedding_collection_fqn, new_ec)
 
         embedding_params = self.embedding_named_parameters(model)
         if not embedding_params:

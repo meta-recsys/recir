@@ -25,21 +25,18 @@ per-feature per-host PRT-padded input sizes and handing them to
 from __future__ import annotations
 
 import logging
-from typing import Callable, Dict, List, Sequence, Tuple
+from typing import Dict, List, Sequence, Tuple
 
 import jax
 import torch
 import torch.nn as nn
-from recir.embedding._sparse_arch_stub import (
-    DummySparseArch,
-    sparse_arch_marker_prefix,
-    swap_sparse_arch,
-)
+from recir.embedding._sparse_arch_stub import DummySparseArch, sparse_arch_marker_prefix
 from recir.embedding.backend import (
     EmbeddingBackend,
     EmbeddingSetupResult,
     SparseOptimizerRuntime,
     SparseUpdatePlacement,
+    swap_submodule,
 )
 from recir.embedding.sparsecore_ops import (
     _num_sc_per_device,
@@ -76,10 +73,13 @@ class SparseCoreEmbeddingBackend(EmbeddingBackend):
     Optimizer: Adagrad fused on-chip via tpu_sparse_dense_matmul_grad.
     No gloo PG required.
 
-    ``set_feature_padded_input_sizes()`` must run before ``setup()``.
+    ``embedding_collection_fqn`` is the FQN of the model's torchrec
+    ``EmbeddingCollection``. ``set_feature_padded_input_sizes()`` must run
+    before ``setup()``.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, embedding_collection_fqn: str) -> None:
+        self._embedding_collection_fqn = embedding_collection_fqn
         self._jax_ec: SparsecoreBackedEC | None = None
         # Shared mutable ref the model's sparse-arch dispatcher reads lazily
         # (install_graph fires after setup() has run).
@@ -149,20 +149,20 @@ class SparseCoreEmbeddingBackend(EmbeddingBackend):
         return {
             name: p
             for name, p in model.named_parameters()
-            if "_embedding_collection" not in name
+            if not name.startswith(self._embedding_collection_fqn + ".")
         }
 
 
 class JAXSparseArchDispatcher:
     """SparseCore variant of :class:`recir.embedding.cpu.SparseArchDispatcher`.
 
-    ``install_eager`` swaps the arch located by ``sparse_arch_getter`` for a
-    :class:`DummySparseArch` exactly like the eager path. ``install_graph``
-    instead wires a graph-break ``fwd_fn`` that builds a KJT from the runtime
-    (values, lengths) and forwards into a :class:`SparsecoreBackedEC`, looked up
-    through ``jax_ec_ref`` -- the mutable one-slot list that
-    :meth:`SparseCoreEmbeddingBackend.setup` fills, since ``install_graph``
-    fires after ``setup()``.
+    ``install_eager`` swaps the ``EmbeddingCollection`` at
+    ``embedding_collection_fqn`` for a :class:`DummySparseArch` exactly like the
+    eager path. ``install_graph`` instead wires a graph-break ``fwd_fn`` that builds
+    a KJT from the runtime (values, lengths) and forwards into a
+    :class:`SparsecoreBackedEC`, looked up through ``jax_ec_ref`` -- the mutable
+    one-slot list that :meth:`SparseCoreEmbeddingBackend.setup` fills, since
+    ``install_graph`` fires after ``setup()``.
     """
 
     def __init__(
@@ -170,26 +170,25 @@ class JAXSparseArchDispatcher:
         cached_output: Dict[str, JaggedTensor],
         input_kjt_keys: List[str],
         jax_ec_ref: List[SparsecoreBackedEC | None],
-        sparse_arch_getter: Callable[[nn.Module], nn.Module],
+        embedding_collection_fqn: str,
         override_id: int = 1,
         num_ranks: int = 1,
     ) -> None:
         self._cached_output = cached_output
         self._input_kjt_keys = input_kjt_keys
         self._jax_ec_ref = jax_ec_ref
-        self._sparse_arch_getter = sparse_arch_getter
+        self._embedding_collection_fqn = embedding_collection_fqn
         self._override_id = override_id
         self._num_ranks = num_ranks
         self._dummy: DummySparseArch | None = None
 
     def install_eager(self, model: nn.Module) -> None:
-        target = self._sparse_arch_getter(model)
         self._dummy = DummySparseArch(
             self._cached_output,
             input_kjt_keys=self._input_kjt_keys,
             override_id=self._override_id,
         )
-        swap_sparse_arch(model, target, self._dummy)
+        swap_submodule(model, self._embedding_collection_fqn, self._dummy)
 
     def install_graph(
         self,

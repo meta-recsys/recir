@@ -273,14 +273,26 @@ class RecirGSPMDCompiledModuleBase(RecirCompiledModuleBase):
         return buffers
 
     def finalize_restore(self) -> None:
-        """Seed device state from the freshly loaded host buffers."""
+        """Seed device state from the freshly loaded host buffers.
+
+        Single device only: on a multi-device mesh the first step places the
+        restored host state with the compiled shardings, so only the restore is
+        checked here.
+        """
+        import jax  # @manual
+
         compiled_step = self._compiled_step
         if compiled_step is None:
             return
         compiled_obj = cast(Any, compiled_step).__dict__.get(COMPILED_OBJECT_KEY)
         if compiled_obj is None:
             return
-        compiled_obj.state_manager.prefill_device_state_from_host(
+        state_manager = compiled_obj.state_manager
+        if jax.device_count() > 1:
+            state_manager.check_no_meta_leaves(compiled_obj.flat_state)
+            state_manager.invalidate_device_state()
+            return
+        state_manager.prefill_device_state_from_host(
             compiled_obj.gm, compiled_obj.flat_state
         )
 

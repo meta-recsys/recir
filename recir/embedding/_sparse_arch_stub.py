@@ -13,14 +13,13 @@ their *graph* half differs; the *eager* half is identical and lives here:
   * :class:`DummySparseArch` -- the tracing stub they both swap in. It plants
     marker ops so tracing sees stable shapes and the graph half can rediscover
     the dispatch inputs/outputs.
-  * :func:`swap_sparse_arch` -- binds that stub in place of the real arch.
   * :func:`sparse_arch_marker_prefix` -- the marker namespace both halves agree on.
 
-The in-graph backend shares none of this: it keeps its arch in-graph and breaks
-at the input instead (``in_graph.SparseArchInputBreakDispatcher``).
+The in-graph backend shares none of this: it keeps its lookup in-graph and
+breaks at the input instead (``in_graph.SparseArchInputBreakDispatcher``).
 
-Model-agnostic: callers locate the arch with their own ``sparse_arch_getter``
-rather than this module importing a model-specific class.
+Model-agnostic: callers name the model's torchrec ``EmbeddingCollection`` by its
+FQN rather than this module importing a model-specific class.
 """
 
 from __future__ import annotations
@@ -37,36 +36,6 @@ SPARSE_ARCH_MARKER_PREFIX = "recir.embedding.sparse_arch"
 
 def sparse_arch_marker_prefix(override_id: int) -> str:
     return f"{SPARSE_ARCH_MARKER_PREFIX}::{override_id}"
-
-
-def swap_sparse_arch(
-    model: nn.Module,
-    target: nn.Module,
-    replacement: nn.Module,
-) -> None:
-    """Replace ``target`` with ``replacement`` wherever it is bound in ``model``.
-
-    Located by identity against the module the caller's ``sparse_arch_getter``
-    resolved, so this stays free of any model-specific type.
-    """
-    for fqn, mod in list(model.named_modules()):
-        if mod is target:
-            if not fqn:
-                # named_modules() yields ("", model) for the root. Binding the
-                # stub would mean setattr(model, "", ...), which does not
-                # replace anything meaningful -- the caller wants a submodule.
-                raise ValueError(
-                    "sparse_arch_getter returned the root model; it must return "
-                    "the submodule holding the sparse arch so it can be swapped."
-                )
-            parent_fqn, leaf = fqn.rsplit(".", 1) if "." in fqn else ("", fqn)
-            parent = model.get_submodule(parent_fqn) if parent_fqn else model
-            setattr(parent, leaf, replacement)
-            return
-    raise RuntimeError(
-        "sparse_arch_getter returned a module that is not bound anywhere in the "
-        "model; cannot swap it for the tracing stub."
-    )
 
 
 class DummySparseArch(nn.Module):

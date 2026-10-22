@@ -10,7 +10,7 @@ Provides:
   SparseCoreLookup      — jit-compiled tpu_sparse_dense_matmul wrapper.
   SparsecoreBackedEC    — drop-in torchrec EmbeddingCollection replacement.
   init_sc_embedding_variables — shared factory for JAX embedding init.
-  _kjt_to_numpy / _lazy_jte / _num_sc_per_device / _swap_ec — helpers.
+  _kjt_to_numpy / _lazy_jte / _num_sc_per_device — helpers.
 
 This module owns the JAX + jax_tpu_embedding dependency. The hardware-agnostic
 backend interface lives in ``recir.embedding.backend``; import from there when
@@ -35,8 +35,7 @@ from __future__ import annotations
 
 import collections
 import logging
-from contextlib import contextmanager
-from typing import Any, Generator
+from typing import Any
 
 import jax
 import jax.numpy as jnp
@@ -101,28 +100,6 @@ def _kjt_to_numpy(features: KeyedJaggedTensor) -> dict[str, np.ndarray]:
         result[key] = all_ids[id_offset : id_offset + total].reshape(-1, 1)
         id_offset += total
     return result
-
-
-@contextmanager
-def _swap_ec(
-    ec_holder: nn.Module,
-    new_ec: nn.Module,
-) -> Generator[None, None, None]:
-    """Temporarily replace ec_holder._embedding_collection with new_ec.
-
-    The caller navigates to the right parent module (the one that owns
-    _embedding_collection as a direct attribute).
-
-    DLRMv3 usage:  _swap_ec(orig_preprocess.model, jax_ec)
-    xsurface usage: _swap_ec(real_sparse_arch, jax_ec)
-    """
-    orig_ec = ec_holder._embedding_collection  # pyre-ignore[16]
-    # pyre-ignore[8,16]: Intentionally replacing EmbeddingCollection with Module
-    ec_holder._embedding_collection = new_ec
-    try:
-        yield
-    finally:
-        ec_holder._embedding_collection = orig_ec  # pyre-ignore[16]
 
 
 # ---------------------------------------------------------------------------

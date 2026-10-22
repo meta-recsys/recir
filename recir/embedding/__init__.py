@@ -22,9 +22,10 @@ Three backends share the ``EmbeddingBackend`` ABC from ``backend.py``:
     (in_graph.py)                       inside the compiled GSPMD program.
 
 All three are model-agnostic. A model binds them to its own architecture by
-passing the seam callables the constructors take (``embedding_param_prefix``,
-``sparse_arch_getter``, ``sparse_optimizer_builder``) and by subclassing to add
-a model-specific ``get_override`` where tracing overrides are needed.
+passing what the constructors take (``embedding_collection_fqn``, the FQN of
+its torchrec ``EmbeddingCollection``, and ``sparse_optimizer_builder``) and by
+subclassing to add a model-specific ``get_override`` where tracing overrides
+are needed.
 
 Import the concrete backends from their own submodules rather than from here,
 so a binary that only needs one does not link torchrec.distributed.* (heavy)

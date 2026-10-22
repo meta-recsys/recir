@@ -18,7 +18,6 @@ class DeviceStateManager:
 
     def __init__(self, torch_device: torch.device = _CPU_DEVICE) -> None:
         self._device_state: Optional[List[Any]] = None
-        self._used_fast_path: bool = False
         self.torch_device: torch.device = torch_device
         # FQNs (fully-qualified names) aligned 1:1 with flat_state, populated at
         # compile time. Lets copy_state_to_host skip specific state entries by

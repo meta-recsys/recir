@@ -142,6 +142,21 @@ class XLADeviceStateManager(DeviceStateManager):
                 jax_state.append(t)
         return jax_state
 
+    def check_no_meta_leaves(self, flat_state: List[torch.Tensor]) -> None:
+        """Raise if a restore left any ``flat_state`` leaf on meta."""
+        meta_leaves = [i for i, t in enumerate(flat_state) if t.is_meta]
+        if meta_leaves:
+            named = ", ".join(
+                f"{i} ({self.state_fqns[i]})"
+                if self.state_fqns and i < len(self.state_fqns)
+                else str(i)
+                for i in meta_leaves
+            )
+            raise RuntimeError(
+                f"flat_state entries [{named}] are still meta; seeding would "
+                "regenerate them from jax.random instead of using the checkpoint"
+            )
+
     def prefill_device_state_from_host(
         self,
         gm: torch.fx.GraphModule,
@@ -155,18 +170,7 @@ class XLADeviceStateManager(DeviceStateManager):
                 "compiled graph has fewer placeholders than flat_state entries: "
                 f"{len(placeholders)} < {len(flat_state)}"
             )
-        meta_leaves = [i for i, t in enumerate(flat_state) if t.is_meta]
-        if meta_leaves:
-            named = ", ".join(
-                f"{i} ({self.state_fqns[i]})"
-                if self.state_fqns and i < len(self.state_fqns)
-                else str(i)
-                for i in meta_leaves
-            )
-            raise RuntimeError(
-                f"flat_state entries [{named}] are still meta; seeding would "
-                "regenerate them from jax.random instead of using the checkpoint"
-            )
+        self.check_no_meta_leaves(flat_state)
 
         devices = _get_global_devices()
         fsdp_axis_size = int(
@@ -235,8 +239,7 @@ class XLADeviceStateManager(DeviceStateManager):
             # host mirror again.
             self.copy_state_to_host(flat_state)
         device_state = self.device_state
-        self._used_fast_path = device_state is not None and not last_train_step
-        if self._used_fast_path:
+        if device_state is not None and not last_train_step:
             # Only the fast path consumes the cached JAX device_state. The slow
             # path (last_train_step, or the first multi-device call) returns
             # flat_state and may legitimately have device_state is None.
@@ -244,7 +247,10 @@ class XLADeviceStateManager(DeviceStateManager):
             self._configure_xla_modules(gm, keep_jax_output=True)
             return device_state + user_inps
         else:
-            self._configure_xla_modules(gm, keep_jax_output=False)
+            # The first multi-device call keeps its outputs on device like the
+            # fast path; converting them would put a second copy of the whole
+            # state in host RAM.
+            self._configure_xla_modules(gm, keep_jax_output=not last_train_step)
             return flat_state + user_inps
 
     def commit_step_state(
@@ -253,12 +259,10 @@ class XLADeviceStateManager(DeviceStateManager):
         updated_flat: List[Any],
         last_train_step: bool,
     ) -> None:
-        # On the fast path the updated state stays on device and is simply
-        # re-cached; only the slow path (first multi-device call, last step)
-        # mirrors it host-ward.
-        if not self._used_fast_path:
-            self._copy_state_into(flat_state, updated_flat)
+        # The updated state stays on device and is simply re-cached; only the
+        # last step mirrors it host-ward.
         if last_train_step:
+            self._copy_state_into(flat_state, updated_flat)
             # Release both cache layers only after the host mirror is current.
             # If execution or the host copy raises, the pre-call device state
             # and frozen-input copies remain available for a retry.

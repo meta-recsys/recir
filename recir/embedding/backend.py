@@ -11,9 +11,9 @@ callers (and the quantization hooks) can depend on the interface without
 pulling in the ~500 MiB JAX/SparseCore stack. The concrete backends live in
 ``cpu.py``, ``sparsecore.py``, and ``in_graph.py``.
 
-Models bind a backend to their own architecture by supplying the seam
-callables the concrete backends accept (``sparse_arch_getter``,
-``sparse_optimizer_builder``) and, where tracing overrides are needed, by
+Models bind a backend to their own architecture by supplying what the concrete
+backends accept (``embedding_collection_fqn``, ``sparse_optimizer_builder``)
+and, where tracing overrides are needed, by
 subclassing to add a model-specific ``get_override``.
 """
 
@@ -130,6 +130,17 @@ class EmbeddingSetupResult:
     model: nn.Module
     dense_named_parameters: dict[str, nn.Parameter]
     sparse_runtime: SparseOptimizerRuntime
+
+
+def swap_submodule(model: nn.Module, fqn: str, replacement: nn.Module) -> nn.Module:
+    """Bind ``replacement`` at ``fqn`` in ``model``; return the module it replaces."""
+    if not fqn:
+        raise ValueError("fqn names the root model; it must name a submodule")
+    original = model.get_submodule(fqn)
+    parent_fqn, _, leaf = fqn.rpartition(".")
+    parent = model.get_submodule(parent_fqn) if parent_fqn else model
+    setattr(parent, leaf, replacement)
+    return original
 
 
 class EmbeddingBackend(ABC):

@@ -8,7 +8,9 @@
 """Tests for recir.backends — Backend ABC + concrete subclasses."""
 
 import tempfile
+import types
 import unittest
+from typing import cast
 from unittest import mock
 
 import torch
@@ -20,11 +22,13 @@ from recir.backends import (
     XLAShardMapBackend,
 )
 from recir.backends.types import BackendType
+from recir.compiler.runtime import COMPILED_OBJECT_KEY
 from recir.distributed.parallel_mode import DataParallel, GSPMDParallel
 from recir.lowering.device_state import DeviceStateManager
 from recir.lowering.xla_device_state import XLADeviceStateManager
 from recir.passes import remove_copy_from_optimizer
 from recir.passes.iter_graph_module import IterGraphModule
+from recir.training.compiled_module import RecirGSPMDCompiledModuleBase
 
 
 class InductorBackendTest(unittest.TestCase):
@@ -309,6 +313,53 @@ class XLADeviceStateManagerTest(unittest.TestCase):
 
         self.assertTrue(torch.equal(flat_state[0], updated_torch))
         mock_jax_to_torch.assert_called_once_with(updated, manager.torch_device)
+
+    def test_first_multi_device_call_keeps_state_on_device(self) -> None:
+        manager = XLADeviceStateManager()
+        flat_state = [torch.zeros(2)]
+        gm = torch.fx.symbolic_trace(torch.nn.Identity())
+        with (
+            mock.patch("jax.device_count", return_value=8),
+            mock.patch.object(manager, "_configure_xla_modules") as configure,
+        ):
+            inputs = manager.prepare_inputs(gm, flat_state, [], last_train_step=False)
+        updated = object()
+
+        with mock.patch(
+            "recir.lowering.xla_device_state._jax_to_torch"
+        ) as mock_jax_to_torch:
+            manager.commit_step_state(flat_state, [updated], last_train_step=False)
+
+        self.assertIs(inputs[0], flat_state[0])
+        configure.assert_called_once_with(gm, keep_jax_output=True)
+        self.assertTrue(torch.equal(flat_state[0], torch.zeros(2)))
+        cached_state = manager.device_state
+        assert cached_state is not None
+        self.assertIs(cached_state[0], updated)
+        mock_jax_to_torch.assert_not_called()
+
+    def test_meta_leaf_left_by_a_restore_raises(self) -> None:
+        manager = XLADeviceStateManager()
+        with self.assertRaisesRegex(RuntimeError, "still meta"):
+            manager.check_no_meta_leaves(
+                [torch.zeros(2), torch.empty(2, device="meta")]
+            )
+
+    def test_restore_on_a_mesh_checks_but_does_not_prefill(self) -> None:
+        state_manager = mock.Mock()
+        flat_state = [torch.zeros(2)]
+        compiled_step = types.SimpleNamespace()
+        compiled_step.__dict__[COMPILED_OBJECT_KEY] = types.SimpleNamespace(
+            state_manager=state_manager, gm=object(), flat_state=flat_state
+        )
+        module = types.SimpleNamespace(_compiled_step=compiled_step)
+        with mock.patch("jax.device_count", return_value=8):
+            RecirGSPMDCompiledModuleBase.finalize_restore(
+                cast(RecirGSPMDCompiledModuleBase, module)
+            )
+        state_manager.check_no_meta_leaves.assert_called_once_with(flat_state)
+        state_manager.invalidate_device_state.assert_called_once_with()
+        state_manager.prefill_device_state_from_host.assert_not_called()
 
     def test_final_call_flushes_device_state_before_host_inputs(self) -> None:
         manager = XLADeviceStateManager()

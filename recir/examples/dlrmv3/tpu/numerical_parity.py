@@ -27,7 +27,7 @@ from recir.examples.dlrmv3.common.data import (
     TokenBudgetBatch,
     TokenBudgetCollate,
 )
-from recir.examples.dlrmv3.tpu.embedding_backends import dlrmhstu
+from recir.examples.dlrmv3.common.model import EMBEDDING_COLLECTION_FQN
 from recir.examples.dlrmv3.tpu.train import DLRMv3TPUModule, TPUTrainer
 from recir.training.compile import WARMUP_ATTR
 from recir.training.optim import prime_optimizer_state
@@ -70,7 +70,7 @@ def _parse(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 def _backend(trainer: TPUTrainer, sharding: TableSharding) -> InGraphEmbeddingBackend:
     return InGraphEmbeddingBackend(
-        sparse_arch_getter=dlrmhstu,
+        embedding_collection_fqn=EMBEDDING_COLLECTION_FQN,
         sparse_optimizer_builder=build_sparse_lr_buffered_optimizer,
         table_plans={
             name: TablePlan(

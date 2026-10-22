@@ -18,8 +18,8 @@ Kept in its own module so the factory in ``__init__.py`` and the other
 backends don't pull in the heavy ``torchrec.distributed.*`` import surface
 when only the SparseCore or in-graph backend is used.
 
-Model-agnostic: the caller supplies ``embedding_param_prefix``, the FQN
-prefix under which its embedding parameters live.
+Model-agnostic: the caller supplies ``embedding_collection_fqn``, the FQN of
+the model's torchrec ``EmbeddingCollection``.
 """
 
 from __future__ import annotations
@@ -27,23 +27,21 @@ from __future__ import annotations
 import logging
 import os
 import tempfile
-from typing import Any, Callable, cast, Dict, List, Optional, Sequence, Tuple, Type
+from typing import Any, cast, Dict, List, Optional, Sequence, Tuple, Type
 
 import jax
 import torch
 import torch.distributed as dist
 import torch.nn as nn
 import torchrec
-from recir.embedding._sparse_arch_stub import (
-    DummySparseArch,
-    sparse_arch_marker_prefix,
-    swap_sparse_arch,
-)
+from recir.embedding._sparse_arch_stub import DummySparseArch, sparse_arch_marker_prefix
+from recir.embedding._torchrec_patches import apply_seq_a2a_int64_patch
 from recir.embedding.backend import (
     EmbeddingBackend,
     EmbeddingSetupResult,
     SparseOptimizerRuntime,
     SparseUpdatePlacement,
+    swap_submodule,
 )
 from recir.embedding.split_collection import (
     assert_replicated_half_is_unplanned,
@@ -135,16 +133,19 @@ class _ECSharder(EmbeddingCollectionSharder):
 class CPUEmbeddingBackend(EmbeddingBackend):
     """torchrec DMP ROW_WISE/TABLE_WISE on CPU via gloo.
 
-    ``embedding_param_prefix`` is the FQN prefix under which the model keeps
-    its embedding collection parameters.
+    ``embedding_collection_fqn`` is the FQN of the model's torchrec
+    ``EmbeddingCollection``.
     """
 
     def __init__(
         self,
-        embedding_param_prefix: str,
+        embedding_collection_fqn: str,
         embedding_tables: Optional[Dict[str, Any]] = None,
     ) -> None:
-        self._embedding_param_prefix = embedding_param_prefix
+        # int32 sequence-embedding offsets overflow in torchrec's all-to-all at
+        # large multi-host batch; see _torchrec_patches.
+        apply_seq_a2a_int64_patch()
+        self._embedding_collection_fqn = embedding_collection_fqn
         # The model's own table objects, read here ONLY for their ``sharding``
         # field -- torchrec's ``EmbeddingConfig`` has no such field, so the
         # per-table ROW_WISE/DATA_PARALLEL choice cannot ride along with
@@ -268,7 +269,7 @@ class CPUEmbeddingBackend(EmbeddingBackend):
         if not replicated:
             return None, sharded
 
-        parent_path, _, attr = self._embedding_param_prefix.rpartition(".")
+        parent_path, _, attr = self._embedding_collection_fqn.rpartition(".")
         parent = model.get_submodule(parent_path) if parent_path else model
         return split_embedding_collection(parent, attr, replicated), sharded
 
@@ -330,7 +331,7 @@ class CPUEmbeddingBackend(EmbeddingBackend):
         plan = planner.collective_plan(model, cast(Any, sharders), pg)
         if split is not None:
             assert_replicated_half_is_unplanned(
-                plan, split, self._embedding_param_prefix
+                plan, split, self._embedding_collection_fqn
             )
         logger.info("DMP sharding plan:")
         for module_path, module_plan in plan.plan.items():
@@ -365,49 +366,50 @@ class CPUEmbeddingBackend(EmbeddingBackend):
 
 
 class SparseArchDispatcher:
-    """Graph-break dispatcher back to the real eager torchrec sparse arch.
+    """Graph-break dispatcher back to the real eager torchrec lookup.
 
-    ``install_eager`` swaps the arch located by ``sparse_arch_getter`` for a
-    :class:`DummySparseArch` so tracing sees stable shapes (the dummy plants
-    input + forward/backward markers). ``install_graph`` finds those markers
-    and installs a graph-break dispatch back to the captured real arch.
+    ``install_eager`` swaps the ``EmbeddingCollection`` at
+    ``embedding_collection_fqn`` for a :class:`DummySparseArch` so tracing sees
+    stable shapes (the dummy plants input + forward/backward markers).
+    ``install_graph`` finds those markers and installs a graph-break dispatch back
+    to the captured real collection.
     """
 
     def __init__(
         self,
         cached_output: Dict[str, JaggedTensor],
         input_kjt_keys: List[str],
-        sparse_arch_getter: Callable[[nn.Module], nn.Module],
+        embedding_collection_fqn: str,
         override_id: int = 1,
         num_ranks: int = 1,
     ) -> None:
         self._cached_output = cached_output
         self._input_kjt_keys = input_kjt_keys
-        self._sparse_arch_getter = sparse_arch_getter
+        self._embedding_collection_fqn = embedding_collection_fqn
         self._override_id = override_id
         self._num_ranks = num_ranks
-        self._orig_sparse_arch: nn.Module | None = None
+        self._orig_collection: nn.Module | None = None
         self._dummy: DummySparseArch | None = None
 
     def install_eager(self, model: nn.Module) -> None:
-        target = self._sparse_arch_getter(model)
-        self._orig_sparse_arch = target
         self._dummy = DummySparseArch(
             self._cached_output,
             input_kjt_keys=self._input_kjt_keys,
             override_id=self._override_id,
         )
-        swap_sparse_arch(model, target, self._dummy)
+        self._orig_collection = swap_submodule(
+            model, self._embedding_collection_fqn, self._dummy
+        )
 
     def install_graph(
         self,
         gm: torch.fx.GraphModule,
         flat_state: List[torch.Tensor],
     ) -> Tuple[torch.fx.GraphModule, List[torch.Tensor]]:
-        if self._orig_sparse_arch is None or self._dummy is None:
+        if self._orig_collection is None or self._dummy is None:
             return gm, flat_state
 
-        real_arch: nn.Module = self._orig_sparse_arch
+        real_arch: nn.Module = self._orig_collection
         input_kjt_keys: List[str] = self._input_kjt_keys
         feature_names: List[str] = self._dummy._feature_names
         num_ranks: int = self._num_ranks

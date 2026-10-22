@@ -23,7 +23,6 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Tuple
 
 import torch
-import torch.nn as nn
 from recir.embedding.backend import (
     EmbeddingBackend,
     TableOptimizer,
@@ -42,19 +41,8 @@ from recir.examples.dlrmv3.common.model import (
 from recir.training.setup import build_sparse_lr_buffered_optimizer
 from torchrec.modules.embedding_configs import EmbeddingConfig
 
-EMBEDDING_PARAM_PREFIX: str = EMBEDDING_COLLECTION_FQN
 SPARSE_ARCH_OVERRIDE_ID: int = 1
 BACKENDS: Tuple[str, ...] = ("in_graph", "cpu")
-
-
-def dlrmhstu(model: nn.Module) -> nn.Module:
-    """The module owning ``_embedding_collection`` (in_graph re-homes it)."""
-    return model.get_submodule("model")
-
-
-def embedding_collection(model: nn.Module) -> nn.Module:
-    """The lookup module the cpu backend's dispatcher swaps for a graph break."""
-    return model.get_submodule(EMBEDDING_COLLECTION_FQN)
 
 
 @dataclass(frozen=True)
@@ -74,7 +62,7 @@ def build_embedding_backend(
 ) -> EmbeddingBackend:
     if name == "in_graph":
         return InGraphEmbeddingBackend(
-            sparse_arch_getter=dlrmhstu,
+            embedding_collection_fqn=EMBEDDING_COLLECTION_FQN,
             sparse_optimizer_builder=build_sparse_lr_buffered_optimizer,
             table_plans={
                 t: TablePlan(
@@ -85,11 +73,7 @@ def build_embedding_backend(
             on_device_init=on_device_init,
         )
     if name == "cpu":
-        from recir.embedding._torchrec_patches import apply_seq_a2a_int64_patch
-
-        # int32 sequence-embedding offsets overflow at large multi-host batch.
-        apply_seq_a2a_int64_patch()
-        return CPUEmbeddingBackend(embedding_param_prefix=EMBEDDING_PARAM_PREFIX)
+        return CPUEmbeddingBackend(embedding_collection_fqn=EMBEDDING_COLLECTION_FQN)
     raise ValueError(f"unknown embedding backend {name!r}; use one of {BACKENDS}")
 
 
@@ -121,7 +105,7 @@ def make_dispatchers(
             SparseArchDispatcher(
                 cached_output=cached,
                 input_kjt_keys=keys,
-                sparse_arch_getter=embedding_collection,
+                embedding_collection_fqn=EMBEDDING_COLLECTION_FQN,
                 override_id=SPARSE_ARCH_OVERRIDE_ID,
             )
         ]
