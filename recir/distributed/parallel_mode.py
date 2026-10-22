@@ -10,6 +10,9 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Optional, Sequence, Set, Tuple
 
+# A module import, read at call time: xla_lower imports this package back, so a
+# from-import here fails under eager (non-lazy) imports.
+import recir.lowering.xla_lower as xla_lower
 import torch
 import torch.distributed as dist
 import torch.nn as nn
@@ -25,11 +28,6 @@ from recir.distributed.data_parallel import (
 )
 from recir.distributed.sharding_plan import EmbeddingShardingPlan
 from recir.distributed.sharding_spec import FSDPWeightShardSpec, set_state_layout
-from recir.lowering.xla_lower import (
-    _AOT_TOPOLOGY,
-    _get_global_devices,
-    _get_local_devices,
-)
 from torch.distributed.tensor import DeviceMesh
 from torch.fx import GraphModule
 
@@ -143,7 +141,7 @@ def _current_process_rank(process_count: int) -> int:
 
     # AOT and single-process test hosts intentionally model a larger deployment
     # without joining its process namespace; rank zero is the only local shard.
-    if _AOT_TOPOLOGY.get() is not None:
+    if xla_lower._AOT_TOPOLOGY.get() is not None:
         logger.debug(
             "AOT topology uses emulated process rank zero; ignored namespaces: %s",
             mismatched_namespaces,
@@ -168,7 +166,7 @@ def _current_device_rank(num_ranks: int, num_processes: int) -> int:
 
 
 def _current_jax_process_index() -> int:
-    if _AOT_TOPOLOGY.get() is not None:
+    if xla_lower._AOT_TOPOLOGY.get() is not None:
         return 0
     import jax  # @manual
 
@@ -571,8 +569,10 @@ class GSPMDParallel(ParallelMode):
         # time `_make_trace_input_transform` (which uses this property) must
         # match the runtime `_to_sharded_jax` local→global multiplier,
         # so use the topology-aware ratio when one is active.
-        if _AOT_TOPOLOGY.get() is not None:
-            return len(_get_global_devices()) // max(1, len(_get_local_devices()))
+        if xla_lower._AOT_TOPOLOGY.get() is not None:
+            return len(xla_lower._get_global_devices()) // max(
+                1, len(xla_lower._get_local_devices())
+            )
         import jax  # @manual
 
         return jax.process_count()
