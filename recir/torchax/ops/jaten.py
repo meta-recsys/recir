@@ -1108,6 +1108,7 @@ def _aten_native_layer_norm(
     axis = [len(input.shape) - i - 1 for i in range(len(normalized_shape))]
 
     # Calculate mean and standard deviation
+    input = jax.lax.optimization_barrier(input)
     mean = jnp.mean(input, axis=axis, keepdims=True)
     var = jnp.var(input, axis=axis, keepdims=True)
     rstd = jax.lax.rsqrt(var + eps)
