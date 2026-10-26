@@ -152,10 +152,10 @@ def _register_kjt_split_op() -> None:
         offsets: torch.Tensor,
         num_keys: int,
     ) -> List[torch.Tensor]:
-        ctx = torch.library.get_ctx()
-        runtime_stride = ctx.new_dynamic_size()
-        torch._check_is_size(runtime_stride)
-        torch._check(runtime_stride > 0)
+        # Mirror the real impl's stride instead of minting an unbacked size: a
+        # fresh symbol gets equated to the batch symbol downstream, and that
+        # assert can land in a lowered subgraph that does not bind the batch.
+        runtime_stride = (offsets.shape[0] - 1) // num_keys
         return [offsets.new_empty(runtime_stride) for _ in range(num_keys)]
 
     split_bags = torch.library.custom_op(
