@@ -176,9 +176,8 @@ class CPUEmbeddingBackend(EmbeddingBackend):
         gloo_rank = int(os.environ.get("JOB_COMPLETION_INDEX", "0"))
         gloo_world = len(addr_list)
         gloo_port = int(os.environ.get("MASTER_PORT", "29500"))
-        # Defer to an already-created PG (the entrypoint train.py::_init_gloo_pg
-        # now owns creation); only self-init for standalone entrypoints that
-        # don't. Avoids a double init_process_group.
+        # Defer to a PG the entrypoint already created; only self-init for
+        # standalone entrypoints that don't. Avoids a double init_process_group.
         if dist.is_initialized():
             logger.info(
                 f"Gloo PG already initialized; reusing rank={gloo_rank}, "
