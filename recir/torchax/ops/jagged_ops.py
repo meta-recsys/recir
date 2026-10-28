@@ -13,6 +13,7 @@ This keeps activations batch-sharded and avoids the large replicated buffer OOM 
 on TPU/GSPMD.
 """
 
+import os
 from typing import Any, List, Optional
 
 import jax
@@ -52,7 +53,15 @@ def _jax_jagged_to_padded_dense_impl(
     mask = col[None, :] < lengths[:, None]
     flat_idx = (starts[:, None] + col[None, :]).clip(0, max(values.shape[0] - 1, 0))
     if values.ndim == 1:
-        gathered = values[flat_idx.reshape(-1)].reshape(b, max_len)
+        packed = os.environ.get("RECIR_PACKED_JAGGED_INT64", "0")
+        if packed not in ("0", "1"):
+            raise ValueError(f"invalid RECIR_PACKED_JAGGED_INT64: {packed!r}")
+        if packed == "1" and values.dtype in (jnp.int64, jnp.uint64):
+            bits = jax.lax.bitcast_convert_type(values, jnp.uint32)
+            gathered_bits = bits[flat_idx.reshape(-1), :].reshape(b, max_len, 2)
+            gathered = jax.lax.bitcast_convert_type(gathered_bits, values.dtype)
+        else:
+            gathered = values[flat_idx.reshape(-1)].reshape(b, max_len)
         return jnp.where(mask, gathered, jnp.asarray(padding_value, dtype=values.dtype))
     gathered = values[flat_idx.reshape(-1)].reshape(b, max_len, values.shape[-1])
     return jnp.where(
