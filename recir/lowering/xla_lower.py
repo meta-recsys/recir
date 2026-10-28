@@ -48,6 +48,12 @@ except ImportError:
 
 logger: logging.Logger = logging.getLogger(__name__)
 
+# Precompile against abstract inputs on the live mesh without allocating model
+# tables or executing a training step. Context-local so runtime threads are inert.
+_PRECOMPILE: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "recir_xla_precompile", default=False
+)
+
 
 def _host_memory_status() -> dict[str, int]:
     status: dict[str, int] = {}
@@ -461,6 +467,48 @@ class _XLAModule(torch.nn.Module):
         self._state_input_cache.clear()
         self._state_input_cache = cache
 
+    def precompile(self) -> None:
+        """Compile this segment from trace metadata without running its graph."""
+        if self._jax_compiled is not None:
+            return
+        if self.backend_type not in (
+            BackendType.XLA_GSPMD,
+            BackendType.XLA_SHARD_MAP,
+        ):
+            raise ValueError("Abstract precompile requires a torchax/JAX backend")
+        gspmd = self.backend_type == BackendType.XLA_GSPMD
+        hosts = len(_get_global_devices()) // len(_get_local_devices())
+        fsdp_size = int(
+            self.gm.meta.get("gspmd_fsdp_axis_size", len(_get_global_devices()))
+        )
+        fsdp_hosts = fsdp_size // len(_get_local_devices())
+        args = []
+        for node in self.gm.graph.nodes:
+            if node.op != "placeholder":
+                continue
+            val = node.meta.get("val")
+            if not isinstance(val, torch.Tensor):
+                raise ValueError(f"Missing tensor metadata for {node.name}")
+            shape = list(val.shape)
+            if gspmd and node.meta.get("is_batch_input", False):
+                dim, divisor = node.meta.get("batch_dim", 0), hosts
+            elif gspmd and node.meta.get("is_fsdp_sharded", False):
+                dim, divisor = node.meta.get("fsdp_shard_dim", 0), fsdp_hosts
+            else:
+                dim, divisor = 0, 1
+            if shape and 0 <= dim < len(shape):
+                if shape[dim] % divisor:
+                    raise ValueError(
+                        f"Non-divisible global input shape for {node.name}"
+                    )
+                shape[dim] //= divisor
+            args.append(torch.empty(shape, dtype=val.dtype, device="meta"))
+        token = _PRECOMPILE.set(True)
+        try:
+            self.forward(*args)
+        finally:
+            _PRECOMPILE.reset(token)
+
     def _log_compiled_memory_analysis(self) -> None:
         if self._logged_memory_analysis or self._jax_compiled is None:
             return
@@ -698,7 +746,9 @@ class _XLAModule(torch.nn.Module):
         """
         torchax.default_env()
         gm: torch.fx.GraphModule = self.gm
-        input_device: torch.device = args[0].device if args else torch.device("cpu")
+        input_device: torch.device = (
+            args[0].device if args and not _PRECOMPILE.get() else torch.device("cpu")
+        )
         local_devs = _get_local_devices()
         jax_device: Any = local_devs[0] if local_devs else _get_global_devices()[0]
 
@@ -778,6 +828,23 @@ class _XLAModule(torch.nn.Module):
         """
         if tensor is None:
             return None
+        if (_AOT_TOPOLOGY.get() is not None or _PRECOMPILE.get()) and isinstance(
+            tensor, torch.Tensor
+        ):
+            shape = list(tensor.shape)
+            abstract_spec: List[Any] = [None] * len(shape)
+            if is_batch_input and 0 <= input_batch_dim < len(shape):
+                shape[input_batch_dim] *= len(_get_global_devices()) // len(
+                    _get_local_devices()
+                )
+                abstract_spec[input_batch_dim] = batch_axis_resource
+            elif is_fsdp_tensor and shape:
+                shape[0] *= fsdp_host_shard_count
+                abstract_spec[0] = fsdp_axis_name
+            dtype = t2j(torch.empty((), dtype=tensor.dtype)).dtype
+            return jax.ShapeDtypeStruct(
+                tuple(shape), dtype, sharding=NamedSharding(mesh, P(*abstract_spec))
+            )
         if not isinstance(tensor, torch.Tensor):
             assert isinstance(tensor, jax.Array), (
                 f"Expected torch.Tensor or jax.Array, got {type(tensor)}"
@@ -856,16 +923,6 @@ class _XLAModule(torch.nn.Module):
         # the per-process slice so ``num_global // num_local`` still
         # encodes the host count.
         num_global = len(_get_global_devices())
-        # AOT mode: the compile-only client returned by
-        # ``get_topology_desc`` raises ``MakeArraysFromHostBufferShards
-        # not available with compile-only client`` from
-        # ``jax.make_array_from_process_local_data``. Lowering only needs
-        # abstract input shapes/dtypes/shardings, so return
-        # ``jax.ShapeDtypeStruct`` instead. The corresponding ``run``
-        # closures (see ``_build_*_executable``) short-circuit before
-        # invoking the executable so these abstract values are never
-        # executed.
-        aot_active = _AOT_TOPOLOGY.get() is not None
         # Local→global multiplier. Use the topology-aware ratio
         # (num_global // num_local) so prebuild and runtime agree on the
         # global batch shape:
@@ -890,10 +947,6 @@ class _XLAModule(torch.nn.Module):
             spec_parts: List[Any] = [None] * max(ndim, input_batch_dim + 1)
             spec_parts[input_batch_dim] = batch_axis_resource
             sharding = NamedSharding(mesh, P(*spec_parts))
-            if aot_active:
-                return jax.ShapeDtypeStruct(
-                    tuple(global_shape), nparray.dtype, sharding=sharding
-                )
             return jax.make_array_from_process_local_data(
                 sharding, nparray, tuple(global_shape)
             )
@@ -907,18 +960,10 @@ class _XLAModule(torch.nn.Module):
             ndim = len(global_shape)
             spec = P(fsdp_axis_name, *([None] * (ndim - 1)))
             sharding = NamedSharding(mesh, spec)
-            if aot_active:
-                return jax.ShapeDtypeStruct(
-                    tuple(global_shape), nparray.dtype, sharding=sharding
-                )
             return jax.make_array_from_process_local_data(
                 sharding, nparray, tuple(global_shape)
             )
         sharding = NamedSharding(mesh, P())
-        if aot_active:
-            return jax.ShapeDtypeStruct(
-                tuple(nparray.shape), nparray.dtype, sharding=sharding
-            )
         return jax.make_array_from_process_local_data(
             sharding, nparray, tuple(nparray.shape)
         )
@@ -1081,10 +1126,7 @@ class _XLAModule(torch.nn.Module):
         lowered: Any = jitted.lower(*example_global_args)
 
         def run(*run_args: torch.Tensor) -> List[torch.Tensor]:
-            # AOT prebuild mode: lower+compile against the closure-
-            # captured abstract args; never execute on a compile-only
-            # topology. ``_to_sharded_jax`` would raise here too.
-            if _AOT_TOPOLOGY.get() is not None:
+            if _AOT_TOPOLOGY.get() is not None or _PRECOMPILE.get():
                 if self._jax_compiled is None:
                     self._jax_compiled = lowered.compile()
                     _trim_host_memory_after_compile()
@@ -1127,9 +1169,9 @@ class _XLAModule(torch.nn.Module):
             return None
         if not isinstance(a, torch.Tensor):
             return a
-        if _AOT_TOPOLOGY.get() is not None:
-            jx = t2j(a)
-            return jax.ShapeDtypeStruct(tuple(jx.shape), jx.dtype)
+        if _AOT_TOPOLOGY.get() is not None or _PRECOMPILE.get():
+            dtype = t2j(torch.empty((), dtype=a.dtype)).dtype
+            return jax.ShapeDtypeStruct(tuple(a.shape), dtype)
         return jax.device_put(t2j(a), jax_device)
 
     def _jit_plain(
@@ -1153,9 +1195,7 @@ class _XLAModule(torch.nn.Module):
             self._jax_compiled = compiled
 
         def run(*run_args: torch.Tensor) -> List[torch.Tensor]:
-            # AOT prebuild mode: skip execution; ``compiled`` is already
-            # captured on ``self._jax_compiled`` above.
-            if _AOT_TOPOLOGY.get() is not None:
+            if _AOT_TOPOLOGY.get() is not None or _PRECOMPILE.get():
                 return []
             jax_args = tuple(self._t2j_safe(a, jax_device) for a in run_args)
             # Prefer the AOT-installed executable when present; fall
@@ -1440,7 +1480,7 @@ class _XLAModule(torch.nn.Module):
             # captured abstract args (see ``lowered`` below). Skip
             # execution — the caller (``aot_prebuild_and_serialize``)
             # only reads ``self._jax_compiled``.
-            if _AOT_TOPOLOGY.get() is not None:
+            if _AOT_TOPOLOGY.get() is not None or _PRECOMPILE.get():
                 if self._jax_compiled is None:
                     self._jax_compiled = lowered.compile()
                     _trim_host_memory_after_compile()
