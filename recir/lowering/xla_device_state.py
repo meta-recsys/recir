@@ -6,7 +6,7 @@
 
 import logging
 import time
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Collection, Dict, List, Optional, Sequence, Tuple
 
 import torch
 from recir.lowering.device_state import DeviceStateManager
@@ -172,6 +172,19 @@ class XLADeviceStateManager(DeviceStateManager):
             )
         self.check_no_meta_leaves(flat_state)
 
+        self.initialize_device_state(gm, flat_state)
+
+    def initialize_device_state(
+        self,
+        gm: torch.fx.GraphModule,
+        flat_state: List[torch.Tensor],
+        host_indices: Collection[int] = (),
+    ) -> None:
+        """Cache sharded state, generating meta tensor leaves directly on device.
+
+        Leaves at ``host_indices`` are cached as their host tensors.
+        """
+        placeholders = [n for n in gm.graph.nodes if n.op == "placeholder"]
         devices = _get_global_devices()
         fsdp_axis_size = int(
             getattr(gm, "meta", {}).get("gspmd_fsdp_axis_size", len(devices))
@@ -179,16 +192,20 @@ class XLADeviceStateManager(DeviceStateManager):
         mesh, batch_axis_resource, _ = _gspmd_mesh(devices, fsdp_axis_size)
         fsdp_host_shard_count = fsdp_axis_size // len(_get_local_devices())
         new_device_state = [
-            _XLAModule._to_sharded_jax(
-                leaf,
-                mesh,
-                # State entries are never batch inputs.
-                False,
-                0,
-                is_fsdp_tensor=placeholders[i].meta.get("is_fsdp_sharded", False),
-                batch_axis_resource=batch_axis_resource,
-                fsdp_axis_name=_GSPMD_FSDP_AXIS,
-                fsdp_host_shard_count=fsdp_host_shard_count,
+            (
+                leaf
+                if i in host_indices
+                else _XLAModule._to_sharded_jax(
+                    leaf,
+                    mesh,
+                    # State entries are never batch inputs.
+                    False,
+                    0,
+                    is_fsdp_tensor=placeholders[i].meta.get("is_fsdp_sharded", False),
+                    batch_axis_resource=batch_axis_resource,
+                    fsdp_axis_name=_GSPMD_FSDP_AXIS,
+                    fsdp_host_shard_count=fsdp_host_shard_count,
+                )
             )
             for i, leaf in enumerate(flat_state)
         ]

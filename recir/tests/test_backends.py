@@ -237,6 +237,16 @@ class XLADynamoBridgeBackendTest(unittest.TestCase):
 
 
 class XLADeviceStateManagerTest(unittest.TestCase):
+    def test_checkpoint_prefill_rejects_unloaded_meta_state(self) -> None:
+        manager = XLADeviceStateManager()
+        gm = torch.fx.symbolic_trace(torch.nn.Identity())
+        with (
+            self.assertRaisesRegex(RuntimeError, "still meta"),
+            mock.patch.object(manager, "initialize_device_state") as initialize,
+        ):
+            manager.prefill_device_state_from_host(gm, [torch.empty(2, device="meta")])
+        initialize.assert_not_called()
+
     def test_materialize_output_preserves_nested_structure(self) -> None:
         manager = XLADeviceStateManager()
         first = object()

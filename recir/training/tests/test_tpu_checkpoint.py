@@ -172,6 +172,37 @@ def _run_dense_step_from_flat_state(
 
 
 class RecirCheckpointableTest(unittest.TestCase):
+    def test_restored_optimizer_slots_rebind_compiled_host_state(self) -> None:
+        model, optimizer = _new_dense_leg()
+        batch = torch.tensor([2.0, -1.0, 3.0, 0.5])
+        _run_dense_step(model, optimizer, batch)
+        flat_state, fqns = _optimizer_flat_state(model, optimizer)
+        buffers = _build_buffers(flat_state, fqns, model, [optimizer], prefixes=())
+        checkpointable = RecirCheckpointable(
+            model,
+            num_processes=1,
+            sharded_prefixes=(),
+            table_prefixes=(),
+            warmup=_Warmup(),
+            host_buffers=lambda: buffers,
+            dense_optimizer=optimizer,
+        )
+        saved = _clone_tree(checkpointable.state_dict())
+        expected = _run_dense_step_from_flat_state(
+            model, optimizer, flat_state, fqns, batch
+        )
+        checkpointable.load_state_dict(saved)
+        for key, value in optimizer.state[model.weight].items():
+            index = fqns.index(f"[1]['weight']['{key}']")
+            self.assertEqual(flat_state[index].data_ptr(), value.data_ptr())
+        actual = _run_dense_step_from_flat_state(
+            model, optimizer, flat_state, fqns, batch
+        )
+        for reference, resumed in zip(expected[:2], actual[:2]):
+            torch.testing.assert_close(resumed, reference)
+        for key in expected[2]:
+            torch.testing.assert_close(actual[2][key], expected[2][key])
+
     def test_async_snapshot_aliases_live_storage_instead_of_copying(self) -> None:
         wrapper = _Wrapper()
         checkpointable = RecirCheckpointable(

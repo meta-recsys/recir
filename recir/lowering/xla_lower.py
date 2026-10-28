@@ -1358,6 +1358,12 @@ class _XLAModule(torch.nn.Module):
         out_sharding_list = []
         for i in range(len(out_leaves)):
             leaf = out_leaves[i]
+            leaf_val = leaf.meta.get("val") if isinstance(leaf, torch.fx.Node) else leaf
+            if getattr(leaf_val, "ndim", None) == 0:
+                # Eager-boundary markers also carry scalar gradients. They
+                # have no batch axis and cannot use P(batch_axis_resource).
+                out_sharding_list.append(replicated)
+                continue
             if i in torch_indices:
                 out_sharding_list.append(batch_sharded)
                 continue

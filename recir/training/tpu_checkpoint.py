@@ -770,15 +770,20 @@ class RecirCheckpointable(Stateful):
             _load_optimizer_state_preserving_lr(
                 self._embedding_optimizer, embedding_opt_sd
             )
-        # DCP has written, and `Optimizer.load_state_dict` has had its chance to
-        # swap slot objects. Everything just written has to still be the buffer
-        # the graph reads, or the restore landed somewhere nothing looks.
         if self._host_buffers is not None:
-            self._host_buffers().check_payload(
-                body,
+            buffers = self._host_buffers()
+            buffers.build()
+            buffers.check_payload(
+                dict(self._wrapper.state_dict()),
                 [
-                    (self._dense_optimizer, opt_sd),
-                    (self._embedding_optimizer, embedding_opt_sd),
+                    (
+                        optimizer,
+                        optimizer.state_dict() if optimizer is not None else None,
+                    )
+                    for optimizer in (
+                        self._dense_optimizer,
+                        self._embedding_optimizer,
+                    )
                 ],
             )
         reseed_warmup(self._warmup, warmup_iter)
