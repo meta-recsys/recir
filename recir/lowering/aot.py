@@ -49,9 +49,8 @@ Usage:
 from __future__ import annotations
 
 import logging
-from typing import Any, Iterable, Iterator, List, Tuple
+from typing import Any, Iterable, Iterator, Tuple
 
-import torch
 import torch.fx as fx
 from jax.experimental import serialize_executable  # @manual
 from recir.lowering.xla_lower import _XLAModule
@@ -97,31 +96,6 @@ def _key(gm_name: str, sub_path: str) -> str:
     return f"{gm_name}::{sub_path}" if gm_name else sub_path
 
 
-def _synthesize_example_args(mod: _XLAModule) -> List[torch.Tensor]:
-    """Build dummy CPU tensors for each placeholder in ``mod.gm``.
-
-    ``segment_and_lower`` lifts every subgraph input as a placeholder
-    whose ``meta["val"]`` carries the FakeTensor produced during fx
-    tracing. Reading shape + dtype from there means the AOT path does
-    not need the caller to construct per-subgraph args (subgraph leaves
-    are flattened tensors, not the original ``params_dict`` / batch
-    tuple the user fed the parent ``gm``) and avoids running the parent
-    ``gm`` end-to-end just to reach the subgraph.
-    """
-    placeholders = [n for n in mod.gm.graph.nodes if n.op == "placeholder"]
-    out: List[torch.Tensor] = []
-    for p in placeholders:
-        val = p.meta.get("val", None)
-        if val is None:
-            raise RuntimeError(
-                f"placeholder {p.name!r} of subgraph has no meta['val']; "
-                "cannot synthesize an example tensor"
-            )
-        shape = tuple(int(s) for s in val.shape)
-        out.append(torch.zeros(shape, dtype=val.dtype, device="cpu"))
-    return out
-
-
 def aot_prebuild_and_serialize(
     gm: fx.GraphModule | IterGraphModule,
 ) -> dict[str, PrebuiltArtifact]:
@@ -129,20 +103,10 @@ def aot_prebuild_and_serialize(
 
     For each :class:`_XLAModule` reachable from ``gm``, this function:
 
-      1. Synthesizes dummy CPU tensors from each subgraph's placeholder
-         ``meta["val"]`` (see :func:`_synthesize_example_args`).
-      2. Invokes ``mod(*dummy)`` once. The lazy-build path inside
-         ``_build_*_executable`` materializes a ``jax.stages.Compiled``
-         and stashes it on ``mod._jax_compiled``.
-      3. Serializes ``mod._jax_compiled`` via
+      1. Calls ``mod.precompile()`` to build the executable from abstract
+         inputs without executing the graph or allocating input buffers.
+      2. Serializes ``mod._jax_compiled`` via
          ``jax.experimental.serialize_executable.serialize``.
-
-    The single-warmup-call pattern is the only correct way to drive
-    backend-build of ``_XLAModule``: two of the three backends
-    (SHARD_MAP-with-collectives and GSPMD) only finalize the executable
-    on first ``run`` invocation, so calling
-    ``_build_xla_executable`` in isolation does not capture the
-    artifact for those backends.
 
     Args:
         gm: Result of ``recir.compile(...)``. Either a bare
@@ -156,20 +120,17 @@ def aot_prebuild_and_serialize(
 
     Raises:
         RuntimeError: If any subgraph fails to populate ``_jax_compiled``
-            after a warmup call (typically a backend bug or missing
+            after precompilation (typically a backend bug or missing
             ``meta["val"]`` annotations on placeholders).
     """
     artifacts: dict[str, PrebuiltArtifact] = {}
     seen = 0
     for gm_name, sub_path, mod in _walk_recir_compiled(gm):
         seen += 1
-        dummy_args = _synthesize_example_args(mod)
-        # Single forward call drives the lazy-build path inside
-        # ``_build_*_executable`` and populates ``mod._jax_compiled``.
-        mod(*dummy_args)
+        mod.precompile()
         if mod._jax_compiled is None:
             raise RuntimeError(
-                f"AOT warmup did not populate _jax_compiled for "
+                f"AOT precompile did not populate _jax_compiled for "
                 f"{gm_name!r}/{sub_path!r}; backend={mod.backend_type.value}"
             )
         bin_, in_tree, out_tree = serialize_executable.serialize(mod._jax_compiled)
