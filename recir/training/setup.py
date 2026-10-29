@@ -124,6 +124,7 @@ def _build_lr_buffered_optimizer(
     cfg: OptimConfig,
     lr_buffer_name: str,
     device: torch.device,
+    grad_scale: float = 1.0,
 ) -> tuple[torch.optim.Optimizer, torch.Tensor]:
     """Register a non-persistent 0-d LR buffer on ``model`` and build a tensor-LR
     optimizer over ``params`` from ``cfg``. Shared by the dense-only (TPU) and
@@ -143,7 +144,7 @@ def _build_lr_buffered_optimizer(
         persistent=False,
     )
     lr_buffer = getattr(model, lr_buffer_name)
-    opt = build_torch_optimizer(params, cfg, lr_buffer)
+    opt = build_torch_optimizer(params, cfg, lr_buffer, grad_scale)
     return opt, lr_buffer
 
 
@@ -152,11 +153,14 @@ def build_sparse_lr_buffered_optimizer(
     params: List[torch.nn.Parameter],
     cfg: OptimConfig,
     device: torch.device,
+    grad_scale: float = 1.0,
 ) -> tuple[torch.optim.Optimizer, torch.Tensor]:
     """``_build_lr_buffered_optimizer`` under ``LR_SPARSE_BUFFER``: the
     optimizer of embedding tables that train inside the compiled step (e.g.
     the recir.embedding in_graph backend's ``sparse_optimizer_builder``)."""
-    return _build_lr_buffered_optimizer(model, params, cfg, LR_SPARSE_BUFFER, device)
+    return _build_lr_buffered_optimizer(
+        model, params, cfg, LR_SPARSE_BUFFER, device, grad_scale
+    )
 
 
 def setup_dense_optimizer_and_warmup(
