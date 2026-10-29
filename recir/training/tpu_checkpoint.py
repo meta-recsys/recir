@@ -24,7 +24,9 @@ from typing import Any, cast, Dict, Iterator, List, Sequence, Tuple
 
 import torch
 import torch.distributed as dist
+import torch.distributed.checkpoint as dcp
 import torch.utils._pytree as pytree
+from torch.distributed.checkpoint import FileSystemReader
 from torch.distributed.checkpoint.stateful import Stateful
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor, Shard
@@ -321,12 +323,40 @@ def _load_optimizer_state_preserving_lr(
 ) -> None:
     """Load optimizer state without replacing its graph-captured LR tensors."""
     live_lrs = [group.get("lr") for group in optimizer.param_groups]
+    live_scales = [group.get("grad_scale") for group in optimizer.param_groups]
     optimizer.load_state_dict(_unwrap_dtensors(state_dict))
     if len(live_lrs) != len(optimizer.param_groups):
         raise RuntimeError("optimizer param-group count changed while loading state")
-    for group, live_lr in zip(optimizer.param_groups, live_lrs):
+    for group, live_lr, live_scale in zip(
+        optimizer.param_groups, live_lrs, live_scales
+    ):
         if isinstance(live_lr, torch.Tensor):
             group["lr"] = live_lr
+        # The step already traced the live value in; a different saved one would be
+        # recorded but never applied.
+        if live_scale is not None and group.get("grad_scale") != live_scale:
+            raise RuntimeError(
+                f"checkpoint grad_scale={group.get('grad_scale')} but the optimizer "
+                f"was built with {live_scale}; build it with the checkpoint's value"
+            )
+
+
+def saved_embedding_grad_scale(checkpoint_dir: str) -> float | None:
+    """The embedding optimizer's ``grad_scale`` in a checkpoint saved through
+    :class:`RecirCheckpointable`, or None if the checkpoint predates the setting.
+
+    Reads that one entry, so a run can build its optimizer with the value before it
+    compiles; the full restore comes after.
+    """
+    reader = FileSystemReader(checkpoint_dir)
+    suffix = f"{EMBEDDING_OPTIMIZER_STATE_KEY}.param_groups.0.grad_scale"
+    keys = [k for k in reader.read_metadata().state_dict_metadata if k.endswith(suffix)]
+    if not keys:
+        return None
+    (key,) = keys
+    state: Dict[str, Any] = {key: 0.0}
+    dcp.load(state, storage_reader=reader)
+    return float(state[key])
 
 
 def _replace_tensor_impl(tensor: torch.Tensor, replacement: torch.Tensor) -> None:
@@ -621,6 +651,10 @@ class RecirCheckpointable(Stateful):
     ``RecirXLACompiledModule.prepare_for_restore()``, which the CheckpointManager
     calls before ``dcp.load`` builds the target dict from ``state_dict()``.
     """
+
+    # Keys ending in these suffixes may be absent from older checkpoints; a loader
+    # that honors this attribute keeps the run's own value for them.
+    optional_state_key_suffixes: Tuple[str, ...] = (".grad_scale",)
 
     def __init__(
         self,

@@ -175,9 +175,19 @@ class TensorLRRowWiseAdagrad(torch.optim.Optimizer):
     torchrec.optim.RowWiseAdagrad's per-row state shape ``(num_rows, 1)``.
 
     Update rule (2-D embedding weights):
+        grad = grad * grad_scale
         state['sum'] += (grad ** 2).mean(axis=1, keepdim=True)  # (rows, 1)
         std = state['sum'].sqrt() + eps                          # (rows, 1)
         param -= (grad / std) * lr_tensor                        # broadcast
+
+    ``grad_scale`` reproduces the updates of a trainer whose embedding gradient is a
+    multiple of the one computed here, e.g. a sum over N workers instead of their
+    mean (``grad_scale=N``). ``eps`` does not scale with the gradient, so the factor
+    cannot be folded into the learning rate. It is a param-group setting, so it is
+    saved with the optimizer and carries over to runs that resume the checkpoint; a
+    checkpoint saved without it keeps the constructor's value. The step bakes it into
+    the traced graph, so a restore must not change it: build the optimizer with the
+    value the checkpoint carries.
 
     Differences from torchrec.optim.RowWiseAdagrad: drops lr_decay, the step
     counter (avoids a host sync that would graph-break under make_fx), and
@@ -192,6 +202,7 @@ class TensorLRRowWiseAdagrad(torch.optim.Optimizer):
         lr_tensor: torch.Tensor,
         eps: float,
         weight_decay: float,
+        grad_scale: float = 1.0,
     ) -> None:
         assert lr_tensor.dim() == 0, (
             f"lr_tensor must be 0-d (got shape {tuple(lr_tensor.shape)})"
@@ -200,8 +211,14 @@ class TensorLRRowWiseAdagrad(torch.optim.Optimizer):
             "lr": lr_tensor,
             "eps": eps,
             "weight_decay": weight_decay,
+            "grad_scale": grad_scale,
         }
         super().__init__(params, defaults)
+
+    def __setstate__(self, state: Dict[str, Any]) -> None:
+        super().__setstate__(state)
+        for group in self.param_groups:
+            group.setdefault("grad_scale", self.defaults["grad_scale"])
 
     @torch.no_grad()
     def step(self, closure: Any = None) -> Any:
@@ -220,6 +237,8 @@ class TensorLRRowWiseAdagrad(torch.optim.Optimizer):
                         "non-embedding params through a per-element optimizer."
                     )
                 grad = p.grad
+                if group["grad_scale"] != 1.0:
+                    grad = grad * group["grad_scale"]
                 state = self.state[p]
                 if "sum" not in state:
                     # Per-row state: (num_rows, 1). Matches prod RowWiseAdagrad.
@@ -360,6 +379,7 @@ def build_torch_optimizer(
     params: List[torch.nn.Parameter],
     cfg: OptimConfig,
     lr_tensor: torch.Tensor,
+    grad_scale: float = 1.0,
 ) -> torch.optim.Optimizer:
     """Construct a torch.optim instance from MVAI's OptimConfig.
 
@@ -375,7 +395,15 @@ def build_torch_optimizer(
     Value-mode grad clipping (GradientClipping.VALUE + max_gradient) is honored
     for the Adam/AdamW branch. Other clipping modes and FBGEMM-only knobs are
     dropped.
+
+    ``grad_scale`` multiplies ROWWISE_ADAGRAD gradients (see
+    :class:`TensorLRRowWiseAdagrad`); the other optimizers take only 1.
     """
+    if grad_scale != 1.0 and cfg.optim_type != OptimType.ROWWISE_ADAGRAD:
+        raise ValueError(
+            f"grad_scale={grad_scale} is only implemented for ROWWISE_ADAGRAD, "
+            f"not {cfg.optim_type.name}"
+        )
     if cfg.optim_type == OptimType.SGD:
         raise NotImplementedError(
             "OptimType.SGD is not supported on the recir path: torch's SGD "
@@ -428,11 +456,13 @@ def build_torch_optimizer(
             "with per-row state shape (num_rows, 1) - prod-parity for sparse "
             "embeddings."
         )
+        logger.info("[recir optimizer] ROWWISE_ADAGRAD grad_scale=%g", grad_scale)
         opt = TensorLRRowWiseAdagrad(
             params,
             lr_tensor=lr_tensor,
             eps=cfg.eps,
             weight_decay=cfg.weight_decay,
+            grad_scale=grad_scale,
         )
         prime_optimizer_state(opt)
         return opt
