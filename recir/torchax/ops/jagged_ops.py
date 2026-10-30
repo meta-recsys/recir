@@ -282,6 +282,16 @@ def _jax_concat_2d_jagged(
 
     intra_offset = positions - pos_sample_start  # offset within the sample
     is_left = intra_offset < pos_left_len
+    left_source = pos_left_off + intra_offset
+    right_source = pos_right_off + (intra_offset - pos_left_len)
+    # The offsets can address more rows than an operand holds: split_2d_jagged's
+    # per-device shards have a fixed size and drop a device's excess rows, so as
+    # its backward this must output zero there, not a row of the other operand.
+    in_range = jnp.where(
+        is_left,
+        left_source < values_left.shape[0],
+        right_source < values_right.shape[0],
+    )
 
     # A shard may legitimately receive 0 rows, which contribute no index space.
     n_left = values_left.shape[0]
@@ -295,14 +305,10 @@ def _jax_concat_2d_jagged(
     if combined.shape[0] == 0:
         out = jnp.zeros((out_total,) + values_left.shape[1:], dtype=values_left.dtype)
     else:
-        source: Any = jnp.where(
-            is_left,
-            pos_left_off + intra_offset,
-            n_left + pos_right_off + (intra_offset - pos_left_len),
-        )
+        source: Any = jnp.where(is_left, left_source, n_left + right_source)
         out = combined[jnp.clip(source, 0, combined.shape[0] - 1)]
 
-    valid = positions < combined_offsets[batch_size]
+    valid = (positions < combined_offsets[batch_size]) & in_range
     # pyrefly: ignore [missing-attribute, no-matching-overload]
     return jnp.where(_bcast_mask(valid, out.ndim), out, 0)
 
