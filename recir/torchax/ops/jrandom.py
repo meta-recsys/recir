@@ -8,19 +8,21 @@
 """torchax JAX lowering of ``recir::bernoulli_keyed``."""
 
 import logging
-import math
 import os
 from typing import Any
 
 import jax
 import jax.numpy as jnp
-import numpy as np
 
 # Defines torch.ops.recir.bernoulli_keyed (schema + fallbacks) before registering.
 import recir.ops.random_op  # noqa: F401
 import torch
-from jax.sharding import Mesh, PartitionSpec as P
-from recir.torchax.gspmd_context import current_gspmd_mesh_context
+from jax.sharding import PartitionSpec as P
+from recir.torchax.gspmd_context import (
+    batch_mesh_layout,
+    batch_shard_index,
+    current_gspmd_mesh_context,
+)
 from recir.torchax.ops.decorators import op
 
 logger: logging.Logger = logging.getLogger(__name__)
@@ -30,17 +32,10 @@ def _hardware_bernoulli_mask(key: Any, shape: tuple[int, ...], p: Any) -> Any:
     """Generate per-chip RBG masks on the GSPMD leading batch axis."""
 
     context = current_gspmd_mesh_context()
+    mesh, resource, chips = batch_mesh_layout("dropout_chips")
     if context is not None:
-        mesh = context.mesh
-        resource = context.batch_axis_resource
-        axes = (resource,) if isinstance(resource, str) else tuple(resource)
-        chips = math.prod(int(mesh.shape[name]) for name in axes)
         axis = 0 if shape and shape[0] >= chips and shape[0] % chips == 0 else None
     else:
-        axes = ("dropout_chips",)
-        resource = axes[0]
-        chips = jax.device_count()
-        mesh = Mesh(np.asarray(jax.devices()), axes)
         axis = next(
             (i for i, n in enumerate(shape) if n >= chips and n % chips == 0), None
         )
@@ -59,9 +54,7 @@ def _hardware_bernoulli_mask(key: Any, shape: tuple[int, ...], p: Any) -> Any:
     spec = P(*(resource if i == axis else None for i in range(len(shape))))
 
     def per_chip(local_key: Any) -> Any:
-        chip_index = jnp.uint32(0)
-        for name in axes:
-            chip_index = chip_index * mesh.shape[name] + jax.lax.axis_index(name)
+        chip_index = batch_shard_index(mesh, resource)
         local_key = jax.random.fold_in(local_key, chip_index)
         return jax.random.bernoulli(local_key, probability, local_shape)
 
