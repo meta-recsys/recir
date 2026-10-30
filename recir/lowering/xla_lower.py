@@ -703,7 +703,16 @@ class _XLAModule(torch.nn.Module):
         jax_device: Any = local_devs[0] if local_devs else _get_global_devices()[0]
 
         def jax_fn(*jax_args: Any) -> Any:
-            return torchax.interop.call_torch(gm, *jax_args)
+            # Random ops rotate the environment's key in place, which under this
+            # trace stores a tracer. Left there, the next graph traced closes over
+            # it, JAX lifts that graph's constants to inputs, and its compiled
+            # call fails on the argument count.
+            prop = torchax.default_env().param
+            key = prop.prng
+            try:
+                return torchax.interop.call_torch(gm, *jax_args)
+            finally:
+                prop.prng = key
 
         if self.backend_type == BackendType.XLA_GSPMD:
             lowered, run = self._jit_gspmd(jax_fn, args, input_device)
