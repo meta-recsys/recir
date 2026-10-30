@@ -31,11 +31,13 @@ from __future__ import annotations
 
 import unittest
 
+import jax
 import jax.numpy as jnp
 import numpy as np
 from recir.ops.pallas.embeddings.ringshift import (
     _block_to_mod_ids,
     _bucketize_and_sort,
+    _count_destinations,
     _dedup_grads_by_id,
     _derive_offsets,
     _pad_per_peer,
@@ -48,6 +50,64 @@ from recir.ops.pallas.embeddings.ringshift import (
     _unpad_per_peer,
     ringshift_embedding_lookup_reference,
 )
+
+
+class SortPayloadTest(unittest.TestCase):
+    def test_carry_preserves_stable_order_and_duplicate_gradients(self) -> None:
+        ids = jnp.array([5, 5, 7, 12, 5, 0], dtype=jnp.int32)
+        grads = jnp.array([[1], [2], [3], [4], [5], [9]], dtype=jnp.float32)
+        rows, counts, perm, inverse = _bucketize_and_sort(ids, jnp.int32(5), 6, 4)
+        compact_rows, compact_grads, compact_counts = _dedup_grads_by_id(
+            ids, jnp.int32(5), grads, 6, 4
+        )
+        np.testing.assert_array_equal(rows, [3, 1, 1, 1, 1, 0])
+        np.testing.assert_array_equal(counts, [1, 3, 0, 1])
+        np.testing.assert_array_equal(perm, [3, 0, 1, 4, 2, 5])
+        np.testing.assert_array_equal(inverse, [1, 2, 4, 0, 3, 5])
+        np.testing.assert_array_equal(compact_rows, [3, 1, 1, 0, 0, 0])
+        np.testing.assert_array_equal(compact_grads, [[4], [8], [3], [0], [0], [0]])
+        np.testing.assert_array_equal(compact_counts, [1, 1, 0, 1])
+
+    def test_carry_preserves_unsigned_ids_above_signed_range(self) -> None:
+        ids = jnp.array([2**31 + 5, 2**31 + 5, 3_000_000_000, 0], dtype=jnp.uint32)
+        grads = jnp.array([[1], [2], [4], [999]], dtype=jnp.float32)
+        rows, counts, perm, inverse = _bucketize_and_sort(ids, jnp.int32(3), 4, 128)
+        compact_rows, compact_grads, compact_counts = _dedup_grads_by_id(
+            ids, jnp.int32(3), grads, 4, 128
+        )
+        np.testing.assert_array_equal(rows, [23_437_500, 16_777_216, 16_777_216, 0])
+        np.testing.assert_array_equal(perm, [2, 0, 1, 3])
+        np.testing.assert_array_equal(inverse, [1, 2, 0, 3])
+        expected_counts = np.zeros(128, dtype=np.int32)
+        expected_counts[0], expected_counts[5] = 1, 2
+        np.testing.assert_array_equal(counts, expected_counts)
+        expected_counts[5] = 1
+        np.testing.assert_array_equal(compact_counts, expected_counts)
+        np.testing.assert_array_equal(compact_rows, [23_437_500, 16_777_216, 0, 0])
+        np.testing.assert_array_equal(compact_grads, [[4], [3], [0], [0]])
+
+
+class CountDestinationsTest(unittest.TestCase):
+    def test_reduce_counts_match_numpy_with_padding_and_hot_peers(self) -> None:
+        rng = np.random.default_rng(17)
+        for world_size in (1, 4, 128):
+            for size in (0, 1, 17, 1024, 1025):
+                inputs = (
+                    rng.integers(0, world_size + 1, size=size, dtype=np.int32),
+                    np.full(size, world_size, dtype=np.int32),
+                    np.zeros(size, dtype=np.int32),
+                )
+                for dest in inputs:
+                    with self.subTest(world_size=world_size, size=size):
+                        expected = np.bincount(dest, minlength=world_size + 1)[
+                            :world_size
+                        ]
+                        count = jax.jit(
+                            lambda values, peers=world_size: _count_destinations(
+                                values, peers
+                            )
+                        )(jnp.asarray(dest))
+                        np.testing.assert_array_equal(np.asarray(count), expected)
 
 
 class RingDeviceIdTest(unittest.TestCase):
