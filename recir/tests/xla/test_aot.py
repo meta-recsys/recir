@@ -34,6 +34,7 @@ if "xla_force_host_platform_device_count" not in _existing_xla_flags:
 
 import pickle
 import unittest
+from unittest.mock import patch
 
 import jax  # @manual
 import torch
@@ -59,8 +60,10 @@ class _TinyMLP(nn.Module):
         return self.net(x)
 
 
-def _make_lowered_gm() -> torch.fx.GraphModule:
-    """Trace _TinyMLP and dispatch into XLA subgraphs (SHARD_MAP backend)."""
+def _make_lowered_gm(
+    backend_type: BackendType = BackendType.XLA_SHARD_MAP,
+) -> torch.fx.GraphModule:
+    """Trace _TinyMLP and dispatch into XLA subgraphs."""
     torch.manual_seed(0)
     model = _TinyMLP()
     x = torch.randn(2, 8)
@@ -70,7 +73,7 @@ def _make_lowered_gm() -> torch.fx.GraphModule:
 
     params = dict(model.named_parameters())
     gm = make_fx(fn)(params, x)
-    return partial_lower_xla(gm, backend_type=BackendType.XLA_SHARD_MAP)
+    return partial_lower_xla(gm, backend_type=backend_type)
 
 
 def _xla_modules(gm) -> list[_XLAModule]:
@@ -92,6 +95,33 @@ class AOTPrebuildAndSerializeTest(unittest.TestCase):
     ``mod._jax_compiled``, then serializes each compiled binary via
     ``jax.experimental.serialize_executable.serialize``. Pin the walk + the
     happy-path artifact-dict contract here."""
+
+    def test_prebuild_never_executes_on_a_live_mesh(self) -> None:
+        for backend, collectives in (
+            (BackendType.XLA_SHARD_MAP, False),
+            (BackendType.XLA_SHARD_MAP, True),
+            (BackendType.XLA_GSPMD, False),
+        ):
+            with self.subTest(backend=backend, collectives=collectives):
+                lowered = _make_lowered_gm(backend)
+                with (
+                    patch.object(
+                        _XLAModule, "_has_collective_ops", return_value=collectives
+                    ),
+                    patch.object(
+                        _XLAModule,
+                        "_postprocess_jax_output",
+                        side_effect=AssertionError("Prebuild executed the graph"),
+                    ),
+                ):
+                    artifacts = aot_prebuild_and_serialize(lowered)
+                    modules = _xla_modules(lowered)
+                    executables = [mod._jax_compiled for mod in modules]
+                    repeated = aot_prebuild_and_serialize(lowered)
+                self.assertGreater(len(artifacts), 0)
+                self.assertEqual(set(artifacts), set(repeated))
+                for mod, executable in zip(modules, executables):
+                    self.assertIs(mod._jax_compiled, executable)
 
     def test_serializes_every_xla_module_in_plain_gm(self) -> None:
         lowered = _make_lowered_gm()
@@ -151,11 +181,6 @@ class AOTRoundTripTest(unittest.TestCase):
         return dict(model.named_parameters()), x
 
     def test_serialize_then_pickle_load_matches_eager_output(self) -> None:
-        # End-to-end serialize -> pickle -> load: ``_build_*_executable``
-        # populates ``_jax_compiled`` during the warmup forward, so
-        # serialize returns a non-empty artifact dict, pickle round-trips
-        # it as opaque bytes, and ``aot_load_prebuilt_into`` installs
-        # each compiled executable on a fresh target gm.
         aot_src = _make_lowered_gm()
         artifacts = aot_prebuild_and_serialize(aot_src)
         self.assertGreater(len(artifacts), 0)
@@ -171,12 +196,18 @@ class AOTRoundTripTest(unittest.TestCase):
         for mod in _xla_modules(target):
             self.assertIsNone(mod._jax_compiled)
 
-        n_loaded = aot_load_prebuilt_into(target, artifacts_roundtrip)
+        n_loaded = aot_load_prebuilt_into(
+            target, artifacts_roundtrip, execution_devices=[jax.devices()[0]]
+        )
         self.assertEqual(n_loaded, len(artifacts_roundtrip))
         # Post-load: every ``_XLAModule`` on the target has the
         # deserialized executable installed.
         for mod in _xla_modules(target):
             self.assertIsNotNone(mod._jax_compiled)
+        params, x = self._params_and_input()
+        expected = torch.func.functional_call(_TinyMLP(), params, (x,))
+        actual = target(params, x)
+        torch.testing.assert_close(actual, expected)
 
 
 class AOTStrictModeTest(unittest.TestCase):
@@ -202,26 +233,16 @@ class AOTStrictModeTest(unittest.TestCase):
             self.assertIsNone(mod._jax_compiled)
 
 
-class WarmupBuildPopulatesCacheTest(unittest.TestCase):
-    """Pin the populate contract at this commit: the AOT slot
-    ``_jax_compiled`` is initialized to ``None`` on every fresh
-    ``_XLAModule``, and the warmup forward inside
-    ``aot_prebuild_and_serialize`` (driven through
-    ``_build_*_executable``) materializes a ``jax.stages.Compiled``
-    and stashes it on every visited subgraph."""
+class PrecompileBuildPopulatesCacheTest(unittest.TestCase):
+    """Precompilation populates the executable cache on every subgraph."""
 
-    def test_warmup_populates_jax_compiled(self) -> None:
+    def test_precompile_populates_jax_compiled(self) -> None:
         lowered = _make_lowered_gm()
-        # Pre-warmup invariant: every _XLAModule's AOT slot starts unset.
         modules = _xla_modules(lowered)
         self.assertGreater(len(modules), 0)
         for mod in modules:
             self.assertIsNone(mod._jax_compiled)
 
-        # The warmup forward populates ``_jax_compiled`` on every
-        # subgraph, so serialize returns one artifact per subgraph and
-        # leaves every ``_jax_compiled`` slot set to a non-None
-        # ``jax.stages.Compiled``.
         artifacts = aot_prebuild_and_serialize(lowered)
         self.assertEqual(len(artifacts), len(modules))
         for mod in modules:
