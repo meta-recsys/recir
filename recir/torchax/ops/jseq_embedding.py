@@ -44,7 +44,7 @@ from recir.ops.pallas.embeddings import (
     ringshift_embedding_lookup_block_local,
 )
 from recir.ops.pallas.embeddings.ringshift import fan_out_pooled_grad
-from recir.torchax.gspmd_context import current_gspmd_mesh_context
+from recir.torchax.gspmd_context import batch_mesh_layout, current_gspmd_mesh_context
 from recir.torchax.ops.decorators import op
 
 _AXIS = "torch_dist"
@@ -81,14 +81,15 @@ def _ringshift_mesh_layout() -> Tuple[Any, Any, int, bool]:
     """Return the concrete mesh and resources visible to the active JAX trace."""
     gspmd_context = current_gspmd_mesh_context()
     if gspmd_context is not None:
+        mesh, batch_resource, _ = batch_mesh_layout()
         if gspmd_context.hybrid_fsdp:
             _validate_host_local_fsdp_groups(
                 gspmd_context.mesh.devices,
                 gspmd_context.fsdp_axis_size,
             )
         return (
-            gspmd_context.mesh,
-            gspmd_context.batch_axis_resource,
+            mesh,
+            batch_resource,
             gspmd_context.fsdp_axis_size,
             gspmd_context.hybrid_fsdp,
         )
