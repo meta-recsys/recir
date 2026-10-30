@@ -212,6 +212,25 @@ def _ring_device_id(axis_name: str, rank: Any) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
+def _count_destinations(dest: jax.Array, world_size: int) -> jax.Array:
+    """Count valid peers; the sentinel ``world_size`` is excluded.
+
+    Tiled reductions replace scatter updates into a small histogram.
+    Tile the comparisons so the intermediate histogram has only one row per
+    1024 ids. Integer counts, including empty and padding-only inputs, match
+    bincount exactly.
+    """
+    tile = 1024
+    padded = jnp.pad(
+        dest, (0, (-dest.shape[0]) % tile), constant_values=world_size
+    ).reshape((-1, tile))
+    peers = jnp.arange(world_size, dtype=jnp.int32)
+    per_tile = jnp.sum(
+        padded[:, :, None] == peers[None, None, :], axis=1, dtype=jnp.int32
+    )
+    return jnp.sum(per_tile, axis=0, dtype=jnp.int32)
+
+
 def _bucketize_and_sort(
     looked_up_ids: jax.Array,
     looked_up_id_count: jax.Array,
@@ -243,15 +262,14 @@ def _bucketize_and_sort(
     # bincount with length=world_size+1 keeps invalid IDs out of send_counts.
     dest_rank = jnp.where(is_valid, raw_dest, world_size).astype(jnp.int32)
 
-    # Stable sort so equal-destination IDs preserve their original order.
-    sort_perm = jnp.argsort(dest_rank, stable=True).astype(jnp.int32)
+    # Carry rows and positions through a stable sort to avoid gathering IDs.
+    local_row = (looked_up_ids // world_size).astype(jnp.int32)
+    _, sorted_local_row, sort_perm = jax.lax.sort(
+        (dest_rank, local_row, position), is_stable=True, num_keys=1
+    )
     reverse_perm = jnp.argsort(sort_perm, stable=True).astype(jnp.int32)
 
-    sorted_ids = looked_up_ids[sort_perm]
-    sorted_local_row = (sorted_ids // world_size).astype(jnp.int32)
-
-    bins = jnp.bincount(dest_rank, length=world_size + 1)
-    send_counts = bins[:world_size].astype(jnp.int32)
+    send_counts = _count_destinations(dest_rank, world_size)
 
     return sorted_local_row, send_counts, sort_perm, reverse_perm
 
@@ -309,10 +327,11 @@ def _dedup_grads_by_id(
     dest = jnp.where(is_valid, looked_up_ids % world_size, world_size).astype(jnp.int32)
 
     # --- Step 2: sort by (dest, id) so identical ids sit next to each other ---
-    # (primary key = dest, secondary key = id; lexsort's LAST arg is primary).
-    order = jnp.lexsort((looked_up_ids, dest)).astype(jnp.int32)
-    sorted_ids = looked_up_ids[order]
-    sorted_valid = is_valid[order]
+    # Carry positions alongside the two keys so IDs need no subsequent gather.
+    _, sorted_ids, order = jax.lax.sort(
+        (dest, looked_up_ids, position), is_stable=True, num_keys=2
+    )
+    sorted_valid = order < looked_up_id_count
     # dest and row are elementwise in looked_up_ids, so they commute with the
     # permutation and cost an op here instead of a gather each.
     sorted_dest = jnp.where(sorted_valid, sorted_ids % world_size, world_size).astype(
@@ -352,9 +371,7 @@ def _dedup_grads_by_id(
         jnp.zeros((max_local_ids,), jnp.int32).at[dst].set(sorted_row, mode="drop")
     )
     rep_dest = jnp.where(is_group_start, sorted_dest, world_size)
-    send_counts = jnp.bincount(rep_dest, length=world_size + 1)[:world_size].astype(
-        jnp.int32
-    )
+    send_counts = _count_destinations(rep_dest, world_size)
     return compact_row, compact_grad, send_counts
 
 
