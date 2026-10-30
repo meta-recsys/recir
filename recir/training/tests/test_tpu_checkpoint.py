@@ -18,6 +18,7 @@ import torch.distributed.checkpoint as dcp
 import torch.utils._pytree as pytree
 from recir.compiler.process_state import _compute_state_fqns
 from recir.distributed.data_parallel import DataParallelStyle, shard_params_and_states
+from recir.training.optim import TensorLRRowWiseAdagrad
 from recir.training.tpu_checkpoint import (
     EMBEDDING_OPTIMIZER_STATE_KEY,
     host_ordinal_from_device_positions,
@@ -25,6 +26,7 @@ from recir.training.tpu_checkpoint import (
     logical_replay_rank,
     OPTIMIZER_STATE_KEY,
     RecirCheckpointable,
+    saved_embedding_grad_scale,
     shard_mesh_order,
     wrap_sharded_for_save,
 )
@@ -416,6 +418,46 @@ class RecirCheckpointableTest(unittest.TestCase):
         )
         self.assertIs(dense_optimizer.param_groups[0]["lr"], live_dense_lr)
         self.assertIs(embedding_optimizer.param_groups[0]["lr"], live_embedding_lr)
+
+    def _embedding_checkpointable(
+        self, grad_scale: float
+    ) -> tuple[RecirCheckpointable, TensorLRRowWiseAdagrad]:
+        wrapper = _ShardedTableWrapper(4, 2, meta=False)
+        optimizer = TensorLRRowWiseAdagrad(
+            [wrapper._sharded_tables["table"]],
+            lr_tensor=torch.tensor(0.02),
+            eps=1.0e-3,
+            weight_decay=0.0,
+            grad_scale=grad_scale,
+        )
+        checkpointable = RecirCheckpointable(
+            wrapper,
+            num_processes=1,
+            sharded_prefixes=("_sharded_tables",),
+            table_prefixes=("_sharded_tables",),
+            warmup=_Warmup(),
+            embedding_optimizer=optimizer,
+        )
+        return checkpointable, optimizer
+
+    def test_restore_refuses_a_grad_scale_the_step_was_not_built_with(self) -> None:
+        saved, _ = self._embedding_checkpointable(grad_scale=32.0)
+        state = cast(Dict[str, Any], _clone_tree(saved.state_dict()))
+        restored, _ = self._embedding_checkpointable(grad_scale=1.0)
+
+        with self.assertRaisesRegex(RuntimeError, "grad_scale=32.0"):
+            restored.load_state_dict(state)
+
+    def test_saved_grad_scale_is_read_before_the_restore(self) -> None:
+        checkpointable, _ = self._embedding_checkpointable(grad_scale=32.0)
+        with tempfile.TemporaryDirectory() as new, tempfile.TemporaryDirectory() as old:
+            dcp.save({"model": checkpointable}, storage_writer=FileSystemWriter(new))
+            dcp.save(
+                {"model": {"w": torch.ones(2)}}, storage_writer=FileSystemWriter(old)
+            )
+
+            self.assertEqual(32.0, saved_embedding_grad_scale(new))
+            self.assertIsNone(saved_embedding_grad_scale(old))
 
 
 class ShardedTableRestoreBindingTest(unittest.TestCase):
