@@ -654,7 +654,12 @@ class RecirCheckpointable(Stateful):
 
     # Keys ending in these suffixes may be absent from older checkpoints; a loader
     # that honors this attribute keeps the run's own value for them.
-    optional_state_key_suffixes: Tuple[str, ...] = (".grad_scale",)
+    optional_state_key_suffixes: Tuple[str, ...] = (
+        ".grad_scale",
+        ".rounding_seed",
+        ".rounding_counter",
+        ".stochastic_rounding",
+    )
 
     def __init__(
         self,
