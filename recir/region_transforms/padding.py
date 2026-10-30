@@ -787,8 +787,9 @@ class JaggedPairConfig:
             that links this pair's batch to the main batch.  Required when
             ``batch_size_arg`` is set: ``PaddingRegionTransform`` uses it to
             pad the count so ``sum(count) == padded_pair_bs``.
-        max_per_sample_count: Upper bound on each entry of ``count_arg``
-            (e.g. the maximum number of candidates per sample).  When set,
+        max_per_sample_count: Candidate padding capacity allocated per main
+            batch item. Individual real counts may exceed this average when
+            the per-chip total fits. When set,
             ``_discover`` derives ``pair_bs = main_batch_size * max_per_sample_count``
             instead of reading the (possibly jagged) trace-time tensor shape.
             Required when ``batch_size_arg`` / ``count_arg`` are set so the

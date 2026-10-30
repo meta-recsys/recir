@@ -13,6 +13,7 @@ This keeps activations batch-sharded and avoids the large replicated buffer OOM 
 on TPU/GSPMD.
 """
 
+import os
 from typing import Any, List, Optional
 
 import jax
@@ -52,7 +53,15 @@ def _jax_jagged_to_padded_dense_impl(
     mask = col[None, :] < lengths[:, None]
     flat_idx = (starts[:, None] + col[None, :]).clip(0, max(values.shape[0] - 1, 0))
     if values.ndim == 1:
-        gathered = values[flat_idx.reshape(-1)].reshape(b, max_len)
+        packed = os.environ.get("RECIR_PACKED_JAGGED_INT64", "0")
+        if packed not in ("0", "1"):
+            raise ValueError(f"invalid RECIR_PACKED_JAGGED_INT64: {packed!r}")
+        if packed == "1" and values.dtype in (jnp.int64, jnp.uint64):
+            bits = jax.lax.bitcast_convert_type(values, jnp.uint32)
+            gathered_bits = bits[flat_idx.reshape(-1), :].reshape(b, max_len, 2)
+            gathered = jax.lax.bitcast_convert_type(gathered_bits, values.dtype)
+        else:
+            gathered = values[flat_idx.reshape(-1)].reshape(b, max_len)
         return jnp.where(mask, gathered, jnp.asarray(padding_value, dtype=values.dtype))
     gathered = values[flat_idx.reshape(-1)].reshape(b, max_len, values.shape[-1])
     return jnp.where(
@@ -356,14 +365,32 @@ def _recir_concat_2d_jagged(
     offsets_left: Any,
     values_right: Any,
     offsets_right: Any,
+    output_size: int | None = None,
 ) -> Any:
     """recir::concat_2d_jagged lowering: per-sample interleave inside shard_map."""
-    out_total = values_left.shape[0] + values_right.shape[0]  # static
+    resolved_output_size: int = (
+        values_left.shape[0] + values_right.shape[0]
+        if output_size is None
+        else output_size
+    )
+    return _recir_concat_2d_jagged_with_output_size(
+        values_left, offsets_left, values_right, offsets_right, resolved_output_size
+    )
+
+
+def _recir_concat_2d_jagged_with_output_size(
+    values_left: Any,
+    offsets_left: Any,
+    values_right: Any,
+    offsets_right: Any,
+    output_size: int,
+) -> Any:
+    """Lower concat with independent physical input and output capacities."""
 
     world_size = len(jax.devices())
     if world_size <= 1:
         return _jax_concat_2d_jagged(
-            values_left, offsets_left, values_right, offsets_right, out_total
+            values_left, offsets_left, values_right, offsets_right, output_size
         )
 
     lengths_left = offsets_left[1:] - offsets_left[:-1]
@@ -374,7 +401,10 @@ def _recir_concat_2d_jagged(
         f"concat totals ({total_left},{total_right}) must be divisible by "
         f"world_size={world_size}"
     )
-    local_out = (total_left + total_right) // world_size
+    assert output_size % world_size == 0, (
+        f"concat output size {output_size} must be divisible by world_size={world_size}"
+    )
+    local_out = output_size // world_size
     mesh = Mesh(jax.devices(), (_DP_AXIS,))
 
     def _per_device(

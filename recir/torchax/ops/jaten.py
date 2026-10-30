@@ -23,6 +23,7 @@
 
 import functools
 import math
+import os
 import sys
 from collections.abc import Sequence
 from typing import Any, Callable
@@ -336,7 +337,14 @@ def _searchsorted(
         v = values[..., None]
         cmp = a < v if side == "left" else a <= v
         return cmp.sum(axis=-1).astype(jnp.int32)
-    return jnp.searchsorted(sorted_sequence, values, side=side, sorter=sorter)
+    # Keep the default algorithm; experiments can unroll the scan without
+    # changing query sharding or use JAX's accelerator sort implementation.
+    method = os.environ.get("RECIR_SEARCHSORTED_METHOD", "scan")
+    if method not in ("scan", "scan_unrolled", "sort"):
+        raise ValueError(f"invalid RECIR_SEARCHSORTED_METHOD: {method!r}")
+    return jnp.searchsorted(
+        sorted_sequence, values, side=side, sorter=sorter, method=method
+    )
 
 
 @op(torch.ops.aten.searchsorted.Tensor)  # pyre-ignore[56]
@@ -935,6 +943,16 @@ def _aten_index_put(
 def _aten_index(self: Any, indexes: Any) -> Any:
     indexes = [slice(None, None, None) if i is None else i for i in indexes]
     indexes = tuple(indexes)
+    packed = os.environ.get("RECIR_PACKED_INT64_INDEX", "0")
+    if packed not in ("0", "1"):
+        raise ValueError(f"invalid RECIR_PACKED_INT64_INDEX: {packed!r}")
+    if packed == "1" and self.dtype in (jnp.int64, jnp.uint64):
+        # Gather the two exact 32-bit lanes together instead of two scalar
+        # gathers produced by TPU's int64 emulation. Leave batch axes intact.
+        bits = jax.lax.bitcast_convert_type(self, jnp.uint32)
+        full_indexes = indexes + (slice(None),) * (self.ndim - len(indexes))
+        selected = bits[full_indexes + (slice(None),)]
+        return jax.lax.bitcast_convert_type(selected, self.dtype)
     return self[indexes]
 
 
