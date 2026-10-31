@@ -908,9 +908,19 @@ def _aten__embedding_bag(
         embedded = embedded * per_sample_weights[:, None]
 
     if mode == 0:  # sum
-        output = jax.ops.segment_sum(embedded, segment_ids, num_segments=num_bags)
+        output = jax.ops.segment_sum(
+            embedded,
+            segment_ids,
+            num_segments=num_bags,
+            indices_are_sorted=True,
+        )
     elif mode == 1:  # mean
-        output = jax.ops.segment_sum(embedded, segment_ids, num_segments=num_bags)
+        output = jax.ops.segment_sum(
+            embedded,
+            segment_ids,
+            num_segments=num_bags,
+            indices_are_sorted=True,
+        )
         safe_sizes = jnp.maximum(bag_size, 1).astype(embedded.dtype)
         output = output / safe_sizes[:, None]
     elif mode == 2:  # max
