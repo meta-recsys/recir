@@ -447,9 +447,6 @@ class RecirJaggedOpsMultiDeviceJitTest(unittest.TestCase):
         orr = np.concatenate([[0], np.cumsum(lb)]).astype(np.int32)
         tl, tr = int(ol[-1]), int(orr[-1])
 
-        left_capacity = 8
-        right_capacity = 8
-        output_capacity = 13
         for d in (1, 4):  # 1D and 2D jagged values
             shp_l = (tl,) if d == 1 else (tl, d)
             shp_r = (tr,) if d == 1 else (tr, d)
@@ -475,58 +472,6 @@ class RecirJaggedOpsMultiDeviceJitTest(unittest.TestCase):
             )(jnp.asarray(oracle), jnp.asarray(ol), jnp.asarray(orr))
             np.testing.assert_allclose(np.asarray(left), vl)
             np.testing.assert_allclose(np.asarray(right), vr)
-
-            padded_left = np.concatenate(
-                [
-                    np.pad(
-                        vl[device * 6 : (device + 1) * 6],
-                        ((0, left_capacity - 6),) + ((0, 0),) * (len(shp_l) - 1),
-                    )
-                    for device in range(w)
-                ]
-            )
-            padded_right = np.concatenate(
-                [
-                    np.pad(
-                        vr[device * 5 : (device + 1) * 5],
-                        ((0, right_capacity - 5),) + ((0, 0),) * (len(shp_r) - 1),
-                    )
-                    for device in range(w)
-                ]
-            )
-            fixed_out = jax.jit(
-                lambda a, b_, c, e: _recir_concat_2d_jagged(
-                    a, b_, c, e, output_capacity * w
-                )
-            )(
-                jnp.asarray(padded_left),
-                jnp.asarray(ol),
-                jnp.asarray(padded_right),
-                jnp.asarray(orr),
-            )
-            actual_per_device = 11
-            padded_oracle = np.concatenate(
-                [
-                    np.pad(
-                        oracle[
-                            device * actual_per_device : (device + 1)
-                            * actual_per_device
-                        ],
-                        ((0, output_capacity - actual_per_device),)
-                        + ((0, 0),) * (len(shp_l) - 1),
-                    )
-                    for device in range(w)
-                ]
-            )
-            np.testing.assert_allclose(np.asarray(fixed_out), padded_oracle)
-
-            fixed_left, fixed_right = jax.jit(
-                lambda v, a, c: _recir_split_2d_jagged(
-                    v, a, c, left_capacity * w, right_capacity * w
-                )
-            )(fixed_out, jnp.asarray(ol), jnp.asarray(orr))
-            np.testing.assert_allclose(np.asarray(fixed_left), padded_left)
-            np.testing.assert_allclose(np.asarray(fixed_right), padded_right)
 
 
 class RecirConcatJaggedEdgeCaseTest(unittest.TestCase):

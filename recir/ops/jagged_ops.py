@@ -123,7 +123,7 @@ _JAGGED_TO_PADDED_DENSE_SCHEMA = "jagged_to_padded_dense(Tensor values, Tensor[]
 # Schema for concat_2d_jagged: (values_left, offsets_left, values_right, offsets_right) -> Tensor
 # Concatenates two jagged tensors along the sequence dimension. The backward is
 # split_2d_jagged (registered via register_autograd), so no separate backward op.
-_CONCAT_2D_JAGGED_SCHEMA = "concat_2d_jagged(Tensor values_left, Tensor offsets_left, Tensor values_right, Tensor offsets_right, SymInt? output_size=None) -> Tensor"
+_CONCAT_2D_JAGGED_SCHEMA = "concat_2d_jagged(Tensor values_left, Tensor offsets_left, Tensor values_right, Tensor offsets_right) -> Tensor"
 
 # Schema for split_2d_jagged: (values, offsets_left, offsets_right) -> (Tensor, Tensor)
 # Splits a jagged tensor into left and right parts. The backward is
@@ -214,56 +214,40 @@ def _jagged_to_padded_dense_fake(
     return out
 
 
-def _concat_2d_jagged_with_output_size_cpu(
+def _concat_2d_jagged_cpu(
     values_left: torch.Tensor,
     offsets_left: torch.Tensor,
     values_right: torch.Tensor,
     offsets_right: torch.Tensor,
-    output_size: int,
 ) -> torch.Tensor:
     """CPU fallback: per-sample interleave concat via searchsorted+index_select.
 
     Self-contained to avoid a dependency cycle with dispatchers that route
     into this op.
     """
+    # A globally-empty side has nothing to interleave; the combined jagged is
+    # just the other side (per-sample order is preserved by the offset sums).
+    # Without this, the empty side's index_select clamps to [0, -1] and throws.
+    if values_left.shape[0] == 0:
+        return values_right
+    if values_right.shape[0] == 0:
+        return values_left
     n = offsets_left.shape[0] - 1
     la = offsets_left[1:] - offsets_left[:-1]
     comb = offsets_left + offsets_right  # cumulative combined offsets
-    p = torch.arange(output_size, device=values_left.device)
+    total = values_left.shape[0] + values_right.shape[0]
+    p = torch.arange(total, device=values_left.device)
     b = torch.clamp(torch.searchsorted(comb[1:], p, right=True), 0, n - 1)
     intra = p - comb[b]
     is_left = intra < la[b]
-    valid = p < comb[-1]
-    safe_left = torch.cat(
-        [values_left, values_left.new_zeros((1,) + values_left.shape[1:])], dim=0
+    src_left = torch.clamp(offsets_left[b] + intra, 0, values_left.shape[0] - 1)
+    src_right = torch.clamp(
+        offsets_right[b] + (intra - la[b]), 0, values_right.shape[0] - 1
     )
-    safe_right = torch.cat(
-        [values_right, values_right.new_zeros((1,) + values_right.shape[1:])],
-        dim=0,
-    )
-    src_left = offsets_left[b] + intra
-    src_right = offsets_right[b] + intra - la[b]
-    src_left = torch.where(valid & is_left, src_left, values_left.shape[0])
-    src_right = torch.where(valid & ~is_left, src_right, values_right.shape[0])
-    return safe_left.index_select(0, src_left) + safe_right.index_select(0, src_right)
-
-
-def _concat_2d_jagged_cpu(
-    values_left: torch.Tensor,
-    offsets_left: torch.Tensor,
-    values_right: torch.Tensor,
-    offsets_right: torch.Tensor,
-    output_size: Optional[int] = None,
-) -> torch.Tensor:
-    if output_size is None:
-        output_size = values_left.shape[0] + values_right.shape[0]
-    return _concat_2d_jagged_with_output_size_cpu(
-        values_left,
-        offsets_left,
-        values_right,
-        offsets_right,
-        output_size,
-    )
+    gl = values_left.index_select(0, src_left)
+    gr = values_right.index_select(0, src_right)
+    mask = is_left if values_left.dim() == 1 else is_left.unsqueeze(-1)
+    return torch.where(mask, gl, gr)
 
 
 def _split_2d_jagged_cpu(
@@ -279,18 +263,16 @@ def _split_2d_jagged_cpu(
     into this op.
     """
     n = offsets_left.shape[0] - 1
-    safe_values = torch.cat([values, values.new_zeros((1,) + values.shape[1:])], dim=0)
-    zero_index = values.shape[0]
     pa = torch.arange(seq_len_a, device=values.device)
-    valid_left = pa < offsets_left[-1]
     ba = torch.clamp(torch.searchsorted(offsets_left[1:], pa, right=True), 0, n - 1)
-    left_index = torch.where(valid_left, pa + offsets_right[ba], zero_index)
-    left = safe_values.index_select(0, left_index)
+    left = values.index_select(
+        0, torch.clamp(pa + offsets_right[ba], 0, values.shape[0] - 1)
+    )
     pb = torch.arange(seq_len_b, device=values.device)
-    valid_right = pb < offsets_right[-1]
     bb = torch.clamp(torch.searchsorted(offsets_right[1:], pb, right=True), 0, n - 1)
-    right_index = torch.where(valid_right, pb + offsets_left[bb + 1], zero_index)
-    right = safe_values.index_select(0, right_index)
+    right = values.index_select(
+        0, torch.clamp(pb + offsets_left[bb + 1], 0, values.shape[0] - 1)
+    )
     return left, right
 
 
@@ -306,14 +288,10 @@ def _concat_2d_jagged_fake(
     offsets_left: torch.Tensor,
     values_right: torch.Tensor,
     offsets_right: torch.Tensor,
-    output_size: Optional[int] = None,
 ) -> torch.Tensor:
     """Fake tensor implementation for concat."""
-    total_L = (
-        values_left.shape[0] + values_right.shape[0]
-        if output_size is None
-        else output_size
-    )
+    # Output size is sum of input sizes
+    total_L = values_left.shape[0] + values_right.shape[0]
     if values_left.dim() == 1:
         out_shape = (total_L,)
     else:
@@ -347,12 +325,10 @@ def _split_2d_jagged_fake(
 # Autograd for concat/split (they are duals)
 def _concat_2d_jagged_autograd_setup_context(
     ctx: Any,
-    inputs: tuple[
-        torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Optional[int]
-    ],
+    inputs: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
     output: torch.Tensor,
 ) -> None:
-    values_left, offsets_left, values_right, offsets_right, output_size = inputs
+    values_left, offsets_left, values_right, offsets_right = inputs
     ctx.save_for_backward(offsets_left, offsets_right)
     ctx.left_shape = values_left.shape
     ctx.right_shape = values_right.shape
@@ -361,7 +337,7 @@ def _concat_2d_jagged_autograd_setup_context(
 def _concat_2d_jagged_autograd_backward(
     ctx: Any,
     grad_output: torch.Tensor,
-) -> tuple[torch.Tensor, None, torch.Tensor, None, None]:
+) -> tuple[torch.Tensor, None, torch.Tensor, None]:
     # Backward of concat is split (per-sample), NOT a flat slice.
     offsets_left, offsets_right = ctx.saved_tensors
     seq_len_a = ctx.left_shape[0]
@@ -369,7 +345,7 @@ def _concat_2d_jagged_autograd_backward(
     grad_left, grad_right = torch.ops.recir.split_2d_jagged(
         grad_output, offsets_left, offsets_right, seq_len_a, seq_len_b
     )
-    return grad_left, None, grad_right, None, None
+    return grad_left, None, grad_right, None
 
 
 def _split_2d_jagged_autograd_setup_context(
@@ -390,11 +366,7 @@ def _split_2d_jagged_autograd_backward(
     # Backward of split is concat (per-sample), NOT a flat cat.
     offsets_left, offsets_right = ctx.saved_tensors
     grad_output = torch.ops.recir.concat_2d_jagged(
-        grad_left,
-        offsets_left,
-        grad_right,
-        offsets_right,
-        ctx.values_shape[0],
+        grad_left, offsets_left, grad_right, offsets_right
     )
     return grad_output, None, None, None, None
 
