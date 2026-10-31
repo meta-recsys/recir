@@ -167,7 +167,8 @@ class JSeqEmbeddingHybridMeshTest(TestCase):
             SimpleNamespace(process_index=1),
         ]
         fake_mesh = SimpleNamespace(
-            devices=np.asarray(devices, dtype=object).reshape(2, 2)
+            devices=np.asarray(devices, dtype=object).reshape(2, 2),
+            shape={"gspmd_data": 2, "torch_dist": 2},
         )
         with (
             gspmd_mesh_context(
@@ -186,7 +187,8 @@ class JSeqEmbeddingHybridMeshTest(TestCase):
         weight = jnp.zeros((32, 4), dtype=jnp.bfloat16)
         driver_output = jnp.arange(12, dtype=jnp.float32).reshape(3, 4)
         fake_mesh = SimpleNamespace(
-            devices=np.asarray(list(range(8)), dtype=object).reshape(2, 4)
+            devices=np.asarray(list(range(8)), dtype=object).reshape(2, 4),
+            shape={"gspmd_data": 2, "torch_dist": 4},
         )
 
         def fake_shard_map(
@@ -243,7 +245,8 @@ class JSeqEmbeddingHybridMeshTest(TestCase):
         weight = jnp.zeros((32, 4), dtype=jnp.bfloat16)
         grad_out = jnp.ones((8, 3, 4), dtype=jnp.bfloat16)
         fake_mesh = SimpleNamespace(
-            devices=np.asarray(list(range(8)), dtype=object).reshape(2, 4)
+            devices=np.asarray(list(range(8)), dtype=object).reshape(2, 4),
+            shape={"gspmd_data": 2, "torch_dist": 4},
         )
 
         def fake_shard_map(fn: Any, **kwargs: Any) -> Any:
