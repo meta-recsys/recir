@@ -186,6 +186,7 @@ class XLADeviceStateManager(DeviceStateManager):
                 False,
                 0,
                 is_fsdp_tensor=placeholders[i].meta.get("is_fsdp_sharded", False),
+                fsdp_shard_dim=placeholders[i].meta.get("fsdp_shard_dim", 0),
                 batch_axis_resource=batch_axis_resource,
                 fsdp_axis_name=_GSPMD_FSDP_AXIS,
                 fsdp_host_shard_count=fsdp_host_shard_count,

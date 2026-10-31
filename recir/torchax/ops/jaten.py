@@ -22,20 +22,29 @@
 """Torch ops implemented using jax."""
 
 import functools
+import logging
 import math
+import os
 import sys
 from collections.abc import Sequence
-from typing import Any, Callable
+from typing import Any, Callable, cast
 
 import jax
 import numpy as np
 import torch
 import torch.distributed._functional_collectives
 from jax import numpy as jnp
-from recir.torchax import interop
+from jax.sharding import PartitionSpec as P
+from recir.torchax.gspmd_context import (
+    batch_mesh_layout,
+    batch_shard_index,
+    current_gspmd_mesh_context,
+)
 from recir.torchax.ops import jax_reimplement, mappings, op_base, ops_registry
 from recir.torchax.ops.decorators import op
 from recir.torchax.view import View
+
+logger: logging.Logger = logging.getLogger(__name__)
 
 # Keys are OpOverload, value is a callable that takes
 # Tensor
@@ -311,6 +320,137 @@ def _torch_binary_scalar_type(scalar: Any, tensor: Any) -> Any:
 _SEARCHSORTED_VECTORIZE_MAX_BINS: int = 16384
 
 
+def _searchsorted_local_bins(  # noqa: C901
+    sorted_sequence: Any,
+    values: Any,
+    side: str,
+) -> Any | None:
+    """Search matching bin/query partitions with exact global boundary answers."""
+    if (
+        os.environ.get("RECIR_LOCAL_RO_SEARCHSORTED", "0") != "1"
+        or current_gspmd_mesh_context() is None
+    ):
+        return None
+    mesh, resource, chips = batch_mesh_layout()
+    if chips <= 1 or sorted_sequence.ndim != 1 or values.ndim != 1:
+        return None
+    global_ros = sorted_sequence.shape[0]
+    if (
+        global_ros <= 0
+        or global_ros >= 2**31
+        or global_ros % chips
+        or values.shape[0] % chips
+    ):
+        return None
+    per_chip = global_ros // chips
+    dtype = jnp.result_type(sorted_sequence, values)
+    if dtype.kind not in "biuf":
+        return None
+    method = os.environ.get("RECIR_SEARCHSORTED_METHOD", "scan")
+    if method not in ("scan", "scan_unrolled", "sort"):
+        raise ValueError(f"invalid RECIR_SEARCHSORTED_METHOD: {method!r}")
+    impl = os.environ.get("RECIR_LOCAL_RO_SEARCHSORTED_IMPL", "compare")
+    if impl not in ("binary", "compare"):
+        raise ValueError(f"Invalid local searchsorted implementation: {impl}")
+    if per_chip > _SEARCHSORTED_VECTORIZE_MAX_BINS:
+        # The compare lookup materializes a [local queries, per_chip] mask.
+        impl = "binary"
+    logger.info(
+        "[RO-local searchsorted] bins=%s per_chip=%s queries=%s side=%s dtype=%s "
+        "impl=%s",
+        global_ros,
+        per_chip,
+        values.shape,
+        side,
+        dtype,
+        impl,
+    )
+
+    def per_device(seq: jax.Array, queries: jax.Array) -> jax.Array:
+        seq = seq.astype(dtype)
+        queries = queries.astype(dtype)
+        base = batch_shard_index(mesh, resource) * per_chip
+        local = cast(jax.Array, jax.lax.dynamic_slice_in_dim(seq, base, per_chip))
+        previous = seq[jnp.maximum(base - 1, 0)]
+        lower = jnp.where(
+            base == 0, jnp.minimum(seq[0], jnp.asarray(0, dtype)), previous
+        )
+        upper = local[-1]
+        boundaries = jnp.stack([jnp.asarray(0, dtype), seq[-1], lower, upper])
+        special = jnp.any(queries[:, None] == boundaries[None, :], axis=1)
+        own = (queries > lower) & (queries < upper)
+        outside = (queries < seq[0]) | (queries > seq[-1])
+        valid = jnp.all(special | own | outside) & jnp.all(seq[1:] >= seq[:-1])
+
+        def fast(_: Any) -> jax.Array:
+            comparisons = (
+                seq[:, None] < boundaries[None, :]
+                if side == "left"
+                else seq[:, None] <= boundaries[None, :]
+            )
+            global_answers = jnp.sum(comparisons, axis=0, dtype=jnp.int32)
+
+            def lookup(a: jax.Array, q: jax.Array) -> jax.Array:
+                if impl == "compare":
+                    cmp = (
+                        a[None, :] < q[:, None]
+                        if side == "left"
+                        else a[None, :] <= q[:, None]
+                    )
+                    return jnp.sum(cmp, axis=-1, dtype=jnp.int32)
+                return jnp.searchsorted(a, q, side=side, method=method)
+
+            if dtype.kind in "iu" and dtype.itemsize > 4:
+                # Monotonicity is already checked. Narrow only after proving
+                # the full sorted range and every query fit signed32 bits.
+                limit = jnp.asarray(2**31 - 1, dtype)
+                narrow = (
+                    (seq[0] >= 0)
+                    & (seq[-1] <= limit)
+                    & jnp.all((queries >= 0) & (queries <= limit))
+                )
+                local_result = cast(
+                    jax.Array,
+                    jax.lax.cond(
+                        narrow,
+                        lambda _: lookup(
+                            local.astype(jnp.int32), queries.astype(jnp.int32)
+                        ),
+                        lambda _: lookup(local, queries),
+                        operand=None,
+                    ),
+                )
+            else:
+                local_result = lookup(local, queries)
+            result = base + local_result
+            for i in range(4):
+                result = cast(
+                    jax.Array,
+                    jnp.where(queries == boundaries[i], global_answers[i], result),
+                )
+            result = cast(jax.Array, jnp.where(queries < seq[0], jnp.int32(0), result))
+            return cast(
+                jax.Array, jnp.where(queries > seq[-1], jnp.int32(global_ros), result)
+            )
+
+        def fallback(_: Any) -> jax.Array:
+            return jnp.searchsorted(seq, queries, side=side, method=method)
+
+        return jax.lax.cond(valid, fast, fallback, operand=None)
+
+    sharded = cast(
+        Callable[[jax.Array, jax.Array], jax.Array],
+        jax.shard_map(
+            per_device,
+            mesh=mesh,
+            in_specs=(P(), P(resource)),
+            out_specs=P(resource),
+            check_vma=False,
+        ),
+    )
+    return sharded(sorted_sequence, values)
+
+
 def _searchsorted(
     sorted_sequence: Any,
     values: Any,
@@ -336,7 +476,18 @@ def _searchsorted(
         v = values[..., None]
         cmp = a < v if side == "left" else a <= v
         return cmp.sum(axis=-1).astype(jnp.int32)
-    return jnp.searchsorted(sorted_sequence, values, side=side, sorter=sorter)
+    if sorter is None:
+        local_result = _searchsorted_local_bins(sorted_sequence, values, side)
+        if local_result is not None:
+            return local_result
+    # Keep the default algorithm; experiments can unroll the scan without
+    # changing query sharding or use JAX's accelerator sort implementation.
+    method = os.environ.get("RECIR_SEARCHSORTED_METHOD", "scan")
+    if method not in ("scan", "scan_unrolled", "sort"):
+        raise ValueError(f"invalid RECIR_SEARCHSORTED_METHOD: {method!r}")
+    return jnp.searchsorted(
+        sorted_sequence, values, side=side, sorter=sorter, method=method
+    )
 
 
 @op(torch.ops.aten.searchsorted.Tensor)  # pyre-ignore[56]
@@ -757,9 +908,19 @@ def _aten__embedding_bag(
         embedded = embedded * per_sample_weights[:, None]
 
     if mode == 0:  # sum
-        output = jax.ops.segment_sum(embedded, segment_ids, num_segments=num_bags)
+        output = jax.ops.segment_sum(
+            embedded,
+            segment_ids,
+            num_segments=num_bags,
+            indices_are_sorted=True,
+        )
     elif mode == 1:  # mean
-        output = jax.ops.segment_sum(embedded, segment_ids, num_segments=num_bags)
+        output = jax.ops.segment_sum(
+            embedded,
+            segment_ids,
+            num_segments=num_bags,
+            indices_are_sorted=True,
+        )
         safe_sizes = jnp.maximum(bag_size, 1).astype(embedded.dtype)
         output = output / safe_sizes[:, None]
     elif mode == 2:  # max
@@ -935,6 +1096,16 @@ def _aten_index_put(
 def _aten_index(self: Any, indexes: Any) -> Any:
     indexes = [slice(None, None, None) if i is None else i for i in indexes]
     indexes = tuple(indexes)
+    packed = os.environ.get("RECIR_PACKED_INT64_INDEX", "0")
+    if packed not in ("0", "1"):
+        raise ValueError(f"invalid RECIR_PACKED_INT64_INDEX: {packed!r}")
+    if packed == "1" and self.dtype in (jnp.int64, jnp.uint64):
+        # Gather the two exact 32-bit lanes together instead of two scalar
+        # gathers produced by TPU's int64 emulation. Leave batch axes intact.
+        bits = jax.lax.bitcast_convert_type(self, jnp.uint32)
+        full_indexes = indexes + (slice(None),) * (self.ndim - len(indexes))
+        selected = bits[full_indexes + (slice(None),)]
+        return jax.lax.bitcast_convert_type(selected, self.dtype)
     return self[indexes]
 
 
