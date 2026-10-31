@@ -365,14 +365,32 @@ def _recir_concat_2d_jagged(
     offsets_left: Any,
     values_right: Any,
     offsets_right: Any,
+    output_size: int | None = None,
 ) -> Any:
     """recir::concat_2d_jagged lowering: per-sample interleave inside shard_map."""
-    out_total = values_left.shape[0] + values_right.shape[0]  # static
+    resolved_output_size: int = (
+        values_left.shape[0] + values_right.shape[0]
+        if output_size is None
+        else output_size
+    )
+    return _recir_concat_2d_jagged_with_output_size(
+        values_left, offsets_left, values_right, offsets_right, resolved_output_size
+    )
+
+
+def _recir_concat_2d_jagged_with_output_size(
+    values_left: Any,
+    offsets_left: Any,
+    values_right: Any,
+    offsets_right: Any,
+    output_size: int,
+) -> Any:
+    """Lower concat with independent physical input and output capacities."""
 
     world_size = len(jax.devices())
     if world_size <= 1:
         return _jax_concat_2d_jagged(
-            values_left, offsets_left, values_right, offsets_right, out_total
+            values_left, offsets_left, values_right, offsets_right, output_size
         )
 
     lengths_left = offsets_left[1:] - offsets_left[:-1]
@@ -383,7 +401,10 @@ def _recir_concat_2d_jagged(
         f"concat totals ({total_left},{total_right}) must be divisible by "
         f"world_size={world_size}"
     )
-    local_out = (total_left + total_right) // world_size
+    assert output_size % world_size == 0, (
+        f"concat output size {output_size} must be divisible by world_size={world_size}"
+    )
+    local_out = output_size // world_size
     mesh = Mesh(jax.devices(), (_DP_AXIS,))
 
     def _per_device(
