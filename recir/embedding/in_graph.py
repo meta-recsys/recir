@@ -659,7 +659,7 @@ class InGraphEmbeddingBackend(EmbeddingBackend):
         self,
         embedding_collection_fqn: str,
         sparse_optimizer_builder: Callable[
-            [nn.Module, List[nn.Parameter], OptimConfig, torch.device],
+            [nn.Module, List[nn.Parameter], OptimConfig, torch.device, float],
             Tuple[torch.optim.Optimizer, torch.Tensor],
         ],
         table_plans: Dict[str, TablePlan],
@@ -667,6 +667,7 @@ class InGraphEmbeddingBackend(EmbeddingBackend):
     ) -> None:
         super().__init__(embedding_collection_fqn)
         self._sparse_optimizer_builder = sparse_optimizer_builder
+        self._sparse_grad_scale: float = 1.0
         self._table_plans: Dict[str, TablePlan] = dict(table_plans)
         self._feature_seqlens: Dict[str, int] = {}
         self._on_device_init: bool = on_device_init
@@ -675,6 +676,12 @@ class InGraphEmbeddingBackend(EmbeddingBackend):
         """Per-feature per-chip token total, consumed by setup()."""
         self._feature_seqlens = feature_seqlens
         logger.info(f"InGraphEmbeddingBackend: feature_chip_tokens={feature_seqlens}")
+
+    def set_sparse_grad_scale(self, scale: float) -> None:
+        """Must run before setup(), which hands it to the sparse optimizer builder."""
+        if scale <= 0:
+            raise ValueError(f"sparse_grad_scale must be positive, got {scale}")
+        self._sparse_grad_scale = scale
 
     def init_pg(self) -> Tuple[int, int]:
         rank = jax.process_index()
@@ -771,6 +778,7 @@ class InGraphEmbeddingBackend(EmbeddingBackend):
             list(embedding_params.values()),
             sparse_config,
             device,
+            self._sparse_grad_scale,
         )
         dense_tables = sum(
             1
