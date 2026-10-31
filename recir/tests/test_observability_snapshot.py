@@ -4,23 +4,31 @@
 # This source code is licensed under the BSD-3-Clause license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Tests for the step compile and the graphs its stages write."""
+"""Tests for the step compile ``compile_from_gm`` writes, and the graphs its stages write."""
 
 from __future__ import annotations
 
 import contextlib
 import logging
+import os
 import pickle
 import unittest
 from typing import Any
 from unittest import mock
 
+import recir
 import torch
 import torch.nn as nn
+from recir.compiler import compilation
+from recir.compiler.tracing import _GraphSpec, _trace_graphs, _trace_record
 from recir.observability import compiles
 from recir.observability.compiles import StepCompile, TlparseCompile, TraceRecord
 from recir.observability.graph_dump import GraphDump
+from recir.observability.settings import Settings, Tier
+from recir.tests.test_utils import _NoopBackend, _PassthroughParallel
+from recir.training.compile import compile_step
 from torch import fx
+from torch._dynamo import convert_frame
 from torch._logging._internal import trace_log
 
 _LOGGER = "recir.observability"
@@ -34,6 +42,31 @@ class _ToyModel(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.linear(x).relu()
+
+
+def _train_step(model: nn.Module, opt: torch.optim.Optimizer, x: torch.Tensor) -> None:
+    opt.zero_grad()
+    model(x).sum().backward()
+    opt.step()
+
+
+def _step_inputs() -> tuple[nn.Module, torch.optim.Optimizer, torch.Tensor]:
+    model = _ToyModel()
+    opt = torch.optim.Adam(model.parameters(), lr=0.01, foreach=True)
+    x = torch.randn(2, 4)
+    # One eager step materializes Adam's state, as on a resumed job.
+    _train_step(model, opt, x)
+    return model, opt, x
+
+
+def _trace() -> tuple[fx.GraphModule, Any]:
+    return recir.trace(_train_step, *_step_inputs())
+
+
+def _compile_traced(gm: fx.GraphModule, flat_state: Any) -> Any:
+    return recir.compile_from_gm(
+        gm, flat_state, parallel_mode=_PassthroughParallel(), backend=_NoopBackend()
+    )
 
 
 class _Capture(logging.Handler):
@@ -222,3 +255,200 @@ class StackTest(unittest.TestCase):
         with wrapped():
             pass
         self.assertEqual(self.caller(), "wrapped")
+
+
+def _set_tier(case: unittest.TestCase, tier: Tier) -> None:
+    patcher = mock.patch.object(Settings, "_loaded", Settings(tier=tier))
+    patcher.start()
+    case.addCleanup(patcher.stop)
+
+
+class CompileFromGmTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.capture = _Capture()
+        trace_log.addHandler(self.capture)
+        self.addCleanup(trace_log.removeHandler, self.capture)
+        _set_tier(self, Tier.INDEX)
+
+    def names(self) -> list[str]:
+        return [
+            m["artifact"]["name"] if n == "artifact" else n
+            for n, m, _ in self.capture.events
+        ]
+
+    def metrics(self) -> dict[str, Any]:
+        name, metadata, _ = self.capture.events[-1]
+        self.assertEqual(name, "compilation_metrics")
+        return metadata["compilation_metrics"]
+
+    def caller(self) -> str:
+        stack = self.capture.events[0][1]["dynamo_start"]["stack"]
+        self.assertEqual(stack[-1]["name"], "recir step compile")
+        return stack[-2]["name"]
+
+    def test_trace_alone_writes_nothing(self) -> None:
+        gm, _ = _trace()
+        self.assertEqual(self.capture.events, [])
+        self.assertIsNotNone(_trace_record(gm))
+
+    def test_compile_writes_the_traced_graph_and_closes(self) -> None:
+        gm, flat_state = _trace()
+        text = GraphDump(gm).text()
+        _compile_traced(gm, flat_state)
+        self.assertEqual(
+            self.names(), ["dynamo_start", "recir_trace_graph", "compilation_metrics"]
+        )
+        self.assertEqual(self.capture.events[1][2], text)
+        metrics = self.metrics()
+        code = _train_step.__code__
+        self.assertEqual(
+            (metrics["co_filename"], metrics["co_firstlineno"]),
+            (code.co_filename, code.co_firstlineno),
+        )
+        self.assertEqual(metrics["graph_node_count"], GraphDump(gm).counts["nodes"])
+        self.assertIsNone(metrics["fail_type"])
+
+    def test_step_compile_sits_under_the_call_into_compile_from_gm(self) -> None:
+        gm, flat_state = _trace()
+        recir.compile_from_gm(
+            gm, flat_state, parallel_mode=_PassthroughParallel(), backend=_NoopBackend()
+        )
+        self.assertEqual(
+            self.caller(), "test_step_compile_sits_under_the_call_into_compile_from_gm"
+        )
+
+    def test_step_compile_sits_under_the_call_into_recir_compile(self) -> None:
+        @recir.compile(parallel_mode=_PassthroughParallel(), backend=_NoopBackend())
+        def train_step(
+            model: nn.Module, opt: torch.optim.Optimizer, x: torch.Tensor
+        ) -> None:
+            _train_step(model, opt, x)
+
+        # recir.compile traces and compiles on the first call.
+        train_step(*_step_inputs())
+        self.assertEqual(
+            self.caller(), "test_step_compile_sits_under_the_call_into_recir_compile"
+        )
+
+    def test_step_compile_sits_under_the_call_into_compile_step(self) -> None:
+        model, opt, x = _step_inputs()
+        compile_step(
+            _train_step,
+            model,
+            [opt],
+            x,
+            parallel_mode=_PassthroughParallel(),
+            backend=_NoopBackend(),
+            flatten_batch=lambda batch, global_loss_denom: (batch,),
+        )
+        self.assertEqual(
+            self.caller(), "test_step_compile_sits_under_the_call_into_compile_step"
+        )
+
+    def test_each_compile_writes_its_own_entry(self) -> None:
+        gm, flat_state = _trace()
+        _compile_traced(gm, flat_state)
+        _compile_traced(gm, flat_state)
+        starts = [m for n, m, _ in self.capture.events if n == "dynamo_start"]
+        self.assertEqual(len(starts), 2)
+        self.assertNotEqual(starts[0]["frame_id"], starts[1]["frame_id"])
+
+    def test_traced_graph_and_counts_exclude_post_trace_edits(self) -> None:
+        gm, flat_state = _trace()
+        counts = GraphDump(gm).counts
+        output = next(n for n in gm.graph.nodes if n.op == "output")
+        with gm.graph.inserting_before(output):
+            gm.graph.create_node(
+                "call_function",
+                torch.ops.aten.zeros.default,
+                ([1],),
+                name="post_trace_edit",
+            )
+        gm.recompile()
+        _compile_traced(gm, flat_state)
+        text = self.capture.events[1][2]
+        assert text is not None
+        self.assertNotIn("post_trace_edit", text)
+        self.assertEqual(self.metrics()["graph_node_count"], counts["nodes"])
+
+    def test_raising_compile_reports_the_failure(self) -> None:
+        gm, flat_state = _trace()
+        with (
+            mock.patch.object(
+                compilation, "_compile_from_gm", side_effect=RuntimeError("boom")
+            ),
+            self.assertRaisesRegex(RuntimeError, "boom"),
+        ):
+            _compile_traced(gm, flat_state)
+        metrics = self.metrics()
+        self.assertEqual(metrics["fail_type"], "RuntimeError")
+        self.assertEqual(metrics["fail_reason"], "raised after RecIR stage trace")
+
+    def test_start_fault_never_fails_the_compile(self) -> None:
+        gm, flat_state = _trace()
+        with (
+            mock.patch.object(TlparseCompile, "_stack", side_effect=RuntimeError),
+            self.assertLogs(_LOGGER, level="WARNING") as logs,
+        ):
+            compiled = _compile_traced(gm, flat_state)
+        self.assertIsNotNone(compiled.gm)
+        self.assertIn("recir step compile not started: RuntimeError", logs.output[0])
+        self.assertEqual(self.capture.events, [])
+
+    def test_tier_off_spends_no_compile_id(self) -> None:
+        _set_tier(self, Tier.OFF)
+        frames_before = convert_frame.FRAME_COUNTER
+        _compile_traced(*_trace())
+        self.assertEqual(self.capture.events, [])
+        self.assertEqual(convert_frame.FRAME_COUNTER, frames_before)
+
+    def test_no_handler_spends_no_compile_id(self) -> None:
+        frames_before = convert_frame.FRAME_COUNTER
+        with mock.patch.object(trace_log, "handlers", []):
+            _compile_traced(*_trace())
+        self.assertEqual(convert_frame.FRAME_COUNTER, frames_before)
+
+    def test_handler_gone_by_compile_opens_nothing(self) -> None:
+        gm, flat_state = _trace()
+        frames_before = convert_frame.FRAME_COUNTER
+        with mock.patch.object(trace_log, "handlers", []):
+            _compile_traced(gm, flat_state)
+        self.assertEqual(convert_frame.FRAME_COUNTER, frames_before)
+
+    def test_trace_fault_never_fails_trace(self) -> None:
+        with (
+            mock.patch.object(GraphDump, "text", side_effect=RuntimeError),
+            self.assertLogs(_LOGGER, level="WARNING") as logs,
+        ):
+            gm, _ = _trace()
+        self.assertIsNone(_trace_record(gm))
+        self.assertIn("trace not kept: RuntimeError", logs.output[0])
+
+    def test_traced_gm_pickles_with_its_trace_record(self) -> None:
+        gm, _ = _trace()
+        restored = pickle.loads(pickle.dumps(gm))
+        self.assertEqual(_trace_record(restored), _trace_record(gm))
+
+    def test_graphs_traced_together_each_keep_a_record(self) -> None:
+        spec = _GraphSpec(_train_step, _step_inputs(), None)
+        traced = _trace_graphs([spec, spec])
+        self.assertTrue(all(_trace_record(gm) is not None for gm, _ in traced))
+        self.assertEqual(len(traced), 2)
+
+
+class SettingsTest(unittest.TestCase):
+    def test_tier_ignores_case_and_whitespace(self) -> None:
+        with mock.patch.dict(os.environ, {"RECIR_SNAPSHOT_TIER": " Index\n"}):
+            self.assertIs(Settings.from_env().tier, Tier.INDEX)
+
+    def test_empty_tier_means_off(self) -> None:
+        with mock.patch.dict(os.environ, {"RECIR_SNAPSHOT_TIER": " "}):
+            self.assertIs(Settings.from_env().tier, Tier.OFF)
+
+    def test_malformed_tier_turns_snapshots_off(self) -> None:
+        with (
+            mock.patch.dict(os.environ, {"RECIR_SNAPSHOT_TIER": "bogus"}),
+            self.assertLogs(_LOGGER, level="WARNING"),
+        ):
+            settings = Settings.from_env()
+        self.assertFalse(settings.enabled)
