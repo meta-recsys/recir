@@ -8,19 +8,81 @@
 
 from __future__ import annotations
 
-from typing import Callable
+import functools
+import logging
+from typing import Any, Callable, cast, Protocol
 
-from recir.composite import CompositeModule
+from recir.composite import CompositeModule, Part
+from recir.lowering.lowering_utils import CarvedRegion, LoweringHooks
 from torch import fx, nn
+
+logger: logging.Logger = logging.getLogger(__name__)
+
+WHOLE = Part("whole")
+
+
+class Lower(Protocol):
+    """A backend's lowering of one graph, which reports its decisions to ``hooks`` when given any."""
+
+    def __call__(
+        self, gm: fx.GraphModule, /, *, hooks: LoweringHooks | None = None
+    ) -> nn.Module: ...
+
+
+class LoweringObserver:
+    """
+    Base class for all lowering observers: told what lowering decides, input by input.
+
+    This class is responsible for containing faults: every event reaches a
+    subclass hook through one guard, so an observer cannot fail lowering. An
+    observer must not edit what lowering returns, except to set
+    ``compile_scope`` on a carved ``LazilyBuiltModule``. This can be extended
+    by subclassing and overriding the ``_on_*`` hooks.
+    """
+
+    def _on_carved(self, part: Part, region: CarvedRegion) -> None:
+        """``region`` was carved from the input ``part``."""
+
+    def _guarded(self, event: str, hook: Callable[..., None], *args: Any) -> None:
+        try:
+            hook(*args)
+        except Exception as e:
+            logger.warning("lowering observer: %s failed: %r", event, e, exc_info=True)
+
+
+class _InputHooks:
+    def __init__(self, observer: LoweringObserver, part: Part) -> None:
+        self.observer = observer
+        self.part = part
+
+    def on_carved(self, region: CarvedRegion) -> None:
+        self.observer._guarded("carved", self.observer._on_carved, self.part, region)
+
+
+def _lower_input(
+    lower: Lower, observer: LoweringObserver | None, part: Part, gm: fx.GraphModule
+) -> nn.Module:
+    hooks = None if observer is None else _InputHooks(observer, part)
+    return lower(gm, hooks=hooks)
 
 
 def lower_inputs(
-    gm: fx.GraphModule | CompositeModule, lower: Callable[[fx.GraphModule], nn.Module]
+    gm: fx.GraphModule | CompositeModule,
+    lower: Lower,
+    observer: LoweringObserver | None = None,
+    *,
+    walk_composites: bool = True,
 ) -> nn.Module:
     """
     Lower each input of ``gm`` with ``lower`` and put the results back: each
-    part of a ``CompositeModule``, or ``gm`` itself. Returns the lowered module.
+    part of a ``CompositeModule``, or ``gm`` itself as the ``whole`` part.
+    ``lower`` gets hooks reporting to ``observer`` for the input, or None
+    without an observer. Without ``walk_composites``, a composite module is
+    handed to ``lower`` whole and unobserved, for a backend that does not
+    lower composites. Returns the lowered module.
     """
     if isinstance(gm, fx.GraphModule):
-        return lower(gm)
-    return gm.lower_parts(lower)
+        return _lower_input(lower, observer, WHOLE, gm)
+    if not walk_composites:
+        return lower(cast(Any, gm), hooks=None)
+    return gm.lower_parts(functools.partial(_lower_input, lower, observer))

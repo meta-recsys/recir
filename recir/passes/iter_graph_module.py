@@ -10,6 +10,7 @@ import logging
 from typing import Any, Callable, cast, Dict, Iterator, List, Optional, Set, Tuple, Type
 
 import torch.nn as nn
+from recir.composite import Part
 from recir.utils.graph import clone_subgraph, get_output, is_leaf_subgraph
 from torch import fx
 from torch.fx.graph import _PyTreeCodeGen, PythonCode
@@ -886,11 +887,12 @@ class IterGraphModule(nn.Module):
         return self.main_gm.print_readable(print_output)
 
     def lower_parts(
-        self, lower: Callable[[fx.GraphModule], nn.Module]
+        self, lower: Callable[[Part, fx.GraphModule], nn.Module]
     ) -> "IterGraphModule":
-        """Replace each phase graph (setup, main, cleanup) with ``lower(graph)``."""
-        for attr in ("setup_gm", "main_gm", "cleanup_gm"):
-            setattr(self, attr, lower(getattr(self, attr)))
+        """Replace each phase graph with ``lower(part, graph)``, as parts ``setup``, ``main`` and ``cleanup``."""
+        for name in ("setup", "main", "cleanup"):
+            attr = f"{name}_gm"
+            setattr(self, attr, lower(Part(name), getattr(self, attr)))
         return self
 
     def print_all_graphs(self) -> None:
