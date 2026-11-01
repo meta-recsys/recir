@@ -78,3 +78,16 @@ class AssemblyStage(GraphStage):
     """
 
     name = "assembly"
+
+
+class PipelineStage(GraphStage):
+    """
+    The pipeline stage: the split graph ``build_pipeline`` returns.
+
+    This class is responsible for writing that graph as ``recir_pipeline_graph``;
+    the text holds each stage body as a nested module. It is recorded only when
+    the compile's pipeline plan split the graph: a compile with no plan, or a
+    steady-state plan, which flattens the graph instead, records none.
+    """
+
+    name = "pipeline"
