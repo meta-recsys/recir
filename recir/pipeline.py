@@ -17,15 +17,16 @@ from typing import Any, Callable, cast, Iterable, Optional, Sequence
 import torch
 import torch.fx as fx
 import torch.nn as nn
+from recir.composite import Part
 from torch.fx.graph import map_arg
 from torch.fx.passes.split_module import split_module
 from torch.utils import _pytree as pytree
 
 
 logger: logging.Logger = logging.getLogger(__name__)
-_PIPELINE_REGION_META = "recir_pipeline_region"
+PIPELINE_REGION_META = "recir_pipeline_region"
 _INDUCTOR_STREAM_META = "stream"
-_PIPELINE_PARTITION_META = "recir_pipeline_partition"
+PIPELINE_PARTITION_META = "recir_pipeline_partition"
 
 
 def _is_pipeline_partition_node(node: fx.Node) -> bool:
@@ -193,13 +194,13 @@ def is_pipeline_pending(value: Any) -> bool:
 
 def mark_pipeline_region(nodes: Iterable[fx.Node], region: Hashable) -> None:
     for node in nodes:
-        existing = node.meta.get(_PIPELINE_REGION_META)
+        existing = node.meta.get(PIPELINE_REGION_META)
         if existing is not None and existing != region:
             raise ValueError(
                 f"Pipeline node {node.name!r} belongs to conflicting region "
                 f"{existing!r}"
             )
-        node.meta[_PIPELINE_REGION_META] = region
+        node.meta[PIPELINE_REGION_META] = region
 
 
 def mark_execution_stream(nodes: Iterable[fx.Node], stream_index: int) -> None:
@@ -252,7 +253,7 @@ class PipelinedGraphModule(nn.Module):
                 for node in cast(fx.GraphModule, stage).graph.nodes
                 if _is_pipeline_partition_node(node)
                 and isinstance(
-                    (index := node.meta.get(_PIPELINE_PARTITION_META)),
+                    (index := node.meta.get(PIPELINE_PARTITION_META)),
                     int,
                 )
             }
@@ -303,18 +304,20 @@ class PipelinedGraphModule(nn.Module):
             stages.append(stage)
         return tuple(stages)
 
-    def lower_stages(
-        self, lower: Callable[[fx.GraphModule], nn.Module]
+    def lower_parts(
+        self, lower: Callable[[Part, fx.GraphModule], nn.Module]
     ) -> PipelinedGraphModule:
-        for stage_call in self._stage_calls:
-            target = cast(str, stage_call.target)
-            stage = self.split_gm.get_submodule(target)
-            if not isinstance(stage, fx.GraphModule):
-                raise TypeError(
-                    f"Pipeline stage {target!r} must be an FX GraphModule, "
-                    f"got {type(stage).__name__}"
-                )
-            self.split_gm.set_submodule(target, lower(stage))
+        """Replace each stage's graph with ``lower(part, graph)``, the part named and numbered after the stage."""
+        stages = zip(
+            self._stage_names,
+            self._stage_calls,
+            self.stage_graph_modules(),
+            strict=True,
+        )
+        for index, (name, stage_call, stage) in enumerate(stages):
+            self.split_gm.set_submodule(
+                cast(str, stage_call.target), lower(Part(name, index), stage)
+            )
         return self
 
     def _build_segments(self) -> tuple[tuple[fx.Node, ...], ...]:
@@ -625,15 +628,14 @@ class SteadyStateGraphModule(nn.Module):
             return self.steady_gm.print_readable(print_output)
         return str(self.graph)
 
-    def lower_steady(
-        self, lower: Callable[[fx.GraphModule], nn.Module]
+    def lower_parts(
+        self, lower: Callable[[Part, fx.GraphModule], nn.Module]
     ) -> SteadyStateGraphModule:
-        """Materialize stream semantics, then lower the flattened steady graph."""
+        """Materialize stream semantics, then lower the flattened graph as the part ``steady``."""
         if not isinstance(self.steady_gm, fx.GraphModule):
             raise TypeError("The steady-state graph has already been lowered")
         self._materialize_execution_streams(self.steady_gm)
-        lowered = lower(self.steady_gm)
-        self.steady_gm = lowered
+        self.steady_gm = lower(Part("steady"), self.steady_gm)
         return self
 
     @staticmethod
@@ -717,7 +719,7 @@ class SteadyStateGraphModule(nn.Module):
             spec.name: [
                 node
                 for node in gm.graph.nodes
-                if node.meta.get(_PIPELINE_REGION_META) in spec.regions
+                if node.meta.get(PIPELINE_REGION_META) in spec.regions
                 and node.op == "call_function"
                 and self._runs_on_cuda(node)
             ]
@@ -1328,9 +1330,9 @@ def _collect_pipeline_stages(
     plan: PipelinePlan,
 ) -> tuple[dict[fx.Node, int], int, tuple[str, ...]]:
     region_nodes: dict[fx.Node, Hashable] = {
-        node: cast(Hashable, node.meta[_PIPELINE_REGION_META])
+        node: cast(Hashable, node.meta[PIPELINE_REGION_META])
         for node in gm.graph.nodes
-        if _PIPELINE_REGION_META in node.meta
+        if PIPELINE_REGION_META in node.meta
     }
     explicit_stages: dict[fx.Node, int] = {}
     mutable_stage_names: list[str] = []
@@ -1403,9 +1405,9 @@ def build_pipeline(
         )
     for node in gm.graph.nodes:
         if _is_pipeline_partition_node(node):
-            node.meta[_PIPELINE_PARTITION_META] = node_stages.get(node, compute_stage)
+            node.meta[PIPELINE_PARTITION_META] = node_stages.get(node, compute_stage)
         else:
-            node.meta.pop(_PIPELINE_PARTITION_META, None)
+            node.meta.pop(PIPELINE_PARTITION_META, None)
     split_gm = split_module(
         gm,
         gm,
