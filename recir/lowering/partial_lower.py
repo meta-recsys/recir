@@ -12,7 +12,10 @@ from typing import Any, Callable, cast, List, Optional, Tuple
 
 import torch
 from recir.lowering.lowering_utils import (
+    BuildKind,
     has_meta_kernel,
+    LazilyBuiltModule,
+    LoweringHooks,
     segment_and_lower,
     strip_profiler_nodes,
 )
@@ -288,7 +291,9 @@ class _StreamSyncOrderingGraphPass(CustomGraphPass):
         return "recir-stream-sync-ordering-v2"
 
 
-class _InductorModule(torch.nn.Module):
+class _InductorModule(LazilyBuiltModule):
+    build_kind = BuildKind.INDUCTOR
+
     def __init__(self, gm: torch.fx.GraphModule) -> None:
         super().__init__()
         self.gm = gm
@@ -378,6 +383,7 @@ class _InductorModule(torch.nn.Module):
                 stack.enter_context(_inductor_config.patch(inductor_config))
                 if comms_config_patch is not None:
                     stack.enter_context(comms_config_patch)
+                stack.enter_context(self.compile_scope())
                 self.compiled = _compile_fx_with_fresh_shape_env(self.gm, detached_args)
         with torch.profiler.record_function(tag):
             compiled = self.compiled
@@ -432,6 +438,7 @@ def partial_lower(
     node_predicate: Callable[[torch.fx.Node], bool] = lambda x: True,
     subgraph_predicate: Callable[[List[torch.fx.Node]], bool] = lambda x: True,
     dumper: Callable[[str], str] = lambda x: "subgraph",
+    hooks: Optional[LoweringHooks] = None,
 ) -> torch.fx.GraphModule:
     """
     Lower Inductor compatible portions of the graph module to Inductor.
@@ -446,6 +453,7 @@ def partial_lower(
             path/handle. The returned path/handle for each subgraph will be made
             available in the subgraph call node in the parent graph, as well as the
             label of the profiler block for the subgraph.
+        hooks: told of each subgraph as it is carved.
     """
     gm = strip_profiler_nodes(gm)
     return segment_and_lower(
@@ -456,4 +464,5 @@ def partial_lower(
         node_predicate=node_predicate,
         subgraph_predicate=subgraph_predicate,
         dumper=dumper,
+        hooks=hooks,
     )
