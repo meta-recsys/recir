@@ -8,11 +8,12 @@
 
 from __future__ import annotations
 
-from typing import Callable, ClassVar, TYPE_CHECKING
+from typing import Any, Callable, ClassVar, TYPE_CHECKING
 
 from recir.composite import Part
 from recir.lowering.lowering_utils import CarvedRegion
 from recir.observability.graph_dump import GraphDump
+from recir.observability.status import ArtifactStatus, Outcome
 from torch import fx, nn
 
 if TYPE_CHECKING:
@@ -23,46 +24,73 @@ class Stage:
     """
     Base class for all snapshot stages: one snapshot point in a compile.
 
-    This class is responsible for naming the stage's artifacts and for its
-    lifecycle: its compile begins it, its RecIR code writes to it as it runs,
-    and ends it with what that code raised, if anything. It writes only
-    through its owning compile, whose write never raises, and does not
-    decide stage order.
+    This class is responsible for naming the stage's artifacts, keeping each
+    one's status, and for its lifecycle: its compile begins it, its RecIR code
+    writes to it as it runs, and ends it with what that code raised, if
+    anything, which writes the stage's manifest, ``recir_{name}_manifest``:
+    its outcome, its artifacts' statuses, and its own fields. It writes only
+    through its owning compile, whose writes never raise, and does not decide
+    stage order.
 
     This can be extended to a new snapshot point by subclassing, setting
-    ``name``, and adding the methods its RecIR code writes through.
+    ``name``, adding the methods its RecIR code writes through, and
+    overriding ``_fields`` with what its manifest adds.
     """
 
     name: ClassVar[str]
 
     def __init__(self, owner: TlparseCompile) -> None:
         self.owner = owner
-        # Whether the stage's RecIR code ran to its end without raising.
-        self.completed = False
+        # How the stage's RecIR code ended; None until it ends.
+        self.outcome: Outcome | None = None
+        self.artifacts: dict[str, ArtifactStatus] = {}
 
     def end(self, error: BaseException | None) -> None:
-        """The stage's RecIR code is over; ``error`` is what it raised, if anything."""
-        self.completed = error is None
+        """
+        The stage's RecIR code is over; ``error`` is what it raised, if
+        anything. Writes the stage's manifest.
+        """
+        self.outcome = Outcome.of(error)
+        self.owner.write_manifest(
+            self.name, error=error, artifacts=self.artifacts, fields=self._fields
+        )
+
+    def _fields(self) -> dict[str, Any]:
+        # What this stage's manifest adds; called only when the manifest is written.
+        return {}
 
     def _write_text(self, body: Callable[[], str], suffix: str = "") -> None:
-        self.owner.write(f"recir_{self.name}{suffix}_graph", body)
+        name = f"recir_{self.name}{suffix}_graph"
+        status = self.owner.write(name, body)
+        if status is not None:
+            self.artifacts[name] = status
 
-    def _write_graph(self, gm: fx.GraphModule, suffix: str = "") -> None:
-        self._write_text(GraphDump(gm).text, suffix)
+    def _write_graph(self, gm: fx.GraphModule, suffix: str = "") -> GraphDump:
+        dump = GraphDump(gm)
+        self._write_text(dump.text, suffix)
+        return dump
 
 
 class GraphStage(Stage):
     """
     Base class for all stages that write one graph, as ``recir_{name}_graph``.
 
-    This can be extended to a new snapshot point by subclassing and setting
-    ``name``; the stage's RecIR code records the graph it produced.
+    Its manifest adds the graph's block: counts, row hashes and collective
+    census. This can be extended to a new snapshot point by subclassing and
+    setting ``name``; the stage's RecIR code records the graph it produced.
     """
 
+    def __init__(self, owner: TlparseCompile) -> None:
+        super().__init__(owner)
+        self._dump: GraphDump | None = None
+
     def record(self, gm: fx.GraphModule) -> None:
-        """End the stage and write ``gm``, the graph its RecIR code produced."""
+        """Write ``gm``, the graph the stage's RecIR code produced, and end the stage."""
+        self._dump = self._write_graph(gm)
         self.end(None)
-        self._write_graph(gm)
+
+    def _fields(self) -> dict[str, Any]:
+        return {} if self._dump is None else self._dump.fields(collectives=True)
 
 
 class TraceStage(Stage):
@@ -71,15 +99,23 @@ class TraceStage(Stage):
 
     This class is responsible for writing that graph's text, taken when the
     trace ended, as ``recir_trace_graph``, so no edit a caller makes ahead of
-    compiling shows in it.
+    compiling shows in it; its manifest adds the fields taken with it.
     """
 
     name = "trace"
 
-    def record(self, text: str) -> None:
-        """End the stage and write ``text``, the traced graph's text."""
-        self.end(None)
+    def __init__(self, owner: TlparseCompile) -> None:
+        super().__init__(owner)
+        self._trace_fields: dict[str, Any] = {}
+
+    def record(self, text: str, fields: dict[str, Any]) -> None:
+        """Write ``text``, the traced graph's text, and end the stage with ``fields`` in its manifest."""
+        self._trace_fields = fields
         self._write_text(lambda: text)
+        self.end(None)
+
+    def _fields(self) -> dict[str, Any]:
+        return self._trace_fields
 
 
 class AssemblyStage(GraphStage):

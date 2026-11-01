@@ -16,6 +16,7 @@ from contextlib import contextmanager, ExitStack, nullcontext
 from copy import copy
 from dataclasses import dataclass, field
 from functools import partial
+from time import perf_counter
 from typing import Any, cast
 
 import torch
@@ -786,7 +787,14 @@ def _finalize_trace_result(
         internal_transforms=list(internal_transforms),
     )
     _set_trace_ctx(local_result.gm, ctx)
-    ctx.trace_record = snapshot.keep_trace(traced, local_result.gm)
+    ctx.trace_record = snapshot.keep_trace(
+        traced,
+        local_result.gm,
+        params=local_result.params,
+        buffers=local_result.buffers,
+        named_states=local_result.named_states,
+        trace_s=local_result.trace_s,
+    )
     return local_result.gm, flat_state
 
 
@@ -1175,6 +1183,8 @@ class _LocalCompiledResult:
     # are stored as gm attributes (not placeholders) and registered via
     # ``_AttrKind.CONSTANT`` so they survive ``gm.recompile()`` cleanly.
     constants: dict[str, torch.Tensor]
+    # Seconds the ``make_fx`` trace took.
+    trace_s: float
 
 
 def _local_compile(  # noqa: C901 -- tracing transaction is intentionally cohesive
@@ -1339,12 +1349,14 @@ def _local_compile(  # noqa: C901 -- tracing transaction is intentionally cohesi
         # case yet. Use explicit decompositions for foreach ops.
         # Remove this when the following issue is addressed.
         # Issue: https://github.com/pytorch/pytorch/issues/97852
+        trace_start = perf_counter()
         gm = make_fx(
             partial(stateless_func, func),
             tracing_mode="fake",
             decomposition_table=SPMD_DECOMP_TABLE,  # type: ignore[arg-type]
             _allow_non_fake_inputs=False,
         )(params, buffers, named_states, args, kwargs)
+        trace_s = perf_counter() - trace_start
 
     _maybe_dump_fx_graph(gm)
 
@@ -1405,4 +1417,6 @@ def _local_compile(  # noqa: C901 -- tracing transaction is intentionally cohesi
             node.meta["fqn"] = params_buffers_fqns[placeholder_idx]
         placeholder_idx += 1
 
-    return _LocalCompiledResult(gm, mod, opts, params, buffers, named_states, constants)
+    return _LocalCompiledResult(
+        gm, mod, opts, params, buffers, named_states, constants, trace_s
+    )

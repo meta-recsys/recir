@@ -4,14 +4,17 @@
 # This source code is licensed under the BSD-3-Clause license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Tests for the step compile ``compile_from_gm`` writes, and the graphs its stages write."""
+"""Tests for the step compile ``compile_from_gm`` writes, and the graphs and manifests its stages write."""
 
 from __future__ import annotations
 
 import contextlib
 import dataclasses
+import enum
 import functools
+import hashlib
 import importlib
+import json
 import logging
 import os
 import pickle
@@ -36,15 +39,21 @@ from recir.lowering.lowering_inputs import (
 )
 from recir.lowering.lowering_utils import CarvedRegion, LazilyBuiltModule
 from recir.lowering.partial_lower import partial_lower
-from recir.observability import compiles, inductor_build, snapshot
+from recir.observability import compiles, graph_dump, inductor_build, snapshot
 from recir.observability.builds import BuildTicket, SubgraphBuild
 from recir.observability.compiles import StepCompile, TlparseCompile, TraceRecord
 from recir.observability.dispatch import ObservedLowering
 from recir.observability.graph_dump import GraphDump
 from recir.observability.inductor_build import IrCapture
 from recir.observability.settings import Settings, Tier
-from recir.observability.stages import DispatchStage
-from recir.pipeline import build_pipeline, PipelinedGraphModule, SteadyStateGraphModule
+from recir.observability.stages import AssemblyStage, DispatchStage, TraceStage
+from recir.observability.status import ArtifactState, ArtifactStatus, Outcome
+from recir.pipeline import (
+    build_pipeline,
+    PIPELINE_REGION_META,
+    PipelinedGraphModule,
+    SteadyStateGraphModule,
+)
 from recir.pipeline_strategies import sdd_pipeline_config
 from recir.region_transforms import RegionTransform
 from recir.tests.test_utils import (
@@ -103,6 +112,15 @@ def _compile_traced(gm: fx.GraphModule, flat_state: Any) -> Any:
     )
 
 
+def _record(gm: fx.GraphModule) -> TraceRecord:
+    return TraceRecord.of(_ToyModel.forward, gm, state={}, trace_s=0.0)
+
+
+class _RaisingBackend(_NoopBackend):
+    def dispatch(self, gm: fx.GraphModule) -> nn.Module:
+        raise RuntimeError("dispatch")
+
+
 class _Capture(logging.Handler):
     def __init__(self) -> None:
         super().__init__()
@@ -122,7 +140,7 @@ class StepCompileTest(unittest.TestCase):
         trace_log.addHandler(self.capture)
         self.addCleanup(trace_log.removeHandler, self.capture)
         self.gm: fx.GraphModule = fx.symbolic_trace(_ToyModel())
-        self.step = StepCompile(TraceRecord.of(_ToyModel.forward, self.gm))
+        self.step = StepCompile(_record(self.gm))
 
     def names(self) -> list[str]:
         return [
@@ -139,7 +157,13 @@ class StepCompileTest(unittest.TestCase):
         with self.step.compiling() as started:
             self.assertIs(started, self.step)
         self.assertEqual(
-            self.names(), ["dynamo_start", "recir_trace_graph", "compilation_metrics"]
+            self.names(),
+            [
+                "dynamo_start",
+                "recir_trace_graph",
+                "recir_trace_manifest",
+                "compilation_metrics",
+            ],
         )
         for _, metadata, _ in self.capture.events:
             self.assertEqual(
@@ -179,7 +203,7 @@ class StepCompileTest(unittest.TestCase):
         self.assertNotIn("boom", str(metrics))
 
     def test_each_step_compile_gets_its_own_id(self) -> None:
-        second = StepCompile(TraceRecord.of(_ToyModel.forward, self.gm))
+        second = StepCompile(_record(self.gm))
         self.assertEqual(second.frame_id, self.step.frame_id + 1)
 
     def test_frame_id_is_reserved_under_dynamos_compile_lock(self) -> None:
@@ -193,18 +217,47 @@ class StepCompileTest(unittest.TestCase):
     def test_no_sink_writes_no_payload(self) -> None:
         self.assertTrue(TlparseCompile.has_sink())
         body = mock.Mock(return_value="text")
+        fields = mock.Mock(return_value={})
         with mock.patch.object(trace_log, "handlers", []):
             self.assertFalse(TlparseCompile.has_sink())
-            self.step.write("recir_x_graph", body)
+            self.assertIsNone(self.step.write("recir_x_graph", body))
+            self.step.write_manifest("x", error=None, artifacts={}, fields=fields)
         body.assert_not_called()
+        fields.assert_not_called()
+
+    def test_write_gives_the_payloads_status(self) -> None:
+        self.assertEqual(
+            self.step.write("recir_x_graph", lambda: "text"),
+            ArtifactStatus(ArtifactState.EMITTED),
+        )
 
     def test_write_fault_is_logged(self) -> None:
         with (
             mock.patch.object(compiles, "trace_structured", side_effect=RuntimeError),
             self.assertLogs(_LOGGER, level="WARNING") as logs,
         ):
-            self.step.write("recir_x_graph", lambda: "text")
+            status = self.step.write("recir_x_graph", lambda: "text")
         self.assertIn("recir_x_graph not written: RuntimeError", logs.output[0])
+        self.assertEqual(
+            status, ArtifactStatus(ArtifactState.EMIT_FAILED, "RuntimeError")
+        )
+
+    def test_trace_stage_fault_still_closes_the_compile(self) -> None:
+        with (
+            mock.patch.object(TraceStage, "record", side_effect=RuntimeError),
+            self.assertLogs(_LOGGER, level="WARNING") as logs,
+            self.assertRaisesRegex(ValueError, "work"),
+        ):
+            with self.step.compiling() as started:
+                self.assertIs(started, self.step)
+                raise ValueError("work")
+        self.assertIn(
+            "recir step compile start not recorded: RuntimeError", logs.output[0]
+        )
+        self.assertEqual(self.names(), ["dynamo_start", "compilation_metrics"])
+        self.assertEqual(
+            self.metrics()["fail_reason"], "raised before any RecIR stage completed"
+        )
 
     def test_start_fault_runs_the_work_as_no_compile(self) -> None:
         with (
@@ -236,7 +289,7 @@ class StepCompileTest(unittest.TestCase):
         self.assertIn("recir step compile not finished: RuntimeError", logs.output[0])
 
     def test_trace_record_pickles(self) -> None:
-        record = TraceRecord.of(_ToyModel.forward, self.gm)
+        record = _record(self.gm)
         self.assertEqual(pickle.loads(pickle.dumps(record)), record)
 
 
@@ -253,7 +306,7 @@ class StackTest(unittest.TestCase):
         trace_log.addHandler(self.capture)
         self.addCleanup(trace_log.removeHandler, self.capture)
         gm = fx.symbolic_trace(_ToyModel())
-        self.step = StepCompile(TraceRecord.of(_ToyModel.forward, gm))
+        self.step = StepCompile(_record(gm))
 
     def caller(self) -> str:
         stack = self.capture.events[0][1]["dynamo_start"]["stack"]
@@ -334,7 +387,10 @@ class CompileFromGmTest(unittest.TestCase):
             [
                 "dynamo_start",
                 "recir_trace_graph",
+                "recir_trace_manifest",
                 "recir_assembly_graph",
+                "recir_assembly_manifest",
+                "recir_dispatch_manifest",
                 "compilation_metrics",
             ],
         )
@@ -425,10 +481,6 @@ class CompileFromGmTest(unittest.TestCase):
         self.assertEqual(metrics["fail_reason"], "raised after RecIR stage trace")
 
     def test_failure_after_assembly_names_it(self) -> None:
-        class _RaisingBackend(_NoopBackend):
-            def dispatch(self, gm: fx.GraphModule) -> nn.Module:
-                raise RuntimeError("dispatch")
-
         gm, flat_state = _trace()
         with self.assertRaisesRegex(RuntimeError, "dispatch"):
             recir.compile_from_gm(
@@ -589,7 +641,7 @@ class SettingsTest(unittest.TestCase):
 def _dispatching(backend: str = "InductorBackend") -> Iterator[StepCompile]:
     """A running step compile whose backend dispatch is observed, as in compile_from_gm."""
     gm = fx.symbolic_trace(_ToyModel())
-    with StepCompile(TraceRecord.of(_ToyModel.forward, gm)).compiling() as step:
+    with StepCompile(_record(gm)).compiling() as step:
         assert step is not None
         with snapshot.dispatching(step, backend):
             yield step
@@ -1097,21 +1149,21 @@ class DispatchTest(_SnapshotTestCase):
             InductorBackend().dispatch(_graph())
         _, stage = step.stages
         self.assertIsInstance(stage, DispatchStage)
-        self.assertTrue(stage.completed)
+        self.assertIs(stage.outcome, Outcome.COMPLETED)
 
     def test_a_backend_that_lowers_on_its_own_still_completes_the_stage(self) -> None:
         with _dispatching() as step:
             _NoopBackend().dispatch(_graph())
         _, stage = step.stages
         self.assertIsInstance(stage, DispatchStage)
-        self.assertTrue(stage.completed)
+        self.assertIs(stage.outcome, Outcome.COMPLETED)
 
     def test_a_raising_dispatch_leaves_the_stage_incomplete(self) -> None:
         with self.assertRaisesRegex(ValueError, "dispatch"):
             with _dispatching() as step:
                 raise ValueError("dispatch")
         _, stage = step.stages
-        self.assertFalse(stage.completed)
+        self.assertIs(stage.outcome, Outcome.RAISED)
         self.assertIsNone(snapshot.lowering_observer())
 
     def test_stage_fault_never_fails_the_dispatch(self) -> None:
@@ -1124,6 +1176,431 @@ class DispatchTest(_SnapshotTestCase):
             lowered = InductorBackend().dispatch(_graph())
         self.assertIsInstance(lowered, nn.Module)
         self.assertIn("dispatch stage not begun: RuntimeError", logs.output[0])
+
+
+class ManifestTest(_SnapshotTestCase):
+    def manifest(self, name: str) -> dict[str, Any]:
+        [payload] = [
+            p
+            for n, m, p in self.capture.events
+            if n == "artifact" and m["artifact"]["name"] == f"recir_{name}_manifest"
+        ]
+        assert payload is not None
+        return json.loads(payload)
+
+    def test_trace_manifest(self) -> None:
+        gm, flat_state = _trace()
+        graph = GraphDump(gm).fields(collectives=True)
+        with mock.patch.dict(os.environ, {"RANK": "3", "WORLD_SIZE": "8"}):
+            _compile_traced(gm, flat_state)
+        manifest = self.manifest("trace")
+        [frame] = [
+            m["frame_id"] for n, m, _ in self.capture.events if n == "dynamo_start"
+        ]
+        placeholders = manifest.pop("placeholders")
+        trace_s = manifest.pop("trace_s")
+        self.assertEqual(
+            manifest,
+            {
+                "schema": "recir.snapshot.manifest",
+                "schema_version": 0,
+                "manifest": "trace",
+                "run_key": {"rank": 3, "world_size": 8},
+                "compile_id": {"frame_id": frame, "frame_compile_id": 0},
+                "tier": "index",
+                "outcome": "completed",
+                "artifacts": {"recir_trace_graph": {"status": "emitted"}},
+                **graph,
+            },
+        )
+        # Adam keeps step, exp_avg and exp_avg_sq for the weight and the bias;
+        # model, opt and x each lift to an input placeholder.
+        self.assertEqual(
+            placeholders,
+            {
+                "params": 2,
+                "buffers": 0,
+                "optimizer_states": 6,
+                "inputs": 3,
+            },
+        )
+        self.assertGreaterEqual(trace_s, 0)
+
+    def test_trace_manifest_ignores_post_trace_edits(self) -> None:
+        gm, flat_state = _trace()
+        graph = GraphDump(gm).fields()
+        output = next(n for n in gm.graph.nodes if n.op == "output")
+        with gm.graph.inserting_before(output):
+            gm.graph.call_function(torch.ops.aten.zeros.default, ([1],))
+        gm.recompile()
+        _compile_traced(gm, flat_state)
+        manifest = self.manifest("trace")
+        self.assertEqual(manifest["counts"], graph["counts"])
+        self.assertEqual(manifest["hashes"], graph["hashes"])
+        self.assertNotEqual(manifest["hashes"], GraphDump(gm).fields()["hashes"])
+
+    def test_trace_fields_fault_keeps_the_step_compile(self) -> None:
+        with (
+            mock.patch.object(graph_dump, "_collectives", side_effect=RuntimeError),
+            self.assertLogs(_LOGGER, level="WARNING") as logs,
+        ):
+            gm, flat_state = _trace()
+        self.assertIn("trace manifest fields not taken: RuntimeError", logs.output[0])
+        _compile_traced(gm, flat_state)
+        self.assertIn("recir_trace_graph", self.artifacts())
+        self.assertEqual(self.manifest("trace")["fields_error"], "RuntimeError")
+        self.assertIsNone(self.metrics()["fail_type"])
+
+    def test_graphs_traced_together_each_time_their_own_trace(self) -> None:
+        spec = _GraphSpec(_train_step, _step_inputs(), None)
+        with mock.patch(
+            "recir.compiler.tracing.perf_counter", side_effect=[0.0, 1.0, 10.0, 13.0]
+        ):
+            traced = _trace_graphs([spec, spec])
+        trace_s = []
+        for gm, _ in traced:
+            record = _trace_record(gm)
+            assert record is not None
+            trace_s.append(record.fields["trace_s"])
+        self.assertEqual(trace_s, [1.0, 3.0])
+
+    def test_assembly_manifest(self) -> None:
+        _compile_traced(*_trace())
+        manifest = self.manifest("assembly")
+        self.assertEqual(manifest["manifest"], "assembly")
+        self.assertEqual(manifest["outcome"], "completed")
+        self.assertEqual(
+            manifest["artifacts"], {"recir_assembly_graph": {"status": "emitted"}}
+        )
+        self.assertEqual(set(manifest["hashes"]), {"topology", "shape", "content"})
+        self.assertEqual(manifest["collectives"], {})
+        self.assertEqual(manifest["subgraph_collectives"], [])
+        self.assertIsNone(manifest["collective_order"])
+
+    def test_pipeline_manifest(self) -> None:
+        pipelined = build_pipeline(_region_graph(), sdd_pipeline_config())
+        assert isinstance(pipelined, PipelinedGraphModule)
+        with mock.patch.object(compilation, "build_pipeline", return_value=pipelined):
+            _compile_traced(*_trace())
+        manifest = self.manifest("pipeline")
+        self.assertEqual(
+            manifest["artifacts"], {"recir_pipeline_graph": {"status": "emitted"}}
+        )
+        self.assertEqual(manifest["counts"], GraphDump(pipelined.split_gm).counts)
+
+    def test_graph_text_fault_marks_its_artifact(self) -> None:
+        gm, flat_state = _trace()
+        with (
+            mock.patch.object(GraphDump, "text", side_effect=RuntimeError),
+            self.assertLogs(_LOGGER, level="WARNING"),
+        ):
+            _compile_traced(gm, flat_state)
+        self.assertEqual(
+            self.manifest("assembly")["artifacts"],
+            {
+                "recir_assembly_graph": {
+                    "status": "emit_failed",
+                    "error": "RuntimeError",
+                }
+            },
+        )
+        # The trace's text was taken when the trace ended.
+        self.assertEqual(
+            self.manifest("trace")["artifacts"],
+            {"recir_trace_graph": {"status": "emitted"}},
+        )
+
+    def test_row_fault_keeps_the_graph_text(self) -> None:
+        gm, flat_state = _trace()
+        with (
+            mock.patch.object(graph_dump, "_node_row", side_effect=RuntimeError),
+            self.assertLogs(_LOGGER, level="WARNING") as logs,
+        ):
+            _compile_traced(gm, flat_state)
+        self.assertIn("node rows not built: RuntimeError", logs.output[0])
+        manifest = self.manifest("assembly")
+        self.assertIsNone(manifest["hashes"])
+        self.assertEqual(manifest["rows_error"], "RuntimeError")
+        self.assertEqual(
+            manifest["artifacts"], {"recir_assembly_graph": {"status": "emitted"}}
+        )
+        self.assertIn("recir_assembly_graph", self.artifacts())
+
+    def test_manifest_fault_drops_only_that_manifest(self) -> None:
+        with (
+            mock.patch.object(AssemblyStage, "_fields", side_effect=RuntimeError),
+            self.assertLogs(_LOGGER, level="WARNING") as logs,
+        ):
+            _compile_traced(*_trace())
+        self.assertIn(
+            "recir_assembly_manifest not written: RuntimeError", logs.output[0]
+        )
+        artifacts = self.artifacts()
+        self.assertNotIn("recir_assembly_manifest", artifacts)
+        self.assertIn("recir_assembly_graph", artifacts)
+        self.assertIn("recir_trace_manifest", artifacts)
+        self.assertIsNone(self.metrics()["fail_type"])
+
+    def test_dispatch_manifest(self) -> None:
+        _compile_inductor()
+        manifest = self.manifest("dispatch")
+        self.assertEqual(manifest["outcome"], "completed")
+        self.assertEqual(
+            {k for k in manifest["artifacts"] if k.startswith("recir_dispatch_input")},
+            {
+                f"recir_dispatch_input_{label}_graph"
+                for label in ("setup", "main", "cleanup")
+            },
+        )
+        self.assertEqual(
+            {s["status"] for s in manifest["artifacts"].values()}, {"emitted"}
+        )
+
+    def test_raising_dispatch_writes_outcome_raised(self) -> None:
+        gm, flat_state = _trace()
+        with self.assertRaisesRegex(RuntimeError, "dispatch"):
+            recir.compile_from_gm(
+                gm,
+                flat_state,
+                parallel_mode=_PassthroughParallel(),
+                backend=_RaisingBackend(),
+            )
+        manifest = self.manifest("dispatch")
+        self.assertEqual(manifest["outcome"], "raised")
+        self.assertEqual(manifest["error"], "RuntimeError")
+        self.assertEqual(manifest["artifacts"], {})
+        self.assertEqual(self.manifest("assembly")["outcome"], "completed")
+
+
+def _one_op_graph(op: Any, *args: Any) -> fx.GraphModule:
+    graph = fx.Graph()
+    x = graph.placeholder("x")
+    graph.output(graph.call_function(op, (x, *args)))
+    return fx.GraphModule(nn.Module(), graph)
+
+
+class _Region(enum.Enum):
+    COMPUTE = "compute"
+
+
+class NodeRowsTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        lib = torch.library.Library("recir", "FRAGMENT")
+        lib.define("_obs_test_handle(int handle, Tensor x) -> Tensor")
+        lib.define("_obs_test_instance(str instance_id, Tensor x) -> Tensor")
+        cls.addClassCleanup(lib._destroy)
+
+    def rows(self, graph: fx.Graph) -> list[dict[str, Any]]:
+        return GraphDump(fx.GraphModule(nn.Module(), graph)).rows()
+
+    def test_handle_argument_is_masked(self) -> None:
+        graph = fx.Graph()
+        x = graph.placeholder("x")
+        out = graph.call_function(
+            torch.ops.recir._obs_test_handle.default, (140703210344512, x)
+        )
+        graph.output(out)
+        self.assertEqual(self.rows(graph)[1]["args"], [{"repr": "handle"}, "%x"])
+
+    def test_instance_id_argument_is_masked(self) -> None:
+        graph = fx.Graph()
+        x = graph.placeholder("x")
+        out = graph.call_function(
+            torch.ops.recir._obs_test_instance.default, ("mot_preproc_1403659", x)
+        )
+        graph.output(out)
+        self.assertEqual(self.rows(graph)[1]["args"], [{"repr": "instance_id"}, "%x"])
+
+    def test_node_rows_add_no_shape_guards(self) -> None:
+        gm = make_fx(lambda x: (x.view(-1) * 2, x.size(0)), tracing_mode="symbolic")(
+            torch.randn(4, 3)
+        )
+        val = next(n for n in gm.graph.nodes if n.op == "placeholder").meta["val"]
+        shape_env = val.fake_mode.shape_env
+        guards = len(shape_env.guards)
+        rows = GraphDump(gm).rows()
+        self.assertEqual(len(shape_env.guards), guards)
+        self.assertTrue(all(isinstance(d, str) for d in rows[0]["shape"]))
+
+    def test_collectives_inside_cond_branches(self) -> None:
+        functional = torch.ops._c10d_functional
+        root = nn.Module()
+        root.true_graph_0 = _one_op_graph(functional.all_reduce.default, "sum", "g0")
+        root.false_graph_0 = _one_op_graph(
+            functional.all_gather_into_tensor.default, 2, "g0"
+        )
+        graph = fx.Graph()
+        pred, x = graph.placeholder("pred"), graph.placeholder("x")
+        branches = (graph.get_attr("true_graph_0"), graph.get_attr("false_graph_0"))
+        cond = graph.call_function(torch.ops.higher_order.cond, (pred, *branches, (x,)))
+        top = graph.call_function(functional.all_reduce.default, (x, "sum", "g0"))
+        graph.output((cond, top))
+
+        census, order, kept = GraphDump(fx.GraphModule(root, graph)).collectives()
+
+        # Only one branch runs, so neither branch counts toward the census.
+        self.assertEqual(census, {"all_reduce": 1})
+        self.assertEqual(
+            kept,
+            [
+                {
+                    "node": "cond",
+                    "op": "cond",
+                    "region": None,
+                    "subgraphs": {
+                        "true_graph_0": {"all_reduce": 1},
+                        "false_graph_0": {"all_gather_into_tensor": 1},
+                    },
+                }
+            ],
+        )
+        sequence = [
+            [
+                "cond",
+                None,
+                {
+                    "true_graph_0": [["all_reduce", None, "g0"]],
+                    "false_graph_0": [["all_gather_into_tensor", None, "g0"]],
+                },
+            ],
+            ["all_reduce", None, "g0"],
+        ]
+        expected = hashlib.sha256(
+            json.dumps(sequence, sort_keys=True, default=str).encode()
+        ).hexdigest()[:16]
+        self.assertEqual(order, expected)
+
+    def test_run_once_hop_counts_its_subgraph_collectives(self) -> None:
+        root = nn.Module()
+        root.subgraph_0 = _one_op_graph(
+            torch.ops._c10d_functional.all_reduce.default, "sum", "g0"
+        )
+        graph = fx.Graph()
+        x = graph.placeholder("x")
+        subgraph = graph.get_attr("subgraph_0")
+        graph.output(
+            graph.call_function(
+                torch.ops.higher_order.invoke_subgraph, (subgraph, "id", x)
+            )
+        )
+
+        census, order, kept = GraphDump(fx.GraphModule(root, graph)).collectives()
+
+        self.assertEqual(census, {"all_reduce": 1})
+        self.assertEqual(kept, [])
+        self.assertEqual(order, graph_dump._digest([["all_reduce", None, "g0"]]))
+
+    def test_run_once_hop_lends_its_region_to_its_subgraph_collectives(
+        self,
+    ) -> None:
+        root = nn.Module()
+        root.subgraph_0 = _one_op_graph(
+            torch.ops._c10d_functional.all_reduce.default, "sum", "g0"
+        )
+        graph = fx.Graph()
+        x = graph.placeholder("x")
+        hop = graph.call_function(
+            torch.ops.higher_order.invoke_subgraph,
+            (graph.get_attr("subgraph_0"), "id", x),
+        )
+        hop.meta[PIPELINE_REGION_META] = "compute"
+        graph.output(hop)
+
+        _, order, _ = GraphDump(fx.GraphModule(root, graph)).collectives()
+
+        self.assertEqual(order, graph_dump._digest([["all_reduce", "compute", "g0"]]))
+
+    def test_cond_inside_a_tagged_run_once_hop_takes_its_region(self) -> None:
+        functional = torch.ops._c10d_functional
+        inner = nn.Module()
+        inner.true_graph_0 = _one_op_graph(functional.all_reduce.default, "sum", "g0")
+        inner.false_graph_0 = _one_op_graph(functional.all_reduce.default, "sum", "g0")
+        inner_graph = fx.Graph()
+        pred, y = inner_graph.placeholder("pred"), inner_graph.placeholder("y")
+        branches = (
+            inner_graph.get_attr("true_graph_0"),
+            inner_graph.get_attr("false_graph_0"),
+        )
+        inner_graph.output(
+            inner_graph.call_function(
+                torch.ops.higher_order.cond, (pred, *branches, (y,))
+            )
+        )
+        root = nn.Module()
+        root.subgraph_0 = fx.GraphModule(inner, inner_graph)
+        graph = fx.Graph()
+        p, x = graph.placeholder("p"), graph.placeholder("x")
+        hop = graph.call_function(
+            torch.ops.higher_order.invoke_subgraph,
+            (graph.get_attr("subgraph_0"), "id", p, x),
+        )
+        hop.meta[PIPELINE_REGION_META] = "compute"
+        graph.output(hop)
+
+        _, _, kept = GraphDump(fx.GraphModule(root, graph)).collectives()
+
+        self.assertEqual(
+            [(k["node"], k["region"]) for k in kept],
+            [("invoke_subgraph/subgraph_0/cond", "compute")],
+        )
+
+    def test_a_region_tag_of_any_type_is_kept_as_text(self) -> None:
+        root = nn.Module()
+        root.cond_fn = _one_op_graph(
+            torch.ops._c10d_functional.all_reduce.default, "sum", "g0"
+        )
+        root.body_fn = _one_op_graph(torch.ops.aten.relu.default)
+        graph = fx.Graph()
+        x = graph.placeholder("x")
+        fns = (graph.get_attr("cond_fn"), graph.get_attr("body_fn"))
+        loop = graph.call_function(torch.ops.higher_order.while_loop, (*fns, (x,), ()))
+        loop.meta[PIPELINE_REGION_META] = _Region.COMPUTE
+        graph.output(loop)
+
+        fields = GraphDump(fx.GraphModule(root, graph)).fields(collectives=True)
+
+        [entry] = json.loads(json.dumps(fields))["subgraph_collectives"]
+        self.assertEqual(entry["region"], "_Region.COMPUTE")
+
+    def test_while_loop_keeps_its_subgraph_collectives_out_of_the_census(
+        self,
+    ) -> None:
+        functional = torch.ops._c10d_functional
+        root = nn.Module()
+        root.cond_fn = _one_op_graph(functional.all_reduce.default, "sum", "g0")
+        root.body_fn = _one_op_graph(functional.all_gather_into_tensor.default, 2, "g0")
+        graph = fx.Graph()
+        x = graph.placeholder("x")
+        fns = (graph.get_attr("cond_fn"), graph.get_attr("body_fn"))
+        graph.output(
+            graph.call_function(torch.ops.higher_order.while_loop, (*fns, (x,), ()))
+        )
+
+        census, _, kept = GraphDump(fx.GraphModule(root, graph)).collectives()
+
+        self.assertEqual(census, {})
+        self.assertEqual(
+            kept,
+            [
+                {
+                    "node": "while_loop",
+                    "op": "while_loop",
+                    "region": None,
+                    "subgraphs": {
+                        "cond_fn": {"all_reduce": 1},
+                        "body_fn": {"all_gather_into_tensor": 1},
+                    },
+                }
+            ],
+        )
+
+    def test_argument_encoding(self) -> None:
+        self.assertEqual(graph_dump._arg("%x"), "%%x")
+        self.assertEqual(graph_dump._arg(float("inf")), {"float": "inf"})
+        self.assertEqual(graph_dump._arg({"a": 1}), {"dict": {"a": 1}})
+        self.assertEqual(graph_dump._arg(torch.float32), {"repr": "torch.float32"})
+        self.assertEqual(graph_dump._arg(object()), {"type": "builtins.object"})
 
 
 def _fake_compile_logging_ir(

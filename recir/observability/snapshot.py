@@ -16,6 +16,7 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from typing import Any, Callable, Iterator
 
+import torch.utils._pytree as pytree
 from recir.lowering.lowering_inputs import LoweringObserver
 from recir.observability.compiles import (
     snapshots_on,
@@ -36,15 +37,30 @@ _observer: ContextVar[LoweringObserver | None] = ContextVar(
 )
 
 
-def keep_trace(traced: Callable[..., Any], gm: fx.GraphModule) -> TraceRecord | None:
+def keep_trace(
+    traced: Callable[..., Any],
+    gm: fx.GraphModule,
+    *,
+    params: dict[str, Any],
+    buffers: dict[str, Any],
+    named_states: dict[str, Any],
+    trace_s: float,
+) -> TraceRecord | None:
     """
-    What the step compiles of ``gm``, traced from ``traced``, need from the
-    trace, taken now so no later edit to ``gm`` shows in it; None when
-    snapshots are off. Never raises.
+    What the step compiles of ``gm``, traced from ``traced`` in ``trace_s``
+    seconds, need from the trace, taken now so no later edit to ``gm`` shows
+    in it; None when snapshots are off. ``params``, ``buffers`` and
+    ``named_states`` (optimizer states) are the state the trace lifted into
+    ``gm``'s placeholders. Never raises.
     """
     with contained("trace not kept"):
         if snapshots_on():
-            return TraceRecord.of(traced, gm)
+            state = {
+                "params": len(pytree.tree_leaves(params)),
+                "buffers": len(pytree.tree_leaves(buffers)),
+                "optimizer_states": len(pytree.tree_leaves(named_states)),
+            }
+            return TraceRecord.of(traced, gm, state=state, trace_s=trace_s)
     return None
 
 

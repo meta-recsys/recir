@@ -4,23 +4,27 @@
 # This source code is licensed under the BSD-3-Clause license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Compile ids in tlparse, the stages created for them, and the graphs written under them."""
+"""Compile ids in tlparse, the stages created for them, and the graphs and manifests written under them."""
 
 from __future__ import annotations
 
 import inspect
+import json
+import os
 import sys
 import time
 import traceback
 from contextlib import contextmanager, ExitStack
 from dataclasses import dataclass
 from types import FrameType
-from typing import Any, Callable, Iterator, Self, TypeVar
+from typing import Any, Callable, Iterator, Mapping, Self, TypeVar
 
+import torch.distributed as dist
 from recir.observability.graph_dump import GraphDump
 from recir.observability.guard import contained
 from recir.observability.settings import Settings
 from recir.observability.stages import GraphStage, Stage, TraceStage
+from recir.observability.status import ArtifactState, ArtifactStatus, Outcome
 from torch import fx
 from torch._guards import compile_context, CompileContext, CompileId
 from torch._logging import trace_structured
@@ -33,6 +37,7 @@ _C = TypeVar("_C", bound="TlparseCompile")
 # recir packages that call into RecIR like any user, as test modules anywhere
 # in recir do; every other recir module is RecIR's own.
 _CALLERS: frozenset[str] = frozenset({"examples", "fb"})
+_MANIFEST_SCHEMA_VERSION = 0
 
 
 def _is_internal(frame: FrameType) -> bool:
@@ -65,23 +70,58 @@ def code_location(fn: Callable[..., Any]) -> tuple[str, int] | None:
     return None if code is None else (code.co_filename, code.co_firstlineno)
 
 
+def _run_key() -> dict[str, int]:
+    # This process's place in its job: torch.distributed's, else the launcher's.
+    if dist.is_available() and dist.is_initialized():
+        return {"rank": dist.get_rank(), "world_size": dist.get_world_size()}
+    try:
+        rank, world_size = int(os.environ["RANK"]), int(os.environ["WORLD_SIZE"])
+    except (KeyError, ValueError):
+        rank, world_size = 0, 1
+    return {"rank": rank, "world_size": world_size}
+
+
 @dataclass(frozen=True)
 class TraceRecord:
     """
     What a step compile keeps of its trace, taken when the trace ends: the
-    traced graph's text and node counts, and where the traced function is
-    defined. Plain data, so it pickles with the traced graph.
+    graph's text and counts, where the traced function is defined, and the
+    trace manifest's fields. Plain data, so it pickles with the traced graph.
     """
 
     text: str
     counts: dict[str, int]
     code_location: tuple[str, int] | None
+    fields: dict[str, Any]
 
     @classmethod
-    def of(cls, traced: Callable[..., Any], gm: fx.GraphModule) -> TraceRecord:
-        """The record of ``gm``, traced from ``traced``."""
+    def of(
+        cls,
+        traced: Callable[..., Any],
+        gm: fx.GraphModule,
+        *,
+        state: dict[str, int],
+        trace_s: float,
+    ) -> TraceRecord:
+        """
+        The record of ``gm``, traced from ``traced`` in ``trace_s`` seconds;
+        ``state`` counts the placeholders of each kind of lifted state, and
+        the rest are inputs.
+        """
         dump = GraphDump(gm)
-        return cls(dump.text(), dump.counts, code_location(traced))
+        text, counts = dump.text(), dump.counts
+        fields: dict[str, Any] = {}
+        with contained("trace manifest fields not taken") as fault:
+            fields = {
+                **dump.fields(collectives=True),
+                "placeholders": {
+                    **state,
+                    "inputs": counts["placeholder"] - sum(state.values()),
+                },
+                "trace_s": round(trace_s, 3),
+            }
+        fault.note(fields, "fields")
+        return cls(text, counts, code_location(traced), fields)
 
 
 class TlparseCompile:
@@ -89,11 +129,11 @@ class TlparseCompile:
     Base class for all tlparse compiles: one compile id in tlparse.
 
     This class is responsible for reserving the compile id, placing it in
-    tlparse's stack trie with ``dynamo_start``, writing payloads under the id,
-    and closing it with ``compilation_metrics``, which color its stack-trie
-    link green or red. A write is skipped when no trace handler is attached,
-    and a write fault is logged rather than raised. It holds all of RecIR's
-    contact with torch's structured-trace internals.
+    tlparse's stack trie with ``dynamo_start``, writing payloads and manifests
+    under the id, and closing it with ``compilation_metrics``, which color its
+    stack-trie link green or red. A write is skipped when no trace handler is
+    attached, and a write fault is logged rather than raised. It holds all of
+    RecIR's contact with torch's structured-trace internals.
 
     The id is reserved on construction; the compile appears in tlparse when
     its work starts inside ``compiling()``. ``counts`` are the node counts its
@@ -101,7 +141,8 @@ class TlparseCompile:
     function is defined.
 
     This can be extended to another kind of compile by subclassing and
-    providing ``name`` and ``_fail_reason()``, and by overriding ``_setup``.
+    providing ``name`` and ``_fail_reason()``, and by overriding ``_setup``
+    and ``_started``.
     """
 
     def __init__(
@@ -141,16 +182,16 @@ class TlparseCompile:
         exception from the work passes through unchanged.
         """
         setup = ExitStack()
-        started = False
-        with contained(f"{self.name} not started"):
+        with contained(f"{self.name} not started") as fault:
             self._setup(setup)
             self._start()
-            started = True
-        if not started:
+        if fault.error is not None:
             with contained(f"{self.name} setup not undone"):
                 setup.close()
             yield None
             return
+        with contained(f"{self.name} start not recorded"):
+            self._started()
         self._start_s = time.time()
         error: BaseException | None = None
         try:
@@ -167,6 +208,11 @@ class TlparseCompile:
     def _setup(self, stack: ExitStack) -> None:
         # What must be in force while the work runs, entered before dynamo_start
         # with its undo on stack; the undo runs before compilation_metrics.
+        pass
+
+    def _started(self) -> None:
+        # What to record once the compile is in tlparse, before its work runs;
+        # a fault here costs only the record, and the compile still closes.
         pass
 
     def _start(self) -> None:
@@ -215,21 +261,70 @@ class TlparseCompile:
     def _compile_context(self) -> CompileContext:
         return CompileContext(CompileId(frame_id=self.frame_id, frame_compile_id=0))
 
-    def write(self, name: str, body: Callable[[], str]) -> None:
+    def write(self, name: str, body: Callable[[], str]) -> ArtifactStatus | None:
         """
-        Write the text payload ``name`` under this compile id, unless no trace
-        handler is attached. ``body`` is only called when the payload is
-        written, and a fault, formatting included, is logged and never raised.
+        Write the text payload ``name`` under this compile id and give its
+        status, unless no trace handler is attached, which gives None.
+        ``body`` is only called when the payload is written, and a fault,
+        formatting included, is logged and never raised.
         """
+        return self._write(name, "string", body)
+
+    def write_manifest(
+        self,
+        kind: str,
+        *,
+        error: BaseException | None,
+        artifacts: Mapping[str, ArtifactStatus],
+        fields: Callable[[], dict[str, Any]],
+    ) -> None:
+        """
+        Write a ``kind`` manifest, ``recir_{kind}_manifest``, as JSON under
+        this compile id: the envelope every manifest starts with, closing with
+        the outcome of the code that raised ``error``, if anything, and the
+        statuses of its ``artifacts``, then ``fields()``. As with ``write``,
+        ``fields`` is only called when the manifest is written, and a fault
+        drops only this manifest.
+        """
+
+        def body() -> str:
+            compile_id = self._compile_context().compile_id
+            assert compile_id is not None
+            manifest: dict[str, Any] = {
+                "schema": "recir.snapshot.manifest",
+                "schema_version": _MANIFEST_SCHEMA_VERSION,
+                "manifest": kind,
+                "run_key": _run_key(),
+                "compile_id": {
+                    "frame_id": compile_id.frame_id,
+                    "frame_compile_id": compile_id.frame_compile_id,
+                },
+                "tier": Settings.load().tier.value,
+                "outcome": Outcome.of(error).value,
+            }
+            if error is not None:
+                manifest["error"] = type(error).__name__
+            manifest["artifacts"] = {k: v.to_json() for k, v in artifacts.items()}
+            manifest.update(fields())
+            return json.dumps(manifest, indent=1, allow_nan=False)
+
+        self._write(f"recir_{kind}_manifest", "json", body)
+
+    def _write(
+        self, name: str, encoding: str, body: Callable[[], str]
+    ) -> ArtifactStatus | None:
         if not self.has_sink():
-            return
-        with contained(f"{name} not written"):
+            return None
+        with contained(f"{name} not written") as fault:
             text = body()
             self._emit(
                 "artifact",
-                lambda: {"name": name, "encoding": "string"},
+                lambda: {"name": name, "encoding": encoding},
                 lambda: text,
             )
+        if fault.error is not None:
+            return ArtifactStatus(ArtifactState.EMIT_FAILED, fault.error_type)
+        return ArtifactStatus(ArtifactState.EMITTED)
 
     @staticmethod
     def _reserve_frame_id() -> int:
@@ -280,14 +375,14 @@ class StepCompile(TlparseCompile):
     ``recir.trace`` returned and the RecIR stages that follow it.
 
     This class is responsible for snapshotting the step's stages as RecIR's
-    code reaches them, starting with the trace stage from ``trace`` when the
-    compile starts. It appears in tlparse as "recir step compile", at the
+    code reaches them, starting with the trace stage from ``trace`` once the
+    compile has started. It appears in tlparse as "recir step compile", at the
     traced function's definition, with the traced graph's node counts.
     """
 
     def __init__(self, trace: TraceRecord) -> None:
         super().__init__(trace.counts, trace.code_location)
-        self._trace_text = trace.text
+        self._trace = trace
         self.stages: list[Stage] = []
 
     @property
@@ -308,12 +403,13 @@ class StepCompile(TlparseCompile):
         self.stages.append(stage)
         return stage
 
-    def _start(self) -> None:
-        super()._start()
-        self.begin(TraceStage).record(self._trace_text)
+    def _started(self) -> None:
+        self.begin(TraceStage).record(self._trace.text, self._trace.fields)
 
     def _fail_reason(self, error: BaseException) -> str:
-        completed = [stage.name for stage in self.stages if stage.completed]
+        completed = [
+            stage.name for stage in self.stages if stage.outcome is Outcome.COMPLETED
+        ]
         if not completed:
             return "raised before any RecIR stage completed"
         return f"raised after RecIR stage {completed[-1]}"
