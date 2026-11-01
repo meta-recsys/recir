@@ -12,7 +12,7 @@ import inspect
 import sys
 import time
 import traceback
-from contextlib import contextmanager
+from contextlib import contextmanager, ExitStack
 from dataclasses import dataclass
 from types import FrameType
 from typing import Any, Callable, Iterator, Self, TypeVar
@@ -28,6 +28,7 @@ from torch._logging._internal import trace_log
 from torch._logging.structured import from_traceback
 
 _S = TypeVar("_S", bound=Stage)
+_C = TypeVar("_C", bound="TlparseCompile")
 
 # recir packages that call into RecIR like any user, as test modules anywhere
 # in recir do; every other recir module is RecIR's own.
@@ -35,9 +36,13 @@ _CALLERS: frozenset[str] = frozenset({"examples", "fb"})
 
 
 def _is_internal(frame: FrameType) -> bool:
-    # RecIR's own frames and the context-manager plumbing between them.
-    module = frame.f_globals.get("__name__", "")
-    if module == "contextlib":
+    # RecIR's own frames and the call plumbing between them: context managers,
+    # torch (nn.Module and FX calls, wrappers like DDP or checkpoint) and FX's
+    # generated forwards, which run with no module name.
+    if "__name__" not in frame.f_globals:
+        return True
+    module = frame.f_globals["__name__"]
+    if module in ("contextlib", "torch") or module.startswith("torch."):
         return True
     path = module.split(".")
     if path[0] != "recir":
@@ -96,7 +101,7 @@ class TlparseCompile:
     function is defined.
 
     This can be extended to another kind of compile by subclassing and
-    providing ``name`` and ``_fail_reason()``.
+    providing ``name`` and ``_fail_reason()``, and by overriding ``_setup``.
     """
 
     def __init__(
@@ -131,15 +136,19 @@ class TlparseCompile:
         """
         Run the compile's work inside this context, which gives the compile, or
         None when it could not start. A started compile is closed on exit with
-        ``compilation_metrics``, raised or not; after a fault while it starts,
-        the work runs as no compile and nothing is closed. An exception from
-        the work passes through unchanged.
+        ``compilation_metrics``, raised or not; after a fault while it sets up
+        or starts, the work runs as no compile and nothing is closed. An
+        exception from the work passes through unchanged.
         """
+        setup = ExitStack()
         started = False
         with contained(f"{self.name} not started"):
+            self._setup(setup)
             self._start()
             started = True
         if not started:
+            with contained(f"{self.name} setup not undone"):
+                setup.close()
             yield None
             return
         self._start_s = time.time()
@@ -150,8 +159,15 @@ class TlparseCompile:
             error = e
             raise
         finally:
+            with contained(f"{self.name} setup not undone"):
+                setup.close()
             with contained(f"{self.name} not finished"):
                 self._finish(error)
+
+    def _setup(self, stack: ExitStack) -> None:
+        # What must be in force while the work runs, entered before dynamo_start
+        # with its undo on stack; the undo runs before compilation_metrics.
+        pass
 
     def _start(self) -> None:
         # Emit dynamo_start, placing this compile in tlparse's stack trie under
@@ -188,14 +204,16 @@ class TlparseCompile:
         """
         Emit one structured-trace event under this compile id.
 
-        The id is pushed around the emit only, so PT2 never books RecIR's own
-        work as compile time.
+        The id is pushed around the emit only, so PT2 books none of RecIR's own
+        work under it; a build holds it for its whole compile in ``_setup``.
         """
-        compile_id = CompileId(frame_id=self.frame_id, frame_compile_id=0)
-        with compile_context(CompileContext(compile_id)):
+        with compile_context(self._compile_context()):
             trace_structured(
                 event, metadata, payload_fn=payload, record_logging_overhead=False
             )
+
+    def _compile_context(self) -> CompileContext:
+        return CompileContext(CompileId(frame_id=self.frame_id, frame_compile_id=0))
 
     def write(self, name: str, body: Callable[[], str]) -> None:
         """
@@ -236,6 +254,24 @@ class TlparseCompile:
         summaries = traceback.extract_stack(frame) if frame is not None else []
         summaries.append(traceback.FrameSummary("recir", 0, self.name, line=""))
         return summaries
+
+
+@contextmanager
+def snapshotted(create: Callable[[], _C], what: str) -> Iterator[_C | None]:
+    """
+    Run the work inside this context as the compile ``create`` makes, which it
+    gives, while snapshots are on; otherwise, or after a snapshot fault, the
+    work runs as no compile and it gives None.
+    """
+    made = None
+    with contained(f"{what} not created"):
+        if snapshots_on():
+            made = create()
+    if made is None:
+        yield None
+        return
+    with made.compiling() as started:
+        yield started
 
 
 class StepCompile(TlparseCompile):

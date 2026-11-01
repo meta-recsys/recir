@@ -13,7 +13,6 @@ from typing import Any, Sequence, TYPE_CHECKING
 
 from recir.backends.base import Backend, GraphPatch
 from recir.composite import CompositeModule
-from recir.lowering.lowering_inputs import lower_inputs
 from recir.lowering.partial_lower import partial_lower
 from recir.passes import remove_copy_from_optimizer
 from torch import fx, nn
@@ -42,8 +41,12 @@ class InductorBackend(Backend):
     def uses_iter_graph(self) -> bool:
         return True
 
+    @property
+    def lowers_composites(self) -> bool:
+        return True
+
     def dispatch(self, gm: fx.GraphModule | CompositeModule) -> nn.Module:
-        return lower_inputs(gm, partial_lower)
+        return self._lower_inputs(gm, partial_lower)
 
     def validate_with(self, parallel_mode: "ParallelMode") -> None:
         from recir.distributed.parallel_mode import GSPMDParallel

@@ -10,30 +10,47 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
+import functools
 import logging
 import os
 import pickle
 import unittest
-from typing import Any
+from contextlib import nullcontext
+from typing import Any, Callable, cast, Iterator
 from unittest import mock
 
 import recir
 import torch
 import torch.nn as nn
+from recir.backends.inductor import InductorBackend
 from recir.compiler import compilation
 from recir.compiler.tracing import _GraphSpec, _trace_graphs, _trace_record
-from recir.observability import compiles
+from recir.composite import Part
+from recir.lowering import lowering_utils
+from recir.lowering.lowering_inputs import _InputHooks, LoweringObserver, WHOLE
+from recir.lowering.lowering_utils import CarvedRegion, LazilyBuiltModule
+from recir.lowering.partial_lower import partial_lower
+from recir.observability import compiles, inductor_build, snapshot
+from recir.observability.builds import BuildTicket, SubgraphBuild
 from recir.observability.compiles import StepCompile, TlparseCompile, TraceRecord
+from recir.observability.dispatch import ObservedLowering
 from recir.observability.graph_dump import GraphDump
 from recir.observability.settings import Settings, Tier
 from recir.pipeline import build_pipeline, PipelinedGraphModule, SteadyStateGraphModule
 from recir.pipeline_strategies import sdd_pipeline_config
 from recir.region_transforms import RegionTransform
-from recir.tests.test_utils import _NoopBackend, _PassthroughParallel, _region_graph
+from recir.tests.test_utils import (
+    _graph,
+    _NoopBackend,
+    _PassthroughParallel,
+    _region_graph,
+)
 from recir.training.compile import compile_step
 from torch import fx
 from torch._dynamo import convert_frame
+from torch._dynamo.utils import counters
 from torch._guards import CompileContext
+from torch._inductor.utils import fresh_cache
 from torch._logging._internal import trace_log
 
 _LOGGER = "recir.observability"
@@ -486,6 +503,17 @@ class CompileFromGmTest(unittest.TestCase):
         self.assertIn("recir step compile not started: RuntimeError", logs.output[0])
         self.assertEqual(self.capture.events, [])
 
+    def test_create_fault_never_fails_the_compile(self) -> None:
+        gm, flat_state = _trace()
+        with (
+            mock.patch.object(StepCompile, "__init__", side_effect=RuntimeError),
+            self.assertLogs("recir.observability.guard", level="WARNING") as logs,
+        ):
+            compiled = _compile_traced(gm, flat_state)
+        self.assertIsNotNone(compiled.gm)
+        self.assertIn("step compile not created: RuntimeError", logs.output[0])
+        self.assertEqual(self.capture.events, [])
+
     def test_tier_off_spends_no_compile_id(self) -> None:
         _set_tier(self, Tier.OFF)
         frames_before = convert_frame.FRAME_COUNTER
@@ -543,3 +571,479 @@ class SettingsTest(unittest.TestCase):
         ):
             settings = Settings.from_env()
         self.assertFalse(settings.enabled)
+
+
+@contextlib.contextmanager
+def _dispatching(backend: str = "InductorBackend") -> Iterator[StepCompile]:
+    """A running step compile whose backend dispatch is observed, as in compile_from_gm."""
+    gm = fx.symbolic_trace(_ToyModel())
+    with StepCompile(TraceRecord.of(_ToyModel.forward, gm)).compiling() as step:
+        assert step is not None
+        with snapshot.dispatching(step, backend):
+            yield step
+
+
+def _observer() -> ObservedLowering:
+    observer = snapshot.lowering_observer()
+    assert isinstance(observer, ObservedLowering)
+    return observer
+
+
+def _lower(observer: LoweringObserver, part: Part, gm: fx.GraphModule) -> nn.Module:
+    """Lower ``gm`` as the dispatch input ``part``, reporting to ``observer`` as ``lower_inputs`` does."""
+    return partial_lower(gm, hooks=_InputHooks(observer, part))
+
+
+def _report_carves(
+    observer: LoweringObserver, part: Part, gm: fx.GraphModule, count: int
+) -> list[LazilyBuiltModule]:
+    """Report ``count`` regions carved from ``part`` without lowering anything."""
+    modules = [LazilyBuiltModule() for _ in range(count)]
+    hooks = _InputHooks(observer, part)
+    for index, module in enumerate(modules):
+        hooks.on_carved(CarvedRegion(f"subgraph_{index}", gm, module))
+    return modules
+
+
+def _carved(*lowered: nn.Module) -> list[LazilyBuiltModule]:
+    return [
+        m
+        for root in lowered
+        for m in root.modules()
+        if isinstance(m, LazilyBuiltModule)
+    ]
+
+
+class _SnapshotTestCase(unittest.TestCase):
+    def setUp(self) -> None:
+        self.capture = _Capture()
+        trace_log.addHandler(self.capture)
+        self.addCleanup(trace_log.removeHandler, self.capture)
+        _set_tier(self, Tier.INDEX)
+
+    def metrics(self) -> dict[str, Any]:
+        name, metadata, _ = self.capture.events[-1]
+        self.assertEqual(name, "compilation_metrics")
+        return metadata["compilation_metrics"]
+
+    def build_names(self) -> list[str]:
+        """The builds that started, in start order."""
+        return [
+            m["dynamo_start"]["stack"][-1]["name"]
+            for n, m, _ in self.capture.events
+            if n == "dynamo_start"
+            and m["dynamo_start"]["stack"][-1]["name"].startswith("recir build")
+        ]
+
+    def build_frame(self, name: str) -> int:
+        [frame] = [
+            m["frame_id"]
+            for n, m, _ in self.capture.events
+            if n == "dynamo_start" and m["dynamo_start"]["stack"][-1]["name"] == name
+        ]
+        return frame
+
+    def events_at(self, frame: int) -> list[str]:
+        return [
+            m["artifact"]["name"] if name == "artifact" else name
+            for name, m, _ in self.capture.events
+            if m["frame_id"] == frame
+        ]
+
+    def build(self, lowered: nn.Module, compile_fx: Any) -> None:
+        with mock.patch(
+            "torch._inductor.compile_fx.compile_fx", side_effect=compile_fx
+        ):
+            lowered(torch.randn(4))
+
+
+def _passthrough(sub_gm: fx.GraphModule, inputs: Any, **kwargs: Any) -> Any:
+    return sub_gm
+
+
+class SubgraphBuildTest(_SnapshotTestCase):
+    def test_build_turns_off_the_bundled_autotune_cache(self) -> None:
+        seen: list[bool | None] = []
+
+        def record(sub_gm: fx.GraphModule, inputs: Any, **kwargs: Any) -> Any:
+            seen.append(torch._inductor.config.bundled_autotune_remote_cache)
+            return sub_gm
+
+        with _dispatching():
+            lowered = _lower(_observer(), WHOLE, _graph())
+        self.build(lowered, record)
+        self.assertTrue(seen)
+        self.assertEqual(set(seen), {False})
+
+    def test_carving_takes_no_compile_id(self) -> None:
+        with _dispatching():
+            frames = convert_frame.FRAME_COUNTER
+            _report_carves(_observer(), WHOLE, _graph(), 3)
+            self.assertEqual(convert_frame.FRAME_COUNTER, frames)
+
+    def test_builds_are_named_after_their_part_and_numbered_as_they_run(
+        self,
+    ) -> None:
+        gm = _graph()
+        with _dispatching() as step:
+            observer = _observer()
+            first = _report_carves(observer, Part("route_start", 0), gm, 1)
+            later = _report_carves(observer, Part("compute", 2), gm, 2)
+        for module in [later[1], first[0]]:
+            with module.compile_scope():
+                pass
+        self.assertEqual(
+            self.build_names(),
+            [
+                "recir build stage2_compute subgraph_1",
+                "recir build stage0_route_start subgraph_0",
+            ],
+        )
+        self.assertGreater(
+            self.build_frame("recir build stage0_route_start subgraph_0"),
+            self.build_frame("recir build stage2_compute subgraph_1"),
+        )
+        self.assertGreater(
+            self.build_frame("recir build stage2_compute subgraph_1"), step.frame_id
+        )
+
+    def test_real_build_writes_pt2_artifacts_under_its_compile_id(self) -> None:
+        with _dispatching():
+            lowered = _lower(_observer(), WHOLE, _graph())
+        # A real, uncached Inductor build, so PT2 writes its own artifacts.
+        with mock.patch.object(torch.compiler.config, "force_disable_caches", True):
+            lowered(torch.randn(4))
+        names = self.events_at(self.build_frame("recir build whole subgraph_0"))
+        for artifact in (
+            "aot_inference_graph",
+            "inductor_post_grad_graph",
+            "inductor_output_code",
+        ):
+            self.assertIn(artifact, names)
+        self.assertIsNone(self.metrics()["fail_type"])
+
+    def test_a_build_served_from_the_cache_still_closes(self) -> None:
+        counters.clear()
+        with (
+            fresh_cache(),
+            torch._inductor.config.patch(
+                fx_graph_cache=True,
+                fx_graph_remote_cache=False,
+                autotune_remote_cache=False,
+            ),
+        ):
+            for _ in range(2):
+                with _dispatching():
+                    lowered = _lower(_observer(), WHOLE, _graph())
+                lowered(torch.randn(4))
+        closes = [
+            m["compilation_metrics"]
+            for n, m, _ in self.capture.events
+            if n == "compilation_metrics"
+            and m["compilation_metrics"]["co_name"] == "recir build whole subgraph_0"
+        ]
+        self.assertEqual(len(closes), 2)
+        self.assertEqual([c["fail_type"] for c in closes], [None, None])
+        self.assertEqual(counters["inductor"]["fxgraph_cache_hit"], 1)
+
+    def test_build_sits_under_the_call_into_the_lowered_graph(self) -> None:
+        with _dispatching():
+            lowered = _lower(_observer(), WHOLE, _graph())
+        # self.build calls the lowered GraphModule, whose forward calls the
+        # carved module through FX's and nn.Module's call plumbing.
+        self.build(lowered, _passthrough)
+        [start] = [
+            m
+            for name, m, _ in self.capture.events
+            if name == "dynamo_start"
+            and m["dynamo_start"]["stack"][-1]["name"] == "recir build whole subgraph_0"
+        ]
+        names = [frame["name"] for frame in start["dynamo_start"]["stack"]]
+        self.assertEqual(names[-2:], ["build", "recir build whole subgraph_0"])
+
+    def test_no_build_outside_a_dispatch(self) -> None:
+        self.assertIsNone(snapshot.lowering_observer())
+        lowered = InductorBackend().dispatch(_graph())
+        self.assertIs(lowered.get_submodule("subgraph_0").compile_scope, nullcontext)
+
+    def test_no_build_when_the_compile_is_not_snapshotted(self) -> None:
+        with snapshot.dispatching(None, "InductorBackend"):
+            self.assertIsNone(snapshot.lowering_observer())
+
+    def test_no_build_once_snapshots_are_off(self) -> None:
+        with _dispatching():
+            [module] = _carved(_lower(_observer(), WHOLE, _graph()))
+        restored = pickle.loads(pickle.dumps(module.compile_scope))
+        frames = convert_frame.FRAME_COUNTER
+        seen = []
+        with mock.patch.object(Settings, "_loaded", Settings(tier=Tier.OFF)):
+            with restored():
+                seen.append(CompileContext.current_compile_id())
+        with mock.patch.object(trace_log, "handlers", []):
+            with module.compile_scope():
+                seen.append(CompileContext.current_compile_id())
+        self.assertEqual(seen, [None, None])
+        self.assertEqual(convert_frame.FRAME_COUNTER, frames)
+
+    def test_observer_fault_never_fails_lowering(self) -> None:
+        with (
+            _dispatching(),
+            mock.patch.object(BuildTicket, "__init__", side_effect=RuntimeError),
+            self.assertLogs("recir.lowering", level="WARNING") as logs,
+        ):
+            lowered = _lower(_observer(), WHOLE, _graph())
+        self.assertIsInstance(lowered.get_submodule("subgraph_0"), nn.Module)
+        self.assertIn("carved failed: RuntimeError", logs.output[0])
+
+    def test_partial_lower_builds_under_their_compile_id(self) -> None:
+        def fake_compile_fx(
+            sub_gm: fx.GraphModule, inputs: Any, **kwargs: Any
+        ) -> fx.GraphModule:
+            torch._logging.trace_structured(
+                "artifact",
+                metadata_fn=lambda: {"name": "fake_output_code", "encoding": "string"},
+                payload_fn=lambda: "code",
+            )
+            return sub_gm
+
+        with _dispatching():
+            lowered = _lower(_observer(), Part("compute", 2), _graph())
+        self.build(lowered, fake_compile_fx)
+        name = "recir build stage2_compute subgraph_0"
+        events = self.events_at(self.build_frame(name))
+        self.assertEqual(
+            (events[0], events[-1]), ("dynamo_start", "compilation_metrics")
+        )
+        # The backend's own artifact lands under the build's id.
+        self.assertIn("fake_output_code", events)
+        metrics = self.metrics()
+        self.assertEqual(metrics["co_name"], name)
+        self.assertIsNone(metrics["fail_type"])
+        self.assertGreater(metrics["graph_op_count"], 0)
+
+    def test_failed_build_is_reported(self) -> None:
+        with _dispatching():
+            lowered = InductorBackend().dispatch(_graph())
+        with self.assertRaises(RuntimeError):
+            self.build(lowered, mock.Mock(side_effect=RuntimeError("boom")))
+        metrics = self.metrics()
+        self.assertEqual(metrics["fail_type"], "RuntimeError")
+        self.assertEqual(metrics["fail_reason"], "the InductorBackend build raised")
+        self.assertEqual(metrics["co_name"], "recir build whole subgraph_0")
+
+    def test_a_build_that_never_started_is_never_closed(self) -> None:
+        with _dispatching():
+            lowered = _lower(_observer(), WHOLE, _graph())
+        events = len(self.capture.events)
+        with (
+            mock.patch.object(SubgraphBuild, "_start", side_effect=RuntimeError),
+            self.assertLogs(_LOGGER, level="WARNING") as logs,
+        ):
+            self.build(lowered, _passthrough)
+        self.assertNotIn(
+            "compilation_metrics", [n for n, _, _ in self.capture.events[events:]]
+        )
+        self.assertIn("recir build whole subgraph_0 not started", logs.output[0])
+        self.assertIsNone(CompileContext.current_compile_id())
+
+    def test_create_fault_builds_with_no_compile_id(self) -> None:
+        with _dispatching():
+            lowered = _lower(_observer(), WHOLE, _graph())
+        events = len(self.capture.events)
+        seen = []
+
+        def record(sub_gm: fx.GraphModule, inputs: Any, **kwargs: Any) -> Any:
+            seen.append(CompileContext.current_compile_id())
+            return sub_gm
+
+        with (
+            mock.patch.object(SubgraphBuild, "__init__", side_effect=RuntimeError),
+            self.assertLogs("recir.observability.guard", level="WARNING") as logs,
+        ):
+            self.build(lowered, record)
+        self.assertEqual(seen, [None])
+        self.assertIn(
+            "recir build whole subgraph_0 not created: RuntimeError", logs.output[0]
+        )
+        self.assertEqual(self.capture.events[events:], [])
+
+    def test_setup_fault_builds_with_no_compile_id(self) -> None:
+        with _dispatching():
+            lowered = _lower(_observer(), WHOLE, _graph())
+        events = len(self.capture.events)
+        seen = []
+
+        def record(sub_gm: fx.GraphModule, inputs: Any, **kwargs: Any) -> Any:
+            seen.append(CompileContext.current_compile_id())
+            return sub_gm
+
+        with (
+            mock.patch.object(
+                inductor_build,
+                "_without_bundled_autotune_cache",
+                side_effect=RuntimeError,
+            ),
+            self.assertLogs(_LOGGER, level="WARNING"),
+        ):
+            self.build(lowered, record)
+        self.assertEqual(seen, [None])
+        self.assertEqual(self.capture.events[events:], [])
+
+    def test_undo_fault_never_replaces_the_builds_exception(self) -> None:
+        @contextlib.contextmanager
+        def undo_raises() -> Iterator[None]:
+            yield
+            raise RuntimeError("undo")
+
+        with _dispatching():
+            lowered = _lower(_observer(), WHOLE, _graph())
+        with (
+            mock.patch.object(
+                inductor_build, "_without_bundled_autotune_cache", undo_raises
+            ),
+            self.assertLogs(_LOGGER, level="WARNING") as logs,
+            self.assertRaisesRegex(ValueError, "build"),
+        ):
+            self.build(lowered, mock.Mock(side_effect=ValueError("build")))
+        self.assertIn("setup not undone", logs.output[0])
+        self.assertEqual(self.metrics()["fail_type"], "ValueError")
+
+    def test_dispatch_names_builds_after_pipeline_stages(self) -> None:
+        pipeline = mock.MagicMock(spec=PipelinedGraphModule)
+        graphs = {"route_start": _graph(), "compute": _graph()}
+        lowered: list[nn.Module] = []
+
+        def lower_parts(lower: Callable[[Part, fx.GraphModule], nn.Module]) -> Any:
+            for index, (name, graph) in enumerate(graphs.items()):
+                lowered.append(lower(Part(name, index), graph))
+            return pipeline
+
+        pipeline.lower_parts = lower_parts
+        with _dispatching():
+            self.assertIs(InductorBackend().dispatch(pipeline), pipeline)
+        for module in _carved(*lowered):
+            with module.compile_scope():
+                pass
+        self.assertEqual(
+            self.build_names(),
+            [
+                "recir build stage0_route_start subgraph_0",
+                "recir build stage1_compute subgraph_0",
+            ],
+        )
+
+    def test_dispatch_names_the_steady_state_build(self) -> None:
+        steady = mock.MagicMock(spec=SteadyStateGraphModule)
+        steady.steady_gm = _graph()
+        steady.lower_parts = lambda lower: SteadyStateGraphModule.lower_parts(
+            steady, lower
+        )
+        with _dispatching():
+            InductorBackend().dispatch(steady)
+        for module in _carved(steady.steady_gm):
+            with module.compile_scope():
+                pass
+        self.assertEqual(self.build_names(), ["recir build steady subgraph_0"])
+
+    def test_unbuilt_subgraph_pickles(self) -> None:
+        with _dispatching():
+            [module] = _carved(_lower(_observer(), WHOLE, _graph()))
+        restored = pickle.loads(pickle.dumps(module.compile_scope))
+        with restored():
+            pass
+        self.assertEqual(self.build_names(), ["recir build whole subgraph_0"])
+
+
+class _FakeModule(LazilyBuiltModule):
+    """A carved module whose "compile" only records what it saw."""
+
+    raises = False
+
+    def __init__(self, gm: fx.GraphModule) -> None:
+        super().__init__()
+        self.gm = gm
+        self.compiled = False
+
+    def forward(self, *args: torch.Tensor, tag: str = "") -> Any:
+        if not self.compiled:
+            with self.compile_scope():
+                if self.raises:
+                    raise RuntimeError("fake build failed")
+                self.compiled = True
+        return self.gm(*args)
+
+
+def _fake_lower(
+    gm: fx.GraphModule,
+    *,
+    hooks: Any = None,
+    module_factory: Callable[[fx.GraphModule], nn.Module] = _FakeModule,
+) -> nn.Module:
+    """Carve every run of nodes, keeping profiler ops as TorchTPU does."""
+    return lowering_utils.segment_and_lower(
+        gm,
+        compatibility_fn=lambda n: (True, ""),
+        module_factory=module_factory,
+        hooks=hooks,
+    )
+
+
+class _FakeCarvingBackend(_NoopBackend):
+    def __init__(self, lower: Callable[..., nn.Module] = _fake_lower) -> None:
+        super().__init__()
+        self._lower = lower
+
+    def dispatch(self, gm: fx.GraphModule) -> nn.Module:
+        return self._lower_inputs(gm, self._lower)
+
+
+class FakeBackendTest(_SnapshotTestCase):
+    """A backend other than Inductor gets the same neutral builds."""
+
+    def lower(self, gm: fx.GraphModule, **kwargs: Any) -> nn.Module:
+        """Dispatch ``gm`` through the fake backend in a step compile; ``kwargs`` go to its lowerer."""
+        backend = _FakeCarvingBackend(functools.partial(_fake_lower, **kwargs))
+        with _dispatching("_FakeCarvingBackend"):
+            return backend.dispatch(gm)
+
+    def test_failed_neutral_build_names_its_backend(self) -> None:
+        lowered = self.lower(_graph())
+        with (
+            mock.patch.object(_FakeModule, "raises", True),
+            self.assertRaises(RuntimeError),
+        ):
+            lowered(torch.randn(4))
+        self.assertEqual(
+            self.metrics()["fail_reason"], "the _FakeCarvingBackend build raised"
+        )
+
+    def test_a_retried_build_gets_its_own_entry(self) -> None:
+        lowered = self.lower(_graph())
+        with (
+            mock.patch.object(_FakeModule, "raises", True),
+            self.assertRaises(RuntimeError),
+        ):
+            lowered(torch.randn(4))
+        lowered(torch.randn(4))
+        self.assertEqual(
+            self.build_names(),
+            ["recir build whole subgraph_0", "recir build whole subgraph_0"],
+        )
+        self.assertIsNone(self.metrics()["fail_type"])
+
+    def test_module_without_the_build_hook_gets_no_build(self) -> None:
+        lowered = self.lower(_graph(), module_factory=lambda gm: nn.Module())
+        self.assertEqual(_carved(lowered), [])
+
+    def test_neutral_build_leaves_inductor_config_alone(self) -> None:
+        seen: list[bool | None] = []
+
+        class _ConfigReadingModule(_FakeModule):
+            def forward(self, *args: torch.Tensor, tag: str = "") -> Any:
+                with self.compile_scope():
+                    seen.append(torch._inductor.config.bundled_autotune_remote_cache)
+                return self.gm(*args)
+
+        lowered = self.lower(_graph(), module_factory=_ConfigReadingModule)
+        lowered(torch.randn(4))
+        self.assertEqual(seen, [torch._inductor.config.bundled_autotune_remote_cache])

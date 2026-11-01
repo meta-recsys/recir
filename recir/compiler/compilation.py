@@ -632,7 +632,8 @@ def _compile_from_gm(  # noqa: C901 — orchestration: stages 4-8 of the pipelin
     # the same gm rewritten as a partial-lowered module, but the contract
     # only requires it be a callable nn.Module compatible with the flat-state
     # invocation convention).
-    dispatched = backend.dispatch(cast(fx.GraphModule, scheduled_gm))
+    with snapshot.dispatching(step, type(backend).__name__):
+        dispatched = backend.dispatch(cast(fx.GraphModule, scheduled_gm))
     # Preserve the gm reference (the dispatched module is typically the gm
     # itself, rewritten in place).  ``_CompiledResult.gm`` is callable, so
     # we use the dispatched module here.

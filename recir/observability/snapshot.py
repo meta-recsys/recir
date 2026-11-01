@@ -13,12 +13,27 @@ attached; the classes in ``compiles`` and ``stages`` do the work.
 from __future__ import annotations
 
 from contextlib import contextmanager
+from contextvars import ContextVar
 from typing import Any, Callable, Iterator
 
-from recir.observability.compiles import snapshots_on, StepCompile, TraceRecord
+from recir.lowering.lowering_inputs import LoweringObserver
+from recir.observability.compiles import (
+    snapshots_on,
+    snapshotted,
+    StepCompile,
+    TraceRecord,
+)
+from recir.observability.dispatch import ObservedLowering
 from recir.observability.guard import contained
 from recir.observability.stages import GraphStage
 from torch import fx
+
+
+# The observer of the backend dispatch this thread is running: a backend's own
+# lowering cannot be handed it through the public Backend API.
+_observer: ContextVar[LoweringObserver | None] = ContextVar(
+    "recir_dispatch_observer", default=None
+)
 
 
 def keep_trace(traced: Callable[..., Any], gm: fx.GraphModule) -> TraceRecord | None:
@@ -39,19 +54,15 @@ def compiling_step(trace: TraceRecord | None) -> Iterator[StepCompile | None]:
     Run ``compile_from_gm`` inside this context as one step compile, which it
     gives, starting with the graph ``trace`` kept and closed with
     ``compilation_metrics`` on exit. Without a trace, or when snapshots are
-    off, no step compile is opened, ``compile_from_gm`` runs as without
-    snapshots, and it gives None. Exceptions from ``compile_from_gm`` pass
-    through unchanged.
+    off, or after a snapshot fault, no step compile is opened,
+    ``compile_from_gm`` runs as without snapshots, and it gives None.
+    Exceptions from ``compile_from_gm`` pass through unchanged.
     """
-    step: StepCompile | None = None
-    with contained("step compile not created"):
-        if trace is not None and snapshots_on():
-            step = StepCompile(trace)
-    if step is None:
+    if trace is None:
         yield None
         return
-    with step.compiling() as started:
-        yield started
+    with snapshotted(lambda: StepCompile(trace), "step compile") as step:
+        yield step
 
 
 def record_stage(
@@ -63,3 +74,27 @@ def record_stage(
     ):
         if step is not None:
             step.record_stage(stage_cls, gm)
+
+
+@contextmanager
+def dispatching(step: StepCompile | None, backend: str) -> Iterator[None]:
+    """
+    Run ``step``'s backend dispatch inside this context, observed through
+    ``lowering_observer``; ``backend`` names the backend that builds the
+    subgraphs the dispatch carves. Without a step, nothing is observed.
+    Exceptions from the dispatch pass through unchanged.
+    """
+    observer = None
+    with contained("dispatch observer not created"):
+        if step is not None:
+            observer = ObservedLowering(backend)
+    token = _observer.set(observer)
+    try:
+        yield
+    finally:
+        _observer.reset(token)
+
+
+def lowering_observer() -> LoweringObserver | None:
+    """The observer of the backend dispatch this thread is running, if any."""
+    return _observer.get()

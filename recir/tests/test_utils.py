@@ -25,6 +25,7 @@ from recir.distributed.parallel_mode import ParallelMode
 from recir.pipeline import mark_pipeline_region
 from recir.pipeline_strategies import PipelineRegion
 from torch import fx
+from torch.fx.experimental.proxy_tensor import make_fx
 
 
 class _PassthroughParallel(ParallelMode):
@@ -117,3 +118,14 @@ def _region_graph() -> fx.GraphModule:
         )
         mark_pipeline_region((node,), region)
     return gm
+
+
+def _twelve_ops(x: torch.Tensor) -> torch.Tensor:
+    for _ in range(6):
+        x = torch.relu(x * 2)
+    return x
+
+
+def _graph() -> fx.GraphModule:
+    """A traced graph of twelve elementwise ops, which partial lowering carves as one subgraph."""
+    return make_fx(_twelve_ops)(torch.randn(4))
