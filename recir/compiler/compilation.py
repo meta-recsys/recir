@@ -58,6 +58,7 @@ from recir.compiler.tracing import (
     _tag_batch_inputs,
     _to_caller_flattened_graph_module,
     _trace_graphs,
+    _trace_record,
     _TraceContext,
     _TraceResult,
 )
@@ -74,9 +75,12 @@ from recir.distributed.parallel_mode import (
     ParallelMode,
 )
 from recir.lowering.device_state import DeviceStateManager
+from recir.observability import snapshot
+from recir.observability.compiles import StepCompile
+from recir.observability.stages import AssemblyStage, PipelineStage
 from recir.ops.decompositions import DEDUP_TARGETS
 from recir.passes.pass_registry import default_registry as default_pass_registry
-from recir.pipeline import build_pipeline, PipelineConfig
+from recir.pipeline import build_pipeline, PipelineConfig, PipelinedGraphModule
 from recir.region_transforms import RegatherTransform, RegionTransform
 from torch import fx
 from torch._subclasses.fake_tensor import FakeTensorMode
@@ -232,7 +236,7 @@ def _compile_and_transform(
 # explicit ``backend``.
 
 
-def compile_from_gm(  # noqa: C901 — orchestration: stages 4-8 of the pipeline are intentionally laid out inline so the # Stage N comments stay readable; refactor would split the pipeline across helpers.
+def compile_from_gm(
     gm: fx.GraphModule,
     flat_state: List[torch.Tensor],
     *,
@@ -248,8 +252,8 @@ def compile_from_gm(  # noqa: C901 — orchestration: stages 4-8 of the pipeline
     The full recir compile pipeline is split into ten stages, of which
     :func:`trace` runs stages 0-3 and this function runs stages 4-10:
 
-    Pipeline stages (consult the inline ``# Stage N:`` comments below for
-    the source-level boundaries):
+    Pipeline stages (consult the inline ``# Stage N:`` comments in
+    :func:`_compile_from_gm` for the source-level boundaries):
 
     * **Stage 0** -- ``eager_preproc`` hooks (handled by :func:`trace`).
       User-supplied callbacks mutate the original ``nn.Module`` *before*
@@ -264,8 +268,8 @@ def compile_from_gm(  # noqa: C901 — orchestration: stages 4-8 of the pipeline
       metadata.  Not run here.
     * **Stage 4** -- ``region_transforms[*].finalize_compiled_graph(gm)``.
       Each :class:`RegionTransform` gets a chance to finalize after the
-      graph is partitioned (note: stage-4 runs *after* stage-5 in the code
-      below to match the legacy ``_compile_and_transform`` ordering).
+      graph is partitioned (note: stage-4 runs *after* stage-5 in
+      :func:`_compile_from_gm` to match the legacy ``_compile_and_transform`` ordering).
     * **Stage 5** -- ``parallel_mode.shard_params`` + ``partition``.
       ``shard_params`` updates ``opt.state`` and may re-key parameters
       in-place; we then re-extract ``named_states`` by walking the
@@ -318,6 +322,32 @@ def compile_from_gm(  # noqa: C901 — orchestration: stages 4-8 of the pipeline
         A :class:`_CompiledResult` ready for runtime use via
         :func:`recir.compile`'s wrapper invocation path.
     """
+    with snapshot.compiling_step(_trace_record(gm)) as step:
+        return _compile_from_gm(
+            gm,
+            flat_state,
+            step=step,
+            parallel_mode=parallel_mode,
+            backend=backend,
+            region_transforms=region_transforms,
+            pipeline_config=pipeline_config,
+            _sharded_by=_sharded_by,
+            _shard_optimizers=_shard_optimizers,
+        )
+
+
+def _compile_from_gm(  # noqa: C901 — orchestration: stages 4-8 of the pipeline are intentionally laid out inline so the # Stage N comments stay readable; refactor would split the pipeline across helpers.
+    gm: fx.GraphModule,
+    flat_state: List[torch.Tensor],
+    *,
+    step: Optional[StepCompile],
+    parallel_mode: ParallelMode,
+    backend: "Backend",
+    region_transforms: Sequence[RegionTransform],
+    pipeline_config: Optional[PipelineConfig],
+    _sharded_by: Optional[_CompiledResult],
+    _shard_optimizers: Optional[Sequence[torch.optim.Optimizer]],
+) -> _CompiledResult:
     # Validate backend ↔ parallel_mode compatibility early.
     backend.validate_with(parallel_mode)
 
@@ -531,6 +561,7 @@ def compile_from_gm(  # noqa: C901 — orchestration: stages 4-8 of the pipeline
     # after the graph has been partitioned.
     for transform in region_transforms_list:
         transform.finalize_compiled_graph(gm)
+    snapshot.record_stage(step, AssemblyStage, gm)
 
     pipeline = pipeline_config or PipelineConfig.none()
     use_iter_graph = backend.uses_iter_graph and not pipeline.enabled
@@ -594,6 +625,8 @@ def compile_from_gm(  # noqa: C901 — orchestration: stages 4-8 of the pipeline
         cast(IterGraphModule, gm).finalize_setup()
 
     scheduled_gm: nn.Module = build_pipeline(gm, pipeline)
+    if isinstance(scheduled_gm, PipelinedGraphModule):
+        snapshot.record_stage(step, PipelineStage, scheduled_gm.split_gm)
 
     # Stage 8: dispatch (backend.dispatch returns an nn.Module — typically
     # the same gm rewritten as a partial-lowered module, but the contract
@@ -1119,7 +1152,7 @@ def compile(  # noqa: C901 — orchestration: stages 0-9 + legacy DP/GSPMD wirin
     for IterGraph cleanup on the final step.
 
     Pipeline stages (the canonical recir vocabulary; consult the inline
-    ``# Stage N:`` comments in :func:`compile_from_gm` and the per-mode
+    ``# Stage N:`` comments in :func:`_compile_from_gm` and the per-mode
     helpers for the source-level boundaries).  **Stages 5-8 (optimize,
     stage, dispatch, build) are owned by the configured**
     :class:`~recir.backends.base.Backend`; the rest are owned by the

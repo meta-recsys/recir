@@ -15,12 +15,15 @@ implementations here removes the previous triplicate copies and makes future
 contract tweaks land in one place.
 """
 
+import operator
 from typing import Any, Dict, Set
 
 import torch
 import torch.nn as nn
 from recir.backends.base import Backend
 from recir.distributed.parallel_mode import ParallelMode
+from recir.pipeline import mark_pipeline_region
+from recir.pipeline_strategies import PipelineRegion
 from torch import fx
 
 
@@ -88,3 +91,29 @@ class _NoopBackend(Backend):
 
     def dispatch(self, gm: fx.GraphModule) -> nn.Module:
         return gm
+
+
+class _FourStageModule(torch.nn.Module):
+    def forward(self, value: torch.Tensor) -> torch.Tensor:
+        preprocessed = value + 1
+        started = preprocessed * 2
+        continued = started - 3
+        return continued / 2
+
+
+def _region_graph() -> fx.GraphModule:
+    """A four-op graph whose first three ops are marked as SDD pipeline regions."""
+    gm = fx.symbolic_trace(_FourStageModule())
+    regions = (
+        (operator.add, PipelineRegion.PREPROCESS),
+        (operator.mul, PipelineRegion.ROUTE_START),
+        (operator.sub, PipelineRegion.ROUTE_CONTINUE),
+    )
+    for target, region in regions:
+        node = next(
+            node
+            for node in gm.graph.nodes
+            if node.op == "call_function" and node.target is target
+        )
+        mark_pipeline_region((node,), region)
+    return gm
