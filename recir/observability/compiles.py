@@ -15,17 +15,19 @@ import traceback
 from contextlib import contextmanager
 from dataclasses import dataclass
 from types import FrameType
-from typing import Any, Callable, Iterator, Self
+from typing import Any, Callable, Iterator, Self, TypeVar
 
 from recir.observability.graph_dump import GraphDump
 from recir.observability.guard import contained
 from recir.observability.settings import Settings
-from recir.observability.stages import Stage, TraceStage
+from recir.observability.stages import GraphStage, Stage, TraceStage
 from torch import fx
 from torch._guards import compile_context, CompileContext, CompileId
 from torch._logging import trace_structured
 from torch._logging._internal import trace_log
 from torch._logging.structured import from_traceback
+
+_S = TypeVar("_S", bound=Stage)
 
 # recir packages that call into RecIR like any user, as test modules anywhere
 # in recir do; every other recir module is RecIR's own.
@@ -257,11 +259,18 @@ class StepCompile(TlparseCompile):
         """The name shown in tlparse's stack trie: "recir step compile"."""
         return "recir step compile"
 
+    def record_stage(self, stage_cls: type[GraphStage], gm: fx.GraphModule) -> None:
+        """Snapshot a new ``stage_cls`` stage from ``gm``, the graph its RecIR code produced."""
+        self._begin(stage_cls).record(gm)
+
+    def _begin(self, stage_cls: type[_S]) -> _S:
+        stage = stage_cls(self)
+        self.stages.append(stage)
+        return stage
+
     def _start(self) -> None:
         super()._start()
-        stage = TraceStage(self)
-        self.stages.append(stage)
-        stage.record(self._trace_text)
+        self._begin(TraceStage).record(self._trace_text)
 
     def _fail_reason(self, error: BaseException) -> str:
         if not self.stages:

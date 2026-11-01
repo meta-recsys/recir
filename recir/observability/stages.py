@@ -10,6 +10,9 @@ from __future__ import annotations
 
 from typing import Callable, ClassVar, TYPE_CHECKING
 
+from recir.observability.graph_dump import GraphDump
+from torch import fx
+
 if TYPE_CHECKING:
     from recir.observability.compiles import TlparseCompile
 
@@ -35,6 +38,19 @@ class Stage:
         self.owner.write(f"recir_{self.name}_graph", body)
 
 
+class GraphStage(Stage):
+    """
+    Base class for all stages that write one graph, as ``recir_{name}_graph``.
+
+    This can be extended to a new snapshot point by subclassing and setting
+    ``name``; the stage's RecIR code records the graph it produced.
+    """
+
+    def record(self, gm: fx.GraphModule) -> None:
+        """Write ``gm``, the graph the stage's RecIR code produced."""
+        self._write_text(GraphDump(gm).text)
+
+
 class TraceStage(Stage):
     """
     The trace stage: the graph ``recir.trace`` returned.
@@ -49,3 +65,16 @@ class TraceStage(Stage):
     def record(self, text: str) -> None:
         """Write ``text``, the traced graph's text."""
         self._write_text(lambda: text)
+
+
+class AssemblyStage(GraphStage):
+    """
+    The assembly stage: the flattened graph ``compile_from_gm`` assembles.
+
+    This class is responsible for writing that graph as ``recir_assembly_graph``:
+    the graph ``compile_from_gm`` hands to the backend's stages, flattened, after
+    RecIR's internal transforms and the caller's region-transform finalize, and
+    before the backend's optimize passes and any pipeline split.
+    """
+
+    name = "assembly"
