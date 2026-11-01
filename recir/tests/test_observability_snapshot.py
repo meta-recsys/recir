@@ -11,6 +11,7 @@ from __future__ import annotations
 import contextlib
 import dataclasses
 import functools
+import importlib
 import logging
 import os
 import pickle
@@ -50,6 +51,7 @@ from recir.tests.test_utils import (
     _NoopBackend,
     _PassthroughParallel,
     _region_graph,
+    _two_runs,
 )
 from recir.training.compile import compile_step
 from torch import fx
@@ -58,6 +60,7 @@ from torch._dynamo.utils import counters
 from torch._guards import CompileContext
 from torch._inductor.utils import fresh_cache
 from torch._logging._internal import trace_log
+from torch.fx.experimental.proxy_tensor import make_fx
 
 _LOGGER = "recir.observability"
 _RESERVED = {"rank", "frame_id", "frame_compile_id", "attempt", "has_payload"}
@@ -599,7 +602,10 @@ def _observer() -> ObservedLowering:
 
 def _lower(observer: LoweringObserver, part: Part, gm: fx.GraphModule) -> nn.Module:
     """Lower ``gm`` as the dispatch input ``part``, reporting to ``observer`` as ``lower_inputs`` does."""
-    return partial_lower(gm, hooks=_InputHooks(observer, part))
+    hooks = observer.lowering(part, gm)
+    lowered = partial_lower(gm, hooks=hooks)
+    hooks.lowered(lowered)
+    return lowered
 
 
 def _report_carves(
@@ -1025,6 +1031,66 @@ class DispatchTest(_SnapshotTestCase):
             self.metrics()["fail_reason"], "raised after RecIR stage trace"
         )
 
+    def test_dispatch_graphs(self) -> None:
+        _compile_inductor()
+        artifacts = self.artifacts()
+        for name in (
+            "recir_dispatch_main_subgraph_0_graph",
+            "recir_dispatch_lowered_setup_graph",
+            "recir_dispatch_lowered_main_graph",
+            "recir_dispatch_lowered_cleanup_graph",
+        ):
+            self.assertIn(name, artifacts)
+
+    def test_carved_subgraph_is_named_like_its_build(self) -> None:
+        with _dispatching():
+            [module] = _carved(_lower(_observer(), Part("route_start", 0), _graph()))
+        with module.compile_scope():
+            pass
+        self.assertEqual(
+            self.build_names(), ["recir build stage0_route_start subgraph_0"]
+        )
+        self.assertIn(
+            "recir_dispatch_stage0_route_start_subgraph_0_graph", self.artifacts()
+        )
+
+    def test_subgraph_write_fault_never_costs_the_build(self) -> None:
+        with (
+            _dispatching(),
+            mock.patch.object(DispatchStage, "add_subgraph", side_effect=RuntimeError),
+            self.assertLogs("recir.lowering", level="WARNING") as logs,
+        ):
+            lowered = InductorBackend().dispatch(_graph())
+        [module] = _carved(lowered)
+        self.assertIsNot(module.compile_scope, nullcontext)
+        self.assertIn("carved failed: RuntimeError", logs.output[0])
+
+    def test_raise_after_a_carve_keeps_the_carved_subgraph(self) -> None:
+        gm = make_fx(_two_runs)(torch.randn(8))
+        middle = [n for n in gm.graph.nodes if n.op == "call_function"][12]
+        module = importlib.import_module("recir.lowering.partial_lower")
+        carve = module._InductorModule
+        carved: list[nn.Module] = []
+
+        def carve_once(sub_gm: fx.GraphModule) -> nn.Module:
+            if carved:
+                raise RuntimeError("boom")
+            carved.append(carve(sub_gm))
+            return carved[-1]
+
+        lower = functools.partial(
+            partial_lower, node_predicate=lambda n: n is not middle
+        )
+        with (
+            mock.patch.object(module, "_InductorModule", carve_once),
+            self.assertRaises(RuntimeError),
+            _dispatching(),
+        ):
+            lower_inputs(gm, lower, _observer())
+        artifacts = self.artifacts()
+        self.assertIn("recir_dispatch_whole_subgraph_0_graph", artifacts)
+        self.assertNotIn("recir_dispatch_lowered_whole_graph", artifacts)
+
     def test_dispatch_stage_completes_when_the_dispatch_ends(self) -> None:
         with _dispatching() as step:
             InductorBackend().dispatch(_graph())
@@ -1155,4 +1221,6 @@ class FakeBackendTest(_SnapshotTestCase):
 
     def test_dispatch_input_is_written_for_any_backend(self) -> None:
         self.lower(_graph())
-        self.assertIn("recir_dispatch_input_whole_graph", self.artifacts())
+        artifacts = self.artifacts()
+        self.assertIn("recir_dispatch_input_whole_graph", artifacts)
+        self.assertIn("recir_dispatch_whole_subgraph_0_graph", artifacts)

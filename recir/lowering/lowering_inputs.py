@@ -41,7 +41,11 @@ class LoweringObserver:
     """
 
     def lowering(self, part: Part, gm: fx.GraphModule) -> _InputHooks:
-        """Report that ``gm``, the input ``part``, is about to be lowered; returns the hooks to lower it with."""
+        """
+        Report that ``gm``, the input ``part``, is about to be lowered; returns
+        the hooks to lower it with, whose ``lowered()`` reports what lowering
+        returned.
+        """
         self._guarded("input", self._on_input, part, gm)
         return _InputHooks(self, part)
 
@@ -50,6 +54,9 @@ class LoweringObserver:
 
     def _on_carved(self, part: Part, region: CarvedRegion) -> None:
         """``region`` was carved from the input ``part``."""
+
+    def _on_lowered(self, part: Part, lowered: nn.Module) -> None:
+        """Lowering the input ``part`` returned ``lowered``."""
 
     def _guarded(self, event: str, hook: Callable[..., None], *args: Any) -> None:
         try:
@@ -66,12 +73,19 @@ class _InputHooks:
     def on_carved(self, region: CarvedRegion) -> None:
         self.observer._guarded("carved", self.observer._on_carved, self.part, region)
 
+    def lowered(self, lowered: nn.Module) -> None:
+        self.observer._guarded("lowered", self.observer._on_lowered, self.part, lowered)
+
 
 def _lower_input(
     lower: Lower, observer: LoweringObserver | None, part: Part, gm: fx.GraphModule
 ) -> nn.Module:
-    hooks = None if observer is None else observer.lowering(part, gm)
-    return lower(gm, hooks=hooks)
+    if observer is None:
+        return lower(gm, hooks=None)
+    hooks = observer.lowering(part, gm)
+    lowered = lower(gm, hooks=hooks)
+    hooks.lowered(lowered)
+    return lowered
 
 
 def lower_inputs(

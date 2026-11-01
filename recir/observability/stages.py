@@ -11,8 +11,9 @@ from __future__ import annotations
 from typing import Callable, ClassVar, TYPE_CHECKING
 
 from recir.composite import Part
+from recir.lowering.lowering_utils import CarvedRegion
 from recir.observability.graph_dump import GraphDump
-from torch import fx
+from torch import fx, nn
 
 if TYPE_CHECKING:
     from recir.observability.compiles import TlparseCompile
@@ -111,9 +112,12 @@ class DispatchStage(Stage):
     """
     The dispatch stage: the graphs of one backend dispatch, written as lowering goes.
 
-    This class is responsible for writing each input's graph as
+    This class is responsible for writing the dispatch's graphs, named after
+    the input part's ``label``: each input's as
     ``recir_dispatch_input_{label}_graph`` before it is lowered, since partial
-    lowering edits it in place, where ``label`` is the input part's label. It
+    lowering edits it in place; each subgraph carved from it as
+    ``recir_dispatch_{label}_{subgraph}_graph``, named like its build; and the
+    parent left after carving as ``recir_dispatch_lowered_{label}_graph``. It
     is completed when the dispatch ends without raising.
     """
 
@@ -122,3 +126,12 @@ class DispatchStage(Stage):
     def add_input(self, part: Part, gm: fx.GraphModule) -> None:
         """Write ``gm``, the input ``part``, before it is lowered."""
         self._write_graph(gm, f"_input_{part.label}")
+
+    def add_subgraph(self, part: Part, region: CarvedRegion) -> None:
+        """Write the graph of ``region``, just carved from the input ``part``."""
+        self._write_graph(region.gm, f"_{part.label}_{region.name}")
+
+    def add_lowered(self, part: Part, lowered: nn.Module) -> None:
+        """Write the parent left after lowering the input ``part``, if lowering returned a graph."""
+        if isinstance(lowered, fx.GraphModule):
+            self._write_graph(lowered, f"_lowered_{part.label}")
