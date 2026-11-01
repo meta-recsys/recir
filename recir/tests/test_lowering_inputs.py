@@ -173,6 +173,42 @@ class ObserverTest(unittest.TestCase):
         self.assertIn("carved failed", logs.output[0])
 
 
+class _Events(LoweringObserver):
+    def __init__(self) -> None:
+        self.events: list[tuple[str, str]] = []
+
+    def _on_input(self, part: Part, gm: fx.GraphModule) -> None:
+        self.events.append(("input", part.name))
+
+    def _on_carved(self, part: Part, region: CarvedRegion) -> None:
+        self.events.append(("carved", part.name))
+
+
+def _raising(gm: fx.GraphModule, *, hooks: Any = None) -> fx.GraphModule:
+    raise RuntimeError("lowering")
+
+
+class LifecycleTest(unittest.TestCase):
+    def test_each_input_is_reported_before_its_carves(self) -> None:
+        observer = _Events()
+        lower_inputs(_graph(), _carve_once, observer)
+        self.assertEqual(observer.events, [("input", "whole"), ("carved", "whole")])
+
+    def test_every_phase_is_reported_in_order(self) -> None:
+        observer = _Events()
+        lower_inputs(_iter_graph(), _carve_once, observer)
+        self.assertEqual(
+            [e for e in observer.events if e[0] == "input"],
+            [("input", "setup"), ("input", "main"), ("input", "cleanup")],
+        )
+
+    def test_a_raising_lowering_raises_after_its_input_is_reported(self) -> None:
+        observer = _Events()
+        with self.assertRaisesRegex(RuntimeError, "lowering"):
+            lower_inputs(_graph(), _raising, observer)
+        self.assertEqual(observer.events, [("input", "whole")])
+
+
 class _LoweringBackend(_NoopBackend):
     def dispatch(self, gm: fx.GraphModule) -> nn.Module:
         return self._lower_inputs(gm, _lower)

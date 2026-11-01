@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from typing import Callable, ClassVar, TYPE_CHECKING
 
+from recir.composite import Part
 from recir.observability.graph_dump import GraphDump
 from torch import fx
 
@@ -21,21 +22,32 @@ class Stage:
     """
     Base class for all snapshot stages: one snapshot point in a compile.
 
-    This class is responsible for naming the stage's artifacts. It writes
-    only through its owning compile, whose write never raises, and does not
+    This class is responsible for naming the stage's artifacts and for its
+    lifecycle: its compile begins it, its RecIR code writes to it as it runs,
+    and ends it with what that code raised, if anything. It writes only
+    through its owning compile, whose write never raises, and does not
     decide stage order.
 
     This can be extended to a new snapshot point by subclassing, setting
-    ``name``, and adding the method its RecIR code records through.
+    ``name``, and adding the methods its RecIR code writes through.
     """
 
     name: ClassVar[str]
 
     def __init__(self, owner: TlparseCompile) -> None:
         self.owner = owner
+        # Whether the stage's RecIR code ran to its end without raising.
+        self.completed = False
 
-    def _write_text(self, body: Callable[[], str]) -> None:
-        self.owner.write(f"recir_{self.name}_graph", body)
+    def end(self, error: BaseException | None) -> None:
+        """The stage's RecIR code is over; ``error`` is what it raised, if anything."""
+        self.completed = error is None
+
+    def _write_text(self, body: Callable[[], str], suffix: str = "") -> None:
+        self.owner.write(f"recir_{self.name}{suffix}_graph", body)
+
+    def _write_graph(self, gm: fx.GraphModule, suffix: str = "") -> None:
+        self._write_text(GraphDump(gm).text, suffix)
 
 
 class GraphStage(Stage):
@@ -47,8 +59,9 @@ class GraphStage(Stage):
     """
 
     def record(self, gm: fx.GraphModule) -> None:
-        """Write ``gm``, the graph the stage's RecIR code produced."""
-        self._write_text(GraphDump(gm).text)
+        """End the stage and write ``gm``, the graph its RecIR code produced."""
+        self.end(None)
+        self._write_graph(gm)
 
 
 class TraceStage(Stage):
@@ -63,7 +76,8 @@ class TraceStage(Stage):
     name = "trace"
 
     def record(self, text: str) -> None:
-        """Write ``text``, the traced graph's text."""
+        """End the stage and write ``text``, the traced graph's text."""
+        self.end(None)
         self._write_text(lambda: text)
 
 
@@ -91,3 +105,20 @@ class PipelineStage(GraphStage):
     """
 
     name = "pipeline"
+
+
+class DispatchStage(Stage):
+    """
+    The dispatch stage: the graphs of one backend dispatch, written as lowering goes.
+
+    This class is responsible for writing each input's graph as
+    ``recir_dispatch_input_{label}_graph`` before it is lowered, since partial
+    lowering edits it in place, where ``label`` is the input part's label. It
+    is completed when the dispatch ends without raising.
+    """
+
+    name = "dispatch"
+
+    def add_input(self, part: Part, gm: fx.GraphModule) -> None:
+        """Write ``gm``, the input ``part``, before it is lowered."""
+        self._write_graph(gm, f"_input_{part.label}")

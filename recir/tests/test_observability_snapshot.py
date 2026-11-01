@@ -27,7 +27,12 @@ from recir.compiler import compilation
 from recir.compiler.tracing import _GraphSpec, _trace_graphs, _trace_record
 from recir.composite import Part
 from recir.lowering import lowering_utils
-from recir.lowering.lowering_inputs import _InputHooks, LoweringObserver, WHOLE
+from recir.lowering.lowering_inputs import (
+    _InputHooks,
+    lower_inputs,
+    LoweringObserver,
+    WHOLE,
+)
 from recir.lowering.lowering_utils import CarvedRegion, LazilyBuiltModule
 from recir.lowering.partial_lower import partial_lower
 from recir.observability import compiles, inductor_build, snapshot
@@ -36,6 +41,7 @@ from recir.observability.compiles import StepCompile, TlparseCompile, TraceRecor
 from recir.observability.dispatch import ObservedLowering
 from recir.observability.graph_dump import GraphDump
 from recir.observability.settings import Settings, Tier
+from recir.observability.stages import DispatchStage
 from recir.pipeline import build_pipeline, PipelinedGraphModule, SteadyStateGraphModule
 from recir.pipeline_strategies import sdd_pipeline_config
 from recir.region_transforms import RegionTransform
@@ -72,8 +78,10 @@ def _train_step(model: nn.Module, opt: torch.optim.Optimizer, x: torch.Tensor) -
     opt.step()
 
 
-def _step_inputs() -> tuple[nn.Module, torch.optim.Optimizer, torch.Tensor]:
-    model = _ToyModel()
+def _step_inputs(
+    model_cls: type[nn.Module] = _ToyModel,
+) -> tuple[nn.Module, torch.optim.Optimizer, torch.Tensor]:
+    model = model_cls()
     opt = torch.optim.Adam(model.parameters(), lr=0.01, foreach=True)
     x = torch.randn(2, 4)
     # One eager step materializes Adam's state, as on a resumed job.
@@ -81,8 +89,8 @@ def _step_inputs() -> tuple[nn.Module, torch.optim.Optimizer, torch.Tensor]:
     return model, opt, x
 
 
-def _trace() -> tuple[fx.GraphModule, Any]:
-    return recir.trace(_train_step, *_step_inputs())
+def _trace(model_cls: type[nn.Module] = _ToyModel) -> tuple[fx.GraphModule, Any]:
+    return recir.trace(_train_step, *_step_inputs(model_cls))
 
 
 def _compile_traced(gm: fx.GraphModule, flat_state: Any) -> Any:
@@ -626,6 +634,13 @@ class _SnapshotTestCase(unittest.TestCase):
         self.assertEqual(name, "compilation_metrics")
         return metadata["compilation_metrics"]
 
+    def artifacts(self) -> dict[str, str | None]:
+        return {
+            m["artifact"]["name"]: payload
+            for n, m, payload in self.capture.events
+            if n == "artifact"
+        }
+
     def build_names(self) -> list[str]:
         """The builds that started, in start order."""
         return [
@@ -954,6 +969,96 @@ class SubgraphBuildTest(_SnapshotTestCase):
         self.assertEqual(self.build_names(), ["recir build whole subgraph_0"])
 
 
+def _compile_inductor(model_cls: type[nn.Module] = _ToyModel) -> Any:
+    gm, flat_state = _trace(model_cls)
+    # Builds are lazy: nothing reaches Inductor until the first forward.
+    return recir.compile_from_gm(
+        gm, flat_state, parallel_mode=_PassthroughParallel(), backend=InductorBackend()
+    )
+
+
+class _SpannedModel(_ToyModel):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        with torch.profiler.record_function("## toy_forward ##"):
+            return super().forward(x)
+
+
+class DispatchTest(_SnapshotTestCase):
+    def test_dispatch_input_graphs(self) -> None:
+        _compile_inductor(_SpannedModel)
+        artifacts = self.artifacts()
+        for label in ("setup", "main", "cleanup"):
+            self.assertIn(f"recir_dispatch_input_{label}_graph", artifacts)
+        # Written before partial lowering strips the profiler ops.
+        setup = artifacts["recir_dispatch_input_setup_graph"]
+        assert setup is not None
+        self.assertIn("profiler", setup)
+
+    def test_input_snapshot_fault_never_fails_the_compile(self) -> None:
+        with (
+            mock.patch.object(DispatchStage, "add_input", side_effect=RuntimeError),
+            self.assertLogs("recir.lowering", level="WARNING") as logs,
+        ):
+            compiled = _compile_inductor()
+        self.assertIsNotNone(compiled.gm)
+        self.assertTrue(any("input failed: RuntimeError" in m for m in logs.output))
+
+    def test_failed_dispatch_names_the_stage_before_it(self) -> None:
+        with (
+            mock.patch(
+                "recir.backends.inductor.partial_lower",
+                side_effect=RuntimeError("lowering failed"),
+            ),
+            self.assertRaises(RuntimeError),
+        ):
+            _compile_inductor()
+        self.assertEqual(
+            self.metrics()["fail_reason"], "raised after RecIR stage assembly"
+        )
+
+    def test_lowering_that_raises_names_the_stage_before_it(self) -> None:
+        failing = mock.Mock(side_effect=RuntimeError("lowering failed"))
+        with self.assertRaises(RuntimeError):
+            with _dispatching():
+                lower_inputs(_graph(), failing, _observer())
+        self.assertEqual(
+            self.metrics()["fail_reason"], "raised after RecIR stage trace"
+        )
+
+    def test_dispatch_stage_completes_when_the_dispatch_ends(self) -> None:
+        with _dispatching() as step:
+            InductorBackend().dispatch(_graph())
+        _, stage = step.stages
+        self.assertIsInstance(stage, DispatchStage)
+        self.assertTrue(stage.completed)
+
+    def test_a_backend_that_lowers_on_its_own_still_completes_the_stage(self) -> None:
+        with _dispatching() as step:
+            _NoopBackend().dispatch(_graph())
+        _, stage = step.stages
+        self.assertIsInstance(stage, DispatchStage)
+        self.assertTrue(stage.completed)
+
+    def test_a_raising_dispatch_leaves_the_stage_incomplete(self) -> None:
+        with self.assertRaisesRegex(ValueError, "dispatch"):
+            with _dispatching() as step:
+                raise ValueError("dispatch")
+        _, stage = step.stages
+        self.assertFalse(stage.completed)
+        self.assertIsNone(snapshot.lowering_observer())
+
+    def test_stage_fault_never_fails_the_dispatch(self) -> None:
+        with (
+            mock.patch.object(DispatchStage, "__init__", side_effect=RuntimeError),
+            self.assertLogs(_LOGGER, level="WARNING") as logs,
+            _dispatching(),
+        ):
+            self.assertIsNone(snapshot.lowering_observer())
+            lowered = InductorBackend().dispatch(_graph())
+        self.assertIsInstance(lowered, nn.Module)
+        self.assertIn("dispatch stage not begun: RuntimeError", logs.output[0])
+
+
 class _FakeModule(LazilyBuiltModule):
     """A carved module whose "compile" only records what it saw."""
 
@@ -1047,3 +1152,7 @@ class FakeBackendTest(_SnapshotTestCase):
         lowered = self.lower(_graph(), module_factory=_ConfigReadingModule)
         lowered(torch.randn(4))
         self.assertEqual(seen, [torch._inductor.config.bundled_autotune_remote_cache])
+
+    def test_dispatch_input_is_written_for_any_backend(self) -> None:
+        self.lower(_graph())
+        self.assertIn("recir_dispatch_input_whole_graph", self.artifacts())

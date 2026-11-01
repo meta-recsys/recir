@@ -40,6 +40,14 @@ class LoweringObserver:
     by subclassing and overriding the ``_on_*`` hooks.
     """
 
+    def lowering(self, part: Part, gm: fx.GraphModule) -> _InputHooks:
+        """Report that ``gm``, the input ``part``, is about to be lowered; returns the hooks to lower it with."""
+        self._guarded("input", self._on_input, part, gm)
+        return _InputHooks(self, part)
+
+    def _on_input(self, part: Part, gm: fx.GraphModule) -> None:
+        """Lowering ``gm``, the input ``part``, is about to start."""
+
     def _on_carved(self, part: Part, region: CarvedRegion) -> None:
         """``region`` was carved from the input ``part``."""
 
@@ -62,7 +70,7 @@ class _InputHooks:
 def _lower_input(
     lower: Lower, observer: LoweringObserver | None, part: Part, gm: fx.GraphModule
 ) -> nn.Module:
-    hooks = None if observer is None else _InputHooks(observer, part)
+    hooks = None if observer is None else observer.lowering(part, gm)
     return lower(gm, hooks=hooks)
 
 
