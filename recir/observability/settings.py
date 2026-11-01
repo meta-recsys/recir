@@ -21,11 +21,13 @@ class Tier(enum.Enum):
     """
     How much a snapshot writes, set by ``RECIR_SNAPSHOT_TIER``.
 
-    ``OFF`` writes nothing, and ``INDEX`` writes each stage's graph text.
+    ``OFF`` writes nothing, ``INDEX`` writes each stage's graph text, and
+    ``FULL`` also writes each build's IR, on backends whose builds capture it.
     """
 
     OFF = "off"
     INDEX = "index"
+    FULL = "full"
 
 
 @dataclass(frozen=True)
@@ -71,3 +73,8 @@ class Settings:
     def enabled(self) -> bool:
         """Whether snapshots are on at all."""
         return self.tier is not Tier.OFF
+
+    @property
+    def full(self) -> bool:
+        """Whether snapshots also write each build's IR, on backends whose builds capture it."""
+        return self.tier is Tier.FULL

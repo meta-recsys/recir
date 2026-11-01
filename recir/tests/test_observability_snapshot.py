@@ -41,6 +41,7 @@ from recir.observability.builds import BuildTicket, SubgraphBuild
 from recir.observability.compiles import StepCompile, TlparseCompile, TraceRecord
 from recir.observability.dispatch import ObservedLowering
 from recir.observability.graph_dump import GraphDump
+from recir.observability.inductor_build import IrCapture
 from recir.observability.settings import Settings, Tier
 from recir.observability.stages import DispatchStage
 from recir.pipeline import build_pipeline, PipelinedGraphModule, SteadyStateGraphModule
@@ -1123,6 +1124,229 @@ class DispatchTest(_SnapshotTestCase):
             lowered = InductorBackend().dispatch(_graph())
         self.assertIsInstance(lowered, nn.Module)
         self.assertIn("dispatch stage not begun: RuntimeError", logs.output[0])
+
+
+def _fake_compile_logging_ir(
+    sub_gm: fx.GraphModule, inputs: Any, **kwargs: Any
+) -> fx.GraphModule:
+    for key in ("pre", "post"):
+        ir_logger = logging.getLogger(f"torch._inductor.debug.__ir_{key}_fusion")
+        if ir_logger.isEnabledFor(logging.INFO):
+            ir_logger.info("%s fusion IR", key)
+    return sub_gm
+
+
+class _BadNode:
+    """A scheduler node Inductor's IR formatter fails on."""
+
+    def debug_str(self) -> str:
+        raise RuntimeError("bad node")
+
+
+class _DebugDir:
+    """Stands in for Inductor's debug dir: off, or on (``faulty``) with its own formatter call failing."""
+
+    def __init__(self, faulty: bool = False) -> None:
+        self.faulty = faulty
+
+    def ir_pre_fusion(self, nodes: Any) -> None:
+        if self.faulty:
+            from torch._inductor.debug import DebugFormatter
+
+            DebugFormatter._write_ir([_BadNode()])
+
+    ir_post_fusion = ir_pre_fusion
+
+
+def _log_ir(dump: str, nodes: Any, debug_dir: _DebugDir | None = None) -> None:
+    """Log one IR dump the way Inductor's scheduler does."""
+    from torch._inductor import debug
+    from torch._inductor.virtualized import V
+
+    log = debug.log_ir_pre_fusion if dump == "pre" else debug.log_ir_post_fusion
+    handler: Any = debug_dir or _DebugDir()
+    with V.set_debug_handler(handler):
+        log(nodes)
+
+
+_NOT_FORMATTED = "<recir snapshot: IR not formatted: RuntimeError('bad node')>"
+
+
+def _logger_state() -> tuple[Any, ...]:
+    # Importing Inductor's debug module configures its loggers, so read them after.
+    import torch._inductor.debug as debug
+
+    loggers = [debug.ir_pre_fusion_log, debug.ir_post_fusion_log]
+    return (
+        tuple((g.level, g.propagate, tuple(g.handlers)) for g in loggers),
+        debug.DebugFormatter.__dict__["_write_ir"],
+        IrCapture.active(),
+    )
+
+
+class BuildIrTest(_SnapshotTestCase):
+    def setUp(self) -> None:
+        super().setUp()
+        _set_tier(self, Tier.FULL)
+
+    def lower(self) -> nn.Module:
+        with _dispatching():
+            return _lower(_observer(), WHOLE, _graph())
+
+    def build(self, lowered: nn.Module, compile_fx: Any = None) -> None:
+        super().build(lowered, compile_fx or _fake_compile_logging_ir)
+
+    def test_build_ir_dumps(self) -> None:
+        self.build(self.lower())
+        artifacts = self.artifacts()
+        self.assertEqual(artifacts["recir_build_ir_pre_fusion"], "pre fusion IR")
+        self.assertEqual(artifacts["recir_build_ir_post_fusion"], "post fusion IR")
+        self.assertEqual(self.metrics()["co_name"], "recir build whole subgraph_0")
+
+    def test_index_tier_captures_no_ir(self) -> None:
+        _set_tier(self, Tier.INDEX)
+        self.build(self.lower())
+        self.assertNotIn("recir_build_ir_pre_fusion", self.artifacts())
+
+    def test_raised_build_keeps_partial_ir(self) -> None:
+        def raise_after_pre_fusion(
+            sub_gm: fx.GraphModule, inputs: Any, **kwargs: Any
+        ) -> Any:
+            logging.getLogger("torch._inductor.debug.__ir_pre_fusion").info("pre")
+            raise RuntimeError("boom")
+
+        lowered = self.lower()
+        with self.assertRaises(RuntimeError):
+            self.build(lowered, raise_after_pre_fusion)
+        artifacts = self.artifacts()
+        self.assertEqual(artifacts["recir_build_ir_pre_fusion"], "pre")
+        self.assertNotIn("recir_build_ir_post_fusion", artifacts)
+
+    def test_capture_fault_builds_uncaptured(self) -> None:
+        lowered = self.lower()
+        before = _logger_state()
+        with (
+            mock.patch.object(IrCapture, "begin", side_effect=RuntimeError),
+            self.assertLogs(_LOGGER, level="WARNING") as logs,
+        ):
+            self.build(lowered)
+        self.assertNotIn("recir_build_ir_pre_fusion", self.artifacts())
+        self.assertIsNone(self.metrics()["fail_type"])
+        self.assertIn("IR not captured: RuntimeError", logs.output[0])
+        self.assertEqual(_logger_state(), before)
+
+    def test_capture_fault_part_way_undoes_what_started(self) -> None:
+        import torch._inductor.debug as debug
+
+        before = _logger_state()
+        lowered = self.lower()
+        with (
+            mock.patch.object(
+                debug.ir_post_fusion_log, "addHandler", side_effect=RuntimeError
+            ),
+            self.assertLogs(_LOGGER, level="WARNING"),
+        ):
+            self.build(lowered)
+        self.assertNotIn("recir_build_ir_pre_fusion", self.artifacts())
+        self.assertEqual(_logger_state(), before)
+
+    def test_start_fault_at_tier_full_restores_loggers(self) -> None:
+        before = _logger_state()
+        lowered = self.lower()
+        with (
+            mock.patch.object(SubgraphBuild, "_start", side_effect=RuntimeError),
+            self.assertLogs(_LOGGER, level="WARNING"),
+        ):
+            self.build(lowered)
+        self.assertEqual(_logger_state(), before)
+        self.assertNotIn("recir_build_ir_pre_fusion", self.artifacts())
+
+    def test_capture_restores_loggers(self) -> None:
+        before = _logger_state()
+        self.build(self.lower())
+        self.assertIn("recir_build_ir_pre_fusion", self.artifacts())
+        self.assertEqual(_logger_state(), before)
+
+    def test_one_capture_at_a_time(self) -> None:
+        lowered = self.lower()
+        with mock.patch.object(IrCapture, "_active", True):
+            self.build(lowered)
+        self.assertNotIn("recir_build_ir_pre_fusion", self.artifacts())
+        self.assertIsNone(self.metrics()["fail_type"])
+
+    def test_ir_formatter_fault_never_fails_the_build(self) -> None:
+        def format_bad_ir(sub_gm: fx.GraphModule, inputs: Any, **kwargs: Any) -> Any:
+            _log_ir("pre", [_BadNode()])
+            return sub_gm
+
+        self.build(self.lower(), format_bad_ir)
+        pre = self.artifacts()["recir_build_ir_pre_fusion"]
+        assert pre is not None
+        self.assertIn(_NOT_FORMATTED, pre)
+
+    def test_formatter_fault_is_contained_only_for_loggers_the_capture_enabled(
+        self,
+    ) -> None:
+        pre = logging.getLogger("torch._inductor.debug.__ir_pre_fusion")
+        self.addCleanup(pre.setLevel, pre.level)
+        pre.setLevel(logging.INFO)
+
+        def bad_post(sub_gm: fx.GraphModule, inputs: Any, **kwargs: Any) -> Any:
+            _log_ir("pre", [])
+            _log_ir("post", [_BadNode()])
+            return sub_gm
+
+        def bad_pre(sub_gm: fx.GraphModule, inputs: Any, **kwargs: Any) -> Any:
+            _log_ir("pre", [_BadNode()])
+            return sub_gm
+
+        self.build(self.lower(), bad_post)
+        post = self.artifacts()["recir_build_ir_post_fusion"]
+        assert post is not None
+        self.assertIn(_NOT_FORMATTED, post)
+        with self.assertRaises(RuntimeError):
+            self.build(self.lower(), bad_pre)
+
+    def test_formatter_fault_keeps_the_dumps_good_ir(self) -> None:
+        # A second scheduler's pre-fusion dump fails after the first logged.
+        def two_schedulers(sub_gm: fx.GraphModule, inputs: Any, **kwargs: Any) -> Any:
+            _log_ir("pre", [])
+            _log_ir("post", [])
+            _log_ir("pre", [_BadNode()])
+            _log_ir("post", [])
+            return sub_gm
+
+        self.build(self.lower(), two_schedulers)
+        pre = self.artifacts()["recir_build_ir_pre_fusion"]
+        assert pre is not None
+        self.assertEqual(pre.count("BEFORE FUSION"), 2)
+        self.assertEqual(pre.count(_NOT_FORMATTED), 1)
+        self.assertIn("recir_build_ir_post_fusion", self.artifacts())
+
+    def test_debug_dir_formatter_fault_is_not_contained(self) -> None:
+        def faulty_debug_dir(sub_gm: fx.GraphModule, inputs: Any, **kwargs: Any) -> Any:
+            _log_ir("pre", [], debug_dir=_DebugDir(faulty=True))
+            _log_ir("post", [])
+            return sub_gm
+
+        with self.assertRaises(RuntimeError):
+            self.build(self.lower(), faulty_debug_dir)
+        self.assertNotIn("recir_build_ir_post_fusion", self.artifacts())
+
+    def test_real_build_captures_real_ir(self) -> None:
+        lowered = self.lower()
+        # A real, uncached Inductor build, so its scheduler runs and logs the IR.
+        with mock.patch.object(torch.compiler.config, "force_disable_caches", True):
+            lowered(torch.randn(4))
+        artifacts = self.artifacts()
+        pre, post = (
+            artifacts["recir_build_ir_pre_fusion"],
+            artifacts["recir_build_ir_post_fusion"],
+        )
+        assert pre is not None and post is not None
+        self.assertTrue(pre.startswith("BEFORE FUSION"))
+        self.assertTrue(post.startswith("AFTER FUSION"))
+        self.assertIn("SchedulerNode", pre)
 
 
 class _FakeModule(LazilyBuiltModule):
