@@ -412,7 +412,7 @@ class PipelineTest(unittest.TestCase):
                 side_effect=get_external_object,
             ),
         ):
-            pipeline.lower_steady(lambda gm: lowered.append(gm) or gm)
+            pipeline.lower_parts(lambda gm: lowered.append(gm) or gm)
 
         self.assertEqual(len(lowered), 1)
         nodes = list(lowered[0].graph.nodes)
@@ -496,7 +496,7 @@ class PipelineTest(unittest.TestCase):
                 side_effect=get_external_object,
             ),
         ):
-            pipeline.lower_steady(lambda gm: lowered.append(gm) or gm)
+            pipeline.lower_parts(lambda gm: lowered.append(gm) or gm)
 
         nodes = list(lowered[0].graph.nodes)
         preprocessed = next(node for node in nodes if node.target is operator.add)
@@ -552,7 +552,7 @@ class PipelineTest(unittest.TestCase):
                 return_value=stream,
             ),
         ):
-            pipeline.lower_steady(
+            pipeline.lower_parts(
                 lambda lowered_gm: lowered.append(lowered_gm) or lowered_gm
             )
 
@@ -754,7 +754,7 @@ class PipelineTest(unittest.TestCase):
             lowered.append(gm)
             return gm
 
-        pipeline.lower_steady(lower)
+        pipeline.lower_parts(lower)
         self.assertEqual(lowered, [pipeline.steady_gm])
 
     def test_steady_state_pipeline_reads_updated_state_for_next_batch(self) -> None:

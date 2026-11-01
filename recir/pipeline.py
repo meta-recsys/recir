@@ -303,18 +303,14 @@ class PipelinedGraphModule(nn.Module):
             stages.append(stage)
         return tuple(stages)
 
-    def lower_stages(
+    def lower_parts(
         self, lower: Callable[[fx.GraphModule], nn.Module]
     ) -> PipelinedGraphModule:
-        for stage_call in self._stage_calls:
-            target = cast(str, stage_call.target)
-            stage = self.split_gm.get_submodule(target)
-            if not isinstance(stage, fx.GraphModule):
-                raise TypeError(
-                    f"Pipeline stage {target!r} must be an FX GraphModule, "
-                    f"got {type(stage).__name__}"
-                )
-            self.split_gm.set_submodule(target, lower(stage))
+        """Replace each stage's graph with ``lower(graph)``."""
+        for stage_call, stage in zip(
+            self._stage_calls, self.stage_graph_modules(), strict=True
+        ):
+            self.split_gm.set_submodule(cast(str, stage_call.target), lower(stage))
         return self
 
     def _build_segments(self) -> tuple[tuple[fx.Node, ...], ...]:
@@ -625,15 +621,14 @@ class SteadyStateGraphModule(nn.Module):
             return self.steady_gm.print_readable(print_output)
         return str(self.graph)
 
-    def lower_steady(
+    def lower_parts(
         self, lower: Callable[[fx.GraphModule], nn.Module]
     ) -> SteadyStateGraphModule:
         """Materialize stream semantics, then lower the flattened steady graph."""
         if not isinstance(self.steady_gm, fx.GraphModule):
             raise TypeError("The steady-state graph has already been lowered")
         self._materialize_execution_streams(self.steady_gm)
-        lowered = lower(self.steady_gm)
-        self.steady_gm = lowered
+        self.steady_gm = lower(self.steady_gm)
         return self
 
     @staticmethod
