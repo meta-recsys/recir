@@ -297,18 +297,23 @@ class StepCompile(TlparseCompile):
 
     def record_stage(self, stage_cls: type[GraphStage], gm: fx.GraphModule) -> None:
         """Snapshot a new ``stage_cls`` stage from ``gm``, the graph its RecIR code produced."""
-        self._begin(stage_cls).record(gm)
+        self.begin(stage_cls).record(gm)
 
-    def _begin(self, stage_cls: type[_S]) -> _S:
+    def begin(self, stage_cls: type[_S]) -> _S:
+        """
+        Create a ``stage_cls`` stage of this compile, for its RecIR code to
+        write to as it runs and end; stages are kept in the order begun.
+        """
         stage = stage_cls(self)
         self.stages.append(stage)
         return stage
 
     def _start(self) -> None:
         super()._start()
-        self._begin(TraceStage).record(self._trace_text)
+        self.begin(TraceStage).record(self._trace_text)
 
     def _fail_reason(self, error: BaseException) -> str:
-        if not self.stages:
-            return "raised before any RecIR stage"
-        return f"raised after RecIR stage {self.stages[-1].name}"
+        completed = [stage.name for stage in self.stages if stage.completed]
+        if not completed:
+            return "raised before any RecIR stage completed"
+        return f"raised after RecIR stage {completed[-1]}"

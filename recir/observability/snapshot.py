@@ -25,7 +25,7 @@ from recir.observability.compiles import (
 )
 from recir.observability.dispatch import ObservedLowering
 from recir.observability.guard import contained
-from recir.observability.stages import GraphStage
+from recir.observability.stages import DispatchStage, GraphStage
 from torch import fx
 
 
@@ -79,20 +79,30 @@ def record_stage(
 @contextmanager
 def dispatching(step: StepCompile | None, backend: str) -> Iterator[None]:
     """
-    Run ``step``'s backend dispatch inside this context, observed through
-    ``lowering_observer``; ``backend`` names the backend that builds the
-    subgraphs the dispatch carves. Without a step, nothing is observed.
-    Exceptions from the dispatch pass through unchanged.
+    Run ``step``'s backend dispatch inside this context as its dispatch stage,
+    observed through ``lowering_observer``, and end the stage with how the
+    dispatch ended; ``backend`` names the backend that builds the subgraphs
+    the dispatch carves. Without a step, nothing is observed. Exceptions from
+    the dispatch pass through unchanged.
     """
+    stage = None
     observer = None
-    with contained("dispatch observer not created"):
+    with contained("dispatch stage not begun"):
         if step is not None:
-            observer = ObservedLowering(backend)
+            stage = step.begin(DispatchStage)
+            observer = ObservedLowering(stage, backend)
     token = _observer.set(observer)
+    error: BaseException | None = None
     try:
         yield
+    except BaseException as e:
+        error = e
+        raise
     finally:
         _observer.reset(token)
+        if stage is not None:
+            with contained("dispatch stage not ended"):
+                stage.end(error)
 
 
 def lowering_observer() -> LoweringObserver | None:
