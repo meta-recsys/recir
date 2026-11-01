@@ -25,10 +25,12 @@ from recir.observability import compiles
 from recir.observability.compiles import StepCompile, TlparseCompile, TraceRecord
 from recir.observability.graph_dump import GraphDump
 from recir.observability.settings import Settings, Tier
+from recir.region_transforms import RegionTransform
 from recir.tests.test_utils import _NoopBackend, _PassthroughParallel
 from recir.training.compile import compile_step
 from torch import fx
 from torch._dynamo import convert_frame
+from torch._guards import CompileContext
 from torch._logging._internal import trace_log
 
 _LOGGER = "recir.observability"
@@ -296,7 +298,13 @@ class CompileFromGmTest(unittest.TestCase):
         text = GraphDump(gm).text()
         _compile_traced(gm, flat_state)
         self.assertEqual(
-            self.names(), ["dynamo_start", "recir_trace_graph", "compilation_metrics"]
+            self.names(),
+            [
+                "dynamo_start",
+                "recir_trace_graph",
+                "recir_assembly_graph",
+                "compilation_metrics",
+            ],
         )
         self.assertEqual(self.capture.events[1][2], text)
         metrics = self.metrics()
@@ -383,6 +391,57 @@ class CompileFromGmTest(unittest.TestCase):
         metrics = self.metrics()
         self.assertEqual(metrics["fail_type"], "RuntimeError")
         self.assertEqual(metrics["fail_reason"], "raised after RecIR stage trace")
+
+    def test_failure_after_assembly_names_it(self) -> None:
+        class _RaisingBackend(_NoopBackend):
+            def dispatch(self, gm: fx.GraphModule) -> nn.Module:
+                raise RuntimeError("dispatch")
+
+        gm, flat_state = _trace()
+        with self.assertRaisesRegex(RuntimeError, "dispatch"):
+            recir.compile_from_gm(
+                gm,
+                flat_state,
+                parallel_mode=_PassthroughParallel(),
+                backend=_RaisingBackend(),
+            )
+        self.assertEqual(
+            self.metrics()["fail_reason"], "raised after RecIR stage assembly"
+        )
+
+    def test_compile_work_runs_outside_any_compile_id(self) -> None:
+        seen = []
+
+        class _RecordingBackend(_NoopBackend):
+            def dispatch(self, gm: fx.GraphModule) -> nn.Module:
+                # Runs after the trace and assembly writes pushed their id.
+                seen.append(CompileContext.current_compile_id())
+                return gm
+
+        recir.compile_from_gm(
+            *_trace(), parallel_mode=_PassthroughParallel(), backend=_RecordingBackend()
+        )
+        self.assertIn("recir_assembly_graph", self.names())
+        self.assertEqual(seen, [None])
+
+    def test_failure_before_assembly_names_the_trace(self) -> None:
+        class _FailingFinalize(RegionTransform):
+            def finalize_compiled_graph(self, gm: fx.GraphModule) -> None:
+                raise RuntimeError("finalize")
+
+        gm, flat_state = _trace()
+        with self.assertRaisesRegex(RuntimeError, "finalize"):
+            recir.compile_from_gm(
+                gm,
+                flat_state,
+                parallel_mode=_PassthroughParallel(),
+                backend=_NoopBackend(),
+                region_transforms=[_FailingFinalize()],
+            )
+        self.assertNotIn("recir_assembly_graph", self.names())
+        self.assertEqual(
+            self.metrics()["fail_reason"], "raised after RecIR stage trace"
+        )
 
     def test_start_fault_never_fails_the_compile(self) -> None:
         gm, flat_state = _trace()
