@@ -23,13 +23,9 @@ from recir.lowering.torchtpu_lower import _TorchTPUModule
 from recir.passes.iter_graph_module import IterGraphModule
 from recir.pipeline import build_pipeline, PipelinedGraphModule, SteadyStateGraphModule
 from recir.pipeline_strategies import sdd_pipeline_config
-from recir.tests.test_utils import _graph, _NoopBackend, _region_graph, _twelve_ops
+from recir.tests.test_utils import _graph, _NoopBackend, _region_graph, _two_runs
 from torch import fx
 from torch.fx.experimental.proxy_tensor import make_fx
-
-
-def _two_runs(x: torch.Tensor) -> torch.Tensor:
-    return _twelve_ops(_twelve_ops(x))
 
 
 def _pipeline() -> PipelinedGraphModule:
@@ -201,6 +197,20 @@ class LifecycleTest(unittest.TestCase):
             [e for e in observer.events if e[0] == "input"],
             [("input", "setup"), ("input", "main"), ("input", "cleanup")],
         )
+
+    def test_lowered_reports_the_result(self) -> None:
+        class _Lowered(_Events):
+            def _on_lowered(self, part: Part, lowered: nn.Module) -> None:
+                self.events.append(("lowered", part.name))
+                self.lowered = lowered
+
+        observer = _Lowered()
+        result = lower_inputs(_graph(), _carve_once, observer)
+        self.assertEqual(
+            observer.events,
+            [("input", "whole"), ("carved", "whole"), ("lowered", "whole")],
+        )
+        self.assertIs(observer.lowered, result)
 
     def test_a_raising_lowering_raises_after_its_input_is_reported(self) -> None:
         observer = _Events()

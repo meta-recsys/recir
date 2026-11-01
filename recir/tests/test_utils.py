@@ -126,6 +126,10 @@ def _twelve_ops(x: torch.Tensor) -> torch.Tensor:
     return x
 
 
+def _two_runs(x: torch.Tensor) -> torch.Tensor:
+    return _twelve_ops(_twelve_ops(x))
+
+
 def _graph() -> fx.GraphModule:
     """A traced graph of twelve elementwise ops, which partial lowering carves as one subgraph."""
     return make_fx(_twelve_ops)(torch.randn(4))
