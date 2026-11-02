@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import dataclasses
 import unittest
+from types import SimpleNamespace
 
 import torch
 from recir.embedding.backend import (
@@ -28,12 +29,14 @@ from recir.embedding.backend import (
 from recir.embedding.in_graph import (
     _seed_in_graph_tables_from_ec,
     DP_TABLE_PREFIX,
+    InGraphEmbeddingBackend,
     InGraphSparseArch,
     SHARDED_TABLE_PREFIX,
 )
 from torch.fx.experimental.proxy_tensor import make_fx
 from torchrec.distributed.types import ShardingType
 from torchrec.modules.embedding_configs import DataType, EmbeddingConfig
+from torchrec.modules.embedding_modules import EmbeddingCollection
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
 
@@ -607,3 +610,42 @@ class RowWiseKeepsFloat32Test(unittest.TestCase):
         """FSDP uses recir.fsdp_embedding, not the ring-shift kernel."""
         m = self._table(_SPARSE_FSDP)
         self.assertEqual(m._sharded_tables["t"].dtype, torch.float16)
+
+
+class SparseGradScaleTest(unittest.TestCase):
+    @staticmethod
+    def _built_grad_scale(sparse_grad_scale: float) -> float:
+        scales: list[float] = []
+
+        def builder(model, params, cfg, device, grad_scale):
+            scales.append(grad_scale)
+            return torch.optim.SGD(params, lr=0.1, foreach=True), torch.tensor(0.1)
+
+        tables = [
+            EmbeddingConfig(
+                name="t", num_embeddings=16, embedding_dim=8, feature_names=["f"]
+            )
+        ]
+        model = torch.nn.Module()
+        model.collection = EmbeddingCollection(tables=tables)
+        backend = InGraphEmbeddingBackend(
+            "collection",
+            builder,
+            {"t": _SPARSE_ROWWISE},
+            on_device_init=False,
+        )
+        backend.set_sparse_grad_scale(sparse_grad_scale)
+        backend.set_feature_seqlens({"f": 2})
+        sparse_config = SimpleNamespace(lr_warmup_schedule=None)
+        # pyrefly: ignore[bad-argument-type]
+        backend.setup(model, tables, sparse_config, torch.device("cpu"), 4)
+        return scales[0]
+
+    def test_the_builder_gets_the_backend_s_scale(self) -> None:
+        for scale in (1.0, 128.0):
+            self.assertEqual(scale, self._built_grad_scale(scale))
+
+    def test_a_non_positive_scale_raises(self) -> None:
+        for scale in (0.0, -128.0):
+            with self.assertRaisesRegex(ValueError, "positive"):
+                self._built_grad_scale(scale)

@@ -32,7 +32,7 @@ from recir.training.setup import build_sparse_lr_buffered_optimizer
 EMBEDDING_BACKENDS: tuple[str, ...] = ("cpu", "tpu", "in_graph")
 
 SparseOptimizerBuilder = Callable[
-    [nn.Module, list[nn.Parameter], OptimConfig, torch.device],
+    [nn.Module, list[nn.Parameter], OptimConfig, torch.device, float],
     tuple[torch.optim.Optimizer, torch.Tensor],
 ]
 
