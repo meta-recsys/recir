@@ -534,6 +534,7 @@ class SparseArchInputBreakDispatcher:
         ]
         for i, arch in enumerate(archs):
             oid = self._override_id + i
+            arch._feature_seqlens = dict(self._feature_seqlens)
             arch.enable_input_break(oid, self._input_kjt_keys)
             self._enabled.append((oid, arch))
         logger.info(

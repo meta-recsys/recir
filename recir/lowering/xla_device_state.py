@@ -6,7 +6,7 @@
 
 import logging
 import time
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Collection, Dict, List, Optional, Sequence, Tuple
 
 import torch
 from recir.lowering.device_state import DeviceStateManager
@@ -28,7 +28,7 @@ class XLADeviceStateManager(DeviceStateManager):
     """Keep XLA state resident and optionally share it across compiled graphs."""
 
     _shared: Optional[Dict[str, Any]] = None
-    _shared_keys: List[str]
+    _shared_keys: List[Optional[str]]
     _shared_host: List[torch.Tensor]
 
     def __init__(self, torch_device: Optional[torch.device] = None) -> None:
@@ -36,12 +36,15 @@ class XLADeviceStateManager(DeviceStateManager):
             torch_device if torch_device is not None else torch.device("cpu")
         )
         self._state_input_cache: _StateInputCache = {}
+        self._local_state: Dict[int, Any] = {}
 
     def share_device_state(
         self,
         store: Dict[str, Any],
         compiled: torch.nn.Module,
         flat_state: List[torch.Tensor],
+        *,
+        local_indices: Collection[int] = (),
     ) -> None:
         state_fqns = self.state_fqns
         if state_fqns is None or len(state_fqns) != len(flat_state):
@@ -49,10 +52,16 @@ class XLADeviceStateManager(DeviceStateManager):
         # A graph left entirely in torch (too small to lower) reads host tensors.
         if not any(isinstance(m, _XLAModule) for m in compiled.modules()):
             return
+        if any(index < 0 or index >= len(flat_state) for index in local_indices):
+            raise ValueError("Graph-local state index is out of range")
         local = self.device_state
         self._shared = store
-        self._shared_keys = list(state_fqns)
+        self._shared_keys = [
+            None if index in local_indices else name
+            for index, name in enumerate(state_fqns)
+        ]
         self._shared_host = flat_state
+        self._device_state = None
         if local is not None:
             self.device_state = local
 
@@ -61,13 +70,17 @@ class XLADeviceStateManager(DeviceStateManager):
         shared = self._shared
         if shared is None:
             return self._device_state
-        if not any(key in shared for key in self._shared_keys):
+        if not self._local_state and not any(
+            key in shared for key in self._shared_keys if key is not None
+        ):
             return None
         # A leaf no graph has made resident yet is its host tensor, which the
         # XLA call converts like on the slow path.
         return [
-            shared.get(key, host)
-            for key, host in zip(self._shared_keys, self._shared_host)
+            self._local_state.get(index, host) if key is None else shared.get(key, host)
+            for index, (key, host) in enumerate(
+                zip(self._shared_keys, self._shared_host)
+            )
         ]
 
     @device_state.setter
@@ -78,10 +91,15 @@ class XLADeviceStateManager(DeviceStateManager):
             return
         if value is None:
             for key in self._shared_keys:
-                shared.pop(key, None)
+                if key is not None:
+                    shared.pop(key, None)
+            self._local_state.clear()
             return
-        for key, array in zip(self._shared_keys, value):
-            shared[key] = array
+        for index, (key, array) in enumerate(zip(self._shared_keys, value)):
+            if key is None:
+                self._local_state[index] = array
+            else:
+                shared[key] = array
 
     def _configure_xla_modules(
         self, gm: torch.nn.Module, *, keep_jax_output: bool
@@ -172,6 +190,19 @@ class XLADeviceStateManager(DeviceStateManager):
             )
         self.check_no_meta_leaves(flat_state)
 
+        self.initialize_device_state(gm, flat_state)
+
+    def initialize_device_state(
+        self,
+        gm: torch.fx.GraphModule,
+        flat_state: List[torch.Tensor],
+        host_indices: Collection[int] = (),
+    ) -> None:
+        """Cache sharded state, generating meta tensor leaves directly on device.
+
+        Leaves at ``host_indices`` are cached as their host tensors.
+        """
+        placeholders = [n for n in gm.graph.nodes if n.op == "placeholder"]
         devices = _get_global_devices()
         fsdp_axis_size = int(
             getattr(gm, "meta", {}).get("gspmd_fsdp_axis_size", len(devices))
@@ -179,17 +210,21 @@ class XLADeviceStateManager(DeviceStateManager):
         mesh, batch_axis_resource, _ = _gspmd_mesh(devices, fsdp_axis_size)
         fsdp_host_shard_count = fsdp_axis_size // len(_get_local_devices())
         new_device_state = [
-            _XLAModule._to_sharded_jax(
-                leaf,
-                mesh,
-                # State entries are never batch inputs.
-                False,
-                0,
-                is_fsdp_tensor=placeholders[i].meta.get("is_fsdp_sharded", False),
-                fsdp_shard_dim=placeholders[i].meta.get("fsdp_shard_dim", 0),
-                batch_axis_resource=batch_axis_resource,
-                fsdp_axis_name=_GSPMD_FSDP_AXIS,
-                fsdp_host_shard_count=fsdp_host_shard_count,
+            (
+                leaf
+                if i in host_indices
+                else _XLAModule._to_sharded_jax(
+                    leaf,
+                    mesh,
+                    # State entries are never batch inputs.
+                    False,
+                    0,
+                    is_fsdp_tensor=placeholders[i].meta.get("is_fsdp_sharded", False),
+                    fsdp_shard_dim=placeholders[i].meta.get("fsdp_shard_dim", 0),
+                    batch_axis_resource=batch_axis_resource,
+                    fsdp_axis_name=_GSPMD_FSDP_AXIS,
+                    fsdp_host_shard_count=fsdp_host_shard_count,
+                )
             )
             for i, leaf in enumerate(flat_state)
         ]

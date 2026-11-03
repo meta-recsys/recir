@@ -9,6 +9,7 @@ import shutil
 import tempfile
 import unittest
 from collections.abc import Callable, Sequence
+from types import SimpleNamespace
 from typing import Any, cast, Dict, TypeVar
 from unittest.mock import MagicMock, patch
 
@@ -18,6 +19,8 @@ import torch.distributed.checkpoint as dcp
 import torch.utils._pytree as pytree
 from recir.compiler.process_state import _compute_state_fqns
 from recir.distributed.data_parallel import DataParallelStyle, shard_params_and_states
+from recir.lowering.device_state import DeviceStateManager
+from recir.training.graph_state import SharedGraphState
 from recir.training.optim import TensorLRRowWiseAdagrad
 from recir.training.tpu_checkpoint import (
     EMBEDDING_OPTIMIZER_STATE_KEY,
@@ -174,6 +177,156 @@ def _run_dense_step_from_flat_state(
 
 
 class RecirCheckpointableTest(unittest.TestCase):
+    def test_restore_rejects_stale_binding_before_rebinding(self) -> None:
+        model, optimizer = _new_dense_leg()
+        _run_dense_step(model, optimizer, torch.ones(4))
+        flat_state, fqns = _optimizer_flat_state(model, optimizer)
+        buffers = _build_buffers(flat_state, fqns, model, [optimizer], prefixes=())
+        checkpointable = RecirCheckpointable(
+            model,
+            num_processes=1,
+            sharded_prefixes=(),
+            table_prefixes=(),
+            warmup=_Warmup(),
+            host_buffers=lambda: buffers,
+            dense_optimizer=optimizer,
+        )
+        saved = _clone_tree(checkpointable.state_dict())
+        saved["weight"].fill_(42)
+        before = model.weight.detach().clone()
+        index = fqns.index("[0]['weight']")
+        flat_state[index] = flat_state[index].clone()
+        with self.assertRaisesRegex(RuntimeError, "binding is stale: weight"):
+            checkpointable.load_state_dict(saved)
+        torch.testing.assert_close(model.weight, before)
+
+    def test_dcp_destination_must_be_the_registered_buffer(self) -> None:
+        model = _DenseModel()
+        structure = [dict(model.named_parameters()), {}]
+        buffers = _build_buffers(
+            pytree.tree_leaves(structure),
+            _compute_state_fqns(structure),
+            model,
+            prefixes=(),
+        )
+        checkpointable = RecirCheckpointable(
+            model,
+            num_processes=1,
+            sharded_prefixes=(),
+            table_prefixes=(),
+            warmup=_Warmup(),
+            host_buffers=lambda: buffers,
+        )
+        destination = _clone_tree(model.state_dict())
+        with patch.object(model, "state_dict", return_value=destination):
+            with self.assertRaisesRegex(
+                RuntimeError, "payload for weight is not the host buffer"
+            ):
+                checkpointable.state_dict()
+
+    def test_restore_checks_each_graph_after_optimizer_slots_are_replaced(self) -> None:
+        for omission in (None, "adopt", "refresh"):
+            with self.subTest(omission=omission):
+                model, optimizer = _new_dense_leg()
+                batch = torch.tensor([2.0, -1.0, 3.0, 0.5])
+                _run_dense_step(model, optimizer, batch)
+                flat_state, fqns = _optimizer_flat_state(model, optimizer)
+                graph = torch.fx.Graph()
+                for index in range(len(flat_state)):
+                    graph.placeholder(f"state_{index}")
+                graph.output(())
+                objects = [
+                    SimpleNamespace(
+                        gm=torch.fx.GraphModule({}, graph),
+                        flat_state=[leaf.clone() for leaf in flat_state],
+                        state_manager=DeviceStateManager(),
+                    )
+                    for _ in range(2)
+                ]
+                for obj in objects:
+                    obj.state_manager.state_fqns = fqns
+                shared = SharedGraphState(objects, [set(), set()])
+                buffers = HostStateBuffers(
+                    objects[-1].flat_state,
+                    fqns,
+                    model,
+                    [optimizer],
+                    (),
+                    shared_state=shared,
+                )
+                buffers.build()
+                checkpointable = RecirCheckpointable(
+                    model,
+                    num_processes=1,
+                    sharded_prefixes=(),
+                    table_prefixes=(),
+                    warmup=_Warmup(),
+                    host_buffers=lambda buffers=buffers: buffers,
+                    dense_optimizer=optimizer,
+                )
+                saved = _clone_tree(checkpointable.state_dict())
+                expected = _run_dense_step_from_flat_state(
+                    model, optimizer, objects[-1].flat_state, fqns, batch
+                )
+                if omission == "adopt":
+                    with patch.object(
+                        buffers,
+                        "_adopt",
+                        side_effect=lambda index,
+                        owner,
+                        buffers=buffers: buffers._owned.__setitem__(
+                            index, owner.data_ptr()
+                        ),
+                    ):
+                        with self.assertRaisesRegex(RuntimeError, "binding is stale"):
+                            checkpointable.load_state_dict(saved)
+                elif omission == "refresh":
+                    with patch.object(shared, "refresh_host_state"):
+                        with self.assertRaisesRegex(
+                            RuntimeError, "graph 0 has a stale"
+                        ):
+                            checkpointable.load_state_dict(saved)
+                else:
+                    checkpointable.load_state_dict(saved)
+                    actual = _run_dense_step_from_flat_state(
+                        model, optimizer, objects[0].flat_state, fqns, batch
+                    )
+                    for reference, resumed in zip(expected[:2], actual[:2]):
+                        torch.testing.assert_close(resumed, reference)
+                    for key in expected[2]:
+                        torch.testing.assert_close(actual[2][key], expected[2][key])
+
+    def test_restored_optimizer_slots_rebind_compiled_host_state(self) -> None:
+        model, optimizer = _new_dense_leg()
+        batch = torch.tensor([2.0, -1.0, 3.0, 0.5])
+        _run_dense_step(model, optimizer, batch)
+        flat_state, fqns = _optimizer_flat_state(model, optimizer)
+        buffers = _build_buffers(flat_state, fqns, model, [optimizer], prefixes=())
+        checkpointable = RecirCheckpointable(
+            model,
+            num_processes=1,
+            sharded_prefixes=(),
+            table_prefixes=(),
+            warmup=_Warmup(),
+            host_buffers=lambda: buffers,
+            dense_optimizer=optimizer,
+        )
+        saved = _clone_tree(checkpointable.state_dict())
+        expected = _run_dense_step_from_flat_state(
+            model, optimizer, flat_state, fqns, batch
+        )
+        checkpointable.load_state_dict(saved)
+        for key, value in optimizer.state[model.weight].items():
+            index = fqns.index(f"[1]['weight']['{key}']")
+            self.assertEqual(flat_state[index].data_ptr(), value.data_ptr())
+        actual = _run_dense_step_from_flat_state(
+            model, optimizer, flat_state, fqns, batch
+        )
+        for reference, resumed in zip(expected[:2], actual[:2]):
+            torch.testing.assert_close(resumed, reference)
+        for key in expected[2]:
+            torch.testing.assert_close(actual[2][key], expected[2][key])
+
     def test_async_snapshot_aliases_live_storage_instead_of_copying(self) -> None:
         wrapper = _Wrapper()
         checkpointable = RecirCheckpointable(
