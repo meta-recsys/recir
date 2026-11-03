@@ -27,6 +27,7 @@ the ``OptimConfig`` protocol.
 import logging
 from typing import Any, Dict, List, Mapping, Optional, Protocol, Sequence, Tuple
 
+import recir.ops.random_op  # noqa: F401
 import torch
 from recir.utils.meta_tensor_init import mark_meta_zero_init
 from torchrec.distributed.embedding_types import OptimType
@@ -193,6 +194,9 @@ class TensorLRRowWiseAdagrad(torch.optim.Optimizer):
     counter (avoids a host sync that would graph-break under make_fx), and
     maximize; replaces addcdiv_(value=-clr) with explicit tensor arithmetic
     (value= is Scalar-only, can't take a tensor LR). Restricted to 2-D params.
+
+    Updates and per-row state use FP32. FP16 weight writeback uses stochastic
+    rounding by default, with a checkpointed seed and counter per parameter.
     """
 
     def __init__(
@@ -203,6 +207,8 @@ class TensorLRRowWiseAdagrad(torch.optim.Optimizer):
         eps: float,
         weight_decay: float,
         grad_scale: float = 1.0,
+        stochastic_rounding: bool = True,
+        rounding_seed: int = 0,
     ) -> None:
         assert lr_tensor.dim() == 0, (
             f"lr_tensor must be 0-d (got shape {tuple(lr_tensor.shape)})"
@@ -212,6 +218,8 @@ class TensorLRRowWiseAdagrad(torch.optim.Optimizer):
             "eps": eps,
             "weight_decay": weight_decay,
             "grad_scale": grad_scale,
+            "stochastic_rounding": stochastic_rounding,
+            "rounding_seed": rounding_seed,
         }
         super().__init__(params, defaults)
 
@@ -220,9 +228,57 @@ class TensorLRRowWiseAdagrad(torch.optim.Optimizer):
         for group in self.param_groups:
             group.setdefault("grad_scale", self.defaults["grad_scale"])
 
+    def _init_state(self) -> None:
+        stream = 0
+        for group in self.param_groups:
+            for p in group["params"]:
+                state = self.state[p]
+                if p.dim() == 2 and "sum" not in state:
+                    state["sum"] = torch.zeros(
+                        (p.shape[0], 1), dtype=torch.float32, device=p.device
+                    )
+                    mark_meta_zero_init(state["sum"])
+                if p.dtype == torch.float16 and group["stochastic_rounding"]:
+                    if "rounding_seed" not in state:
+                        state["rounding_seed"] = torch.tensor(
+                            (group["rounding_seed"] + stream) % (2**32),
+                            dtype=torch.int64,
+                            device=group["lr"].device,
+                        )
+                    if "rounding_counter" not in state:
+                        state["rounding_counter"] = torch.zeros(
+                            (), dtype=torch.int64, device=group["lr"].device
+                        )
+                stream += 1
+
+    def load_state_dict(self, state_dict: Dict[str, Any]) -> None:
+        live_states = {p: dict(state) for p, state in self.state.items()}
+        super().load_state_dict(state_dict)
+        for group, saved_group in zip(self.param_groups, state_dict["param_groups"]):
+            for key in ("stochastic_rounding", "rounding_seed"):
+                group.setdefault(key, self.defaults[key])
+            for p, state_id in zip(group["params"], saved_group["params"]):
+                saved = state_dict["state"].get(state_id, {})
+                for key, dtype in (
+                    ("sum", torch.float32),
+                    ("rounding_seed", torch.int64),
+                    ("rounding_counter", torch.int64),
+                ):
+                    if key not in saved:
+                        continue
+                    live = live_states.get(p, {}).get(key)
+                    device = p.device if key == "sum" else group["lr"].device
+                    restored = saved[key].to(device=device, dtype=dtype)
+                    if live is not None:
+                        live.copy_(restored)
+                        restored = live
+                    self.state[p][key] = restored
+        self._init_state()
+
     @torch.no_grad()
     def step(self, closure: Any = None) -> Any:
         loss = closure() if closure is not None else None
+        self._init_state()
         for group in self.param_groups:
             lr_t: torch.Tensor = group["lr"]
             eps: float = group["eps"]
@@ -236,22 +292,25 @@ class TensorLRRowWiseAdagrad(torch.optim.Optimizer):
                         f"got param of shape {tuple(p.shape)}. Route 1-D / "
                         "non-embedding params through a per-element optimizer."
                     )
-                grad = p.grad
+                grad = p.grad.float()
                 if group["grad_scale"] != 1.0:
                     grad = grad * group["grad_scale"]
                 state = self.state[p]
-                if "sum" not in state:
-                    # Per-row state: (num_rows, 1). Matches prod RowWiseAdagrad.
-                    state["sum"] = torch.zeros(
-                        (p.shape[0], 1), dtype=torch.float32, device=p.device
-                    )
-                    mark_meta_zero_init(state["sum"])
+                weight = p.float()
                 if wd != 0:
-                    grad = grad.add(p, alpha=wd)
+                    grad = grad.add(weight, alpha=wd)
                 state["sum"] += grad.pow(2).mean(axis=1, keepdim=True)
                 std = state["sum"].sqrt().add_(eps)
                 # Cannot use addcdiv_(value=lr_t) (Scalar-only); explicit math.
-                p.sub_(grad / std * lr_t)
+                updated = weight - grad / std * lr_t
+                if p.dtype == torch.float16 and group["stochastic_rounding"]:
+                    rounded = torch.ops.recir.stochastic_round_fp16(
+                        updated, state["rounding_counter"], state["rounding_seed"]
+                    )
+                    p.copy_(rounded)
+                    state["rounding_counter"].add_(1)
+                else:
+                    p.copy_(updated)
         return loss
 
 
@@ -339,6 +398,10 @@ def prime_optimizer_state(opt: torch.optim.Optimizer) -> None:
     if is_adam and _run_adam_init_step(opt):
         return
 
+    if isinstance(opt, TensorLRRowWiseAdagrad):
+        opt._init_state()
+        return
+
     primed = 0
     for group in opt.param_groups:
         capturable = bool(group.get("capturable", False))
@@ -347,26 +410,16 @@ def prime_optimizer_state(opt: torch.optim.Optimizer) -> None:
             state = opt.state[p]
             if state:
                 continue
-            if is_adam:
-                step_device = p.device if capturable else torch.device("cpu")
-                state["step"] = torch.ones((), dtype=scalar_dtype, device=step_device)
-                state["exp_avg"] = torch.zeros_like(
+            step_device = p.device if capturable else torch.device("cpu")
+            state["step"] = torch.ones((), dtype=scalar_dtype, device=step_device)
+            state["exp_avg"] = torch.zeros_like(p, memory_format=torch.preserve_format)
+            state["exp_avg_sq"] = torch.zeros_like(
+                p, memory_format=torch.preserve_format
+            )
+            if amsgrad:
+                state["max_exp_avg_sq"] = torch.zeros_like(
                     p, memory_format=torch.preserve_format
                 )
-                state["exp_avg_sq"] = torch.zeros_like(
-                    p, memory_format=torch.preserve_format
-                )
-                if amsgrad:
-                    state["max_exp_avg_sq"] = torch.zeros_like(
-                        p, memory_format=torch.preserve_format
-                    )
-            else:
-                if p.dim() != 2:
-                    continue
-                state["sum"] = torch.zeros(
-                    (p.shape[0], 1), dtype=torch.float32, device=p.device
-                )
-                mark_meta_zero_init(state["sum"])
             primed += 1
     logger.info(
         "[recir optimizer] primed %s state for %d params (pre-trace)",
@@ -380,6 +433,9 @@ def build_torch_optimizer(
     cfg: OptimConfig,
     lr_tensor: torch.Tensor,
     grad_scale: float = 1.0,
+    *,
+    stochastic_rounding: bool = True,
+    rounding_seed: int = 0,
 ) -> torch.optim.Optimizer:
     """Construct a torch.optim instance from MVAI's OptimConfig.
 
@@ -391,6 +447,9 @@ def build_torch_optimizer(
     tracing, so any branch added here has to preserve it.
 
     ``lr_tensor``'s initial value must equal ``cfg.lr``.
+
+    ``stochastic_rounding`` and ``rounding_seed`` control FP16 writeback for
+    ROWWISE_ADAGRAD; its RNG tensors are saved in the optimizer state_dict.
 
     Value-mode grad clipping (GradientClipping.VALUE + max_gradient) is honored
     for the Adam/AdamW branch. Other clipping modes and FBGEMM-only knobs are
@@ -463,6 +522,8 @@ def build_torch_optimizer(
             eps=cfg.eps,
             weight_decay=cfg.weight_decay,
             grad_scale=grad_scale,
+            stochastic_rounding=stochastic_rounding,
+            rounding_seed=rounding_seed,
         )
         prime_optimizer_state(opt)
         return opt

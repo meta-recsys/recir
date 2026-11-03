@@ -5,6 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 
+import copy
 import types
 import unittest
 from typing import cast
@@ -17,8 +18,125 @@ from recir.training.optim import (
     TensorLRRowWiseAdagrad,
     WarmupController,
 )
+from torch.fx.experimental.proxy_tensor import make_fx
 from torchrec.distributed.embedding_types import OptimType
 from torchrec.optim.warmup import WarmupPolicy, WarmupStage
+
+
+class RowWiseAdagradRoundingTest(unittest.TestCase):
+    def _optimizer(
+        self, parameter: torch.nn.Parameter, stochastic_rounding: bool = True
+    ) -> TensorLRRowWiseAdagrad:
+        return TensorLRRowWiseAdagrad(
+            [parameter],
+            lr_tensor=torch.tensor(2**-12),
+            eps=0.0,
+            weight_decay=0.0,
+            stochastic_rounding=stochastic_rounding,
+            rounding_seed=37,
+        )
+
+    def test_fp16_writeback_preserves_small_updates_in_expectation(self) -> None:
+        parameter = torch.nn.Parameter(torch.ones((16384, 1), dtype=torch.float16))
+        optimizer = self._optimizer(parameter)
+        parameter.grad = torch.ones_like(parameter)
+        optimizer.step()
+
+        self.assertEqual(parameter.dtype, torch.float16)
+        self.assertTrue(bool(((parameter == 1) | (parameter == 1 - 2**-11)).all()))
+        self.assertAlmostEqual(float((parameter < 1).float().mean()), 0.5, delta=0.02)
+        self.assertEqual(int(optimizer.state[parameter]["rounding_counter"]), 1)
+
+        deterministic = torch.nn.Parameter(torch.ones_like(parameter))
+        deterministic.grad = torch.ones_like(parameter)
+        self._optimizer(deterministic, stochastic_rounding=False).step()
+        torch.testing.assert_close(deterministic, torch.ones_like(deterministic))
+
+    def test_fp16_gradient_squares_and_update_use_fp32(self) -> None:
+        parameter = torch.nn.Parameter(torch.ones((2, 2), dtype=torch.float16))
+        gradient = torch.tensor([[300, -300], [2**-12, -(2**-12)]], dtype=torch.float16)
+        parameter.grad = gradient
+        optimizer = self._optimizer(parameter, stochastic_rounding=False)
+        optimizer.step()
+
+        expected_sum = gradient.float().square().mean(dim=1, keepdim=True)
+        torch.testing.assert_close(optimizer.state[parameter]["sum"], expected_sum)
+        expected = (
+            torch.ones((2, 2)) - gradient.float() / expected_sum.sqrt() * 2**-12
+        ).half()
+        torch.testing.assert_close(parameter, expected, rtol=0, atol=0)
+
+    def test_checkpoint_replays_rng_and_preserves_state_buffers(self) -> None:
+        parameter = torch.nn.Parameter(torch.ones((128, 4), dtype=torch.float16))
+        optimizer = self._optimizer(parameter)
+        parameter.grad = torch.ones_like(parameter)
+        optimizer.step()
+        optimizer.state[parameter]["rounding_counter"].fill_(65537)
+        optimizer.state[parameter]["rounding_seed"].fill_(2**31 + 123)
+        checkpoint = copy.deepcopy(optimizer.state_dict())
+        saved_weight = parameter.detach().clone()
+        optimizer.step()
+        expected = parameter.detach().clone()
+
+        restored_parameter = torch.nn.Parameter(saved_weight)
+        restored = self._optimizer(restored_parameter)
+        prime_optimizer_state(restored)
+        buffers = dict(restored.state[restored_parameter])
+        restored.load_state_dict(checkpoint)
+        for key, buffer in buffers.items():
+            self.assertIs(restored.state[restored_parameter][key], buffer)
+        self.assertEqual(buffers["sum"].dtype, torch.float32)
+        self.assertEqual(buffers["rounding_counter"].dtype, torch.int64)
+        self.assertEqual(int(buffers["rounding_counter"]), 65537)
+        self.assertEqual(int(buffers["rounding_seed"]), 2**31 + 123)
+        restored_parameter.grad = torch.ones_like(restored_parameter)
+        restored.step()
+        torch.testing.assert_close(restored_parameter, expected, rtol=0, atol=0)
+
+    def test_legacy_checkpoint_and_meta_priming(self) -> None:
+        parameter = torch.nn.Parameter(torch.ones((2, 4), dtype=torch.float16))
+        optimizer = self._optimizer(parameter)
+        prime_optimizer_state(optimizer)
+        checkpoint = optimizer.state_dict()
+        checkpoint["state"][0] = {"sum": torch.ones((2, 1))}
+        del checkpoint["param_groups"][0]["stochastic_rounding"]
+        del checkpoint["param_groups"][0]["rounding_seed"]
+        optimizer.load_state_dict(checkpoint)
+        self.assertEqual(int(optimizer.state[parameter]["rounding_counter"]), 0)
+        torch.testing.assert_close(
+            optimizer.state[parameter]["sum"], torch.ones((2, 1))
+        )
+
+        meta = torch.nn.Parameter(
+            torch.empty((2, 4), dtype=torch.float16, device="meta")
+        )
+        meta_optimizer = self._optimizer(meta)
+        prime_optimizer_state(meta_optimizer)
+        self.assertEqual(meta_optimizer.state[meta]["sum"].device.type, "meta")
+        self.assertEqual(
+            meta_optimizer.state[meta]["rounding_counter"].device.type, "cpu"
+        )
+
+    def test_fp32_does_not_allocate_rounding_state(self) -> None:
+        parameter = torch.nn.Parameter(torch.ones((2, 4)))
+        optimizer = self._optimizer(parameter)
+        parameter.grad = torch.ones_like(parameter)
+        optimizer.step()
+        self.assertEqual(set(optimizer.state[parameter]), {"sum"})
+        torch.testing.assert_close(parameter, torch.full_like(parameter, 1 - 2**-12))
+
+    def test_meta_optimizer_traces_keyed_rounding(self) -> None:
+        parameter = torch.nn.Parameter(
+            torch.ones((2, 4), dtype=torch.float16, device="meta")
+        )
+        parameter.grad = torch.ones_like(parameter)
+        optimizer = self._optimizer(parameter)
+        prime_optimizer_state(optimizer)
+        graph = make_fx(
+            lambda: optimizer.step(), tracing_mode="fake", _allow_non_fake_inputs=True
+        )()
+        targets = [node.target for node in graph.graph.nodes]
+        self.assertIn(torch.ops.recir.stochastic_round_fp16.default, targets)
 
 
 class WarmupControllerTest(unittest.TestCase):
