@@ -735,3 +735,125 @@ class PoolingImplParityTest(unittest.TestCase):
         self.assertEqual(grads["xla"].shape, (self.W, self.V_LOCAL, self.DIM))
         self.assertEqual(grads["xla"].shape, grads["fused_kernel"].shape)
         self.assertEqual(grads["xla"].dtype, grads["fused_kernel"].dtype)
+
+
+class FP16StorageTest(unittest.TestCase):
+    @unittest.skipUnless(
+        any(d.platform == "tpu" for d in jax.devices()), "Requires real TPU"
+    )
+    def test_real_tpu_fp16_gather_pooling_and_backward(self) -> None:
+        from recir.ops.pallas.embeddings import ringshift as rs
+
+        devices = jax.devices()[:4]
+        world = len(devices)
+        mesh = jax.sharding.Mesh(np.array(devices), ("rank",))
+        host_table = np.broadcast_to(
+            np.array([2048.0, 1.0, -2048.0], np.float16)[None, :, None],
+            (world, 3, 128),
+        ).copy()
+        ids = np.tile(
+            np.array([0, world, 2 * world, 0, 1, 0, 0, 0], np.int32), (world, 1)
+        )
+        counts = np.full(world, 5, np.int32)
+        lengths = np.tile(np.array([3, 0, 2], np.int32), (world, 1))
+        sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec("rank"))
+        table = jax.device_put(host_table, sharding)
+        device_ids = jax.device_put(ids, sharding)
+        device_counts = jax.device_put(counts, sharding)
+        device_lengths = jax.device_put(lengths, sharding)
+        for dma in (False, True):
+            for pooling in ("none", "sum", "mean"):
+                with (
+                    self.subTest(dma=dma, pooling=pooling),
+                    mock.patch.object(
+                        rs, "_TABLE_VMEM_BUDGET_BYTES", 0 if dma else 16 * 1024 * 1024
+                    ),
+                ):
+
+                    def lookup(t, pooling=pooling):
+                        return ringshift_embedding_lookup(
+                            device_ids,
+                            device_counts if pooling == "none" else None,
+                            t,
+                            mesh=mesh,
+                            axis_name="rank",
+                            recv_capacity=_TILE_INT32,
+                            pooling=pooling,
+                            bag_lengths=None if pooling == "none" else device_lengths,
+                        )
+
+                    output = jax.jit(lookup)(table)
+                    reference = ringshift_embedding_lookup_reference(
+                        ids,
+                        counts if pooling == "none" else None,
+                        host_table.astype(np.float32),
+                        world,
+                        pooling,
+                        None if pooling == "none" else lengths,
+                    )
+                    self.assertEqual(output.dtype, jnp.float32)
+                    np.testing.assert_allclose(
+                        np.array(output), reference, rtol=1e-6, atol=1e-6
+                    )
+                    gradient = jax.jit(jax.grad(lambda t: jnp.sum(lookup(t))))(table)
+                    expected = np.zeros_like(host_table, dtype=np.float32)
+                    for rank in range(world):
+                        for pos in range(5):
+                            value = (
+                                1.0
+                                if pooling != "mean"
+                                else (1.0 / 3 if pos < 3 else 1.0 / 2)
+                            )
+                            idx = ids[rank, pos]
+                            expected[idx % world, idx // world] += value
+                    np.testing.assert_allclose(
+                        np.array(gradient), expected.astype(np.float16), rtol=0, atol=0
+                    )
+
+    def test_half_storage_traces_fp32_output_and_matching_table_cotangent(self) -> None:
+        from recir.ops.pallas.embeddings import ringshift as rs
+
+        mesh = jax.sharding.Mesh(np.array(jax.devices()[:1]), ("rank",))
+        for dma in (False, True):
+            for pooling in ("none", "sum", "mean"):
+                for exchange_bf16 in (False, True):
+                    with (
+                        self.subTest(dma=dma, pooling=pooling, exchange=exchange_bf16),
+                        mock.patch.object(
+                            rs,
+                            "_TABLE_VMEM_BUDGET_BYTES",
+                            0 if dma else 16 * 1024 * 1024,
+                        ),
+                    ):
+
+                        def lookup(table, pooling=pooling, exchange_bf16=exchange_bf16):
+                            return ringshift_embedding_lookup(
+                                jnp.array([[0, 1, 2, 0]], jnp.int32),
+                                jnp.array([3], jnp.int32)
+                                if pooling == "none"
+                                else None,
+                                table,
+                                mesh=mesh,
+                                axis_name="rank",
+                                recv_capacity=_TILE_INT32,
+                                pooling=pooling,
+                                bag_lengths=None
+                                if pooling == "none"
+                                else jnp.array([[2, 0, 1]], jnp.int32),
+                                exchange_bf16=exchange_bf16,
+                            )
+
+                        table = jax.ShapeDtypeStruct((1, 3, 128), jnp.float16)
+                        out = jax.eval_shape(lookup, table)
+                        from jax import export
+
+                        export.export(jax.jit(lookup), platforms=("tpu",))(table)
+                        self.assertEqual(out.dtype, jnp.float32)
+                        self.assertEqual(
+                            out.shape, (1, 4 if pooling == "none" else 3, 128)
+                        )
+                        grad = jax.eval_shape(
+                            jax.grad(lambda t: jnp.sum(lookup(t))), table
+                        )
+                        self.assertEqual(grad.shape, table.shape)
+                        self.assertEqual(grad.dtype, jnp.float16)
