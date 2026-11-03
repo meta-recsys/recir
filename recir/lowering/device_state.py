@@ -4,7 +4,7 @@
 # This source code is licensed under the BSD-3-Clause license found in the
 # LICENSE file in the root directory of this source tree.
 
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Collection, Dict, List, Optional, Sequence
 
 import torch
 from torch import fx
@@ -47,10 +47,13 @@ class DeviceStateManager:
         store: Dict[str, Any],
         compiled: torch.nn.Module,
         flat_state: List[torch.Tensor],
+        *,
+        local_indices: Collection[int] = (),
     ) -> None:
         """Share resident state with the other graphs compiled together with
         this one (``recir.api.compile_together``). No-op here: these graphs
-        read and write the module tensors directly."""
+        read and write the module tensors directly. ``local_indices`` remain
+        private to each graph."""
         return
 
     def prepare_inputs(

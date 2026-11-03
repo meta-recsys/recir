@@ -66,6 +66,11 @@ class DummySparseArch(nn.Module):
             self.register_buffer(f"_jt_values_{i}", jt.values())
             self.register_buffer(f"_jt_lengths_{i}", jt.lengths())
 
+        self.graph_local_state_names: tuple[str, ...] = (
+            "_grad_anchor",
+            *dict(self.named_buffers(recurse=False)),
+        )
+
     def forward(
         self,
         id_list_features: KeyedJaggedTensor,

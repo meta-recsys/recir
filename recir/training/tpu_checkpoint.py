@@ -26,6 +26,7 @@ import torch
 import torch.distributed as dist
 import torch.distributed.checkpoint as dcp
 import torch.utils._pytree as pytree
+from recir.training.graph_state import SharedGraphState
 from torch.distributed.checkpoint import FileSystemReader
 from torch.distributed.checkpoint.stateful import Stateful
 from torch.distributed.device_mesh import DeviceMesh
@@ -479,6 +480,8 @@ class HostStateBuffers:
         model: torch.nn.Module,
         optimizers: Sequence[Any],
         table_prefixes: Sequence[str],
+        *,
+        shared_state: SharedGraphState | None = None,
     ) -> None:
         self._flat_state = flat_state
         self._model = model
@@ -487,6 +490,7 @@ class HostStateBuffers:
         self._param_indices = _param_leaf_indices(state_fqns)
         self._state_indices = _state_leaf_indices(state_fqns)
         self._owned: Dict[int, int] = {}
+        self._shared_state = shared_state
 
     def _state_leaves(self) -> Iterator[Tuple[int, torch.Tensor, str, bool]]:
         """Every ``(flat_state index, owning tensor, name, zero_when_meta)``."""
@@ -532,6 +536,9 @@ class HostStateBuffers:
                 allocated += owner.numel() * owner.element_size()
             self._adopt(index, owner)
 
+        if self._shared_state is not None:
+            self._shared_state.refresh_host_state(len(self._shared_state.compiled) - 1)
+
         logger.info(
             "[hostbuf] build: allocated %.2f GB, %d leaves owned",
             allocated / 1e9,
@@ -556,6 +563,21 @@ class HostStateBuffers:
                 self._check_payload_entry(
                     self._state_indices.get((fqn, key)), value, f"{fqn}[{key!r}]"
                 )
+
+    def check_bindings(self) -> None:
+        """Verify the graph reads the live owners without adopting new storage."""
+        for index, owner, name, _ in self._state_leaves():
+            leaf = self._flat_state[index]
+            if (
+                owner.is_meta
+                or leaf.is_meta
+                or leaf.shape != owner.shape
+                or leaf.dtype != owner.dtype
+                or leaf.data_ptr() != owner.data_ptr()
+            ):
+                raise RuntimeError(f"Compiled host-state binding is stale: {name}")
+        if self._shared_state is not None:
+            self._shared_state.check_host_state(len(self._shared_state.compiled) - 1)
 
     def _check_payload_entry(self, index: int | None, value: Any, name: str) -> None:
         if index is None or not isinstance(value, (torch.Tensor, DTensor)):
@@ -750,6 +772,7 @@ class RecirCheckpointable(Stateful):
         # same dict is what it will write into, so this is the one place both
         # directions can be checked against the buffers.
         if buffers is not None:
+            buffers.check_bindings()
             buffers.check_payload(
                 sd,
                 [
@@ -776,6 +799,9 @@ class RecirCheckpointable(Stateful):
         return _RecirAsyncStager()
 
     def load_state_dict(self, state_dict: Dict[str, Any]) -> None:
+        buffers = self._host_buffers() if self._host_buffers is not None else None
+        if buffers is not None:
+            buffers.check_bindings()
         warmup_iter = int(state_dict.get(WARMUP_ITER_KEY, 0))
         opt_sd = state_dict.get(OPTIMIZER_STATE_KEY, None)
         embedding_opt_sd = state_dict.get(EMBEDDING_OPTIMIZER_STATE_KEY, None)
@@ -804,15 +830,7 @@ class RecirCheckpointable(Stateful):
             _load_optimizer_state_preserving_lr(
                 self._embedding_optimizer, embedding_opt_sd
             )
-        # DCP has written, and `Optimizer.load_state_dict` has had its chance to
-        # swap slot objects. Everything just written has to still be the buffer
-        # the graph reads, or the restore landed somewhere nothing looks.
-        if self._host_buffers is not None:
-            self._host_buffers().check_payload(
-                body,
-                [
-                    (self._dense_optimizer, opt_sd),
-                    (self._embedding_optimizer, embedding_opt_sd),
-                ],
-            )
+        if buffers is not None:
+            buffers.build()
+            buffers.check_bindings()
         reseed_warmup(self._warmup, warmup_iter)
