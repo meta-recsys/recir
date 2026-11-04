@@ -44,7 +44,7 @@ class TorchTPUBackend(Backend):
         return False
 
     def dispatch(self, gm: fx.GraphModule) -> nn.Module:
-        return partial_lower_torchtpu(gm)
+        return self._lower_inputs(gm, partial_lower_torchtpu)
 
     def device_state_manager(self) -> DeviceStateManager:
         # State lives on the tpu device (model + lifted params are traced on
