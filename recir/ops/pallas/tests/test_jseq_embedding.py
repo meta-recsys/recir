@@ -59,6 +59,41 @@ class JSeqEmbeddingManualMeshTest(TestCase):
         self.assertEqual(jnp.float32, local_weight.dtype)
         self.assertEqual(4, driver.call_args.kwargs["world_size"])
 
+    def test_fp16_table_returns_unrounded_float32_activations(self) -> None:
+        ids = jnp.array([[0, 1, 2], [3, 4, 5]], dtype=jnp.int32)
+        lengths = jnp.array([3, 3], dtype=jnp.int32)
+        weight = jnp.zeros((8, 4), dtype=jnp.float16)
+        # 2e-8 rounds to zero in FP16, so it only survives an FP32 output.
+        driver_output = jnp.full((6, 4), 2e-8, dtype=jnp.float32)
+
+        with (
+            patch.object(
+                jseq_embedding.jax.sharding,
+                "get_abstract_mesh",
+                return_value=SimpleNamespace(
+                    manual_axes={"torch_dist"}, shape={"torch_dist": 4}
+                ),
+            ),
+            patch.object(
+                jseq_embedding.jax.lax,
+                "axis_index",
+                return_value=jnp.asarray(1, dtype=jnp.int32),
+            ),
+            patch.object(
+                jseq_embedding,
+                "ringshift_embedding_lookup_block_local",
+                return_value=driver_output,
+            ) as driver,
+        ):
+            output = jseq_embedding._jringshift_embedding(ids, lengths, weight)
+
+        self.assertEqual(jnp.float32, output.dtype)
+        np.testing.assert_array_equal(
+            np.asarray(output), np.asarray(driver_output).reshape(2, 3, 4)
+        )
+        _local_ids, _count, local_weight = driver.call_args.args
+        self.assertEqual(jnp.float16, local_weight.dtype)
+
     def test_backward_reuses_manual_mesh_local_driver(self) -> None:
         ids = jnp.array([[0, 1, 2], [3, 4, 5]], dtype=jnp.int32)
         lengths = jnp.array([3, 3], dtype=jnp.int32)

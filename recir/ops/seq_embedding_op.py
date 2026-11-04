@@ -35,6 +35,8 @@ meta-tolerant custom op is needed.
     weight:  [vocab, D]        embedding table; row-wise (FSDP/block) sharded by
                                recir's GSPMD lowering. BF16 tables use FP32 inside
                                the TPU kernel and cast the result/gradient back.
+                               FP16 tables return FP32 activations; only their
+                               table gradient is cast back to FP16.
     padding_idx: int           nonnegative row whose gradient is suppressed, or
                                -1 for no padding row (matching ``F.embedding``).
     pooling: str               "none" (sequence, the default and the unchanged
@@ -121,6 +123,12 @@ def _shard_batch0_backward(ctx, grad_out: torch.Tensor) -> torch.Tensor:  # noqa
 torch.library.register_autograd("recir::shard_batch0", _shard_batch0_backward)
 
 
+def _output_dtype(weight_dtype: torch.dtype) -> torch.dtype:
+    # An FP16 activation gets an FP16 cotangent, which flushes per-token
+    # gradients below 2**-25 to zero before they are summed per row.
+    return torch.float32 if weight_dtype == torch.float16 else weight_dtype
+
+
 def _fwd_ref(
     ids: torch.Tensor,
     lengths: torch.Tensor,
@@ -152,7 +160,7 @@ def _fwd_ref(
 
     emb = F.embedding(
         ids.long(),
-        weight,
+        weight.to(_output_dtype(weight.dtype)),
         padding_idx=None if padding_idx < 0 else padding_idx,
     )
     if pooling == "none":
@@ -247,7 +255,7 @@ def _fwd_meta(
     # Sequence keeps one row per id; pooling replaces the id axis with the bag
     # axis, whose length is only knowable from lengths.
     shape = (*ids.shape, d) if pooling == "none" else (*lengths.shape, d)
-    return ids.new_empty(shape, dtype=weight.dtype)
+    return ids.new_empty(shape, dtype=_output_dtype(weight.dtype))
 
 
 @torch.library.register_fake("recir::ringshift_embedding_backward")
