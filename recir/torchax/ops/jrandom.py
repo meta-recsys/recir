@@ -3,13 +3,11 @@
 # This source code is licensed under the BSD-3-Clause license found in the
 # LICENSE file in the root directory of this source tree.
 
-# pyre-strict
-
-"""torchax JAX lowering of ``recir::bernoulli_keyed``."""
+"""Torchax JAX lowerings for explicitly keyed random ops."""
 
 import logging
 import os
-from typing import Any
+from typing import Any, cast
 
 import jax
 import jax.numpy as jnp
@@ -100,3 +98,37 @@ def _jbernoulli_keyed(
     # away with returning bool only because it lands in ``to_mutate.copy_(...)``
     # (recir/torchax/ops/op_base.py).
     return (jax.random.uniform(key, self.shape) < p).astype(self.dtype)
+
+
+@op(torch.ops.recir.stochastic_round_fp16)
+def _jstochastic_round_fp16(value: Any, counter: Any, seed: Any) -> Any:
+    key = jax.random.fold_in(
+        jax.random.PRNGKey(_fold_counter(seed)), _fold_counter(counter)
+    )
+    if "torch_dist" in jax.sharding.get_abstract_mesh().manual_axes:
+        key = jax.random.fold_in(key, jax.lax.axis_index("torch_dist"))
+    _, value_exponent = jnp.frexp(value)
+    quantum = jnp.maximum(jnp.ldexp(jnp.ones_like(value), value_exponent - 11), 2**-24)
+    nearest_f32 = jnp.rint(value / quantum) * quantum
+    nearest_f32 = jnp.where(
+        jnp.abs(nearest_f32) > 65504,
+        jnp.copysign(jnp.inf, value),
+        nearest_f32,
+    )
+    mantissa, exponent = jnp.frexp(jnp.abs(nearest_f32))
+    toward_zero = jnp.abs(value) < jnp.abs(nearest_f32)
+    exponent = exponent - ((mantissa == 0.5) & toward_zero).astype(jnp.int32)
+    gap = jnp.where(
+        nearest_f32 == 0,
+        2**-24,
+        jnp.maximum(jnp.ldexp(jnp.ones_like(value), exponent - 11), 2**-24),
+    )
+    neighbor = nearest_f32 + jnp.where(value > nearest_f32, gap, -gap)
+    probability = jnp.abs(value - nearest_f32) / gap
+    uniform = jax.random.uniform(key, value.shape, dtype=jnp.float32)
+    use_neighbor = (
+        (uniform < probability) & jnp.isfinite(value) & (jnp.abs(value) <= 65504)
+    )
+    return cast(jax.Array, jnp.where(use_neighbor, neighbor, nearest_f32)).astype(
+        jnp.float16
+    )

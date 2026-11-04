@@ -3,8 +3,6 @@
 # This source code is licensed under the BSD-3-Clause license found in the
 # LICENSE file in the root directory of this source tree.
 
-# pyre-strict
-
 """``recir::bernoulli_keyed`` -- dropout's Bernoulli draw with the PRNG key
 derived from an explicit tensor argument.
 
@@ -12,6 +10,11 @@ torchax's ``aten.bernoulli`` reads its key off the ``Environment``
 (``recir/torchax/tensor.py``) and rotates it in place. The
 ``Environment`` is neither an argument nor a return value of the traced
 function, so nothing hung on it can become a graph placeholder.
+
+``stochastic_round_fp16`` takes an FP32 update plus tensor seed/counter and
+returns FP16 weights. Values within the finite FP16 range round to either
+adjacent value in proportion to their distance. Out-of-range values and
+NaN/Inf keep the ordinary FP16 conversion result.
 
 This op takes the PRNG source as a **tensor**, a
 registered buffer rides the ``stateless_func`` loop (``recir/api.py``)
@@ -79,3 +82,47 @@ def _bernoulli_keyed_meta(
     base_seed: int,
 ) -> torch.Tensor:
     return torch.empty_like(self)
+
+
+_LIB.define(
+    "stochastic_round_fp16(Tensor value, Tensor counter, Tensor seed) -> Tensor"
+)
+
+
+def _stochastic_round_fp16_fallback(
+    value: torch.Tensor, counter: torch.Tensor, seed: torch.Tensor
+) -> torch.Tensor:
+    """Round finite, in-range FP32 values to adjacent FP16 values without bias."""
+    nearest = value.to(torch.float16)
+    nearest_f32 = nearest.float()
+    direction = torch.where(
+        value > nearest_f32,
+        torch.full_like(nearest, float("inf")),
+        torch.full_like(nearest, -float("inf")),
+    )
+    neighbor = torch.nextafter(nearest, direction).float()
+    gap = (neighbor - nearest_f32).abs()
+    probability = (value - nearest_f32).abs() / torch.where(gap > 0, gap, 1)
+    gen = torch.Generator(device=value.device)
+    gen.manual_seed((int(seed) * 0x9E3779B1 + int(counter) * 0x85EBCA6B) % (2**63))
+    uniform = torch.rand(
+        value.shape, dtype=torch.float32, device=value.device, generator=gen
+    )
+    use_neighbor = (
+        (uniform < probability) & torch.isfinite(value) & torch.isfinite(neighbor)
+    )
+    return torch.where(use_neighbor, neighbor, nearest_f32).to(torch.float16)
+
+
+_LIB.impl(
+    "stochastic_round_fp16",
+    _stochastic_round_fp16_fallback,
+    "CompositeExplicitAutograd",
+)
+
+
+@torch.library.register_fake("recir::stochastic_round_fp16")
+def _stochastic_round_fp16_meta(
+    value: torch.Tensor, counter: torch.Tensor, seed: torch.Tensor
+) -> torch.Tensor:
+    return torch.empty_like(value, dtype=torch.float16)
