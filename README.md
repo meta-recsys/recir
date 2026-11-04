@@ -41,26 +41,70 @@ runs through RecIR on both GPU and TPU using publicly available packages.
 
 ## Installation
 
-RecIR requires Python 3.12 or newer. Install from a source checkout with the
-extra matching the environment:
+The DLRMv3 extras below depend on Linux packages. If you are using an
+Apple Silicon Mac, read the [macOS notes](#macos-apple-silicon) first.
+
+RecIR requires Python 3.12 or newer. From the root of your source checkout,
+create and activate a virtual environment:
 
 ```bash
 python3.12 -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
+```
 
-# Host-only smoke test and local TPU-path debugging.
+Then run one of the following installation commands, choosing the extra
+that matches your environment.
+
+**CPU: host-only smoke test and local TPU-path debugging**
+
+```bash
 python -m pip install -e ".[dlrm-cpu]"
+```
 
-# CUDA training environment.
+**GPU: CUDA training**
+
+```bash
 python -m pip install -e ".[dlrm-gpu]"
+```
 
-# TPU environment.
+**TPU: training on a TPU host**
+
+```bash
 python -m pip install -e ".[dlrm-tpu]"
 ```
 
 The DLRMv3 extras use the stack tested by the reference Dockerfiles: PyTorch
 2.10, TorchRec 1.4, FBGEMM 1.5, and JAX 0.8–0.10.
+
+### macOS (Apple Silicon)
+
+The `dlrm-cpu` extra does not provide a native macOS installation, including
+on M1 Macs. It still installs Triton, which
+[lists Linux as its supported platform][triton-platforms], and
+`fbgemm-gpu-cpu==1.5.*`, whose [1.5.0 wheels are Linux-only][fbgemm-files].
+Setting `JAX_PLATFORMS=cpu` does not remove these dependencies.
+
+To check which Python you are using:
+
+```bash
+python3 - <<'PY'
+import platform
+print(platform.python_version(), platform.system(), platform.machine())
+PY
+```
+
+A native Apple Silicon interpreter reports `Darwin arm64`. If it reports
+`Darwin x86_64`, Python is running as an Intel process. Using an ARM64
+interpreter does not make the Linux-only dependencies available on macOS.
+
+You can edit the project on your Mac and run the DLRMv3 examples on a Linux
+host. Follow the installation steps there, then run the CPU smoke test
+below. GPU training requires a CUDA environment; TPU training requires a
+TPU host. Native macOS training is not covered by these instructions.
+
+[triton-platforms]: https://github.com/triton-lang/triton#compatibility
+[fbgemm-files]: https://pypi.org/project/fbgemm-gpu-cpu/1.5.0/#files
 
 ## Five-minute CPU smoke test
 
