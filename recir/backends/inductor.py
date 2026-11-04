@@ -12,10 +12,9 @@ from __future__ import annotations
 from typing import Any, Sequence, TYPE_CHECKING
 
 from recir.backends.base import Backend, GraphPatch
+from recir.composite import CompositeModule
 from recir.lowering.partial_lower import partial_lower
 from recir.passes import remove_copy_from_optimizer
-from recir.passes.iter_graph_module import IterGraphModule
-from recir.pipeline import PipelinedGraphModule, SteadyStateGraphModule
 from torch import fx, nn
 
 if TYPE_CHECKING:
@@ -42,25 +41,12 @@ class InductorBackend(Backend):
     def uses_iter_graph(self) -> bool:
         return True
 
-    def dispatch(
-        self,
-        gm: (
-            fx.GraphModule
-            | IterGraphModule
-            | PipelinedGraphModule
-            | SteadyStateGraphModule
-        ),
-    ) -> nn.Module:
-        if isinstance(gm, SteadyStateGraphModule):
-            return gm.lower_steady(partial_lower)
-        if isinstance(gm, PipelinedGraphModule):
-            return gm.lower_stages(partial_lower)
-        if isinstance(gm, IterGraphModule):
-            for sub_name in ("setup_gm", "main_gm", "cleanup_gm"):
-                sub_gm = getattr(gm, sub_name)
-                setattr(gm, sub_name, partial_lower(sub_gm))
-            return gm
-        return partial_lower(gm)
+    @property
+    def lowers_composites(self) -> bool:
+        return True
+
+    def dispatch(self, gm: fx.GraphModule | CompositeModule) -> nn.Module:
+        return self._lower_inputs(gm, partial_lower)
 
     def validate_with(self, parallel_mode: "ParallelMode") -> None:
         from recir.distributed.parallel_mode import GSPMDParallel
