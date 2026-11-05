@@ -39,6 +39,24 @@ def _walk_nested_jaxprs(value: Any) -> Iterator[Any]:
             yield from _walk_nested_jaxprs(child)
 
 
+def _kernel_name(equation: Any) -> str:
+    """``pallas_call(name=...)`` lands on the kernel jaxpr's debug info."""
+    jaxpr = equation.params.get("jaxpr")
+    debug_info = getattr(getattr(jaxpr, "jaxpr", jaxpr), "debug_info", None)
+    return str(getattr(debug_info, "func_name", ""))
+
+
+def _attention_pallas_calls(nested_jaxprs: list[Any]) -> list[Any]:
+    """The attention kernels, excluding the alignment compaction kernel."""
+    return [
+        equation
+        for jaxpr in nested_jaxprs
+        for equation in jaxpr.eqns
+        if equation.primitive.name == "pallas_call"
+        and "hstu_attention" in _kernel_name(equation)
+    ]
+
+
 @contextlib.contextmanager
 def _mock_tpu_generation() -> Iterator[None]:
     pipeline_module = importlib.import_module("jax._src.pallas.mosaic.pipeline")
@@ -287,12 +305,7 @@ class JaggedHSTUAttentionTest(unittest.TestCase):
             )(qkv, qkv, qkv)
 
         nested_jaxprs = list(_walk_nested_jaxprs(traced))
-        pallas_calls = [
-            equation
-            for jaxpr in nested_jaxprs
-            for equation in jaxpr.eqns
-            if equation.primitive.name == "pallas_call"
-        ]
+        pallas_calls = _attention_pallas_calls(nested_jaxprs)
         self.assertEqual(len(pallas_calls), 1)
         return traced, nested_jaxprs, pallas_calls[0]
 
@@ -301,9 +314,10 @@ class JaggedHSTUAttentionTest(unittest.TestCase):
             max_seq_len=3072,
             block_q=256,
             block_k=128,
+            query_tiles_per_program=4,
         )
         self.assertEqual(pallas_call.params["grid_mapping"].grid, (1, 3))
-        self.assertEqual(pallas_call.outvars[0].aval.shape, (3079, 1, 128))
+        self.assertEqual(pallas_call.outvars[0].aval.shape, (3072, 1, 128))
         self.assertEqual(traced.jaxpr.outvars[0].aval.shape, (3072, 1, 128))
 
         kernel_jaxpr = cast(Any, pallas_call.params["jaxpr"])
@@ -314,7 +328,7 @@ class JaggedHSTUAttentionTest(unittest.TestCase):
             if "vmem" in str(variable.aval)
         ]
         self.assertEqual(
-            sum(aval.shape == (1032, 1, 128) for aval in kernel_vmem_avals),
+            sum(aval.shape == (2064, 1, 128) for aval in kernel_vmem_avals),
             1,
         )
         output_scratch = [
@@ -364,7 +378,7 @@ class JaggedHSTUAttentionTest(unittest.TestCase):
             for variable in jaxpr.invars
             if "vmem" in str(variable.aval)
         }
-        self.assertIn((1032, 1, 128), vmem_shapes)
+        self.assertIn((2064, 1, 128), vmem_shapes)
         self.assertIn((1, 1024, 128), vmem_shapes)
         self.assertIn(buffered_shape, vmem_shapes)
         self.assertNotIn((3072, 1, 128), vmem_shapes)
@@ -387,7 +401,7 @@ class JaggedHSTUAttentionTest(unittest.TestCase):
             query_tiles_per_program=2,
         )
         self.assertEqual(pallas_call.params["grid_mapping"].grid, (1, 3))
-        self.assertEqual(pallas_call.outvars[0].aval.shape, (520, 1, 128))
+        self.assertEqual(pallas_call.outvars[0].aval.shape, (513, 1, 128))
         self.assertEqual(traced.jaxpr.outvars[0].aval.shape, (513, 1, 128))
 
         kernel_jaxpr = cast(Any, pallas_call.params["jaxpr"])
@@ -398,7 +412,7 @@ class JaggedHSTUAttentionTest(unittest.TestCase):
             if "vmem" in str(variable.aval)
         ]
         self.assertEqual(
-            sum(aval.shape == (264, 1, 128) for aval in kernel_vmem_avals),
+            sum(aval.shape == (528, 1, 128) for aval in kernel_vmem_avals),
             1,
         )
         output_scratch = [
@@ -446,7 +460,7 @@ class JaggedHSTUAttentionTest(unittest.TestCase):
             block_k=128,
         )
         self.assertEqual(pallas_call.params["grid_mapping"].grid, (1, 1))
-        self.assertEqual(pallas_call.outvars[0].aval.shape, (519, 1, 128))
+        self.assertEqual(pallas_call.outvars[0].aval.shape, (512, 1, 128))
         self.assertEqual(traced.jaxpr.outvars[0].aval.shape, (512, 1, 128))
 
         kernel_jaxpr = cast(Any, pallas_call.params["jaxpr"])
@@ -456,9 +470,9 @@ class JaggedHSTUAttentionTest(unittest.TestCase):
             for variable in kernel_jaxpr.invars
             if "vmem" in str(variable.aval)
         }
-        self.assertIn((520, 1, 128), vmem_shapes)
+        self.assertIn((1040, 1, 128), vmem_shapes)
         self.assertIn((1, 512, 128), vmem_shapes)
-        self.assertNotIn((1032, 1, 128), vmem_shapes)
+        self.assertNotIn((2064, 1, 128), vmem_shapes)
 
     def _trace_native_backward(
         self,
@@ -494,12 +508,7 @@ class JaggedHSTUAttentionTest(unittest.TestCase):
             )(grad_out, qkv, qkv, qkv)
 
         nested_jaxprs = list(_walk_nested_jaxprs(traced))
-        pallas_calls = [
-            equation
-            for jaxpr in nested_jaxprs
-            for equation in jaxpr.eqns
-            if equation.primitive.name == "pallas_call"
-        ]
+        pallas_calls = _attention_pallas_calls(nested_jaxprs)
         self.assertEqual(len(pallas_calls), 2)
         dq_calls = [equation for equation in pallas_calls if len(equation.outvars) == 1]
         dkv_calls = [
@@ -517,7 +526,7 @@ class JaggedHSTUAttentionTest(unittest.TestCase):
             query_tiles_per_program=4,
         )
         self.assertEqual(dq_call.params["grid_mapping"].grid, (1, 3))
-        self.assertEqual(dq_call.outvars[0].aval.shape, (3079, 1, 128))
+        self.assertEqual(dq_call.outvars[0].aval.shape, (3072, 1, 128))
         self.assertEqual(
             [variable.aval.shape for variable in traced.jaxpr.outvars],
             [(3072, 1, 128)] * 3,
@@ -531,16 +540,21 @@ class JaggedHSTUAttentionTest(unittest.TestCase):
             if "vmem" in str(variable.aval)
         ]
         self.assertEqual(
-            sum(aval.shape == (1032, 1, 128) for aval in kernel_vmem_avals),
+            sum(aval.shape == (2064, 1, 128) for aval in kernel_vmem_avals),
             2,
         )
+        # The f32 dq accumulator plus the two bf16 q/dO transpose scratches.
         group_scratch = [
             aval for aval in kernel_vmem_avals if aval.shape == (1, 1024, 128)
         ]
-        self.assertEqual(len(group_scratch), 1)
+        self.assertEqual(len(group_scratch), 3)
         self.assertEqual(
             sum(aval.dtype == jnp.dtype(jnp.float32) for aval in group_scratch),
             1,
+        )
+        self.assertEqual(
+            sum(aval.dtype == jnp.dtype(jnp.bfloat16) for aval in group_scratch),
+            2,
         )
 
         buffered_shape = (2, 136, 1, 128)
@@ -581,7 +595,9 @@ class JaggedHSTUAttentionTest(unittest.TestCase):
             if variable.aval.dtype == jnp.dtype(jnp.bfloat16)
             and len(variable.aval.shape) == 3
         ]
-        self.assertEqual(data_gather_shapes, [(3072, 1, 384)])
+        # The kernels write packed, so no alignment conversion -- and so no
+        # row gather -- reaches the graph at all.
+        self.assertEqual(data_gather_shapes, [])
 
     def test_native_backward_traces_double_buffered_dkv(self) -> None:
         _, _, _, dkv_call = self._trace_native_backward(
@@ -600,7 +616,7 @@ class JaggedHSTUAttentionTest(unittest.TestCase):
             if "vmem" in str(variable.aval)
         ]
         self.assertEqual(
-            sum(aval.shape == (136, 1, 128) for aval in kernel_vmem_avals),
+            sum(aval.shape == (272, 1, 128) for aval in kernel_vmem_avals),
             2,
         )
         self.assertEqual(
@@ -638,11 +654,11 @@ class JaggedHSTUAttentionTest(unittest.TestCase):
             query_tiles_per_program=2,
         )
         self.assertEqual(dq_call.params["grid_mapping"].grid, (1, 4))
-        self.assertEqual(dq_call.outvars[0].aval.shape, (776, 1, 128))
+        self.assertEqual(dq_call.outvars[0].aval.shape, (769, 1, 128))
         self.assertEqual(dkv_call.params["grid_mapping"].grid, (1, 3))
         self.assertEqual(
             [variable.aval.shape for variable in dkv_call.outvars],
-            [(776, 1, 128)] * 2,
+            [(769, 1, 128)] * 2,
         )
         self.assertEqual(
             [variable.aval.shape for variable in traced.jaxpr.outvars],
@@ -656,7 +672,7 @@ class JaggedHSTUAttentionTest(unittest.TestCase):
             for variable in jaxpr.invars
             if "vmem" in str(variable.aval)
         }
-        self.assertIn((264, 1, 128), vmem_shapes)
+        self.assertIn((528, 1, 128), vmem_shapes)
         self.assertIn((1, 256, 128), vmem_shapes)
         self.assertIn((2, 392, 1, 128), vmem_shapes)
 

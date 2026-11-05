@@ -37,7 +37,7 @@ from recir.ops.pallas.hstu_attention import (
 
 _ALIGNMENT_ROWS = 8
 _SAFE_TAIL_ROWS = _ALIGNMENT_ROWS - 1
-_DEFAULT_BLOCK = 256
+_DEFAULT_BLOCK = 512
 _DEFAULT_QUERY_TILES_PER_PROGRAM = 4
 _DEFAULT_BACKWARD_QUERY_TILES_PER_PROGRAM = 2
 _AXIS = "torch_dist"
@@ -169,31 +169,6 @@ def _aligned_sequence_offsets(seq_offsets: jax.Array) -> jax.Array:
     )
 
 
-def _aligned_capacity(total_length: int, num_sequences: int) -> int:
-    return total_length + num_sequences * (_ALIGNMENT_ROWS - 1)
-
-
-def _aligned_values_to_packed(
-    values: tuple[jax.Array, ...],
-    seq_offsets: jax.Array,
-    aligned_offsets: jax.Array,
-    total_length: int,
-) -> tuple[jax.Array, ...]:
-    sequence_ids, positions = _packed_row_sources(seq_offsets, total_length)
-    source_rows = aligned_offsets[sequence_ids] + positions
-    valid = jnp.arange(total_length, dtype=seq_offsets.dtype) < seq_offsets[-1]
-
-    feature_sizes = tuple(value.shape[-1] for value in values)
-    combined = values[0] if len(values) == 1 else jnp.concatenate(values, axis=-1)
-    clipped_rows = jnp.clip(source_rows, 0, combined.shape[0] - 1)
-    packed = jnp.take(combined, clipped_rows, axis=0)
-    packed = jnp.where(valid[:, None, None], packed, 0)
-    if len(values) == 1:
-        return (packed,)
-    split_points = tuple(itertools.accumulate(feature_sizes[:-1]))
-    return tuple(jnp.split(packed, split_points, axis=-1))
-
-
 def _dense_values_to_packed(
     values: tuple[jax.Array, ...],
     seq_offsets: jax.Array,
@@ -282,6 +257,64 @@ def _native_sequence_layout(
     return padded_seq_len, stage_rows
 
 
+_TAIL_ZERO_BLOCK = 2048
+
+
+def _tail_zero_kernel(seq_off_ref, src, out_hbm_ref, *, rows: int, last: int) -> None:
+    index = pl.program_id(0)
+
+    def _emit(dst_ref) -> None:
+        dst_ref[...] = jnp.zeros_like(dst_ref)
+
+    def _window(_):
+        tail_start = seq_off_ref[last]
+        start_raw = jnp.maximum(index * _TAIL_ZERO_BLOCK, tail_start)
+        stop = jnp.minimum((index + 1) * _TAIL_ZERO_BLOCK, rows)
+        size = jnp.clip(stop - start_raw, 0, _TAIL_ZERO_BLOCK)
+        start = jnp.clip(start_raw, 0, max(rows - 1, 0))
+        return pl.ds(start, size), 0, 0
+
+    pltpu.emit_pipeline(
+        _emit,
+        grid=(1,),
+        out_specs=(
+            pl.BlockSpec(
+                (
+                    pl.BoundedSlice(_TAIL_ZERO_BLOCK),
+                    out_hbm_ref.shape[1],
+                    out_hbm_ref.shape[2],
+                ),
+                _window,
+                memory_space=pltpu.VMEM,
+            ),
+        ),
+    )(out_hbm_ref)
+
+
+def _zero_unvisited_tail(packed: jax.Array, seq_offsets: jax.Array) -> jax.Array:
+    """Zero ``[seq_offsets[-1], L)``, the rows no grid program writes.
+
+    Each block clamps its write to that region, so blocks before it transfer
+    nothing. Aliasing a zeroed buffer to the output also works, but memsets the
+    whole tensor.
+    """
+    rows = int(packed.shape[0])
+    return pl.pallas_call(
+        functools.partial(
+            _tail_zero_kernel, rows=rows, last=int(seq_offsets.shape[0]) - 1
+        ),
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=1,
+            grid=(pl.cdiv(rows, _TAIL_ZERO_BLOCK),),
+            in_specs=[pl.BlockSpec(memory_space=pltpu.HBM)],
+            out_specs=pl.BlockSpec(memory_space=pltpu.HBM),
+        ),
+        out_shape=jax.ShapeDtypeStruct(packed.shape, packed.dtype),
+        input_output_aliases={1: 0},
+        name="pallas_jagged_tail_zero",
+    )(seq_offsets.astype(jnp.int32), packed)
+
+
 def _native_qkv_inputs(
     q: jax.Array,
     k: jax.Array,
@@ -291,21 +324,24 @@ def _native_qkv_inputs(
     inv_n: float | jax.Array,
     tail_rows: int = _SAFE_TAIL_ROWS,
 ) -> tuple[tuple[Any, ...], tuple[Any, ...]]:
-    num_heads = q.shape[1]
-    tail_q = jnp.zeros((tail_rows, num_heads, q.shape[2]), dtype=q.dtype)
-    tail_v = jnp.zeros((tail_rows, num_heads, v.shape[2]), dtype=v.dtype)
     scalar_args = (
         seq_offsets.astype(jnp.int32),
         num_targets.astype(jnp.int32),
         jnp.asarray(inv_n, dtype=jnp.float32).reshape((1,)),
     )
-    hbm_args = tuple(
-        pltpu.with_memory_space_constraint(value, pltpu.HBM)
-        for value in (
-            jnp.concatenate((q, tail_q), axis=0),
-            jnp.concatenate((k, tail_q), axis=0),
-            jnp.concatenate((v, tail_v), axis=0),
+    deficit = max(tail_rows - q.shape[0], 0)
+    values = (
+        tuple(
+            jnp.concatenate(
+                (x, jnp.zeros((deficit,) + x.shape[1:], dtype=x.dtype)), axis=0
+            )
+            for x in (q, k, v)
         )
+        if deficit
+        else (q, k, v)
+    )
+    hbm_args = tuple(
+        pltpu.with_memory_space_constraint(value, pltpu.HBM) for value in values
     )
     return scalar_args, hbm_args
 
@@ -340,7 +376,7 @@ def _jagged_fwd_kernel(
     aligned_start, prefix, _ = _aligned_sequence_window(start, length)
     query_group_rows = block_q * query_tiles_per_program
     query_group_start = query_group * query_group_rows
-    q_stage_rows = q_stage_ref.shape[0]
+    q_stage_rows = query_group_rows + _ALIGNMENT_ROWS
     kv_stage_rows = block_k + _ALIGNMENT_ROWS
 
     @pl.when(query_group_start >= length)
@@ -349,15 +385,16 @@ def _jagged_fwd_kernel(
 
     output_acc_ref[...] = jnp.zeros_like(output_acc_ref)
 
+    q_read_cap = max(q_hbm_ref.shape[0] - q_stage_rows, 0)
+    q_raw_start = aligned_start + query_group_start
+    q_read_start = jnp.clip(q_raw_start, 0, q_read_cap)
+    q_prefix = prefix + (q_raw_start - q_read_start)
+
     @pl.when(query_group_start < length)
     def _stage_query() -> None:
-        query_aligned_start = pl.multiple_of(
-            aligned_start + query_group_start,
-            _ALIGNMENT_ROWS,
-        )
         copy = pltpu.make_async_copy(
-            q_hbm_ref.at[pl.ds(query_aligned_start, q_stage_rows), :, :],
-            q_stage_ref,
+            q_hbm_ref.at[pl.ds(q_read_start, q_stage_rows), :, :],
+            q_stage_ref.at[pl.ds(0, q_stage_rows), :, :],
             q_dma_sem,
         )
         copy.start()
@@ -394,7 +431,7 @@ def _jagged_fwd_kernel(
                 query_positions = query_start + jnp.arange(block_q)
                 query_ids = jnp.minimum(query_positions, max_id)
                 q_tile = jnp.swapaxes(
-                    q_stage_ref[pl.ds(prefix + query_offset, block_q), :, :],
+                    q_stage_ref[pl.ds(q_prefix + query_offset, block_q), :, :],
                     0,
                     1,
                 )
@@ -479,21 +516,36 @@ def _jagged_fwd_kernel(
     )
     out_tile_ref[...] = jnp.swapaxes(cast(Any, output).astype(out_tile_ref.dtype), 0, 1)
 
-    @pl.when(query_group_start < length)
-    def _write_output() -> None:
-        valid_rows = jnp.minimum(query_group_rows, length - query_group_start)
-        copy_rows = pl.multiple_of(
-            pl.cdiv(valid_rows, _ALIGNMENT_ROWS) * _ALIGNMENT_ROWS,
-            _ALIGNMENT_ROWS,
+    def _emit_output(dst_ref) -> None:
+        dst_ref[...] = out_tile_ref[...]
+
+    def _output_window(_):
+        rows = out_hbm_ref.shape[0]
+        start = jnp.clip(
+            seq_offsets_ref[sequence] + query_group_start, 0, max(rows - 1, 0)
         )
-        output_start = pl.multiple_of(
-            aligned_offsets_ref[sequence] + query_group_start,
-            _ALIGNMENT_ROWS,
+        size = jnp.clip(
+            jnp.minimum(length - query_group_start, rows - start),
+            0,
+            query_group_rows,
         )
-        pltpu.sync_copy(
-            out_tile_ref.at[pl.ds(0, copy_rows), :, :],
-            out_hbm_ref.at[pl.ds(output_start, copy_rows), :, :],
-        )
+        return pl.ds(start, size), 0, 0
+
+    pltpu.emit_pipeline(
+        _emit_output,
+        grid=(1,),
+        out_specs=(
+            pl.BlockSpec(
+                (
+                    pl.BoundedSlice(query_group_rows),
+                    out_hbm_ref.shape[1],
+                    out_hbm_ref.shape[2],
+                ),
+                _output_window,
+                memory_space=pltpu.VMEM,
+            ),
+        ),
+    )(out_hbm_ref)
 
 
 def _native_jagged_hstu_attention(
@@ -514,7 +566,6 @@ def _native_jagged_hstu_attention(
     dqk = q.shape[2]
     dv = v.shape[2]
     aligned_offsets = _aligned_sequence_offsets(seq_offsets)
-    output_capacity = _aligned_capacity(q.shape[0], num_sequences)
     num_query_blocks = (max_seq_len + block_q - 1) // block_q
     query_tiles_per_program = min(query_tiles_per_program, num_query_blocks)
     query_group_rows = block_q * query_tiles_per_program
@@ -548,7 +599,7 @@ def _native_jagged_hstu_attention(
     )
     output = pl.pallas_call(
         kernel,
-        out_shape=jax.ShapeDtypeStruct((output_capacity, num_heads, dv), q.dtype),
+        out_shape=jax.ShapeDtypeStruct((q.shape[0], num_heads, dv), q.dtype),
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=4,
             in_specs=[
@@ -559,7 +610,7 @@ def _native_jagged_hstu_attention(
             out_specs=pl.BlockSpec(memory_space=pltpu.HBM),
             grid=(num_sequences, num_query_groups),
             scratch_shapes=(
-                pltpu.VMEM((q_stage_rows, num_heads, dqk), q.dtype),
+                pltpu.VMEM((2 * q_stage_rows, num_heads, dqk), q.dtype),
                 pltpu.VMEM((num_heads, query_group_rows, dv), jnp.float32),
                 pltpu.VMEM((query_group_rows, num_heads, dv), q.dtype),
                 pltpu.SemaphoreType.DMA,
@@ -570,9 +621,7 @@ def _native_jagged_hstu_attention(
         ),
         name="pallas_jagged_hstu_attention_fwd_pipelined",
     )(*scalar_args, *hbm_args)
-    return _aligned_values_to_packed(
-        (output,), seq_offsets, aligned_offsets, q.shape[0]
-    )[0]
+    return _zero_unvisited_tail(output, seq_offsets)
 
 
 def sample_sharded_jagged_hstu_attention(
@@ -652,11 +701,14 @@ def _jagged_bwd_dq_kernel(
     k_hbm_ref,
     v_hbm_ref,
     do_hbm_ref,
+    dq_init_hbm_ref,
     dq_hbm_ref,
     q_stage_ref,
     do_stage_ref,
     dq_acc_ref,
     dq_tile_ref,
+    q_t_ref,
+    do_t_ref,
     dma_sems,
     *,
     alpha: float,
@@ -675,7 +727,7 @@ def _jagged_bwd_dq_kernel(
     aligned_start, prefix, _ = _aligned_sequence_window(start, length)
     query_group_rows = block_q * query_tiles_per_program
     query_group_start = query_group * query_group_rows
-    q_stage_rows = q_stage_ref.shape[0]
+    q_stage_rows = query_group_rows + _ALIGNMENT_ROWS
     kv_stage_rows = block_k + _ALIGNMENT_ROWS
 
     @pl.when(query_group_start >= length)
@@ -685,21 +737,22 @@ def _jagged_bwd_dq_kernel(
 
     dq_acc_ref[...] = jnp.zeros_like(dq_acc_ref)
 
+    q_read_cap = max(q_hbm_ref.shape[0] - q_stage_rows, 0)
+    q_raw_start = aligned_start + query_group_start
+    q_read_start = jnp.clip(q_raw_start, 0, q_read_cap)
+    q_prefix = prefix + (q_raw_start - q_read_start)
+
     @pl.when(query_group_start < length)
     def _stage_query() -> None:
-        query_aligned_start = pl.multiple_of(
-            aligned_start + query_group_start,
-            _ALIGNMENT_ROWS,
-        )
         copies = (
             pltpu.make_async_copy(
-                q_hbm_ref.at[pl.ds(query_aligned_start, q_stage_rows), :, :],
-                q_stage_ref,
+                q_hbm_ref.at[pl.ds(q_read_start, q_stage_rows), :, :],
+                q_stage_ref.at[pl.ds(0, q_stage_rows), :, :],
                 dma_sems.at[0],
             ),
             pltpu.make_async_copy(
-                do_hbm_ref.at[pl.ds(query_aligned_start, q_stage_rows), :, :],
-                do_stage_ref,
+                do_hbm_ref.at[pl.ds(q_read_start, q_stage_rows), :, :],
+                do_stage_ref.at[pl.ds(0, q_stage_rows), :, :],
                 dma_sems.at[1],
             ),
         )
@@ -708,6 +761,16 @@ def _jagged_bwd_dq_kernel(
         for copy in copies:
             copy.wait()
 
+    @pl.when(query_group_start < length)
+    def _transpose_query() -> None:
+        q_t_ref[...] = jnp.swapaxes(
+            q_stage_ref[pl.ds(q_prefix, query_group_rows), :, :], 0, 1
+        )
+        do_t_ref[...] = (
+            jnp.swapaxes(do_stage_ref[pl.ds(q_prefix, query_group_rows), :, :], 0, 1)
+            * inv_n
+        ).astype(do_t_ref.dtype)
+
     max_id = length - num_targets
 
     def _accumulate(k_stage_ref, v_stage_ref) -> None:
@@ -715,11 +778,9 @@ def _jagged_bwd_dq_kernel(
         kv_start = kv_block * block_k
         key_positions = kv_start + jnp.arange(block_k)
         key_ids = jnp.minimum(key_positions, max_id)
-        k_tile = jnp.swapaxes(
-            k_stage_ref[pl.ds(prefix, block_k), :, :],
-            0,
-            1,
-        )
+        k_tile = (
+            jnp.swapaxes(k_stage_ref[pl.ds(prefix, block_k), :, :], 0, 1) * alpha
+        ).astype(k_stage_ref.dtype)
         v_tile = jnp.swapaxes(
             v_stage_ref[pl.ds(prefix, block_k), :, :],
             0,
@@ -738,16 +799,8 @@ def _jagged_bwd_dq_kernel(
             ) -> None:
                 query_positions = query_start + jnp.arange(block_q)
                 query_ids = jnp.minimum(query_positions, max_id)
-                q_tile = jnp.swapaxes(
-                    q_stage_ref[pl.ds(prefix + query_offset, block_q), :, :],
-                    0,
-                    1,
-                )
-                do_tile = jnp.swapaxes(
-                    do_stage_ref[pl.ds(prefix + query_offset, block_q), :, :],
-                    0,
-                    1,
-                )
+                q_tile = q_t_ref[:, pl.ds(query_offset, block_q), :]
+                do_tile = do_t_ref[:, pl.ds(query_offset, block_q), :]
                 scores = jax.lax.dot(
                     q_tile,
                     k_tile,
@@ -769,13 +822,9 @@ def _jagged_bwd_dq_kernel(
                 )
                 ds = cast(
                     Any,
-                    jnp.where(
-                        valid[None, :, :],
-                        dp * _silu_grad(scores * alpha) * inv_n,
-                        0,
-                    ),
+                    jnp.where(valid[None, :, :], dp * _silu_grad(scores), 0),
                 )
-                dq_update = alpha * jax.lax.dot(
+                dq_update = jax.lax.dot(
                     ds.astype(k_tile.dtype),
                     k_tile,
                     dimension_numbers=(((2,), (1,)), ((0,), (0,))),
@@ -838,21 +887,36 @@ def _jagged_bwd_dq_kernel(
     )
     dq_tile_ref[...] = jnp.swapaxes(cast(Any, dq).astype(dq_tile_ref.dtype), 0, 1)
 
-    @pl.when(query_group_start < length)
-    def _write_dq() -> None:
-        valid_rows = jnp.minimum(query_group_rows, length - query_group_start)
-        copy_rows = pl.multiple_of(
-            pl.cdiv(valid_rows, _ALIGNMENT_ROWS) * _ALIGNMENT_ROWS,
-            _ALIGNMENT_ROWS,
+    def _emit_dq(dst_ref) -> None:
+        dst_ref[...] = dq_tile_ref[...]
+
+    def _dq_window(_):
+        rows = dq_hbm_ref.shape[0]
+        start = jnp.clip(
+            seq_offsets_ref[sequence] + query_group_start, 0, max(rows - 1, 0)
         )
-        output_start = pl.multiple_of(
-            aligned_offsets_ref[sequence] + query_group_start,
-            _ALIGNMENT_ROWS,
+        size = jnp.clip(
+            jnp.minimum(length - query_group_start, rows - start),
+            0,
+            query_group_rows,
         )
-        pltpu.sync_copy(
-            dq_tile_ref.at[pl.ds(0, copy_rows), :, :],
-            dq_hbm_ref.at[pl.ds(output_start, copy_rows), :, :],
-        )
+        return pl.ds(start, size), 0, 0
+
+    pltpu.emit_pipeline(
+        _emit_dq,
+        grid=(1,),
+        out_specs=(
+            pl.BlockSpec(
+                (
+                    pl.BoundedSlice(query_group_rows),
+                    dq_hbm_ref.shape[1],
+                    dq_hbm_ref.shape[2],
+                ),
+                _dq_window,
+                memory_space=pltpu.VMEM,
+            ),
+        ),
+    )(dq_hbm_ref)
 
 
 def _jagged_bwd_dkv_kernel(
@@ -864,6 +928,8 @@ def _jagged_bwd_dkv_kernel(
     k_hbm_ref,
     v_hbm_ref,
     do_hbm_ref,
+    dk_init_hbm_ref,
+    dv_init_hbm_ref,
     dk_hbm_ref,
     dv_hbm_ref,
     k_stage_ref,
@@ -898,21 +964,22 @@ def _jagged_bwd_dkv_kernel(
         k_stage_ref[...] = jnp.zeros_like(k_stage_ref)
         v_stage_ref[...] = jnp.zeros_like(v_stage_ref)
 
+    kv_read_cap = max(k_hbm_ref.shape[0] - kv_stage_rows, 0)
+    kv_raw_start = aligned_start + kv_start
+    kv_read_start = jnp.clip(kv_raw_start, 0, kv_read_cap)
+    kv_prefix = prefix + (kv_raw_start - kv_read_start)
+
     @pl.when(kv_start < length)
     def _stage_kv() -> None:
-        kv_aligned_start = pl.multiple_of(
-            aligned_start + kv_start,
-            _ALIGNMENT_ROWS,
-        )
         copies = (
             pltpu.make_async_copy(
-                k_hbm_ref.at[pl.ds(kv_aligned_start, kv_stage_rows), :, :],
-                k_stage_ref,
+                k_hbm_ref.at[pl.ds(kv_read_start, kv_stage_rows), :, :],
+                k_stage_ref.at[pl.ds(0, kv_stage_rows), :, :],
                 dma_sems.at[0],
             ),
             pltpu.make_async_copy(
-                v_hbm_ref.at[pl.ds(kv_aligned_start, kv_stage_rows), :, :],
-                v_stage_ref,
+                v_hbm_ref.at[pl.ds(kv_read_start, kv_stage_rows), :, :],
+                v_stage_ref.at[pl.ds(0, kv_stage_rows), :, :],
                 dma_sems.at[1],
             ),
         )
@@ -925,12 +992,12 @@ def _jagged_bwd_dkv_kernel(
     key_positions = kv_start + jnp.arange(block_k)
     key_ids = jnp.minimum(key_positions, max_id)
     k_tile = jnp.swapaxes(
-        k_stage_ref[pl.ds(prefix, block_k), :, :],
+        k_stage_ref[pl.ds(kv_prefix, block_k), :, :],
         0,
         1,
     )
     v_tile = jnp.swapaxes(
-        v_stage_ref[pl.ds(prefix, block_k), :, :],
+        v_stage_ref[pl.ds(kv_prefix, block_k), :, :],
         0,
         1,
     )
@@ -1056,25 +1123,32 @@ def _jagged_bwd_dkv_kernel(
     dk_tile_ref[...] = jnp.swapaxes(cast(Any, dk).astype(dk_tile_ref.dtype), 0, 1)
     dv_tile_ref[...] = jnp.swapaxes(cast(Any, dv).astype(dv_tile_ref.dtype), 0, 1)
 
-    @pl.when(kv_start < length)
-    def _write_dkv() -> None:
-        valid_rows = jnp.minimum(block_k, length - kv_start)
-        copy_rows = pl.multiple_of(
-            pl.cdiv(valid_rows, _ALIGNMENT_ROWS) * _ALIGNMENT_ROWS,
-            _ALIGNMENT_ROWS,
-        )
-        output_start = pl.multiple_of(
-            aligned_offsets_ref[sequence] + kv_start,
-            _ALIGNMENT_ROWS,
-        )
-        pltpu.sync_copy(
-            dk_tile_ref.at[pl.ds(0, copy_rows), :, :],
-            dk_hbm_ref.at[pl.ds(output_start, copy_rows), :, :],
-        )
-        pltpu.sync_copy(
-            dv_tile_ref.at[pl.ds(0, copy_rows), :, :],
-            dv_hbm_ref.at[pl.ds(output_start, copy_rows), :, :],
-        )
+    def _emit_dkv(dk_dst_ref, dv_dst_ref) -> None:
+        dk_dst_ref[...] = dk_tile_ref[...]
+        dv_dst_ref[...] = dv_tile_ref[...]
+
+    def _kv_out_window(_):
+        rows = dk_hbm_ref.shape[0]
+        start = jnp.clip(seq_offsets_ref[sequence] + kv_start, 0, max(rows - 1, 0))
+        size = jnp.clip(jnp.minimum(length - kv_start, rows - start), 0, block_k)
+        return pl.ds(start, size), 0, 0
+
+    pltpu.emit_pipeline(
+        _emit_dkv,
+        grid=(1,),
+        out_specs=(
+            pl.BlockSpec(
+                (pl.BoundedSlice(block_k), dk_hbm_ref.shape[1], dk_hbm_ref.shape[2]),
+                _kv_out_window,
+                memory_space=pltpu.VMEM,
+            ),
+            pl.BlockSpec(
+                (pl.BoundedSlice(block_k), dv_hbm_ref.shape[1], dv_hbm_ref.shape[2]),
+                _kv_out_window,
+                memory_space=pltpu.VMEM,
+            ),
+        ),
+    )(dk_hbm_ref, dv_hbm_ref)
 
 
 def _native_jagged_hstu_attention_backward(
@@ -1097,7 +1171,6 @@ def _native_jagged_hstu_attention_backward(
     dqk = q.shape[2]
     dv_dim = v.shape[2]
     aligned_offsets = _aligned_sequence_offsets(seq_offsets)
-    output_capacity = _aligned_capacity(q.shape[0], num_sequences)
 
     num_query_blocks = (max_seq_len + block_q - 1) // block_q
     query_tiles_per_program = min(query_tiles_per_program, num_query_blocks)
@@ -1126,11 +1199,18 @@ def _native_jagged_hstu_attention_backward(
         tail_rows=tail_rows,
     )
     scalar_args = (scalar_args[0], aligned_offsets, *scalar_args[1:])
-    grad_tail = jnp.zeros(
-        (tail_rows, num_heads, dv_dim),
-        dtype=grad_out.dtype,
+    grad_deficit = max(tail_rows - grad_out.shape[0], 0)
+    packed_grad_out = (
+        jnp.concatenate(
+            (
+                grad_out,
+                jnp.zeros((grad_deficit,) + grad_out.shape[1:], dtype=grad_out.dtype),
+            ),
+            axis=0,
+        )
+        if grad_deficit
+        else grad_out
     )
-    packed_grad_out = jnp.concatenate((grad_out, grad_tail), axis=0)
     backward_hbm_args = (
         *qkv_hbm_args,
         pltpu.with_memory_space_constraint(
@@ -1142,14 +1222,16 @@ def _native_jagged_hstu_attention_backward(
     q_stage_rows = query_group_rows + _ALIGNMENT_ROWS
     dq_grid_spec = pltpu.PrefetchScalarGridSpec(
         num_scalar_prefetch=4,
-        in_specs=[pl.BlockSpec(memory_space=pltpu.HBM)] * 4,
+        in_specs=[pl.BlockSpec(memory_space=pltpu.HBM)] * 5,
         out_specs=pl.BlockSpec(memory_space=pltpu.HBM),
         grid=(num_sequences, num_query_groups),
         scratch_shapes=(
-            pltpu.VMEM((q_stage_rows, num_heads, dqk), q.dtype),
-            pltpu.VMEM((q_stage_rows, num_heads, dv_dim), grad_out.dtype),
+            pltpu.VMEM((2 * q_stage_rows, num_heads, dqk), q.dtype),
+            pltpu.VMEM((2 * q_stage_rows, num_heads, dv_dim), grad_out.dtype),
             pltpu.VMEM((num_heads, query_group_rows, dqk), jnp.float32),
             pltpu.VMEM((query_group_rows, num_heads, dqk), q.dtype),
+            pltpu.VMEM((num_heads, query_group_rows, dqk), q.dtype),
+            pltpu.VMEM((num_heads, query_group_rows, dv_dim), grad_out.dtype),
             pltpu.SemaphoreType.DMA((2,)),
         ),
     )
@@ -1161,26 +1243,34 @@ def _native_jagged_hstu_attention_backward(
             block_q=block_q,
             query_tiles_per_program=query_tiles_per_program,
         ),
-        out_shape=jax.ShapeDtypeStruct((output_capacity, num_heads, dqk), q.dtype),
+        out_shape=jax.ShapeDtypeStruct((q.shape[0], num_heads, dqk), q.dtype),
         grid_spec=dq_grid_spec,
+        input_output_aliases={8: 0},
         compiler_params=pltpu.CompilerParams(
             dimension_semantics=("parallel", "parallel")
         ),
         name="pallas_jagged_hstu_attention_bwd_dq",
-    )(*scalar_args, *backward_hbm_args)
+    )(
+        *scalar_args,
+        *backward_hbm_args,
+        pltpu.with_memory_space_constraint(
+            jnp.zeros((q.shape[0], num_heads, dqk), q.dtype),
+            pltpu.HBM,
+        ),
+    )
 
     kv_stage_rows = block_k + _ALIGNMENT_ROWS
     dkv_grid_spec = pltpu.PrefetchScalarGridSpec(
         num_scalar_prefetch=4,
-        in_specs=[pl.BlockSpec(memory_space=pltpu.HBM)] * 4,
+        in_specs=[pl.BlockSpec(memory_space=pltpu.HBM)] * 6,
         out_specs=[
             pl.BlockSpec(memory_space=pltpu.HBM),
             pl.BlockSpec(memory_space=pltpu.HBM),
         ],
         grid=(num_sequences, num_kv_blocks),
         scratch_shapes=(
-            pltpu.VMEM((kv_stage_rows, num_heads, dqk), k.dtype),
-            pltpu.VMEM((kv_stage_rows, num_heads, dv_dim), v.dtype),
+            pltpu.VMEM((2 * kv_stage_rows, num_heads, dqk), k.dtype),
+            pltpu.VMEM((2 * kv_stage_rows, num_heads, dv_dim), v.dtype),
             pltpu.VMEM((num_heads, block_k, dqk), jnp.float32),
             pltpu.VMEM((num_heads, block_k, dv_dim), jnp.float32),
             pltpu.VMEM((block_k, num_heads, dqk), k.dtype),
@@ -1196,19 +1286,28 @@ def _native_jagged_hstu_attention_backward(
             block_q=block_q,
         ),
         out_shape=(
-            jax.ShapeDtypeStruct((output_capacity, num_heads, dqk), k.dtype),
-            jax.ShapeDtypeStruct((output_capacity, num_heads, dv_dim), v.dtype),
+            jax.ShapeDtypeStruct((q.shape[0], num_heads, dqk), k.dtype),
+            jax.ShapeDtypeStruct((q.shape[0], num_heads, dv_dim), v.dtype),
         ),
         grid_spec=dkv_grid_spec,
+        input_output_aliases={8: 0, 9: 1},
         compiler_params=pltpu.CompilerParams(
             dimension_semantics=("parallel", "parallel")
         ),
         name="pallas_jagged_hstu_attention_bwd_dkv",
-    )(*scalar_args, *backward_hbm_args)
-    dq_packed, dk_packed, dv_packed = _aligned_values_to_packed(
-        (dq, dk, dv), seq_offsets, aligned_offsets, q.shape[0]
+    )(
+        *scalar_args,
+        *backward_hbm_args,
+        pltpu.with_memory_space_constraint(
+            jnp.zeros((q.shape[0], num_heads, dqk), k.dtype),
+            pltpu.HBM,
+        ),
+        pltpu.with_memory_space_constraint(
+            jnp.zeros((q.shape[0], num_heads, dv_dim), v.dtype),
+            pltpu.HBM,
+        ),
     )
-    return dq_packed, dk_packed, dv_packed
+    return dq, dk, dv
 
 
 def pallas_jagged_hstu_attention_backward(
