@@ -37,7 +37,7 @@ from recir.ops.pallas.hstu_attention import (
 
 _ALIGNMENT_ROWS = 8
 _SAFE_TAIL_ROWS = _ALIGNMENT_ROWS - 1
-_DEFAULT_BLOCK = 512
+_DEFAULT_BLOCK = 640
 _DEFAULT_QUERY_TILES_PER_PROGRAM = 4
 _DEFAULT_BACKWARD_QUERY_TILES_PER_PROGRAM = 2
 _AXIS = "torch_dist"
@@ -155,6 +155,27 @@ def _packed_row_sources(
     return sequence_ids, positions
 
 
+def _in_32bit_index_mode(fn: Any) -> Any:
+    """Trace the pallas kernels with 32-bit integer defaults.
+
+    Scoped rather than global, so callers that need ``JAX_ENABLE_X64=1``
+    elsewhere keep it.
+    """
+
+    @functools.wraps(fn)
+    def wrapper(*args: Any, **kwargs: Any) -> Any:
+        previous = jax.config.values["jax_enable_x64"]
+        if not previous:
+            return fn(*args, **kwargs)
+        jax.config.update("jax_enable_x64", False)
+        try:
+            return fn(*args, **kwargs)
+        finally:
+            jax.config.update("jax_enable_x64", previous)
+
+    return wrapper
+
+
 def _aligned_sequence_offsets(seq_offsets: jax.Array) -> jax.Array:
     seq_offsets = seq_offsets.astype(jnp.int32)
     lengths = seq_offsets[1:] - seq_offsets[:-1]
@@ -227,11 +248,19 @@ def jagged_hstu_attention_reference(
     )
 
 
+def _cdiv(value: Any, divisor: int) -> Any:
+    """``pl.cdiv`` with the divisor matched to ``value``'s dtype."""
+    dtype = getattr(value, "dtype", None)
+    if dtype is None:
+        return pl.cdiv(value, divisor)
+    return pl.cdiv(value, jnp.asarray(divisor, dtype))
+
+
 def _aligned_sequence_window(start, length) -> tuple[Any, Any, Any]:
     aligned_start = pl.multiple_of(start - start % _ALIGNMENT_ROWS, _ALIGNMENT_ROWS)
     prefix = start - aligned_start
     copy_rows = pl.multiple_of(
-        pl.cdiv(prefix + length, _ALIGNMENT_ROWS) * _ALIGNMENT_ROWS,
+        _cdiv(prefix + length, _ALIGNMENT_ROWS) * _ALIGNMENT_ROWS,
         _ALIGNMENT_ROWS,
     )
     return aligned_start, prefix, copy_rows
@@ -405,7 +434,7 @@ def _jagged_fwd_kernel(
     def _accumulate(k_stage_ref, v_stage_ref) -> None:
         kv_block = pl.program_id(0)
         kv_start = kv_block * block_k
-        key_positions = kv_start + jnp.arange(block_k)
+        key_positions = kv_start + jnp.arange(block_k, dtype=jnp.int32)
         key_ids = jnp.minimum(key_positions, max_id)
         k_tile = jnp.swapaxes(
             k_stage_ref[pl.ds(prefix, block_k), :, :],
@@ -428,7 +457,7 @@ def _jagged_fwd_kernel(
                 query_offset=query_offset,
                 query_start=query_start,
             ) -> None:
-                query_positions = query_start + jnp.arange(block_q)
+                query_positions = query_start + jnp.arange(block_q, dtype=jnp.int32)
                 query_ids = jnp.minimum(query_positions, max_id)
                 q_tile = jnp.swapaxes(
                     q_stage_ref[pl.ds(q_prefix + query_offset, block_q), :, :],
@@ -473,7 +502,7 @@ def _jagged_fwd_kernel(
     query_group_end = jnp.minimum(query_group_start + query_group_rows, length)
     causal_upper = jnp.where(
         query_group_start < length,
-        pl.cdiv(query_group_end, block_k),
+        _cdiv(query_group_end, block_k),
         0,
     )
     kv_input_specs = (
@@ -508,7 +537,7 @@ def _jagged_fwd_kernel(
         v_hbm_ref,
     )
 
-    query_positions = query_group_start + jnp.arange(query_group_rows)
+    query_positions = query_group_start + jnp.arange(query_group_rows, dtype=jnp.int32)
     output = jnp.where(
         query_positions[None, :, None] < length,
         output_acc_ref[...],
@@ -776,7 +805,7 @@ def _jagged_bwd_dq_kernel(
     def _accumulate(k_stage_ref, v_stage_ref) -> None:
         kv_block = pl.program_id(0)
         kv_start = kv_block * block_k
-        key_positions = kv_start + jnp.arange(block_k)
+        key_positions = kv_start + jnp.arange(block_k, dtype=jnp.int32)
         key_ids = jnp.minimum(key_positions, max_id)
         k_tile = (
             jnp.swapaxes(k_stage_ref[pl.ds(prefix, block_k), :, :], 0, 1) * alpha
@@ -797,7 +826,7 @@ def _jagged_bwd_dq_kernel(
                 query_offset=query_offset,
                 query_start=query_start,
             ) -> None:
-                query_positions = query_start + jnp.arange(block_q)
+                query_positions = query_start + jnp.arange(block_q, dtype=jnp.int32)
                 query_ids = jnp.minimum(query_positions, max_id)
                 q_tile = q_t_ref[:, pl.ds(query_offset, block_q), :]
                 do_tile = do_t_ref[:, pl.ds(query_offset, block_q), :]
@@ -844,7 +873,7 @@ def _jagged_bwd_dq_kernel(
     query_group_end = jnp.minimum(query_group_start + query_group_rows, length)
     causal_upper = jnp.where(
         query_group_start < length,
-        pl.cdiv(query_group_end, block_k),
+        _cdiv(query_group_end, block_k),
         0,
     )
     kv_input_specs = (
@@ -879,7 +908,7 @@ def _jagged_bwd_dq_kernel(
         v_hbm_ref,
     )
 
-    query_positions = query_group_start + jnp.arange(query_group_rows)
+    query_positions = query_group_start + jnp.arange(query_group_rows, dtype=jnp.int32)
     dq = jnp.where(
         query_positions[None, :, None] < length,
         dq_acc_ref[...],
@@ -989,7 +1018,7 @@ def _jagged_bwd_dkv_kernel(
             copy.wait()
 
     max_id = length - num_targets
-    key_positions = kv_start + jnp.arange(block_k)
+    key_positions = kv_start + jnp.arange(block_k, dtype=jnp.int32)
     key_ids = jnp.minimum(key_positions, max_id)
     k_tile = jnp.swapaxes(
         k_stage_ref[pl.ds(kv_prefix, block_k), :, :],
@@ -1006,7 +1035,7 @@ def _jagged_bwd_dkv_kernel(
     def _accumulate(q_stage_ref, do_stage_ref) -> None:
         query_block = first_query_block + pl.program_id(0)
         query_start = query_block * block_q
-        query_positions = query_start + jnp.arange(block_q)
+        query_positions = query_start + jnp.arange(block_q, dtype=jnp.int32)
         query_ids = jnp.minimum(query_positions, max_id)
         q_tile = jnp.swapaxes(
             q_stage_ref[pl.ds(prefix, block_q), :, :],
@@ -1081,7 +1110,7 @@ def _jagged_bwd_dkv_kernel(
         Any,
         jnp.where(
             kv_start < length,
-            pl.cdiv(length, block_q) - first_query_block,
+            _cdiv(length, block_q) - first_query_block,
             0,
         ),
     )
@@ -1310,6 +1339,7 @@ def _native_jagged_hstu_attention_backward(
     return dq, dk, dv
 
 
+@_in_32bit_index_mode
 def pallas_jagged_hstu_attention_backward(
     grad_out: jax.Array,
     q: jax.Array,
@@ -1485,6 +1515,7 @@ def _validate_jagged_hstu_attention_inputs(
     return num_sequences
 
 
+@_in_32bit_index_mode
 def pallas_jagged_hstu_attention(
     q: jax.Array,
     k: jax.Array,
