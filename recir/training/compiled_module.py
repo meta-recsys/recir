@@ -195,9 +195,15 @@ class RecirGSPMDCompiledModuleBase(RecirCompiledModuleBase):
         result: Tuple[torch.Tensor, Dict[str, torch.Tensor]] = compiled_step(
             *self._step_args(batch)
         )
-        if self._emb_opt is None:
+        if self._syncs_state_every_step():
             sync_device_state_to_torch(compiled_step)
         return result
+
+    def _syncs_state_every_step(self) -> bool:
+        """Whether every step mirrors all device state to torch: backends without
+        an in_graph embedding optimizer read host copies between steps (e.g. the
+        CPU backend pushes the sparse LR from its host buffer)."""
+        return self._emb_opt is None
 
     @property
     def in_graph_metrics(self) -> bool:
@@ -302,7 +308,11 @@ class RecirGSPMDCompiledModuleBase(RecirCompiledModuleBase):
         Duck-typed hook: mvai_cloud's CheckpointManager uses this if present, so
         the recir/JAX-specific checkpoint logic stays out of the shared framework.
         """
-        from recir.embedding.in_graph import DP_TABLE_PREFIX, SHARDED_TABLE_PREFIX
+        from recir.embedding.in_graph import (
+            DP_TABLE_PREFIX,
+            InGraphSparseArch,
+            SHARDED_TABLE_PREFIX,
+        )
         from recir.training.tpu_checkpoint import (
             gather_shard_order,
             RecirCheckpointable,
@@ -321,5 +331,13 @@ class RecirGSPMDCompiledModuleBase(RecirCompiledModuleBase):
                 gather_shard_order(self._num_processes)
                 if self._num_processes > 1
                 else None
+            ),
+            sparse_arch=next(
+                (
+                    m
+                    for m in self._model.modules()
+                    if isinstance(m, InGraphSparseArch) and m.sparsecore is not None
+                ),
+                None,
             ),
         )
