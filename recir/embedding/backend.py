@@ -52,6 +52,9 @@ class TableSharding(enum.Enum):
     FSDP = "fsdp"
     # Full copy on every device; looked up via ``F.embedding``.
     REPLICATED = "replicated"
+    # In JAX TPU Embedding's SparseCore layout; looked up on SparseCore and trained
+    # there with row-wise Adagrad (``recir.embedding.sparsecore_rowwise``).
+    SPARSECORE = "sparsecore"
 
 
 class TableOptimizer(enum.Enum):

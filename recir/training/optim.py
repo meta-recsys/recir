@@ -578,6 +578,13 @@ def _stage_multiplier(stages: List[WarmupStage], iter_t: torch.Tensor) -> torch.
     return mult
 
 
+def warmup_lr(cfg: OptimConfig, iteration: int) -> float:
+    """``cfg.lr`` under its warmup schedule at ``iteration``: the rate
+    :class:`WarmupController` sets for that step."""
+    stages = _lr_stages(list(cfg.lr_warmup_schedule or []))
+    return cfg.lr * float(_stage_multiplier(stages, torch.tensor(iteration)))
+
+
 class WarmupController:
     """Drives runtime-mutable LR over warmup stages for the dense + sparse opts.
 
