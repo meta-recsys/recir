@@ -38,6 +38,8 @@ from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor, Shard
 from torch.distributed.tensor._utils import compute_local_shape_and_global_offset
 from torch.testing._internal.distributed.fake_pg import FakeStore
+from torchrec.distributed.embedding_types import OptimType
+from torchrec.optim.clipping import GradientClipping
 
 
 class _Wrapper(torch.nn.Module):
@@ -1249,3 +1251,127 @@ class DcpRoundTripTest(unittest.TestCase):
         # the compiled graph reading the tensor it was given at build time.
         self.assertEqual(wrapper.dense.data_ptr(), dense_ptr)
         self.assertEqual(wrapper._sharded_tables["table"].data_ptr(), table_ptr)
+
+
+class _FakeSparseCore:
+    """SparseCoreRowwiseTables' checkpoint surface: momentum blocks by table."""
+
+    def __init__(self) -> None:
+        self.momentum = {
+            "post": torch.full((4, 1), 1.0).numpy(),
+            "viewer": torch.full((4, 1), 2.0).numpy(),
+        }
+        self.rounding_counter = 7
+
+    def export_table(self, table: str, part: str) -> Any:
+        assert part == "momentum"
+        return self.momentum[table].copy()
+
+    def import_table(self, table: str, part: str, values: Any) -> None:
+        assert part == "momentum"
+        self.momentum[table] = values
+
+
+class SparseCoreEmbeddingStateTest(unittest.TestCase):
+    """SparseCore tables' momentum and rounding counter ride in the embedding
+    optimizer entry under the indices a build without SparseCore tables uses."""
+
+    def _checkpointable(self, with_live_table: bool) -> Any:
+        wrapper = _ShardedTableWrapper(4, 2, meta=False)
+        order = ["post", "table", "viewer"] if with_live_table else ["post", "viewer"]
+        optimizer = None
+        if with_live_table:
+            optimizer = TensorLRRowWiseAdagrad(
+                [wrapper._sharded_tables["table"]],
+                lr_tensor=torch.tensor(0.02),
+                eps=1e-3,
+                weight_decay=0.0,
+            )
+            optimizer.state[wrapper._sharded_tables["table"]]["sum"] = torch.full(
+                (4, 1), 3.0
+            )
+        config = SimpleNamespace(
+            optim_type=OptimType.ROWWISE_ADAGRAD,
+            lr=0.02,
+            eps=1e-3,
+            weight_decay=0.0,
+            gradient_clipping=GradientClipping.NONE,
+        )
+        self.sparsecore = _FakeSparseCore()
+        arch = SimpleNamespace(
+            sparse_optimizer_order=order,
+            sparsecore=self.sparsecore,
+            sparsecore_tables=[
+                SimpleNamespace(name="post", fp16=True),
+                SimpleNamespace(name="viewer", fp16=False),
+            ],
+            row_sharded=lambda table: True,
+            sparse_optimizer_args=(config, torch.tensor(0.02), 1.0),
+        )
+        return RecirCheckpointable(
+            wrapper,
+            num_processes=1,
+            sharded_prefixes=("_sharded_tables",),
+            table_prefixes=("_sharded_tables",),
+            warmup=_Warmup(),
+            embedding_optimizer=optimizer,
+            sparse_arch=arch,
+        )
+
+    def test_save_numbers_every_table_as_without_sparsecore(self) -> None:
+        ckpt = self._checkpointable(with_live_table=True)
+
+        entry = ckpt.state_dict()[EMBEDDING_OPTIMIZER_STATE_KEY]
+
+        self.assertEqual([0, 1, 2], entry["param_groups"][0]["params"])
+        self.assertEqual({0, 1, 2}, set(entry["state"]))
+        torch.testing.assert_close(entry["state"][0]["sum"], torch.full((4, 1), 1.0))
+        self.assertEqual(7, int(entry["state"][0]["rounding_counter"]))
+        self.assertEqual(
+            int(entry["param_groups"][0]["rounding_seed"]),
+            int(entry["state"][0]["rounding_seed"]),
+        )
+        torch.testing.assert_close(entry["state"][1]["sum"], torch.full((4, 1), 3.0))
+        torch.testing.assert_close(entry["state"][2]["sum"], torch.full((4, 1), 2.0))
+        self.assertNotIn("rounding_counter", entry["state"][2])
+
+    def test_load_splits_sparsecore_and_live_state(self) -> None:
+        ckpt = self._checkpointable(with_live_table=True)
+        sd = ckpt.state_dict()
+        entry = sd[EMBEDDING_OPTIMIZER_STATE_KEY]
+        entry["state"][0]["sum"] = torch.full((4, 1), 10.0)
+        entry["state"][0]["rounding_counter"] = torch.tensor(11)
+        entry["state"][1]["sum"] = torch.full((4, 1), 30.0)
+        entry["state"][2]["sum"] = torch.full((4, 1), 20.0)
+
+        ckpt.load_state_dict(sd)
+
+        torch.testing.assert_close(
+            torch.from_numpy(self.sparsecore.momentum["post"]), torch.full((4, 1), 10.0)
+        )
+        torch.testing.assert_close(
+            torch.from_numpy(self.sparsecore.momentum["viewer"]),
+            torch.full((4, 1), 20.0),
+        )
+        self.assertEqual(11, self.sparsecore.rounding_counter)
+        live = ckpt._embedding_optimizer
+        torch.testing.assert_close(
+            live.state[live.param_groups[0]["params"][0]]["sum"],
+            torch.full((4, 1), 30.0),
+        )
+
+    def test_without_a_live_optimizer_the_param_group_matches_a_built_one(
+        self,
+    ) -> None:
+        ckpt = self._checkpointable(with_live_table=False)
+
+        group = ckpt.state_dict()[EMBEDDING_OPTIMIZER_STATE_KEY]["param_groups"][0]
+
+        built = TensorLRRowWiseAdagrad(
+            [torch.nn.Parameter(torch.zeros(1, 1))],
+            lr_tensor=torch.tensor(0.02),
+            eps=1e-3,
+            weight_decay=0.0,
+        ).state_dict()["param_groups"][0]
+        self.assertEqual(set(built), set(group))
+        self.assertEqual([0, 1], group["params"])

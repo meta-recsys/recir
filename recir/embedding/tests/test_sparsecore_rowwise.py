@@ -6,14 +6,23 @@
 """Host-side input preparation of the SparseCore tables: the lookup's COO input and
 per-position slots, and the backward's exchange layout."""
 
-import unittest
-from typing import List, Tuple
+import os
 
+os.environ.setdefault("XLA_FLAGS", "--xla_force_host_platform_device_count=8")
+
+import unittest
+from typing import Any, List, NamedTuple, Tuple
+
+import jax
+import jax.numpy as jnp
 import numpy as np
+from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from recir.embedding.sparsecore_rowwise import (
     _device_inputs,
     _exchange_layout,
     _SubTable,
+    SparseCoreRowwiseTables,
+    SparseCoreTable,
 )
 
 _NUM_SC = 2
@@ -106,3 +115,87 @@ class ExchangeLayoutTest(unittest.TestCase):
 
         with self.assertRaisesRegex(RuntimeError, "more than the exchange buffer"):
             _exchange_layout(parts, _LAYOUT, _WORLD, _NUM_SC, cap=ids.size - 1)
+
+
+class _Variables(NamedTuple):
+    table: Any
+
+
+class IdOrderBlocksTest(unittest.TestCase):
+    """export_table / import_table on 8 CPU devices with a layout JTE does not use
+    for single-table stacks (rotation 3, offset 2), so every term of it counts."""
+
+    _N, _D, _SC = 1003, 4, 2
+    _SUBS = [_SubTable("t@0", "t", 0, 600), _SubTable("t@1", "t", 600, 403)]
+
+    def setUp(self) -> None:
+        os.environ["RECIR_SPARSECORE_CKPT_CHUNK_ROWS"] = "50"
+        devices = jax.devices()[:8]
+        world, shards = len(devices), len(devices) * self._SC
+        self.shards = shards
+        self.layout = {
+            sub.stack: (-(-sub.rows // shards) + 2, 3, 2) for sub in self._SUBS
+        }
+        sc = SparseCoreRowwiseTables.__new__(SparseCoreRowwiseTables)
+        sc._mesh, sc._axis = Mesh(np.array(devices), ("x",)), "x"
+        sc._world, sc._num_sc, sc._programs = world, self._SC, {}
+        sc._tables = {"t": SparseCoreTable("t", self._N, self._D, ("f",), 0.1)}
+        sc._subs, sc._layout = {"t": self._SUBS}, self.layout
+        sc._host_blocks = {}
+        sharding = NamedSharding(sc._mesh, P("x"))
+        sc.ev_w, sc.momentum = {}, {}
+        for sub in self._SUBS:
+            rows = shards * self.layout[sub.stack][0]
+            w = np.full((rows, self._D), -1.0, np.float32)
+            m = np.full((rows,), -1.0, np.float32)
+            phys = self._phys(sub, np.arange(sub.rows))
+            ids = sub.start + np.arange(sub.rows)
+            w[phys] = ids[:, None] + np.arange(self._D) / 10
+            m[phys] = ids
+            sc.ev_w[sub.stack] = _Variables(jax.device_put(jnp.asarray(w), sharding))
+            sc.momentum[sub.stack] = jax.device_put(jnp.asarray(m), sharding)
+        self.sc = sc
+
+    def tearDown(self) -> None:
+        del os.environ["RECIR_SPARSECORE_CKPT_CHUNK_ROWS"]
+
+    def _phys(self, sub: _SubTable, u: np.ndarray) -> np.ndarray:
+        size, rotation, offset = self.layout[sub.stack]
+        shards = self.shards
+        return ((u % shards + rotation) % shards) * size + u // shards + offset
+
+    def test_export_gives_rows_in_id_order(self) -> None:
+        weights = self.sc.export_table("t", "weights")
+        momentum = self.sc.export_table("t", "momentum")
+
+        ids = np.arange(self._N)
+        padded = 8 * -(-self._N // 8)
+        self.assertEqual((padded, self._D), weights.shape)
+        np.testing.assert_array_equal(
+            weights[: self._N],
+            (ids[:, None] + np.arange(self._D) / 10).astype(np.float32),
+        )
+        np.testing.assert_array_equal(momentum[: self._N, 0], ids)
+        self.assertFalse(weights[self._N :].any())
+
+    def test_import_puts_each_id_at_its_sparsecore_row(self) -> None:
+        rng = np.random.default_rng(0)
+        padded = 8 * -(-self._N // 8)
+        weights = rng.standard_normal((padded, self._D)).astype(np.float32)
+        momentum = rng.uniform(0, 1, (padded, 1)).astype(np.float32)
+
+        self.sc.import_table("t", "weights", weights)
+        self.sc.import_table("t", "momentum", momentum)
+
+        for sub in self._SUBS:
+            table = np.asarray(self.sc.ev_w[sub.stack].table)
+            mom = np.asarray(self.sc.momentum[sub.stack])
+            phys = self._phys(sub, np.arange(sub.rows))
+            np.testing.assert_array_equal(
+                table[phys], weights[sub.start : sub.start + sub.rows]
+            )
+            np.testing.assert_array_equal(
+                mom[phys], momentum[sub.start : sub.start + sub.rows, 0]
+            )
+            untouched = np.setdiff1d(np.arange(table.shape[0]), phys)
+            self.assertTrue((table[untouched] == -1).all())

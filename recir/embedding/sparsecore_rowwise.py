@@ -29,6 +29,7 @@ from __future__ import annotations
 import dataclasses
 import logging
 import os
+import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from itertools import repeat
@@ -38,6 +39,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from jax.sharding import NamedSharding, PartitionSpec as P
+from recir.lowering.xla_lower import _single_device_array_to_numpy_uncached
 from recir.ops.pallas.embeddings.sparsecore_rowwise_adagrad import (
     fp16_rounding_key,
     rowwise_adagrad_update,
@@ -178,6 +180,31 @@ def _keep_formats(tree: Any) -> Any:
     return jax.tree.map(lambda a: getattr(a, "format", None) or a.layout, tree)
 
 
+def _block_ranges(
+    sub: _SubTable, block: int, chunk: int, num_chunks: int, world: int
+) -> np.ndarray:
+    """[num_chunks, world, 3] int32: for chunk c of device e's id-order block, the
+    sub-table ids it holds, [lo, hi), and the chunk row of id lo."""
+    e = np.arange(world, dtype=np.int64)[None, :]
+    c = np.arange(num_chunks, dtype=np.int64)[:, None]
+    first = e * block + c * chunk
+    last = np.minimum(first + chunk, (e + 1) * block)
+    lo = np.clip(first - sub.start, 0, sub.rows)
+    hi = np.clip(last - sub.start, 0, sub.rows)
+    pos0 = np.where(lo < hi, lo + sub.start - first, 0)
+    return np.stack([lo, hi, pos0], axis=-1).astype(np.int32)
+
+
+def _progressions(
+    lo: jax.Array, hi: jax.Array, residues: jax.Array, num_shards: int, cap: int
+) -> Tuple[jax.Array, jax.Array]:
+    """Sub-table ids u in [lo, hi) with u % num_shards == residue, ``cap`` per
+    residue, and which of them exist. Broadcasts lo/hi against residues."""
+    first = lo + jnp.mod(residues - lo, num_shards)
+    u = first[..., None] + jnp.arange(cap, dtype=jnp.int32) * num_shards
+    return u, u < hi[..., None]
+
+
 class SparseCoreRowwiseTables:
     """Owns the SparseCore tables of one sparse arch and their per-step programs.
 
@@ -242,7 +269,7 @@ class SparseCoreRowwiseTables:
                 )
                 for k in range(n_sub)
             ]
-        self._programs: Dict[Tuple[Tuple[str, Tuple[int, int]], ...], Any] = {}
+        self._programs: Dict[Any, Any] = {}
         self._pending: Dict[int, jax.Array] = {}
         self._step_inputs: Any = None
         self._warned_host_grad: bool = False
@@ -250,6 +277,8 @@ class SparseCoreRowwiseTables:
         self._logged_grad_type: bool = False
         self._lookups: int = 0
         self._rounding_counter: int = 0
+        self._layout: Dict[str, Tuple[int, int, int]] = {}
+        self._host_blocks: Dict[Tuple[str, str], np.ndarray] = {}
         self._pool = ThreadPoolExecutor(self._local_devices)
         self.ev_w: Dict[str, Any] = {}
         self.momentum: Dict[str, jax.Array] = {}
@@ -359,6 +388,15 @@ class SparseCoreRowwiseTables:
         stacks: Dict[str, List[Any]] = {}
         for tspec in jax.tree.leaves(self._jte_embedding.get_table_specs(specs)):
             stacks.setdefault(tspec.setting_in_stack.stack_name, []).append(tspec)
+        # Per stack: (shard size, shard rotation, row offset in shard).
+        self._layout = {
+            s.table_spec.name: (
+                s.table_spec.stacked_table_spec.stack_vocab_size // width,
+                s.table_spec.setting_in_stack.shard_rotation,
+                s.table_spec.setting_in_stack.row_offset_in_shard,
+            )
+            for s in specs.values()
+        }
         rngs = jax.random.split(jax.random.PRNGKey(0), width * len(stacks))
         for i, (stack, ts) in enumerate(sorted(stacks.items())):
             self.ev_w[stack] = self._jte_embedding._init_stacked_embedding_table(
@@ -778,3 +816,223 @@ class SparseCoreRowwiseTables:
         self.ev_w, self.momentum = bwd(
             grads, dest_g, send_rows_g, lr, counter, self.ev_w, self.momentum
         )
+
+    @property
+    def rounding_counter(self) -> int:
+        return self._rounding_counter
+
+    @rounding_counter.setter
+    def rounding_counter(self, value: int) -> None:
+        self._rounding_counter = int(value) % (2**31)
+
+    def block_rows(self, table: str) -> int:
+        """Rows of each device's block of ``table`` in id order: the table padded to
+        a multiple of the device count, split evenly in device order."""
+        return _round_up(self._tables[table].num_embeddings, self._world) // self._world
+
+    def _host_positions(self, sharding: NamedSharding, rows: int) -> List[int]:
+        """This host's devices' positions in the mesh's batch order, ascending."""
+        starts = []
+        for idx in sharding.addressable_devices_indices_map(
+            (self._world * rows,)
+        ).values():
+            assert idx is not None
+            starts.append((idx[0].start or 0) // rows)
+        positions = sorted(starts)
+        assert positions == list(range(positions[0], positions[0] + len(positions)))
+        return positions
+
+    def _block_programs(
+        self, stack: str, dim: int, chunk: int, out_dtype: Any
+    ) -> Tuple[Any, Any]:
+        """(export, import) for one stack: each moves one chunk of every device's
+        id-order block between it and the stack's SparseCore layout. Export
+        produces ``out_dtype``; import takes the dtype it is given."""
+        key = ("block", stack, dim, chunk, np.dtype(out_dtype).name)
+        if key in self._programs:
+            return self._programs[key]
+        world, num_sc, axis = self._world, self._num_sc, self._axis
+        shards = world * num_sc
+        shard_size, rotation, offset = self._layout[stack]
+        cap = -(-chunk // shards) + 1
+        own = jnp.arange(num_sc, dtype=jnp.int32)
+        every = jnp.arange(world, dtype=jnp.int32)[:, None] * num_sc + own
+
+        def local_rows(u: jax.Array) -> jax.Array:
+            return own[None, :, None] * shard_size + u // shards + offset
+
+        def export_local(table: jax.Array, ranges: jax.Array) -> jax.Array:
+            table = table.reshape(table.shape[0], -1)
+            me = jax.lax.axis_index(axis).astype(jnp.int32)
+            # As a SparseCore owner: the rows each block device's chunk needs.
+            u, ok = _progressions(
+                ranges[:, None, 0],
+                ranges[:, None, 1],
+                jnp.mod(me * num_sc + own - rotation, shards)[None, :],
+                shards,
+                cap,
+            )
+            rows = jnp.clip(local_rows(u), 0, table.shape[0] - 1)
+            send = jnp.where(ok[..., None], table[rows], 0).astype(out_dtype)
+            recv = jax.lax.all_to_all(send, axis, 0, 0)
+            # As a block device: where each owner's rows land in my chunk.
+            lo, hi, pos0 = ranges[me, 0], ranges[me, 1], ranges[me, 2]
+            u, ok = _progressions(
+                lo, hi, jnp.mod(every - rotation, shards), shards, cap
+            )
+            pos = jnp.where(ok, pos0 + u - lo, chunk).reshape(-1)
+            out = jnp.zeros((chunk + 1, table.shape[1]), out_dtype)
+            return out.at[pos].set(recv.reshape(-1, table.shape[1]))[:chunk]
+
+        def import_local(
+            table: jax.Array, block: jax.Array, ranges: jax.Array
+        ) -> jax.Array:
+            flat = table.reshape(table.shape[0], -1)
+            me = jax.lax.axis_index(axis).astype(jnp.int32)
+            # As a block device: my chunk's rows for each SparseCore owner.
+            lo, hi, pos0 = ranges[me, 0], ranges[me, 1], ranges[me, 2]
+            u, ok = _progressions(
+                lo, hi, jnp.mod(every - rotation, shards), shards, cap
+            )
+            send = jnp.where(
+                ok[..., None], block[jnp.clip(pos0 + u - lo, 0, chunk - 1)], 0
+            )
+            recv = jax.lax.all_to_all(send, axis, 0, 0)
+            # As an owner: the local rows of what each block device sent.
+            u, ok = _progressions(
+                ranges[:, None, 0],
+                ranges[:, None, 1],
+                jnp.mod(me * num_sc + own - rotation, shards)[None, :],
+                shards,
+                cap,
+            )
+            rows = jnp.where(ok, local_rows(u), flat.shape[0]).reshape(-1)
+            flat = flat.at[rows].set(
+                recv.reshape(-1, flat.shape[1]).astype(flat.dtype), mode="drop"
+            )
+            return flat.reshape(table.shape)
+
+        batch = P(axis)
+        export = jax.jit(
+            jax.shard_map(
+                export_local,
+                mesh=self._mesh,
+                in_specs=(batch, P()),
+                out_specs=batch,
+                check_vma=False,
+            )
+        )
+        import_ = jax.jit(
+            jax.shard_map(
+                import_local,
+                mesh=self._mesh,
+                in_specs=(batch, batch, P()),
+                out_specs=batch,
+                check_vma=False,
+            ),
+            donate_argnums=0,
+            out_shardings=_keep_formats(
+                self.momentum[stack] if dim == 1 else self.ev_w[stack].table
+            ),
+        )
+        self._programs[key] = (export, import_)
+        return self._programs[key]
+
+    def _chunking(self, table: str) -> Tuple[int, int]:
+        block = self.block_rows(table)
+        chunk = min(
+            block, int(os.environ.get("RECIR_SPARSECORE_CKPT_CHUNK_ROWS", 1 << 22))
+        )
+        return chunk, -(-block // chunk)
+
+    def export_table(self, table: str, part: str) -> np.ndarray:
+        """This host's id-order blocks of ``table``'s ``part`` ("weights", or
+        "momentum" as one column): rows ``[first * block, (first + n) * block)``
+        of the table padded to a multiple of the device count, for this host's n
+        devices starting at mesh position ``first``. FP16 tables' weights come out
+        as FP16; padding rows are zero."""
+        t = self._tables[table]
+        momentum = part == "momentum"
+        dim = 1 if momentum else t.embedding_dim
+        block = self.block_rows(table)
+        chunk, num_chunks = self._chunking(table)
+        sharding = NamedSharding(self._mesh, P(self._axis, None))
+        positions = self._host_positions(sharding, chunk)
+        dtype = np.dtype(np.float16 if t.fp16 and not momentum else np.float32)
+        # Allocated once and reused by every save, as the ring-shift tables'
+        # host buffers are (tpu_checkpoint.HostStateBuffers).
+        out = self._host_blocks.get((table, part))
+        if out is None:
+            out = np.empty((len(positions) * block, dim), dtype)
+            self._host_blocks[(table, part)] = out
+        started, copy_s = time.perf_counter(), 0.0
+        for c in range(num_chunks):
+            rows = min(chunk, block - c * chunk)
+            parts = []
+            for sub in self._subs[table]:
+                export, _ = self._block_programs(sub.stack, dim, chunk, dtype)
+                ranges = _block_ranges(sub, block, chunk, num_chunks, self._world)[c]
+                src = (
+                    self.momentum[sub.stack] if momentum else self.ev_w[sub.stack].table
+                )
+                parts.append(export(src, jnp.asarray(ranges)))
+            total = parts[0]
+            for p in parts[1:]:
+                total = total + p
+            t0 = time.perf_counter()
+            for shard in total.addressable_shards:
+                start = (
+                    (shard.index[0].start or 0) // chunk - positions[0]
+                ) * block + c * chunk
+                values = _single_device_array_to_numpy_uncached(shard.data)
+                out[start : start + rows] = values[:rows]
+            copy_s += time.perf_counter() - t0
+        logger.info(
+            "[sparsecore] export %s %s: %.1f GB in %.1fs (%.1fs copying to host)",
+            table,
+            part,
+            out.nbytes / 1e9,
+            time.perf_counter() - started,
+            copy_s,
+        )
+        return out
+
+    def import_table(self, table: str, part: str, values: np.ndarray) -> None:
+        """Inverse of :meth:`export_table`: set ``table``'s ``part`` from this
+        host's id-order blocks (any float dtype; FP16 values load exactly)."""
+        t = self._tables[table]
+        momentum = part == "momentum"
+        dim = 1 if momentum else t.embedding_dim
+        block = self.block_rows(table)
+        chunk, num_chunks = self._chunking(table)
+        sharding = NamedSharding(self._mesh, P(self._axis, None))
+        n = len(self._host_positions(sharding, chunk))
+        if values.shape != (n * block, dim):
+            raise ValueError(
+                f"[sparsecore] {table} {part}: got {values.shape}, this host's "
+                f"blocks are {(n * block, dim)}"
+            )
+        local = np.zeros((n * chunk, dim), values.dtype)
+        for c in range(num_chunks):
+            rows = min(chunk, block - c * chunk)
+            for p in range(n):
+                local[p * chunk : p * chunk + rows] = values[
+                    p * block + c * chunk : p * block + c * chunk + rows
+                ]
+            chunk_array = jax.make_array_from_process_local_data(
+                sharding, local, (self._world * chunk, dim)
+            )
+            for sub in self._subs[table]:
+                _, import_ = self._block_programs(sub.stack, dim, chunk, values.dtype)
+                ranges = jnp.asarray(
+                    _block_ranges(sub, block, chunk, num_chunks, self._world)[c]
+                )
+                if momentum:
+                    self.momentum[sub.stack] = import_(
+                        self.momentum[sub.stack], chunk_array, ranges
+                    )
+                else:
+                    ev = self.ev_w[sub.stack]
+                    self.ev_w[sub.stack] = ev._replace(
+                        table=import_(ev.table, chunk_array, ranges)
+                    )
