@@ -262,6 +262,7 @@ def install_graph_break_dispatch(
     num_ranks: int = 1,
     disable_torchrec_gradient_division: bool = False,
     register_backward: bool = True,
+    bwd_fn: Optional[Callable[[Any, int], None]] = None,
 ) -> Optional[int]:
     """Replace markers planted under ``marker_prefix`` with a graph-break dispatch.
 
@@ -280,6 +281,12 @@ def install_graph_break_dispatch(
 
     ``disable_torchrec_gradient_division`` is only for torchrec sparse seams,
     where the combined backward must produce a cross-host gradient sum.
+
+    With ``bwd_fn`` the dispatch is device-resident: ``fwd_fn`` returns jax
+    arrays that feed the next compiled subgraph without a host copy, and
+    ``bwd_fn(grad, grad_idx)`` receives each gradient as the producing
+    subgraph's jax array (lowering keeps outputs consumed only by these nodes
+    on device). No torch autograd bridges the break.
 
     Returns the allocated dispatch id (``None`` if no markers matched).
     """
@@ -309,7 +316,12 @@ def install_graph_break_dispatch(
         gm.recompile()
         return None
 
-    fwd, bwd = _wrap_with_save_for_backward(fwd_fn, disable_torchrec_gradient_division)
+    if bwd_fn is None:
+        fwd, bwd = _wrap_with_save_for_backward(
+            fwd_fn, disable_torchrec_gradient_division
+        )
+    else:
+        fwd, bwd = fwd_fn, bwd_fn
     dispatch_id = _allocate_dispatch_id()
     with _registry_lock:
         _FWD_REGISTRY[dispatch_id] = fwd
@@ -350,6 +362,7 @@ def install_graph_break_dispatch(
                 args=(input_nodes, dispatch_id),
             )
             fwd_call.meta["xla_graph_break"] = True
+            fwd_call.meta["device_resident"] = bwd_fn is not None
 
         for output_idx, marker in output_markers:
             with gm.graph.inserting_before(marker):
@@ -377,6 +390,10 @@ def install_graph_break_dispatch(
             key=lambda n: int(n.args[1].split("::bwd::")[1]),
         )
         for grad_idx, marker in enumerate(sorted_bwd):
+            if bwd_fn is not None:
+                # Device-resident callers map gradients by output index, and an
+                # output the loss does not use has no backward marker.
+                grad_idx = int(marker.args[1].split("::bwd::")[1])
             grad_node = marker.args[0]
             with gm.graph.inserting_before(marker):
                 bwd_call = gm.graph.call_function(
@@ -385,6 +402,7 @@ def install_graph_break_dispatch(
                 )
                 bwd_call.meta = dict(marker.meta)
                 bwd_call.meta["xla_graph_break"] = True
+                bwd_call.meta["device_resident"] = bwd_fn is not None
             marker.replace_all_uses_with(bwd_call)
             gm.graph.erase_node(marker)
 
@@ -421,6 +439,38 @@ class _OutputBackwardMarker(torch.autograd.Function):
             None,
             None,
         ) + (None,) * ctx._num_deps
+
+
+class _DeviceOutputBackwardMarker(torch.autograd.Function):
+    """``_OutputBackwardMarker`` whose backward ends at the marker.
+
+    For device-resident dispatches: the gradient goes only to the dispatch's
+    ``bwd_fn`` as a jax array, so nothing downstream of the backward marker may
+    consume it (a small eager segment there would get a jax array, not a tensor).
+    """
+
+    @staticmethod
+    def forward(ctx, x, prefix: str, idx: int, *deps):
+        ctx.prefix = prefix
+        ctx.idx = idx
+        ctx._num_deps = len(deps)
+        return torch.ops.recir.mark_boundary(x, f"{prefix}::output::{idx}")
+
+    @staticmethod
+    def backward(ctx, grad):
+        torch.ops.recir.mark_boundary(grad, f"{ctx.prefix}::bwd::{ctx.idx}")
+        return (None, None, None) + (None,) * ctx._num_deps
+
+
+def mark_output_with_device_bwd(
+    tensor: torch.Tensor,
+    prefix: str,
+    idx: int,
+    deps: Optional[List[torch.Tensor]] = None,
+) -> torch.Tensor:
+    """``mark_output_with_bwd`` for a device-resident dispatch (``bwd_fn``): the
+    traced gradient stops at the backward marker."""
+    return _DeviceOutputBackwardMarker.apply(tensor, prefix, idx, *(deps or []))
 
 
 def mark_output_with_bwd(
