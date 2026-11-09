@@ -546,5 +546,172 @@ class RecirConcatJaggedEdgeCaseTest(unittest.TestCase):
             self._assert_matches_oracle([3], [2], d)
 
 
+class RecirJaggedGradientTest(unittest.TestCase):
+    """Independent padding and gradient oracles for the reused movement ops."""
+
+    def test_concat_padding_and_gradients(self) -> None:
+        import jax
+        import jax.numpy as jnp
+        import numpy as np
+        from recir.torchax.ops.jagged_ops import (
+            _jax_concat_2d_jagged,
+            _jax_split_2d_jagged,
+        )
+
+        left_offsets = jnp.array([0, 0, 0, 4, 4, 6, 6], dtype=jnp.int32)
+        right_offsets = jnp.array([0, 1, 1, 1, 4, 4, 4], dtype=jnp.int32)
+        left = jnp.arange(9, dtype=jnp.float32)
+        right = jnp.arange(6, dtype=jnp.float32) + 10
+        expected = [10, 0, 1, 2, 3, 11, 12, 13, 4, 5, 0, 0, 0, 0]
+        with jax.default_device(jax.devices("cpu")[0]):
+            result = jax.jit(
+                lambda a, b: _jax_concat_2d_jagged(
+                    a, left_offsets, b, right_offsets, 14
+                )
+            )(left, right)
+            np.testing.assert_array_equal(result, expected)
+            gradients = jax.jit(
+                jax.grad(
+                    lambda a, b: jnp.sum(
+                        _jax_concat_2d_jagged(a, left_offsets, b, right_offsets, 14)
+                    ),
+                    argnums=(0, 1),
+                )
+            )(left, right)
+        np.testing.assert_array_equal(gradients[0], [1] * 6 + [0] * 3)
+        np.testing.assert_array_equal(gradients[1], [1] * 4 + [0] * 2)
+
+    def test_split_matches_oracle_values_and_gradients(self) -> None:
+        import jax
+        import jax.numpy as jnp
+        import numpy as np
+        from recir.torchax.ops.jagged_ops import (
+            _jax_concat_2d_jagged,
+            _jax_split_2d_jagged,
+        )
+
+        left_offsets = jnp.array([0, 0, 2, 2, 5], dtype=jnp.int32)
+        right_offsets = jnp.array([0, 1, 1, 3, 4], dtype=jnp.int32)
+        for dtype in (jnp.float32, jnp.bfloat16):
+            values = jnp.arange(13 * 4, dtype=jnp.float32).reshape(13, 4).astype(dtype)
+
+            def oracle(x: Any, dtype: Any = dtype) -> Any:
+                left = jnp.concatenate(
+                    (x[jnp.array([1, 2, 5, 6, 7])], jnp.zeros((3, 4), dtype))
+                )
+                right = jnp.concatenate(
+                    (x[jnp.array([0, 3, 4, 8])], jnp.zeros((3, 4), dtype))
+                )
+                return left, right
+
+            def actual(x: Any) -> Any:
+                return _jax_split_2d_jagged(x, left_offsets, right_offsets, 8, 7)
+
+            def loss(fn: Any, x: Any) -> Any:
+                a, b = fn(x)
+                return jnp.sum(jnp.sin(a).astype(jnp.float32)) + jnp.sum(
+                    jnp.cos(b).astype(jnp.float32)
+                )
+
+            expected = jax.jit(oracle)(values)
+            outputs = jax.jit(actual)(values)
+            for a, b in zip(outputs, expected):
+                np.testing.assert_array_equal(a, b)
+            ga = jax.jit(jax.grad(lambda x: loss(actual, x)))(values)
+            gb = jax.jit(jax.grad(lambda x: loss(oracle, x)))(values)
+            np.testing.assert_array_equal(ga, gb)
+
+
+def _compact_oracle(dense, lengths, total_l):
+    """Concatenate each sequence's valid rows."""
+    import numpy as np
+
+    out = np.zeros((total_l,) + dense.shape[2:], dtype=dense.dtype)
+    pos = 0
+    for i, length in enumerate(lengths):
+        out[pos : pos + length] = dense[i, :length]
+        pos += int(length)
+    return out
+
+
+class RecirDenseToJaggedOracleTest(unittest.TestCase):
+    """dense_to_jagged must match a plain row-by-row compaction."""
+
+    def _check(self, b, n, d, dtype, label, make, rng, ndims=(2, 3), totals=None):
+        import jax.numpy as jnp
+        import numpy as np
+        from recir.torchax.ops.jagged_ops import _jax_dense_to_jagged_forward_impl
+
+        lengths = np.asarray(make(b, n), dtype=np.int32)
+        offs = jnp.asarray(np.concatenate([[0], np.cumsum(lengths)]).astype(np.int32))
+        packed = int(lengths.sum())
+        checked = 0
+        for ndim in ndims:
+            shape = (b, n) if ndim == 2 else (b, n, d)
+            host = np.asarray(
+                jnp.asarray(rng.standard_normal(shape).astype(np.float32)).astype(dtype)
+            )
+            dense = jnp.asarray(host)
+            for total_l in totals or (b * n, packed, packed + 3):
+                got = np.asarray(
+                    _jax_dense_to_jagged_forward_impl(dense, [offs], total_l)
+                )
+                want = _compact_oracle(host, lengths, total_l)
+                msg = f"{label} b={b} n={n} shape={shape} L={total_l}"
+                self.assertEqual(got.shape, want.shape, msg)
+                np.testing.assert_array_equal(got, want, err_msg=msg)
+                checked += 1
+        return checked
+
+    def test_matches_oracle(self) -> None:
+        import numpy as np
+
+        rng = np.random.default_rng(0)
+        patterns = {
+            "random": lambda b, n: rng.integers(0, n + 1, size=b),
+            "all_full": lambda b, n: np.full(b, n),
+            "all_zero": lambda b, n: np.zeros(b, dtype=int),
+            "some_zero": lambda b, n: np.where(
+                rng.random(b) < 0.4, 0, rng.integers(0, n + 1, size=b)
+            ),
+            "only_first": lambda b, n: np.array([n] + [0] * (b - 1)),
+            "only_last": lambda b, n: np.array([0] * (b - 1) + [n]),
+        }
+        checked = 0
+        for b, n, d in [(5, 7, 4), (1, 3, 2), (8, 1, 16), (3, 9, 1), (65, 13, 8)]:
+            for label, make in patterns.items():
+                checked += self._check(
+                    b, n, d, __import__("jax").numpy.float32, label, make, rng
+                )
+        self.assertEqual(checked, 180)
+
+    def test_matches_oracle_at_prod_shapes(self) -> None:
+        import jax.numpy as jnp
+        import numpy as np
+
+        rng = np.random.default_rng(0)
+        # Shapes and dtypes taken from the 64-chip trace. The length patterns
+        # and total_L variants live in test_matches_oracle, which covers them
+        # far more cheaply; what these add is dtype and width coverage.
+        cases = [
+            (65, 1032, 512, jnp.float32),
+            (65, 1032, 896, jnp.float32),
+            (65, 1032, 216, jnp.float32),
+            (65, 1032, 512, jnp.bfloat16),
+            (65, 1042, 512, jnp.bfloat16),
+        ]
+
+        def mixed(b, n):
+            # Empty, full and partial sequences in one deterministic pass.
+            return np.array([(0, n, n // 2)[i % 3] for i in range(b)])
+
+        checked = 0
+        for b, n, d, dtype in cases:
+            checked += self._check(
+                b, n, d, dtype, "mixed", mixed, rng, ndims=(3,), totals=(b * n,)
+            )
+        self.assertEqual(checked, 5)
+
+
 if __name__ == "__main__":
     unittest.main()

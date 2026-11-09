@@ -74,26 +74,24 @@ def _jax_dense_to_jagged_forward_impl(
     offsets: Any,
     total_L: Any = None,
 ) -> Any:
-    """Pure-JAX dense->jagged scatter-free gather (per-device kernel)."""
+    """Compact a padded [B, N, ...] tensor into a packed [total_L, ...] one."""
     seq_offsets = offsets[0]
     b: int = dense.shape[0]
     n: int = dense.shape[1]
     if total_L is None:
         total_L = b * n
-    lengths = seq_offsets[1:] - seq_offsets[:-1]
-    col = jnp.arange(n)
-    mask = col[None, :] < lengths[:, None]
-    dest = (seq_offsets[:-1, None] + col[None, :]).clip(0, max(total_L - 1, 0))
-    if dense.ndim == 2:
-        src = jnp.where(mask, dense, jnp.zeros_like(dense))
-        result = jnp.zeros(total_L, dtype=dense.dtype)
-        # pyrefly: ignore [missing-attribute]
-        return result.at[dest.reshape(-1)].add(src.reshape(-1))
-    d: int = dense.shape[2]
-    src = jnp.where(mask[:, :, None], dense, jnp.zeros_like(dense))
-    result = jnp.zeros((total_L, d), dtype=dense.dtype)
-    # pyrefly: ignore [missing-attribute]
-    return result.at[dest.reshape(-1), :].add(src.reshape(-1, d))
+    feature = dense.shape[2:]
+    zeros_tail = (jnp.zeros((), seq_offsets.dtype),) * len(feature)
+    buf = jnp.zeros((total_L + n,) + feature, dtype=dense.dtype)
+    for i in range(b):
+        buf = jax.lax.dynamic_update_slice(
+            buf, dense[i], (seq_offsets[i],) + zeros_tail
+        )
+    return jax.lax.dynamic_update_slice(
+        buf,
+        jnp.zeros((n,) + feature, dtype=dense.dtype),
+        (seq_offsets[b],) + zeros_tail,
+    )[:total_L]
 
 
 @op(torch.ops.recir.dense_to_jagged.default)  # pyre-ignore[56]
