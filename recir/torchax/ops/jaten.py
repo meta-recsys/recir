@@ -1278,6 +1278,12 @@ def _aten_native_layer_norm(
         normalized_shape = [normalized_shape]
     axis = [len(input.shape) - i - 1 for i in range(len(normalized_shape))]
 
+    barrier = os.environ.get("RECIR_LAYER_NORM_REDUCE_BARRIER", "0")
+    if barrier not in ("0", "1"):
+        raise ValueError(f"invalid RECIR_LAYER_NORM_REDUCE_BARRIER: {barrier!r}")
+    if barrier == "1":
+        input = jax.lax.optimization_barrier(input)
+
     # Calculate mean and standard deviation
     mean = jnp.mean(input, axis=axis, keepdims=True)
     var = jnp.var(input, axis=axis, keepdims=True)
