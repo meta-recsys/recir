@@ -74,24 +74,22 @@ logger: logging.Logger = logging.getLogger(__name__)
 # Block sizes for the (tile_q, tile_kv) tile loops. pallas_worklist_grouping=2
 # flattens the (sequence, q-tile) pairs into a 1-D worklist grid, so each program
 # handles one fixed [block, H, D] window -- VMEM is bounded by block, not the
-# per-sequence L. pallas_loop_type="emit_pipeline" lowers the ordered kv-tile
-# reduction via pltpu.emit_pipeline, streaming the kv tiles through double-buffered
-# VMEM (prefetch overlapped with compute) instead of staging the whole per-sequence
-# window resident (the "unroll" resident-cache path). The kernel's packed
-# offsets[seq]/offsets[seq+1] bounds satisfy the worklist pattern (owner grid +
-# compact q-tile + ordered kv-tile).
+# per-sequence L. pallas_loop_type="unroll" lowers the ordered kv-tile reduction
+# as a lax.fori_loop with the per-sequence window resident, rather than streaming
+# the kv tiles through double-buffered VMEM (the "emit_pipeline" path). The
+# kernel's packed offsets[seq]/offsets[seq+1] bounds satisfy the worklist pattern
+# (owner grid + compact q-tile + ordered kv-tile).
 #
 # The two settings are PINNED TOGETHER and validated as a pair against the 64MB
-# physical device VMEM cap: streaming bounds the footprint by the double-buffered
-# kv-tile pair rather than the per-sequence window, which is what lets the block be
-# 512. Do not change one without re-validating -- the cap is physical (no
-# --xla_tpu_scoped_vmem_limit_kib raise absorbs it) and an over-budget config fails
-# late and opaquely, surfacing from the AOT warm as a nested-compile
-# "SymIntArrayRef ..." rather than as an OOM.
+# physical device VMEM cap: the resident window does not fit a 512 block, so a
+# 512 block requires emit_pipeline. Do not change one without re-validating --
+# the cap is physical (no --xla_tpu_scoped_vmem_limit_kib raise absorbs it) and
+# an over-budget config fails late and opaquely, surfacing from the AOT warm as
+# a nested-compile "SymIntArrayRef ..." rather than as an OOM.
 PINNED_CONFIG: helion.Config = helion.Config(
-    block_sizes=[512, 512],
+    block_sizes=[256, 256],
     pallas_worklist_grouping=2,
-    pallas_loop_type="emit_pipeline",
+    pallas_loop_type="unroll",
 )
 
 # RankFM's L1 stack uses this fixed semi-local attention shape.  Keep the
@@ -554,13 +552,14 @@ def _bwd_dkv_impl(
                 m_idx = tile_q.index.unsqueeze(0)
                 keep_t = ((m_idx >= n_idx) & (n_idx < cap)) | (m_idx == n_idx)
 
-                # dV += P^T @ (attn_scale dO), P^T = silu(S^T)
-                p_t = torch.where(keep_t[None, :, :], F.silu(s_t), 0.0)
+                # dV += P^T @ (attn_scale dO), P^T = silu(S^T) = S^T sigmoid(S^T),
+                # sharing the sigmoid with silu' below.
+                sig = torch.sigmoid(s_t)
+                p_t = torch.where(keep_t[None, :, :], s_t * sig, 0.0)
                 acc_dv = acc_dv + torch.bmm(p_t.to(dout.dtype), do_blk)
 
                 # dK += dS^T @ (alpha Q), dS^T = (V @ dO_s^T) * silu'(S^T)
                 dp_t = torch.bmm(v_blk, do_blk.transpose(-2, -1))
-                sig = torch.sigmoid(s_t)
                 silu_grad = sig * (1.0 + s_t * (1.0 - sig))
                 ds_t = torch.where(keep_t[None, :, :], dp_t * silu_grad, 0.0)
                 acc_dk = acc_dk + torch.bmm(ds_t.to(q.dtype), q_blk)
