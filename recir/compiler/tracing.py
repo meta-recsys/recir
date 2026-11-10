@@ -21,6 +21,7 @@ from typing import Any, cast
 import torch
 import torch.distributed._functional_collectives
 import torch.fx as fx
+import torch.fx.traceback as fx_traceback
 import torch.nn as nn
 import torch.utils._pytree as pytree
 from functorch import make_fx
@@ -930,6 +931,28 @@ def _trace_graphs(specs: Sequence[_GraphSpec]) -> list[_TraceResult]:
     return traced
 
 
+def _functionalize(gm: fx.GraphModule, *inputs: Any) -> fx.GraphModule:
+    """Retrace ``gm`` with its mutations removed. Lowering treats every view as a
+    copy, so an in-place op on a view (``y[:2] = 0``, ``x.fill_diagonal_(v)``,
+    ``t.detach().div_(n)``) would update only that copy and the base tensor would
+    silently keep its old values; functionalized, the write becomes a scatter
+    into the base. Mutated graph inputs end in a ``copy_`` onto the placeholder.
+
+    Model code cannot be traced under functionalization directly (ops such as
+    ``fill_diagonal_`` reject it), so this retraces the aten graph, through an
+    Interpreter so that node meta (``nn_module_stack``, ``custom``, stack traces)
+    carries over to the new nodes.
+    """
+    detached = pytree.tree_map_only(torch.Tensor, torch.Tensor.detach, inputs)
+    with fx_traceback.preserve_node_meta():
+        return make_fx(
+            torch.func.functionalize(fx.Interpreter(gm).run, remove="mutations"),
+            tracing_mode="fake",
+            decomposition_table=SPMD_DECOMP_TABLE,  # type: ignore[arg-type]
+            _allow_non_fake_inputs=False,
+        )(*detached)
+
+
 def _maybe_dump_fx_graph(gm: torch.fx.GraphModule) -> None:
     """When RECIR_DUMP_GRAPHS is set, log the make_fx-output graph: readable code
     plus a per-node op/target/out-shape/stack-trace listing. The stack traces are
@@ -1322,16 +1345,13 @@ def _local_compile(  # noqa: C901 -- tracing transaction is intentionally cohesi
         else nullcontext()
     )
     with fake_mode, _enable_compile(), _detect_anomaly_ctx:
-        # FIXME(@mrshenli): functionalization does not work for our use
-        # case yet. Use explicit decompositions for foreach ops.
-        # Remove this when the following issue is addressed.
-        # Issue: https://github.com/pytorch/pytorch/issues/97852
         gm = make_fx(
             partial(stateless_func, func),
             tracing_mode="fake",
             decomposition_table=SPMD_DECOMP_TABLE,  # type: ignore[arg-type]
             _allow_non_fake_inputs=False,
         )(params, buffers, named_states, args, kwargs)
+        gm = _functionalize(gm, params, buffers, named_states, args, kwargs)
 
     _maybe_dump_fx_graph(gm)
 
