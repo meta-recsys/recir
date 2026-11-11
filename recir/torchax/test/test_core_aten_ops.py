@@ -4538,6 +4538,20 @@ class TestCoreAtenOps(unittest.TestCase):
         kwargs = {}
         run_export_and_compare(self, torch.ops.aten.view, args, kwargs)
 
+    def test_aten_view_dtype(self) -> None:
+        # Same, smaller and larger item size: the last dimension is kept, multiplied
+        # or divided.
+        cases = (
+            (torch.randn((3, 4)), torch.int32),
+            (torch.randint(-(2**30), 2**30, (3, 4), dtype=torch.int32), torch.int16),
+            (torch.randint(-(2**14), 2**14, (3, 4), dtype=torch.int16), torch.int32),
+        )
+        for x, dtype in cases:
+            with self.subTest(src=x.dtype, dst=dtype):
+                run_export_and_compare(
+                    self, torch.ops.aten.view.dtype, (x, dtype), {}, check_dtype=True
+                )
+
     def test_aten_view_1(self) -> None:
         args = (
             torch.randn((10, 10)).to(torch.float16),

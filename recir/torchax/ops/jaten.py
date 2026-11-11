@@ -86,6 +86,19 @@ def _aten_unsafe_view(x: Any, shape: Any) -> Any:
     return jnp.reshape(x, shape)
 
 
+@op(torch.ops.aten.view.dtype)  # pyre-ignore[56]
+def _aten_view_dtype(x: Any, dtype: Any) -> Any:
+    # A bit reinterpretation: across item sizes torch scales the last dimension.
+    new = mappings.t2j_dtype(dtype)
+    old_size, new_size = x.dtype.itemsize, jnp.dtype(new).itemsize
+    if old_size > new_size:
+        out = jax.lax.bitcast_convert_type(x, new)
+        return out.reshape(*x.shape[:-1], -1)
+    if old_size < new_size:
+        x = x.reshape(*x.shape[:-1], -1, new_size // old_size)
+    return jax.lax.bitcast_convert_type(x, new)
+
+
 def _run_binary_pointwise_operator(op: Any, x: Any, y: Any) -> Any:
     if isinstance(x, float):
         dtype = _torch_binary_scalar_type(x, y)
