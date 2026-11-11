@@ -42,6 +42,15 @@ def _jagged_to_padded_dense_impl(
             return values.reshape(B, max_len)
         return values.reshape(B, max_len, *values.shape[1:])
 
+    # No values (every segment empty): all padding; the gather below would index row 0
+    if values.shape[0] == 0:
+        return torch.full(
+            (B, max_len, *values.shape[1:]),
+            padding_value,
+            dtype=values.dtype,
+            device=values.device,
+        )
+
     starts = seq_offsets[:-1]  # (B,)
     lengths = seq_offsets[1:] - seq_offsets[:-1]  # (B,)
     col_range = torch.arange(max_len, device=values.device)  # (N,)

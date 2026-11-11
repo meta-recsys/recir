@@ -474,6 +474,52 @@ class RecirJaggedOpsMultiDeviceJitTest(unittest.TestCase):
             np.testing.assert_allclose(np.asarray(right), vr)
 
 
+class RecirJaggedToPaddedDenseEmptyTest(unittest.TestCase):
+    """jagged_to_padded_dense on values with no rows (every segment of length 0, e.g. a
+    feature absent from the whole batch): the result is all padding, as dense_to_jagged
+    returns no rows for total_L == 0. The gather clamps its indices to the last row,
+    which does not exist here."""
+
+    def test_torch_op(self) -> None:
+        offs = [torch.zeros(4, dtype=torch.int64)]
+        for shape, want in (((0,), (3, 2)), ((0, 5), (3, 2, 5))):
+            values = torch.zeros(shape, dtype=torch.float32)
+            out = torch.ops.recir.jagged_to_padded_dense(values, offs, [2], -1.0)
+            self.assertEqual(tuple(out.shape), want)
+            self.assertTrue(bool((out == -1.0).all()))
+
+    def test_jax_kernel_jit(self) -> None:
+        import jax
+        import jax.numpy as jnp
+        from recir.torchax.ops.jagged_ops import _jax_jagged_to_padded_dense_impl
+
+        offs = jnp.zeros(4, dtype=jnp.int32)
+        for shape, want in (((0,), (3, 2)), ((0, 5), (3, 2, 5))):
+            values = jnp.zeros(shape, dtype=jnp.float32)
+            out = jax.jit(
+                lambda v, o: _jax_jagged_to_padded_dense_impl(v, [o], [2], -1.0)
+            )(values, offs)
+            self.assertEqual(tuple(out.shape), want)
+            self.assertTrue(bool((out == -1.0).all()))
+
+    def test_multidevice_jit(self) -> None:
+        import jax
+        import jax.numpy as jnp
+        from recir.torchax.ops.jagged_ops import _recir_jagged_to_padded_dense
+
+        w = len(jax.devices())
+        if w < 2:
+            self.skipTest("need >= 2 jax devices")
+        b, d = 2 * w, 4
+        values = jnp.zeros((0, d), dtype=jnp.float32)
+        offs = jnp.zeros(b + 1, dtype=jnp.int32)
+        out = jax.jit(lambda v, o: _recir_jagged_to_padded_dense(v, [o], [3], 0.0))(
+            values, offs
+        )
+        self.assertEqual(tuple(out.shape), (b, 3, d))
+        self.assertTrue(bool((out == 0.0).all()))
+
+
 class RecirConcatJaggedEdgeCaseTest(unittest.TestCase):
     """Empty and zero-length operands for ``_jax_concat_2d_jagged`` -- shapes a
     shard_map shard can legitimately receive. An operand with no rows contributes
