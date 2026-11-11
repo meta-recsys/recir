@@ -1957,6 +1957,30 @@ class TestCoreAtenOps(unittest.TestCase):
         kwargs = {}
         run_export_and_compare(self, torch.ops.aten.index_put, args, kwargs)
 
+    def test_aten_index_put_bool_accumulate(self) -> None:
+        # Repeated indices: accumulating bools is a logical or.
+        args = (
+            torch.zeros((6, 4), dtype=torch.bool),
+            [torch.tensor([0, 2, 0, 5])],
+            torch.tensor(
+                [[1, 0, 0, 1], [0, 1, 0, 0], [1, 1, 0, 0], [0, 0, 0, 0]],
+                dtype=torch.bool,
+            ),
+            True,
+        )
+        kwargs = {}
+        run_export_and_compare(self, torch.ops.aten.index_put, args, kwargs)
+
+    def test_aten_index_add_bool(self) -> None:
+        args = (
+            torch.zeros((4, 4), dtype=torch.bool),
+            0,
+            torch.tensor([0, 1, 0, 2]),
+            torch.eye(4, dtype=torch.bool) | torch.eye(4, dtype=torch.bool).roll(1, 1),
+        )
+        kwargs = {}
+        run_export_and_compare(self, torch.ops.aten.index_add, args, kwargs)
+
     def test_aten_index_select_0(self) -> None:
         args = (
             torch.randn((2, 10)).to(torch.float32),
