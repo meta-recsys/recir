@@ -410,8 +410,10 @@ class SparseArchDispatcher:
         embedding_collection_fqn: str,
         override_id: int = 1,
         num_ranks: int = 1,
+        trace_device: torch.device | None = None,
     ) -> None:
         self._cached_output = cached_output
+        self._trace_device = trace_device
         self._input_kjt_keys = input_kjt_keys
         self._embedding_collection_fqn = embedding_collection_fqn
         self._override_id = override_id
@@ -424,6 +426,7 @@ class SparseArchDispatcher:
             self._cached_output,
             input_kjt_keys=self._input_kjt_keys,
             override_id=self._override_id,
+            trace_device=self._trace_device,
         )
         self._orig_collection = swap_submodule(
             model, self._embedding_collection_fqn, self._dummy
@@ -446,8 +449,9 @@ class SparseArchDispatcher:
             # input_tensors == (values, lengths) thanks to mark_input markers
             # in DummySparseArch.forward (kept alive through trace by the
             # zero-valued anchor that depends on them).
-            values = input_tensors[0]
-            lengths = input_tensors[1]
+            # The lookup runs on the host even when the graph runs on a device.
+            values = input_tensors[0].cpu()
+            lengths = input_tensors[1].cpu()
             total = int(lengths.sum().item())
             if values.shape[0] < total:
                 pad_size = total - values.shape[0]
