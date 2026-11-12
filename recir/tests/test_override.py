@@ -71,6 +71,81 @@ class TestOverride(unittest.TestCase):
         self.assertFalse(getitem.meta["is_batch_input"])
         self.assertNotIn("batch_dim", getitem.meta)
 
+    @staticmethod
+    def _two_output_graph() -> torch.fx.GraphModule:
+        graph = torch.fx.Graph()
+        x = graph.placeholder("x")
+        x.meta["val"] = torch.ones(4, 2)
+        grad = graph.placeholder("grad")
+        grad.meta["val"] = torch.ones(4, 2)
+        x_in = graph.call_function(
+            torch.ops.recir.mark_boundary.default, args=(x, "dev::input::0")
+        )
+        x_in.meta["val"] = torch.ones(4, 2)
+        outputs = []
+        for i in range(2):
+            out = graph.call_function(
+                torch.ops.recir.mark_boundary.default, args=(x_in, f"dev::output::{i}")
+            )
+            out.meta["val"] = torch.ones(4, 2)
+            outputs.append(out)
+        # Only output 1 feeds the loss, so only it has a backward marker.
+        bwd = graph.call_function(
+            torch.ops.recir.mark_boundary.default, args=(grad, "dev::bwd::1")
+        )
+        graph.output((*outputs, bwd))
+        return torch.fx.GraphModule({}, graph)
+
+    def test_bwd_fn_gets_gradients_by_output_index(self):
+        received = []
+        for device_resident in (False, True):
+            with self.subTest(device_resident=device_resident):
+                gm = self._two_output_graph()
+                received.clear()
+                install_graph_break_dispatch(
+                    gm,
+                    "dev",
+                    lambda value: (value * 2, value * 3),
+                    num_state_tensors=0,
+                    bwd_fn=lambda g, idx: received.append((g, idx)),
+                    device_resident=device_resident,
+                )
+                g = torch.full((4, 2), 5.0)
+                out0, out1, _ = gm(torch.ones(4, 2), g)
+
+                self.assertTrue(torch.equal(out0, torch.full((4, 2), 2.0)))
+                self.assertTrue(torch.equal(out1, torch.full((4, 2), 3.0)))
+                self.assertEqual(1, len(received))
+                self.assertIs(g, received[0][0])
+                self.assertEqual(1, received[0][1])
+                resident = [
+                    n.meta.get("device_resident")
+                    for n in gm.graph.nodes
+                    if n.meta.get("xla_graph_break")
+                ]
+                self.assertEqual([device_resident] * 2, resident)
+
+    def test_bwd_fn_rejects_torchrec_gradient_division(self):
+        with self.assertRaises(ValueError):
+            install_graph_break_dispatch(
+                self._two_output_graph(),
+                "dev",
+                lambda value: (value, value),
+                num_state_tensors=0,
+                bwd_fn=lambda g, idx: None,
+                disable_torchrec_gradient_division=True,
+            )
+
+    def test_device_resident_needs_bwd_fn(self):
+        with self.assertRaises(ValueError):
+            install_graph_break_dispatch(
+                self._two_output_graph(),
+                "dev",
+                lambda value: (value, value),
+                num_state_tensors=0,
+                device_resident=True,
+            )
+
     def test_install_without_backward_removes_backward_markers(self):
         graph = torch.fx.Graph()
         x = graph.placeholder("x")

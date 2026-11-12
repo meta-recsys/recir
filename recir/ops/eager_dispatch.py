@@ -253,7 +253,7 @@ def _replace_input_markers(gm: fx.GraphModule, marker_prefix: str) -> List[fx.No
     return upstream
 
 
-def install_graph_break_dispatch(
+def install_graph_break_dispatch(  # noqa: C901
     gm: fx.GraphModule,
     marker_prefix: str,
     fwd_fn: Callable[..., object],
@@ -262,6 +262,8 @@ def install_graph_break_dispatch(
     num_ranks: int = 1,
     disable_torchrec_gradient_division: bool = False,
     register_backward: bool = True,
+    bwd_fn: Optional[Callable[[Any, int], None]] = None,
+    device_resident: bool = False,
 ) -> Optional[int]:
     """Replace markers planted under ``marker_prefix`` with a graph-break dispatch.
 
@@ -281,8 +283,26 @@ def install_graph_break_dispatch(
     ``disable_torchrec_gradient_division`` is only for torchrec sparse seams,
     where the combined backward must produce a cross-host gradient sum.
 
+    ``bwd_fn(grad, grad_idx)`` replaces the backward derived from ``fwd_fn``: it
+    receives each output's gradient by output index and returns nothing, so no
+    gradient flows to the dispatch inputs.
+
+    With ``device_resident`` (needs ``bwd_fn``), ``fwd_fn``'s outputs and the
+    gradients ``bwd_fn`` receives stay jax arrays on device: lowering keeps
+    outputs consumed only by these nodes on device, and no torch autograd
+    bridges the break.
+
     Returns the allocated dispatch id (``None`` if no markers matched).
     """
+    if device_resident and bwd_fn is None:
+        raise ValueError(
+            "device_resident needs bwd_fn: the derived backward runs torch autograd"
+        )
+    if bwd_fn is not None and disable_torchrec_gradient_division:
+        raise ValueError(
+            "disable_torchrec_gradient_division applies to the derived backward; "
+            "a bwd_fn handles its own gradients"
+        )
     fwd_markers, bwd_markers = _collect_marker_groups(gm, marker_prefix)
     if not fwd_markers and not bwd_markers:
         return None
@@ -309,7 +329,12 @@ def install_graph_break_dispatch(
         gm.recompile()
         return None
 
-    fwd, bwd = _wrap_with_save_for_backward(fwd_fn, disable_torchrec_gradient_division)
+    if bwd_fn is None:
+        fwd, bwd = _wrap_with_save_for_backward(
+            fwd_fn, disable_torchrec_gradient_division
+        )
+    else:
+        fwd, bwd = fwd_fn, bwd_fn
     dispatch_id = _allocate_dispatch_id()
     with _registry_lock:
         _FWD_REGISTRY[dispatch_id] = fwd
@@ -350,6 +375,7 @@ def install_graph_break_dispatch(
                 args=(input_nodes, dispatch_id),
             )
             fwd_call.meta["xla_graph_break"] = True
+            fwd_call.meta["device_resident"] = device_resident
 
         for output_idx, marker in output_markers:
             with gm.graph.inserting_before(marker):
@@ -377,6 +403,9 @@ def install_graph_break_dispatch(
             key=lambda n: int(n.args[1].split("::bwd::")[1]),
         )
         for grad_idx, marker in enumerate(sorted_bwd):
+            if bwd_fn is not None:
+                # An output the loss does not use has no backward marker.
+                grad_idx = int(marker.args[1].split("::bwd::")[1])
             grad_node = marker.args[0]
             with gm.graph.inserting_before(marker):
                 bwd_call = gm.graph.call_function(
@@ -385,6 +414,7 @@ def install_graph_break_dispatch(
                 )
                 bwd_call.meta = dict(marker.meta)
                 bwd_call.meta["xla_graph_break"] = True
+                bwd_call.meta["device_resident"] = device_resident
             marker.replace_all_uses_with(bwd_call)
             gm.graph.erase_node(marker)
 
@@ -421,6 +451,38 @@ class _OutputBackwardMarker(torch.autograd.Function):
             None,
             None,
         ) + (None,) * ctx._num_deps
+
+
+class _DeviceOutputBackwardMarker(torch.autograd.Function):
+    """``_OutputBackwardMarker`` whose backward ends at the marker.
+
+    For device-resident dispatches: the gradient goes only to the dispatch's
+    ``bwd_fn`` as a jax array, so nothing downstream of the backward marker may
+    consume it (a small eager segment there would get a jax array, not a tensor).
+    """
+
+    @staticmethod
+    def forward(ctx, x, prefix: str, idx: int, *deps):
+        ctx.prefix = prefix
+        ctx.idx = idx
+        ctx._num_deps = len(deps)
+        return torch.ops.recir.mark_boundary(x, f"{prefix}::output::{idx}")
+
+    @staticmethod
+    def backward(ctx, grad):
+        torch.ops.recir.mark_boundary(grad, f"{ctx.prefix}::bwd::{ctx.idx}")
+        return (None, None, None) + (None,) * ctx._num_deps
+
+
+def mark_output_with_device_bwd(
+    tensor: torch.Tensor,
+    prefix: str,
+    idx: int,
+    deps: Optional[List[torch.Tensor]] = None,
+) -> torch.Tensor:
+    """``mark_output_with_bwd`` for a device-resident dispatch (``bwd_fn``): the
+    traced gradient stops at the backward marker."""
+    return _DeviceOutputBackwardMarker.apply(tensor, prefix, idx, *(deps or []))
 
 
 def mark_output_with_bwd(
