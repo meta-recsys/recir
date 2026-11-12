@@ -29,7 +29,10 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from typing import Any, Callable, Optional, Sequence, TYPE_CHECKING
 
+from recir.composite import CompositeModule
 from recir.lowering.device_state import DeviceStateManager
+from recir.lowering.lowering_inputs import Lower, lower_inputs
+from recir.observability import snapshot
 from torch import fx, nn
 
 if TYPE_CHECKING:
@@ -48,6 +51,9 @@ class Backend(ABC):
     :meth:`default_optimize_passes`, decide whether the graph needs
     ``IterGraphModule`` wrapping via :attr:`uses_iter_graph`, and implement
     :meth:`dispatch` to lower the graph to executable form.
+
+    A backend that carves subgraphs dispatches through :meth:`_lower_inputs`,
+    so snapshots observe every backend's dispatch the same way.
 
     Args:
         optimize_passes: optional override for stage 6.  When ``None`` (the
@@ -82,9 +88,29 @@ class Backend(ABC):
         """Stage 7: whether to wrap the graph in an ``IterGraphModule``."""
         return False
 
+    @property
+    def lowers_composites(self) -> bool:
+        """
+        Whether :meth:`dispatch` lowers each graph inside a composite module
+        (an ``IterGraphModule``'s phases, a pipeline's stages). A backend that
+        does not is handed a composite module whole.
+        """
+        return False
+
     @abstractmethod
     def dispatch(self, gm: fx.GraphModule) -> nn.Module:
         """Stage 8: lower ``gm`` to an executable ``nn.Module``."""
+
+    def _lower_inputs(
+        self, gm: fx.GraphModule | CompositeModule, lower: Lower
+    ) -> nn.Module:
+        """Lower each input of ``gm`` with ``lower``, reporting to a snapshot observer while a step compile dispatches."""
+        return lower_inputs(
+            gm,
+            lower,
+            snapshot.lowering_observer(),
+            walk_composites=self.lowers_composites,
+        )
 
     def device_state_manager(self) -> DeviceStateManager:
         """Return the device-state manager that mediates runtime I/O."""

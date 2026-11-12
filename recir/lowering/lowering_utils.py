@@ -4,9 +4,12 @@
 # This source code is licensed under the BSD-3-Clause license found in the
 # LICENSE file in the root directory of this source tree.
 
+import enum
 import logging
 import operator
-from typing import Any, Callable, List, Set, Tuple
+from contextlib import AbstractContextManager, nullcontext
+from dataclasses import dataclass
+from typing import Any, Callable, ClassVar, List, Optional, Protocol, Set, Tuple
 
 import torch
 
@@ -25,6 +28,60 @@ def has_meta_kernel(op: torch._ops.OpOverload) -> bool:
     direct Meta registration and rejects them.
     """
     return torch._C._dispatch_has_computed_kernel_for_dispatch_key(op.name(), "Meta")
+
+
+@dataclass(frozen=True)
+class CarvedRegion:
+    """
+    One subgraph ``segment_and_lower`` carved out and spliced back into its parent.
+
+    ``name`` is the submodule name its call targets, ``gm`` the carved graph,
+    and ``module`` the wrapper ``module_factory`` built around it.
+    """
+
+    name: str
+    gm: torch.fx.GraphModule
+    module: torch.nn.Module
+
+
+class LoweringHooks(Protocol):
+    """
+    The hooks ``segment_and_lower`` calls as it makes its lowering decisions.
+
+    Calls are synchronous: ``on_carved`` comes right after a subgraph is spliced
+    into its parent. Lowering does not guard these calls, so an implementation
+    must observe only: never raise, never edit the graph. Subclass
+    ``LoweringObserver`` in ``lowering_inputs`` for guarded hooks per dispatch
+    input.
+    """
+
+    def on_carved(self, region: CarvedRegion) -> None:
+        """``region`` was just carved and spliced into its parent."""
+        ...
+
+
+class BuildKind(enum.Enum):
+    """The backend builds an observer handles beyond giving them a compile id."""
+
+    INDUCTOR = "inductor"
+
+
+class LazilyBuiltModule(torch.nn.Module):
+    """
+    Base class for all carved modules that compile on their first forward.
+
+    This class is responsible for what an observer uses to see that build:
+    ``compile_scope()``, which the module runs its backend compile inside,
+    from its ``forward``, and which does nothing unless an observer replaced
+    it; and ``build_kind``, which names the backend build for an observer
+    that handles it specially, or is None. This can be extended to a new
+    backend by subclassing and entering ``compile_scope()`` around exactly
+    the work that compiles.
+    """
+
+    build_kind: ClassVar[BuildKind | None] = None
+    # A class default, so a module pickled before the attribute existed has it.
+    compile_scope: Callable[[], AbstractContextManager[object]] = nullcontext
 
 
 def strip_profiler_nodes(gm: torch.fx.GraphModule) -> torch.fx.GraphModule:
@@ -112,6 +169,8 @@ def lower_subgraph_nodes(
     module_factory: Callable[[torch.fx.GraphModule], torch.nn.Module],
     dumper: Callable[[str], str],
     all_lowered_nodes: Set[torch.fx.Node],
+    *,
+    hooks: Optional[LoweringHooks] = None,
 ) -> None:
     """Extract subgraph_nodes from gm, wrap via module_factory, and splice back.
 
@@ -278,6 +337,9 @@ def lower_subgraph_nodes(
         if len(node.users) == 0:
             gm.graph.erase_node(node, **erase_kwargs)
 
+    if hooks is not None:
+        hooks.on_carved(CarvedRegion(subgraph_name, subgraph_module, module))
+
 
 def segment_and_lower(
     gm: torch.fx.GraphModule,
@@ -287,6 +349,7 @@ def segment_and_lower(
     node_predicate: Callable[[torch.fx.Node], bool] = lambda x: True,
     subgraph_predicate: Callable[[List[torch.fx.Node]], bool] = lambda x: True,
     dumper: Callable[[str], str] = lambda x: "subgraph",
+    hooks: Optional[LoweringHooks] = None,
 ) -> torch.fx.GraphModule:
     """Segment a graph into compatible subgraphs and lower each one.
 
@@ -308,6 +371,7 @@ def segment_and_lower(
         node_predicate: Additional user predicate for node filtering.
         subgraph_predicate: Additional user predicate for subgraph filtering.
         dumper: Callback producing a human-readable label per subgraph.
+        hooks: Told of each subgraph as it is carved.
     """
     nodes_per_subgraph: List[List[torch.fx.Node]] = [[]]
     ptr = next(iter(gm.graph.nodes))
@@ -349,7 +413,13 @@ def segment_and_lower(
     for idx, subgraph_nodes in enumerate(nodes_per_subgraph):
         subgraph_name = f"{subgraph_prefix}_{idx}"
         lower_subgraph_nodes(
-            gm, subgraph_name, subgraph_nodes, module_factory, dumper, all_lowered_nodes
+            gm,
+            subgraph_name,
+            subgraph_nodes,
+            module_factory,
+            dumper,
+            all_lowered_nodes,
+            hooks=hooks,
         )
 
     gm.graph.lint()

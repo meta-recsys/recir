@@ -76,7 +76,7 @@ class InductorBackendTest(unittest.TestCase):
 
         self.assertIs(iter_gm, result)
         self.assertEqual(
-            [mock.call(subgraph) for subgraph in original_subgraphs],
+            [mock.call(subgraph, hooks=None) for subgraph in original_subgraphs],
             lower.call_args_list,
         )
         self.assertIs(lowered_subgraphs[0], iter_gm.setup_gm)
@@ -143,6 +143,7 @@ class XLAGSPMDBackendTest(unittest.TestCase):
             gm,
             backend_type=BackendType.XLA_GSPMD,
             capture_hlo_text=True,
+            hooks=None,
         )
 
     def test_hlo_capture_is_disabled_by_default(self) -> None:
@@ -158,6 +159,7 @@ class XLAGSPMDBackendTest(unittest.TestCase):
             gm,
             backend_type=BackendType.XLA_GSPMD,
             capture_hlo_text=False,
+            hooks=None,
         )
 
     def test_validate_with_gspmd_parallel_passes(self) -> None:
