@@ -38,16 +38,5 @@ def _enable_compile() -> Generator[None, None, None]:
     discovery + inner ``make_fx`` (``api._discover_for_region_transforms`` and
     ``region_transforms.core._apply_region_transforms``).
     """
-
-    def _f_true() -> bool:
-        return True
-
-    orig_is_compiling_code = torch._utils.is_compiling.__code__  # pyre-ignore[16]
-    torch._utils.is_compiling.__code__ = _f_true.__code__  # pyre-ignore[16]
-    orig_compiling_flag = torch.compiler._is_compiling_flag
-    torch.compiler._is_compiling_flag = True
-    try:
+    with torch.compiler._compile_session_context():
         yield
-    finally:
-        torch._utils.is_compiling.__code__ = orig_is_compiling_code  # pyre-ignore[16]
-        torch.compiler._is_compiling_flag = orig_compiling_flag
