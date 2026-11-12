@@ -1085,6 +1085,12 @@ def _aten_index_put(
         else:
             return jnp.where(mask, values, self)
     if accumulate:
+        if self.dtype == jnp.bool_:
+            # JAX's scatter-add rejects bool; torch adds bools as logical or.
+            return (
+                self.astype(jnp.int32).at[indexes].add(jnp.asarray(values, jnp.int32))
+                != 0
+            )
         return self.at[indexes].add(values)
     else:
         return self.at[indexes].set(values)
