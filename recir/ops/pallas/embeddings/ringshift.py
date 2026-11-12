@@ -150,6 +150,34 @@ def _use_dma_gather(v_local: int, embedding_dim: int, dtype) -> bool:
     return v_local * embedding_dim * np.dtype(dtype).itemsize > _TABLE_VMEM_BUDGET_BYTES
 
 
+# Mosaic computes a DMA slice's element offset (row * width) in 32 bits, so a
+# one-row copy at row r of a ``[rows, D]`` HBM ref lands on row r - 2**32 // D
+# once r * D reaches 2**32, for reads and writes alike. A static ``.at`` base is
+# added outside that arithmetic, so :func:`_row_dma` addresses such rows as a
+# static chunk start plus a dynamic row within the chunk.
+_DMA_OFFSET_LIMIT: int = 1 << 32
+
+
+def _row_dma(ref: Any, row: Any, fn: Any) -> None:
+    """Call ``fn`` on the one-row slice ``ref[row]`` of a 2-D HBM ref, for any row.
+
+    Refs under ``_DMA_OFFSET_LIMIT`` elements get the plain slice. Larger ones are
+    split into static chunks (16-row aligned, the 16-bit tile), and ``fn`` runs
+    under the ``pl.when`` of the chunk holding ``row``.
+    """
+    rows, width = ref.shape
+    chunk = _DMA_OFFSET_LIMIT // width // 16 * 16
+    if rows <= chunk:
+        fn(ref.at[pl.ds(row, 1), :])
+        return
+    for lo in range(0, rows, chunk):
+        n = min(chunk, rows - lo)
+
+        @pl.when((row >= lo) & (row < lo + n))
+        def _copy(lo: int = lo, n: int = n) -> None:
+            fn(ref.at[pl.ds(lo, n), :].at[pl.ds(row - lo, 1), :])
+
+
 # Number of per-row gather DMAs kept in flight at once in the DMA-gather path.
 # The gather issues this many async row-copies from the HBM table shard and only
 # then waits on them, so up to this many 1KB transfers overlap -- hiding per-row
@@ -1180,11 +1208,15 @@ def _make_ringshift_single_wave_kernel(
                 row_idx = idx_smem[i]
                 if _SKIP_DMA:
                     row_idx = jnp.clip(row_idx, 0, v_local - 1)
-                pltpu.make_async_copy(
-                    src_ref=table_ref.at[pl.ds(row_idx, 1), :],
-                    dst_ref=zero_emb_vmem.at[pl.ds(i, 1), :],
-                    sem=gather_sems.at[b],
-                ).start()
+                _row_dma(
+                    table_ref,
+                    row_idx,
+                    lambda src: pltpu.make_async_copy(
+                        src_ref=src,
+                        dst_ref=zero_emb_vmem.at[pl.ds(i, 1), :],
+                        sem=gather_sems.at[b],
+                    ).start(),
+                )
                 return None
 
             lax.fori_loop(0, n, _issue, None)
@@ -1194,11 +1226,15 @@ def _make_ringshift_single_wave_kernel(
                 row_idx = idx_smem[i]
                 if _SKIP_DMA:
                     row_idx = jnp.clip(row_idx, 0, v_local - 1)
-                pltpu.make_async_copy(
-                    src_ref=table_ref.at[pl.ds(row_idx, 1), :],
-                    dst_ref=zero_emb_vmem.at[pl.ds(i, 1), :],
-                    sem=gather_sems.at[b],
-                ).wait()
+                _row_dma(
+                    table_ref,
+                    row_idx,
+                    lambda src: pltpu.make_async_copy(
+                        src_ref=src,
+                        dst_ref=zero_emb_vmem.at[pl.ds(i, 1), :],
+                        sem=gather_sems.at[b],
+                    ).wait(),
+                )
                 return None
 
             lax.fori_loop(0, n, _wait, None)
@@ -2522,21 +2558,29 @@ def _make_ringshift_backward_single_wave_kernel(
                 return r
 
             def _issue_read(b, __):
-                pltpu.make_async_copy(
-                    src_ref=grad_table_acc_ref.at[pl.ds(_row(b), 1), :],
-                    dst_ref=grad_table_acc_vmem.at[pl.ds(b, 1), :],
-                    sem=gather_sems.at[b],
-                ).start()
+                _row_dma(
+                    grad_table_acc_ref,
+                    _row(b),
+                    lambda src: pltpu.make_async_copy(
+                        src_ref=src,
+                        dst_ref=grad_table_acc_vmem.at[pl.ds(b, 1), :],
+                        sem=gather_sems.at[b],
+                    ).start(),
+                )
                 return None
 
             lax.fori_loop(0, n, _issue_read, None)
 
             def _wait_read(b, __):
-                pltpu.make_async_copy(
-                    src_ref=grad_table_acc_ref.at[pl.ds(_row(b), 1), :],
-                    dst_ref=grad_table_acc_vmem.at[pl.ds(b, 1), :],
-                    sem=gather_sems.at[b],
-                ).wait()
+                _row_dma(
+                    grad_table_acc_ref,
+                    _row(b),
+                    lambda src: pltpu.make_async_copy(
+                        src_ref=src,
+                        dst_ref=grad_table_acc_vmem.at[pl.ds(b, 1), :],
+                        sem=gather_sems.at[b],
+                    ).wait(),
+                )
                 return None
 
             lax.fori_loop(0, n, _wait_read, None)
@@ -2551,21 +2595,29 @@ def _make_ringshift_backward_single_wave_kernel(
             lax.fori_loop(0, n, _add, None)
 
             def _issue_write(b, __):
-                pltpu.make_async_copy(
-                    src_ref=grad_table_acc_vmem.at[pl.ds(b, 1), :],
-                    dst_ref=grad_table_acc_ref.at[pl.ds(_row(b), 1), :],
-                    sem=gather_sems.at[b],
-                ).start()
+                _row_dma(
+                    grad_table_acc_ref,
+                    _row(b),
+                    lambda dst: pltpu.make_async_copy(
+                        src_ref=grad_table_acc_vmem.at[pl.ds(b, 1), :],
+                        dst_ref=dst,
+                        sem=gather_sems.at[b],
+                    ).start(),
+                )
                 return None
 
             lax.fori_loop(0, n, _issue_write, None)
 
             def _wait_write(b, __):
-                pltpu.make_async_copy(
-                    src_ref=grad_table_acc_vmem.at[pl.ds(b, 1), :],
-                    dst_ref=grad_table_acc_ref.at[pl.ds(_row(b), 1), :],
-                    sem=gather_sems.at[b],
-                ).wait()
+                _row_dma(
+                    grad_table_acc_ref,
+                    _row(b),
+                    lambda dst: pltpu.make_async_copy(
+                        src_ref=grad_table_acc_vmem.at[pl.ds(b, 1), :],
+                        dst_ref=dst,
+                        sem=gather_sems.at[b],
+                    ).wait(),
+                )
                 return None
 
             lax.fori_loop(0, n, _wait_write, None)
