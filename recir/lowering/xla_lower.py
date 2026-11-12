@@ -444,6 +444,8 @@ class _XLAModule(torch.nn.Module):
         self.xla_hlo_text: Optional[str] = None
         self.keep_jax_output: bool = False
         self.torch_output_indices: Optional[set[int]] = None
+        # Outputs consumed as jax arrays by device-resident graph-break calls.
+        self.device_output_indices: set[int] = set()
         self.final_output_indices: set[int] = set()
         self.safe_donate_indices: Optional[set[int]] = None
         # AOT (ahead-of-time) build state. Populated by ``_build_xla_executable``
@@ -746,8 +748,14 @@ class _XLAModule(torch.nn.Module):
         """
         torchax.default_env()
         gm: torch.fx.GraphModule = self.gm
-        input_device: torch.device = (
-            args[0].device if args and not _PRECOMPILE.get() else torch.device("cpu")
+        # Device-resident graph breaks feed jax arrays in; they have no torch device.
+        input_device: torch.device = next(
+            (
+                a.device
+                for a in args
+                if isinstance(a, torch.Tensor) and not _PRECOMPILE.get()
+            ),
+            torch.device("cpu"),
         )
         local_devs = _get_local_devices()
         jax_device: Any = local_devs[0] if local_devs else _get_global_devices()[0]
@@ -1366,7 +1374,7 @@ class _XLAModule(torch.nn.Module):
                 # have no batch axis and cannot use P(batch_axis_resource).
                 out_sharding_list.append(replicated)
                 continue
-            if i in torch_indices:
+            if i in torch_indices or i in self.device_output_indices:
                 out_sharding_list.append(batch_sharded)
                 continue
             if self._is_replicated_final_output(i, leaf, self.final_output_indices):

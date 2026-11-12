@@ -176,10 +176,19 @@ def lower_subgraph_nodes(
     assert len(outputs) == len(set(outputs))
 
     lowered = visible | all_lowered_nodes
-    torch_output_indices = {
+    eager_output_indices = {
         idx
         for idx, output in enumerate(outputs)
         if any(u not in lowered and u.op != "output" for u in output.users)
+    }
+    # Device-resident graph-break calls (see eager_dispatch) take jax arrays.
+    torch_output_indices = {
+        idx
+        for idx in eager_output_indices
+        if any(
+            u not in lowered and u.op != "output" and not u.meta.get("device_resident")
+            for u in outputs[idx].users
+        )
     }
     final_output_indices = {
         idx
@@ -192,6 +201,10 @@ def lower_subgraph_nodes(
     module.final_output_indices = final_output_indices  # pyre-ignore[16]
     if torch_output_indices:
         module.torch_output_indices = torch_output_indices  # pyre-ignore[16]
+    device_output_indices = eager_output_indices - torch_output_indices
+    module.device_output_indices = (
+        device_output_indices  # pyrefly: ignore[bad-argument-type]
+    )
     # Register the lowered subgraph as a submodule attribute.
     #
     # For a plain ``fx.GraphModule`` a bare ``setattr`` is sufficient: the
