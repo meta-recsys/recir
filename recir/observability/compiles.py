@@ -21,6 +21,7 @@ from typing import Any, Callable, Iterator, ParamSpec, Self, TypeVar
 
 from recir.observability.graph_dump import GraphDump
 from recir.observability.guard import contained
+from recir.observability.settings import Settings
 from recir.observability.stages import Stage, TraceStage
 from torch import fx
 from torch._guards import compile_context, CompileContext, CompileId
@@ -61,6 +62,11 @@ def entry_caller_stack() -> list[traceback.FrameSummary]:
     """The stack up to the call into the running ``entry_point``; empty outside one."""
     caller = _entry_caller.get()
     return traceback.extract_stack(caller) if caller is not None else []
+
+
+def snapshots_on() -> bool:
+    """Whether to snapshot now: the tier is on and a structured-trace handler is attached."""
+    return Settings.load().enabled and TlparseCompile.has_sink()
 
 
 def code_location(fn: Callable[..., Any]) -> tuple[str, int] | None:
@@ -124,9 +130,8 @@ class TlparseCompile:
     @staticmethod
     def has_sink() -> bool:
         """
-        Whether a structured-trace handler is attached.
-
-        torch's lazy handler stays attached until its first emit finds no sink.
+        Whether a structured-trace handler is attached. torch's lazy handler
+        counts until its first emit finds no sink to write to.
         """
         return bool(trace_log.handlers)
 
