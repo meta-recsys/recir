@@ -473,6 +473,51 @@ class RecirJaggedOpsMultiDeviceJitTest(unittest.TestCase):
             np.testing.assert_allclose(np.asarray(left), vl)
             np.testing.assert_allclose(np.asarray(right), vr)
 
+    def test_concat_split_numerics_dense_left_multidevice_jit(self) -> None:
+        import jax
+        import jax.numpy as jnp
+        import numpy as np
+        from recir.torchax.ops.jagged_ops import (
+            _recir_concat_2d_jagged,
+            _recir_split_2d_jagged,
+        )
+
+        w = len(jax.devices())
+        if w < 2:
+            self.skipTest("need >= 2 jax devices")
+        dense_size = 2
+        la = np.full(3 * w, dense_size, dtype=np.int32)
+        lb = np.array([2, 1, 2] * w, dtype=np.int32)
+        b = la.shape[0]
+        ol = np.concatenate([[0], np.cumsum(la)]).astype(np.int32)
+        orr = np.concatenate([[0], np.cumsum(lb)]).astype(np.int32)
+        tl, tr = int(ol[-1]), int(orr[-1])
+
+        for d in (1, 4):
+            shp_l = (tl,) if d == 1 else (tl, d)
+            shp_r = (tr,) if d == 1 else (tr, d)
+            vl = np.arange(int(np.prod(shp_l)), dtype=np.float32).reshape(shp_l)
+            vr = (np.arange(int(np.prod(shp_r)), dtype=np.float32) + 1000.0).reshape(
+                shp_r
+            )
+
+            parts = []
+            for i in range(b):
+                parts.append(vl[ol[i] : ol[i + 1]])
+                parts.append(vr[orr[i] : orr[i + 1]])
+            oracle = np.concatenate(parts, axis=0)
+
+            out = jax.jit(lambda a, b_, c, e: _recir_concat_2d_jagged(a, b_, c, e))(
+                jnp.asarray(vl), jnp.asarray(ol), jnp.asarray(vr), jnp.asarray(orr)
+            )
+            np.testing.assert_allclose(np.asarray(out), oracle)
+
+            left, right = jax.jit(
+                lambda v, a, c: _recir_split_2d_jagged(v, a, c, tl, tr)
+            )(jnp.asarray(oracle), jnp.asarray(ol), jnp.asarray(orr))
+            np.testing.assert_allclose(np.asarray(left), vl)
+            np.testing.assert_allclose(np.asarray(right), vr)
+
 
 class RecirConcatJaggedEdgeCaseTest(unittest.TestCase):
     """Empty and zero-length operands for ``_jax_concat_2d_jagged`` -- shapes a
