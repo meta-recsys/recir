@@ -16,6 +16,35 @@ We actively welcome your pull requests.
 5. Make sure your code lints.
 6. If you haven't already, complete the Contributor License Agreement ("CLA").
 
+## CPU checks
+
+The `CPU CI` GitHub Actions workflow runs on pushes and pull requests, and can
+also be started manually. On Python 3.12 it checks Python syntax throughout
+the source and tests, builds a source distribution and wheel, and validates
+their package metadata. These checks run on a standard Ubuntu runner without
+an accelerator or the model-training dependencies.
+
+Run the same checks from the repository root:
+
+```bash
+python3.12 -m venv .venv
+source .venv/bin/activate
+export PYTHONUTF8=1
+python -m pip install --upgrade pip
+python -m pip install build twine
+python -m pip check
+python -m compileall -q recir setup.py
+python -m build
+python -m twine check --strict dist/*
+```
+
+This workflow does not import RecIR or run runtime unit tests. At the initial
+CI baseline, `import recir` fails because of a circular import involving the
+compiler, distributed, and XLA lowering packages. Runtime tests can be added
+after that issue is fixed separately. The checks above validate syntax and
+packaging; they do not establish training or GPU/TPU correctness. See the
+[DLRMv3 guide](recir/examples/dlrmv3/README.md) for reference training commands.
+
 ## Contributor License Agreement ("CLA")
 In order to accept your pull request, we need you to submit a CLA. You only need
 to do this once to work on any of Meta's open source projects.
