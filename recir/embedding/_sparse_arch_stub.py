@@ -55,6 +55,7 @@ class DummySparseArch(nn.Module):
         cached_output: Dict[str, JaggedTensor],
         input_kjt_keys: List[str],
         override_id: int = 1,
+        trace_device: torch.device | None = None,
     ) -> None:
         super().__init__()
         self._override_id: int = override_id
@@ -65,6 +66,10 @@ class DummySparseArch(nn.Module):
         for i, (_name, jt) in enumerate(cached_output.items()):
             self.register_buffer(f"_jt_values_{i}", jt.values())
             self.register_buffer(f"_jt_lengths_{i}", jt.lengths())
+        # The dense graph may be traced on an accelerator while the real lookup
+        # stays on the host; the stand-in lives where the trace runs.
+        if trace_device is not None:
+            self.to(trace_device)
 
         self.graph_local_state_names: tuple[str, ...] = (
             "_grad_anchor",

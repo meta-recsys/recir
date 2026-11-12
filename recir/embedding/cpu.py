@@ -44,6 +44,7 @@ from recir.embedding.backend import (
     SparseUpdatePlacement,
     swap_submodule,
 )
+from recir.embedding.seeded_init import init_shards_from_seeded_tables
 from recir.embedding.split_collection import (
     assert_replicated_half_is_unplanned,
     partition_by_sharding,
@@ -52,6 +53,7 @@ from recir.embedding.split_collection import (
 )
 from recir.ops.eager_dispatch import install_graph_break_dispatch
 from recir.training.optim import OptimConfig
+from torch.distributed._shard.sharded_tensor import ShardedTensor
 from torchrec.distributed.embedding import EmbeddingCollectionSharder
 from torchrec.distributed.embedding_types import EmbeddingComputeKernel, OptimType
 from torchrec.distributed.model_parallel import DistributedModelParallel
@@ -129,6 +131,28 @@ class _ECSharder(EmbeddingCollectionSharder):
         self, sharding_type: str, compute_device_type: str
     ) -> List[str]:
         return [self._kernel_type]
+
+
+def _check_shards_written(
+    dmp: DistributedModelParallel, table_configs: Sequence[BaseEmbeddingConfig]
+) -> None:
+    """Fail if the seeded rows did not reach the weights the kernel reads.
+
+    Re-seeding a fresh ``state_dict`` must change nothing if the first write
+    landed; it changes a shard if ``state_dict`` handed out copies instead.
+    """
+    for key, value in dmp.state_dict().items():
+        if not isinstance(value, ShardedTensor) or not value.local_shards():
+            continue
+        before = value.local_shards()[0].tensor.clone()
+        if not init_shards_from_seeded_tables({key: value}, table_configs):
+            continue
+        if not torch.equal(before, value.local_shards()[0].tensor):
+            raise RuntimeError(
+                f"Seeded rows for {key!r} did not reach the embedding kernel's "
+                "weights: its state_dict shards are copies, not views."
+            )
+        return
 
 
 class CPUEmbeddingBackend(EmbeddingBackend):
@@ -354,6 +378,9 @@ class CPUEmbeddingBackend(EmbeddingBackend):
             init_data_parallel=False,
         )
         logger.info("CPUEmbeddingBackend: DMP initialized (world=%d)", world_size)
+        seeded = init_shards_from_seeded_tables(dmp.state_dict(), table_configs)
+        _check_shards_written(dmp, table_configs)
+        logger.info("CPUEmbeddingBackend: seeded table shards: %s", seeded)
         # The DMP itself, not dmp.module: setup() needs dmp.fused_optimizer to
         # drive the sparse LR schedule. The EmbeddingFusedOptimizer objects
         # survive inside the sharded EC either way, but the CombinedOptimizer
@@ -383,8 +410,10 @@ class SparseArchDispatcher:
         embedding_collection_fqn: str,
         override_id: int = 1,
         num_ranks: int = 1,
+        trace_device: torch.device | None = None,
     ) -> None:
         self._cached_output = cached_output
+        self._trace_device = trace_device
         self._input_kjt_keys = input_kjt_keys
         self._embedding_collection_fqn = embedding_collection_fqn
         self._override_id = override_id
@@ -397,6 +426,7 @@ class SparseArchDispatcher:
             self._cached_output,
             input_kjt_keys=self._input_kjt_keys,
             override_id=self._override_id,
+            trace_device=self._trace_device,
         )
         self._orig_collection = swap_submodule(
             model, self._embedding_collection_fqn, self._dummy
@@ -419,8 +449,9 @@ class SparseArchDispatcher:
             # input_tensors == (values, lengths) thanks to mark_input markers
             # in DummySparseArch.forward (kept alive through trace by the
             # zero-valued anchor that depends on them).
-            values = input_tensors[0]
-            lengths = input_tensors[1]
+            # The lookup runs on the host even when the graph runs on a device.
+            values = input_tensors[0].cpu()
+            lengths = input_tensors[1].cpu()
             total = int(lengths.sum().item())
             if values.shape[0] < total:
                 pad_size = total - values.shape[0]
