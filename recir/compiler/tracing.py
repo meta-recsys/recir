@@ -16,6 +16,7 @@ from contextlib import contextmanager, ExitStack, nullcontext
 from copy import copy
 from dataclasses import dataclass, field
 from functools import partial
+from time import perf_counter
 from typing import Any, cast
 
 import torch
@@ -38,6 +39,8 @@ from recir.distributed.parallel_mode import (
     HybridParallel,
     ParallelMode,
 )
+from recir.observability import snapshot
+from recir.observability.compiles import TraceRecord
 from recir.ops.decompositions import SPMD_DECOMP_TABLE
 from recir.region_transforms import (
     _apply_region_transforms,
@@ -371,6 +374,7 @@ class _TraceContext:
     input_batch_dim: int
     embedding_param_indices: set[int] | None = None
     internal_transforms: list[RegionTransform] = field(default_factory=list)
+    trace_record: TraceRecord | None = None
 
 
 def _make_hybrid_sparse_transform(
@@ -453,6 +457,12 @@ def _get_trace_ctx(gm: fx.GraphModule) -> _TraceContext:
             "if you built the gm from scratch you must call recir.trace first."
         )
     return cast(_TraceContext, ctx)
+
+
+def _trace_record(gm: fx.GraphModule) -> TraceRecord | None:
+    """The trace record ``gm``'s trace context carries; None without one. Never raises."""
+    ctx = getattr(gm, _TRACE_CTX_ATTR, None)
+    return ctx.trace_record if isinstance(ctx, _TraceContext) else None
 
 
 _TraceResult = tuple[fx.GraphModule, list[torch.Tensor]]
@@ -680,6 +690,7 @@ def _finish_data_parallel_trace(
         )
     return _finalize_trace_result(
         local_result,
+        traced=prepared.spec.fn,
         input_batch_dim=prepared.spec.resolved_input_batch_dim,
         embedding_param_indices=prepared.embedding_param_indices,
         internal_transforms=prepared.internal_transforms,
@@ -729,6 +740,7 @@ def _trace_without_pre_sharding(spec: _GraphSpec) -> _TraceResult:
         )
     return _finalize_trace_result(
         local_result,
+        traced=spec.fn,
         input_batch_dim=spec.resolved_input_batch_dim,
     )
 
@@ -736,6 +748,7 @@ def _trace_without_pre_sharding(spec: _GraphSpec) -> _TraceResult:
 def _finalize_trace_result(
     local_result: _LocalCompiledResult,
     *,
+    traced: Callable[..., Any],
     input_batch_dim: int,
     embedding_param_indices: set[int] | None = None,
     internal_transforms: Sequence[RegionTransform] = (),
@@ -774,6 +787,14 @@ def _finalize_trace_result(
         internal_transforms=list(internal_transforms),
     )
     _set_trace_ctx(local_result.gm, ctx)
+    ctx.trace_record = snapshot.keep_trace(
+        traced,
+        local_result.gm,
+        params=local_result.params,
+        buffers=local_result.buffers,
+        named_states=local_result.named_states,
+        trace_s=local_result.trace_s,
+    )
     return local_result.gm, flat_state
 
 
@@ -1162,6 +1183,8 @@ class _LocalCompiledResult:
     # are stored as gm attributes (not placeholders) and registered via
     # ``_AttrKind.CONSTANT`` so they survive ``gm.recompile()`` cleanly.
     constants: dict[str, torch.Tensor]
+    # Seconds the ``make_fx`` trace took.
+    trace_s: float
 
 
 def _local_compile(  # noqa: C901 -- tracing transaction is intentionally cohesive
@@ -1326,12 +1349,14 @@ def _local_compile(  # noqa: C901 -- tracing transaction is intentionally cohesi
         # case yet. Use explicit decompositions for foreach ops.
         # Remove this when the following issue is addressed.
         # Issue: https://github.com/pytorch/pytorch/issues/97852
+        trace_start = perf_counter()
         gm = make_fx(
             partial(stateless_func, func),
             tracing_mode="fake",
             decomposition_table=SPMD_DECOMP_TABLE,  # type: ignore[arg-type]
             _allow_non_fake_inputs=False,
         )(params, buffers, named_states, args, kwargs)
+        trace_s = perf_counter() - trace_start
 
     _maybe_dump_fx_graph(gm)
 
@@ -1392,4 +1417,6 @@ def _local_compile(  # noqa: C901 -- tracing transaction is intentionally cohesi
             node.meta["fqn"] = params_buffers_fqns[placeholder_idx]
         placeholder_idx += 1
 
-    return _LocalCompiledResult(gm, mod, opts, params, buffers, named_states, constants)
+    return _LocalCompiledResult(
+        gm, mod, opts, params, buffers, named_states, constants, trace_s
+    )
