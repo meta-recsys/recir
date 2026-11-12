@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 import os
 import pickle
@@ -24,8 +25,10 @@ from recir.observability import compiles
 from recir.observability.compiles import StepCompile, TlparseCompile, TraceRecord
 from recir.observability.graph_dump import GraphDump
 from recir.observability.settings import Settings, Tier
+from recir.pipeline import build_pipeline, PipelinedGraphModule, SteadyStateGraphModule
+from recir.pipeline_strategies import sdd_pipeline_config
 from recir.region_transforms import RegionTransform
-from recir.tests.test_utils import _NoopBackend, _PassthroughParallel
+from recir.tests.test_utils import _NoopBackend, _PassthroughParallel, _region_graph
 from recir.training.compile import compile_step
 from torch import fx
 from torch._dynamo import convert_frame
@@ -409,6 +412,40 @@ class CompileFromGmTest(unittest.TestCase):
         self.assertEqual(
             self.metrics()["fail_reason"], "raised after RecIR stage assembly"
         )
+
+    def test_pipeline_graph(self) -> None:
+        pipelined = build_pipeline(_region_graph(), sdd_pipeline_config())
+        assert isinstance(pipelined, PipelinedGraphModule)
+        with mock.patch.object(compilation, "build_pipeline", return_value=pipelined):
+            _compile_traced(*_trace())
+        [text] = [
+            payload
+            for n, m, payload in self.capture.events
+            if n == "artifact" and m["artifact"]["name"] == "recir_pipeline_graph"
+        ]
+        assert text is not None
+        self.assertIn("class submod_pipeline_0", text)
+
+    def test_steady_state_plan_writes_the_steady_graph(self) -> None:
+        config = dataclasses.replace(
+            sdd_pipeline_config(), materialize_steady_state=True
+        )
+        steady = build_pipeline(_region_graph(), config)
+        assert isinstance(steady, SteadyStateGraphModule)
+        with mock.patch.object(compilation, "build_pipeline", return_value=steady):
+            _compile_traced(*_trace())
+        [text] = [
+            payload
+            for n, m, payload in self.capture.events
+            if n == "artifact" and m["artifact"]["name"] == "recir_pipeline_graph"
+        ]
+        assert text is not None
+        self.assertIn("pipeline_stage_1_state_", text)
+
+    def test_no_pipeline_plan_writes_no_pipeline_graph(self) -> None:
+        _compile_traced(*_trace())
+        self.assertIn("compilation_metrics", self.names())
+        self.assertNotIn("recir_pipeline_graph", self.names())
 
     def test_compile_work_runs_outside_any_compile_id(self) -> None:
         seen = []

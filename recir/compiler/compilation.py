@@ -77,10 +77,15 @@ from recir.distributed.parallel_mode import (
 from recir.lowering.device_state import DeviceStateManager
 from recir.observability import snapshot
 from recir.observability.compiles import entry_point, StepCompile
-from recir.observability.stages import AssemblyStage
+from recir.observability.stages import AssemblyStage, PipelineStage
 from recir.ops.decompositions import DEDUP_TARGETS
 from recir.passes.pass_registry import default_registry as default_pass_registry
-from recir.pipeline import build_pipeline, PipelineConfig
+from recir.pipeline import (
+    build_pipeline,
+    PipelineConfig,
+    PipelinedGraphModule,
+    SteadyStateGraphModule,
+)
 from recir.region_transforms import RegatherTransform, RegionTransform
 from torch import fx
 from torch._subclasses.fake_tensor import FakeTensorMode
@@ -626,6 +631,12 @@ def _compile_from_gm(  # noqa: C901 — orchestration: stages 4-8 of the pipelin
         cast(IterGraphModule, gm).finalize_setup()
 
     scheduled_gm: nn.Module = build_pipeline(gm, pipeline)
+    if isinstance(scheduled_gm, PipelinedGraphModule):
+        snapshot.record_stage(step, PipelineStage, scheduled_gm.split_gm)
+    elif isinstance(scheduled_gm, SteadyStateGraphModule):
+        snapshot.record_stage(
+            step, PipelineStage, cast(fx.GraphModule, scheduled_gm.steady_gm)
+        )
 
     # Stage 8: dispatch (backend.dispatch returns an nn.Module — typically
     # the same gm rewritten as a partial-lowered module, but the contract
