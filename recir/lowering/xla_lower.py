@@ -29,6 +29,8 @@ from recir.compiler.batch_dim import (
 from recir.distributed.sharding_spec import get_state_layout
 from recir.lowering.lowering_utils import (
     has_meta_kernel,
+    LazilyBuiltModule,
+    LoweringHooks,
     segment_and_lower,
     strip_profiler_nodes,
 )
@@ -409,7 +411,7 @@ def _materialize_meta_fsdp_tensor(tensor: Any, mesh: Any) -> Any:
     )(jnp.arange(fsdp_axis_size, dtype=jnp.int32))
 
 
-class _XLAModule(torch.nn.Module):
+class _XLAModule(LazilyBuiltModule):
     """Wraps an fx.GraphModule subgraph for lazy XLA compilation.
 
     On first forward call, the subgraph is compiled to an XLA computation
@@ -1607,22 +1609,33 @@ class _XLAModule(torch.nn.Module):
         return lowered, run
 
     def forward(self, *args: torch.Tensor, tag: str = "") -> List[torch.Tensor]:
-        if self.compiled is None:
-            logger.info(
-                "Compiling subgraph (%s) to XLA [%s]...",
-                tag,
-                self.backend_type.value,
-            )
-            if self.backend_type == BackendType.XLA_DYNAMO_BRIDGE:
-                self.compiled = self._compile_dynamo_bridge(*args)
-            elif self.backend_type in (
-                BackendType.XLA_SHARD_MAP,
-                BackendType.XLA_GSPMD,
-            ):
-                self.compiled = self._compile_xla(*args)
-            else:
-                raise ValueError(f"Unknown XLA backend type: {self.backend_type}")
-            logger.info("Completed XLA compilation for subgraph (%s)", tag)
+        if self.compiled is not None:
+            return self._run(tag, *args)
+        with self.compile_scope():
+            self._compile(tag, *args)
+            if self.backend_type != BackendType.XLA_DYNAMO_BRIDGE:
+                # shard_map and GSPMD compile inside their first call.
+                return self._run(tag, *args)
+        return self._run(tag, *args)
+
+    def _compile(self, tag: str, *args: torch.Tensor) -> None:
+        logger.info(
+            "Compiling subgraph (%s) to XLA [%s]...",
+            tag,
+            self.backend_type.value,
+        )
+        if self.backend_type == BackendType.XLA_DYNAMO_BRIDGE:
+            self.compiled = self._compile_dynamo_bridge(*args)
+        elif self.backend_type in (
+            BackendType.XLA_SHARD_MAP,
+            BackendType.XLA_GSPMD,
+        ):
+            self.compiled = self._compile_xla(*args)
+        else:
+            raise ValueError(f"Unknown XLA backend type: {self.backend_type}")
+        logger.info("Completed XLA compilation for subgraph (%s)", tag)
+
+    def _run(self, tag: str, *args: torch.Tensor) -> List[torch.Tensor]:
         with torch.profiler.record_function(tag):
             assert self.compiled is not None
             result = self.compiled(*args)
@@ -1910,6 +1923,7 @@ def partial_lower_xla(
     subgraph_predicate: Callable[[List[torch.fx.Node]], bool] = lambda x: True,
     dumper: Callable[[str], str] = lambda x: "subgraph",
     op_swap_map: Optional[OpSwapRegistry] = None,
+    hooks: Optional[LoweringHooks] = None,
 ) -> torch.fx.GraphModule:
     if op_swap_map is not None:
         gm = swap_ops(gm, op_swap_map)
@@ -1953,6 +1967,7 @@ def partial_lower_xla(
         node_predicate=node_predicate,
         subgraph_predicate=subgraph_predicate,
         dumper=dumper,
+        hooks=hooks,
     )
     _annotate_safe_donate_indices(lowered)
     return lowered
