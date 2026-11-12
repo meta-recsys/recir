@@ -22,7 +22,11 @@ import logging
 from typing import Any, Callable, List, Optional, Tuple
 
 import torch
-from recir.lowering.lowering_utils import segment_and_lower
+from recir.lowering.lowering_utils import (
+    LazilyBuiltModule,
+    LoweringHooks,
+    segment_and_lower,
+)
 from recir.ops.decompositions import SPMD_DECOMP_TABLE
 from torch._decomp import get_decompositions
 
@@ -68,7 +72,7 @@ def _is_torchtpu_compatible(node: torch.fx.Node) -> Tuple[bool, str]:
     return True, ""
 
 
-class _TorchTPUModule(torch.nn.Module):
+class _TorchTPUModule(LazilyBuiltModule):
     """Wraps an ``fx.GraphModule`` subgraph for lazy torch_tpu compilation.
 
     On the first forward call the subgraph is compiled via torch_tpu's
@@ -109,7 +113,8 @@ class _TorchTPUModule(torch.nn.Module):
                         "compile time; got a meta/fake tensor."
                     )
             logger.info("Compiling subgraph (%s) via torch_tpu TpuBackend...", tag)
-            self.compiled = TpuBackend()(self.gm, list(tpu_args))
+            with self.compile_scope():
+                self.compiled = TpuBackend()(self.gm, list(tpu_args))
             logger.info("Completed torch_tpu compilation for subgraph (%s)", tag)
         with torch.profiler.record_function(tag):
             assert self.compiled is not None
@@ -121,6 +126,7 @@ def partial_lower_torchtpu(
     node_predicate: Callable[[torch.fx.Node], bool] = lambda x: True,
     subgraph_predicate: Callable[[List[torch.fx.Node]], bool] = lambda x: True,
     dumper: Callable[[str], str] = lambda x: "subgraph",
+    hooks: Optional[LoweringHooks] = None,
 ) -> torch.fx.GraphModule:
     """Segment ``gm`` and lower each compatible subgraph via ``TpuBackend``.
 
@@ -135,4 +141,5 @@ def partial_lower_torchtpu(
         node_predicate=node_predicate,
         subgraph_predicate=subgraph_predicate,
         dumper=dumper,
+        hooks=hooks,
     )
