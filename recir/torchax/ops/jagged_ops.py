@@ -47,6 +47,10 @@ def _jax_jagged_to_padded_dense_impl(
     seq_offsets = offsets[0]
     max_len: int = int(max_lengths[0])
     b: int = seq_offsets.shape[0] - 1
+    if values.shape[0] == 0:  # every segment empty: all padding (nothing to gather)
+        return jnp.full(
+            (b, max_len, *values.shape[1:]), padding_value, dtype=values.dtype
+        )
     starts = seq_offsets[:-1]
     lengths = seq_offsets[1:] - seq_offsets[:-1]
     col = jnp.arange(max_len)
