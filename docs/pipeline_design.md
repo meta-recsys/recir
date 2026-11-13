@@ -263,7 +263,7 @@ behavior.
 ## Stage lowering and inspection
 
 `stage_graph_modules()` returns the ordered child FX modules for inspection.
-`lower_stages(lower)` replaces each child `GraphModule` with the `nn.Module`
+`lower_parts(lower)` replaces each child `GraphModule` with the `nn.Module`
 returned by a caller-provided lowering function while leaving pipeline slot
 movement and scheduling intact. `print_readable()` delegates to the split FX
 wrapper for debugging.

@@ -34,6 +34,7 @@ from recir.pipeline_strategies import (
     sdd_pipeline_config,
     semi_sync_pipeline_config,
 )
+from recir.tests.test_utils import _region_graph
 from torch.fx.experimental.proxy_tensor import make_fx
 
 
@@ -86,14 +87,6 @@ class _ContainerBoundaryModule(torch.nn.Module):
         maximum, index = torch.max(value, dim=0)
         distributed = maximum + 1
         return distributed + index
-
-
-class _FourStageModule(torch.nn.Module):
-    def forward(self, value: torch.Tensor) -> torch.Tensor:
-        preprocessed = value + 1
-        started = preprocessed * 2
-        continued = started - 3
-        return continued / 2
 
 
 class _SemiSyncModule(torch.nn.Module):
@@ -235,23 +228,6 @@ def _functional_state_graph() -> fx.GraphModule:
     mark_pipeline_region((add,), PipelineRegion.ROUTE_START)
     mark_pipeline_region((sub,), PipelineRegion.ROUTE_CONTINUE)
     mark_pipeline_region((lookup,), PipelineRegion.EMBEDDING_LOOKUP)
-    return gm
-
-
-def _region_graph() -> fx.GraphModule:
-    gm = fx.symbolic_trace(_FourStageModule())
-    regions = (
-        (operator.add, PipelineRegion.PREPROCESS),
-        (operator.mul, PipelineRegion.ROUTE_START),
-        (operator.sub, PipelineRegion.ROUTE_CONTINUE),
-    )
-    for target, region in regions:
-        node = next(
-            node
-            for node in gm.graph.nodes
-            if node.op == "call_function" and node.target is target
-        )
-        mark_pipeline_region((node,), region)
     return gm
 
 
@@ -436,7 +412,7 @@ class PipelineTest(unittest.TestCase):
                 side_effect=get_external_object,
             ),
         ):
-            pipeline.lower_steady(lambda gm: lowered.append(gm) or gm)
+            pipeline.lower_parts(lambda gm: lowered.append(gm) or gm)
 
         self.assertEqual(len(lowered), 1)
         nodes = list(lowered[0].graph.nodes)
@@ -520,7 +496,7 @@ class PipelineTest(unittest.TestCase):
                 side_effect=get_external_object,
             ),
         ):
-            pipeline.lower_steady(lambda gm: lowered.append(gm) or gm)
+            pipeline.lower_parts(lambda gm: lowered.append(gm) or gm)
 
         nodes = list(lowered[0].graph.nodes)
         preprocessed = next(node for node in nodes if node.target is operator.add)
@@ -576,7 +552,7 @@ class PipelineTest(unittest.TestCase):
                 return_value=stream,
             ),
         ):
-            pipeline.lower_steady(
+            pipeline.lower_parts(
                 lambda lowered_gm: lowered.append(lowered_gm) or lowered_gm
             )
 
@@ -778,7 +754,7 @@ class PipelineTest(unittest.TestCase):
             lowered.append(gm)
             return gm
 
-        pipeline.lower_steady(lower)
+        pipeline.lower_parts(lower)
         self.assertEqual(lowered, [pipeline.steady_gm])
 
     def test_steady_state_pipeline_reads_updated_state_for_next_batch(self) -> None:
