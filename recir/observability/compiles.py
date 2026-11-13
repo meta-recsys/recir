@@ -22,7 +22,7 @@ from typing import Any, Callable, Iterator, ParamSpec, Self, TypeVar
 from recir.observability.graph_dump import GraphDump
 from recir.observability.guard import contained
 from recir.observability.settings import Settings
-from recir.observability.stages import Stage, TraceStage
+from recir.observability.stages import GraphStage, Stage, TraceStage
 from torch import fx
 from torch._guards import compile_context, CompileContext, CompileId
 from torch._logging import trace_structured
@@ -31,6 +31,7 @@ from torch._logging.structured import from_traceback
 
 _Args = ParamSpec("_Args")
 _R = TypeVar("_R")
+_S = TypeVar("_S", bound=Stage)
 
 # The frame that called the outermost entry point now running.
 _entry_caller: ContextVar[FrameType | None] = ContextVar(
@@ -275,11 +276,18 @@ class StepCompile(TlparseCompile):
         """The name shown in tlparse's stack trie: "recir step compile"."""
         return "recir step compile"
 
+    def record_stage(self, stage_cls: type[GraphStage], gm: fx.GraphModule) -> None:
+        """Snapshot a new ``stage_cls`` stage from ``gm``, the graph its RecIR code produced."""
+        self._begin(stage_cls).record(gm)
+
+    def _begin(self, stage_cls: type[_S]) -> _S:
+        stage = stage_cls(self)
+        self.stages.append(stage)
+        return stage
+
     def _start(self) -> None:
         super()._start()
-        stage = TraceStage(self)
-        self.stages.append(stage)
-        stage.record(self._trace_text)
+        self._begin(TraceStage).record(self._trace_text)
 
     def _fail_reason(self, error: BaseException) -> str:
         if not self.stages:

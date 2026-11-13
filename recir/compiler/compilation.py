@@ -76,7 +76,8 @@ from recir.distributed.parallel_mode import (
 )
 from recir.lowering.device_state import DeviceStateManager
 from recir.observability import snapshot
-from recir.observability.compiles import entry_point
+from recir.observability.compiles import entry_point, StepCompile
+from recir.observability.stages import AssemblyStage
 from recir.ops.decompositions import DEDUP_TARGETS
 from recir.passes.pass_registry import default_registry as default_pass_registry
 from recir.pipeline import build_pipeline, PipelineConfig
@@ -322,10 +323,11 @@ def compile_from_gm(
         A :class:`_CompiledResult` ready for runtime use via
         :func:`recir.compile`'s wrapper invocation path.
     """
-    with snapshot.compiling_step(_trace_record(gm)):
+    with snapshot.compiling_step(_trace_record(gm)) as step:
         return _compile_from_gm(
             gm,
             flat_state,
+            step=step,
             parallel_mode=parallel_mode,
             backend=backend,
             region_transforms=region_transforms,
@@ -339,6 +341,7 @@ def _compile_from_gm(  # noqa: C901 — orchestration: stages 4-8 of the pipelin
     gm: fx.GraphModule,
     flat_state: List[torch.Tensor],
     *,
+    step: Optional[StepCompile],
     parallel_mode: ParallelMode,
     backend: "Backend",
     region_transforms: Sequence[RegionTransform],
@@ -559,6 +562,7 @@ def _compile_from_gm(  # noqa: C901 — orchestration: stages 4-8 of the pipelin
     # after the graph has been partitioned.
     for transform in region_transforms_list:
         transform.finalize_compiled_graph(gm)
+    snapshot.record_stage(step, AssemblyStage, gm)
 
     pipeline = pipeline_config or PipelineConfig.none()
     use_iter_graph = backend.uses_iter_graph and not pipeline.enabled
