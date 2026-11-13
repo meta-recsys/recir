@@ -51,6 +51,7 @@ from recir.compiler.runtime import make_compiled_runner, sync_device_state_to_to
 from recir.compiler.tracing import _GraphSpec, _trace_graphs, trace
 from recir.distributed.parallel_mode import GSPMDParallel, HybridParallel
 from recir.distributed.sharding_plan import EmbeddingShardingPlan
+from recir.observability.compiles import entry_point
 from recir.pipeline import PipelineConfig
 from torch.distributed import ProcessGroup
 from torch.distributed.distributed_c10d import _get_default_group, _world
@@ -271,6 +272,7 @@ def _declared_tensor_attr_holders(model: nn.Module) -> Tuple[Any, ...]:
     return () if warmup is None else (warmup,)
 
 
+@entry_point
 def compile_step(
     train_step_fn: Callable[..., Any],
     model: nn.Module,
