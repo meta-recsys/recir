@@ -885,6 +885,14 @@ class IterGraphModule(nn.Module):
     def print_readable(self, print_output: bool = True) -> str:
         return self.main_gm.print_readable(print_output)
 
+    def lower_parts(
+        self, lower: Callable[[fx.GraphModule], nn.Module]
+    ) -> "IterGraphModule":
+        """Replace each phase graph (setup, main, cleanup) with ``lower(graph)``."""
+        for attr in ("setup_gm", "main_gm", "cleanup_gm"):
+            setattr(self, attr, lower(getattr(self, attr)))
+        return self
+
     def print_all_graphs(self) -> None:
         logger.info("Printing the three fx.Graph:")
         logger.info("1. Setup fx.Graph:")

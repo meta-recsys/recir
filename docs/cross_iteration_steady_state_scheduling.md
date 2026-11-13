@@ -123,9 +123,9 @@ The wrapper has three phases:
 - Drain: calls with `last_iter=True` use the eager stage runner without
   admitting a new batch, until no slots remain.
 
-Only `steady_gm` is lowered as one unit. `InductorBackend.dispatch()`
-recognizes `SteadyStateGraphModule` and calls
-`lower_steady(partial_lower)`.
+Only `steady_gm` is lowered as one unit: `SteadyStateGraphModule.lower_parts()`
+materializes the side streams and lowers it, which `InductorBackend.dispatch()`
+reaches through `lower_inputs(gm, partial_lower)`.
 
 ## Side-stream synchronization
 
