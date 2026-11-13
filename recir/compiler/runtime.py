@@ -15,6 +15,7 @@ from typing import Any
 import torch
 import torch.utils._pytree as pytree
 from recir.compiler.process_state import CompiledProcessState
+from recir.observability.compiles import entry_point
 from recir.pipeline import is_pipeline_pending
 
 
@@ -112,6 +113,7 @@ def make_compiled_runner(compiled_obj: Any) -> Callable[..., Any]:
     return runner
 
 
+@entry_point
 def prepare_compiled(
     compiled_fn: Callable[..., Any], *args: Any, **kwargs: Any
 ) -> bool:
