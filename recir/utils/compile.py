@@ -30,9 +30,9 @@ def _enable_compile() -> Generator[None, None, None]:
       device asserts / ``.item()`` calls in ``_get_value()``). See
       https://github.com/pytorch/pytorch/blob/a524123c91ab399c9dd6882c1189596dd77e7734/torch/optim/optimizer.py#L41
     - Many ops gate data-dependent asserts / ``.item()`` behind
-      ``if not torch.compiler.is_compiling():`` (which reads
-      ``_is_compiling_flag``) so they are skipped during capture; otherwise
-      they run on unbacked SymInts and raise ``GuardOnDataDependentSymNode``.
+      ``if not torch.compiler.is_compiling():`` so they are skipped during
+      capture; otherwise they run on unbacked SymInts and raise
+      ``GuardOnDataDependentSymNode``.
 
     Used by the outer trace (``api._local_compile``) and the region-transform
     discovery + inner ``make_fx`` (``api._discover_for_region_transforms`` and
@@ -44,10 +44,20 @@ def _enable_compile() -> Generator[None, None, None]:
 
     orig_is_compiling_code = torch._utils.is_compiling.__code__  # pyre-ignore[16]
     torch._utils.is_compiling.__code__ = _f_true.__code__  # pyre-ignore[16]
-    orig_compiling_flag = torch.compiler._is_compiling_flag
-    torch.compiler._is_compiling_flag = True
     try:
-        yield
+        # Newer torch keeps the flag per thread; torch 2.10 has a module flag.
+        if hasattr(torch.compiler, "_compile_session_context"):
+            with torch.compiler._compile_session_context():
+                yield
+        else:
+            # pyrefly: ignore[missing-attribute]
+            orig_compiling_flag = torch.compiler._is_compiling_flag
+            # pyrefly: ignore[missing-attribute]
+            torch.compiler._is_compiling_flag = True
+            try:
+                yield
+            finally:
+                # pyrefly: ignore[missing-attribute]
+                torch.compiler._is_compiling_flag = orig_compiling_flag
     finally:
         torch._utils.is_compiling.__code__ = orig_is_compiling_code  # pyre-ignore[16]
-        torch.compiler._is_compiling_flag = orig_compiling_flag
