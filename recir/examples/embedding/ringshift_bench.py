@@ -72,8 +72,7 @@ _EBC_REL_TOL = 1e-4
 
 # SparseCores per JAX device. jte's num_sparsecores_per_device() raises
 # ValueError on device kinds it doesn't recognise (e.g. "TPU7x"); fall back to
-# 4 (the value jte uses internally for TPU v5/v6/v7), matching the DLRMv3
-# SparseCore backend (recir/embedding/sparsecore_ops.py).
+# 4 (the value jte uses internally for TPU v5/v6/v7).
 _NUM_SC_PER_DEVICE_FALLBACK = 4
 
 # jte CSR padding sentinel (INT32_MAX); matches sparsecore_custom_call._PAD_VALUE.

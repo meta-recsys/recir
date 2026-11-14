@@ -14,8 +14,7 @@ from unittest import TestCase
 from recir.embedding.backend import TableOptimizer, TablePlan, TableSharding
 from recir.embedding.cpu import CPUEmbeddingBackend
 from recir.embedding.factory import build_embedding_backend
-from recir.embedding.in_graph import InGraphEmbeddingBackend
-from recir.embedding.sparsecore import SparseCoreEmbeddingBackend
+from recir.embedding.in_graph import TPUEmbeddingBackend
 
 
 @dataclass
@@ -39,8 +38,8 @@ class BuildEmbeddingBackendTest(TestCase):
         }
         expected = {
             "cpu": CPUEmbeddingBackend,
-            "tpu": SparseCoreEmbeddingBackend,
-            "in_graph": InGraphEmbeddingBackend,
+            "tpu": TPUEmbeddingBackend,
+            "in_graph": TPUEmbeddingBackend,
         }
         for name, cls in expected.items():
             backend = build_embedding_backend(
@@ -55,7 +54,7 @@ class BuildEmbeddingBackendTest(TestCase):
             embedding_tables={"t": _Table(_Sharding("row_wise"))},
         )
 
-        self.assertIsInstance(backend, InGraphEmbeddingBackend)
+        self.assertIsInstance(backend, TPUEmbeddingBackend)
         self.assertEqual(
             backend._table_plans["t"],
             TablePlan(sharding=TableSharding.ROWWISE, optimizer=TableOptimizer.SPARSE),
@@ -65,6 +64,14 @@ class BuildEmbeddingBackendTest(TestCase):
         with self.assertRaisesRegex(ValueError, "table plans"):
             build_embedding_backend(
                 "in_graph", embedding_collection_fqn="owner.collection"
+            )
+
+    def test_sparsecore_tables_need_the_in_graph_backend(self) -> None:
+        with self.assertRaisesRegex(ValueError, "in_graph"):
+            build_embedding_backend(
+                "cpu",
+                embedding_collection_fqn="owner.collection",
+                sparsecore_tables="all",
             )
 
     def test_an_unknown_name_raises(self) -> None:

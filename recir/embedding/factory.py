@@ -24,8 +24,7 @@ from recir.embedding.backend import (
     TablePlan,
 )
 from recir.embedding.cpu import CPUEmbeddingBackend
-from recir.embedding.in_graph import InGraphEmbeddingBackend
-from recir.embedding.sparsecore import SparseCoreEmbeddingBackend
+from recir.embedding.in_graph import TPUEmbeddingBackend
 from recir.training.optim import OptimConfig
 from recir.training.setup import build_sparse_lr_buffered_optimizer
 
@@ -45,21 +44,26 @@ def build_embedding_backend(
     embedding_tables: dict[str, Any] | None = None,
     sparse_optimizer_builder: SparseOptimizerBuilder = build_sparse_lr_buffered_optimizer,
     on_device_init: bool = True,
+    sparsecore_tables: str = "",
 ) -> EmbeddingBackend:
     """``name`` is one of :data:`EMBEDDING_BACKENDS`.
 
     ``embedding_tables`` are the model's own table objects; the cpu backend
     reads their placement, and in_graph derives its plans from them when
-    ``table_plans`` is not given.
+    ``table_plans`` is not given. ``sparsecore_tables`` is in_graph's (see
+    :class:`TPUEmbeddingBackend`). "tpu" names the same backend as "in_graph".
     """
+    if sparsecore_tables and name not in ("in_graph", "tpu"):
+        raise ValueError(
+            f"sparsecore_tables={sparsecore_tables!r} needs the in_graph backend, "
+            f"not {name!r}"
+        )
     if name == "cpu":
         return CPUEmbeddingBackend(
             embedding_collection_fqn=embedding_collection_fqn,
             embedding_tables=embedding_tables,
         )
-    if name == "tpu":
-        return SparseCoreEmbeddingBackend(embedding_collection_fqn)
-    if name == "in_graph":
+    if name in ("in_graph", "tpu"):
         if table_plans is None and embedding_tables is not None:
             table_plans = table_plans_from_embedding_tables(embedding_tables)
         if table_plans is None:
@@ -68,11 +72,12 @@ def build_embedding_backend(
                 "decides both its layout and which optimizer trains it, and "
                 "there is no default to fall back on."
             )
-        return InGraphEmbeddingBackend(
+        return TPUEmbeddingBackend(
             embedding_collection_fqn=embedding_collection_fqn,
             sparse_optimizer_builder=sparse_optimizer_builder,
             table_plans=dict(table_plans),
             on_device_init=on_device_init,
+            sparsecore_tables=sparsecore_tables,
         )
     raise ValueError(
         f"unknown embedding backend {name!r}; use one of {EMBEDDING_BACKENDS}"
