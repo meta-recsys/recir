@@ -16,6 +16,7 @@ from recir.training.optim import (
     OptimConfig,
     prime_optimizer_state,
     TensorLRRowWiseAdagrad,
+    warmup_lr,
     WarmupController,
 )
 from torch.fx.experimental.proxy_tensor import make_fx
@@ -184,6 +185,29 @@ class WarmupControllerTest(unittest.TestCase):
 
         torch.testing.assert_close(restored_sparse_lr, sparse_lr)
         self.assertEqual(restored_sparse_lr.device.type, "cpu")
+
+    def test_warmup_lr_matches_the_controller_at_every_iteration(self) -> None:
+        schedule = [
+            WarmupStage(policy=WarmupPolicy.LINEAR, max_iters=5, value=0.1),
+            WarmupStage(policy=WarmupPolicy.LINEAR, max_iters=9, value=0.5),
+        ]
+        sparse_lr = torch.tensor(0.0, dtype=torch.float32)
+        controller = WarmupController(
+            dense_base_lr=0.01,
+            dense_lr_warmup_schedule=None,
+            dense_lr_buffer=torch.tensor(0.0, dtype=torch.float32),
+            iter_buffer=torch.zeros((), dtype=torch.int64),
+            sparse_base_lr=0.2,
+            sparse_lr_warmup_schedule=schedule,
+            sparse_lr_buffer=sparse_lr,
+        )
+        cfg = types.SimpleNamespace(lr=0.2, lr_warmup_schedule=schedule)
+
+        controller.apply()
+        for iteration in range(12):
+            # pyrefly: ignore[bad-argument-type]
+            self.assertAlmostEqual(float(sparse_lr), warmup_lr(cfg, iteration))
+            controller.step()
 
     def test_prime_rowwise_state_uses_parameter_device(self) -> None:
         parameter = torch.nn.Parameter(torch.ones((2, 4), device="meta"))
