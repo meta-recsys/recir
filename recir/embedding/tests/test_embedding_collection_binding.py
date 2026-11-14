@@ -14,7 +14,6 @@ import torch
 import torch.nn as nn
 from recir.embedding.backend import check_binding, swap_submodule
 from recir.embedding.cpu import CPUEmbeddingBackend
-from recir.embedding.sparsecore import SparseCoreEmbeddingBackend
 from recir.embedding.split_collection import ReplicatedEmbeddingCollection
 from torchrec.modules.embedding_configs import EmbeddingBagConfig, EmbeddingConfig
 from torchrec.modules.embedding_modules import (
@@ -89,23 +88,6 @@ class SwapSubmoduleTest(TestCase):
             swap_submodule(_model(), "owner.missing", nn.Identity())
 
 
-class SparseCoreDenseParametersTest(TestCase):
-    def test_only_the_bound_collection_is_excluded(self) -> None:
-        backend = SparseCoreEmbeddingBackend("owner.collection")
-
-        dense = backend.dense_named_parameters(_model())
-
-        self.assertEqual(
-            set(dense),
-            {
-                "tower.weight",
-                "tower.bias",
-                "owner.collection_b.weight",
-                "owner.collection_b.bias",
-            },
-        )
-
-
 class CheckBindingTest(TestCase):
     def test_a_replicated_collection_may_sit_beside_the_bound_one(self) -> None:
         check_binding(_CollectionModel(), "owner.collection")
@@ -141,10 +123,7 @@ class CheckBindingTest(TestCase):
             check_binding(_CollectionModel(), "owner")
 
     def test_setup_checks_the_binding_first(self) -> None:
-        for backend in (
-            CPUEmbeddingBackend("owner"),
-            SparseCoreEmbeddingBackend("owner"),
-        ):
+        for backend in (CPUEmbeddingBackend("owner"),):
             with self.assertRaisesRegex(TypeError, "owner is a"):
                 backend.setup(
                     _CollectionModel(),
