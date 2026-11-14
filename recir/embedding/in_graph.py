@@ -33,7 +33,7 @@ This module bundles the whole in-graph embedding path:
     id-list handling out of the XLA/GSPMD program (the SPMD partitioner segfaults
     on it at 64-chip) while doing the embedding lookup on TPU.
 
-  * ``InGraphEmbeddingBackend`` -- the ``EmbeddingBackend`` entry point.
+  * ``TPUEmbeddingBackend`` -- the ``EmbeddingBackend`` entry point.
     ``setup()`` swaps the model's torchrec ``EmbeddingCollection`` (named by
     ``embedding_collection_fqn``) for ``InGraphSparseArch`` and builds the
     sparse optimizer over the tables their plan assigns to it (the table is now
@@ -854,7 +854,7 @@ def _seed_in_graph_tables_from_ec(
     )
 
 
-class InGraphEmbeddingBackend(EmbeddingBackend):
+class TPUEmbeddingBackend(EmbeddingBackend):
     """In-graph ring-shift embedding backend.
 
     ``embedding_collection_fqn`` names the model's torchrec
@@ -900,7 +900,7 @@ class InGraphEmbeddingBackend(EmbeddingBackend):
     def set_feature_seqlens(self, feature_seqlens: Dict[str, int]) -> None:
         """Per-feature per-chip token total, consumed by setup()."""
         self._feature_seqlens = feature_seqlens
-        logger.info(f"InGraphEmbeddingBackend: feature_chip_tokens={feature_seqlens}")
+        logger.info(f"TPUEmbeddingBackend: feature_chip_tokens={feature_seqlens}")
 
     def set_sparse_grad_scale(self, scale: float) -> None:
         """Must run before setup(), which hands it to the sparse optimizer builder."""
@@ -911,9 +911,7 @@ class InGraphEmbeddingBackend(EmbeddingBackend):
     def init_pg(self) -> Tuple[int, int]:
         rank = jax.process_index()
         world = jax.process_count()
-        logger.info(
-            f"InGraphEmbeddingBackend: JAX PJRT PG (rank={rank}, world={world})"
-        )
+        logger.info(f"TPUEmbeddingBackend: JAX PJRT PG (rank={rank}, world={world})")
         return rank, world
 
     def _params_by_optimizer(
@@ -995,7 +993,7 @@ class InGraphEmbeddingBackend(EmbeddingBackend):
         check_binding(model, self.embedding_collection_fqn)
         if not self._feature_seqlens:
             raise RuntimeError(
-                "InGraphEmbeddingBackend.set_feature_seqlens() must run before setup()."
+                "TPUEmbeddingBackend.set_feature_seqlens() must run before setup()."
             )
         if world_size <= 0:
             raise ValueError(f"world_size must be positive, got {world_size}.")
@@ -1009,7 +1007,7 @@ class InGraphEmbeddingBackend(EmbeddingBackend):
             on_device_init=self._on_device_init,
         )
         logger.info(
-            f"InGraphEmbeddingBackend: on_device_init={self._on_device_init} "
+            f"TPUEmbeddingBackend: on_device_init={self._on_device_init} "
             f"(meta param -> on-device HBM random init, no host alloc/H2D)"
         )
         old_ec: Any = model.get_submodule(self.embedding_collection_fqn)
@@ -1054,8 +1052,7 @@ class InGraphEmbeddingBackend(EmbeddingBackend):
             if plan.optimizer is TableOptimizer.DENSE
         )
         logger.info(
-            "InGraphEmbeddingBackend: %d table param(s) on %s, %d on the dense "
-            "optimizer",
+            "TPUEmbeddingBackend: %d table param(s) on %s, %d on the dense optimizer",
             len(embedding_params),
             type(sparse_optimizer).__name__ if sparse_optimizer else "no optimizer",
             dense_tables,
@@ -1074,3 +1071,7 @@ class InGraphEmbeddingBackend(EmbeddingBackend):
                 lr_buffer=sparse_lr_buffer,
             ),
         )
+
+
+# The name before ComputeKernel; code written against it keeps working.
+InGraphEmbeddingBackend = TPUEmbeddingBackend
