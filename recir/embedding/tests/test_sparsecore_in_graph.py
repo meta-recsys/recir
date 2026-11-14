@@ -41,9 +41,9 @@ from recir.embedding.backend import (
     TableSharding,
 )
 from recir.embedding.in_graph import (
-    InGraphEmbeddingBackend,
     InGraphSparseArch,
     SparseArchInputBreakDispatcher,
+    TPUEmbeddingBackend,
 )
 from recir.embedding.sparsecore_rowwise import SparseCoreRowwiseTables
 from recir.lowering.xla_lower import _gspmd_mesh, _XLAModule, partial_lower_xla
@@ -342,7 +342,7 @@ class SparseCoreInGraphTest(unittest.TestCase):
         def builder(*args: Any) -> Any:
             raise AssertionError("no table is left for the sparse optimizer")
 
-        backend = InGraphEmbeddingBackend(
+        backend = TPUEmbeddingBackend(
             "collection",
             builder,
             {"big": TablePlan(TableSharding.ROWWISE, TableOptimizer.SPARSE)},
@@ -416,7 +416,7 @@ class SparseCoreInGraphTest(unittest.TestCase):
             "rep": TablePlan(TableSharding.REPLICATED, TableOptimizer.DENSE),
             "pooled": rowwise_sparse,
         }
-        backend = InGraphEmbeddingBackend(
+        backend = TPUEmbeddingBackend(
             "collection",
             mock.Mock(),
             plans,
