@@ -27,8 +27,6 @@
      provided -- see the split-optimizer Ads/Horizon recipe below) so they
      are jointly optimized -- must happen *before* ``@recir.compile`` fires
      so ``_local_compile`` snapshots them into ``named_states`` at Stage 1.
-  6. Wraps any ``SparsecoreBackedEC`` instances (Python-side) so activations
-     returned from the JAX kernel flow through STE at the PyTorch boundary.
 
 The hook is idempotent per-module: running it twice on the same module tree
 skips already-tagged embeddings.
@@ -242,47 +240,6 @@ def _install_on_embedding(
     return new_params
 
 
-def _wrap_sparsecore_forward_if_available(
-    ec: nn.Module,
-    cfg: QATConfig,
-    matched_keys: set[str],
-) -> list[nn.Parameter]:
-    """Delegate to :func:`recir.quant.sparsecore_hook.wrap_sparsecore_forward`
-    if the caller's target depends on ``//recir/quant:sparsecore_hook``;
-    otherwise no-op.
-
-    Kept as a lazy import + try/except so downstream targets that don't touch
-    SparseCore do NOT transitively pull in ``recir.embedding.sparsecore_ops`` (which
-    drags in JAX, ~500 MiB of .par bloat). Users who need SC-side QAT must
-    explicitly add ``//recir/quant:sparsecore_hook`` to their BUCK deps.
-    """
-    try:
-        # pyre-ignore[21]: optional dep -- see module docstring.
-        from recir.quant.sparsecore_hook import (  # @manual  # noqa: WPS433
-            wrap_sparsecore_forward,
-        )
-    except ImportError:
-        return []
-    return wrap_sparsecore_forward(ec, cfg, matched_keys)
-
-
-def _iter_sparsecore_modules(mod: nn.Module) -> list[nn.Module]:
-    """Return every ``SparsecoreBackedEC`` under ``mod``, or ``[]`` when
-    the ``recir.quant.sparsecore_hook`` module is not available (caller did
-    not opt into the SC-side dep chain).
-    """
-    try:
-        # pyre-ignore[21]: optional dep -- see :func:`_wrap_sparsecore_forward_if_available`.
-        from recir.quant.sparsecore_hook import (  # @manual  # noqa: WPS433
-            is_sparsecore_module,
-        )
-    except ImportError:
-        return []
-    return [
-        submod for _fqn, submod in mod.named_modules() if is_sparsecore_module(submod)
-    ]
-
-
 def _add_params_to_optimizer(
     optimizer: torch.optim.Optimizer,
     new_params: list[nn.Parameter],
@@ -350,17 +307,7 @@ def install_qat(
             if added:
                 logger.debug(f"[QAT] installed qat params on embedding {key!r}")
 
-        # 2. SparseCore embeddings (optional). Delegated to
-        #    ``recir.quant.sparsecore_hook`` so downstream targets that don't
-        #    depend on ``//recir/quant:sparsecore_hook`` don't transitively
-        #    pull in JAX / torchrec.sparse. See the helper's docstring.
-        for sc_module in _iter_sparsecore_modules(mod):
-            added = _wrap_sparsecore_forward_if_available(
-                sc_module, cfg, set(cfg.target_table_names)
-            )
-            new_params.extend(added)
-
-        # 3. Register with the optimizer BEFORE recir.compile fires.
+        # 2. Register with the optimizer BEFORE recir.compile fires.
         target_opt = qat_optimizer if qat_optimizer is not None else optimizer
         _add_params_to_optimizer(target_opt, new_params)
 

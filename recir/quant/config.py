@@ -34,8 +34,7 @@ class QATConfig:
     Attributes:
         target_table_names: names of embedding tables to fake-quantize. Names
             must match the ``nn.ModuleDict`` keys under
-            ``TracableEmbeddingCollection.embeddings`` (i.e. ``EmbeddingConfig.name``)
-            or the ``SparsecoreBackedEC`` per-feature keys.
+            ``TracableEmbeddingCollection.embeddings`` (i.e. ``EmbeddingConfig.name``).
         n_bits: number of quantization bits. Default 8.
         granularity: one of:
 
