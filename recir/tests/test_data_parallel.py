@@ -2272,6 +2272,7 @@ class TestShardParamsByPlan(DTensorTestBase):
 
         shard_params_by_plan(
             model,
+            # pyrefly: ignore [bad-argument-type]
             params,
             optimizer,
             DeviceMesh("cuda", torch.arange(self.world_size)),
@@ -2311,6 +2312,7 @@ class TestShardParamsByPlan(DTensorTestBase):
         )
         shard_params_by_plan(
             model,
+            # pyrefly: ignore [bad-argument-type]
             params,
             optimizer,
             DeviceMesh("cuda", torch.arange(self.world_size)),
@@ -2355,6 +2357,7 @@ class TestShardParamsByPlan(DTensorTestBase):
 
         shard_params_by_plan(
             model,
+            # pyrefly: ignore [bad-argument-type]
             params,
             optimizer,
             DeviceMesh("cuda", torch.arange(self.world_size)),
