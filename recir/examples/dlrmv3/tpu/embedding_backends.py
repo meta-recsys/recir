@@ -10,7 +10,7 @@ The backends are model-agnostic; this module supplies where DLRMv3 keeps its
 embeddings (``DlrmHSTU._embedding_collection``) and the static per-feature
 sizes that the token-budget layout makes known up front.
 
-  in_graph  (default) tables are parameters inside the GSPMD program, row-wise
+  tpu       (default) tables are parameters inside the GSPMD program, row-wise
             sharded over all chips (ring-shift lookup) and trained by a second
             optimizer compiled into the same graph.
   cpu       torchrec DMP on host CPU over gloo with an eager graph-break lookup
@@ -29,11 +29,8 @@ from recir.embedding.backend import (
     TablePlan,
     TableSharding,
 )
-from recir.embedding.cpu import CPUEmbeddingBackend, SparseArchDispatcher
-from recir.embedding.in_graph import (
-    InGraphEmbeddingBackend,
-    SparseArchInputBreakDispatcher,
-)
+from recir.embedding.cpu import CPUEmbeddingBackend, CPUSparseArchDispatcher
+from recir.embedding.tpu import TPUEmbeddingBackend, TPUSparseArchDispatcher
 from recir.examples.dlrmv3.common.model import (
     DlrmV3TrainModule,
     EMBEDDING_COLLECTION_FQN,
@@ -41,7 +38,7 @@ from recir.examples.dlrmv3.common.model import (
 from torchrec.modules.embedding_configs import EmbeddingConfig
 
 SPARSE_ARCH_OVERRIDE_ID: int = 1
-BACKENDS: Tuple[str, ...] = ("in_graph", "cpu")
+BACKENDS: Tuple[str, ...] = ("tpu", "cpu")
 
 
 @dataclass(frozen=True)
@@ -78,7 +75,7 @@ def prepare_backend(
     backend: EmbeddingBackend, module: DlrmV3TrainModule, geom: BatchGeometry
 ) -> None:
     """Hand the backend the static per-feature sizes it needs before setup()."""
-    if isinstance(backend, InGraphEmbeddingBackend):
+    if isinstance(backend, TPUEmbeddingBackend):
         backend.set_feature_seqlens(module.layout.feature_totals(geom.real_rows))
 
 
@@ -88,9 +85,9 @@ def make_dispatchers(
     """Tracing dispatchers for the sparse arch (the DLRMv3 preprocess is static
     and traced in-graph, so nothing else needs one)."""
     keys, cached = module.sparse_io_shapes(geom.real_rows, geom.local_chips)
-    if isinstance(backend, InGraphEmbeddingBackend):
+    if isinstance(backend, TPUEmbeddingBackend):
         return [
-            SparseArchInputBreakDispatcher(
+            TPUSparseArchDispatcher(
                 input_kjt_keys=keys,
                 override_id=SPARSE_ARCH_OVERRIDE_ID,
                 num_ranks=geom.num_ranks,
@@ -99,7 +96,7 @@ def make_dispatchers(
         ]
     if isinstance(backend, CPUEmbeddingBackend):
         return [
-            SparseArchDispatcher(
+            CPUSparseArchDispatcher(
                 cached_output=cached,
                 input_kjt_keys=keys,
                 embedding_collection_fqn=EMBEDDING_COLLECTION_FQN,

@@ -4,7 +4,7 @@
 # This source code is licensed under the BSD-3-Clause license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""CPU FX-trace check for InGraphSparseArch.
+"""CPU FX-trace check for TPUSparseArch.
 
 Answers (without TPU): does the in-graph module trace cleanly -- i.e. does the
 KeyedJaggedTensor flow through, and does the lookup appear as the expected node
@@ -26,12 +26,12 @@ from recir.embedding.backend import (
     TablePlan,
     TableSharding,
 )
-from recir.embedding.in_graph import (
+from recir.embedding.tpu import (
     _seed_in_graph_tables_from_ec,
     DP_TABLE_PREFIX,
-    InGraphEmbeddingBackend,
-    InGraphSparseArch,
     SHARDED_TABLE_PREFIX,
+    TPUEmbeddingBackend,
+    TPUSparseArch,
 )
 from torch.fx.experimental.proxy_tensor import make_fx
 from torchrec.distributed.types import ShardingType
@@ -94,7 +94,7 @@ def _build_module_and_kjt(
         ),
     ]
     feature_seqlens = {"f0": 4, "f1": 4, "c0": 1}
-    module = InGraphSparseArch(
+    module = TPUSparseArch(
         table_configs,
         feature_seqlens,
         world_size=world_size,
@@ -249,7 +249,7 @@ class SeqInGraphTraceTest(unittest.TestCase):
         # fake/real param mix. ids in [0,16) are valid for both tables.
         gm = make_fx(fn, pre_dispatch=True)(values, lengths)
         graph_str = gm.graph.python_code("self").src
-        print("\n===== FX GRAPH (InGraphSparseArch) =====\n" + graph_str)
+        print("\n===== FX GRAPH (TPUSparseArch) =====\n" + graph_str)
         targets = [str(n.target) for n in gm.graph.nodes if n.op == "call_function"]
         seq_nodes = [t for t in targets if t.endswith("ringshift_embedding.default")]
         emb_nodes = [t for t in targets if t.endswith("aten.embedding.default")]
@@ -332,7 +332,7 @@ class SeqInGraphTraceTest(unittest.TestCase):
         """A table with no plan must fail loudly. Defaulting it would pick an
         optimizer for it, and the wrong one is invisible in every shape and key."""
         with self.assertRaisesRegex(ValueError, "no TablePlan for \\['small'\\]"):
-            InGraphSparseArch(
+            TPUSparseArch(
                 [
                     EmbeddingConfig(
                         name="big",
@@ -521,7 +521,7 @@ class TablePlansFromEmbeddingTablesTest(unittest.TestCase):
             table_plans_from_embedding_tables({"big": _FakeTable("ROW_WISE")})
 
     def test_unsupported_sharding_raises(self) -> None:
-        """in_graph implements ROW_WISE and DATA_PARALLEL only; anything else has
+        """The tpu backend implements ROW_WISE and DATA_PARALLEL only; anything else has
         no lookup and must not be silently bucketed into one of them."""
         with self.assertRaisesRegex(ValueError, "no lookup for"):
             table_plans_from_embedding_tables(
@@ -549,8 +549,8 @@ class TableStorageDtypeTest(unittest.TestCase):
     """
 
     @staticmethod
-    def _module(data_type: DataType) -> InGraphSparseArch:
-        return InGraphSparseArch(
+    def _module(data_type: DataType) -> TPUSparseArch:
+        return TPUSparseArch(
             [
                 EmbeddingConfig(
                     name="t",
@@ -600,9 +600,9 @@ class RowWiseStorageDtypeTest(unittest.TestCase):
         data_type: DataType = DataType.FP16,
         pooled: bool = False,
         on_device_init: bool = True,
-    ) -> InGraphSparseArch:
+    ) -> TPUSparseArch:
         config_cls = EmbeddingBagConfig if pooled else EmbeddingConfig
-        return InGraphSparseArch(
+        return TPUSparseArch(
             [
                 config_cls(
                     name="t",
@@ -623,7 +623,7 @@ class RowWiseStorageDtypeTest(unittest.TestCase):
         self.assertEqual(m._sharded_tables["t"].dtype, torch.float16)
 
     def test_row_wise_unsupported_dtype_falls_back_to_float32(self) -> None:
-        with self.assertLogs("recir.embedding.in_graph", level="WARNING"):
+        with self.assertLogs("recir.embedding.tpu", level="WARNING"):
             m = self._table(_SPARSE_ROWWISE, DataType.BF16)
         self.assertEqual(m._sharded_tables["t"].dtype, torch.float32)
 
@@ -688,7 +688,7 @@ class SparseGradScaleTest(unittest.TestCase):
         ]
         model = torch.nn.Module()
         model.collection = EmbeddingCollection(tables=tables)
-        backend = InGraphEmbeddingBackend(
+        backend = TPUEmbeddingBackend(
             "collection",
             builder,
             {"t": _SPARSE_ROWWISE},

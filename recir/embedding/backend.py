@@ -9,7 +9,7 @@
 Deliberately free of JAX and of any model-specific import so that CPU-only
 callers (and the quantization hooks) can depend on the interface without
 pulling in the ~500 MiB JAX/SparseCore stack. The concrete backends live in
-``cpu.py``, ``sparsecore.py``, and ``in_graph.py``.
+``cpu.py`` and ``tpu.py``.
 
 A backend binds the torchrec ``EmbeddingCollection`` the model names by FQN
 (``embedding_collection_fqn``); ``factory.build_embedding_backend`` picks one by
@@ -46,12 +46,22 @@ class TableSharding(enum.Enum):
     table -- see :class:`TableOptimizer`.
     """
 
-    # Dim-0 sharded; looked up via the ring-shift kernel.
+    # Dim-0 sharded; looked up by the plan's :class:`ComputeKernel`.
     ROWWISE = "rowwise"
     # Dim-0 sharded; looked up via ``recir.fsdp_embedding`` (all-gather).
     FSDP = "fsdp"
     # Full copy on every device; looked up via ``F.embedding``.
     REPLICATED = "replicated"
+
+
+class ComputeKernel(enum.Enum):
+    """What looks up, and updates, a ROWWISE table."""
+
+    # The ring-shift kernel, inside the compiled step.
+    RINGSHIFT = "ringshift"
+    # JAX TPU Embedding's SparseCore layout and lookup, trained there with row-wise
+    # Adagrad (``recir.embedding.sparsecore_rowwise``).
+    SPARSECORE = "sparsecore"
 
 
 class TableOptimizer(enum.Enum):
@@ -70,10 +80,23 @@ class TableOptimizer(enum.Enum):
 
 @dataclass(frozen=True)
 class TablePlan:
-    """The complete per-table decision: where it lives, and who trains it."""
+    """The complete per-table decision: where it lives, what looks it up, and who
+    trains it. ``compute_kernel`` applies to ROWWISE tables; the other shardings
+    have one lookup each."""
 
     sharding: TableSharding
     optimizer: TableOptimizer
+    compute_kernel: ComputeKernel = ComputeKernel.RINGSHIFT
+
+    def __post_init__(self) -> None:
+        if self.compute_kernel is ComputeKernel.SPARSECORE and (
+            self.sharding is not TableSharding.ROWWISE
+            or self.optimizer is not TableOptimizer.SPARSE
+        ):
+            raise ValueError(
+                f"{self}: SparseCore tables are ROWWISE and trained by the sparse "
+                "optimizer's row-wise Adagrad"
+            )
 
 
 class SparseUpdatePlacement(enum.Enum):
@@ -263,7 +286,7 @@ def table_plans_from_embedding_tables(
 
     ``sharding`` is one field that decides two things, because that is how
     torchrec couples them: the sharding type picks the compute kernel, and the
-    kernel picks the optimizer (see this module's header table). The in-graph
+    kernel picks the optimizer (see this module's header table). The tpu
     backend has no such coupling -- it reads plain ``nn.Parameter``s -- so it
     has to reproduce the pairing deliberately:
 
@@ -292,7 +315,7 @@ def table_plans_from_embedding_tables(
             plans[name] = TablePlan(TableSharding.REPLICATED, TableOptimizer.DENSE)
         else:
             raise ValueError(
-                f"table {name!r} asks for sharding={value!r}, which the in-graph "
+                f"table {name!r} asks for sharding={value!r}, which the tpu "
                 "backend has no lookup for. It implements ROW_WISE and "
                 "DATA_PARALLEL only."
             )

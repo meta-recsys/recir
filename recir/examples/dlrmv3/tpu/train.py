@@ -10,7 +10,7 @@ torch runs on the host CPU and JAX owns the TPUs. The whole train step is
 traced once and lowered to a single GSPMD program over all chips; the batch is
 sharded on dim 0 and dense parameters are replicated. Embedding tables are
 parameters inside the same program, row-wise sharded over all chips
-(``recir.embedding`` in_graph backend). ``--embedding_backend cpu`` instead
+(``recir.embedding`` tpu backend). ``--embedding_backend cpu`` instead
 keeps them in torchrec on the host, for debugging without TPUs.
 
 Single host::
@@ -45,7 +45,7 @@ import torch.distributed.checkpoint as dcp
 import torch.nn as nn
 from generative_recommenders.common import HammerKernel, set_dev_mode
 from recir.embedding.backend import EmbeddingBackend
-from recir.embedding.in_graph import InGraphEmbeddingBackend, SHARDED_TABLE_PREFIX
+from recir.embedding.tpu import SHARDED_TABLE_PREFIX, TPUEmbeddingBackend
 from recir.examples.dlrmv3.common.config import DLRMv3TrainConfig, parse_config
 from recir.examples.dlrmv3.common.data import (
     make_dataset,
@@ -173,7 +173,7 @@ def _parse(
     argv: Optional[Sequence[str]],
 ) -> Tuple[DLRMv3TrainConfig, argparse.Namespace]:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    parser.add_argument("--embedding_backend", choices=BACKENDS, default="in_graph")
+    parser.add_argument("--embedding_backend", choices=BACKENDS, default="tpu")
     parser.add_argument("--profile_dir", default="")
     parser.add_argument("--profile_start_step", type=int, default=0)
     parser.add_argument("--profile_end_step", type=int, default=0)
@@ -220,7 +220,7 @@ class TPUTrainer:
         assert isinstance(setup.model, DlrmV3TrainModule)
         model = setup.model
         sparse_rt = setup.sparse_runtime
-        # One warmup controller for both sides: the in_graph
+        # One warmup controller for both sides: the tpu
         # sparse optimizer reads its own LR buffer; the cpu backend's fused
         # optimizer gets a plain one that DLRMv3TPUModule pushes before each step.
         sparse_lr_buffer = sparse_rt.lr_buffer
@@ -245,10 +245,10 @@ class TPUTrainer:
             # Dropout draws its key from the in-graph warmup counter because
             # jax.random cannot run inside the traced step.
             region_transforms=[DropoutPRNGTransform(counter_fqn=LR_ITER_BUFFER)],
-            # in_graph tables are row-sharded over all chips; nothing else is.
+            # tpu tables are row-sharded over all chips; nothing else is.
             fsdp_table_substr=(
                 SHARDED_TABLE_PREFIX
-                if isinstance(self.backend, InGraphEmbeddingBackend)
+                if isinstance(self.backend, TPUEmbeddingBackend)
                 else None
             ),
         )
@@ -307,11 +307,11 @@ def main(argv: Optional[Sequence[str]] = None) -> None:  # noqa: C901
     torch.manual_seed(cfg.seed)
     trainer = TPUTrainer(cfg, args, world)
     if (cfg.ckpt_dir or cfg.resume_from) and not isinstance(
-        trainer.backend, InGraphEmbeddingBackend
+        trainer.backend, TPUEmbeddingBackend
     ):
-        # RecirCheckpointable covers the in_graph backend;
+        # RecirCheckpointable covers the tpu backend;
         # the cpu backend's torchrec fused optimizer state is not part of it.
-        raise NotImplementedError("checkpointing needs --embedding_backend in_graph")
+        raise NotImplementedError("checkpointing needs --embedding_backend tpu")
 
     dataset = make_dataset(cfg.dataset, cfg.data_root, trainer.hstu, trainer.tables)
     geom = trainer.geom
