@@ -3,7 +3,7 @@
 # This source code is licensed under the BSD-3-Clause license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""SparseCore lookup with exact row-wise Adagrad, for the in-graph backend.
+"""SparseCore lookup with exact row-wise Adagrad, for the tpu backend.
 
 Each table lives in JAX TPU Embedding (JTE)'s SparseCore layout. Per step:
 
@@ -239,8 +239,8 @@ class SparseCoreRowwiseTables:
         lr: returns the current sparse learning rate (the warmup schedule's value).
         max_ids_per_partition / max_unique_ids_per_partition: JTE's per-partition
             input limits.
-        grad_scale: multiplies the gradients before the update, as the in_graph
-            sparse optimizer's ``grad_scale`` does.
+        grad_scale: multiplies the gradients before the update, as the tpu
+            backend's sparse optimizer's ``grad_scale`` does.
     """
 
     def __init__(

@@ -47,7 +47,7 @@ logger: logging.Logger = logging.getLogger(__name__)
 
 # Per-step device->host state sync (sync_device_state_to_torch) skips state
 # entries whose FQN contains any of these substrings. The on-device embedding
-# tables (InGraphSparseArch's "_sharded_tables" / "_dp_tables" module dicts) are
+# tables (TPUSparseArch's "_sharded_tables" / "_dp_tables" module dicts) are
 # GBs each and are kept resident in the cached JAX device_state across steps, so
 # mirroring them to host every step is O(table-size) waste (D2H copy + layout
 # transpose) that dominates the step at large hash sizes. Dense params / LR /
@@ -166,7 +166,7 @@ class RecirGSPMDCompiledModuleBase(RecirCompiledModuleBase):
 
     Subclasses build the step (``_build_compiled_step``) and its arguments
     (``_step_args``), and set ``_model``, ``_dense_opt``, ``_emb_opt`` (the
-    in_graph embedding optimizer, or None), ``_warmup``, ``_trace_batch`` and
+    tpu embedding optimizer, or None), ``_warmup``, ``_trace_batch`` and
     ``_num_processes``.
     """
 
@@ -201,7 +201,7 @@ class RecirGSPMDCompiledModuleBase(RecirCompiledModuleBase):
 
     def _syncs_state_every_step(self) -> bool:
         """Whether every step mirrors all device state to torch: backends without
-        an in_graph embedding optimizer read host copies between steps (e.g. the
+        a tpu embedding optimizer read host copies between steps (e.g. the
         CPU backend pushes the sparse LR from its host buffer)."""
         return self._emb_opt is None
 
@@ -308,10 +308,10 @@ class RecirGSPMDCompiledModuleBase(RecirCompiledModuleBase):
         Duck-typed hook: mvai_cloud's CheckpointManager uses this if present, so
         the recir/JAX-specific checkpoint logic stays out of the shared framework.
         """
-        from recir.embedding.in_graph import (
+        from recir.embedding.tpu import (
             DP_TABLE_PREFIX,
-            InGraphSparseArch,
             SHARDED_TABLE_PREFIX,
+            TPUSparseArch,
         )
         from recir.training.tpu_checkpoint import (
             gather_shard_order,
@@ -336,7 +336,7 @@ class RecirGSPMDCompiledModuleBase(RecirCompiledModuleBase):
                 (
                     m
                     for m in self._model.modules()
-                    if isinstance(m, InGraphSparseArch) and m.sparsecore is not None
+                    if isinstance(m, TPUSparseArch) and m.sparsecore is not None
                 ),
                 None,
             ),

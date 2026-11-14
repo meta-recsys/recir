@@ -6,8 +6,8 @@
 
 """Custom embedding ops for the in-graph embedding path.
 
-Defines the ``recir::*`` ops used by ``InGraphSparseArch``
-(``recir/embedding/in_graph.py``):
+Defines the ``recir::*`` ops used by ``TPUSparseArch``
+(``recir/embedding/tpu.py``):
 
   * ``ringshift_embedding`` -- ROWWISE sequence lookup, lowered on the
     recir/torchax TPU path to the on-TensorCore ring-shift kernel (see
@@ -30,7 +30,7 @@ meta-tolerant custom op is needed.
       ids, lengths, weight, padding_idx=-1, pooling="none"
   ) -> activations
     ids:     int32 [R, C]      ids reshaped to [W, max_local_ids] (leading axis =
-                               mesh axis). The in-graph backend passes [W, T_local]
+                               mesh axis). The tpu backend passes [W, T_local]
                                (one row per chip; T_local = per-chip token total).
     weight:  [vocab, D]        embedding table; row-wise (FSDP/block) sharded by
                                recir's GSPMD lowering. BF16 tables use FP32 inside

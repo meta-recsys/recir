@@ -14,7 +14,7 @@ from unittest import TestCase
 from recir.embedding.backend import TableOptimizer, TablePlan, TableSharding
 from recir.embedding.cpu import CPUEmbeddingBackend
 from recir.embedding.factory import build_embedding_backend
-from recir.embedding.in_graph import TPUEmbeddingBackend
+from recir.embedding.tpu import TPUEmbeddingBackend
 
 
 @dataclass
@@ -39,7 +39,6 @@ class BuildEmbeddingBackendTest(TestCase):
         expected = {
             "cpu": CPUEmbeddingBackend,
             "tpu": TPUEmbeddingBackend,
-            "in_graph": TPUEmbeddingBackend,
         }
         for name, cls in expected.items():
             backend = build_embedding_backend(
@@ -47,9 +46,9 @@ class BuildEmbeddingBackendTest(TestCase):
             )
             self.assertIsInstance(backend, cls, name)
 
-    def test_in_graph_derives_its_plans_from_the_tables(self) -> None:
+    def test_tpu_derives_its_plans_from_the_tables(self) -> None:
         backend = build_embedding_backend(
-            "in_graph",
+            "tpu",
             embedding_collection_fqn="owner.collection",
             embedding_tables={"t": _Table(_Sharding("row_wise"))},
         )
@@ -60,14 +59,12 @@ class BuildEmbeddingBackendTest(TestCase):
             TablePlan(sharding=TableSharding.ROWWISE, optimizer=TableOptimizer.SPARSE),
         )
 
-    def test_in_graph_without_plans_raises(self) -> None:
+    def test_tpu_without_plans_raises(self) -> None:
         with self.assertRaisesRegex(ValueError, "table plans"):
-            build_embedding_backend(
-                "in_graph", embedding_collection_fqn="owner.collection"
-            )
+            build_embedding_backend("tpu", embedding_collection_fqn="owner.collection")
 
-    def test_sparsecore_tables_need_the_in_graph_backend(self) -> None:
-        with self.assertRaisesRegex(ValueError, "in_graph"):
+    def test_sparsecore_tables_need_the_tpu_backend(self) -> None:
+        with self.assertRaisesRegex(ValueError, "tpu backend"):
             build_embedding_backend(
                 "cpu",
                 embedding_collection_fqn="owner.collection",

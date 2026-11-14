@@ -20,7 +20,7 @@ os.environ.setdefault("JAX_ENABLE_X64", "1")
 import jax
 import torch
 from recir.embedding.backend import TableOptimizer, TablePlan, TableSharding
-from recir.embedding.in_graph import TPUEmbeddingBackend
+from recir.embedding.tpu import TPUEmbeddingBackend
 from recir.examples.dlrmv3.common.config import DLRMv3TrainConfig
 from recir.examples.dlrmv3.common.data import (
     make_dataset,
@@ -89,7 +89,7 @@ def _trainer(
     sharding: TableSharding,
 ) -> TPUTrainer:
     trainer_args = argparse.Namespace(
-        embedding_backend="in_graph",
+        embedding_backend="tpu",
         profile_dir="",
         profile_start_step=0,
         profile_end_step=0,

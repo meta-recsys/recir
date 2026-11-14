@@ -157,7 +157,7 @@ def build_sparse_lr_buffered_optimizer(
 ) -> tuple[torch.optim.Optimizer, torch.Tensor]:
     """``_build_lr_buffered_optimizer`` under ``LR_SPARSE_BUFFER``: the
     optimizer of embedding tables that train inside the compiled step (e.g.
-    the recir.embedding in_graph backend's ``sparse_optimizer_builder``)."""
+    the recir.embedding tpu backend's ``sparse_optimizer_builder``)."""
     return _build_lr_buffered_optimizer(
         model, params, cfg, LR_SPARSE_BUFFER, device, grad_scale
     )

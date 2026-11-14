@@ -6,7 +6,7 @@
 
 """Shared eager-swap machinery for the per-backend sparse-arch dispatchers.
 
-The dispatcher itself lives with its backend -- ``cpu.SparseArchDispatcher``
+The dispatcher itself lives with its backend -- ``cpu.CPUSparseArchDispatcher``
 (eager torchrec). Its *eager* half lives here:
 
   * :class:`DummySparseArch` -- the tracing stub it swaps in. It plants
@@ -14,8 +14,8 @@ The dispatcher itself lives with its backend -- ``cpu.SparseArchDispatcher``
     the dispatch inputs/outputs.
   * :func:`sparse_arch_marker_prefix` -- the marker namespace both halves agree on.
 
-The in-graph backend shares none of this: it keeps its lookup in-graph and
-breaks at the input instead (``in_graph.SparseArchInputBreakDispatcher``).
+The tpu backend shares none of this: it keeps its lookup in-graph and
+breaks at the input instead (``tpu.TPUSparseArchDispatcher``).
 
 Model-agnostic: callers name the model's torchrec ``EmbeddingCollection`` by its
 FQN rather than this module importing a model-specific class.
@@ -77,7 +77,7 @@ class DummySparseArch(nn.Module):
         oid = self._override_id
         prefix = sparse_arch_marker_prefix(oid)
 
-        # Mark the input KJT components so SparseArchDispatcher.install_graph
+        # Mark the input KJT components so CPUSparseArchDispatcher.install_graph
         # can rediscover them via the marker prefix and use them as dispatch
         # inputs (instead of falling back to all batch placeholders).
         m_v = mark_input(id_list_features.values(), prefix, 0)

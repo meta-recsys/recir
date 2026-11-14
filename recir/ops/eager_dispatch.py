@@ -100,7 +100,7 @@ def _dispatch_bwd(grad: torch.Tensor, dispatch_id: int, grad_idx: int) -> torch.
 # looks dead. Without this:
 #   (a) an EARLIER dispatcher's install runs eliminate_dead_code and prunes a
 #       LATER dispatcher's still-unwired ``::bwd::`` markers (so the sparse-arch
-#       backward markers vanish before SparseArchDispatcher.install_graph can
+#       backward markers vanish before CPUSparseArchDispatcher.install_graph can
 #       wire them -> install sees bwd_markers=0), and
 #   (b) the final eliminate_dead_code prunes the _dispatch_bwd node itself
 #       (its output feeds only the dead dummy-backward chain).

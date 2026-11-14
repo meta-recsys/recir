@@ -5,9 +5,9 @@
 
 """The SPARSECORE placement's graph wiring, against plain torch.
 
-Traces a train step through InGraphSparseArch (one SPARSECORE table with two
+Traces a train step through TPUSparseArch (one SPARSECORE table with two
 features, one REPLICATED table), installs the dispatches with the real
-SparseArchInputBreakDispatcher, runs the graph eagerly and after
+TPUSparseArchDispatcher, runs the graph eagerly and after
 ``partial_lower_xla``, and compares loss, dense params and the SparseCore table
 after one step with the same model in plain torch (row-wise Adagrad on the
 SparseCore table, SGD on everything else). The SparseCore tables are a numpy
@@ -40,12 +40,12 @@ from recir.embedding.backend import (
     TablePlan,
     TableSharding,
 )
-from recir.embedding.in_graph import (
-    InGraphSparseArch,
-    SparseArchInputBreakDispatcher,
-    TPUEmbeddingBackend,
-)
 from recir.embedding.sparsecore_rowwise import SparseCoreRowwiseTables
+from recir.embedding.tpu import (
+    TPUEmbeddingBackend,
+    TPUSparseArch,
+    TPUSparseArchDispatcher,
+)
 from recir.lowering.xla_lower import _gspmd_mesh, _XLAModule, partial_lower_xla
 from recir.training.optim import warmup_lr
 from recir.utils.compile import _enable_compile
@@ -113,7 +113,7 @@ class _NumpySparseCore(SparseCoreRowwiseTables):
 
 
 class _Wrapper(nn.Module):
-    def __init__(self, arch: InGraphSparseArch, used: List[str]) -> None:
+    def __init__(self, arch: TPUSparseArch, used: List[str]) -> None:
         super().__init__()
         self.arch, self.lin, self.used = arch, nn.Linear(_D, _CHIPS), used
 
@@ -173,7 +173,7 @@ def _run(used: List[str], lower: bool) -> Dict[str, Any]:
         "big": _SPARSECORE_PLAN,
         "rep": TablePlan(TableSharding.REPLICATED, TableOptimizer.DENSE),
     }
-    arch = InGraphSparseArch(
+    arch = TPUSparseArch(
         tables, _SEQ, world_size=_CHIPS, table_plans=plans, on_device_init=False
     )
     w0 = arch._sparsecore_host_weights["big"][:50].numpy().copy()
@@ -192,7 +192,7 @@ def _run(used: List[str], lower: bool) -> Dict[str, Any]:
     ids["f1"][0] = ids["f0"][0]  # one row shared by both features
     values = torch.from_numpy(np.concatenate([ids[k] for k in _KEYS])).long()
     lengths = torch.tensor([3] * _CHIPS + [2] * _CHIPS + [1] * _CHIPS)
-    dispatcher = SparseArchInputBreakDispatcher(
+    dispatcher = TPUSparseArchDispatcher(
         input_kjt_keys=_KEYS, override_id=1, num_ranks=1, feature_seqlens=_SEQ
     )
     dispatcher.install_eager(wrapper)
@@ -278,7 +278,7 @@ class SparseCoreInGraphTest(unittest.TestCase):
         self.assertEqual({"ArrayImpl"}, out["grad_types"])
 
     def test_fp16_table_keeps_fp16_values(self) -> None:
-        arch = InGraphSparseArch(
+        arch = TPUSparseArch(
             [
                 EmbeddingConfig(
                     num_embeddings=50,
@@ -308,7 +308,7 @@ class SparseCoreInGraphTest(unittest.TestCase):
 
     def test_pooled_table_cannot_use_sparsecore(self) -> None:
         with self.assertRaisesRegex(ValueError, "unpooled"):
-            InGraphSparseArch(
+            TPUSparseArch(
                 [
                     EmbeddingBagConfig(
                         num_embeddings=50,
@@ -351,7 +351,7 @@ class SparseCoreInGraphTest(unittest.TestCase):
         )
         backend.set_feature_seqlens({"f0": 3})
         backend.set_sparse_grad_scale(grad_scale)
-        with mock.patch.object(InGraphSparseArch, "init_sparsecore") as init:
+        with mock.patch.object(TPUSparseArch, "init_sparsecore") as init:
             setup = backend.setup(
                 model,
                 tables,
@@ -464,7 +464,7 @@ class SparseCoreCheckpointFormatTest(unittest.TestCase):
         ),
     ]
 
-    def _arch(self, big: ComputeKernel) -> InGraphSparseArch:
+    def _arch(self, big: ComputeKernel) -> TPUSparseArch:
         rowwise = TablePlan(TableSharding.ROWWISE, TableOptimizer.SPARSE)
         plans = {
             "a": rowwise,
@@ -472,7 +472,7 @@ class SparseCoreCheckpointFormatTest(unittest.TestCase):
             "big": TablePlan(TableSharding.ROWWISE, TableOptimizer.SPARSE, big),
             "c": rowwise,
         }
-        return InGraphSparseArch(
+        return TPUSparseArch(
             self._TABLES,
             {"fa": 1, "fr": 1, "fb": 1, "fc": 1},
             world_size=_CHIPS,
