@@ -67,6 +67,14 @@ class BuildEmbeddingBackendTest(TestCase):
                 "in_graph", embedding_collection_fqn="owner.collection"
             )
 
+    def test_sparsecore_tables_need_the_in_graph_backend(self) -> None:
+        with self.assertRaisesRegex(ValueError, "in_graph"):
+            build_embedding_backend(
+                "cpu",
+                embedding_collection_fqn="owner.collection",
+                sparsecore_tables="all",
+            )
+
     def test_an_unknown_name_raises(self) -> None:
         with self.assertRaisesRegex(ValueError, "unknown embedding backend"):
             build_embedding_backend("gpu", embedding_collection_fqn="owner.collection")
