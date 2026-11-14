@@ -53,7 +53,7 @@ spec:
                 --dataset debug
                 --batch_size 32
                 --num_train_batches 100
-                --embedding_backend in_graph
+                --embedding_backend tpu
                 --log_every 10
               ports:
               - containerPort: 8471

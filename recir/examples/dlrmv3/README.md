@@ -9,7 +9,7 @@ generative-recommenders, JAX (TPU), and recir.
 dlrmv3/
   common/   model, token-budget batch layout, data pipeline, config, metrics (shared)
   gpu/      HybridParallel + Inductor + FBGEMM TBE, one process per GPU (torchrun)
-  tpu/      GSPMD + XLA via torchax, embedding tables inside the program (in_graph)
+  tpu/      GSPMD + XLA via torchax, embedding tables inside the program (tpu)
 ```
 
 ## Tested software stack
@@ -158,7 +158,7 @@ scale.
 - torch runs on the host CPU, and the step is lowered to one GSPMD program
   over all chips.
 - Embedding tables are parameters inside the same GSPMD program (the
-  `recir.embedding` in_graph backend). They are row-wise sharded over all chips,
+  `recir.embedding` tpu backend). They are row-wise sharded over all chips,
   looked up with the ring-shift kernel, and trained by a second optimizer
   compiled into the graph. The ring-shift kernel only runs on real TPUs.
 - `--embedding_backend cpu` keeps the tables in torchrec DMP on the hosts
@@ -166,7 +166,7 @@ scale.
   TPUs.
 - Dropout uses `DropoutPRNGTransform`, keyed by the in-graph warmup counter so
   each compiled step receives a deterministic, iteration-specific mask.
-- Checkpointing supports the default `in_graph` backend on single- and
+- Checkpointing supports the default `tpu` backend on single- and
   multi-host jobs. The `cpu` embedding backend does not yet checkpoint its
   torchrec fused optimizer state.
 
@@ -214,7 +214,7 @@ Both trainers can periodically evaluate and write distributed checkpoints:
 ```
 
 Resume with `--resume_from <checkpoint>`. GPU checkpoints cover dense and
-planned sparse state. TPU checkpoints support the default `in_graph` embedding
+planned sparse state. TPU checkpoints support the default `tpu` embedding
 backend; the host CPU embedding backend does not currently save its fused
 TorchRec optimizer state.
 

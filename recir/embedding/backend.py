@@ -9,7 +9,7 @@
 Deliberately free of JAX and of any model-specific import so that CPU-only
 callers (and the quantization hooks) can depend on the interface without
 pulling in the ~500 MiB JAX/SparseCore stack. The concrete backends live in
-``cpu.py``, ``sparsecore.py``, and ``in_graph.py``.
+``cpu.py`` and ``tpu.py``.
 
 A backend binds the torchrec ``EmbeddingCollection`` the model names by FQN
 (``embedding_collection_fqn``); ``factory.build_embedding_backend`` picks one by
@@ -286,7 +286,7 @@ def table_plans_from_embedding_tables(
 
     ``sharding`` is one field that decides two things, because that is how
     torchrec couples them: the sharding type picks the compute kernel, and the
-    kernel picks the optimizer (see this module's header table). The in-graph
+    kernel picks the optimizer (see this module's header table). The tpu
     backend has no such coupling -- it reads plain ``nn.Parameter``s -- so it
     has to reproduce the pairing deliberately:
 
@@ -315,7 +315,7 @@ def table_plans_from_embedding_tables(
             plans[name] = TablePlan(TableSharding.REPLICATED, TableOptimizer.DENSE)
         else:
             raise ValueError(
-                f"table {name!r} asks for sharding={value!r}, which the in-graph "
+                f"table {name!r} asks for sharding={value!r}, which the tpu "
                 "backend has no lookup for. It implements ROW_WISE and "
                 "DATA_PARALLEL only."
             )

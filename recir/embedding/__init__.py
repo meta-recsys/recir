@@ -12,7 +12,7 @@ Two backends share the ``EmbeddingBackend`` ABC from ``backend.py``:
                                         Small tables -> TABLE_WISE, large
                                         -> ROW_WISE.
 
-  TPUEmbeddingBackend (in_graph.py)   - each table's TablePlan picks its
+  TPUEmbeddingBackend (tpu.py)        - each table's TablePlan picks its
                                         compute kernel: ring shift, traced
                                         inside the compiled GSPMD program, or
                                         SparseCore (sparsecore_rowwise.py).

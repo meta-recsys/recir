@@ -4,11 +4,13 @@
 # LICENSE file in the root directory of this source tree.
 
 
-"""In-graph row-wise-sharding embedding backend.
+"""TPU embedding backend.
 
-This module bundles the whole in-graph embedding path:
+Each table's ``TablePlan`` picks its compute kernel: ring shift, traced inside
+the compiled GSPMD program, or SparseCore (``sparsecore_rowwise.py``), run by a
+device-resident graph break outside it. This module bundles the whole path:
 
-  * ``InGraphSparseArch`` -- an EC-shaped ``nn.Module`` that calls
+  * ``TPUSparseArch`` -- an EC-shaped ``nn.Module`` that calls
     ``torch.ops.recir.ringshift_embedding`` for the ROWWISE tables. The op is
     opaque + lowered to the ring-shift kernel INSIDE recir's single compiled
     GSPMD program (see ``recir/torchax/ops/jseq_embedding.py``), so the
@@ -26,16 +28,16 @@ This module bundles the whole in-graph embedding path:
     wrongly matches on every shape, key and name, so the choice has to be made
     where someone can read it.
 
-  * ``SparseArchInputBreakDispatcher`` -- cuts a graph break at the sparse-arch
+  * ``TPUSparseArchDispatcher`` -- cuts a graph break at the sparse-arch
     *input ids* (not the arch): the preprocessor + merged-id-list build run eager
     and the ids are injected back into the graph, while the (ring-shift)
-    ``InGraphSparseArch`` stays in-graph consuming them. Keeps the heavy
+    ``TPUSparseArch`` stays in-graph consuming them. Keeps the heavy
     id-list handling out of the XLA/GSPMD program (the SPMD partitioner segfaults
     on it at 64-chip) while doing the embedding lookup on TPU.
 
   * ``TPUEmbeddingBackend`` -- the ``EmbeddingBackend`` entry point.
     ``setup()`` swaps the model's torchrec ``EmbeddingCollection`` (named by
-    ``embedding_collection_fqn``) for ``InGraphSparseArch`` and builds the
+    ``embedding_collection_fqn``) for ``TPUSparseArch`` and builds the
     sparse optimizer over the tables their plan assigns to it (the table is now
     a normal ``nn.Parameter``). The model binding supplies that FQN and the
     optimizer factory via ``sparse_optimizer_builder``, keeping this module free
@@ -152,7 +154,7 @@ def _to_compute_dtype(x: torch.Tensor) -> torch.Tensor:
     return x.float() if x.dtype != torch.float32 else x
 
 
-class InGraphSparseArch(nn.Module):
+class TPUSparseArch(nn.Module):
     """In-graph EC replacement. forward(KJT) -> Dict[str, JaggedTensor].
 
     Args:
@@ -237,7 +239,7 @@ class InGraphSparseArch(nn.Module):
                 torch.float16,
             ):
                 logger.warning(
-                    "[in_graph] table '%s': data_type=%s ignored, storing "
+                    "[tpu] table '%s': data_type=%s ignored, storing "
                     "float32 -- ring-shift storage supports float32 and float16",
                     tc.name,
                     tc.data_type,
@@ -267,7 +269,7 @@ class InGraphSparseArch(nn.Module):
                     nn.init.uniform_(host, -init_bound, init_bound)
                     self._sparsecore_host_weights[tc.name] = host
                 logger.info(
-                    f"[in_graph] table '{tc.name}': rows={tc.num_embeddings} "
+                    f"[tpu] table '{tc.name}': rows={tc.num_embeddings} "
                     f"D={tc.embedding_dim} dtype={dtype} sharding=rowwise "
                     f"kernel=sparsecore optimizer=row-wise Adagrad on SparseCore "
                     f"features={tc.feature_names}"
@@ -299,7 +301,7 @@ class InGraphSparseArch(nn.Module):
                     nn.init.uniform_(p, -init_bound, init_bound)
                 self._sharded_tables[tc.name] = p
             logger.info(
-                f"[in_graph] table '{tc.name}': rows={tc.num_embeddings} "
+                f"[tpu] table '{tc.name}': rows={tc.num_embeddings} "
                 f"D={tc.embedding_dim} dtype={dtype} sharding={sharding.value} "
                 f"optimizer={table_plans[tc.name].optimizer.value} "
                 f"features={tc.feature_names}"
@@ -380,7 +382,7 @@ class InGraphSparseArch(nn.Module):
         """Embed a merged id-list KJT -> per-feature activations.
 
         Two paths:
-          * input-break (in-graph backend, ``_input_break`` set): mark the merged
+          * input-break (tpu backend, ``_input_break`` set): mark the merged
             ids/lengths as a graph-break boundary and inject per-feature
             ``[W, T_local]`` blocks, so the feature-major flat values never enter
             the compiled graph (slicing a feature-major axis after batch-sharding
@@ -620,7 +622,7 @@ def _sparsecore_prefix(override_id: int) -> str:
 
 
 def _sparsecore_state_dict_hook(
-    module: "InGraphSparseArch",
+    module: "TPUSparseArch",
     state_dict: Dict[str, Any],
     prefix: str,
     local_metadata: Any,
@@ -639,7 +641,7 @@ def _sparsecore_state_dict_hook(
 
 
 def _sparsecore_load_state_dict_pre_hook(
-    module: "InGraphSparseArch",
+    module: "TPUSparseArch",
     state_dict: Dict[str, Any],
     prefix: str,
     local_metadata: Any,
@@ -753,9 +755,9 @@ def _mark_input_break(
     return inj_ids, inj_lens
 
 
-class SparseArchInputBreakDispatcher:
+class TPUSparseArchDispatcher:
     """Dispatcher protocol (install_eager / install_graph) that breaks at the input
-    of the in-graph ``InGraphSparseArch`` while leaving the arch (ring-shift)
+    of the in-graph ``TPUSparseArch`` while leaving the arch (ring-shift)
     in-graph."""
 
     def __init__(
@@ -769,17 +771,15 @@ class SparseArchInputBreakDispatcher:
         self._override_id: int = override_id
         self._num_ranks: int = num_ranks
         self._feature_seqlens: Dict[str, int] = dict(feature_seqlens or {})
-        self._enabled: List[Tuple[int, InGraphSparseArch]] = []
+        self._enabled: List[Tuple[int, TPUSparseArch]] = []
 
     def install_eager(self, model: nn.Module) -> None:
-        # Enable graph-break-at-input mode on the InGraphSparseArch that setup()
+        # Enable graph-break-at-input mode on the TPUSparseArch that setup()
         # swapped in for the EmbeddingCollection. No module swap -- just
         # flip a flag; the arch's own forward then marks the break (see
-        # InGraphSparseArch.forward's input-break branch).
+        # TPUSparseArch.forward's input-break branch).
         archs = [
-            mod
-            for _fqn, mod in model.named_modules()
-            if isinstance(mod, InGraphSparseArch)
+            mod for _fqn, mod in model.named_modules() if isinstance(mod, TPUSparseArch)
         ]
         for i, arch in enumerate(archs):
             oid = self._override_id + i
@@ -787,12 +787,11 @@ class SparseArchInputBreakDispatcher:
             arch.enable_input_break(oid, self._input_kjt_keys)
             self._enabled.append((oid, arch))
         logger.info(
-            "SparseArchInputBreakDispatcher: enabled input-break on %d "
-            "InGraphSparseArch(s)",
+            "TPUSparseArchDispatcher: enabled input-break on %d TPUSparseArch(s)",
             len(self._enabled),
         )
         assert self._enabled, (
-            "SparseArchInputBreakDispatcher found no InGraphSparseArch -- did "
+            "TPUSparseArchDispatcher found no TPUSparseArch -- did "
             "setup() run, or did the model structure change?"
         )
 
@@ -846,7 +845,7 @@ class SparseArchInputBreakDispatcher:
             )
             if len(grad_indices) < len(sc_keys):
                 logger.warning(
-                    "[in_graph] SparseCore features without a gradient (unused by the loss): %s",
+                    "[tpu] SparseCore features without a gradient (unused by the loss): %s",
                     [k for i, k in enumerate(sc_keys) if i not in grad_indices],
                 )
             sparsecore.expect_gradients(grad_indices)
@@ -874,11 +873,9 @@ class SparseArchInputBreakDispatcher:
         return gm, flat_state
 
 
-def _seed_in_graph_tables_from_ec(
-    old_ec: nn.Module, new_ec: "InGraphSparseArch"
-) -> None:
+def _seed_in_graph_tables_from_ec(old_ec: nn.Module, new_ec: "TPUSparseArch") -> None:
     """Copy per-table weights from the model's existing torchrec
-    EmbeddingCollection into the in-graph table params, so the in_graph init is
+    EmbeddingCollection into the in-graph table params, so the tpu init is
     BYTE-identical to the cpu EC.
 
     Only host-materialized tables can be copied. Sharded meta params
@@ -896,7 +893,7 @@ def _seed_in_graph_tables_from_ec(
     if not src:
         logger.warning(
             "[seed] no EmbeddingCollection weights found to seed in-graph tables "
-            "(old_ec=%s); in_graph tables keep their random init",
+            "(old_ec=%s); tpu tables keep their random init",
             type(old_ec).__name__,
         )
         return
@@ -935,11 +932,12 @@ def _seed_in_graph_tables_from_ec(
 
 
 class TPUEmbeddingBackend(EmbeddingBackend):
-    """In-graph ring-shift embedding backend.
+    """TPU embedding backend: ring-shift tables in the compiled step, SparseCore
+    tables outside it.
 
     ``embedding_collection_fqn`` names the model's torchrec
     ``EmbeddingCollection`` (``setup()`` replaces it with an
-    :class:`InGraphSparseArch`). ``sparse_optimizer_builder`` builds
+    :class:`TPUSparseArch`). ``sparse_optimizer_builder`` builds
     the LR-buffered optimizer over the resulting table params and returns
     ``(optimizer, lr_buffer)``. Both are injected so this module stays free
     of model-specific module paths and imports.
@@ -1079,7 +1077,7 @@ class TPUEmbeddingBackend(EmbeddingBackend):
             raise ValueError(f"world_size must be positive, got {world_size}.")
         self._plan_sparsecore(table_configs)
 
-        new_ec = InGraphSparseArch(
+        new_ec = TPUSparseArch(
             table_configs=table_configs,
             feature_seqlens=self._feature_seqlens,
             world_size=world_size,
@@ -1156,7 +1154,3 @@ class TPUEmbeddingBackend(EmbeddingBackend):
                 lr_buffer=sparse_lr_buffer,
             ),
         )
-
-
-# The name before ComputeKernel; code written against it keeps working.
-InGraphEmbeddingBackend = TPUEmbeddingBackend

@@ -17,7 +17,7 @@ RUN pip install --upgrade pip
 #   table. fbgemm 1.4's jagged ops lack the meta kernels recir's fake-tensor
 #   trace needs; unpinned, pip pulls an fbgemm built against a torch nightly ABI.
 # - jax <0.11: 0.11 removed pltpu.DeviceIdType, used by recir's ring-shift
-#   embedding kernel (the default in_graph backend).
+#   embedding kernel (the default tpu backend).
 # PyTorch on CPU: recir lowers the traced step to XLA through torchax.
 RUN pip install 'torch==2.10.*' --index-url https://download.pytorch.org/whl/cpu
 RUN pip install "jax[tpu]<0.11"

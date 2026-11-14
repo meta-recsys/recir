@@ -16,7 +16,7 @@ Gloo coordinates ranks via JobSet env vars.
 
 Kept in its own module so the factory in ``__init__.py`` and the other
 backends don't pull in the heavy ``torchrec.distributed.*`` import surface
-when only the SparseCore or in-graph backend is used.
+when only the tpu backend is used.
 
 Model-agnostic: the caller supplies ``embedding_collection_fqn``, the FQN of
 the model's torchrec ``EmbeddingCollection``.
@@ -366,7 +366,7 @@ class CPUEmbeddingBackend(EmbeddingBackend):
         return dict(in_backward_optimizer_filter(model.named_parameters()))
 
 
-class SparseArchDispatcher:
+class CPUSparseArchDispatcher:
     """Graph-break dispatcher back to the real eager torchrec lookup.
 
     ``install_eager`` swaps the ``EmbeddingCollection`` at

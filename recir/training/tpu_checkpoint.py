@@ -7,7 +7,7 @@
 
 """TPU checkpoint support for RecIR GSPMD models with in-graph embeddings.
 
-The in_graph embedding tables live as torch ``nn.Parameter``s, so the whole
+The tpu embedding tables live as torch ``nn.Parameter``s, so the whole
 checkpoint can stay in the ``torch.distributed.checkpoint`` (DCP) world. But the
 ``_sharded_tables`` are per-process ``Shard(0)`` row blocks stored as *plain*
 Parameters with no sharding metadata: DCP would treat them as replicated and
@@ -659,7 +659,7 @@ def load_module_state_without_self_copy(
 
 
 class RecirCheckpointable(Stateful):
-    """DCP ``Stateful`` view of a ``RecirXLACompiledModule`` for the in_graph
+    """DCP ``Stateful`` view of a ``RecirXLACompiledModule`` for the tpu
     (TensorCore) backend.
 
     Wraps the compiled module so ``dcp.save``/``dcp.load`` capture the full model
@@ -709,7 +709,7 @@ class RecirCheckpointable(Stateful):
         self._host_buffers = host_buffers
         self._dense_optimizer = dense_optimizer
         self._embedding_optimizer = embedding_optimizer
-        # The in_graph sparse arch when it has SparseCore tables, else None.
+        # The tpu sparse arch when it has SparseCore tables, else None.
         self._sparse_arch = sparse_arch
         self._shard_order: List[int] | None = (
             None if shard_order is None else list(shard_order)
@@ -808,7 +808,7 @@ class RecirCheckpointable(Stateful):
 
     def _live_embedding_indices(self) -> Dict[str, int]:
         """Table -> its index in the live embedding optimizer's state_dict."""
-        from recir.embedding.in_graph import table_name_from_param
+        from recir.embedding.tpu import table_name_from_param
 
         optimizer = self._embedding_optimizer
         if optimizer is None:

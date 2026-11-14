@@ -24,11 +24,11 @@ from recir.embedding.backend import (
     TablePlan,
 )
 from recir.embedding.cpu import CPUEmbeddingBackend
-from recir.embedding.in_graph import TPUEmbeddingBackend
+from recir.embedding.tpu import TPUEmbeddingBackend
 from recir.training.optim import OptimConfig
 from recir.training.setup import build_sparse_lr_buffered_optimizer
 
-EMBEDDING_BACKENDS: tuple[str, ...] = ("cpu", "tpu", "in_graph")
+EMBEDDING_BACKENDS: tuple[str, ...] = ("cpu", "tpu")
 
 SparseOptimizerBuilder = Callable[
     [nn.Module, list[nn.Parameter], OptimConfig, torch.device, float],
@@ -49,13 +49,13 @@ def build_embedding_backend(
     """``name`` is one of :data:`EMBEDDING_BACKENDS`.
 
     ``embedding_tables`` are the model's own table objects; the cpu backend
-    reads their placement, and in_graph derives its plans from them when
-    ``table_plans`` is not given. ``sparsecore_tables`` is in_graph's (see
-    :class:`TPUEmbeddingBackend`). "tpu" names the same backend as "in_graph".
+    reads their placement, and tpu derives its plans from them when
+    ``table_plans`` is not given. ``sparsecore_tables`` is tpu's (see
+    :class:`TPUEmbeddingBackend`).
     """
-    if sparsecore_tables and name not in ("in_graph", "tpu"):
+    if sparsecore_tables and name != "tpu":
         raise ValueError(
-            f"sparsecore_tables={sparsecore_tables!r} needs the in_graph backend, "
+            f"sparsecore_tables={sparsecore_tables!r} needs the tpu backend, "
             f"not {name!r}"
         )
     if name == "cpu":
@@ -63,12 +63,12 @@ def build_embedding_backend(
             embedding_collection_fqn=embedding_collection_fqn,
             embedding_tables=embedding_tables,
         )
-    if name in ("in_graph", "tpu"):
+    if name == "tpu":
         if table_plans is None and embedding_tables is not None:
             table_plans = table_plans_from_embedding_tables(embedding_tables)
         if table_plans is None:
             raise ValueError(
-                "the in_graph backend needs table plans: each table's placement "
+                "the tpu backend needs table plans: each table's placement "
                 "decides both its layout and which optimizer trains it, and "
                 "there is no default to fall back on."
             )
