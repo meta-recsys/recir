@@ -308,7 +308,11 @@ class RecirGSPMDCompiledModuleBase(RecirCompiledModuleBase):
         Duck-typed hook: mvai_cloud's CheckpointManager uses this if present, so
         the recir/JAX-specific checkpoint logic stays out of the shared framework.
         """
-        from recir.embedding.in_graph import DP_TABLE_PREFIX, SHARDED_TABLE_PREFIX
+        from recir.embedding.in_graph import (
+            DP_TABLE_PREFIX,
+            InGraphSparseArch,
+            SHARDED_TABLE_PREFIX,
+        )
         from recir.training.tpu_checkpoint import (
             gather_shard_order,
             RecirCheckpointable,
@@ -327,5 +331,13 @@ class RecirGSPMDCompiledModuleBase(RecirCompiledModuleBase):
                 gather_shard_order(self._num_processes)
                 if self._num_processes > 1
                 else None
+            ),
+            sparse_arch=next(
+                (
+                    m
+                    for m in self._model.modules()
+                    if isinstance(m, InGraphSparseArch) and m.sparsecore is not None
+                ),
+                None,
             ),
         )
