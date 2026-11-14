@@ -27,6 +27,7 @@ import torch.distributed as dist
 import torch.distributed.checkpoint as dcp
 import torch.utils._pytree as pytree
 from recir.training.graph_state import SharedGraphState
+from recir.training.optim import build_torch_optimizer
 from torch.distributed.checkpoint import FileSystemReader
 from torch.distributed.checkpoint.stateful import Stateful
 from torch.distributed.device_mesh import DeviceMesh
@@ -698,6 +699,7 @@ class RecirCheckpointable(Stateful):
         dense_optimizer: Any = None,
         embedding_optimizer: Any = None,
         shard_order: Sequence[int] | None = None,
+        sparse_arch: Any = None,
     ) -> None:
         self._wrapper = wrapper
         self._num_processes = num_processes
@@ -707,6 +709,8 @@ class RecirCheckpointable(Stateful):
         self._host_buffers = host_buffers
         self._dense_optimizer = dense_optimizer
         self._embedding_optimizer = embedding_optimizer
+        # The in_graph sparse arch when it has SparseCore tables, else None.
+        self._sparse_arch = sparse_arch
         self._shard_order: List[int] | None = (
             None if shard_order is None else list(shard_order)
         )
@@ -763,13 +767,19 @@ class RecirCheckpointable(Stateful):
             sd[OPTIMIZER_STATE_KEY] = pytree.tree_map(
                 _freeze_checkpoint_value, self._dense_optimizer.state_dict()
             )
-        if self._embedding_optimizer is not None:
+        embedding_payload = None
+        if self._sparse_arch is not None:
+            sd[EMBEDDING_OPTIMIZER_STATE_KEY], embedding_payload = (
+                self._embedding_state_with_sparsecore(mesh)
+            )
+        elif self._embedding_optimizer is not None:
             sd[EMBEDDING_OPTIMIZER_STATE_KEY] = _embedding_optimizer_state_for_save(
                 self._embedding_optimizer,
                 self._wrapper,
                 self._sharded_prefixes,
                 mesh,
             )
+            embedding_payload = sd[EMBEDDING_OPTIMIZER_STATE_KEY]
         sd[WARMUP_ITER_KEY] = int(self._warmup.iter)
         if mesh is not None:
             sd[SHARD_ORDER_KEY] = list(self.shard_order())
@@ -782,10 +792,7 @@ class RecirCheckpointable(Stateful):
                 sd,
                 [
                     (self._dense_optimizer, sd.get(OPTIMIZER_STATE_KEY)),
-                    (
-                        self._embedding_optimizer,
-                        sd.get(EMBEDDING_OPTIMIZER_STATE_KEY),
-                    ),
+                    (self._embedding_optimizer, embedding_payload),
                 ],
             )
         logger.info(
@@ -798,6 +805,129 @@ class RecirCheckpointable(Stateful):
             time.perf_counter() - t_wrap,
         )
         return sd
+
+    def _live_embedding_indices(self) -> Dict[str, int]:
+        """Table -> its index in the live embedding optimizer's state_dict."""
+        from recir.embedding.in_graph import table_name_from_param
+
+        optimizer = self._embedding_optimizer
+        if optimizer is None:
+            return {}
+        names = {id(p): n for n, p in self._wrapper.named_parameters()}
+        (group,) = optimizer.param_groups
+        return {
+            cast(str, table_name_from_param(names[id(p)])): i
+            for i, p in enumerate(group["params"])
+        }
+
+    def _embedding_state_with_sparsecore(
+        self, mesh: DeviceMesh | None
+    ) -> Tuple[Dict[str, Any], Dict[str, Any] | None]:
+        """The embedding optimizer's checkpoint entry numbered as a build without
+        SparseCore tables numbers it, the SparseCore tables' momentum (and FP16
+        rounding counter) included; and the live optimizer's part of it, numbered
+        as the live optimizer is, for the host-buffer checks."""
+        arch = self._sparse_arch
+        sparsecore = arch.sparsecore
+        order: List[str] = arch.sparse_optimizer_order
+        live = self._live_embedding_indices()
+        optimizer = self._embedding_optimizer
+        if optimizer is not None:
+            live_sd = optimizer.state_dict()
+            (group,) = live_sd["param_groups"]
+            live_state = live_sd["state"]
+        else:
+            args = arch.sparse_optimizer_args
+            assert args is not None, "TPUEmbeddingBackend.setup() did not run"
+            config, lr, grad_scale = args
+            stand_in = torch.nn.Parameter(torch.zeros(1, 1))
+            (group,) = build_torch_optimizer(
+                [stand_in], config, lr, grad_scale
+            ).state_dict()["param_groups"]
+            live_state = {}
+        fp16 = {t.name for t in arch.sparsecore_tables if t.fp16}
+        state: Dict[int, Any] = {}
+        for i, table in enumerate(order):
+            if table in live:
+                if live[table] in live_state:
+                    state[i] = live_state[live[table]]
+                continue
+            state[i] = {
+                "sum": torch.from_numpy(sparsecore.export_table(table, "momentum"))
+            }
+            if table in fp16 and group.get("stochastic_rounding", True):
+                # As a build without SparseCore tables seeds the table's stream.
+                state[i]["rounding_seed"] = torch.tensor(
+                    (int(group["rounding_seed"]) + i) % (2**32), dtype=torch.int64
+                )
+                state[i]["rounding_counter"] = torch.tensor(
+                    sparsecore.rounding_counter, dtype=torch.int64
+                )
+        payload = pytree.tree_map(
+            _freeze_checkpoint_value,
+            {
+                "state": state,
+                "param_groups": [dict(group, params=list(range(len(order))))],
+            },
+        )
+        if mesh is not None:
+            for i, table in enumerate(order):
+                if i in payload["state"] and arch.row_sharded(table):
+                    payload["state"][i] = pytree.tree_map(
+                        lambda leaf: (
+                            DTensor.from_local(leaf, mesh, [Shard(0)], run_check=False)
+                            if isinstance(leaf, torch.Tensor) and leaf.ndim > 0
+                            else leaf
+                        ),
+                        payload["state"][i],
+                    )
+        if optimizer is None:
+            return payload, None
+        live_view = {
+            "state": {
+                live[t]: payload["state"][i]
+                for i, t in enumerate(order)
+                if t in live and i in payload["state"]
+            },
+            "param_groups": [
+                dict(payload["param_groups"][0], params=sorted(live.values()))
+            ],
+        }
+        return payload, live_view
+
+    def _load_embedding_state_with_sparsecore(
+        self, payload: Dict[str, Any]
+    ) -> Dict[str, Any] | None:
+        """Load the SparseCore tables' momentum and rounding counter from an entry
+        numbered as by :meth:`_embedding_state_with_sparsecore`; return the rest,
+        renumbered for the live optimizer (None without one)."""
+        arch = self._sparse_arch
+        live = self._live_embedding_indices()
+        state = payload.get("state", {})
+        live_state: Dict[int, Any] = {}
+        for i, table in enumerate(arch.sparse_optimizer_order):
+            entry = state.get(i)
+            if entry is None:
+                continue
+            if table in live:
+                live_state[live[table]] = entry
+                continue
+            entry = _unwrap_dtensors(entry)
+            if "sum" in entry:
+                arch.sparsecore.import_table(
+                    table,
+                    "momentum",
+                    entry["sum"].detach().cpu().numpy().reshape(-1, 1),
+                )
+            if "rounding_counter" in entry:
+                arch.sparsecore.rounding_counter = int(entry["rounding_counter"])
+        if self._embedding_optimizer is None:
+            return None
+        (group,) = payload["param_groups"]
+        return {
+            "state": live_state,
+            "param_groups": [dict(group, params=sorted(live.values()))],
+        }
 
     def make_async_stager(self) -> Any:
         """Avoid DCP's full CPU deepcopy after ``state_dict`` has frozen state."""
@@ -829,6 +959,10 @@ class RecirCheckpointable(Stateful):
             )
         }
         load_module_state_without_self_copy(self._wrapper, body)
+        if self._sparse_arch is not None and embedding_opt_sd is not None:
+            embedding_opt_sd = self._load_embedding_state_with_sparsecore(
+                embedding_opt_sd
+            )
         if opt_sd is not None and self._dense_optimizer is not None:
             _load_optimizer_state_preserving_lr(self._dense_optimizer, opt_sd)
         if embedding_opt_sd is not None and self._embedding_optimizer is not None:

@@ -107,6 +107,7 @@ logger: logging.Logger = logging.getLogger(__name__)
 
 _PREFIX: str = "seq_sparse_input_break"
 _SPARSECORE_PREFIX: str = "seq_sparsecore_lookup"
+_SPARSECORE_ANCHOR: str = "_sparsecore_grad_anchor"
 
 
 SHARDED_TABLE_PREFIX: str = "_sharded_tables"
@@ -196,6 +197,11 @@ class InGraphSparseArch(nn.Module):
         self._sparsecore_tables: List[SparseCoreTable] = []
         self._sparsecore_host_weights: Dict[str, torch.Tensor] = {}
         self.sparsecore: Optional[SparseCoreRowwiseTables] = None
+        # The sparse optimizer a build without SparseCore tables would make:
+        # (config, LR buffer, grad_scale), set by TPUEmbeddingBackend.setup.
+        self.sparse_optimizer_args: Optional[
+            Tuple[OptimConfig, torch.Tensor, float]
+        ] = None
         self._world_size: int = world_size
 
         missing = sorted(tc.name for tc in table_configs if tc.name not in table_plans)
@@ -298,10 +304,38 @@ class InGraphSparseArch(nn.Module):
                 f"optimizer={table_plans[tc.name].optimizer.value} "
                 f"features={tc.feature_names}"
             )
+        # The sparse optimizer's parameter order in a build without SparseCore
+        # tables (_sharded_tables, then _dp_tables, each in config order): the
+        # checkpoint numbers embedding optimizer state this way.
+        self.sparse_optimizer_order: List[str] = sorted(
+            (
+                tc.name
+                for tc in table_configs
+                if table_plans[tc.name].optimizer is TableOptimizer.SPARSE
+            ),
+            key=lambda name: self._table_sharding[name] is TableSharding.REPLICATED,
+        )
         if self._sparsecore_tables:
             # Gives the SparseCore activations a gradient path, so their backward
-            # markers are traced; always zero and receives zero gradient.
+            # markers are traced; always zero and receives zero gradient. Kept out
+            # of the optimizers and the checkpoint, which then match a build
+            # without SparseCore tables.
             self._sparsecore_grad_anchor = nn.Parameter(torch.zeros(()))
+            self._register_state_dict_hook(_sparsecore_state_dict_hook)
+            self._register_load_state_dict_pre_hook(
+                _sparsecore_load_state_dict_pre_hook, with_module=True
+            )
+            self.register_load_state_dict_post_hook(
+                _sparsecore_load_state_dict_post_hook
+            )
+
+    @property
+    def sparsecore_tables(self) -> List[SparseCoreTable]:
+        return self._sparsecore_tables
+
+    def row_sharded(self, table: str) -> bool:
+        """Whether ``table`` is saved as row blocks (``_sharded_tables``)."""
+        return self._table_sharding[table] is not TableSharding.REPLICATED
 
     def init_sparsecore(
         self, lr: Callable[[], float], eps: float, grad_scale: float
@@ -583,6 +617,52 @@ def _prefix(override_id: int) -> str:
 
 def _sparsecore_prefix(override_id: int) -> str:
     return f"{_SPARSECORE_PREFIX}_{override_id}"
+
+
+def _sparsecore_state_dict_hook(
+    module: "InGraphSparseArch",
+    state_dict: Dict[str, Any],
+    prefix: str,
+    local_metadata: Any,
+) -> None:
+    """SparseCore tables as ROWWISE ones are saved: this host's id-order rows
+    under ``_sharded_tables.<table>``. Their momentum goes with the embedding
+    optimizer's (``recir.training.tpu_checkpoint``)."""
+    state_dict.pop(prefix + _SPARSECORE_ANCHOR, None)
+    sparsecore = module.sparsecore
+    if sparsecore is None:
+        return
+    for t in module._sparsecore_tables:
+        state_dict[f"{prefix}{SHARDED_TABLE_PREFIX}.{t.name}"] = torch.from_numpy(
+            sparsecore.export_table(t.name, "weights")
+        )
+
+
+def _sparsecore_load_state_dict_pre_hook(
+    module: "InGraphSparseArch",
+    state_dict: Dict[str, Any],
+    prefix: str,
+    local_metadata: Any,
+    strict: bool,
+    missing_keys: List[str],
+    unexpected_keys: List[str],
+    error_msgs: List[str],
+) -> None:
+    sparsecore = module.sparsecore
+    assert sparsecore is not None, "init_sparsecore() did not run"
+    for t in module._sparsecore_tables:
+        key = f"{prefix}{SHARDED_TABLE_PREFIX}.{t.name}"
+        if key not in state_dict:
+            missing_keys.append(key)
+            continue
+        sparsecore.import_table(
+            t.name, "weights", state_dict.pop(key).detach().cpu().numpy()
+        )
+
+
+def _sparsecore_load_state_dict_post_hook(module: nn.Module, incompatible: Any) -> None:
+    for key in [k for k in incompatible.missing_keys if k.endswith(_SPARSECORE_ANCHOR)]:
+        incompatible.missing_keys.remove(key)
 
 
 def _scheduled_lr(model: nn.Module, cfg: OptimConfig) -> Callable[[], float]:
@@ -945,7 +1025,7 @@ class TPUEmbeddingBackend(EmbeddingBackend):
         dense = {
             n: p
             for n, p in model.named_parameters()
-            if table_name_from_param(n) is None
+            if table_name_from_param(n) is None and not n.endswith(_SPARSECORE_ANCHOR)
         }
         dense.update(self._params_by_optimizer(model, TableOptimizer.DENSE))
         return dense
@@ -1045,6 +1125,11 @@ class TPUEmbeddingBackend(EmbeddingBackend):
                 lr=_scheduled_lr(model, sparse_config),
                 eps=sparse_config.eps,
                 grad_scale=self._sparse_grad_scale,
+            )
+            new_ec.sparse_optimizer_args = (
+                sparse_config,
+                sparse_lr_buffer,
+                self._sparse_grad_scale,
             )
         dense_tables = sum(
             1
