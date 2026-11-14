@@ -6,11 +6,10 @@
 
 """Shared eager-swap machinery for the per-backend sparse-arch dispatchers.
 
-The dispatchers themselves live with their backends -- ``cpu.SparseArchDispatcher``
-(eager torchrec) and ``sparsecore.JAXSparseArchDispatcher`` (SparseCore). Only
-their *graph* half differs; the *eager* half is identical and lives here:
+The dispatcher itself lives with its backend -- ``cpu.SparseArchDispatcher``
+(eager torchrec). Its *eager* half lives here:
 
-  * :class:`DummySparseArch` -- the tracing stub they both swap in. It plants
+  * :class:`DummySparseArch` -- the tracing stub it swaps in. It plants
     marker ops so tracing sees stable shapes and the graph half can rediscover
     the dispatch inputs/outputs.
   * :func:`sparse_arch_marker_prefix` -- the marker namespace both halves agree on.
