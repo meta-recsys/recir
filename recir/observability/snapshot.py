@@ -17,6 +17,7 @@ from typing import Any, Callable, Iterator
 
 from recir.observability.compiles import snapshots_on, StepCompile, TraceRecord
 from recir.observability.guard import contained
+from recir.observability.stages import GraphStage
 from torch import fx
 
 
@@ -33,20 +34,32 @@ def keep_trace(traced: Callable[..., Any], gm: fx.GraphModule) -> TraceRecord | 
 
 
 @contextmanager
-def compiling_step(trace: TraceRecord | None) -> Iterator[None]:
+def compiling_step(trace: TraceRecord | None) -> Iterator[StepCompile | None]:
     """
-    Run ``compile_from_gm`` inside this context as one step compile, starting
-    with the graph ``trace`` kept and closed with ``compilation_metrics`` on
-    exit. Without a trace, or when snapshots are off, no step compile is opened
-    and ``compile_from_gm`` runs as without snapshots.
-    Exceptions from ``compile_from_gm`` pass through unchanged.
+    Run ``compile_from_gm`` inside this context as one step compile, which it
+    gives, starting with the graph ``trace`` kept and closed with
+    ``compilation_metrics`` on exit. Without a trace, or when snapshots are
+    off, no step compile is opened, ``compile_from_gm`` runs as without
+    snapshots, and it gives None. Exceptions from ``compile_from_gm`` pass
+    through unchanged.
     """
     step: StepCompile | None = None
     with contained("step compile not created"):
         if trace is not None and snapshots_on():
             step = StepCompile(trace)
     if step is None:
-        yield
+        yield None
         return
-    with step.compiling():
-        yield
+    with step.compiling() as started:
+        yield started
+
+
+def record_stage(
+    step: StepCompile | None, stage_cls: type[GraphStage], gm: fx.GraphModule
+) -> None:
+    """Snapshot a ``stage_cls`` stage from ``gm`` in ``step``, if any. Never raises."""
+    with contained(
+        f"{getattr(stage_cls, 'name', stage_cls.__name__)} stage not recorded"
+    ):
+        if step is not None:
+            step.record_stage(stage_cls, gm)
