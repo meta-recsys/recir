@@ -195,9 +195,15 @@ class RecirGSPMDCompiledModuleBase(RecirCompiledModuleBase):
         result: Tuple[torch.Tensor, Dict[str, torch.Tensor]] = compiled_step(
             *self._step_args(batch)
         )
-        if self._emb_opt is None:
+        if self._syncs_state_every_step():
             sync_device_state_to_torch(compiled_step)
         return result
+
+    def _syncs_state_every_step(self) -> bool:
+        """Whether every step mirrors all device state to torch: backends without
+        an in_graph embedding optimizer read host copies between steps (e.g. the
+        CPU backend pushes the sparse LR from its host buffer)."""
+        return self._emb_opt is None
 
     @property
     def in_graph_metrics(self) -> bool:
