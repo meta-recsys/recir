@@ -435,3 +435,104 @@ class SparseCoreInGraphTest(unittest.TestCase):
             },
             backend._table_plans,
         )
+
+
+class _StubSparseCore:
+    def __init__(self) -> None:
+        self.imported: Dict[str, np.ndarray] = {}
+
+    def export_table(self, table: str, part: str) -> np.ndarray:
+        return np.full((56, _D), 0.5, np.float32)
+
+    def import_table(self, table: str, part: str, values: np.ndarray) -> None:
+        self.imported[f"{table}/{part}"] = values
+
+
+class SparseCoreCheckpointFormatTest(unittest.TestCase):
+    _TABLES = [
+        EmbeddingConfig(
+            num_embeddings=50, embedding_dim=_D, name="a", feature_names=["fa"]
+        ),
+        EmbeddingConfig(
+            num_embeddings=16, embedding_dim=_D, name="rep", feature_names=["fr"]
+        ),
+        EmbeddingConfig(
+            num_embeddings=50, embedding_dim=_D, name="big", feature_names=["fb"]
+        ),
+        EmbeddingConfig(
+            num_embeddings=50, embedding_dim=_D, name="c", feature_names=["fc"]
+        ),
+    ]
+
+    def _arch(self, big: ComputeKernel) -> InGraphSparseArch:
+        rowwise = TablePlan(TableSharding.ROWWISE, TableOptimizer.SPARSE)
+        plans = {
+            "a": rowwise,
+            "rep": TablePlan(TableSharding.REPLICATED, TableOptimizer.DENSE),
+            "big": TablePlan(TableSharding.ROWWISE, TableOptimizer.SPARSE, big),
+            "c": rowwise,
+        }
+        return InGraphSparseArch(
+            self._TABLES,
+            {"fa": 1, "fr": 1, "fb": 1, "fc": 1},
+            world_size=_CHIPS,
+            table_plans=plans,
+            on_device_init=False,
+        )
+
+    def test_optimizer_order_is_the_order_without_sparsecore(self) -> None:
+        sparsecore = self._arch(ComputeKernel.SPARSECORE)
+        ringshift = self._arch(ComputeKernel.RINGSHIFT)
+        rowwise = TablePlan(TableSharding.ROWWISE, TableOptimizer.SPARSE)
+        backend = TPUEmbeddingBackend(
+            "x",
+            mock.Mock(),
+            {
+                "a": rowwise,
+                "rep": TablePlan(TableSharding.REPLICATED, TableOptimizer.DENSE),
+                "big": rowwise,
+                "c": rowwise,
+            },
+        )
+
+        order = [
+            name.split(".")[-1]
+            for name in backend.embedding_named_parameters(ringshift)
+        ]
+
+        self.assertEqual(order, sparsecore.sparse_optimizer_order)
+        self.assertEqual(["a", "big", "c"], order)
+
+    def test_state_dict_saves_sparsecore_tables_as_rowwise_ones(self) -> None:
+        arch = self._arch(ComputeKernel.SPARSECORE)
+        stub = _StubSparseCore()
+        arch.sparsecore = stub  # pyrefly: ignore[bad-assignment]
+
+        state = arch.state_dict()
+
+        self.assertIn("_sharded_tables.big", state)
+        self.assertNotIn("_sparsecore_grad_anchor", state)
+        self.assertEqual(
+            set(self._arch(ComputeKernel.RINGSHIFT).state_dict()), set(state)
+        )
+        state["_sharded_tables.big"] = torch.full((56, _D), 2.0)
+        arch.load_state_dict(state)
+        np.testing.assert_array_equal(
+            stub.imported["big/weights"], np.full((56, _D), 2.0)
+        )
+
+    def test_anchor_is_in_no_optimizer(self) -> None:
+        arch = self._arch(ComputeKernel.SPARSECORE)
+        backend = TPUEmbeddingBackend("x", mock.Mock(), {})
+        backend._table_plans = {
+            "a": TablePlan(TableSharding.ROWWISE, TableOptimizer.SPARSE),
+            "rep": TablePlan(TableSharding.REPLICATED, TableOptimizer.DENSE),
+            "big": _SPARSECORE_PLAN,
+            "c": TablePlan(TableSharding.ROWWISE, TableOptimizer.SPARSE),
+        }
+
+        names = set(backend.dense_named_parameters(arch)) | set(
+            backend.embedding_named_parameters(arch)
+        )
+
+        self.assertNotIn("_sparsecore_grad_anchor", names)
