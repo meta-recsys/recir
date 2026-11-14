@@ -45,13 +45,20 @@ def build_embedding_backend(
     embedding_tables: dict[str, Any] | None = None,
     sparse_optimizer_builder: SparseOptimizerBuilder = build_sparse_lr_buffered_optimizer,
     on_device_init: bool = True,
+    sparsecore_tables: str = "",
 ) -> EmbeddingBackend:
     """``name`` is one of :data:`EMBEDDING_BACKENDS`.
 
     ``embedding_tables`` are the model's own table objects; the cpu backend
     reads their placement, and in_graph derives its plans from them when
-    ``table_plans`` is not given.
+    ``table_plans`` is not given. ``sparsecore_tables`` is in_graph's (see
+    :class:`InGraphEmbeddingBackend`).
     """
+    if sparsecore_tables and name != "in_graph":
+        raise ValueError(
+            f"sparsecore_tables={sparsecore_tables!r} needs the in_graph backend, "
+            f"not {name!r}"
+        )
     if name == "cpu":
         return CPUEmbeddingBackend(
             embedding_collection_fqn=embedding_collection_fqn,
@@ -73,6 +80,7 @@ def build_embedding_backend(
             sparse_optimizer_builder=sparse_optimizer_builder,
             table_plans=dict(table_plans),
             on_device_init=on_device_init,
+            sparsecore_tables=sparsecore_tables,
         )
     raise ValueError(
         f"unknown embedding backend {name!r}; use one of {EMBEDDING_BACKENDS}"
