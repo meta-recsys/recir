@@ -54,7 +54,8 @@ from the cached KJT).
 from __future__ import annotations
 
 import logging
-from typing import Any, Callable, Dict, List, Sequence, Tuple
+import os
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import jax
 import recir.ops.seq_embedding_op  # noqa: F401  (defines torch.ops.recir.ringshift_embedding)
@@ -72,6 +73,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from recir.embedding.backend import (
     check_binding,
+    ComputeKernel,
     EmbeddingBackend,
     EmbeddingSetupResult,
     SparseOptimizerRuntime,
@@ -81,12 +83,14 @@ from recir.embedding.backend import (
     TablePlan,
     TableSharding,
 )
+from recir.embedding.sparsecore_rowwise import SparseCoreRowwiseTables, SparseCoreTable
 from recir.ops.eager_dispatch import (
     install_graph_break_dispatch,
     mark_input,
     mark_output_with_bwd,
+    mark_output_with_device_bwd,
 )
-from recir.training.optim import OptimConfig
+from recir.training.optim import OptimConfig, warmup_lr
 from recir.utils.meta_tensor_init import (
     default_embedding_init_bound,
     mark_meta_uniform_init,
@@ -102,6 +106,7 @@ from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor
 logger: logging.Logger = logging.getLogger(__name__)
 
 _PREFIX: str = "seq_sparse_input_break"
+_SPARSECORE_PREFIX: str = "seq_sparsecore_lookup"
 
 
 SHARDED_TABLE_PREFIX: str = "_sharded_tables"
@@ -184,9 +189,14 @@ class InGraphSparseArch(nn.Module):
         self._break_input_kjt_keys: List[str] = []
         self._feature_to_table: Dict[str, str] = {}
         self._table_sharding: Dict[str, TableSharding] = {}
+        self._table_kernel: Dict[str, ComputeKernel] = {}
         self._table_pooling: Dict[str, str] = {}
         self._sharded_tables: nn.ParameterDict = nn.ParameterDict()
         self._dp_tables: nn.ParameterDict = nn.ParameterDict()
+        self._sparsecore_tables: List[SparseCoreTable] = []
+        self._sparsecore_host_weights: Dict[str, torch.Tensor] = {}
+        self.sparsecore: Optional[SparseCoreRowwiseTables] = None
+        self._world_size: int = world_size
 
         missing = sorted(tc.name for tc in table_configs if tc.name not in table_plans)
         if missing:
@@ -198,14 +208,21 @@ class InGraphSparseArch(nn.Module):
 
         for tc in table_configs:
             sharding = table_plans[tc.name].sharding
+            kernel = table_plans[tc.name].compute_kernel
             for f in tc.feature_names:
                 self._feature_to_table[f] = tc.name
             self._table_sharding[tc.name] = sharding
+            self._table_kernel[tc.name] = kernel
             pooling = _pooling_of(tc)
             if pooling != "none" and sharding is not TableSharding.ROWWISE:
                 raise ValueError(
                     f"table {tc.name!r} is pooled ({pooling}) but its TablePlan "
                     f"selects {sharding.value}; pooling needs ROWWISE sharding"
+                )
+            if pooling != "none" and kernel is ComputeKernel.SPARSECORE:
+                raise ValueError(
+                    f"table {tc.name!r} is pooled ({pooling}); SparseCore tables "
+                    "are unpooled"
                 )
             self._table_pooling[tc.name] = pooling
             dtype = data_type_to_dtype(tc.data_type)
@@ -222,6 +239,34 @@ class InGraphSparseArch(nn.Module):
                 dtype = torch.float32
             # Match the TorchRec EmbeddingCollection init scale
             init_bound = default_embedding_init_bound(tc.num_embeddings)
+            if kernel is ComputeKernel.SPARSECORE:
+                self._sparsecore_tables.append(
+                    SparseCoreTable(
+                        name=tc.name,
+                        num_embeddings=tc.num_embeddings,
+                        embedding_dim=tc.embedding_dim,
+                        feature_names=tuple(tc.feature_names),
+                        init_bound=init_bound,
+                        fp16=dtype == torch.float16,
+                    )
+                )
+                if not self._on_device_init:
+                    # Same shape, dtype and RNG draw as the ROWWISE host init, so
+                    # both placements start from the same weights.
+                    host = torch.empty(
+                        _round_up(tc.num_embeddings, world_size),
+                        tc.embedding_dim,
+                        dtype=dtype,
+                    )
+                    nn.init.uniform_(host, -init_bound, init_bound)
+                    self._sparsecore_host_weights[tc.name] = host
+                logger.info(
+                    f"[in_graph] table '{tc.name}': rows={tc.num_embeddings} "
+                    f"D={tc.embedding_dim} dtype={dtype} sharding=rowwise "
+                    f"kernel=sparsecore optimizer=row-wise Adagrad on SparseCore "
+                    f"features={tc.feature_names}"
+                )
+                continue
             if sharding is TableSharding.REPLICATED:
                 p = nn.Parameter(
                     torch.empty(tc.num_embeddings, tc.embedding_dim, dtype=dtype)
@@ -253,6 +298,49 @@ class InGraphSparseArch(nn.Module):
                 f"optimizer={table_plans[tc.name].optimizer.value} "
                 f"features={tc.feature_names}"
             )
+        if self._sparsecore_tables:
+            # Gives the SparseCore activations a gradient path, so their backward
+            # markers are traced; always zero and receives zero gradient.
+            self._sparsecore_grad_anchor = nn.Parameter(torch.zeros(()))
+
+    def init_sparsecore(
+        self, lr: Callable[[], float], eps: float, grad_scale: float
+    ) -> None:
+        """Create the SparseCore tables; after any seeding of the host weights."""
+        from recir.lowering.xla_lower import _get_global_devices, _gspmd_mesh
+
+        devices = _get_global_devices()
+        mesh, axis, hybrid = _gspmd_mesh(devices, len(devices))
+        assert not hybrid
+        limit = int(os.environ.get("RECIR_SPARSECORE_MAX_IDS_PER_PARTITION", "12288"))
+        self.sparsecore = SparseCoreRowwiseTables(
+            self._sparsecore_tables,
+            mesh=mesh,
+            axis=axis,
+            eps=eps,
+            lr=lr,
+            max_ids_per_partition=limit,
+            max_unique_ids_per_partition=limit,
+            grad_scale=grad_scale,
+        )
+        self.sparsecore.initialize(
+            {
+                f: self._feature_seqlens[f] * self._world_size
+                for f in self.sparsecore.feature_names
+                if f in self._feature_seqlens
+            },
+            {
+                name: w[
+                    : next(
+                        t.num_embeddings
+                        for t in self._sparsecore_tables
+                        if t.name == name
+                    )
+                ].numpy()
+                for name, w in self._sparsecore_host_weights.items()
+            },
+        )
+        self._sparsecore_host_weights = {}
 
     def forward(self, id_list_features: KeyedJaggedTensor) -> Dict[str, JaggedTensor]:
         """Embed a merged id-list KJT -> per-feature activations.
@@ -277,8 +365,13 @@ class InGraphSparseArch(nn.Module):
                 keys,
                 self._feature_seqlens,
             )
-            return self._forward_presliced(keys, inj_ids, inj_lens)
+            sparsecore_acts = self._mark_sparsecore_lookup(
+                id_list_features.values(), id_list_features.lengths(), keys
+            )
+            return self._forward_presliced(keys, inj_ids, inj_lens, sparsecore_acts)
 
+        if self._sparsecore_tables:
+            raise NotImplementedError("SPARSECORE tables need the input-break path")
         keys = id_list_features.keys()
         ids_per_chip, lengths_1d = _slice_per_feature(
             id_list_features.values(),
@@ -288,11 +381,54 @@ class InGraphSparseArch(nn.Module):
         )
         return self._forward_presliced(keys, ids_per_chip, lengths_1d)
 
+    def sparsecore_keys(self, keys: List[str]) -> List[str]:
+        """The features of ``keys`` that SPARSECORE tables serve, in ``keys`` order."""
+        return [
+            k
+            for k in keys
+            if self._table_kernel.get(self._feature_to_table.get(k, ""))
+            is ComputeKernel.SPARSECORE
+        ]
+
+    def _mark_sparsecore_lookup(
+        self, values: torch.Tensor, lengths: torch.Tensor, keys: List[str]
+    ) -> Dict[str, torch.Tensor]:
+        """Stand-in activations for the SPARSECORE features, marked as the outputs
+        (and backward inputs) of a device-resident graph break that the dispatcher
+        replaces with the SparseCore lookup and update. Shapes only."""
+        sc_keys = self.sparsecore_keys(keys)
+        if not sc_keys:
+            return {}
+        prefix = _sparsecore_prefix(self._break_override_id)
+        v_in = mark_input(values, prefix, 0)
+        l_in = mark_input(lengths, prefix, 1)
+        anchor = (
+            (v_in.to(torch.float32).sum() * 0)
+            + (l_in.to(torch.float32).sum() * 0)
+            + self._sparsecore_grad_anchor * 0
+        )
+        n_chips = values.shape[0] // sum(self._feature_seqlens[k] for k in keys)
+        dims = {t.name: t.embedding_dim for t in self._sparsecore_tables}
+        out: Dict[str, torch.Tensor] = {}
+        for idx, key in enumerate(sc_keys):
+            dim = dims[self._feature_to_table[key]]
+            stand_in = (
+                values.new_zeros(
+                    (n_chips * self._feature_seqlens[key], dim), dtype=torch.float32
+                )
+                + anchor
+            )
+            out[key] = mark_output_with_device_bwd(
+                stand_in, prefix, idx, deps=[v_in, l_in]
+            )
+        return out
+
     def _forward_presliced(
         self,
         keys: List[str],
         ids_2d: List[torch.Tensor],
         lengths_1d: List[torch.Tensor],
+        sparsecore_acts: Optional[Dict[str, torch.Tensor]] = None,
     ) -> Dict[str, JaggedTensor]:
         """Embed already-per-feature-sliced ids.
 
@@ -327,7 +463,11 @@ class InGraphSparseArch(nn.Module):
             table_name = self._feature_to_table.get(key)
             if table_name is None:
                 continue
-            if self._table_sharding[table_name] is TableSharding.ROWWISE:
+            if self._table_kernel[table_name] is ComputeKernel.SPARSECORE:
+                assert sparsecore_acts is not None
+                emb = torch.ops.recir.shard_batch0(sparsecore_acts[key])
+                result[key] = JaggedTensor(values=emb, lengths=k_lengths)
+            elif self._table_sharding[table_name] is TableSharding.ROWWISE:
                 if self._table_pooling[table_name] == "none":
                     big_ids.setdefault(table_name, []).append(ids)
                     big_lengths.setdefault(table_name, []).append(k_lengths)
@@ -439,6 +579,30 @@ class InGraphSparseArch(nn.Module):
 
 def _prefix(override_id: int) -> str:
     return f"{_PREFIX}_{override_id}"
+
+
+def _sparsecore_prefix(override_id: int) -> str:
+    return f"{_SPARSECORE_PREFIX}_{override_id}"
+
+
+def _scheduled_lr(model: nn.Module, cfg: OptimConfig) -> Callable[[], float]:
+    """The sparse learning rate of each successive step, from ``cfg``'s warmup
+    schedule on the host: the compiled step's copy of the rate reaches the host
+    only at its periodic syncs. Starts at the warmup counter's host value, which
+    is 0 or the iteration a checkpoint restored."""
+    step: Optional[int] = None
+
+    def lr() -> float:
+        nonlocal step
+        if step is None:
+            # Must match recir.training.compile.LR_ITER_BUFFER.
+            counter = getattr(model, "_lr_iter_buffer", None)
+            step = 0 if counter is None else int(counter)
+        else:
+            step += 1
+        return warmup_lr(cfg, step)
+
+    return lr
 
 
 def _slice_per_feature(
@@ -585,6 +749,48 @@ class SparseArchInputBreakDispatcher:
                 num_ranks=self._num_ranks,
                 register_backward=False,
             )
+        for oid, arch in self._enabled:
+            sparsecore = arch.sparsecore
+            sc_keys = arch.sparsecore_keys(keys)
+            if not sc_keys:
+                continue
+            assert sparsecore is not None, "init_sparsecore() did not run"
+            bwd_prefix = f"{_sparsecore_prefix(oid)}::bwd::"
+            grad_indices = sorted(
+                int(n.args[1][len(bwd_prefix) :])
+                for n in gm.graph.nodes
+                if n.op == "call_function"
+                and n.target is torch.ops.recir.mark_boundary.default
+                and isinstance(n.args[1], str)
+                and n.args[1].startswith(bwd_prefix)
+            )
+            if len(grad_indices) < len(sc_keys):
+                logger.warning(
+                    "[in_graph] SparseCore features without a gradient (unused by the loss): %s",
+                    [k for i, k in enumerate(sc_keys) if i not in grad_indices],
+                )
+            sparsecore.expect_gradients(grad_indices)
+
+            def _sparsecore_fwd(
+                values: torch.Tensor,
+                lengths: torch.Tensor,
+                sparsecore: SparseCoreRowwiseTables = sparsecore,
+                sc_keys: List[str] = sc_keys,
+            ) -> List[Any]:
+                ids_2d, _ = _slice_per_feature(values, lengths, keys, seqlens)
+                return sparsecore.lookup(
+                    {k: ids_2d[keys.index(k)].reshape(-1).numpy() for k in sc_keys}
+                )
+
+            install_graph_break_dispatch(
+                gm,
+                _sparsecore_prefix(oid),
+                _sparsecore_fwd,
+                num_state_tensors=len(flat_state),
+                num_ranks=self._num_ranks,
+                bwd_fn=sparsecore.backward,
+                device_resident=True,
+            )
         return gm, flat_state
 
 
@@ -634,6 +840,12 @@ def _seed_in_graph_tables_from_ec(
             rows = src[name].shape[0]  # logical vocab; skip the padded tail rows
             p[:rows].copy_(src[name].to(p.dtype))
             copied += 1
+        for name, host in new_ec._sparsecore_host_weights.items():
+            if name not in src or src[name].device.type == "meta":
+                continue
+            rows = src[name].shape[0]
+            host[:rows].copy_(src[name].to(host.dtype))
+            copied += 1
     logger.info(
         "[seed] copied %d EC table(s) into in-graph params "
         "(%d meta table(s) skipped -> on-device init)",
@@ -658,6 +870,11 @@ class InGraphEmbeddingBackend(EmbeddingBackend):
     it. Build it with
     ``recir.embedding.split_collection.table_plans_from_embedding_tables``.
 
+    ``sparsecore_tables`` moves tables to the SparseCore compute kernel: ``all``
+    (every unpooled ROWWISE table on the sparse optimizer) or a comma-separated
+    list. The production config's plans cannot express it, since its sharding
+    comes from the GPU model.
+
     ``set_feature_seqlens()`` must run before ``setup()``.
     """
 
@@ -670,10 +887,12 @@ class InGraphEmbeddingBackend(EmbeddingBackend):
         ],
         table_plans: Dict[str, TablePlan],
         on_device_init: bool = True,
+        sparsecore_tables: str = "",
     ) -> None:
         super().__init__(embedding_collection_fqn)
         self._sparse_optimizer_builder = sparse_optimizer_builder
         self._sparse_grad_scale: float = 1.0
+        self._sparsecore_tables: str = sparsecore_tables
         self._table_plans: Dict[str, TablePlan] = dict(table_plans)
         self._feature_seqlens: Dict[str, int] = {}
         self._on_device_init: bool = on_device_init
@@ -740,6 +959,31 @@ class InGraphEmbeddingBackend(EmbeddingBackend):
         # apart is the failure this split exists to prevent.
         return self._params_by_optimizer(model, TableOptimizer.SPARSE)
 
+    def _plan_sparsecore(self, table_configs: Sequence[BaseEmbeddingConfig]) -> None:
+        """Moves the tables ``sparsecore_tables`` names to SparseCore."""
+        rowwise_sparse = TablePlan(TableSharding.ROWWISE, TableOptimizer.SPARSE)
+        sparsecore = TablePlan(
+            TableSharding.ROWWISE, TableOptimizer.SPARSE, ComputeKernel.SPARSECORE
+        )
+        names = self._sparsecore_tables
+        if names == "all":
+            selected = [
+                tc.name
+                for tc in table_configs
+                if self._table_plans.get(tc.name) == rowwise_sparse
+                and _pooling_of(tc) == "none"
+            ]
+        else:
+            selected = list(filter(None, names.split(",")))
+        for name in selected:
+            plan = self._table_plans.get(name)
+            if plan not in (rowwise_sparse, sparsecore):
+                raise ValueError(
+                    f"sparsecore_tables names {name!r}, whose plan is {plan}; "
+                    "only ROWWISE tables on the sparse optimizer can move to SparseCore"
+                )
+            self._table_plans[name] = sparsecore
+
     def setup(
         self,
         model: nn.Module,
@@ -755,6 +999,7 @@ class InGraphEmbeddingBackend(EmbeddingBackend):
             )
         if world_size <= 0:
             raise ValueError(f"world_size must be positive, got {world_size}.")
+        self._plan_sparsecore(table_configs)
 
         new_ec = InGraphSparseArch(
             table_configs=table_configs,
@@ -772,20 +1017,37 @@ class InGraphEmbeddingBackend(EmbeddingBackend):
         swap_submodule(model, self.embedding_collection_fqn, new_ec)
 
         embedding_params = self.embedding_named_parameters(model)
-        if not embedding_params:
+        if not embedding_params and not new_ec._sparsecore_tables:
             raise RuntimeError(
                 "No table is planned for the sparse optimizer, so there is "
                 "nothing for it to train. Every table's TablePlan says DENSE; "
                 "if that is really intended this backend needs a way to report "
                 "no sparse runtime at all."
             )
-        sparse_optimizer, sparse_lr_buffer = self._sparse_optimizer_builder(
-            model,
-            list(embedding_params.values()),
-            sparse_config,
-            device,
-            self._sparse_grad_scale,
-        )
+        sparse_optimizer: Optional[torch.optim.Optimizer] = None
+        if embedding_params:
+            sparse_optimizer, sparse_lr_buffer = self._sparse_optimizer_builder(
+                model,
+                list(embedding_params.values()),
+                sparse_config,
+                device,
+                self._sparse_grad_scale,
+            )
+        else:
+            # Must match recir.training.compile.LR_SPARSE_BUFFER: the warmup
+            # writes it and the learning-rate metrics read it.
+            model.register_buffer(
+                "_lr_sparse_buffer",
+                torch.tensor(sparse_config.lr, device=device, dtype=torch.float32),
+                persistent=False,
+            )
+            sparse_lr_buffer = model.get_buffer("_lr_sparse_buffer")
+        if new_ec._sparsecore_tables:
+            new_ec.init_sparsecore(
+                lr=_scheduled_lr(model, sparse_config),
+                eps=sparse_config.eps,
+                grad_scale=self._sparse_grad_scale,
+            )
         dense_tables = sum(
             1
             for plan in self._table_plans.values()
@@ -795,14 +1057,18 @@ class InGraphEmbeddingBackend(EmbeddingBackend):
             "InGraphEmbeddingBackend: %d table param(s) on %s, %d on the dense "
             "optimizer",
             len(embedding_params),
-            type(sparse_optimizer).__name__,
+            type(sparse_optimizer).__name__ if sparse_optimizer else "no optimizer",
             dense_tables,
         )
         return EmbeddingSetupResult(
             model=model,
             dense_named_parameters=self.dense_named_parameters(model),
             sparse_runtime=SparseOptimizerRuntime(
-                placement=SparseUpdatePlacement.COMPILED_OPTIMIZER,
+                placement=(
+                    SparseUpdatePlacement.COMPILED_OPTIMIZER
+                    if sparse_optimizer is not None
+                    else SparseUpdatePlacement.BACKEND_FUSED
+                ),
                 config=sparse_config,
                 optimizer=sparse_optimizer,
                 lr_buffer=sparse_lr_buffer,
