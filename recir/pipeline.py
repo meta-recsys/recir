@@ -23,9 +23,9 @@ from torch.utils import _pytree as pytree
 
 
 logger: logging.Logger = logging.getLogger(__name__)
-_PIPELINE_REGION_META = "recir_pipeline_region"
+PIPELINE_REGION_META = "recir_pipeline_region"
 _INDUCTOR_STREAM_META = "stream"
-_PIPELINE_PARTITION_META = "recir_pipeline_partition"
+PIPELINE_PARTITION_META = "recir_pipeline_partition"
 
 
 def _is_pipeline_partition_node(node: fx.Node) -> bool:
@@ -193,13 +193,13 @@ def is_pipeline_pending(value: Any) -> bool:
 
 def mark_pipeline_region(nodes: Iterable[fx.Node], region: Hashable) -> None:
     for node in nodes:
-        existing = node.meta.get(_PIPELINE_REGION_META)
+        existing = node.meta.get(PIPELINE_REGION_META)
         if existing is not None and existing != region:
             raise ValueError(
                 f"Pipeline node {node.name!r} belongs to conflicting region "
                 f"{existing!r}"
             )
-        node.meta[_PIPELINE_REGION_META] = region
+        node.meta[PIPELINE_REGION_META] = region
 
 
 def mark_execution_stream(nodes: Iterable[fx.Node], stream_index: int) -> None:
@@ -252,7 +252,7 @@ class PipelinedGraphModule(nn.Module):
                 for node in cast(fx.GraphModule, stage).graph.nodes
                 if _is_pipeline_partition_node(node)
                 and isinstance(
-                    (index := node.meta.get(_PIPELINE_PARTITION_META)),
+                    (index := node.meta.get(PIPELINE_PARTITION_META)),
                     int,
                 )
             }
@@ -717,7 +717,7 @@ class SteadyStateGraphModule(nn.Module):
             spec.name: [
                 node
                 for node in gm.graph.nodes
-                if node.meta.get(_PIPELINE_REGION_META) in spec.regions
+                if node.meta.get(PIPELINE_REGION_META) in spec.regions
                 and node.op == "call_function"
                 and self._runs_on_cuda(node)
             ]
@@ -1328,9 +1328,9 @@ def _collect_pipeline_stages(
     plan: PipelinePlan,
 ) -> tuple[dict[fx.Node, int], int, tuple[str, ...]]:
     region_nodes: dict[fx.Node, Hashable] = {
-        node: cast(Hashable, node.meta[_PIPELINE_REGION_META])
+        node: cast(Hashable, node.meta[PIPELINE_REGION_META])
         for node in gm.graph.nodes
-        if _PIPELINE_REGION_META in node.meta
+        if PIPELINE_REGION_META in node.meta
     }
     explicit_stages: dict[fx.Node, int] = {}
     mutable_stage_names: list[str] = []
@@ -1403,9 +1403,9 @@ def build_pipeline(
         )
     for node in gm.graph.nodes:
         if _is_pipeline_partition_node(node):
-            node.meta[_PIPELINE_PARTITION_META] = node_stages.get(node, compute_stage)
+            node.meta[PIPELINE_PARTITION_META] = node_stages.get(node, compute_stage)
         else:
-            node.meta.pop(_PIPELINE_PARTITION_META, None)
+            node.meta.pop(PIPELINE_PARTITION_META, None)
     split_gm = split_module(
         gm,
         gm,
