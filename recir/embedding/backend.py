@@ -46,12 +46,22 @@ class TableSharding(enum.Enum):
     table -- see :class:`TableOptimizer`.
     """
 
-    # Dim-0 sharded; looked up via the ring-shift kernel.
+    # Dim-0 sharded; looked up by the plan's :class:`ComputeKernel`.
     ROWWISE = "rowwise"
     # Dim-0 sharded; looked up via ``recir.fsdp_embedding`` (all-gather).
     FSDP = "fsdp"
     # Full copy on every device; looked up via ``F.embedding``.
     REPLICATED = "replicated"
+
+
+class ComputeKernel(enum.Enum):
+    """What looks up, and updates, a ROWWISE table."""
+
+    # The ring-shift kernel, inside the compiled step.
+    RINGSHIFT = "ringshift"
+    # JAX TPU Embedding's SparseCore layout and lookup, trained there with row-wise
+    # Adagrad (``recir.embedding.sparsecore_rowwise``).
+    SPARSECORE = "sparsecore"
 
 
 class TableOptimizer(enum.Enum):
@@ -70,10 +80,23 @@ class TableOptimizer(enum.Enum):
 
 @dataclass(frozen=True)
 class TablePlan:
-    """The complete per-table decision: where it lives, and who trains it."""
+    """The complete per-table decision: where it lives, what looks it up, and who
+    trains it. ``compute_kernel`` applies to ROWWISE tables; the other shardings
+    have one lookup each."""
 
     sharding: TableSharding
     optimizer: TableOptimizer
+    compute_kernel: ComputeKernel = ComputeKernel.RINGSHIFT
+
+    def __post_init__(self) -> None:
+        if self.compute_kernel is ComputeKernel.SPARSECORE and (
+            self.sharding is not TableSharding.ROWWISE
+            or self.optimizer is not TableOptimizer.SPARSE
+        ):
+            raise ValueError(
+                f"{self}: SparseCore tables are ROWWISE and trained by the sparse "
+                "optimizer's row-wise Adagrad"
+            )
 
 
 class SparseUpdatePlacement(enum.Enum):
