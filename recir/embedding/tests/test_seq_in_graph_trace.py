@@ -29,9 +29,9 @@ from recir.embedding.backend import (
 from recir.embedding.in_graph import (
     _seed_in_graph_tables_from_ec,
     DP_TABLE_PREFIX,
-    InGraphEmbeddingBackend,
     InGraphSparseArch,
     SHARDED_TABLE_PREFIX,
+    TPUEmbeddingBackend,
 )
 from torch.fx.experimental.proxy_tensor import make_fx
 from torchrec.distributed.types import ShardingType
@@ -688,7 +688,7 @@ class SparseGradScaleTest(unittest.TestCase):
         ]
         model = torch.nn.Module()
         model.collection = EmbeddingCollection(tables=tables)
-        backend = InGraphEmbeddingBackend(
+        backend = TPUEmbeddingBackend(
             "collection",
             builder,
             {"t": _SPARSE_ROWWISE},

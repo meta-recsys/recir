@@ -30,10 +30,7 @@ from recir.embedding.backend import (
     TableSharding,
 )
 from recir.embedding.cpu import CPUEmbeddingBackend, SparseArchDispatcher
-from recir.embedding.in_graph import (
-    InGraphEmbeddingBackend,
-    SparseArchInputBreakDispatcher,
-)
+from recir.embedding.in_graph import SparseArchInputBreakDispatcher, TPUEmbeddingBackend
 from recir.examples.dlrmv3.common.model import (
     DlrmV3TrainModule,
     EMBEDDING_COLLECTION_FQN,
@@ -78,7 +75,7 @@ def prepare_backend(
     backend: EmbeddingBackend, module: DlrmV3TrainModule, geom: BatchGeometry
 ) -> None:
     """Hand the backend the static per-feature sizes it needs before setup()."""
-    if isinstance(backend, InGraphEmbeddingBackend):
+    if isinstance(backend, TPUEmbeddingBackend):
         backend.set_feature_seqlens(module.layout.feature_totals(geom.real_rows))
 
 
@@ -88,7 +85,7 @@ def make_dispatchers(
     """Tracing dispatchers for the sparse arch (the DLRMv3 preprocess is static
     and traced in-graph, so nothing else needs one)."""
     keys, cached = module.sparse_io_shapes(geom.real_rows, geom.local_chips)
-    if isinstance(backend, InGraphEmbeddingBackend):
+    if isinstance(backend, TPUEmbeddingBackend):
         return [
             SparseArchInputBreakDispatcher(
                 input_kjt_keys=keys,

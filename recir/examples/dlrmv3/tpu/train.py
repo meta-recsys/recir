@@ -45,7 +45,7 @@ import torch.distributed.checkpoint as dcp
 import torch.nn as nn
 from generative_recommenders.common import HammerKernel, set_dev_mode
 from recir.embedding.backend import EmbeddingBackend
-from recir.embedding.in_graph import InGraphEmbeddingBackend, SHARDED_TABLE_PREFIX
+from recir.embedding.in_graph import SHARDED_TABLE_PREFIX, TPUEmbeddingBackend
 from recir.examples.dlrmv3.common.config import DLRMv3TrainConfig, parse_config
 from recir.examples.dlrmv3.common.data import (
     make_dataset,
@@ -248,7 +248,7 @@ class TPUTrainer:
             # in_graph tables are row-sharded over all chips; nothing else is.
             fsdp_table_substr=(
                 SHARDED_TABLE_PREFIX
-                if isinstance(self.backend, InGraphEmbeddingBackend)
+                if isinstance(self.backend, TPUEmbeddingBackend)
                 else None
             ),
         )
@@ -307,7 +307,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:  # noqa: C901
     torch.manual_seed(cfg.seed)
     trainer = TPUTrainer(cfg, args, world)
     if (cfg.ckpt_dir or cfg.resume_from) and not isinstance(
-        trainer.backend, InGraphEmbeddingBackend
+        trainer.backend, TPUEmbeddingBackend
     ):
         # RecirCheckpointable covers the in_graph backend;
         # the cpu backend's torchrec fused optimizer state is not part of it.
