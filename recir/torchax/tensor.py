@@ -128,7 +128,12 @@ def log_nested(env: "Environment", message: str) -> Iterator[None]:
 class Tensor(torch.Tensor):
     @staticmethod
     def __new__(
-        cls, elem: jax.Array, env: "Environment", requires_grad: bool = False
+        # pyrefly: ignore [missing-attribute]
+        cls,
+        # pyrefly: ignore [missing-attribute]
+        elem: jax.Array,
+        env: "Environment",
+        requires_grad: bool = False,
     ) -> "Tensor":
         dtype = mappings.j2t_dtype(elem.dtype)
         shape = list(elem.shape)
@@ -150,7 +155,12 @@ class Tensor(torch.Tensor):
         )
 
     def __init__(
-        self, elem: jax.Array, env: "Environment", requires_grad: bool = False
+        # pyrefly: ignore [missing-attribute]
+        self,
+        # pyrefly: ignore [missing-attribute]
+        elem: jax.Array,
+        env: "Environment",
+        requires_grad: bool = False,
     ) -> None:
         super().__init__()
         self._elem: jax.Array = elem
@@ -162,7 +172,7 @@ class Tensor(torch.Tensor):
     __repr__ = __str__  # pyre-ignore[4]
 
     @property
-    # pyrefly: ignore [bad-override]
+    # pyrefly: ignore [bad-override, missing-attribute]
     def shape(self) -> torch.Size:
         return torch.Size(self._elem.shape)
 
@@ -221,9 +231,11 @@ class Tensor(torch.Tensor):
 
         return np.array(self._elem)
 
+    # pyrefly: ignore [missing-attribute]
     def jax(self) -> jax.Array:
         return self._elem
 
+    # pyrefly: ignore [missing-attribute]
     def torch(self) -> torch.Tensor:
         return self._env.j2t_copy(self.jax())
 
