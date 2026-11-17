@@ -677,6 +677,7 @@ def _scheduled_lr(model: nn.Module, cfg: OptimConfig) -> Callable[[], float]:
         if step is None:
             # Must match recir.training.compile.LR_ITER_BUFFER.
             counter = getattr(model, "_lr_iter_buffer", None)
+            # pyrefly: ignore [bad-argument-type]
             step = 0 if counter is None else int(counter)
         else:
             step += 1
