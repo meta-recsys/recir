@@ -291,6 +291,7 @@ class View(torch.Tensor):
 
     __torch_function__: Any = torch._C._disabled_torch_function_impl
 
+    # pyrefly: ignore [missing-attribute]
     def source_jax(self) -> jax.Array:
         """
         Returns the source tensor.
@@ -300,6 +301,7 @@ class View(torch.Tensor):
         else:
             return self.parent.jax()
 
+    # pyrefly: ignore [missing-attribute]
     def replace_source_jax(self, new_value: jax.Array) -> None:
         """
         Update the source tensor with new values.
@@ -320,6 +322,7 @@ class View(torch.Tensor):
 
     def update(
         self,
+        # pyrefly: ignore [missing-attribute]
         new_values: jax.Array | View | _TorchaxTensor,  # noqa: F821
         view_infos: list[ViewInfo] | None = None,
     ) -> None:
@@ -384,6 +387,7 @@ class View(torch.Tensor):
     def __str__(self) -> str:
         return f"View({self.torch()})"
 
+    # pyrefly: ignore [missing-attribute]
     def jax(self) -> jax.Array:
         """
         Returns a copy of the source tensor after transformations.
