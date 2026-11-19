@@ -51,16 +51,29 @@ std::vector<at::Tensor> kjtSplitPerFeature(
   TORCH_CHECK(stride > 0, "stride must be positive, got ", stride);
   TORCH_CHECK(numKeys >= 0, "num_keys must be non-negative, got ", numKeys);
   TORCH_CHECK(offsets.dim() == 1, "offsets must be one-dimensional");
+  if (numKeys == 0) {
+    return {};
+  }
+  TORCH_CHECK(offsets.numel() > 0, "offsets must contain a terminal offset");
   TORCH_CHECK(
-      numKeys == 0 || numKeys * stride < offsets.numel(),
-      "offsets does not contain a terminal offset for every key");
+      (offsets.numel() - 1) % numKeys == 0,
+      "offsets must contain the same runtime stride for every key");
+
+  // `stride` is part of the published TorchScript operator ABI, but a
+  // make_fx graph may have captured it from the training batch. Derive the
+  // effective stride from the runtime offsets so a saved graph can accept a
+  // different serving batch size without requiring republish.
+  const auto runtimeStride = (offsets.numel() - 1) / numKeys;
+  TORCH_CHECK(runtimeStride > 0, "runtime stride must be positive");
 
   const auto cpuOffsets = offsets.cpu().contiguous();
   std::vector<at::Tensor> result;
   result.reserve(numKeys);
   for (int64_t key = 0; key < numKeys; ++key) {
-    const auto start = cpuOffsets.select(0, key * stride).item<int64_t>();
-    const auto end = cpuOffsets.select(0, (key + 1) * stride).item<int64_t>();
+    const auto start =
+        cpuOffsets.select(0, key * runtimeStride).item<int64_t>();
+    const auto end =
+        cpuOffsets.select(0, (key + 1) * runtimeStride).item<int64_t>();
     TORCH_CHECK(
         0 <= start && start <= end && end <= values.size(0),
         "invalid value range [",
