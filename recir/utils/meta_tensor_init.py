@@ -4,9 +4,10 @@
 # This source code is licensed under the BSD-3-Clause license found in the
 # LICENSE file in the root directory of this source tree.
 
+import functools
 import logging
 import zlib
-from typing import Any
+from typing import Any, Sequence, Tuple
 
 import torch
 
@@ -15,6 +16,9 @@ logger: logging.Logger = logging.getLogger(__name__)
 _META_INIT_KIND_ATTR: str = "_recir_meta_init_kind"
 _META_INIT_BOUND_ATTR: str = "_recir_meta_init_bound"
 _META_INIT_STREAM_ID_ATTR: str = "_recir_meta_init_stream_id"
+# Rows per independently seeded block of a table (see fill_table_shard). Fixed,
+# so a row's initial value depends on its table and index, never on the sharding.
+_INIT_BLOCK_ROWS: int = 1 << 16
 
 
 def default_embedding_init_bound(num_embeddings: int) -> float:
@@ -40,6 +44,81 @@ def initialize_tensor_from_meta_init(
 def table_init_stream_id(name: str) -> int:
     """Stable per-table PRNG stream identifier for on-device init."""
     return zlib.crc32(name.encode("utf-8"))
+
+
+def fill_table_shard(
+    shard: torch.Tensor,
+    table_name: str,
+    table_shape: Sequence[int],
+    offsets: Sequence[int],
+    low: float,
+    high: float,
+) -> torch.Tensor:
+    """Fill ``shard``, at ``offsets`` in the table, with its part of the table's
+    uniform ``[low, high)`` init.
+
+    The table is drawn in fixed blocks of rows, each from a generator seeded by
+    the table's stream id and the block index, so every split of a table over
+    any number of ranks assembles the same table; a shard draws at most one
+    extra partial block at each end. Values are drawn on the CPU, whose
+    generator gives the same stream on every host, then copied to ``shard``.
+    """
+    if shard.numel() == 0:
+        return shard
+    first, last = offsets[0], offsets[0] + shard.shape[0]
+    columns = tuple(slice(o, o + n) for o, n in zip(offsets[1:], shard.shape[1:]))
+    stream = table_init_stream_id(table_name)
+    for block in range(first // _INIT_BLOCK_ROWS, -(-last // _INIT_BLOCK_ROWS)):
+        start = block * _INIT_BLOCK_ROWS
+        end = min(start + _INIT_BLOCK_ROWS, table_shape[0])
+        # The CPU generator keeps only a seed's low 32 bits, so the table and
+        # block are mixed into one 32-bit value rather than packed side by side.
+        seed = zlib.crc32(block.to_bytes(8, "little"), stream)
+        generator = torch.Generator().manual_seed(seed)
+        values = torch.empty((end - start, *table_shape[1:])).uniform_(
+            low, high, generator=generator
+        )
+        lo, hi = max(start, first), min(end, last)
+        shard[lo - first : hi - first].copy_(
+            values[(slice(lo - start, hi - start), *columns)]
+        )
+    return shard
+
+
+def table_init_bounds(config: Any) -> Tuple[float, float]:
+    """The ``[low, high)`` a torchrec table config's ``init_fn`` draws from.
+
+    torchrec's default ``init_fn`` is ``uniform_`` over the config's
+    ``weight_init_min/max``, which ``fill_table_shard`` can draw in
+    shard-invariant blocks. Any other initializer raises rather than being
+    replaced by a uniform.
+    """
+    init_fn = config.init_fn
+    if init_fn is None:
+        return config.get_weight_init_min(), config.get_weight_init_max()
+    if (
+        isinstance(init_fn, functools.partial)
+        and init_fn.func is torch.nn.init.uniform_
+        and not init_fn.args
+        and set(init_fn.keywords) <= {"a", "b"}
+    ):
+        return init_fn.keywords.get("a", 0.0), init_fn.keywords.get("b", 1.0)
+    raise NotImplementedError(
+        f"table {config.name}: init_fn {init_fn!r} is not torch.nn.init.uniform_ "
+        "with bounds, which is the only table init recir draws per shard"
+    )
+
+
+def init_table_shard(
+    shard: torch.Tensor,
+    config: Any,
+    table_shape: Sequence[int],
+    offsets: Sequence[int],
+) -> torch.Tensor:
+    """Fill ``shard``, at ``offsets`` in ``config``'s table, with its part of the
+    table's init (``table_init_bounds``), the same for any sharding."""
+    low, high = table_init_bounds(config)
+    return fill_table_shard(shard, config.name, table_shape, offsets, low, high)
 
 
 def mark_meta_uniform_init(tensor: Any, bound: float, stream_id: int) -> None:
