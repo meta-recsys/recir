@@ -38,6 +38,19 @@ _DLRM_GPU_REQUIREMENTS = _DLRM_COMMON_REQUIREMENTS + [
 
 _DLRM_TPU_REQUIREMENTS = _DLRM_CPU_REQUIREMENTS + ["libtpu"]
 
+_DLRM_TORCHTPU_REQUIREMENTS = [
+    "etils[epath]",
+    "fbgemm-gpu-cpu",
+    "generative-recommenders",
+    "gin-config",
+    "pandas",
+    "pybind11",
+    "tensorboard",
+    "torch>=2.10",
+    "torchrec>=1.6",
+    "triton",
+]
+
 _readme = os.path.join(os.path.dirname(os.path.abspath(__file__)), "README.md")
 long_description = open(_readme).read() if os.path.exists(_readme) else ""
 
@@ -88,6 +101,7 @@ setup(
         "dlrm-cpu": _DLRM_CPU_REQUIREMENTS,
         "dlrm-gpu": _DLRM_GPU_REQUIREMENTS,
         "dlrm-tpu": _DLRM_TPU_REQUIREMENTS,
+        "dlrm-torchtpu": _DLRM_TORCHTPU_REQUIREMENTS,
         "all": [
             *_DLRM_TPU_REQUIREMENTS,
             "expecttest>=0.3.0",

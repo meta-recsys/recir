@@ -41,7 +41,9 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+
 from recir.backends.inductor import InductorBackend
+from recir.backends.torchtpu import TorchTPUBackend
 from recir.compiler.compilation import (
     _compile_and_transform,
     _compile_graphs,
@@ -49,7 +51,7 @@ from recir.compiler.compilation import (
 )
 from recir.compiler.runtime import make_compiled_runner, sync_device_state_to_torch
 from recir.compiler.tracing import _GraphSpec, _trace_graphs, trace
-from recir.distributed.parallel_mode import GSPMDParallel, HybridParallel
+from recir.distributed.parallel_mode import DataParallel, GSPMDParallel, HybridParallel
 from recir.distributed.sharding_plan import EmbeddingShardingPlan
 from recir.observability.compiles import entry_point
 from recir.pipeline import PipelineConfig
@@ -592,3 +594,46 @@ def run_step_and_sync(
     )
     sync_device_state_to_torch(runner)
     return result
+
+
+def compile_torchtpu_step(
+    model: nn.Module,
+    dense_opt: torch.optim.Optimizer,
+    trace_batch: Any,
+    *,
+    train_step_fn: Optional[Callable[..., Any]] = None,
+    flatten_batch: FlattenBatch,
+    device: torch.device,
+    world_size: int = 1,
+    rank: int = 0,
+    eval_step_fn: Optional[Callable[..., Any]] = None,
+) -> Any:
+    """Trace and compile train (and optional eval) steps via TorchTPUBackend."""
+    os.environ.setdefault("TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS", "0")
+    model_to_train = (
+        model.module if isinstance(model, DistributedModelParallel) else model
+    )
+    if world_size > 1 and dist.is_initialized():
+        mesh = build_default_pg_mesh(device.type, world_size, rank)
+    else:
+        mesh = DeviceMesh(device.type, torch.arange(1), _init_backend=False, _rank=0)
+
+    dp_mode = DataParallel(
+        "replicate",
+        num_ranks=world_size,
+        num_processes=world_size,
+        device_type=device.type,
+    )
+    dp_mode._device_mesh = mesh
+    dp_mode._process_mesh = mesh
+    return compile_step(
+        train_step_fn or recir_train_step,
+        model_to_train,
+        (dense_opt,),
+        trace_batch,
+        parallel_mode=dp_mode,
+        backend=TorchTPUBackend(),
+        global_loss_denom=False,
+        flatten_batch=flatten_batch,
+        eval_step_fn=eval_step_fn,
+    )

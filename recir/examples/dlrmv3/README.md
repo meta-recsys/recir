@@ -7,9 +7,10 @@ generative-recommenders, JAX (TPU), and recir.
 
 ```
 dlrmv3/
-  common/   model, token-budget batch layout, data pipeline, config, metrics (shared)
-  gpu/      HybridParallel + Inductor + FBGEMM TBE, one process per GPU (torchrun)
-  tpu/      GSPMD + XLA via torchax, embedding tables inside the program (in_graph)
+  common/    model, token-budget batch layout, data pipeline, config, metrics (shared)
+  gpu/       HybridParallel + Inductor + FBGEMM TBE, one process per GPU (torchrun)
+  tpu/       GSPMD + XLA via torchax, embedding tables inside the program (in_graph)
+  torchtpu/  DataParallel + TorchTPUBackend + SparseCore (torchrec.experimental.torch_tpu)
 ```
 
 ## Tested software stack
@@ -210,6 +211,20 @@ python -m recir.examples.dlrmv3.tpu.numerical_parity \
 The command reports per-step gradient, loss, output, and state gaps and ends
 with `TPU numerical parity passed` when every tensor is within the requested
 `--atol`, `--rtol`, and `--state_atol` thresholds.
+
+### TorchTPU + SparseCore
+
+When running with `torch_tpu` and `torchrec.experimental.torch_tpu` (`>=1.6`),
+`recir.examples.dlrmv3.torchtpu.train` compiles the full training step directly
+through `TorchTPUBackend` (one `torchrun` process per TPU TensorCore, zero JAX
+or `torchax` imports) while sharding and updating `EmbeddingCollection` tables
+on SparseCore via `SparseCoreFusedEmbeddingCollection`:
+
+```bash
+torchrun --nproc_per_node=8 -m recir.examples.dlrmv3.torchtpu.train \
+  --dataset debug --batch_size 16 --uih_len 256 --uih_budget 128 \
+  --num_candidates 10 --num_train_batches 100 --log_every 10
+```
 
 ## Expected behavior
 
