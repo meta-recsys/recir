@@ -11,8 +11,10 @@ import torch
 import torch.distributed as dist
 from recir.lowering.torchtpu_lower import (
     _check_same_graph_on_all_ranks,
+    _functional_graph,
     _graph_fingerprint,
     _mark_collectives_spmd_safe,
+    _register_tpu_fbgemm_kernels,
     _shape_mismatches,
     _TorchTPUModule,
     partial_lower_torchtpu,
@@ -137,3 +139,47 @@ class TorchTPULowerTest(unittest.TestCase):
         check(0)
         with self.assertRaisesRegex(RuntimeError, r"ranks \[1\]"):
             check(1)
+
+    def test_fbgemm_ops_left_in_a_graph_get_tpu_kernels(self) -> None:
+        _register_tpu_fbgemm_kernels()
+        for name in (
+            "fbgemm::jagged_to_padded_dense_forward",
+            "fbgemm::jagged_to_padded_dense_backward",
+        ):
+            self.assertTrue(
+                torch._C._dispatch_has_kernel_for_dispatch_key(name, "PrivateUse1"),
+                name,
+            )
+        self.assertEqual(_register_tpu_fbgemm_kernels(), [])
+
+    def test_functional_graph_returns_the_inputs_it_mutated(self) -> None:
+        def step(
+            param: torch.Tensor, grad: torch.Tensor, momentum: torch.Tensor
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            momentum.mul_(0.9).add_(grad)
+            param.sub_(momentum * 0.1)
+            return (param * 2).sum(), momentum + 1
+
+        inputs = [torch.randn(4), torch.randn(4), torch.randn(4)]
+        gm = make_fx(step)(*[t.clone() for t in inputs])
+
+        fgm, mutated = _functional_graph(gm, [t.clone() for t in inputs])
+
+        self.assertEqual(sorted(mutated), [0, 2])
+        in_place = [
+            n.target
+            for n in fgm.graph.nodes
+            if isinstance(n.target, torch._ops.OpOverload)
+            and n.target._schema.is_mutable
+        ]
+        self.assertEqual(in_place, [])
+        expected_inputs = [t.clone() for t in inputs]
+        expected = gm(*expected_inputs)
+        actual_inputs = [t.clone() for t in inputs]
+        outputs = fgm(*actual_inputs)
+        for index, value in zip(mutated, outputs[2:]):
+            actual_inputs[index].copy_(value)
+        for want, got in zip(expected, outputs[:2]):
+            torch.testing.assert_close(got, want)
+        for want, got in zip(expected_inputs, actual_inputs):
+            torch.testing.assert_close(got, want)
