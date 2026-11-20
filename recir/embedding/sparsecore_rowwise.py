@@ -286,6 +286,8 @@ class SparseCoreRowwiseTables:
         self._warned_host_grad: bool = False
         self._expected: Optional[set] = None
         self._logged_grad_type: bool = False
+        # The zero gradient of a lookup output the loss does not use, per shape.
+        self._zero_grads: Dict[Tuple[int, int], jax.Array] = {}
         self._lookups: int = 0
         self._rounding_counter: int = 0
         self._layout: Dict[str, Tuple[int, int, int]] = {}
@@ -798,11 +800,16 @@ class SparseCoreRowwiseTables:
         for i, (f, (n, _)) in enumerate(sizes.items()):
             grad = pending.get(i)
             if grad is None:
-                dim = self._tables[self._feature_table[f]].embedding_dim
-                grad = jax.jit(
-                    lambda shape=(n * self._world, dim): jnp.zeros(shape, jnp.float32),
-                    out_shardings=NamedSharding(self._mesh, P(self._axis, None)),
-                )()
+                shape = (
+                    n * self._world,
+                    self._tables[self._feature_table[f]].embedding_dim,
+                )
+                grad = self._zero_grads.get(shape)
+                if grad is None:
+                    grad = self._zero_grads[shape] = jax.jit(
+                        lambda shape=shape: jnp.zeros(shape, jnp.float32),
+                        out_shardings=NamedSharding(self._mesh, P(self._axis, None)),
+                    )()
             elif not isinstance(grad, jax.Array):
                 # The compiled step's last train step returns torch tensors (host copies).
                 if not self._warned_host_grad:
