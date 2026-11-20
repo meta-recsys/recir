@@ -132,7 +132,7 @@ class RecirCompileSpec:
     loss_reduction: str = "sum"
     region_transforms: List[Any] = field(default_factory=list)
     # Params whose FQN contains this substring are row-sharded over all chips
-    # (e.g. recir.embedding.in_graph.SHARDED_TABLE_PREFIX); None = all replicated.
+    # (e.g. recir.embedding.tpu.SHARDED_TABLE_PREFIX); None = all replicated.
     fsdp_table_substr: Optional[str] = None
 
 
@@ -197,7 +197,7 @@ def recir_train_step(
     embedding update fires off-GM via its backward hook during ``loss.backward()``.
 
     LR binding: every optimizer reaching here was built by
-    ``build_torch_optimizer`` (including the in_graph ``emb_opt`` -- the backend
+    ``build_torch_optimizer`` (including the tpu ``emb_opt`` -- the backend
     only calls an injected builder), so each one's group['lr'] already IS the
     matching 0-d buffer and make_fx traces the lifted proxy rather than a baked
     constant.
@@ -535,7 +535,7 @@ def compile_gspmd_step(
     (SparseCore / FBGEMM-fused DMP) and fires off-GM via its backward hook.
     Returns ``runner(model, dense_opt, *flat_args) -> (losses, named)``.
 
-    ``sparse_opt`` (the in_graph embedding backend's optimizer, whose tables are
+    ``sparse_opt`` (the tpu embedding backend's optimizer, whose tables are
     parameters inside the program) also steps in the GM; the runner then takes
     ``(model, dense_opt, sparse_opt, *flat_args)``.
 
