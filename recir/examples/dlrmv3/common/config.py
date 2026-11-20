@@ -105,12 +105,15 @@ class DLRMv3TrainConfig:
     def embedding_tables(self) -> Dict[str, EmbeddingConfig]:
         # Tables train in fp32, like the dense model consuming their lookups
         # (the dataset configs declare fp16, an inference storage choice).
+        # init_fn=None: the dataset configs' init_fn is torchrec's default
+        # uniform, bounded for their own row count; the resized table gets its own.
         return {
             name: dataclasses.replace(
                 t,
                 embedding_dim=self.embedding_dim or t.embedding_dim,
                 num_embeddings=self.hash_size or t.num_embeddings,
                 data_type=DataType.FP32,
+                init_fn=None,
             )
             for name, t in get_embedding_table_config(self.dataset).items()
         }
