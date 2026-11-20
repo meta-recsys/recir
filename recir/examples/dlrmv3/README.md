@@ -10,6 +10,7 @@ dlrmv3/
   common/   model, token-budget batch layout, data pipeline, config, metrics (shared)
   gpu/      HybridParallel + Inductor + FBGEMM TBE, one process per GPU (torchrun)
   tpu/      GSPMD + XLA via torchax, embedding tables inside the program (tpu)
+  torchtpu/ DataParallel + TorchTPU, one process per TPU device (torchrun)
 ```
 
 ## Tested software stack
@@ -210,6 +211,24 @@ python -m recir.examples.dlrmv3.tpu.numerical_parity \
 The command reports per-step gradient, loss, output, and state gaps and ends
 with `TPU numerical parity passed` when every tensor is within the requested
 `--atol`, `--rtol`, and `--state_atol` thresholds.
+
+## TorchTPU
+
+`torchtpu/train.py` runs the same model on TorchTPU
+(`torch_tpu`), PyTorch's native TPU device, instead of torchax/XLA:
+
+```bash
+python -m recir.examples.dlrmv3.torchtpu.train --dataset debug --num_train_batches 10
+```
+
+- One process per TPU device, as on GPU. Started without torchrun, the module
+  relaunches itself under torchrun with `--nproc_per_node` processes (default 8,
+  every device of a v7x host); multi-host jobs read the GKE TPU environment.
+- Each process runs the dense model on its device; gradients are averaged with
+  explicit collectives (`DataParallel` + `TorchTPUBackend`).
+- Embedding tables stay in torchrec DMP on the hosts (the `cpu` embedding
+  backend), row-wise sharded over the processes, behind a graph break.
+- Evaluation and checkpointing are not wired up yet.
 
 ## Expected behavior
 
