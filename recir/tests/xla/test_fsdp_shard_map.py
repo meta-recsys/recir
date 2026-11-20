@@ -71,11 +71,13 @@ class ShardMapFsdpSpecsTest(unittest.TestCase):
         self,
         gm: fx.GraphModule,
         torch_output_indices: Optional[set[int]] = None,
+        device_output_indices: Optional[set[int]] = None,
     ) -> Tuple[Any, Any]:
         """Run the real ``_jit_shard_map`` and capture the specs it hands to
         ``shard_map``, short-circuiting before the JAX lowering."""
         module = _XLAModule(gm, backend_type=BackendType.XLA_SHARD_MAP)
         module.torch_output_indices = torch_output_indices
+        module.device_output_indices = device_output_indices or set()
         captured: Dict[str, Any] = {}
 
         def _fake_shard_map(
@@ -269,6 +271,53 @@ class ShardMapFsdpSpecsTest(unittest.TestCase):
         module.torch_output_indices = None
         with self.assertRaises(RuntimeError):
             module._jit_shard_map(lambda *a: a, (), torch.device("cpu"))
+
+    def test_device_resident_output_is_batch_sharded(self) -> None:
+        # A device-resident graph break reads each device's block, so its input
+        # is Shard(0); a host-bound output keeps P().
+        graph = fx.Graph()
+        x = graph.placeholder("x")
+        x.meta["is_batch_input"] = True
+        _set_val(x, (8, 3))
+        ids = graph.call_function(torch.ops.aten.relu.default, args=(x,))
+        _set_val(ids, (8, 3))
+        host = graph.call_function(torch.ops.aten.sum.default, args=(x,))
+        _set_val(host, ())
+        graph.output((ids, host))
+        gm = fx.GraphModule(torch.nn.Module(), graph)
+
+        _, out_specs = self._capture_specs(gm, device_output_indices={0})
+
+        self.assertEqual(out_specs, (P("torch_dist", None), P()))
+
+
+class CompileXlaRouteTest(unittest.TestCase):
+    """``_compile_xla`` runs a collective-free subgraph in ``shard_map`` when it
+    exchanges values with a device-resident graph break."""
+
+    def _route(self, device_output_indices: set[int], args: Tuple[Any, ...]) -> Any:
+        graph = fx.Graph()
+        x = graph.placeholder("x")
+        _set_val(x, (8, 3))
+        graph.output((x,))
+        module = _XLAModule(
+            fx.GraphModule(torch.nn.Module(), graph),
+            backend_type=BackendType.XLA_SHARD_MAP,
+        )
+        module.device_output_indices = device_output_indices
+        with (
+            patch.object(
+                _XLAModule, "_jit_shard_map", return_value=(None, "shard_map")
+            ),
+            patch.object(_XLAModule, "_jit_plain", return_value=(None, "plain")),
+        ):
+            return module._compile_xla(*args)
+
+    def test_routes(self) -> None:
+        host_arg = (torch.ones(8, 3),)
+        self.assertEqual("plain", self._route(set(), host_arg))
+        self.assertEqual("shard_map", self._route({0}, host_arg))
+        self.assertEqual("shard_map", self._route(set(), (jax.numpy.ones((8, 3)),)))
 
 
 if __name__ == "__main__":
