@@ -49,6 +49,41 @@ SPMD_DECOMP_TABLE.update(
 )
 
 
+_TPU_FBGEMM_LIB: Optional[torch.library.Library] = None
+
+
+def _register_tpu_fbgemm_kernels() -> List[str]:
+    """Give TorchTPU kernels to the fbgemm ops a RecIR graph may still hold.
+
+    RecIR's trace decomposes fbgemm ops through SPMD_DECOMP_TABLE, but ops that
+    custom ops call from their autograd (e.g. fbgemm::jagged_to_padded_dense_backward)
+    reach the graph as they are. torchax lowers them itself; torch_tpu has no
+    kernels for them. Each gets the table's pure-PyTorch implementation as its
+    PrivateUse1 kernel, which torch_tpu's exporter records as ATen ops. Returns
+    the ops registered by this call.
+    """
+    global _TPU_FBGEMM_LIB
+    import recir.lowering.fbgemm_fallback  # noqa: F401 -- fills SPMD_DECOMP_TABLE
+
+    registered = []
+    for op, fn in list(SPMD_DECOMP_TABLE.items()):
+        if not isinstance(op, torch._ops.OpOverload) or op.namespace != "fbgemm":
+            continue
+        overload = op._overloadname
+        name = op._schema.name.split("::", 1)[1]
+        if overload != "default":
+            name = f"{name}.{overload}"
+        if torch._C._dispatch_has_kernel_for_dispatch_key(
+            f"fbgemm::{name}", "PrivateUse1"
+        ):
+            continue
+        if _TPU_FBGEMM_LIB is None:
+            _TPU_FBGEMM_LIB = torch.library.Library("fbgemm", "IMPL")
+        _TPU_FBGEMM_LIB.impl(name, fn, "PrivateUse1")
+        registered.append(f"fbgemm::{name}")
+    return registered
+
+
 def _is_torchtpu_compatible(node: torch.fx.Node) -> Tuple[bool, str]:
     """Per-node check: can this node be absorbed into a torch_tpu subgraph?
 
@@ -297,6 +332,9 @@ def partial_lower_torchtpu(
     the Inductor and XLA partial-lowering paths).
     """
     gm = strip_profiler_nodes(gm)
+    registered = _register_tpu_fbgemm_kernels()
+    if registered:
+        logger.info("TorchTPU kernels for fbgemm ops: %s", registered)
     return segment_and_lower(
         gm,
         compatibility_fn=_is_torchtpu_compatible,

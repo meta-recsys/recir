@@ -13,6 +13,7 @@ from recir.lowering.torchtpu_lower import (
     _check_same_graph_on_all_ranks,
     _graph_fingerprint,
     _mark_collectives_spmd_safe,
+    _register_tpu_fbgemm_kernels,
     _shape_mismatches,
     _TorchTPUModule,
     partial_lower_torchtpu,
@@ -137,3 +138,15 @@ class TorchTPULowerTest(unittest.TestCase):
         check(0)
         with self.assertRaisesRegex(RuntimeError, r"ranks \[1\]"):
             check(1)
+
+    def test_fbgemm_ops_left_in_a_graph_get_tpu_kernels(self) -> None:
+        _register_tpu_fbgemm_kernels()
+        for name in (
+            "fbgemm::jagged_to_padded_dense_forward",
+            "fbgemm::jagged_to_padded_dense_backward",
+        ):
+            self.assertTrue(
+                torch._C._dispatch_has_kernel_for_dispatch_key(name, "PrivateUse1"),
+                name,
+            )
+        self.assertEqual(_register_tpu_fbgemm_kernels(), [])
