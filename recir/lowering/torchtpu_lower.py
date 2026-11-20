@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import os
 from collections import Counter, defaultdict
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -161,10 +162,17 @@ def _shape_mismatches(gm: torch.fx.GraphModule, args: List[Any]) -> List[str]:
     return mismatches
 
 
+# By default each subgraph is compiled by TpuBackend with its collectives marked
+# SPMD-safe; "static" compiles the functionalized graph with StaticCompiler.
+COMPILER_ENV = "RECIR_TORCHTPU_COMPILER"
 # The node annotation torch.tpu.distributed.spmd_safe sets under compilation.
 # TpuBackend's split compiler otherwise gives every collective a program of its
 # own, so that ranks whose graphs differ around a collective cannot deadlock.
 _SPMD_SAFE_METADATA_KEY = "spmd_safe"
+
+
+def _uses_static_compiler() -> bool:
+    return os.environ.get(COMPILER_ENV) == "static"
 
 
 def _mark_collectives_spmd_safe(gm: torch.fx.GraphModule) -> int:
@@ -218,8 +226,8 @@ def _check_same_graph_on_all_ranks(gm: torch.fx.GraphModule, tag: str) -> None:
     on every other rank, so a rank that traced a different graph hangs the job
     inside the TPU program. ``TpuBackend`` splits at collectives (or, with
     ``TORCH_TPU_SPMD_HANDSHAKE_STAGE``, compares graphs first); with collectives
-    marked SPMD-safe it does neither, so the ranks compare fingerprints over
-    the host process group.
+    marked SPMD-safe, or under StaticCompiler, it does neither, so the ranks
+    compare fingerprints over the host process group.
     """
     if not dist.is_initialized() or dist.get_world_size() == 1:
         return
@@ -249,6 +257,46 @@ def _check_same_graph_on_all_ranks(gm: torch.fx.GraphModule, tag: str) -> None:
         )
 
 
+def _functional_graph(
+    gm: torch.fx.GraphModule,
+    args: List[Any],
+    decompositions: Optional[Dict[Any, Callable[..., Any]]] = None,
+) -> Tuple[torch.fx.GraphModule, List[int]]:
+    """``gm`` without mutations, plus the inputs whose new values it returns.
+
+    RecIR graphs update parameters and optimizer state in place. The functional
+    graph returns ``gm``'s outputs flattened, followed by the new value of each
+    mutated input; the second result lists those inputs' positions in order.
+    """
+    from torch.fx.experimental.proxy_tensor import make_fx
+
+    def run(*inputs: Any) -> List[Any]:
+        return pytree.tree_leaves(torch.fx.Interpreter(gm).run(*inputs))
+
+    fgm = make_fx(
+        torch.func.functionalize(run, remove="mutations"),
+        decomposition_table=decompositions,
+        tracing_mode="fake",
+    )(*args)
+    placeholders = {
+        node: i for i, node in enumerate(fgm.graph.find_nodes(op="placeholder"))
+    }
+    # Functionalization writes each mutated input back with a trailing copy_.
+    mutated: Dict[int, torch.fx.Node] = {}
+    for node in list(fgm.graph.nodes):
+        if node.target is torch.ops.aten.copy_.default and node.args[0] in placeholders:
+            new_value = node.args[1]
+            assert isinstance(new_value, torch.fx.Node)
+            mutated[placeholders[node.args[0]]] = new_value
+            node.replace_all_uses_with(new_value)
+            fgm.graph.erase_node(node)
+    output = next(iter(fgm.graph.find_nodes(op="output")))
+    output.args = (list(output.args[0]) + list(mutated.values()),)
+    fgm.graph.lint()
+    fgm.recompile()
+    return fgm, list(mutated)
+
+
 class _TorchTPUModule(torch.nn.Module):
     """Wraps an ``fx.GraphModule`` subgraph for lazy torch_tpu compilation.
 
@@ -263,6 +311,10 @@ class _TorchTPUModule(torch.nn.Module):
         super().__init__()
         self.gm = gm
         self.compiled: Optional[Callable[..., Any]] = None
+        # Set by the StaticCompiler path: inputs the compiled program returns
+        # new values for, and the structure of gm's own outputs.
+        self._mutated: Optional[List[int]] = None
+        self._out_spec: Optional[pytree.TreeSpec] = None
         logger.info(
             "torch_tpu subgraph: %d empty intermediates made fresh",
             _fresh_empty_tensors(gm),
@@ -307,17 +359,47 @@ class _TorchTPUModule(torch.nn.Module):
                 tag,
                 sum(isinstance(a, torch.Tensor) and a.numel() == 0 for a in args),
             )
-            logger.info(
-                "spmd_safe: marked %d collectives in subgraph (%s)",
-                _mark_collectives_spmd_safe(self.gm),
-                tag,
-            )
-            _check_same_graph_on_all_ranks(self.gm, tag)
-            self.compiled = TpuBackend()(self.gm, list(tpu_args))
+            if _uses_static_compiler():
+                self._compile_static(tpu_args, tag)
+            else:
+                logger.info(
+                    "spmd_safe: marked %d collectives in subgraph (%s)",
+                    _mark_collectives_spmd_safe(self.gm),
+                    tag,
+                )
+                _check_same_graph_on_all_ranks(self.gm, tag)
+                self.compiled = TpuBackend()(self.gm, list(tpu_args))
             logger.info("Completed torch_tpu compilation for subgraph (%s)", tag)
         with torch.profiler.record_function(tag):
             assert self.compiled is not None
-            return self.compiled(*tpu_args)
+            outputs = self.compiled(*tpu_args)
+            if self._mutated is None:
+                return outputs
+            num_outputs = len(outputs) - len(self._mutated)
+            for index, value in zip(self._mutated, outputs[num_outputs:]):
+                args[index].copy_(value)
+            assert self._out_spec is not None
+            return pytree.tree_unflatten(list(outputs[:num_outputs]), self._out_spec)
+
+    def _compile_static(self, tpu_args: List[Any], tag: str) -> None:
+        """Compile with torch_tpu's StaticCompiler: no AOT autograd re-trace and
+        no split at collectives, so the subgraph becomes one program."""
+        # pyre-ignore[21]: torch_tpu is a TPU-runtime-only package.
+        from torch_tpu._internal.compile._backend import _TPU_DECOMPOSITIONS
+
+        # pyre-ignore[21]: torch_tpu is a TPU-runtime-only package.
+        from torch_tpu._internal.compile.compiler import StaticCompiler
+
+        output = next(iter(self.gm.graph.find_nodes(op="output")))
+        self._out_spec = pytree.tree_flatten(output.args[0])[1]
+        fgm, self._mutated = _functional_graph(self.gm, tpu_args, _TPU_DECOMPOSITIONS)
+        logger.info(
+            "StaticCompiler: functional graph of %d nodes, %d mutated inputs",
+            len(fgm.graph.nodes),
+            len(self._mutated),
+        )
+        _check_same_graph_on_all_ranks(fgm, tag)
+        self.compiled = StaticCompiler()(fgm, tpu_args)
 
 
 def partial_lower_torchtpu(
