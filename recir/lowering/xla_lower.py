@@ -735,7 +735,9 @@ class _XLAModule(torch.nn.Module):
           with replicated P() specs so ``jax.lax.psum`` etc. can
           reference the ``"torch_dist"`` axis.
         - **XLA_SHARD_MAP without collectives**: plain ``jax.jit`` on a
-          single device.
+          single device, unless the subgraph exchanges values with a
+          device-resident graph break: those are per-device blocks, so it runs
+          in ``shard_map`` too.
         - **XLA_GSPMD**: ``jax.jit`` with explicit ``in_shardings`` /
           ``out_shardings`` read from per-node ``node.meta`` attributes.
 
@@ -765,7 +767,11 @@ class _XLAModule(torch.nn.Module):
 
         if self.backend_type == BackendType.XLA_GSPMD:
             lowered, run = self._jit_gspmd(jax_fn, args, input_device)
-        elif self._has_collective_ops():
+        elif (
+            self._has_collective_ops()
+            or self.device_output_indices
+            or any(isinstance(a, jax.Array) for a in args)
+        ):
             lowered, run = self._jit_shard_map(jax_fn, args, input_device)
         else:
             lowered, run = self._jit_plain(jax_fn, args, input_device, jax_device)
@@ -1066,6 +1072,10 @@ class _XLAModule(torch.nn.Module):
             # Other user outputs preserve the historical replicated contract.
             if i in torch_indices and fsdp_src is None:
                 out_spec_list.append(P())
+                continue
+            # A device-resident graph break reads each device's own block.
+            if i in self.device_output_indices and ndim >= 1:
+                out_spec_list.append(P("torch_dist", *([None] * (ndim - 1))))
                 continue
             if fsdp_src is not None and ndim >= 1:
                 out_spec_list.append(P("torch_dist", *([None] * (ndim - 1))))
