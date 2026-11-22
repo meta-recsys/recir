@@ -536,6 +536,7 @@ def build_torch_optimizer(
 _TRACEABLE_POLICIES: Tuple[WarmupPolicy, ...] = (
     WarmupPolicy.NONE,
     WarmupPolicy.LINEAR,
+    WarmupPolicy.CONSTANT,
 )
 
 
@@ -568,6 +569,8 @@ def _stage_multiplier(stages: List[WarmupStage], iter_t: torch.Tensor) -> torch.
     for stage in reversed(stages):
         if stage.policy == WarmupPolicy.LINEAR:
             here = stage.value + (1.0 - stage.value) * it / float(stage.max_iters)
+        elif stage.policy == WarmupPolicy.CONSTANT:
+            here = torch.full_like(it, stage.value)
         else:
             here = torch.ones_like(it)
         here = here * float(stage.lr_scale)
@@ -582,6 +585,7 @@ def warmup_lr(cfg: OptimConfig, iteration: int) -> float:
     """``cfg.lr`` under its warmup schedule at ``iteration``: the rate
     :class:`WarmupController` sets for that step."""
     stages = _lr_stages(list(cfg.lr_warmup_schedule or []))
+    _assert_traceable_stages(stages)
     return cfg.lr * float(_stage_multiplier(stages, torch.tensor(iteration)))
 
 
