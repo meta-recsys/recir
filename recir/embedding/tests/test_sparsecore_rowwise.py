@@ -224,3 +224,28 @@ class IdOrderBlocksTest(unittest.TestCase):
             )
             untouched = np.setdiff1d(np.arange(table.shape[0]), phys)
             self.assertTrue((table[untouched] == -1).all())
+
+    def test_reset_rows_sets_only_those_rows_and_zeroes_their_momentum(self) -> None:
+        # Both sub-tables, and a count that is not a power of two.
+        ids = np.array([0, 5, 599, 600, 1002])
+        weights = np.arange(ids.size * self._D, dtype=np.float32).reshape(-1, self._D)
+
+        self.sc.reset_rows("t", ids, weights + 0.5)
+
+        expected_w = (np.arange(self._N)[:, None] + np.arange(self._D) / 10).astype(
+            np.float32
+        )
+        expected_m = np.arange(self._N, dtype=np.float32)
+        expected_w[ids] = weights + 0.5
+        expected_m[ids] = 0
+        np.testing.assert_array_equal(
+            self.sc.export_table("t", "weights")[: self._N], expected_w
+        )
+        np.testing.assert_array_equal(
+            self.sc.export_table("t", "momentum")[: self._N, 0], expected_m
+        )
+        for sub in self._SUBS:
+            table = np.asarray(self.sc.ev_w[sub.stack].table)
+            used = self._phys(sub, np.arange(sub.rows))
+            untouched = np.setdiff1d(np.arange(table.shape[0]), used)
+            self.assertTrue((table[untouched] == -1).all())

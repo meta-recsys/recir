@@ -1056,3 +1056,56 @@ class SparseCoreRowwiseTables:
                     self.ev_w[sub.stack] = ev._replace(
                         table=import_(ev.table, chunk_array, ranges)
                     )
+
+    def reset_rows(self, table: str, ids: np.ndarray, weights: np.ndarray) -> None:
+        """Set rows ``ids`` of ``table`` to ``weights`` ([len(ids), D]) and their
+        momentum to 0, as TBE's ``reset_embedding_weight_momentum`` followed by a
+        re-init does. FP16 tables store the weights rounded to FP16."""
+        t = self._tables[table]
+        ids = np.asarray(ids, np.int64)
+        weights = np.asarray(weights, np.float32)
+        if weights.shape != (ids.size, t.embedding_dim):
+            raise ValueError(f"{table}: {weights.shape=} for {ids.size} ids")
+        if ids.size and (ids.min() < 0 or ids.max() >= t.num_embeddings):
+            raise ValueError(f"{table}: ids outside [0, {t.num_embeddings})")
+        if t.fp16:
+            weights = weights.astype(np.float16).astype(np.float32)
+        shards = self._world * self._num_sc
+        for sub in self._subs[table]:
+            inside = (ids >= sub.start) & (ids < sub.start + sub.rows)
+            if not inside.any():
+                continue
+            size, rotation, offset = self._layout[sub.stack]
+            u = ids[inside] - sub.start
+            phys = ((u % shards + rotation) % shards) * size + u // shards + offset
+            # A power-of-two count bounds the compiles; padding rows index past
+            # the table and are dropped.
+            n = 1 << int(phys.size - 1).bit_length()
+            rows = np.full(n, self.momentum[sub.stack].shape[0], np.int32)
+            rows[: phys.size] = phys
+            values = np.zeros((n, t.embedding_dim), np.float32)
+            values[: phys.size] = weights[inside]
+            self.ev_w[sub.stack], self.momentum[sub.stack] = self._reset_program(
+                sub.stack
+            )(
+                self.ev_w[sub.stack],
+                self.momentum[sub.stack],
+                jnp.asarray(rows),
+                jnp.asarray(values),
+            )
+
+    def _reset_program(self, stack: str) -> Any:
+        key = ("reset", stack)
+        if key not in self._programs:
+            self._programs[key] = jax.jit(
+                lambda ev, m, r, x: (
+                    ev._replace(table=ev.table.at[r].set(x, mode="drop")),
+                    m.at[r].set(0.0, mode="drop"),
+                ),
+                donate_argnums=(0, 1),
+                out_shardings=(
+                    _keep_formats(self.ev_w[stack]),
+                    _keep_formats(self.momentum[stack]),
+                ),
+            )
+        return self._programs[key]
