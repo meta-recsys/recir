@@ -21,7 +21,7 @@ from recir.training.optim import (
 )
 from torch.fx.experimental.proxy_tensor import make_fx
 from torchrec.distributed.embedding_types import OptimType
-from torchrec.optim.warmup import WarmupPolicy, WarmupStage
+from torchrec.optim.warmup import _get_multiplier, _lr_stages, WarmupPolicy, WarmupStage
 
 
 class RowWiseAdagradRoundingTest(unittest.TestCase):
@@ -208,6 +208,32 @@ class WarmupControllerTest(unittest.TestCase):
             # pyrefly: ignore[bad-argument-type]
             self.assertAlmostEqual(float(sparse_lr), warmup_lr(cfg, iteration))
             controller.step()
+
+    def test_warmup_lr_matches_torchrec_for_every_traceable_policy(self) -> None:
+        schedule = [
+            WarmupStage(policy=WarmupPolicy.CONSTANT, max_iters=3, value=0.25),
+            WarmupStage(policy=WarmupPolicy.LINEAR, max_iters=7, value=0.5),
+            WarmupStage(policy=WarmupPolicy.CONSTANT, max_iters=9, lr_scale=0.5),
+        ]
+        cfg = types.SimpleNamespace(lr=0.2, lr_warmup_schedule=schedule)
+        stages = _lr_stages(schedule)
+        for iteration in range(12):
+            stage = next(s for s in stages if iteration <= s.max_iters)
+            # pyrefly: ignore[bad-argument-type]
+            self.assertAlmostEqual(
+                warmup_lr(cfg, iteration), 0.2 * _get_multiplier(stage, iteration)
+            )
+
+    def test_warmup_lr_rejects_policies_without_a_tensor_form(self) -> None:
+        cfg = types.SimpleNamespace(
+            lr=0.2,
+            lr_warmup_schedule=[
+                WarmupStage(policy=WarmupPolicy.STEP, max_iters=5, decay_iters=2)
+            ],
+        )
+        with self.assertRaisesRegex(NotImplementedError, "STEP"):
+            # pyrefly: ignore[bad-argument-type]
+            warmup_lr(cfg, 1)
 
     def test_prime_rowwise_state_uses_parameter_device(self) -> None:
         parameter = torch.nn.Parameter(torch.ones((2, 4), device="meta"))
