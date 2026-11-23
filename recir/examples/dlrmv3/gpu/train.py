@@ -372,7 +372,9 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     torch.cuda.set_device(trainer.device)
     torch.manual_seed(cfg.seed)
 
-    dataset = make_dataset(cfg.dataset, cfg.data_root, trainer.hstu, trainer.tables)
+    dataset = make_dataset(
+        cfg.dataset, cfg.data_root, trainer.hstu, trainer.tables, trainer.layout
+    )
     collate = TokenBudgetCollate(trainer.layout, trainer.hstu, cfg.batch_size)
     train_dl, eval_dl = make_train_eval_loaders(
         dataset,

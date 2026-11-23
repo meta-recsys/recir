@@ -189,6 +189,7 @@ def _real_batches(
         args.data_root,
         trainer.hstu,
         trainer.tables,
+        trainer.layout,
     )
     streaming = dataset.dataset
     set_timestamp = getattr(streaming, "set_ts", None)

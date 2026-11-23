@@ -23,6 +23,7 @@ from generative_recommenders.dlrm_v3.configs import (
     get_hstu_configs,
 )
 from generative_recommenders.modules.dlrm_hstu import DlrmHSTUConfig
+from recir.examples.dlrmv3.common import yambda
 from recir.examples.dlrmv3.common.model import FeatureLayout
 from torchrec.distributed.embedding_types import OptimType
 from torchrec.modules.embedding_configs import DataType, EmbeddingConfig
@@ -95,7 +96,10 @@ class DLRMv3TrainConfig:
     hash_size: int = 0
 
     def hstu_config(self) -> DlrmHSTUConfig:
-        cfg = get_hstu_configs(self.dataset)
+        if yambda.is_yambda(self.dataset):
+            cfg = yambda.hstu_config()
+        else:
+            cfg = get_hstu_configs(self.dataset)
         if self.embedding_dim:
             cfg.hstu_embedding_table_dim = self.embedding_dim
         if self.num_layers:
@@ -103,6 +107,12 @@ class DLRMv3TrainConfig:
         return cfg
 
     def embedding_tables(self) -> Dict[str, EmbeddingConfig]:
+        if yambda.is_yambda(self.dataset):
+            base = yambda.embedding_tables(
+                yambda.read_meta(self.data_root, self.dataset)
+            )
+        else:
+            base = get_embedding_table_config(self.dataset)
         # Tables train in fp32, like the dense model consuming their lookups
         # (the dataset configs declare fp16, an inference storage choice).
         # init_fn=None: the dataset configs' init_fn is torchrec's default
@@ -115,7 +125,7 @@ class DLRMv3TrainConfig:
                 data_type=DataType.FP32,
                 init_fn=None,
             )
-            for name, t in get_embedding_table_config(self.dataset).items()
+            for name, t in base.items()
         }
 
     def resolved_uih_len(self, hstu: DlrmHSTUConfig) -> int:

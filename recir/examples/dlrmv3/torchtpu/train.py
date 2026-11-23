@@ -281,7 +281,9 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     torch.manual_seed(cfg.seed)
     trainer = TorchTPUTrainer(cfg, world, device, args.embedding_backend)
 
-    dataset = make_dataset(cfg.dataset, cfg.data_root, trainer.hstu, trainer.tables)
+    dataset = make_dataset(
+        cfg.dataset, cfg.data_root, trainer.hstu, trainer.tables, trainer.layout
+    )
     collate = TokenBudgetCollate(trainer.layout, trainer.hstu, cfg.batch_size, 1)
     train_dl, _ = make_train_eval_loaders(
         dataset,

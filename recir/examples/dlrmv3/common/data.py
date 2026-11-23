@@ -28,6 +28,7 @@ from typing import Any, Dict, List, Sequence, Tuple
 import torch
 from generative_recommenders.dlrm_v3.utils import get_dataset
 from generative_recommenders.modules.dlrm_hstu import DlrmHSTUConfig
+from recir.examples.dlrmv3.common import yambda
 from recir.examples.dlrmv3.common.model import FeatureLayout
 from torch.utils.data import DataLoader, Dataset as TorchDataset, Subset
 from torch.utils.data.distributed import DistributedSampler
@@ -69,6 +70,12 @@ class GRDataset(TorchDataset):
 
     def __len__(self) -> int:
         return self.dataset.get_item_count()
+
+    def train_size(self, train_split: float) -> int:
+        """Samples before the train/eval boundary: the dataset's own (time)
+        split if it has one, else the first ``train_split`` of the samples."""
+        n = getattr(self.dataset, "num_train_samples", None)
+        return n if n is not None else int(round(train_split * len(self)))
 
     def __getitem__(self, index: int) -> Sample:
         return self.__getitems__([index])[0]
@@ -199,7 +206,19 @@ def make_dataset(
     data_root: str,
     hstu_config: DlrmHSTUConfig,
     tables: Dict[str, EmbeddingConfig],
+    layout: FeatureLayout,
 ) -> GRDataset:
+    """Yambda samples read at most ``layout.uih_len`` history events; the
+    collate keeps only that many, so reading more would be wasted host work."""
+    if yambda.is_yambda(dataset):
+        return GRDataset(
+            yambda.YambdaDataset(
+                yambda.data_dir(data_root, dataset),
+                tables,
+                num_candidates=layout.num_candidates,
+                max_uih_len=layout.uih_len,
+            )
+        )
     cls, kwargs = get_dataset(name=dataset, new_path_prefix=data_root)
     kwargs["embedding_config"] = tables
     return GRDataset(cls(hstu_config=hstu_config, is_inference=False, **kwargs))
@@ -217,7 +236,7 @@ def make_train_eval_loaders(
     pin_memory: bool,
 ) -> Tuple[DataLoader, DataLoader]:
     n = len(dataset)
-    n_train = int(round(train_split * n))
+    n_train = dataset.train_size(train_split)
     splits = (Subset(dataset, range(n_train)), Subset(dataset, range(n_train, n)))
     loaders = []
     for i, subset in enumerate(splits):
