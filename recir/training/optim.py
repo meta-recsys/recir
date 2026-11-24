@@ -594,8 +594,9 @@ class WarmupController:
     torchrec.optim.warmup.WarmupOptimizer semantics; ``_lr_stages`` appends a
     terminal NONE-policy stage so reads past the last stage hold at base_lr.
 
-    Lifecycle: construct, call :meth:`apply` once to seed iter 0, then call
-    :meth:`step` after each compiled step to advance to the next iter's LR.
+    Lifecycle: construct, call :meth:`set_iter` once with the first training
+    iteration, then call :meth:`step` after each compiled step to advance to
+    the next iter's LR.
     The 0-d buffers are owned by the caller (registered on the module) and
     passed in by reference so fill_() preserves the traced identity.
     """
