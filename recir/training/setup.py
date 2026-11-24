@@ -108,6 +108,12 @@ def _partition_params(
     return sparse_params, dense_params
 
 
+# torchrec's ``KeyedOptimizer.init_state`` (which production's RecOptimizer runs
+# at construction, and ``prime_optimizer_state`` reproduces) is one step through
+# every ``WarmupOptimizer``, so the first training step runs at iteration 1.
+FIRST_TRAINING_ITER: int = 1
+
+
 def _register_iter_buffer(model: torch.nn.Module, device: torch.device) -> torch.Tensor:
     """Register the 0-d int64 warmup counter under ``LR_ITER_BUFFER``."""
     model.register_buffer(
@@ -205,7 +211,7 @@ def setup_dense_optimizer_and_warmup(
         ),
         sparse_lr_buffer=sparse_lr_buffer,
     )
-    warmup.apply()  # seed iter-0 LR
+    warmup.set_iter(FIRST_TRAINING_ITER)
     setattr(model, WARMUP_ATTR, warmup)  # recir_train_step advances it in-graph
     logger.info(
         "[recir setup] dense-only optimizer: %d params, optim=%s, lr=%g, stages=%d",
@@ -231,7 +237,7 @@ def setup_dual_optimizers_and_warmup(
     LR_DENSE_BUFFER / LR_SPARSE_BUFFER (the names `recir_train_step` rebinds each
     optimizer group LR to). The sparse buffer is created on CPU for TBE, whose
     fused optimizer requires a host learning-rate tensor. The WarmupController
-    is seeded for iter 0 so the first compiled step uses the warmup LR.
+    starts at ``FIRST_TRAINING_ITER``, so the first compiled step uses that LR.
     """
     sparse_params, dense_params = _partition_params(model, embedding_plan.param_fqns)
 
@@ -255,7 +261,7 @@ def setup_dual_optimizers_and_warmup(
         dense_lr_buffer=dense_lr_buffer,
         sparse_lr_buffer=sparse_lr_buffer,
     )
-    warmup.apply()  # seed iter-0 LR
+    warmup.set_iter(FIRST_TRAINING_ITER)
     setattr(model, WARMUP_ATTR, warmup)  # recir_train_step advances it in-graph
 
     logger.info(
