@@ -313,7 +313,9 @@ def main(argv: Optional[Sequence[str]] = None) -> None:  # noqa: C901
         # the cpu backend's torchrec fused optimizer state is not part of it.
         raise NotImplementedError("checkpointing needs --embedding_backend tpu")
 
-    dataset = make_dataset(cfg.dataset, cfg.data_root, trainer.hstu, trainer.tables)
+    dataset = make_dataset(
+        cfg.dataset, cfg.data_root, trainer.hstu, trainer.tables, trainer.layout
+    )
     geom = trainer.geom
     collate = TokenBudgetCollate(
         trainer.layout, trainer.hstu, geom.real_rows, geom.local_chips

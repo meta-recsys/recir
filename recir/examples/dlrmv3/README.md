@@ -92,6 +92,10 @@ For the real datasets, run generative-recommenders'
 The `debug` dataset is generated locally and requires no download. Use it for
 installation smoke tests and deterministic numerical parity.
 
+`yambda-<scale>` reads the public [Yambda](https://huggingface.co/datasets/yandex/yambda)
+listening log as converted by `common/preprocess_yambda.py`; see
+[torchtpu/README.md](torchtpu/README.md#3-yambda).
+
 ## CPU smoke test
 
 The TPU entrypoint can run through JAX's CPU backend with embeddings on the
@@ -215,7 +219,9 @@ with `TPU numerical parity passed` when every tensor is within the requested
 ## TorchTPU
 
 `torchtpu/train.py` runs the same model on TorchTPU
-(`torch_tpu`), PyTorch's native TPU device, instead of torchax/XLA:
+(`torch_tpu`), PyTorch's native TPU device, instead of torchax/XLA.
+[torchtpu/README.md](torchtpu/README.md) is the step-by-step playbook: image,
+GKE launch, synthetic and Yambda data, and the knobs.
 
 ```bash
 python -m recir.examples.dlrmv3.torchtpu.train --dataset debug --num_train_batches 10
@@ -226,8 +232,9 @@ python -m recir.examples.dlrmv3.torchtpu.train --dataset debug --num_train_batch
   every device of a v7x host); multi-host jobs read the GKE TPU environment.
 - Each process runs the dense model on its device; gradients are averaged with
   explicit collectives (`DataParallel` + `TorchTPUBackend`).
-- Embedding tables stay in torchrec DMP on the hosts (the `cpu` embedding
-  backend), row-wise sharded over the processes, behind a graph break.
+- Embedding tables sit behind a graph break: in torchrec on the hosts (the
+  `cpu` embedding backend, row-wise sharded over the processes) or on the TPUs'
+  SparseCores (`--embedding_backend sparsecore`).
 - Evaluation and checkpointing are not wired up yet.
 
 ## Expected behavior

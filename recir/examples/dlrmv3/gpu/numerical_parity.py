@@ -115,7 +115,7 @@ def _fixed_batches(
     sample_offset: int,
     steps: int,
 ) -> list[TokenBudgetBatch]:
-    dataset = make_dataset(cfg.dataset, cfg.data_root, hstu, dict(tables))
+    dataset = make_dataset(cfg.dataset, cfg.data_root, hstu, dict(tables), layout)
     streaming = dataset.dataset
     set_timestamp = getattr(streaming, "set_ts", None)
     if callable(set_timestamp):

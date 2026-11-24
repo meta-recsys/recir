@@ -1,0 +1,15 @@
+# pip constraints for the TorchTPU image (PIP_CONSTRAINT; applies to every install).
+# torch-tpu 0.2.0 accepts torch >=2.11,<=2.15; 2.12 is the lowest Helion 1.5
+# imports against. fbgemm 1.N pairs with torch 2.(N+5); torchrec matches fbgemm.
+torch==2.12.1+cpu
+torch-tpu==0.2.0
+helion==1.5.2
+triton==3.8.0
+torchrec==1.7.*
+fbgemm-gpu==1.7.*
+fbgemm-gpu-cpu==1.7.*
+# recir's ring-shift kernel still uses pltpu.DeviceIdType, removed in JAX 0.11.
+jax<0.11
+# torch-tpu 0.2.0 fails to load on libtpu 0.0.53.1 ("expected version string ...
+# got '0.0.53.1'"), which jax[tpu] otherwise pulls in.
+libtpu<0.0.53.1

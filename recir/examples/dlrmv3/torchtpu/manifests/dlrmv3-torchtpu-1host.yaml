@@ -1,0 +1,58 @@
+# DLRMv3 on TorchTPU, one TPU v7x host (2x2x1: 4 chips, 8 TorchTPU devices).
+# IMAGE=<registry>/dlrmv3_torchtpu:latest \
+# COMMAND='python3 -u -m recir.examples.dlrmv3.torchtpu.train --dataset debug ...' \
+#   envsubst < dlrmv3-torchtpu-1host.yaml | kubectl create -f -
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  generateName: dlrmv3-torchtpu-
+  namespace: default
+spec:
+  failurePolicy:
+    maxRestarts: 0
+  replicatedJobs:
+  - name: worker
+    replicas: 1
+    template:
+      metadata:
+        labels:
+          x.tpu.google.com/inject-slice-selector: "true"
+      spec:
+        parallelism: 1
+        completions: 1
+        completionMode: Indexed
+        backoffLimit: 0
+        template:
+          metadata:
+            annotations:
+              cloud.google.com/gke-tpu-slice-topology: "2x2x1"
+          spec:
+            containers:
+            - name: dlrmv3
+              image: ${IMAGE}
+              imagePullPolicy: Always
+              env:
+              - name: PYTHONUNBUFFERED
+                value: "1"
+              - name: PYTHONFAULTHANDLER
+                value: "1"
+              - name: MASTER_PORT
+                value: "29500"
+              command:
+              - sh
+              - -c
+              - >-
+                ${COMMAND}
+              ports:
+              - containerPort: 8471
+              resources:
+                limits:
+                  google.com/tpu: 4
+            nodeSelector:
+              cloud.google.com/gke-tpu-accelerator: tpu7x
+              cloud.google.com/gke-tpu-topology: "2x2x1"
+            tolerations:
+            - key: "google.com/tpu"
+              operator: "Exists"
+              effect: "NoSchedule"
+            restartPolicy: Never
