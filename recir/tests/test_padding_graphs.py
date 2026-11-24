@@ -15,6 +15,7 @@ import numpy as np
 import torch
 from recir.api import make_compiled_runner
 from recir.backends.types import BackendType
+from recir.distributed.sharding_spec import FSDPWeightShardSpec, set_state_layout
 from recir.fb.examples.fm_v3_common.capacity import CapacityBucket, CapacitySelector
 from recir.fb.examples.fm_v3_common.padding_graph_set import PaddingGraphSet
 from recir.lowering.xla_device_state import XLADeviceStateManager
@@ -383,3 +384,31 @@ class TestGraphStateHandoff(TestCase):
         state = obj.state_manager.device_state
         self.assertIs(state[3], obj.flat_state[3])
         self.assertTrue(all(isinstance(value, jax.Array) for value in state[:3]))
+
+
+def _weighted_sum(w, table, x):
+    return ((x * w).sum(1) + table.sum(),)
+
+
+def _shard_map_module() -> _XLAModule:
+    gm = make_fx(_weighted_sum, tracing_mode="fake")(
+        torch.ones(4), torch.ones(3, 4), torch.ones(2, 4)
+    )
+    inputs = [n for n in gm.graph.nodes if n.op == "placeholder"]
+    set_state_layout(inputs[1], FSDPWeightShardSpec(0, 8, 1))
+    inputs[2].meta["is_batch_input"] = True
+    inputs[2].meta["batch_dim"] = 0
+    return _XLAModule(gm, backend_type=BackendType.XLA_SHARD_MAP)
+
+
+class TestShardMapPrecompile(TestCase):
+    def test_precompiled_executable_runs_per_process_inputs(self) -> None:
+        w = torch.arange(4, dtype=torch.float32)
+        table = torch.arange(96, dtype=torch.float32).reshape(24, 4) / 100
+        x = torch.arange(64, dtype=torch.float32).reshape(16, 4) / 10
+        expected = _shard_map_module()(w, table, x)
+        module = _shard_map_module()
+        module.precompile()
+        self.assertIsNotNone(module._jax_compiled)
+        for actual, reference in zip(module(w, table, x), expected):
+            torch.testing.assert_close(actual, reference, rtol=0, atol=0)

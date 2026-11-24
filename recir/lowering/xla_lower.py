@@ -504,6 +504,16 @@ class _XLAModule(torch.nn.Module):
                         f"Non-divisible global input shape for {node.name}"
                     )
                 shape[dim] //= divisor
+            if (
+                not gspmd
+                and shape
+                and (
+                    node.meta.get("is_batch_input", False)
+                    or get_state_layout(node) is not None
+                )
+            ):
+                # shard_map traces per-device shapes; _to_sharded_jax takes per-process ones.
+                shape[0] *= len(_get_local_devices())
             args.append(torch.empty(shape, dtype=val.dtype, device="meta"))
         token = _PRECOMPILE.set(True)
         try:
