@@ -205,27 +205,20 @@ class JaggedHSTUAttentionTest(unittest.TestCase):
         # the 400 - 256 - 8 = 136 the stage start used to be clamped to.
         self._assert_parity([200, 200], [0, 0], max_seq_len=200, block=256)
 
-    def test_the_staged_start_stays_8_aligned_and_in_bounds(self) -> None:
-        """The cap at ``rows - block`` is only 8-aligned when ``rows`` and
-        ``block`` agree modulo 8, so the hint is claimed only then. Either way
-        the start must stay 8-aligned when it does not bind, and the read must
-        stay inside the tensor."""
+    def test_the_stage_starts_at_the_8_aligned_row_before_the_sequence(self) -> None:
+        """So the sequence's first row is stage row ``start % 8``, and a sequence
+        of up to ``block - 7`` rows fits the ``block``-row stage."""
         offsets = jnp.asarray([0, 200, 401], dtype=jnp.int32)
 
-        for rows, block in ((408, 256), (401, 256), (404, 100)):
-            for seq in (0, 1):
-                with self.subTest(rows=rows, block=block, seq=seq):
-                    start, length, prefix = jax.jit(
-                        lambda s=seq, r=rows, b=block: _single_block_stage(
-                            offsets, s, r, b
-                        )
-                    )()
-                    self.assertLessEqual(int(start) + block, rows)
-                    self.assertGreaterEqual(int(prefix), 0)
-                    self.assertEqual(int(start) + int(prefix), int(offsets[seq]))
-                    if int(start) < rows - block:
-                        self.assertEqual(int(start) % _ALIGNMENT_ROWS, 0)
-                        self.assertLess(int(prefix), _ALIGNMENT_ROWS)
+        for seq in (0, 1):
+            with self.subTest(seq=seq):
+                start, length, prefix = jax.jit(
+                    lambda s=seq: _single_block_stage(offsets, s)
+                )()
+                self.assertEqual(int(start) % _ALIGNMENT_ROWS, 0)
+                self.assertLess(int(prefix), _ALIGNMENT_ROWS)
+                self.assertEqual(int(start) + int(prefix), int(offsets[seq]))
+                self.assertEqual(int(length), int(offsets[seq + 1] - offsets[seq]))
 
     def test_an_unaligned_block_keeps_the_single_block_path(self) -> None:
         # Nothing is padded for alignment, so no shape loses the fast path.
@@ -832,10 +825,6 @@ class JaggedHSTUAttentionTest(unittest.TestCase):
         self.assertEqual(len(pallas_calls), 1)
         dq_shape, dv_shape = (max_seq_len, 1, 128), (max_seq_len, 1, dv)
         self.assertEqual(
-            [variable.aval.shape for variable in pallas_calls[0].outvars],
-            [dq_shape, dv_shape, dq_shape],
-        )
-        self.assertEqual(
             [variable.aval.shape for variable in traced.jaxpr.outvars],
             [dq_shape, dq_shape, dv_shape],
         )
@@ -892,11 +881,15 @@ class JaggedHSTUAttentionTest(unittest.TestCase):
         call = self._trace_fused_backward(max_seq_len=200, block=256)
         self.assertEqual(call.params["grid_mapping"].grid, (1,))
         # One pipeline over the sequences stages q, k, v and dO as 2-D blocks
-        # and writes dK, dV and dQ.
+        # and writes dK, dV and dQ as 2-D blocks with a spare row group. The
+        # inputs are padded to a block and a row group.
         self.assertTrue(
             self._pipelines_with_buffers(
-                call, [(2, 256, 128)] * 4 + [(2, 256, 1, 128)] * 3
+                call, [(2, 256, 128)] * 4 + [(2, 264, 128)] * 3
             )
+        )
+        self.assertEqual(
+            [variable.aval.shape for variable in call.outvars], [(264, 128)] * 3
         )
 
     def test_native_forward_pipelines_single_block_sequences(self) -> None:
@@ -906,7 +899,10 @@ class JaggedHSTUAttentionTest(unittest.TestCase):
         self.assertIn("fwd_single_block", _kernel_name(call))
         self.assertEqual(call.params["grid_mapping"].grid, (1,))
         self.assertTrue(
-            self._pipelines_with_buffers(call, [(2, 256, 128)] * 3 + [(2, 256, 1, 128)])
+            self._pipelines_with_buffers(call, [(2, 256, 128)] * 3 + [(2, 264, 128)])
+        )
+        self.assertEqual(
+            [variable.aval.shape for variable in call.outvars], [(264, 128)]
         )
 
     def _dot_output_shapes(self, call: Any) -> set[tuple[int, ...]]:
