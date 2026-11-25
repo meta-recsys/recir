@@ -1621,34 +1621,32 @@ def _single_block_stage(seq_offsets_ref, sequence, rows: int, block: int):
     return stage_start, length, start - stage_start
 
 
-def _stage_heads(stage_ref, num_heads: int) -> Any:
-    """``[rows, heads * dim]`` stage -> ``[heads, rows, dim]``: each head is a
+def _sequence_rows(stage_ref, prefix, length) -> Any:
+    """A stage's values with the rows outside the sequence, which belong to its
+    neighbours, zeroed."""
+    row = jax.lax.broadcasted_iota(jnp.int32, (stage_ref.shape[0], 1), 0)
+    inside = (row >= prefix) & (row < prefix + length)
+    return jnp.where(inside, stage_ref[...], jnp.zeros((), stage_ref.dtype))
+
+
+def _split_heads(stage, num_heads: int) -> Any:
+    """``[rows, heads * dim]`` -> ``[heads, rows, dim]``: each head is a
     lane-aligned column block, so this moves no data."""
-    dim = stage_ref.shape[1] // num_heads
+    dim = stage.shape[1] // num_heads
     return jnp.stack(
-        [stage_ref[:, head * dim : (head + 1) * dim] for head in range(num_heads)]
+        [stage[:, head * dim : (head + 1) * dim] for head in range(num_heads)]
     )
 
 
-def _stage_mask(prefix, first: int, rows: int, keys: int, max_id, length):
+def _causal_stage_mask(first: int, rows: int, keys: int, first_target):
     """``_attention_mask`` for stage rows [first, first + rows) against stage rows
-    [0, keys), where the sequence starts at stage row ``prefix``; rows before it
-    belong to the previous sequence."""
-    query_start = first - prefix
-    query_positions = query_start + jnp.arange(rows, dtype=jnp.int32)
-    key_positions = jnp.arange(keys, dtype=jnp.int32) - prefix
-    return (
-        _attention_mask(
-            query_start,
-            rows,
-            key_positions,
-            jnp.minimum(key_positions, max_id),
-            max_id,
-            length,
-        )
-        & (query_positions[:, None] >= 0)
-        & (key_positions[None, :] >= 0)
-    )
+    [0, keys), with ``first_target`` the stage row of the sequence's first
+    target: a history row sees the rows up to itself, a target row the history
+    and itself. The kernels zero the keys outside the sequence, whose scores are
+    then 0 and SiLU(0) = 0, so no range checks are needed."""
+    query_rows = first + jax.lax.broadcasted_iota(jnp.int32, (rows, 1), 0)
+    key_rows = jax.lax.broadcasted_iota(jnp.int32, (1, keys), 1)
+    return (key_rows < jnp.minimum(query_rows, first_target)) | (key_rows == query_rows)
 
 
 def _query_strips(block: int) -> list[tuple[int, int, int]]:
@@ -1689,11 +1687,10 @@ def _jagged_fwd_single_block_kernel(
         _, length, prefix = _single_block_stage(
             seq_offsets_ref, sequence, q_hbm_ref.shape[0], block
         )
-        q_tile, k_tile, v_tile = (
-            _stage_heads(stage_ref, num_heads)
-            for stage_ref in (q_stage_ref, k_stage_ref, v_stage_ref)
-        )
-        max_id = length - num_targets_ref[sequence]
+        q_tile = _split_heads(q_stage_ref[...], num_heads)
+        k_tile = _split_heads(_sequence_rows(k_stage_ref, prefix, length), num_heads)
+        v_tile = _split_heads(v_stage_ref[...], num_heads)
+        first_target = prefix + length - num_targets_ref[sequence]
         if mask_past_sequence:
             # The output sums over key rows, and past the sequence the stage holds
             # the buffer's padding; 0 * NaN is NaN.
@@ -1711,7 +1708,7 @@ def _jagged_fwd_single_block_kernel(
                 weights = h + h * jnp.tanh(h)
             else:
                 weights = jax.nn.silu(scores * alpha) * inv_n
-            valid = _stage_mask(prefix, first, rows, keys, max_id, length)
+            valid = _causal_stage_mask(first, rows, keys, first_target)
             weights = jnp.where(valid[None, :, :], weights, 0)
             output = jax.lax.dot(
                 cast(Any, weights).astype(v_tile.dtype),
@@ -1774,11 +1771,13 @@ def _jagged_bwd_single_block_kernel(  # noqa: C901
         _, length, prefix = _single_block_stage(
             seq_offsets_ref, sequence, q_hbm_ref.shape[0], block
         )
-        q_tile, k_tile, v_tile, do_tile = (
-            _stage_heads(stage_ref, num_heads)
-            for stage_ref in (q_stage_ref, k_stage_ref, v_stage_ref, do_stage_ref)
-        )
-        max_id = length - num_targets_ref[sequence]
+        # dO is zeroed outside the sequence too, so rows of the neighbouring
+        # sequences add nothing to dK and dV.
+        q_tile = _split_heads(q_stage_ref[...], num_heads)
+        k_tile = _split_heads(_sequence_rows(k_stage_ref, prefix, length), num_heads)
+        v_tile = _split_heads(v_stage_ref[...], num_heads)
+        do_tile = _split_heads(_sequence_rows(do_stage_ref, prefix, length), num_heads)
+        first_target = prefix + length - num_targets_ref[sequence]
         if mask_past_sequence:
             # dQ, dK and dV sum products over stage rows, and past the sequence
             # the stage holds the buffer's padding; 0 * NaN is NaN.
@@ -1794,7 +1793,7 @@ def _jagged_bwd_single_block_kernel(  # noqa: C901
             q_strip = q_tile[:, first : first + rows, :]
             do_strip = do_tile[:, first : first + rows, :]
             k_keys, v_keys = k_tile[:, :keys, :], v_tile[:, :keys, :]
-            valid = _stage_mask(prefix, first, rows, keys, max_id, length)
+            valid = _causal_stage_mask(first, rows, keys, first_target)
             scores = jax.lax.dot(
                 q_strip,
                 k_keys,
