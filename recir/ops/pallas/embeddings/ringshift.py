@@ -1517,14 +1517,27 @@ def _ringshift_embedding_lookup_local(
     # sum_p send_counts_padded[p] <= sum_p send_counts_real[p] + W*(TILE-1)
     # <= max_local_ids + W*TILE.
     max_padded = max_local_ids + world_size * _TILE_INT32
-    sorted_row_padded = _pad_per_peer(
-        sorted_row_real,
-        send_counts_real,
-        send_counts_padded,
-        max_local_ids,
-        max_padded,
-        world_size,
-    )
+    pad_ids_impl = os.environ.get("RECIR_RINGSHIFT_PAD_IDS_DMA", "0")
+    if pad_ids_impl not in ("0", "1"):
+        raise ValueError(f"unknown RECIR_RINGSHIFT_PAD_IDS_DMA {pad_ids_impl}")
+    if pad_ids_impl == "1":
+        from recir.ops.pallas.embeddings.pad_ids_dma import pad_ids_dma
+
+        sorted_row_padded = pad_ids_dma(
+            sorted_row_real,
+            send_counts_real,
+            send_counts_padded,
+            interpret=interpret,
+        )
+    else:
+        sorted_row_padded = _pad_per_peer(
+            sorted_row_real,
+            send_counts_real,
+            send_counts_padded,
+            max_local_ids,
+            max_padded,
+            world_size,
+        )
 
     HBM = pltpu.MemorySpace.HBM
     SMEM = pltpu.MemorySpace.SMEM
