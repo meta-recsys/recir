@@ -630,3 +630,144 @@ def _recir_split_2d_jagged(
         _with_sharding_constraint(left, out_spec),
         _with_sharding_constraint(right, out_spec),
     )
+
+
+def _local_offsets(lengths: Any) -> Any:
+    return jnp.concatenate([jnp.zeros(1, dtype=lengths.dtype), jnp.cumsum(lengths)])
+
+
+def _replace_last_n_destinations(
+    offsets_left: Any, offsets_right: Any, num_left: int, num_right: int
+) -> tuple[Any, Any]:
+    """The left row each right row replaces (distinct out-of-range rows if none).
+
+    Right row ``i`` of sequence ``b`` replaces left row
+    ``offsets_left[b + 1] - (offsets_right[b + 1] - i)`` when that row is still
+    inside sequence ``b``, so only the right rows are touched instead of every
+    left row.
+    """
+    rows = jnp.arange(num_right, dtype=jnp.int32)
+    groups = jnp.minimum(
+        _segment_id_by_cumsum(offsets_right[1:-1], num_right),
+        offsets_right.shape[0] - 2,
+    )
+    left_end = offsets_left[1:].astype(jnp.int32)[groups]
+    right_end = offsets_right[1:].astype(jnp.int32)[groups]
+    destination = left_end - (right_end - rows)
+    valid = (rows < offsets_right[-1]) & (
+        destination >= offsets_left[:-1].astype(jnp.int32)[groups]
+    )
+    return jnp.where(valid, destination, num_left + rows), valid
+
+
+def _jax_replace_last_n_jagged(
+    values_left: Any, offsets_left: Any, values_right: Any, offsets_right: Any
+) -> Any:
+    if values_right.shape[0] == 0 or offsets_right.shape[0] < 2:
+        return values_left
+    destination, _ = _replace_last_n_destinations(
+        offsets_left, offsets_right, values_left.shape[0], values_right.shape[0]
+    )
+    return values_left.at[destination].set(
+        values_right, mode="drop", unique_indices=True
+    )
+
+
+def _jax_replace_last_n_jagged_backward(
+    grad: Any, offsets_left: Any, offsets_right: Any, num_right: int
+) -> tuple[Any, Any]:
+    if num_right == 0 or offsets_right.shape[0] < 2:
+        return grad, jnp.zeros((num_right, *grad.shape[1:]), grad.dtype)
+    destination, valid = _replace_last_n_destinations(
+        offsets_left, offsets_right, grad.shape[0], num_right
+    )
+    grad_right = jnp.where(
+        _bcast_mask(valid, grad.ndim),
+        grad[jnp.minimum(destination, grad.shape[0] - 1)],
+        0,
+    )
+    grad_left = grad.at[destination].set(0, mode="drop", unique_indices=True)
+    # The CPU form accumulates into zeros with index_add, which turns -0.0 into 0.0.
+    return grad_left, _positive_zero(grad_right)
+
+
+def _shard_replace_last_n(
+    fn: Any,
+    row_inputs: tuple[Any, ...],
+    offsets_left: Any,
+    offsets_right: Any,
+    out_specs: Any,
+) -> Any:
+    """Run ``fn(*row_shards, local_offsets_left, local_offsets_right)`` per device."""
+    world_size = len(jax.devices())
+    for x in row_inputs:
+        assert x.shape[0] % world_size == 0, (
+            f"replace rows {x.shape[0]} must be divisible by world_size={world_size}"
+        )
+
+    def _per_device(*args: Any) -> Any:
+        *shards, lengths_left, lengths_right = args
+        return fn(*shards, _local_offsets(lengths_left), _local_offsets(lengths_right))
+
+    row_specs = tuple(P(*([_DP_AXIS] + [None] * (x.ndim - 1))) for x in row_inputs)
+    return jax.shard_map(
+        _per_device,
+        mesh=Mesh(jax.devices(), (_DP_AXIS,)),
+        in_specs=(*row_specs, P(_DP_AXIS), P(_DP_AXIS)),
+        out_specs=out_specs,
+        check_vma=False,
+        # pyrefly: ignore [bad-argument-count]
+    )(*row_inputs, jnp.diff(offsets_left), jnp.diff(offsets_right))
+
+
+@op(torch.ops.recir.replace_last_n_jagged.default)  # pyre-ignore[56]
+def _recir_replace_last_n_jagged(
+    values_left: Any, offsets_left: Any, values_right: Any, offsets_right: Any
+) -> Any:
+    """recir::replace_last_n_jagged lowering: scatter the right rows inside shard_map."""
+    if len(jax.devices()) <= 1:
+        return _jax_replace_last_n_jagged(
+            values_left, offsets_left, values_right, offsets_right
+        )
+    out_spec = P(*([_DP_AXIS] + [None] * (values_left.ndim - 1)))
+    result = _shard_replace_last_n(
+        lambda left, right, off_l, off_r: _jax_replace_last_n_jagged(
+            left, off_l, right, off_r
+        ),
+        (values_left, values_right),
+        offsets_left,
+        offsets_right,
+        out_spec,
+    )
+    return _with_sharding_constraint(result, out_spec)
+
+
+@op(torch.ops.recir.replace_last_n_jagged_backward.default)  # pyre-ignore[56]
+def _recir_replace_last_n_jagged_backward(
+    grad: Any, offsets_left: Any, offsets_right: Any, num_right: int
+) -> Any:
+    """recir::replace_last_n_jagged_backward lowering inside shard_map."""
+    world_size = len(jax.devices())
+    if world_size <= 1:
+        return _jax_replace_last_n_jagged_backward(
+            grad, offsets_left, offsets_right, num_right
+        )
+    assert num_right % world_size == 0, (
+        f"replace rows {num_right} must be divisible by world_size={world_size}"
+    )
+    local_right = num_right // world_size
+    out_spec = P(*([_DP_AXIS] + [None] * (grad.ndim - 1)))
+    # pyrefly: ignore [not-iterable]
+    grad_left, grad_right = _shard_replace_last_n(
+        lambda g, off_l, off_r: _jax_replace_last_n_jagged_backward(
+            g, off_l, off_r, local_right
+        ),
+        (grad,),
+        offsets_left,
+        offsets_right,
+        (out_spec, out_spec),
+    )
+    return (
+        _with_sharding_constraint(grad_left, out_spec),
+        _with_sharding_constraint(grad_right, out_spec),
+    )
