@@ -9,6 +9,7 @@ from __future__ import annotations
 import contextlib
 import importlib
 import math
+import os
 import unittest
 from collections.abc import Iterator
 from typing import Any, cast
@@ -738,6 +739,108 @@ class JaggedHSTUAttentionTest(unittest.TestCase):
                 # Aliasing the input is what makes the call load-bearing: the
                 # output is not a fresh zeroed buffer.
                 self.assertEqual(call.params["input_output_aliases"], ((1, 0),))
+
+    def _trace_fused_backward(
+        self, *, max_seq_len: int, block: int, dv: int = 128
+    ) -> Any:
+        qk = jax.ShapeDtypeStruct((max_seq_len, 1, 128), jnp.bfloat16)
+        v = jax.ShapeDtypeStruct((max_seq_len, 1, dv), jnp.bfloat16)
+        offsets = jnp.asarray([0, max_seq_len], dtype=jnp.int32)
+        targets = jnp.zeros((1,), dtype=jnp.int32)
+        inv_n = jnp.asarray(1.0 / max_seq_len, dtype=jnp.float32)
+        with (
+            _mock_tpu_generation(),
+            mock.patch.dict(os.environ, {"RECIR_HSTU_FUSED_BWD": "1"}),
+        ):
+            traced = jax.make_jaxpr(
+                lambda do_, q_, k_, v_: pallas_jagged_hstu_attention_backward(
+                    do_,
+                    q_,
+                    k_,
+                    v_,
+                    offsets,
+                    targets,
+                    inv_n,
+                    max_seq_len=max_seq_len,
+                    alpha=1.0 / math.sqrt(128),
+                    interpret=False,
+                    block_q=block,
+                    block_k=block,
+                    query_tiles_per_program=1,
+                )
+            )(v, qk, qk, v)
+        pallas_calls = _attention_pallas_calls(list(_walk_nested_jaxprs(traced)))
+        # dQ, dK and dV all come from one program.
+        self.assertEqual(len(pallas_calls), 1)
+        dq_shape, dv_shape = (max_seq_len, 1, 128), (max_seq_len, 1, dv)
+        self.assertEqual(
+            [variable.aval.shape for variable in pallas_calls[0].outvars],
+            [dq_shape, dv_shape, dq_shape],
+        )
+        self.assertEqual(
+            [variable.aval.shape for variable in traced.jaxpr.outvars],
+            [dq_shape, dq_shape, dv_shape],
+        )
+        return pallas_calls[0]
+
+    def test_fused_backward_handles_a_v_narrower_than_q(self) -> None:
+        """Every other fused test uses D_v == D_qk. Interpret mode takes the
+        dense fallback before the flag is read, so this checks the native trace
+        of both fused kernels."""
+        for max_seq_len in (200, 600):
+            with self.subTest(max_seq_len=max_seq_len):
+                call = self._trace_fused_backward(
+                    max_seq_len=max_seq_len, block=256, dv=64
+                )
+                kernel_jaxpr = next(_walk_nested_jaxprs(call.params["jaxpr"]))
+                vmem_widths = {
+                    variable.aval.shape[-1]
+                    for variable in kernel_jaxpr.invars
+                    if "vmem" in str(variable.aval)
+                }
+                self.assertIn(64, vmem_widths)
+
+    def test_fused_backward_stages_room_for_a_pulled_back_read(self) -> None:
+        """Near the end of the buffer the single-block stage copy starts early,
+        so the sequence's tile can begin up to ``block + 8`` rows into it."""
+        call = self._trace_fused_backward(max_seq_len=200, block=256)
+        kernel_jaxpr = next(_walk_nested_jaxprs(call.params["jaxpr"]))
+        stage_shapes = [
+            variable.aval.shape
+            for variable in kernel_jaxpr.invars
+            if "vmem" in str(variable.aval) and variable.aval.shape[0] > 256
+        ]
+        self.assertEqual(stage_shapes, [(2 * (256 + 8), 1, 128)] * 4)
+
+    def test_fused_backward_falls_back_when_dq_does_not_fit_vmem(self) -> None:
+        """The fused dQ accumulator grows with the layer; past the VMEM limit
+        the backward runs the separate dQ and dK/dV programs."""
+        with mock.patch.dict(os.environ, {"RECIR_HSTU_FUSED_BWD": "1"}):
+            _, _, dq_call, dkv_call = self._trace_native_backward(
+                max_seq_len=131072,
+                block_q=256,
+                block_k=256,
+                query_tiles_per_program=1,
+            )
+        self.assertNotIn("fused", _kernel_name(dq_call))
+        self.assertNotIn("fused", _kernel_name(dkv_call))
+
+    def test_fused_backward_runs_one_program_per_single_block_sequence(self) -> None:
+        call = self._trace_fused_backward(max_seq_len=200, block=256)
+        self.assertEqual(call.params["grid_mapping"].grid, (1,))
+
+    def test_fused_backward_accumulates_dq_over_kv_blocks(self) -> None:
+        call = self._trace_fused_backward(max_seq_len=600, block=256)
+        self.assertEqual(call.params["grid_mapping"].grid, (1, 3))
+        kernel_jaxpr = next(_walk_nested_jaxprs(call.params["jaxpr"]))
+        accumulators = [
+            variable.aval
+            for variable in kernel_jaxpr.invars
+            if "vmem" in str(variable.aval) and variable.aval.shape == (1, 768, 128)
+        ]
+        self.assertEqual(
+            [aval.dtype for aval in accumulators], [jnp.dtype(jnp.float32)]
+        )
 
     def test_rejects_invalid_shapes(self) -> None:
         q, k, v, offsets = self._inputs([3, 2])
