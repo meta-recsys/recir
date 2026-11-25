@@ -2688,6 +2688,16 @@ def _ringshift_embedding_lookup_backward_local(
     if pad_cast_control not in ("0", "1"):
         raise ValueError(f"invalid RECIR_RINGSHIFT_PAD_CAST_DMA: {pad_cast_control!r}")
     use_pad_cast_dma = use_dma_gather and exchange_bf16 and pad_cast_control == "1"
+    pad_ids_cast_control = os.environ.get("RECIR_RINGSHIFT_PAD_IDS_CAST_DMA", "0")
+    if pad_ids_cast_control not in ("0", "1"):
+        raise ValueError(
+            f"invalid RECIR_RINGSHIFT_PAD_IDS_CAST_DMA: {pad_ids_cast_control!r}"
+        )
+    if pad_ids_cast_control == "1" and pad_cast_control != "1":
+        raise ValueError(
+            "RECIR_RINGSHIFT_PAD_IDS_CAST_DMA requires RECIR_RINGSHIFT_PAD_CAST_DMA=1"
+        )
+    use_pad_ids_cast_dma = use_pad_cast_dma and pad_ids_cast_control == "1"
 
     # --- Re-derive splitter inputs (send layout) ---
     if use_dma_gather:
@@ -2742,23 +2752,35 @@ def _ringshift_embedding_lookup_backward_local(
 
     # --- Pad sorted_row + grad per-peer (sentinel padding to TILE) ---
     max_padded = max_local_ids + world_size * _TILE_INT32
-    sorted_row_padded = _pad_per_peer(
-        sorted_row_real,
-        send_counts_real,
-        send_counts_padded,
-        max_local_ids,
-        max_padded,
-        world_size,
-        pad_value=row_pad_value,
-    )
     # Grad padding is always zero rows (zero gradient = no contribution).
-    if use_pad_cast_dma:
+    if use_pad_ids_cast_dma:
+        from recir.ops.pallas.embeddings.pad_ids_cast_dma import pad_ids_cast_dma
+
+        grad_emb_padded, sorted_row_padded = pad_ids_cast_dma(
+            grad_emb_sorted,
+            sorted_row_real,
+            send_counts_real,
+            send_counts_padded,
+            row_pad_value,
+            interpret=interpret,
+        )
+    else:
+        sorted_row_padded = _pad_per_peer(
+            sorted_row_real,
+            send_counts_real,
+            send_counts_padded,
+            max_local_ids,
+            max_padded,
+            world_size,
+            pad_value=row_pad_value,
+        )
+    if use_pad_cast_dma and not use_pad_ids_cast_dma:
         from recir.ops.pallas.embeddings.pad_cast_dma import pad_cast_dma
 
         grad_emb_padded = pad_cast_dma(
             grad_emb_sorted, send_counts_real, send_counts_padded, interpret=interpret
         )
-    else:
+    elif not use_pad_ids_cast_dma:
         grad_emb_padded = _pad_per_peer_2d(
             grad_emb_sorted,
             send_counts_real,
