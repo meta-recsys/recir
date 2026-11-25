@@ -20,6 +20,8 @@ import jax.numpy as jnp
 import numpy as np
 from recir.ops.pallas.jagged_hstu_attention import (
     _ALIGNMENT_ROWS,
+    _native_qkv_inputs,
+    _single_block_fits,
     _single_block_stage,
     jagged_hstu_attention_reference,
     pallas_jagged_hstu_attention,
@@ -198,30 +200,58 @@ class JaggedHSTUAttentionTest(unittest.TestCase):
     def test_sequences_within_max_seq_len_are_accepted(self) -> None:
         self._assert_parity([12, 3], [0, 0], max_seq_len=12)
 
-    def test_a_sequence_near_the_end_still_starts_inside_the_stage(self) -> None:
-        """The stage is block + 8 rows because the sequence's first row is meant
-        to land at row start % 8. Clamping the stage start to keep the read
-        inside the tensor breaks that: the row index grows to as much as block
-        and the sequence's slice runs off the end of the stage."""
-        rows, block = 400, 256
-        offsets = jnp.asarray([0, 200, rows], dtype=jnp.int32)
-
-        for sequence in range(2):
-            with self.subTest(sequence=sequence):
-                stage_start, _, row_prefix = jax.jit(
-                    lambda s=sequence: _single_block_stage(offsets, s, rows, block)
-                )()
-
-                self.assertLess(int(row_prefix), _ALIGNMENT_ROWS)
-                self.assertEqual(int(stage_start) % _ALIGNMENT_ROWS, 0)
-                self.assertEqual(
-                    int(stage_start) + int(row_prefix), int(offsets[sequence])
-                )
-
     def test_a_sequence_near_the_end_matches_the_reference(self) -> None:
         # rows=400 against a 256 block: the second sequence starts at 200, past
         # the 400 - 256 - 8 = 136 the stage start used to be clamped to.
         self._assert_parity([200, 200], [0, 0], max_seq_len=200, block=256)
+
+    def test_the_staged_start_stays_8_aligned_and_in_bounds(self) -> None:
+        """The cap at ``rows - block`` is only 8-aligned when ``rows`` and
+        ``block`` agree modulo 8, so the hint is claimed only then. Either way
+        the start must stay 8-aligned when it does not bind, and the read must
+        stay inside the tensor."""
+        offsets = jnp.asarray([0, 200, 401], dtype=jnp.int32)
+
+        for rows, block in ((408, 256), (401, 256), (404, 100)):
+            for seq in (0, 1):
+                with self.subTest(rows=rows, block=block, seq=seq):
+                    start, length, prefix = jax.jit(
+                        lambda s=seq, r=rows, b=block: _single_block_stage(
+                            offsets, s, r, b
+                        )
+                    )()
+                    self.assertLessEqual(int(start) + block, rows)
+                    self.assertGreaterEqual(int(prefix), 0)
+                    self.assertEqual(int(start) + int(prefix), int(offsets[seq]))
+                    if int(start) < rows - block:
+                        self.assertEqual(int(start) % _ALIGNMENT_ROWS, 0)
+                        self.assertLess(int(prefix), _ALIGNMENT_ROWS)
+
+    def test_an_unaligned_block_keeps_the_single_block_path(self) -> None:
+        # Nothing is padded for alignment, so no shape loses the fast path.
+        self.assertTrue(_single_block_fits(max_seq_len=93, block_q=100, block_k=100))
+        self.assertTrue(_single_block_fits(max_seq_len=93, block_q=104, block_k=104))
+        self.assertFalse(_single_block_fits(max_seq_len=98, block_q=104, block_k=104))
+
+    def test_packed_rows_are_not_padded_for_alignment(self) -> None:
+        """Padding here fires a concatenate over the whole packed tensor."""
+        q, k, v, offsets = self._inputs([200, 201], heads=1, dqk=8, dv=8)
+        targets = jnp.zeros((2,), jnp.int32)
+
+        _, hbm_args = jax.eval_shape(
+            lambda q_, k_, v_: _native_qkv_inputs(
+                q_, k_, v_, offsets, targets, 0.17, tail_rows=264
+            ),
+            q,
+            k,
+            v,
+        )
+
+        for arg in hbm_args:
+            self.assertEqual(arg.shape[0], 401)
+
+    def test_unaligned_packed_rows_match_the_reference(self) -> None:
+        self._assert_parity([200, 201], [0, 0], max_seq_len=201, block=256)
 
     def test_nonuniform_causal_sequences(self) -> None:
         self._assert_parity([7, 3, 9], [0, 0, 0], max_seq_len=9)
@@ -852,7 +882,7 @@ class JaggedHSTUAttentionTest(unittest.TestCase):
             and sorted(
                 tuple(variable.aval.shape)
                 for variable in jaxpr.invars
-                if len(getattr(variable.aval, "shape", ())) == 4
+                if len(getattr(variable.aval, "shape", ())) >= 3
                 and variable.aval.shape[0] == 2
             )
             == sorted(shapes)
@@ -861,11 +891,11 @@ class JaggedHSTUAttentionTest(unittest.TestCase):
     def test_fused_backward_pipelines_single_block_sequences(self) -> None:
         call = self._trace_fused_backward(max_seq_len=200, block=256)
         self.assertEqual(call.params["grid_mapping"].grid, (1,))
-        # One pipeline over the sequences stages q, k, v and dO (the block plus
-        # 8 alignment rows) and writes dK, dV and dQ.
+        # One pipeline over the sequences stages q, k, v and dO as 2-D blocks
+        # and writes dK, dV and dQ.
         self.assertTrue(
             self._pipelines_with_buffers(
-                call, [(2, 264, 1, 128)] * 4 + [(2, 256, 1, 128)] * 3
+                call, [(2, 256, 128)] * 4 + [(2, 256, 1, 128)] * 3
             )
         )
 
@@ -876,9 +906,7 @@ class JaggedHSTUAttentionTest(unittest.TestCase):
         self.assertIn("fwd_single_block", _kernel_name(call))
         self.assertEqual(call.params["grid_mapping"].grid, (1,))
         self.assertTrue(
-            self._pipelines_with_buffers(
-                call, [(2, 264, 1, 128)] * 3 + [(2, 256, 1, 128)]
-            )
+            self._pipelines_with_buffers(call, [(2, 256, 128)] * 3 + [(2, 256, 1, 128)])
         )
 
     def _dot_output_shapes(self, call: Any) -> set[tuple[int, ...]]:
