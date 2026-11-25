@@ -29,10 +29,162 @@ from recir.torchax.ops.jagged_ops import (
 )
 
 
+def select_concat_split_right(
+    left: Any,
+    ca: Any,
+    right: Any,
+    cb: Any,
+    capacity: int,
+    sa: Any,
+    sb: Any,
+    query_capacity: int,
+    left_capacity: int | None = None,
+) -> Any:
+    left_prefix = left_capacity is not None
+    left_capacity = left.shape[0] if left_capacity is None else left_capacity
+    if (
+        max(capacity, query_capacity, left.shape[0], left_capacity + right.shape[0])
+        >= 1 << 31
+    ):
+        raise ValueError("Jagged query composition requires int32 capacities")
+    shape = (query_capacity,) + left.shape[1:]
+    if capacity == 0 or left_capacity + right.shape[0] == 0 or ca.shape[0] <= 1:
+        return jnp.zeros(shape, jnp.result_type(left, right))
+    positions = jnp.arange(query_capacity, dtype=jnp.int32)
+    group = jnp.clip(
+        jnp.searchsorted(sb, positions, side="right", method="scan_unrolled") - 1,
+        0,
+        sb.shape[0] - 2,
+    )
+    selected_row = jnp.clip(positions + sa[group + 1], 0, capacity - 1)
+    combined_offsets = ca + cb
+    group = jnp.clip(
+        jnp.searchsorted(
+            combined_offsets, selected_row, side="right", method="scan_unrolled"
+        )
+        - 1,
+        0,
+        ca.shape[0] - 2,
+    )
+    intra = selected_row - combined_offsets[group]
+    left_length = ca[group + 1] - ca[group]
+    source = jnp.where(
+        intra < left_length,
+        ca[group] + intra,
+        left_capacity + cb[group] + intra - left_length,
+    )
+    source = jnp.clip(source, 0, left_capacity + right.shape[0] - 1)
+    from_left = source < left_capacity
+    left_position = jnp.clip(source, 0, max(0, left_capacity - 1))
+    left_valid = jnp.ones_like(from_left)
+    if left_prefix:
+        group = jnp.clip(
+            jnp.searchsorted(ca, left_position, side="right", method="scan_unrolled")
+            - 1,
+            0,
+            ca.shape[0] - 2,
+        )
+        left_source = jnp.clip(left_position + cb[group], 0, max(0, left.shape[0] - 1))
+        left_valid = left_position < ca[-1]
+    else:
+        left_source = jnp.clip(left_position, 0, max(0, left.shape[0] - 1))
+    left_values = left[left_source] if left.shape[0] else jnp.zeros(shape, left.dtype)
+    right_values = (
+        right[jnp.clip(source - left_capacity, 0, right.shape[0] - 1)]
+        if right.shape[0]
+        else jnp.zeros(shape, right.dtype)
+    )
+    mask_shape = (query_capacity,) + (1,) * (left_values.ndim - 1)
+    value = jnp.where(from_left.reshape(mask_shape), left_values, right_values)
+    valid = (
+        (positions < sb[-1])
+        & (selected_row < combined_offsets[-1])
+        & (~from_left | left_valid)
+    )
+    return jnp.where(valid.reshape(mask_shape), value, 0)
 
 
+@op(torch.ops.recir.jagged_concat_split_right.default)
+def _jagged_concat_split_right(
+    left: Any,
+    ca: Any,
+    right: Any,
+    cb: Any,
+    capacity: int,
+    sa: Any,
+    sb: Any,
+    query_capacity: int,
+    left_capacity: int,
+    left_is_prefix: bool,
+) -> Any:
+    world_size = len(jax.devices())
+    if any(offsets.shape != ca.shape for offsets in (cb, sa, sb)):
+        raise ValueError("Jagged query offsets must have the same batch size")
+    if world_size == 1:
+        return select_concat_split_right(
+            left,
+            ca,
+            right,
+            cb,
+            capacity,
+            sa,
+            sb,
+            query_capacity,
+            left_capacity if left_is_prefix else None,
+        )
+    if any(
+        size % world_size
+        for size in (
+            left.shape[0],
+            right.shape[0],
+            capacity,
+            query_capacity,
+            left_capacity,
+        )
+    ):
+        raise ValueError("Jagged query capacities must be divisible by world size")
+    mesh = Mesh(jax.devices(), (_DP_AXIS,))
+    values_spec = P(*([_DP_AXIS] + [None] * (left.ndim - 1)))
 
+    def per_device(
+        values_left: Any, lc: Any, values_right: Any, rc: Any, ls: Any, rs: Any
+    ) -> Any:
+        offsets = [
+            jnp.concatenate((jnp.zeros(1, jnp.int32), jnp.cumsum(lengths))).astype(
+                jnp.int32
+            )
+            for lengths in (lc, rc, ls, rs)
+        ]
+        return select_concat_split_right(
+            values_left,
+            offsets[0],
+            values_right,
+            offsets[1],
+            capacity // world_size,
+            offsets[2],
+            offsets[3],
+            query_capacity // world_size,
+            left_capacity // world_size if left_is_prefix else None,
+        )
 
+    mapped = cast(
+        Callable[..., Any],
+        jax.shard_map(
+            per_device,
+            mesh=mesh,
+            in_specs=(
+                values_spec,
+                P(_DP_AXIS),
+                values_spec,
+                P(_DP_AXIS),
+                P(_DP_AXIS),
+                P(_DP_AXIS),
+            ),
+            out_specs=values_spec,
+            check_vma=False,
+        ),
+    )
+    return mapped(left, jnp.diff(ca), right, jnp.diff(cb), jnp.diff(sa), jnp.diff(sb))
 
 
 def _valid_rows(offsets: Any, capacity: int, max_len: int) -> tuple[Any, Any]:

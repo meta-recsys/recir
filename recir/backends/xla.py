@@ -22,6 +22,7 @@ from recir.passes.fsdp_collectives import (
     merge_backward_gathers as _merge_backward_gathers,
     serialize_backward_gathers as _serialize_backward_gathers,
 )
+from recir.passes.jagged_queries import fuse_jagged_queries as _fuse_jagged_queries
 from torch import fx, nn
 
 if TYPE_CHECKING:
@@ -67,8 +68,19 @@ class XLAGSPMDBackend(_XLABackendBase):
 
     _backend_type: ClassVar[BackendType] = BackendType.XLA_GSPMD
 
-    def __init__(self, *, dump_hlo: bool = False, **kwargs: Any) -> None:
-        super().__init__(dump_hlo=dump_hlo, **kwargs)
+    def __init__(
+        self,
+        *,
+        dump_hlo: bool = False,
+        fuse_jagged_queries: bool = False,
+        optimize_passes: Optional[Sequence[GraphPatch]] = None,
+        **kwargs: Any,
+    ) -> None:
+        if fuse_jagged_queries:
+            if optimize_passes is not None:
+                raise ValueError("fuse_jagged_queries requires default optimize_passes")
+            optimize_passes = (_fuse_jagged_queries,)
+        super().__init__(dump_hlo=dump_hlo, optimize_passes=optimize_passes, **kwargs)
         self._fsdp_axis_size: Optional[int] = None
 
     def dispatch(self, gm: fx.GraphModule) -> nn.Module:
