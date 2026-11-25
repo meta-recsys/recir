@@ -45,6 +45,8 @@ _FUSED_BACKWARD_VMEM_LIMIT = 56 * 1024 * 1024
 _FUSED_BACKWARD_SCORE_TILES = 4
 # Rows per query strip when a causal tile on the diagonal is computed in strips.
 _QUERY_STRIP_ROWS = 128
+# Rows per copy from a single-block kernel's output stage to its output tile.
+_OUTPUT_CHUNK_ROWS = 128
 _AXIS = "torch_dist"
 _PAD_SEQS_PER_DEVICE: int | None = None
 _PADDED_NUM_SEQUENCES: int | None = None
@@ -349,6 +351,22 @@ def _zero_unvisited_tail(packed: jax.Array, seq_offsets: jax.Array) -> jax.Array
     )(seq_offsets.astype(jnp.int32), packed)
 
 
+def _single_block_fits(max_seq_len: int, block_q: int, block_k: int) -> bool:
+    """Whether every sequence fits one block from the 8-aligned row before it."""
+    return block_q == block_k and max_seq_len + _ALIGNMENT_ROWS - 1 <= block_k
+
+
+def _flat_rows(values: tuple[Any, ...]) -> tuple[Any, ...]:
+    """``[rows, heads, dim]`` -> ``[rows, heads * dim]``, with rows padded to a
+    multiple of 8. The projections produce the 2-D layout; giving a kernel the
+    3-D one makes XLA relayout every input."""
+    rows = values[0].shape[0]
+    pad = -rows % _ALIGNMENT_ROWS
+    return tuple(
+        jnp.pad(value.reshape(rows, -1), ((0, pad), (0, 0))) for value in values
+    )
+
+
 def _native_qkv_inputs(
     q: jax.Array,
     k: jax.Array,
@@ -645,10 +663,12 @@ def _native_jagged_hstu_attention(
         pad_to_block_k=False,
     )
     tail_rows = max(query_group_rows, block_k) + _ALIGNMENT_ROWS
+    single_block = _single_block_fits(max_seq_len, block_q, block_k)
+    q_in, k_in, v_in = _flat_rows((q, k, v)) if single_block else (q, k, v)
     scalar_args, hbm_args = _native_qkv_inputs(
-        q,
-        k,
-        v,
+        q_in,
+        k_in,
+        v_in,
         seq_offsets,
         num_targets,
         inv_n,
@@ -656,7 +676,7 @@ def _native_jagged_hstu_attention(
     )
     scalar_args = (scalar_args[0], aligned_offsets, *scalar_args[1:])
     out_shape = jax.ShapeDtypeStruct((q.shape[0], num_heads, dv), q.dtype)
-    if block_q == block_k and max_seq_len <= block_k:
+    if single_block:
         output = pl.pallas_call(
             functools.partial(
                 _jagged_fwd_single_block_kernel,
@@ -670,6 +690,9 @@ def _native_jagged_hstu_attention(
                 in_specs=[pl.BlockSpec(memory_space=pltpu.HBM)] * 3,
                 out_specs=pl.BlockSpec(memory_space=pltpu.HBM),
                 grid=(1,),
+                scratch_shapes=(
+                    pltpu.VMEM((block_k + _OUTPUT_CHUNK_ROWS, num_heads, dv), q.dtype),
+                ),
             ),
             name="pallas_jagged_hstu_attention_fwd_single_block",
         )(*scalar_args, *hbm_args)
@@ -1507,41 +1530,29 @@ def _jagged_bwd_fused_kernel(
     )
 
 
-def _single_block_pipeline(body, seq_offsets_ref, block: int, inputs, outputs) -> None:
-    """Run ``body(*input_stages, *output_tiles, mask_past_sequence=...)`` once per
-    sequence, for sequences that fit one ``block``, with ``pl.program_id(0)`` the
-    sequence.
+def _single_block_pipeline(
+    body, seq_offsets_ref, block: int, inputs, outputs, out_stages
+) -> None:
+    """Run ``body(*input_stages, mask_past_sequence=...)`` once per sequence, for
+    sequences that fit one ``block``, with ``pl.program_id(0)`` the sequence.
 
     The sequences are one pipeline: while ``body`` computes one, the next one's
-    inputs are staged and the previous one's outputs written. Each input stage
-    holds ``block`` rows from the 8-aligned row at or before the sequence start
-    (see ``_single_block_stage``); each output tile holds the sequence's rows
-    from row 0.
+    inputs are staged and the previous one's outputs written. ``inputs`` are
+    2-D ``[rows, heads * dim]``, the layout the projections produce, so XLA has
+    nothing to relayout; each stage is the ``block`` rows from the 8-aligned row
+    at or before the sequence start (see ``_single_block_stage``). ``body``
+    writes each output in stage rows to its ``out_stages`` buffer; this copies
+    the sequence's rows, from its first, to the output tile.
     """
-    stage_rows = block + _ALIGNMENT_ROWS
     rows = outputs[0].shape[0]
     num_sequences = seq_offsets_ref.shape[0] - 1
-
-    def _sequence(*refs) -> None:
-        stage_start, _, _ = _single_block_stage(
-            seq_offsets_ref, pl.program_id(0), inputs[0].shape[0], block
-        )
-        # A stage reaching past the last sequence holds padding and, where the
-        # copy was cut at the end of the tensor, rows it never wrote. The body
-        # then zeroes the rows past the sequence in its tiles, never in the
-        # stage: the pipeline reuses a stage whose window does not change.
-        past_end = stage_start + stage_rows > seq_offsets_ref[num_sequences]
-        pl.when(past_end)(functools.partial(body, *refs, mask_past_sequence=True))
-        pl.when(~past_end)(functools.partial(body, *refs, mask_past_sequence=False))
 
     def _in_window(sequence):
         in_rows = inputs[0].shape[0]
         stage_start, _, _ = _single_block_stage(
             seq_offsets_ref, sequence, in_rows, block
         )
-        # Bound the read's size, not its start: pulling the start back would
-        # move the sequence's first row past row 8 of the stage.
-        return pl.ds(stage_start, jnp.minimum(stage_rows, in_rows - stage_start)), 0, 0
+        return pl.ds(stage_start, block), 0
 
     def _out_window(sequence):
         start = seq_offsets_ref[sequence]
@@ -1550,12 +1561,32 @@ def _single_block_pipeline(body, seq_offsets_ref, block: int, inputs, outputs) -
         size = jnp.clip(jnp.minimum(length, rows - out_start), 0, block)
         return pl.ds(out_start, size), 0, 0
 
+    def _sequence(*refs) -> None:
+        stage_start, length, prefix = _single_block_stage(
+            seq_offsets_ref, pl.program_id(0), inputs[0].shape[0], block
+        )
+        # A stage reaching past the last sequence holds the buffer's padding.
+        # The body then zeroes the rows past the sequence in its tiles, never in
+        # the stage: the pipeline reuses a stage whose window does not change.
+        past_end = stage_start + block > seq_offsets_ref[num_sequences]
+        stages = refs[: len(inputs)]
+        pl.when(past_end)(functools.partial(body, *stages, mask_past_sequence=True))
+        pl.when(~past_end)(functools.partial(body, *stages, mask_past_sequence=False))
+        for tile_ref, stage_ref in zip(refs[len(inputs) :], out_stages):
+            for chunk in range(0, block, _OUTPUT_CHUNK_ROWS):
+
+                @pl.when(chunk < length)
+                def _copy(tile_ref=tile_ref, stage_ref=stage_ref, chunk=chunk) -> None:
+                    tile_ref[chunk : chunk + _OUTPUT_CHUNK_ROWS] = stage_ref[
+                        pl.ds(prefix + chunk, _OUTPUT_CHUNK_ROWS)
+                    ]
+
     pltpu.emit_pipeline(
         _sequence,
         grid=(num_sequences,),
         in_specs=tuple(
             pl.BlockSpec(
-                (pl.BoundedSlice(stage_rows), *ref.shape[1:]),
+                (pl.BoundedSlice(block), ref.shape[1]),
                 _in_window,
                 memory_space=pltpu.VMEM,
             )
@@ -1573,19 +1604,51 @@ def _single_block_pipeline(body, seq_offsets_ref, block: int, inputs, outputs) -
 
 
 def _single_block_stage(seq_offsets_ref, sequence, rows: int, block: int):
-    """A sequence's (first staged row, sequence length, its first row's index in
-    the stage) for ``_single_block_pipeline``.
+    """A sequence's (first staged row, length, its first row's index in the
+    stage) for ``_single_block_pipeline``. The stage is the ``block`` rows from
+    the 8-aligned row at or before the sequence start, so the sequence fits when
+    ``max_seq_len + 7 <= block``.
 
-    The stage starts at the 8-aligned row at or before the sequence start, so
-    the third value is ``start % 8`` and a ``block + 8`` row stage always holds
-    the sequence. Keeping the start off the end of the tensor is the caller's
-    job: clamping it here instead would push the third value up to ``block``
-    and the sequence's slice off the end of the stage.
-    """
+    The start is capped at ``rows - block`` to keep the read inside the tensor,
+    and that cap is 8-aligned only when ``rows`` and ``block`` agree modulo 8.
+    Both are static, so claim the alignment only when it actually holds; padding
+    the rows to force it would copy the whole tensor for the sake of 7 rows."""
     start = seq_offsets_ref[sequence]
     length = seq_offsets_ref[sequence + 1] - start
-    stage_start = pl.multiple_of(start - start % _ALIGNMENT_ROWS, _ALIGNMENT_ROWS)
+    stage_start = jnp.minimum(start - start % _ALIGNMENT_ROWS, rows - block)
+    if (rows - block) % _ALIGNMENT_ROWS == 0:
+        stage_start = pl.multiple_of(stage_start, _ALIGNMENT_ROWS)
     return stage_start, length, start - stage_start
+
+
+def _stage_heads(stage_ref, num_heads: int) -> Any:
+    """``[rows, heads * dim]`` stage -> ``[heads, rows, dim]``: each head is a
+    lane-aligned column block, so this moves no data."""
+    dim = stage_ref.shape[1] // num_heads
+    return jnp.stack(
+        [stage_ref[:, head * dim : (head + 1) * dim] for head in range(num_heads)]
+    )
+
+
+def _stage_mask(prefix, first: int, rows: int, keys: int, max_id, length):
+    """``_attention_mask`` for stage rows [first, first + rows) against stage rows
+    [0, keys), where the sequence starts at stage row ``prefix``; rows before it
+    belong to the previous sequence."""
+    query_start = first - prefix
+    query_positions = query_start + jnp.arange(rows, dtype=jnp.int32)
+    key_positions = jnp.arange(keys, dtype=jnp.int32) - prefix
+    return (
+        _attention_mask(
+            query_start,
+            rows,
+            key_positions,
+            jnp.minimum(key_positions, max_id),
+            max_id,
+            length,
+        )
+        & (query_positions[:, None] >= 0)
+        & (key_positions[None, :] >= 0)
+    )
 
 
 def _query_strips(block: int) -> list[tuple[int, int, int]]:
@@ -1608,6 +1671,7 @@ def _jagged_fwd_single_block_kernel(
     k_hbm_ref,
     v_hbm_ref,
     out_hbm_ref,
+    out_stage_ref,
     *,
     alpha: float,
     block: int,
@@ -1616,24 +1680,25 @@ def _jagged_fwd_single_block_kernel(
     """``_jagged_fwd_kernel`` for sequences that fit one ``block``, as one
     pipeline over the sequences."""
     inv_n = attn_scale_ref[0]
+    num_heads = out_hbm_ref.shape[1]
 
     def _sequence(
-        q_stage_ref, k_stage_ref, v_stage_ref, out_ref, *, mask_past_sequence: bool
+        q_stage_ref, k_stage_ref, v_stage_ref, *, mask_past_sequence: bool
     ) -> None:
         sequence = pl.program_id(0)
-        _, length, row_prefix = _single_block_stage(
+        _, length, prefix = _single_block_stage(
             seq_offsets_ref, sequence, q_hbm_ref.shape[0], block
         )
         q_tile, k_tile, v_tile = (
-            jnp.swapaxes(stage_ref[pl.ds(row_prefix, block), :, :], 0, 1)
+            _stage_heads(stage_ref, num_heads)
             for stage_ref in (q_stage_ref, k_stage_ref, v_stage_ref)
         )
         max_id = length - num_targets_ref[sequence]
-        positions = jnp.arange(block, dtype=jnp.int32)
         if mask_past_sequence:
-            # The output sums over key rows; 0 * NaN is NaN.
-            v_tile = jnp.where(positions[None, :, None] < length, v_tile, 0)
-        key_ids = jnp.minimum(positions, max_id)
+            # The output sums over key rows, and past the sequence the stage holds
+            # the buffer's padding; 0 * NaN is NaN.
+            stage_row = jnp.arange(block, dtype=jnp.int32)[None, :, None]
+            v_tile = jnp.where(stage_row < prefix + length, v_tile, 0)
         for first, rows, keys in _query_strips(block):
             scores = jax.lax.dot(
                 q_tile[:, first : first + rows, :],
@@ -1646,9 +1711,7 @@ def _jagged_fwd_single_block_kernel(
                 weights = h + h * jnp.tanh(h)
             else:
                 weights = jax.nn.silu(scores * alpha) * inv_n
-            valid = _attention_mask(
-                first, rows, positions[:keys], key_ids[:keys], max_id, length
-            )
+            valid = _stage_mask(prefix, first, rows, keys, max_id, length)
             weights = jnp.where(valid[None, :, :], weights, 0)
             output = jax.lax.dot(
                 cast(Any, weights).astype(v_tile.dtype),
@@ -1656,13 +1719,10 @@ def _jagged_fwd_single_block_kernel(
                 dimension_numbers=(((2,), (1,)), ((0,), (0,))),
                 preferred_element_type=jnp.float32,
             )
-            output = jnp.where(
-                positions[None, first : first + rows, None] < length,
-                output * inv_n if tanh_silu else output,
-                0,
-            )
-            out_ref[first : first + rows, :, :] = jnp.swapaxes(
-                cast(Any, output).astype(out_ref.dtype), 0, 1
+            if tanh_silu:
+                output = output * inv_n
+            out_stage_ref[first : first + rows, :, :] = jnp.swapaxes(
+                cast(Any, output).astype(out_stage_ref.dtype), 0, 1
             )
 
     _single_block_pipeline(
@@ -1671,6 +1731,7 @@ def _jagged_fwd_single_block_kernel(
         block,
         (q_hbm_ref, k_hbm_ref, v_hbm_ref),
         (out_hbm_ref,),
+        (out_stage_ref,),
     )
 
 
@@ -1686,6 +1747,9 @@ def _jagged_bwd_single_block_kernel(  # noqa: C901
     dk_hbm_ref,
     dv_hbm_ref,
     dq_hbm_ref,
+    dk_stage_ref,
+    dv_stage_ref,
+    dq_stage_ref,
     dk_acc_ref,
     dv_acc_ref,
     *,
@@ -1696,45 +1760,41 @@ def _jagged_bwd_single_block_kernel(  # noqa: C901
     """``_jagged_bwd_fused_kernel`` for sequences that fit one ``block``, as one
     pipeline over the sequences."""
     inv_n = attn_scale_ref[0]
+    num_heads = dq_hbm_ref.shape[1]
 
     def _sequence(
         q_stage_ref,
         k_stage_ref,
         v_stage_ref,
         do_stage_ref,
-        dk_ref,
-        dv_ref,
-        dq_ref,
         *,
         mask_past_sequence: bool,
     ) -> None:
         sequence = pl.program_id(0)
-        _, length, row_prefix = _single_block_stage(
+        _, length, prefix = _single_block_stage(
             seq_offsets_ref, sequence, q_hbm_ref.shape[0], block
         )
         q_tile, k_tile, v_tile, do_tile = (
-            jnp.swapaxes(stage_ref[pl.ds(row_prefix, block), :, :], 0, 1)
+            _stage_heads(stage_ref, num_heads)
             for stage_ref in (q_stage_ref, k_stage_ref, v_stage_ref, do_stage_ref)
         )
         max_id = length - num_targets_ref[sequence]
-        positions = jnp.arange(block, dtype=jnp.int32)
         if mask_past_sequence:
-            # dQ, dK and dV sum products over rows past the sequence; 0 * NaN
-            # is NaN.
-            in_sequence = positions[None, :, None] < length
+            # dQ, dK and dV sum products over stage rows, and past the sequence
+            # the stage holds the buffer's padding; 0 * NaN is NaN.
+            in_sequence = jnp.arange(block, dtype=jnp.int32)[None, :, None] < (
+                prefix + length
+            )
             q_tile = jnp.where(in_sequence, q_tile, 0)
             k_tile = jnp.where(in_sequence, k_tile, 0)
             do_tile = jnp.where(in_sequence, do_tile, 0)
-        key_ids = jnp.minimum(positions, max_id)
         dk_acc_ref[...] = jnp.zeros_like(dk_acc_ref)
         dv_acc_ref[...] = jnp.zeros_like(dv_acc_ref)
         for first, rows, keys in _query_strips(block):
             q_strip = q_tile[:, first : first + rows, :]
             do_strip = do_tile[:, first : first + rows, :]
             k_keys, v_keys = k_tile[:, :keys, :], v_tile[:, :keys, :]
-            valid = _attention_mask(
-                first, rows, positions[:keys], key_ids[:keys], max_id, length
-            )
+            valid = _stage_mask(prefix, first, rows, keys, max_id, length)
             scores = jax.lax.dot(
                 q_strip,
                 k_keys,
@@ -1785,23 +1845,21 @@ def _jagged_bwd_single_block_kernel(  # noqa: C901
                 dimension_numbers=(((2,), (1,)), ((0,), (0,))),
                 preferred_element_type=jnp.float32,
             )
-            valid_row = positions[None, first : first + rows, None] < length
-            dq = jnp.where(
-                valid_row, dq * (0.5 * alpha * inv_n) if tanh_silu else alpha * dq, 0
-            )
-            dq_ref[first : first + rows, :, :] = jnp.swapaxes(
-                cast(Any, dq).astype(dq_ref.dtype), 0, 1
+            dq = dq * (0.5 * alpha * inv_n) if tanh_silu else alpha * dq
+            dq_stage_ref[first : first + rows, :, :] = jnp.swapaxes(
+                cast(Any, dq).astype(dq_stage_ref.dtype), 0, 1
             )
 
-        valid_row = positions[None, :, None] < length
         if tanh_silu:
-            dk = jnp.where(valid_row, dk_acc_ref[...] * (0.5 * alpha * inv_n), 0)
-            dv = jnp.where(valid_row, dv_acc_ref[...] * inv_n, 0)
+            dk = dk_acc_ref[...] * (0.5 * alpha * inv_n)
+            dv = dv_acc_ref[...] * inv_n
         else:
-            dk = jnp.where(valid_row, alpha * dk_acc_ref[...], 0)
-            dv = jnp.where(valid_row, dv_acc_ref[...], 0)
-        for out_ref, grad in ((dk_ref, dk), (dv_ref, dv)):
-            out_ref[...] = jnp.swapaxes(cast(Any, grad).astype(out_ref.dtype), 0, 1)
+            dk = alpha * dk_acc_ref[...]
+            dv = dv_acc_ref[...]
+        for stage_ref, grad in ((dk_stage_ref, dk), (dv_stage_ref, dv)):
+            stage_ref[:block, :, :] = jnp.swapaxes(
+                cast(Any, grad).astype(stage_ref.dtype), 0, 1
+            )
 
     _single_block_pipeline(
         _sequence,
@@ -1809,6 +1867,7 @@ def _jagged_bwd_single_block_kernel(  # noqa: C901
         block,
         (q_hbm_ref, k_hbm_ref, v_hbm_ref, do_hbm_ref),
         (dk_hbm_ref, dv_hbm_ref, dq_hbm_ref),
+        (dk_stage_ref, dv_stage_ref, dq_stage_ref),
     )
 
 
@@ -1850,16 +1909,22 @@ def _native_jagged_hstu_attention_backward(
     )
     num_kv_blocks = dkv_padded_seq_len // block_k
     tail_rows = max(query_group_rows, block_k) + _ALIGNMENT_ROWS
+    single_block = _fused_backward_enabled() and _single_block_fits(
+        max_seq_len, block_q, block_k
+    )
+    q_in, k_in, v_in = _flat_rows((q, k, v)) if single_block else (q, k, v)
     scalar_args, qkv_hbm_args = _native_qkv_inputs(
-        q,
-        k,
-        v,
+        q_in,
+        k_in,
+        v_in,
         seq_offsets,
         num_targets,
         attn_scale,
         tail_rows=tail_rows,
     )
     scalar_args = (scalar_args[0], aligned_offsets, *scalar_args[1:])
+    if single_block:
+        (grad_out,) = _flat_rows((grad_out,))
     grad_deficit = max(tail_rows - grad_out.shape[0], 0)
     packed_grad_out = (
         jnp.concatenate(
@@ -1898,7 +1963,6 @@ def _native_jagged_hstu_attention_backward(
         "block_q": block_q,
         "tanh_silu": _tanh_silu_enabled(),
     }
-    single_block = block_q == block_k and num_kv_blocks == 1
     if _fused_backward_enabled() and (
         single_block
         or _fused_backward_vmem_bytes(
@@ -1920,7 +1984,11 @@ def _native_jagged_hstu_attention_backward(
                 tanh_silu=_tanh_silu_enabled(),
             )
             grid = (1,)
+            stage_rows = block_k + _OUTPUT_CHUNK_ROWS
             scratch = (
+                pltpu.VMEM((stage_rows, num_heads, dqk), k.dtype),
+                pltpu.VMEM((stage_rows, num_heads, dv_dim), v.dtype),
+                pltpu.VMEM((stage_rows, num_heads, dqk), q.dtype),
                 pltpu.VMEM((num_heads, block_k, dqk), jnp.float32),
                 pltpu.VMEM((num_heads, block_k, dv_dim), jnp.float32),
             )
