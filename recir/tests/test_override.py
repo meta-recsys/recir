@@ -14,7 +14,13 @@ from copy import deepcopy
 
 import torch
 from functorch import make_fx
-from recir.ops.eager_dispatch import _dispatch_bwd, install_graph_break_dispatch
+from recir.ops.eager_dispatch import (
+    _dispatch_bwd,
+    dispatch_output_sources,
+    install_graph_break_dispatch,
+    notify_dispatch_outputs,
+    observe_dispatch_outputs,
+)
 from recir.tests.eager_test_utils import (
     run_graph,
     ToyDense,
@@ -145,6 +151,52 @@ class TestOverride(unittest.TestCase):
                 num_state_tensors=0,
                 device_resident=True,
             )
+
+    def test_dispatch_outputs_reach_observers_of_the_dispatch_reading_them(self):
+        graph = torch.fx.Graph()
+        x = graph.placeholder("x")
+        x.meta["val"] = torch.ones(3)
+
+        def mark(value, name):
+            node = graph.call_function(
+                torch.ops.recir.mark_boundary.default, args=(value, name)
+            )
+            node.meta["val"] = torch.ones(3)
+            return node
+
+        produced = [mark(x, f"producer::output::{i}") for i in range(3)]
+        consumed = [
+            mark(produced[2], "consumer::input::0"),
+            mark(produced[0], "consumer::input::1"),
+        ]
+        graph.output((mark(consumed[0], "consumer::output::0"), produced[1]))
+        gm = torch.fx.GraphModule({}, graph)
+        producer = install_graph_break_dispatch(
+            gm,
+            "producer",
+            lambda value: (value + 1, value + 2, value + 3),
+            num_state_tensors=0,
+            register_backward=False,
+        )
+        consumer = install_graph_break_dispatch(
+            gm,
+            "consumer",
+            lambda a, b: (a * b,),
+            num_state_tensors=0,
+            register_backward=False,
+        )
+        seen = []
+        observe_dispatch_outputs(producer, lambda outputs: seen.append(outputs))
+        early = [torch.ones(3), torch.ones(3), torch.zeros(3)]
+        notify_dispatch_outputs(producer, early)
+        result, _ = gm(torch.ones(3))
+
+        self.assertEqual(
+            [(producer, 2), (producer, 0)], dispatch_output_sources(gm, consumer)
+        )
+        self.assertIsNone(dispatch_output_sources(gm, producer))
+        self.assertEqual([early], seen)
+        self.assertTrue(torch.equal(result, torch.full((3,), 8.0)))
 
     def test_install_without_backward_removes_backward_markers(self):
         graph = torch.fx.Graph()
