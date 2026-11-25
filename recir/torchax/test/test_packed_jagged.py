@@ -20,6 +20,7 @@ from recir.ops.packed_jagged_ops import (
     jagged_dense_bmm_add,
     jagged_dense_broadcast_add,
 )
+from recir.passes.jagged_queries import fuse_jagged_queries
 from recir.torchax.ops.jagged_dma_ops import (
     concat_jagged_dma,
     concat_jagged_tiled_dma,
@@ -45,6 +46,7 @@ from recir.torchax.ops.packed_jagged_ops import (
     _packed_position_add,
     _packed_position_add_backward,
     _packed_weight_grad_aligned,
+    select_concat_split_right,
 )
 from torch.fx.experimental.proxy_tensor import make_fx
 
@@ -113,12 +115,172 @@ def _segment_values(
     return left, right
 
 
+def _query_reference(
+    x: Any,
+    right: Any,
+    *,
+    ca: Any,
+    cb: Any,
+    sa: Any,
+    sb: Any,
+    capacity: int,
+    query_capacity: int,
+    left_capacity: int,
+    right_capacity: int,
+    prefix: bool,
+) -> Any:
+    if prefix:
+        x = _jax_split_2d_jagged_gather(x, ca, cb, left_capacity, right_capacity)[0]
+    full = _jax_concat_2d_jagged_gather(x, ca, right, cb, capacity)
+    return _jax_split_2d_jagged_gather(full, sa, sb, 0, query_capacity)[1]
 
 
 class PackedJaggedTest(unittest.TestCase):
+    def test_query_composition_raw_clipped_and_prefix(self) -> None:
+        rng = np.random.default_rng(619)
+        cases = (
+            ([0, 1, 0, 12, 512], [3, 7, 1, 8, 20], [1, 0, 1, 3, 8]),
+            ([0, 0, 0], [0, 1, 0], [0, 1, 0]),
+            ([7, 0, 3], [0, 0, 0], [0, 0, 0]),
+        )
+        with jax.enable_x64():
+            for dtype, case, delta, prefix in product(
+                (jnp.float32, jnp.bfloat16, jnp.int64),
+                cases,
+                (-15, 0, 5),
+                (False, True),
+            ):
+                ca = jnp.asarray(np.r_[0, np.cumsum(case[0])], jnp.int32)
+                cb = jnp.asarray(np.r_[0, np.cumsum(case[1])], jnp.int32)
+                sb = jnp.asarray(np.r_[0, np.cumsum(case[2])], jnp.int32)
+                sa = ca + cb - sb
+                left_capacity = max(0, int(ca[-1]) + delta)
+                right_capacity = max(0, int(cb[-1]) + delta)
+                capacity = max(0, int((ca + cb)[-1]) + delta)
+                xcap = capacity if prefix else left_capacity
+                query_capacity = int(sb[-1]) + 5
+                left = jnp.asarray(rng.integers(-400, 400, (xcap, 128))).astype(dtype)
+                right = jnp.asarray(
+                    rng.integers(-400, 400, (right_capacity, 128))
+                ).astype(dtype)
+                if dtype == jnp.int64:
+                    left = left * (1 << 40)
+                    right = right * (1 << 40)
+                elif xcap:
+                    left = left.at[0, 0].set(-0.0).at[-1, 1].set(jnp.nan)
 
+                reference = partial(
+                    _query_reference,
+                    ca=ca,
+                    cb=cb,
+                    sa=sa,
+                    sb=sb,
+                    capacity=capacity,
+                    query_capacity=query_capacity,
+                    left_capacity=left_capacity,
+                    right_capacity=right_capacity,
+                    prefix=prefix,
+                )
+                candidate = partial(
+                    select_concat_split_right,
+                    ca=ca,
+                    cb=cb,
+                    sa=sa,
+                    sb=sb,
+                    capacity=capacity,
+                    query_capacity=query_capacity,
+                    left_capacity=left_capacity if prefix else None,
+                )
+                expected = np.asarray(jax.jit(reference)(left, right))
+                actual = np.asarray(jax.jit(candidate)(left=left, right=right))
+                with self.subTest(
+                    dtype=str(dtype), delta=delta, prefix=prefix, case=case
+                ):
+                    np.testing.assert_array_equal(
+                        actual.view(np.uint8), expected.view(np.uint8)
+                    )
 
+    def test_query_fusion_keeps_other_split_output(self) -> None:
+        graph = torch.fx.Graph()
+        left, ca, right, cb, sa, sb = [
+            graph.placeholder(name)
+            for name in ("left", "ca", "right", "cb", "sa", "sb")
+        ]
+        left.meta["val"] = torch.empty((16, 128))
+        concat = graph.call_function(
+            torch.ops.recir.concat_2d_jagged.default, (left, ca, right, cb, 24)
+        )
+        concat.meta["val"] = torch.empty((24, 128))
+        split = graph.call_function(
+            torch.ops.recir.split_2d_jagged.default, (concat, sa, sb, 20, 4)
+        )
+        first = graph.call_function(operator.getitem, (split, 0))
+        query = graph.call_function(operator.getitem, (split, 1))
+        graph.output((first, query))
+        gm = torch.fx.GraphModule(torch.nn.Module(), graph)
+        before = gm.code
+        fuse_jagged_queries(gm)
+        self.assertEqual(gm.code, before)
+        self.assertEqual(gm.meta["jagged_query_fusion_count"], 0)
 
+    def test_query_fusion_bypasses_prefix_and_full_group_view(self) -> None:
+        graph = torch.fx.Graph()
+        x, ca, right, cb, sa, sb = [
+            graph.placeholder(name) for name in ("x", "ca", "right", "cb", "sa", "sb")
+        ]
+        x.meta["val"] = torch.empty((24, 128))
+        prefix_split = graph.call_function(
+            torch.ops.recir.split_2d_jagged.default, (x, ca, cb, 16, 8)
+        )
+        prefix = graph.call_function(operator.getitem, (prefix_split, 0))
+        prefix.meta["val"] = torch.empty((16, 128))
+        right.meta["val"] = torch.empty((8, 128))
+        original_suffix = graph.call_function(operator.getitem, (prefix_split, 1))
+        concat = graph.call_function(
+            torch.ops.recir.concat_2d_jagged.default, (prefix, ca, right, cb, 24)
+        )
+        concat.meta["val"] = torch.empty((24, 128))
+        group = graph.call_function(
+            torch.ops.aten.split_with_sizes.default, (concat, [24], 0)
+        )
+        view = graph.call_function(operator.getitem, (group, 0))
+        view.meta["val"] = torch.empty((24, 128))
+        split = graph.call_function(
+            torch.ops.recir.split_2d_jagged.default, (view, sa, sb, 20, 4)
+        )
+        query = graph.call_function(operator.getitem, (split, 1))
+        query.meta["val"] = torch.empty((4, 128))
+        graph.output((query, original_suffix))
+        gm = torch.fx.GraphModule(torch.nn.Module(), graph)
+        ca_value = torch.tensor([0, 5, 11])
+        cb_value = torch.tensor([0, 3, 7])
+        sb_value = torch.tensor([0, 1, 3])
+        inputs = (
+            torch.arange(24 * 128, dtype=torch.float32).reshape(24, 128),
+            ca_value,
+            -torch.arange(8 * 128, dtype=torch.float32).reshape(8, 128),
+            cb_value,
+            ca_value + cb_value - sb_value,
+            sb_value,
+        )
+        expected = gm(*inputs)
+        fuse_jagged_queries(gm)
+        actual = gm(*inputs)
+        for first, second in zip(expected, actual):
+            torch.testing.assert_close(first, second, rtol=0, atol=0)
+        selected = [
+            node
+            for node in gm.graph.nodes
+            if node.target == torch.ops.recir.jagged_concat_split_right.default
+        ]
+        self.assertEqual(len(selected), 1)
+        self.assertIs(selected[0].args[0], x)
+        self.assertEqual(selected[0].args[-2:], (16, True))
+        self.assertIn(prefix_split, list(gm.graph.nodes))
+        self.assertIn(original_suffix, list(gm.graph.nodes))
+        self.assertNotIn(prefix, list(gm.graph.nodes))
+        self.assertNotIn(concat, list(gm.graph.nodes))
+        self.assertNotIn(split, list(gm.graph.nodes))
 
     def test_segment_dma_mixed_dtype_fallback(self) -> None:
         offsets = jnp.asarray([0, 1, 3], jnp.int32)
