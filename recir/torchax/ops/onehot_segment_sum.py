@@ -38,8 +38,8 @@ _MAX_GATHER_SEGMENTS = 512
 
 
 def onehot_segment_sum_enabled(num_segments: int) -> bool:
-    """``RECIR_ONEHOT_SEGMENT_SUM=1``: embedding and packed-position gradients
-    of tables up to 4096 rows use ``onehot_segment_sum``."""
+    """``RECIR_ONEHOT_SEGMENT_SUM=1``: embedding, packed-position and packed
+    bias gradients of tables up to 4096 rows use ``onehot_segment_sum``."""
     value = os.environ.get("RECIR_ONEHOT_SEGMENT_SUM", "0")
     if value not in ("0", "1"):
         raise ValueError(f"Invalid RECIR_ONEHOT_SEGMENT_SUM: {value!r}")

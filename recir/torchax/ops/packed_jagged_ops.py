@@ -884,6 +884,9 @@ def _packed_add_backward(
 ) -> tuple[Any, Any]:
     groups, valid = _valid_rows(offsets, grad.shape[0], max_len)
     dv = jnp.where(valid[:, None], grad, 0)
+    if onehot_segment_sum_enabled(bias.shape[0]):
+        # The sorted scatter takes 2.4 ms on RankFM's [325619, 512] -> 257.
+        return dv, onehot_segment_sum(dv, groups, bias.shape[0]).astype(dv.dtype)
     db = jax.ops.segment_sum(
         dv, groups, num_segments=bias.shape[0], indices_are_sorted=True
     )
