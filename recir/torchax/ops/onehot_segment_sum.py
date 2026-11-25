@@ -4,7 +4,8 @@
 # This source code is licensed under the BSD-3-Clause license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Segment sums into small tables as one-hot matmuls on the TPU MXU.
+"""Segment sums into, and gathers from, small tables as one-hot matmuls on the
+TPU MXU.
 
 A scatter-add of N rows into a table of a few thousand rows serializes on
 conflicting rows: RankFM's 325k-row embedding and position gradients take
@@ -12,6 +13,12 @@ conflicting rows: RankFM's 325k-row embedding and position gradients take
 rows does the same reduction on the MXU. Each f32 row is split into three bf16
 terms (8 + 8 + 8 mantissa bits), so every product is exact and the result
 differs from a scatter-add only in the f32 summation order.
+
+The forward lookups into the same tables are TensorCore gathers at ~3.7 ns per
+row whatever the row width (1.2 ms for 325k rows), and libtpu does not offload
+them to SparseCore because every table row repeats thousands of times. For
+tables of a few hundred rows, the one-hot product of the table's terms is
+cheaper, and each output row is exactly one table row.
 """
 
 import os
@@ -26,6 +33,8 @@ _BLOCK_ROWS = 2048
 _BLOCK_SEGMENTS = 512
 # Above this the one-hot work (segments x rows) outgrows the scatter.
 _MAX_SEGMENTS = 4096
+# Above this it outgrows the gather (2002 rows: 1.21 vs 1.22 ms per 325k rows).
+_MAX_GATHER_SEGMENTS = 512
 
 
 def onehot_segment_sum_enabled(num_segments: int) -> bool:
@@ -35,6 +44,15 @@ def onehot_segment_sum_enabled(num_segments: int) -> bool:
     if value not in ("0", "1"):
         raise ValueError(f"Invalid RECIR_ONEHOT_SEGMENT_SUM: {value!r}")
     return value == "1" and 0 < num_segments <= _MAX_SEGMENTS
+
+
+def onehot_gather_enabled(num_segments: int) -> bool:
+    """``RECIR_ONEHOT_GATHER=1``: embedding lookups into tables up to 512 rows
+    use ``onehot_gather``."""
+    value = os.environ.get("RECIR_ONEHOT_GATHER", "0")
+    if value not in ("0", "1"):
+        raise ValueError(f"Invalid RECIR_ONEHOT_GATHER: {value!r}")
+    return value == "1" and 0 < num_segments <= _MAX_GATHER_SEGMENTS
 
 
 def _truncate_to_bf16(x: Any) -> Any:
@@ -105,3 +123,53 @@ def onehot_segment_sum(values: Any, segment_ids: Any, num_segments: int) -> Any:
             ),
         )(ids, *terms)
     return out[:num_segments, :d]
+
+
+def onehot_gather(table: Any, ids: Any) -> Any:
+    """``table[ids]`` for a [segments, D] table of at most 512 rows and 1-D ids.
+
+    Each output row equals its table row bit for bit (a -0.0 entry reads as
+    +0.0). Negative ids count from the end; ids outside ``[-segments,
+    segments)`` give NaN rows, as ``jnp.take``'s default fill mode does. The
+    kernel writes the rows transposed, [D, N], so that it reads the ids
+    lane-dense.
+    """
+    num_segments, d = table.shape
+    n = ids.shape[0]
+    rows = pl.cdiv(max(n, 1), _BLOCK_ROWS) * _BLOCK_ROWS
+    segments = pl.cdiv(num_segments, 128) * 128
+    width = pl.cdiv(d, 8) * 8
+    ids = ids.astype(jnp.int32)
+    ids = jnp.where(ids < 0, ids + num_segments, ids)
+    ids = jnp.pad(ids, (0, rows - n), constant_values=-1).reshape(1, rows)
+    terms = [
+        t.T
+        for t in _bf16_terms(
+            jnp.pad(table, ((0, segments - num_segments), (0, width - d)))
+        )
+    ]
+
+    def kernel(ids_ref: Any, *refs: Any) -> None:
+        *term_refs, out_ref = refs
+        segment = jax.lax.broadcasted_iota(jnp.int32, (segments, _BLOCK_ROWS), 0)
+        onehot = (segment == ids_ref[...]).astype(jnp.bfloat16)
+        total = jnp.dot(term_refs[0][...], onehot, preferred_element_type=jnp.float32)
+        for term_ref in term_refs[1:]:
+            total += jnp.dot(term_ref[...], onehot, preferred_element_type=jnp.float32)
+        # An id matching no iota value leaves a zero row; jnp.take fills it, so
+        # an out-of-range id stays as loud here as it is in the gather.
+        in_range = (ids_ref[...] >= 0) & (ids_ref[...] < num_segments)
+        out_ref[...] = jnp.where(in_range, total, jnp.float32(jnp.nan))
+
+    with jax.enable_x64(False):
+        out = pl.pallas_call(
+            kernel,
+            name="onehot_gather",
+            out_shape=jax.ShapeDtypeStruct((width, rows), jnp.float32),
+            grid=(rows // _BLOCK_ROWS,),
+            in_specs=[pl.BlockSpec((1, _BLOCK_ROWS), lambda r: (0, r))]
+            + [pl.BlockSpec((width, segments), lambda r: (0, 0))] * len(terms),
+            out_specs=pl.BlockSpec((width, _BLOCK_ROWS), lambda r: (0, r)),
+            compiler_params=pltpu.CompilerParams(dimension_semantics=("parallel",)),
+        )(ids, *terms)
+    return out.T[:n, :d].astype(table.dtype)
