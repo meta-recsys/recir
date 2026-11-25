@@ -17,6 +17,7 @@ from recir.backends.types import BackendType
 from recir.lowering.device_state import DeviceStateManager
 from recir.lowering.xla_device_state import XLADeviceStateManager
 from recir.lowering.xla_lower import partial_lower_xla
+from recir.passes.concat_row_sums import split_concat_row_sums as _split_concat_row_sums
 from recir.passes.fsdp_collectives import (
     bucket_grad_reduce_scatters as _bucket_grad_reduce_scatters,
     merge_backward_gathers as _merge_backward_gathers,
@@ -73,13 +74,20 @@ class XLAGSPMDBackend(_XLABackendBase):
         *,
         dump_hlo: bool = False,
         fuse_jagged_queries: bool = False,
+        split_concat_row_sums: bool = False,
         optimize_passes: Optional[Sequence[GraphPatch]] = None,
         **kwargs: Any,
     ) -> None:
-        if fuse_jagged_queries:
+        if fuse_jagged_queries or split_concat_row_sums:
             if optimize_passes is not None:
-                raise ValueError("fuse_jagged_queries requires default optimize_passes")
-            optimize_passes = (_fuse_jagged_queries,)
+                raise ValueError(
+                    "fuse_jagged_queries and split_concat_row_sums require default "
+                    "optimize_passes"
+                )
+            optimize_passes = (
+                *((_fuse_jagged_queries,) if fuse_jagged_queries else ()),
+                *((_split_concat_row_sums,) if split_concat_row_sums else ()),
+            )
         super().__init__(dump_hlo=dump_hlo, optimize_passes=optimize_passes, **kwargs)
         self._fsdp_axis_size: Optional[int] = None
 
