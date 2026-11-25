@@ -9,6 +9,9 @@ import torch
 
 _LIB = torch.library.Library("recir", "FRAGMENT")
 _LIB.define(
+    "jagged_concat_split_right(Tensor values_left, Tensor offsets_left, Tensor values_right, Tensor offsets_right, int capacity, Tensor split_left, Tensor split_right, int query_capacity, int left_capacity, bool left_is_prefix) -> Tensor"
+)
+_LIB.define(
     "packed_jagged_bmm(Tensor values, Tensor weights, Tensor offsets, int max_len) -> Tensor"
 )
 _LIB.define(
@@ -34,10 +37,54 @@ _LIB.define(
 )
 
 
+def _jagged_concat_split_right(
+    values_left: torch.Tensor,
+    offsets_left: torch.Tensor,
+    values_right: torch.Tensor,
+    offsets_right: torch.Tensor,
+    capacity: int,
+    split_left: torch.Tensor,
+    split_right: torch.Tensor,
+    query_capacity: int,
+    left_capacity: int,
+    left_is_prefix: bool,
+) -> torch.Tensor:
+    if left_is_prefix:
+        values_left = torch.ops.recir.split_2d_jagged(
+            values_left, offsets_left, offsets_right, left_capacity, 0
+        )[0]
+    combined = torch.ops.recir.concat_2d_jagged(
+        values_left, offsets_left, values_right, offsets_right, capacity
+    )
+    return torch.ops.recir.split_2d_jagged(
+        combined, split_left, split_right, 0, query_capacity
+    )[1]
 
 
+_LIB.impl(
+    "jagged_concat_split_right",
+    _jagged_concat_split_right,
+    "CompositeExplicitAutograd",
+)
 
 
+@torch.library.register_fake("recir::jagged_concat_split_right")
+def _jagged_concat_split_right_fake(
+    values_left: torch.Tensor,
+    offsets_left: torch.Tensor,
+    values_right: torch.Tensor,
+    offsets_right: torch.Tensor,
+    capacity: int,
+    split_left: torch.Tensor,
+    split_right: torch.Tensor,
+    query_capacity: int,
+    left_capacity: int,
+    left_is_prefix: bool,
+) -> torch.Tensor:
+    return values_left.new_empty(
+        (query_capacity,) + values_left.shape[1:],
+        dtype=torch.promote_types(values_left.dtype, values_right.dtype),
+    )
 
 
 def _position_add(
