@@ -429,7 +429,9 @@ def _jagged_fwd_kernel(
         copy.start()
         copy.wait()
 
-    max_id = length - num_targets
+    # A negative count would put max_id past length, and the mask skip in
+    # _keys_precede_queries reads that as the next sequence's keys being history.
+    max_id = length - jnp.maximum(num_targets, 0)
 
     def _accumulate(k_stage_ref, v_stage_ref) -> None:
         kv_block = pl.program_id(0)
@@ -451,14 +453,16 @@ def _jagged_fwd_kernel(
             query_offset = query_tile * block_q
             query_start = query_group_start + query_offset
             query_end = jnp.minimum(query_start + block_q, length)
+            active = (query_start < length) & (kv_start < query_end)
+            # Every key is history and precedes every query, so the mask only
+            # clears rows past ``length``, which the final store drops anyway.
+            interior = _keys_precede_queries(kv_start, block_k, query_start, max_id)
 
-            @pl.when((query_start < length) & (kv_start < query_end))
             def _accumulate_query_tile(
+                masked: bool,
                 query_offset=query_offset,
                 query_start=query_start,
             ) -> None:
-                query_positions = query_start + jnp.arange(block_q, dtype=jnp.int32)
-                query_ids = jnp.minimum(query_positions, max_id)
                 q_tile = jnp.swapaxes(
                     q_stage_ref[pl.ds(q_prefix + query_offset, block_q), :, :],
                     0,
@@ -471,17 +475,12 @@ def _jagged_fwd_kernel(
                     preferred_element_type=jnp.float32,
                 )
                 weights = jax.nn.silu(scores * alpha) * inv_n
-                causal = (query_ids[:, None] - key_ids[None, :]) > 0
-                diagonal = query_positions[:, None] == key_positions[None, :]
-                valid = (
-                    (causal | diagonal)
-                    & (query_positions[:, None] < length)
-                    & (key_positions[None, :] < length)
-                )
-                weights = cast(
-                    Any,
-                    jnp.where(valid[None, :, :], weights, 0),
-                ).astype(v_tile.dtype)
+                if masked:
+                    valid = _attention_mask(
+                        query_start, block_q, key_positions, key_ids, max_id, length
+                    )
+                    weights = jnp.where(valid[None, :, :], weights, 0)
+                weights = cast(Any, weights).astype(v_tile.dtype)
                 output_update = jax.lax.dot(
                     weights,
                     v_tile,
@@ -491,6 +490,9 @@ def _jagged_fwd_kernel(
                 output_acc_ref[:, pl.ds(query_offset, block_q), :] = (
                     output_acc_ref[:, pl.ds(query_offset, block_q), :] + output_update
                 )
+
+            pl.when(active & interior)(functools.partial(_accumulate_query_tile, False))
+            pl.when(active & ~interior)(functools.partial(_accumulate_query_tile, True))
 
     def _kv_window(kv_block):
         kv_aligned_start = pl.multiple_of(
@@ -721,6 +723,28 @@ def _silu_grad(x: jax.Array) -> jax.Array:
     return sigmoid * (1.0 + x * (1.0 - sigmoid))
 
 
+def _keys_precede_queries(kv_start, block_k: int, query_start, max_id) -> Any:
+    """Whether the whole key tile is history strictly before the query tile.
+
+    Then every (query, key) pair passes the causal and target test, and keys are
+    below ``length``; only queries at or past ``length`` can still be invalid.
+    """
+    kv_end = kv_start + block_k
+    return (kv_end <= query_start) & (kv_end <= max_id)
+
+
+def _attention_mask(query_start, block_q: int, key_positions, key_ids, max_id, length):
+    query_positions = query_start + jnp.arange(block_q, dtype=jnp.int32)
+    query_ids = jnp.minimum(query_positions, max_id)
+    causal = (query_ids[:, None] - key_ids[None, :]) > 0
+    diagonal = query_positions[:, None] == key_positions[None, :]
+    return (
+        (causal | diagonal)
+        & (query_positions[:, None] < length)
+        & (key_positions[None, :] < length)
+    )
+
+
 def _jagged_bwd_dq_kernel(
     seq_offsets_ref,
     aligned_offsets_ref,
@@ -800,7 +824,9 @@ def _jagged_bwd_dq_kernel(
             * inv_n
         ).astype(do_t_ref.dtype)
 
-    max_id = length - num_targets
+    # A negative count would put max_id past length, and the mask skip in
+    # _keys_precede_queries reads that as the next sequence's keys being history.
+    max_id = length - jnp.maximum(num_targets, 0)
 
     def _accumulate(k_stage_ref, v_stage_ref) -> None:
         kv_block = pl.program_id(0)
@@ -820,14 +846,15 @@ def _jagged_bwd_dq_kernel(
             query_offset = query_tile * block_q
             query_start = query_group_start + query_offset
             query_end = jnp.minimum(query_start + block_q, length)
+            active = (query_start < length) & (kv_start < query_end)
+            # Rows past ``length`` are dropped by the final store, as in forward.
+            interior = _keys_precede_queries(kv_start, block_k, query_start, max_id)
 
-            @pl.when((query_start < length) & (kv_start < query_end))
             def _accumulate_query_tile(
+                masked: bool,
                 query_offset=query_offset,
                 query_start=query_start,
             ) -> None:
-                query_positions = query_start + jnp.arange(block_q, dtype=jnp.int32)
-                query_ids = jnp.minimum(query_positions, max_id)
                 q_tile = q_t_ref[:, pl.ds(query_offset, block_q), :]
                 do_tile = do_t_ref[:, pl.ds(query_offset, block_q), :]
                 scores = jax.lax.dot(
@@ -842,19 +869,14 @@ def _jagged_bwd_dq_kernel(
                     dimension_numbers=(((2,), (2,)), ((0,), (0,))),
                     preferred_element_type=jnp.float32,
                 )
-                causal = (query_ids[:, None] - key_ids[None, :]) > 0
-                diagonal = query_positions[:, None] == key_positions[None, :]
-                valid = (
-                    (causal | diagonal)
-                    & (query_positions[:, None] < length)
-                    & (key_positions[None, :] < length)
-                )
-                ds = cast(
-                    Any,
-                    jnp.where(valid[None, :, :], dp * _silu_grad(scores), 0),
-                )
+                ds = dp * _silu_grad(scores)
+                if masked:
+                    valid = _attention_mask(
+                        query_start, block_q, key_positions, key_ids, max_id, length
+                    )
+                    ds = jnp.where(valid[None, :, :], ds, 0)
                 dq_update = jax.lax.dot(
-                    ds.astype(k_tile.dtype),
+                    cast(Any, ds).astype(k_tile.dtype),
                     k_tile,
                     dimension_numbers=(((2,), (1,)), ((0,), (0,))),
                     preferred_element_type=jnp.float32,
@@ -862,6 +884,9 @@ def _jagged_bwd_dq_kernel(
                 dq_acc_ref[:, pl.ds(query_offset, block_q), :] = (
                     dq_acc_ref[:, pl.ds(query_offset, block_q), :] + dq_update
                 )
+
+            pl.when(active & interior)(functools.partial(_accumulate_query_tile, False))
+            pl.when(active & ~interior)(functools.partial(_accumulate_query_tile, True))
 
     def _kv_window(kv_block):
         kv_aligned_start = pl.multiple_of(
@@ -1017,7 +1042,9 @@ def _jagged_bwd_dkv_kernel(
         for copy in copies:
             copy.wait()
 
-    max_id = length - num_targets
+    # A negative count would put max_id past length, and the mask skip in
+    # _keys_precede_queries reads that as the next sequence's keys being history.
+    max_id = length - jnp.maximum(num_targets, 0)
     key_positions = kv_start + jnp.arange(block_k, dtype=jnp.int32)
     key_ids = jnp.minimum(key_positions, max_id)
     k_tile = jnp.swapaxes(
@@ -1035,8 +1062,6 @@ def _jagged_bwd_dkv_kernel(
     def _accumulate(q_stage_ref, do_stage_ref) -> None:
         query_block = first_query_block + pl.program_id(0)
         query_start = query_block * block_q
-        query_positions = query_start + jnp.arange(block_q, dtype=jnp.int32)
-        query_ids = jnp.minimum(query_positions, max_id)
         q_tile = jnp.swapaxes(
             q_stage_ref[pl.ds(prefix, block_q), :, :],
             0,
@@ -1047,56 +1072,56 @@ def _jagged_bwd_dkv_kernel(
             0,
             1,
         )
-        scores = jax.lax.dot(
-            q_tile,
-            k_tile,
-            dimension_numbers=(((2,), (2,)), ((0,), (0,))),
-            preferred_element_type=jnp.float32,
+        # Queries past ``length`` would add into valid keys here, so unlike
+        # forward and dQ the tile must also lie wholly inside the sequence.
+        interior = _keys_precede_queries(kv_start, block_k, query_start, max_id) & (
+            query_start + block_q <= length
         )
-        scaled_scores = scores * alpha
-        causal = (query_ids[:, None] - key_ids[None, :]) > 0
-        diagonal = query_positions[:, None] == key_positions[None, :]
-        valid = (
-            (causal | diagonal)
-            & (query_positions[:, None] < length)
-            & (key_positions[None, :] < length)
-        )
-        weights = cast(
-            Any,
-            jnp.where(
-                valid[None, :, :],
-                jax.nn.silu(scaled_scores) * inv_n,
-                0,
-            ),
-        )
-        dv_update = jax.lax.dot(
-            weights.astype(do_tile.dtype),
-            do_tile,
-            dimension_numbers=(((1,), (1,)), ((0,), (0,))),
-            preferred_element_type=jnp.float32,
-        )
-        dp = jax.lax.dot(
-            do_tile,
-            v_tile,
-            dimension_numbers=(((2,), (2,)), ((0,), (0,))),
-            preferred_element_type=jnp.float32,
-        )
-        ds = cast(
-            Any,
-            jnp.where(
-                valid[None, :, :],
-                dp * _silu_grad(scaled_scores) * inv_n,
-                0,
-            ),
-        )
-        dk_update = jax.lax.dot(
-            ds.astype(q_tile.dtype),
-            q_tile,
-            dimension_numbers=(((1,), (1,)), ((0,), (0,))),
-            preferred_element_type=jnp.float32,
-        )
-        dk_acc_ref[...] = dk_acc_ref[...] + alpha * dk_update
-        dv_acc_ref[...] = dv_acc_ref[...] + dv_update
+
+        def _update(masked: bool) -> None:
+            scores = jax.lax.dot(
+                q_tile,
+                k_tile,
+                dimension_numbers=(((2,), (2,)), ((0,), (0,))),
+                preferred_element_type=jnp.float32,
+            )
+            scaled_scores = scores * alpha
+            weights = jax.nn.silu(scaled_scores) * inv_n
+            valid = (
+                _attention_mask(
+                    query_start, block_q, key_positions, key_ids, max_id, length
+                )
+                if masked
+                else None
+            )
+            if valid is not None:
+                weights = jnp.where(valid[None, :, :], weights, 0)
+            dv_update = jax.lax.dot(
+                cast(Any, weights).astype(do_tile.dtype),
+                do_tile,
+                dimension_numbers=(((1,), (1,)), ((0,), (0,))),
+                preferred_element_type=jnp.float32,
+            )
+            dp = jax.lax.dot(
+                do_tile,
+                v_tile,
+                dimension_numbers=(((2,), (2,)), ((0,), (0,))),
+                preferred_element_type=jnp.float32,
+            )
+            ds = dp * _silu_grad(scaled_scores) * inv_n
+            if valid is not None:
+                ds = jnp.where(valid[None, :, :], ds, 0)
+            dk_update = jax.lax.dot(
+                cast(Any, ds).astype(q_tile.dtype),
+                q_tile,
+                dimension_numbers=(((1,), (1,)), ((0,), (0,))),
+                preferred_element_type=jnp.float32,
+            )
+            dk_acc_ref[...] = dk_acc_ref[...] + alpha * dk_update
+            dv_acc_ref[...] = dv_acc_ref[...] + dv_update
+
+        pl.when(interior)(functools.partial(_update, False))
+        pl.when(~interior)(functools.partial(_update, True))
 
     def _query_window(query_block):
         query_start = (first_query_block + query_block) * block_q
