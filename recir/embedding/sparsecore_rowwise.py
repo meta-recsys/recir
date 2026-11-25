@@ -32,7 +32,6 @@ import os
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from itertools import repeat
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import jax
@@ -179,10 +178,16 @@ def _device_inputs(
     """
     per_sc = padded // num_sc
     sorted_uniq, inv = _unique_inverse(ids)
-    k = np.arange(_round_up(sorted_uniq.size, num_sc)).reshape(-1, num_sc).T.ravel()
-    k = k[k < sorted_uniq.size]
-    uniq, samples = sorted_uniq[k], (k % num_sc) * per_sc + k // num_sc
-    slots[d] = (inv % num_sc) * per_sc + inv // num_sc
+    spread = [sorted_uniq[c::num_sc] for c in range(num_sc)]
+    uniq = np.concatenate(spread)
+    samples = np.concatenate(
+        [np.arange(c * per_sc, c * per_sc + s.size) for c, s in enumerate(spread)]
+    )
+    if num_sc & (num_sc - 1) == 0:
+        # Bit ops instead of int64 % and //, which take twice as long.
+        slots[d] = (inv & (num_sc - 1)) * per_sc + (inv >> (num_sc.bit_length() - 1))
+    else:
+        slots[d] = (inv % num_sc) * per_sc + inv // num_sc
     out = []
     for sub in subs:
         inside = (uniq >= sub.start) & (uniq < sub.start + sub.rows)
@@ -209,11 +214,11 @@ def _exchange_layout(
     """
     shard_size, rotation, offset = layout
     shards, per_device = world * num_sc, shard_size * num_sc
-    cands, ranks = [], []
+    insides, cands = [], []
     for sorted_uniq, _, _, sub in parts:
         inside = (sorted_uniq >= sub.start) & (sorted_uniq < sub.start + sub.rows)
+        insides.append(inside)
         cands.append(sorted_uniq[inside] - sub.start)
-        ranks.append(np.where(inside, _cumsum_mask(inside) - 1, -1))
     ids = np.concatenate(cands)
     phys = ((ids % shards + rotation) % shards) * shard_size + ids // shards + offset
     rows, row_of = _unique_inverse(phys)
@@ -231,10 +236,12 @@ def _exchange_layout(
     slot_of_row = owner * cap + j
     dest = np.full(sum(p[2] for p in parts), world * cap, np.int32)
     pos, cand = 0, 0
-    for (_, inv, padded, _), c, rank in zip(parts, cands, ranks):
-        r = rank[inv]
-        hit = np.flatnonzero(r >= 0)
-        dest[pos + hit] = slot_of_row[row_of[cand + r[hit]]]
+    for (sorted_uniq, inv, padded, _), inside, c in zip(parts, insides, cands):
+        # Each unique id's slot, then one gather per position: cheaper than
+        # composing the maps per position.
+        slot_of_id = np.full(sorted_uniq.size, world * cap, np.int32)
+        slot_of_id[inside] = slot_of_row[row_of[cand : cand + c.size]]
+        dest[pos : pos + inv.size] = slot_of_id[inv]
         pos, cand = pos + padded, cand + c.size
     return dest, send_rows, fill
 
@@ -334,7 +341,7 @@ class SparseCoreRowwiseTables:
         self._rounding_counter: int = 0
         self._layout: Dict[str, Tuple[int, int, int]] = {}
         self._host_blocks: Dict[Tuple[str, str], np.ndarray] = {}
-        self._pool = ThreadPoolExecutor(self._local_devices)
+        self._pool = ThreadPoolExecutor(2 * self._local_devices)
         self.ev_w: Dict[str, Any] = {}
         self.momentum: Dict[str, jax.Array] = {}
 
@@ -769,23 +776,23 @@ class SparseCoreRowwiseTables:
         per_device: Dict[str, List[Any]] = {}
         # Per-device work runs in worker threads writing into preallocated arrays:
         # the main thread shares the GIL with the input pipeline's producer thread.
+        # Each stage is a single map over all (feature or stack, device) jobs, so
+        # no thread idles at a feature boundary.
         local = self._local_devices
+        jobs = []
         for f, ids in host_ids.items():
             n, padded = sizes[f]
             subs = self._subs[self._feature_table[f]]
             ids = ids.astype(np.int64, copy=False).reshape(local, n)
             slots[f] = np.empty((local, n), np.int32)
-            per_device[f] = list(
-                self._pool.map(
-                    _device_inputs,
-                    ids,
-                    range(local),
-                    repeat(padded),
-                    repeat(self._num_sc),
-                    repeat(subs),
-                    repeat(slots[f]),
-                )
-            )
+            jobs += [
+                (ids[d], d, padded, self._num_sc, subs, slots[f]) for d in range(local)
+            ]
+        done = self._pool.map(_device_inputs, *zip(*jobs))
+        for f in host_ids:
+            padded = sizes[f][1]
+            subs = self._subs[self._feature_table[f]]
+            per_device[f] = [next(done) for _ in range(local)]
             slots[f] = slots[f].reshape(-1)
             for i, sub in enumerate(subs):
                 name = f"{f}@{sub.stack}"
@@ -797,6 +804,7 @@ class SparseCoreRowwiseTables:
         dest: Dict[str, np.ndarray] = {}
         send_rows: Dict[str, np.ndarray] = {}
         stack_features, caps, layout = exchange
+        jobs = []
         for stack, features in stack_features.items():
             sub = {
                 f: next(
@@ -804,23 +812,22 @@ class SparseCoreRowwiseTables:
                 )
                 for f in features
             }
-            parts = [
-                [
-                    (per_device[f][d][1], per_device[f][d][2], sizes[f][1], sub[f])
-                    for f in features
-                ]
+            jobs += [
+                (
+                    [
+                        (per_device[f][d][1], per_device[f][d][2], sizes[f][1], sub[f])
+                        for f in features
+                    ],
+                    layout[stack],
+                    self._world,
+                    self._num_sc,
+                    caps[stack],
+                )
                 for d in range(local)
             ]
-            out = list(
-                self._pool.map(
-                    _exchange_layout,
-                    parts,
-                    repeat(layout[stack]),
-                    repeat(self._world),
-                    repeat(self._num_sc),
-                    repeat(caps[stack]),
-                )
-            )
+        done = self._pool.map(_exchange_layout, *zip(*jobs))
+        for stack in stack_features:
+            out = [next(done) for _ in range(local)]
             dest[stack] = np.concatenate([o[0] for o in out])
             send_rows[stack] = np.concatenate([o[1].reshape(-1) for o in out])
             self._exchange_fill = max(self._exchange_fill, max(o[2] for o in out))
