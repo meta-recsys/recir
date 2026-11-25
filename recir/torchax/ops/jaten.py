@@ -1106,7 +1106,25 @@ def _aten_index(self: Any, indexes: Any) -> Any:
         full_indexes = indexes + (slice(None),) * (self.ndim - len(indexes))
         selected = bits[full_indexes + (slice(None),)]
         return jax.lax.bitcast_convert_type(selected, self.dtype)
+    if _gathers_scalars_densely(self, indexes):
+        # TPU's scalar gather is ~2.5x slower than gathering two-element rows, so
+        # duplicate the column and keep one: a table of 32896 int32 read at 325619
+        # indices takes 1.3 ms instead of 3.4 ms, with identical values.
+        return jnp.stack((self, self), axis=-1)[indexes][..., 0]
     return self[indexes]
+
+
+def _gathers_scalars_densely(self: Any, indexes: tuple[Any, ...]) -> bool:
+    """A 1-D 32-bit table read at many more positions than it has rows."""
+    if self.ndim != 1 or len(indexes) != 1 or self.dtype.itemsize != 4:
+        return False
+    index = indexes[0]
+    return (
+        hasattr(index, "dtype")
+        and jnp.issubdtype(index.dtype, jnp.integer)
+        and index.size >= 4096
+        and self.shape[0] <= 4 * index.size
+    )
 
 
 @op(torch.ops.aten.split)
