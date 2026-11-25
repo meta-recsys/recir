@@ -6,7 +6,8 @@
 
 
 """``recir::dense_to_jagged``, ``recir::jagged_to_padded_dense``,
-``recir::concat_2d_jagged``, and ``recir::split_2d_jagged`` custom ops.
+``recir::concat_2d_jagged``, ``recir::split_2d_jagged`` and
+``recir::replace_last_n_jagged`` custom ops.
 
 These ops provide shard-local jagged operations for non-uniform offsets
 on TPU/GSPMD. The torchax lowering runs inside jax.shard_map over the
@@ -130,10 +131,18 @@ _CONCAT_2D_JAGGED_SCHEMA = "concat_2d_jagged(Tensor values_left, Tensor offsets_
 # concat_2d_jagged (registered via register_autograd), so no separate backward op.
 _SPLIT_2D_JAGGED_SCHEMA = "split_2d_jagged(Tensor values, Tensor offsets_left, Tensor offsets_right, SymInt seq_len_a, SymInt seq_len_b) -> (Tensor, Tensor)"
 
+# Schema for replace_last_n_jagged: the last len(right) rows of each left
+# sequence take the right rows (hammer's replace_last_n_with_jagged). The
+# backward is replace_last_n_jagged_backward.
+_REPLACE_LAST_N_JAGGED_SCHEMA = "replace_last_n_jagged(Tensor values_left, Tensor offsets_left, Tensor values_right, Tensor offsets_right) -> Tensor"
+_REPLACE_LAST_N_JAGGED_BACKWARD_SCHEMA = "replace_last_n_jagged_backward(Tensor grad, Tensor offsets_left, Tensor offsets_right, SymInt num_right) -> (Tensor, Tensor)"
+
 _LIB.define(_DENSE_TO_JAGGED_SCHEMA)
 _LIB.define(_JAGGED_TO_PADDED_DENSE_SCHEMA)
 _LIB.define(_CONCAT_2D_JAGGED_SCHEMA)
 _LIB.define(_SPLIT_2D_JAGGED_SCHEMA)
+_LIB.define(_REPLACE_LAST_N_JAGGED_SCHEMA)
+_LIB.define(_REPLACE_LAST_N_JAGGED_BACKWARD_SCHEMA)
 
 
 def _dense_to_jagged_cpu(
@@ -380,4 +389,119 @@ torch.library.register_autograd(
     "recir::split_2d_jagged",
     _split_2d_jagged_autograd_backward,
     setup_context=_split_2d_jagged_autograd_setup_context,
+)
+
+
+def _replace_zone(
+    offsets_left: torch.Tensor,
+    offsets_right: torch.Tensor,
+    total_len: int,
+    num_right: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Per left row: whether a right row replaces it, and which (num_right if none)."""
+    lengths_left = offsets_left[1:] - offsets_left[:-1]
+    lengths_right = offsets_right[1:] - offsets_right[:-1]
+    positions = torch.arange(total_len, device=offsets_left.device)
+    batch = torch.searchsorted(offsets_left[1:], positions, right=True)
+    # ``values_left`` may be padded past the last sequence, as recir's packed
+    # layout pads it; searchsorted puts those rows one batch past the end.
+    packed = positions < offsets_left[-1]
+    batch = batch.clamp(max=lengths_left.numel() - 1)
+    local = positions - offsets_left[batch]
+    threshold = lengths_left[batch] - lengths_right[batch]
+    right_index = (offsets_right[batch] + (local - threshold)).clamp(
+        min=0, max=num_right
+    )
+    return packed & (local >= threshold), right_index
+
+
+def _replace_last_n_jagged_cpu(
+    values_left: torch.Tensor,
+    offsets_left: torch.Tensor,
+    values_right: torch.Tensor,
+    offsets_right: torch.Tensor,
+) -> torch.Tensor:
+    """CPU fallback, the formulation of hammer's pytorch_replace_last_n_with_jagged."""
+    in_zone, right_index = _replace_zone(
+        offsets_left, offsets_right, values_left.shape[0], values_right.shape[0]
+    )
+    safe_right = torch.nn.functional.pad(values_right, (0, 0, 0, 1))
+    return torch.where(
+        in_zone.unsqueeze(-1), safe_right.index_select(0, right_index), values_left
+    )
+
+
+def _replace_last_n_jagged_backward_cpu(
+    grad: torch.Tensor,
+    offsets_left: torch.Tensor,
+    offsets_right: torch.Tensor,
+    num_right: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """The autograd of ``_replace_last_n_jagged_cpu``: where, then index_add."""
+    in_zone, right_index = _replace_zone(
+        offsets_left, offsets_right, grad.shape[0], num_right
+    )
+    zone = in_zone.unsqueeze(-1)
+    zeros = torch.zeros_like(grad)
+    grad_right = grad.new_zeros((num_right + 1, *grad.shape[1:])).index_add(
+        0, right_index, torch.where(zone, grad, zeros)
+    )
+    return torch.where(zone, zeros, grad), grad_right[:num_right]
+
+
+_LIB.impl(
+    "replace_last_n_jagged", _replace_last_n_jagged_cpu, "CompositeExplicitAutograd"
+)
+_LIB.impl(
+    "replace_last_n_jagged_backward",
+    _replace_last_n_jagged_backward_cpu,
+    "CompositeExplicitAutograd",
+)
+
+
+@torch.library.register_fake("recir::replace_last_n_jagged")
+def _replace_last_n_jagged_fake(
+    values_left: torch.Tensor,
+    offsets_left: torch.Tensor,
+    values_right: torch.Tensor,
+    offsets_right: torch.Tensor,
+) -> torch.Tensor:
+    return values_left.new_empty(values_left.shape)
+
+
+@torch.library.register_fake("recir::replace_last_n_jagged_backward")
+def _replace_last_n_jagged_backward_fake(
+    grad: torch.Tensor,
+    offsets_left: torch.Tensor,
+    offsets_right: torch.Tensor,
+    num_right: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return grad.new_empty(grad.shape), grad.new_empty((num_right, *grad.shape[1:]))
+
+
+def _replace_last_n_jagged_autograd_setup_context(
+    ctx: Any,
+    inputs: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+    output: torch.Tensor,
+) -> None:
+    _, offsets_left, values_right, offsets_right = inputs
+    ctx.save_for_backward(offsets_left, offsets_right)
+    ctx.num_right = values_right.shape[0]
+
+
+def _replace_last_n_jagged_autograd_backward(
+    ctx: Any,
+    grad_output: torch.Tensor,
+) -> tuple[torch.Tensor, None, torch.Tensor, None]:
+    offsets_left, offsets_right = ctx.saved_tensors
+    grad_left, grad_right = torch.ops.recir.replace_last_n_jagged_backward(
+        grad_output, offsets_left, offsets_right, ctx.num_right
+    )
+    return grad_left, None, grad_right, None
+
+
+torch.library.register_autograd(
+    "recir::replace_last_n_jagged",
+    _replace_last_n_jagged_autograd_backward,
+    setup_context=_replace_last_n_jagged_autograd_setup_context,
 )
