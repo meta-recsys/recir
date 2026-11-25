@@ -521,7 +521,7 @@ class SparseCoreRowwiseTables:
                 out_shardings=fmt,
             )(ev, jnp.asarray(phys, jnp.int32), jnp.asarray(values))
 
-    def _program(self, sizes: Dict[str, Tuple[int, int]]) -> Any:
+    def _program(self, sizes: Dict[str, Tuple[int, int]]) -> Any:  # noqa: C901
         """``sizes``: per feature, (positions, positions padded to JTE's per-device multiple)."""
         key = tuple(sorted(sizes.items()))
         if key in self._programs:
@@ -635,7 +635,8 @@ class SparseCoreRowwiseTables:
             rounding_key: Optional[jax.Array],
         ) -> Any:
             cap, dim = caps[stack], g.shape[1]
-            send = jnp.zeros((world * cap + 1, dim), jnp.float32).at[dest].add(g)[:-1]
+            send = jnp.zeros((world * cap + 1, dim), jnp.float32)
+            send = send.at[dest].add(g, indices_are_sorted=True)[:-1]
             recv = jax.lax.all_to_all(
                 send.astype(transfer).reshape(world, cap, dim), axis, 0, 0
             )
@@ -659,9 +660,31 @@ class SparseCoreRowwiseTables:
             if self._tables[sub.table].fp16
         }
 
+        def sort_local(
+            grads: Dict[str, jax.Array], dest: Dict[str, jax.Array]
+        ) -> Tuple[Dict[str, jax.Array], Dict[str, jax.Array]]:
+            """Each stack's position gradients and send-buffer slots, ordered by
+            slot. A sorted scatter-add takes half the time of an unsorted one, and
+            the stable sort keeps the order in which rows sharing a slot are summed."""
+            sorted_grads, sorted_dest = {}, {}
+            for stack in stacks:
+                g = jnp.concatenate(
+                    [
+                        jnp.pad(
+                            grads[f].astype(jnp.float32),
+                            ((0, sizes[f][1] - sizes[f][0]), (0, 0)),
+                        )
+                        for f in stack_features[stack]
+                    ]
+                )
+                order = jnp.argsort(dest[stack], stable=True).astype(jnp.int32)
+                sorted_grads[stack] = _take_rows(g, order)
+                sorted_dest[stack] = dest[stack][order]
+            return sorted_grads, sorted_dest
+
         def exchange_local(
-            grads: Dict[str, jax.Array],
-            dest: Dict[str, jax.Array],
+            sorted_grads: Dict[str, jax.Array],
+            sorted_dest: Dict[str, jax.Array],
             send_rows: Dict[str, jax.Array],
             lr: jax.Array,
             counter: jax.Array,
@@ -676,19 +699,10 @@ class SparseCoreRowwiseTables:
                     if stack in fp16_stacks
                     else None
                 )
-                g = self._grad_scale * jnp.concatenate(
-                    [
-                        jnp.pad(
-                            grads[f].astype(jnp.float32),
-                            ((0, sizes[f][1] - sizes[f][0]), (0, 0)),
-                        )
-                        for f in stack_features[stack]
-                    ]
-                )
                 w, m = exchange_update(
                     stack,
-                    g,
-                    dest[stack],
+                    self._grad_scale * sorted_grads[stack],
+                    sorted_dest[stack],
                     send_rows[stack],
                     lr,
                     ev_w[stack].table,
@@ -698,7 +712,17 @@ class SparseCoreRowwiseTables:
                 new_w[stack], new_m[stack] = ev_w[stack]._replace(table=w), m
             return new_w, new_m
 
-        bwd = jax.jit(
+        # Its own program, so that libtpu offloads the gather (see _take_rows).
+        sort = jax.jit(
+            jax.shard_map(
+                sort_local,
+                mesh=mesh,
+                in_specs=(batch, batch),
+                out_specs=batch,
+                check_vma=False,
+            )
+        )
+        exchange = jax.jit(
             jax.shard_map(
                 exchange_local,
                 mesh=mesh,
@@ -709,6 +733,12 @@ class SparseCoreRowwiseTables:
             donate_argnums=(5, 6),
             out_shardings=_keep_formats((self.ev_w, self.momentum)),
         )
+
+        def bwd(
+            grads: Dict[str, jax.Array], dest: Dict[str, jax.Array], *rest: Any
+        ) -> Any:
+            return exchange(*sort(grads, dest), *rest)
+
         self._programs[key] = (specs, fwd, bwd, (stack_features, caps, layout))
         return self._programs[key]
 
