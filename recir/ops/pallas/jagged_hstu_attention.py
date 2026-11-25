@@ -23,6 +23,7 @@ from __future__ import annotations
 import functools
 import itertools
 import math
+import os
 from collections.abc import Callable
 from typing import Any, cast
 
@@ -393,6 +394,7 @@ def _jagged_fwd_kernel(
     block_k: int,
     block_q: int,
     query_tiles_per_program: int,
+    tanh_silu: bool = False,
 ) -> None:
     sequence = pl.program_id(0)
     query_group = pl.program_id(1)
@@ -474,7 +476,11 @@ def _jagged_fwd_kernel(
                     dimension_numbers=(((2,), (2,)), ((0,), (0,))),
                     preferred_element_type=jnp.float32,
                 )
-                weights = jax.nn.silu(scores * alpha) * inv_n
+                if tanh_silu:
+                    h = scores * (0.5 * alpha)
+                    weights = h + h * jnp.tanh(h)
+                else:
+                    weights = jax.nn.silu(scores * alpha) * inv_n
                 if masked:
                     valid = _attention_mask(
                         query_start, block_q, key_positions, key_ids, max_id, length
@@ -542,7 +548,7 @@ def _jagged_fwd_kernel(
     query_positions = query_group_start + jnp.arange(query_group_rows, dtype=jnp.int32)
     output = jnp.where(
         query_positions[None, :, None] < length,
-        output_acc_ref[...],
+        output_acc_ref[...] * inv_n if tanh_silu else output_acc_ref[...],
         0,
     )
     out_tile_ref[...] = jnp.swapaxes(cast(Any, output).astype(out_tile_ref.dtype), 0, 1)
@@ -627,6 +633,7 @@ def _native_jagged_hstu_attention(
         block_k=block_k,
         block_q=block_q,
         query_tiles_per_program=query_tiles_per_program,
+        tanh_silu=_tanh_silu_enabled(),
     )
     output = pl.pallas_call(
         kernel,
@@ -723,6 +730,25 @@ def _silu_grad(x: jax.Array) -> jax.Array:
     return sigmoid * (1.0 + x * (1.0 - sigmoid))
 
 
+def _tanh_silu_enabled() -> bool:
+    """``RECIR_HSTU_TANH_SILU=1``: SiLU as ``h + h * tanh(h)`` with ``h = x / 2``.
+
+    The logistic in ``jax.nn.silu`` dominates the VPU-bound kernels; the tanh form
+    is one EUP op and two VPU ops, and the 1/n and alpha scales then move from
+    every score to the output tile. Rounding differs from the default path
+    (error against float64 is no larger), so it is opt-in.
+    """
+    value = os.environ.get("RECIR_HSTU_TANH_SILU", "0")
+    if value not in ("0", "1"):
+        raise ValueError(f"Invalid RECIR_HSTU_TANH_SILU: {value!r}")
+    return value == "1"
+
+
+def _tanh_silu_grad_x2(h: jax.Array, t: jax.Array) -> jax.Array:
+    """``2 * silu'(2h)`` given ``t = tanh(h)``."""
+    return 1.0 + t + h * (1.0 - t * t)
+
+
 def _keys_precede_queries(kv_start, block_k: int, query_start, max_id) -> Any:
     """Whether the whole key tile is history strictly before the query tile.
 
@@ -768,6 +794,7 @@ def _jagged_bwd_dq_kernel(
     block_k: int,
     block_q: int,
     query_tiles_per_program: int,
+    tanh_silu: bool = False,
 ) -> None:
     sequence = pl.program_id(0)
     query_group = pl.program_id(1)
@@ -776,6 +803,11 @@ def _jagged_bwd_dq_kernel(
     length = end - start
     num_targets = num_targets_ref[sequence]
     inv_n = attn_scale_ref[0]
+    # With tanh SiLU, K is scaled by alpha / 2 so scores are h = x / 2 directly,
+    # dO by inv_n / 2 to absorb silu' = (1 + t + h (1 - t^2)) / 2, and dQ doubled
+    # at the end; both halvings are exact.
+    k_scale = 0.5 * alpha if tanh_silu else alpha
+    do_scale = 0.5 * inv_n if tanh_silu else inv_n
 
     aligned_start, prefix, _ = _aligned_sequence_window(start, length)
     query_group_rows = block_q * query_tiles_per_program
@@ -821,7 +853,7 @@ def _jagged_bwd_dq_kernel(
         )
         do_t_ref[...] = (
             jnp.swapaxes(do_stage_ref[pl.ds(q_prefix, query_group_rows), :, :], 0, 1)
-            * inv_n
+            * do_scale
         ).astype(do_t_ref.dtype)
 
     # A negative count would put max_id past length, and the mask skip in
@@ -834,7 +866,7 @@ def _jagged_bwd_dq_kernel(
         key_positions = kv_start + jnp.arange(block_k, dtype=jnp.int32)
         key_ids = jnp.minimum(key_positions, max_id)
         k_tile = (
-            jnp.swapaxes(k_stage_ref[pl.ds(prefix, block_k), :, :], 0, 1) * alpha
+            jnp.swapaxes(k_stage_ref[pl.ds(prefix, block_k), :, :], 0, 1) * k_scale
         ).astype(k_stage_ref.dtype)
         v_tile = jnp.swapaxes(
             v_stage_ref[pl.ds(prefix, block_k), :, :],
@@ -869,7 +901,10 @@ def _jagged_bwd_dq_kernel(
                     dimension_numbers=(((2,), (2,)), ((0,), (0,))),
                     preferred_element_type=jnp.float32,
                 )
-                ds = dp * _silu_grad(scores)
+                if tanh_silu:
+                    ds = dp * _tanh_silu_grad_x2(scores, jnp.tanh(scores))
+                else:
+                    ds = dp * _silu_grad(scores)
                 if masked:
                     valid = _attention_mask(
                         query_start, block_q, key_positions, key_ids, max_id, length
@@ -936,7 +971,7 @@ def _jagged_bwd_dq_kernel(
     query_positions = query_group_start + jnp.arange(query_group_rows, dtype=jnp.int32)
     dq = jnp.where(
         query_positions[None, :, None] < length,
-        dq_acc_ref[...],
+        dq_acc_ref[...] * 2.0 if tanh_silu else dq_acc_ref[...],
         0,
     )
     dq_tile_ref[...] = jnp.swapaxes(cast(Any, dq).astype(dq_tile_ref.dtype), 0, 1)
@@ -997,6 +1032,7 @@ def _jagged_bwd_dkv_kernel(
     alpha: float,
     block_k: int,
     block_q: int,
+    tanh_silu: bool = False,
 ) -> None:
     sequence = pl.program_id(0)
     kv_block = pl.program_id(1)
@@ -1085,8 +1121,23 @@ def _jagged_bwd_dkv_kernel(
                 dimension_numbers=(((2,), (2,)), ((0,), (0,))),
                 preferred_element_type=jnp.float32,
             )
-            scaled_scores = scores * alpha
-            weights = jax.nn.silu(scaled_scores) * inv_n
+            if tanh_silu:
+                # Scales move to the output tiles: dV = inv_n * sum(w dO) and
+                # dK = alpha * inv_n / 2 * sum(ds q).
+                h = scores * (0.5 * alpha)
+                t = jnp.tanh(h)
+                weights = h + h * t
+
+                def _score_grad(dp: jax.Array) -> jax.Array:
+                    return dp * _tanh_silu_grad_x2(h, t)
+
+            else:
+                scaled_scores = scores * alpha
+                weights = jax.nn.silu(scaled_scores) * inv_n
+
+                def _score_grad(dp: jax.Array) -> jax.Array:
+                    return dp * _silu_grad(scaled_scores) * inv_n
+
             valid = (
                 _attention_mask(
                     query_start, block_q, key_positions, key_ids, max_id, length
@@ -1108,7 +1159,7 @@ def _jagged_bwd_dkv_kernel(
                 dimension_numbers=(((2,), (2,)), ((0,), (0,))),
                 preferred_element_type=jnp.float32,
             )
-            ds = dp * _silu_grad(scaled_scores) * inv_n
+            ds = _score_grad(dp)
             if valid is not None:
                 ds = jnp.where(valid[None, :, :], ds, 0)
             dk_update = jax.lax.dot(
@@ -1117,7 +1168,10 @@ def _jagged_bwd_dkv_kernel(
                 dimension_numbers=(((1,), (1,)), ((0,), (0,))),
                 preferred_element_type=jnp.float32,
             )
-            dk_acc_ref[...] = dk_acc_ref[...] + alpha * dk_update
+            if tanh_silu:
+                dk_acc_ref[...] = dk_acc_ref[...] + dk_update
+            else:
+                dk_acc_ref[...] = dk_acc_ref[...] + alpha * dk_update
             dv_acc_ref[...] = dv_acc_ref[...] + dv_update
 
         pl.when(interior)(functools.partial(_update, False))
@@ -1172,8 +1226,12 @@ def _jagged_bwd_dkv_kernel(
     )
 
     valid_key = key_positions[None, :, None] < length
-    dk = jnp.where(valid_key, dk_acc_ref[...], 0)
-    dv = jnp.where(valid_key, dv_acc_ref[...], 0)
+    if tanh_silu:
+        dk = jnp.where(valid_key, dk_acc_ref[...] * (0.5 * alpha * inv_n), 0)
+        dv = jnp.where(valid_key, dv_acc_ref[...] * inv_n, 0)
+    else:
+        dk = jnp.where(valid_key, dk_acc_ref[...], 0)
+        dv = jnp.where(valid_key, dv_acc_ref[...], 0)
     dk_tile_ref[...] = jnp.swapaxes(cast(Any, dk).astype(dk_tile_ref.dtype), 0, 1)
     dv_tile_ref[...] = jnp.swapaxes(cast(Any, dv).astype(dv_tile_ref.dtype), 0, 1)
 
@@ -1296,6 +1354,7 @@ def _native_jagged_hstu_attention_backward(
             block_k=block_k,
             block_q=block_q,
             query_tiles_per_program=query_tiles_per_program,
+            tanh_silu=_tanh_silu_enabled(),
         ),
         out_shape=jax.ShapeDtypeStruct((q.shape[0], num_heads, dqk), q.dtype),
         grid_spec=dq_grid_spec,
@@ -1338,6 +1397,7 @@ def _native_jagged_hstu_attention_backward(
             alpha=alpha,
             block_k=block_k,
             block_q=block_q,
+            tanh_silu=_tanh_silu_enabled(),
         ),
         out_shape=(
             jax.ShapeDtypeStruct((q.shape[0], num_heads, dqk), k.dtype),
