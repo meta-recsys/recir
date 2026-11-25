@@ -200,3 +200,68 @@ class HardwareRNGTests(unittest.TestCase):
         with patch.dict(os.environ, {"RECIR_DROPOUT_MASK_BITS": "16"}):
             expected = np.asarray(jax.jit(lambda: _bernoulli(key, 0.9, (8190, 5)))())
         np.testing.assert_array_equal(mask, expected.astype(mask.dtype))
+
+
+class HashDropoutTests(unittest.TestCase):
+    def _mask(self, shape, p=0.9, counter=500, site=2, **jit_kwargs):
+        with patch.dict(os.environ, {"RECIR_DROPOUT_PRNG_IMPL": "hash"}):
+            return np.asarray(
+                jax.jit(
+                    lambda: _jbernoulli_keyed(
+                        jnp.zeros(shape), p, jnp.uint32(counter), site, 0
+                    ),
+                    **jit_kwargs,
+                )()
+            )
+
+    def test_keeps_each_element_with_the_16_bit_probability(self) -> None:
+        mask = self._mask((8192, 32))
+        self.assertEqual(set(np.unique(mask)), {0.0, 1.0})
+        # 262144 draws: five standard deviations are 0.003.
+        self.assertLess(abs(float(mask.mean()) - round(0.9 * 65536) / 65536), 0.003)
+        # Rows and columns are not correlated.
+        self.assertLess(float(np.abs(mask.mean(axis=1) - 0.9).max()), 0.3)
+        self.assertLess(float(np.abs(mask.mean(axis=0) - 0.9).max()), 0.02)
+
+    def test_counter_and_site_give_independent_masks(self) -> None:
+        first = self._mask((8192, 32))
+        np.testing.assert_array_equal(first, self._mask((8192, 32)))
+        for other in (
+            self._mask((8192, 32), site=3),
+            self._mask((8192, 32), counter=501),
+        ):
+            # Two independent masks agree with probability 0.9^2 + 0.1^2.
+            self.assertLess(abs(float(np.mean(first == other)) - 0.82), 0.005)
+
+    def test_positions_within_one_mask_are_independent(self) -> None:
+        """A row is hashed once and the hash reused for every column, so two
+        elements of one mask could agree more often than chance. The marginal
+        rates above cannot see that -- a mask whose columns were all copies of
+        one draw would pass them. Comparing the mask with itself shifted along
+        each axis is what measures it.
+        """
+        p = 0.9
+        agree = p**2 + (1 - p) ** 2
+        mask = self._mask((8192, 32), p=p).astype(bool)
+        # ~2.6e5 pairs per comparison: five standard deviations are ~0.004.
+        for name, a, b in (
+            ("column+1", mask[:, :-1], mask[:, 1:]),
+            ("column+7", mask[:, :-7], mask[:, 7:]),
+            ("row+1", mask[:-1, :], mask[1:, :]),
+            ("row+256", mask[:-256, :], mask[256:, :]),
+            ("diagonal", mask[:-1, :-1], mask[1:, 1:]),
+        ):
+            with self.subTest(shift=name):
+                self.assertLess(abs(float(np.mean(a == b)) - agree), 0.005)
+
+    def test_mask_depends_only_on_position_not_on_the_mesh(self) -> None:
+        shape = (4 * 1024, 16)
+        mesh = Mesh(np.asarray(jax.devices())[:4], ("batch",))
+        sharding = NamedSharding(mesh, PartitionSpec("batch", None))
+        with gspmd_mesh_context(mesh, "batch", 4, False):
+            sharded = self._mask(shape, out_shardings=sharding)
+        np.testing.assert_array_equal(sharded, self._mask(shape))
+
+    def test_probability_edges(self) -> None:
+        np.testing.assert_array_equal(self._mask((32, 16), p=0.0), 0.0)
+        np.testing.assert_array_equal(self._mask((32, 16), p=1.0), 1.0)
