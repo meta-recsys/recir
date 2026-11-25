@@ -23,6 +23,7 @@ from recir.embedding.sparsecore_rowwise import (
     _split_table,
     _SUB_TABLE_MAX_ROWS,
     _SubTable,
+    _unique_inverse,
     SparseCoreRowwiseTables,
     SparseCoreTable,
 )
@@ -66,6 +67,26 @@ class DeviceInputsTest(unittest.TestCase):
             )
             self.assertLessEqual(per_sc.max() - per_sc.min(), 1)
             self.assertEqual(np.unique(ids[d]).size, per_sc.sum())
+
+
+class UniqueInverseTest(unittest.TestCase):
+    def test_matches_np_unique(self) -> None:
+        rng = np.random.default_rng(0)
+        cases = [
+            rng.integers(0, 3_000_000_000, size=5000),
+            rng.integers(0, 50, size=5000).astype(np.int32),
+            np.array([7], np.int64),
+            np.zeros(0, np.int64),
+            # Outside what the packed sort handles: falls back to np.unique.
+            np.array([-3, 5, -3]),
+            np.array([2**62, 1, 2**62]),
+        ]
+        for values in cases:
+            want_values, want_inverse = np.unique(values, return_inverse=True)
+            got_values, got_inverse = _unique_inverse(values)
+            self.assertEqual(got_values.dtype, want_values.dtype)
+            self.assertTrue(np.array_equal(got_values, want_values))
+            self.assertTrue(np.array_equal(got_inverse, want_inverse.reshape(-1)))
 
 
 class ExchangeLayoutTest(unittest.TestCase):
