@@ -407,11 +407,14 @@ def _native_qkv_inputs(
     return scalar_args, hbm_args
 
 
-def _jagged_fwd_kernel(
+def _jagged_fwd_kernel(  # noqa: C901
     seq_offsets_ref,
     aligned_offsets_ref,
     num_targets_ref,
     attn_scale_ref,
+    group_sequence_ref,
+    group_index_ref,
+    num_groups_ref,
     q_hbm_ref,
     k_hbm_ref,
     v_hbm_ref,
@@ -426,31 +429,68 @@ def _jagged_fwd_kernel(
     num_heads: int,
     tanh_silu: bool = False,
 ) -> None:
-    """Program (sequence, query group) of the forward for sequences longer than a
-    block, on 2-D ``[rows, heads * dim]`` arrays like the single-block kernel.
+    """The forward for sequences longer than a block, on 2-D ``[rows, heads *
+    dim]`` arrays like the single-block kernel.
 
-    Rows are stage rows (see ``_single_block_stage``): the group holds query rows
-    [group_first, group_first + group_rows) of the sequence's stage and sees the
-    key blocks [b * block_k, (b + 1) * block_k) up to them. The output is written
-    as in ``_single_block_pipeline``, handing the row group a sequence ends in to
-    the next sequence; the grid runs in order, so the next sequence's first
-    group comes later.
+    The query groups that hold rows of their sequence are one pipeline, in
+    order: while one group computes, the next one's queries are staged and the
+    previous one's output is written. ``group_sequence_ref[i]`` and
+    ``group_index_ref[i]`` name the i-th group. Rows are stage rows (see
+    ``_single_block_stage``): group ``g`` holds query rows ``[g * group_rows, (g
+    + 1) * group_rows)`` of its sequence's stage and sees the key blocks
+    ``[b * block_k, (b + 1) * block_k)`` up to them. The output is written as in
+    ``_single_block_pipeline``, handing the row group a sequence ends in to the
+    next sequence.
     """
-    sequence = pl.program_id(0)
-    query_group = pl.program_id(1)
     num_sequences = seq_offsets_ref.shape[0] - 1
-    stage_start, length, prefix = _single_block_stage(seq_offsets_ref, sequence)
-    end = prefix + length
-    first_target = end - num_targets_ref[sequence]
     inv_n = attn_scale_ref[0]
     rows = _tile_rows(q_hbm_ref.shape[0])
     group_rows = block_q * query_tiles_per_program
-    group_first = query_group * group_rows
     dim = out_hbm_ref.shape[1] // num_heads
 
-    q_start = stage_start + group_first
+    def _group(index):
+        """(sequence, query group, stage start, length, prefix, the group's
+        first stage row) of the pipeline's ``index``-th group."""
+        sequence = group_sequence_ref[index]
+        query_group = group_index_ref[index]
+        stage_start, length, prefix = _single_block_stage(seq_offsets_ref, sequence)
+        return (
+            sequence,
+            query_group,
+            stage_start,
+            length,
+            prefix,
+            query_group * group_rows,
+        )
 
-    def _query_group(q_stage_ref) -> None:
+    def _last(sequence):
+        return seq_offsets_ref[sequence + 1] == seq_offsets_ref[num_sequences]
+
+    def _q_window(index):
+        _, _, stage_start, _, _, group_first = _group(index)
+        q_start = stage_start + group_first
+        return pl.ds(q_start, jnp.minimum(group_rows, rows - q_start)), 0
+
+    def _out_window(index):
+        sequence, _, stage_start, length, prefix, group_first = _group(index)
+        local_end = prefix + length - group_first
+        out_rows = jnp.where(
+            local_end <= group_rows,
+            jnp.where(
+                _last(sequence),
+                local_end + (-local_end) % _ALIGNMENT_ROWS,
+                local_end - local_end % _ALIGNMENT_ROWS,
+            ),
+            group_rows,
+        )
+        return pl.ds(stage_start + group_first, out_rows), 0
+
+    def _query_group(q_stage_ref, out_ref) -> None:
+        sequence, query_group, stage_start, length, prefix, group_first = _group(
+            pl.program_id(0)
+        )
+        end = prefix + length
+        first_target = end - num_targets_ref[sequence]
         output_acc_ref[...] = jnp.zeros_like(output_acc_ref)
 
         def _accumulate(k_stage_ref, v_stage_ref) -> None:
@@ -562,74 +602,68 @@ def _jagged_fwd_kernel(
             dimension_semantics=(pltpu.ARBITRARY,),
         )(k_hbm_ref, v_hbm_ref)
 
+        for head in range(num_heads):
+            output = output_acc_ref[head]
+            if tanh_silu:
+                output = output * inv_n
+            out_ref[:group_rows, head * dim : (head + 1) * dim] = output.astype(
+                out_ref.dtype
+            )
         local_end = end - group_first
-        ends = local_end <= group_rows
-        last = seq_offsets_ref[sequence + 1] == seq_offsets_ref[num_sequences]
+        _carry_row_groups(
+            out_ref,
+            out_carry_ref,
+            prefix,
+            local_end,
+            starts=query_group == 0,
+            ends=local_end <= group_rows,
+            last=_last(sequence),
+        )
 
-        def _emit_output(out_ref) -> None:
-            for head in range(num_heads):
-                output = output_acc_ref[head]
-                if tanh_silu:
-                    output = output * inv_n
-                out_ref[:group_rows, head * dim : (head + 1) * dim] = output.astype(
-                    out_ref.dtype
-                )
-            _carry_row_groups(
-                out_ref,
-                out_carry_ref,
-                prefix,
-                local_end,
-                starts=query_group == 0,
-                ends=ends,
-                last=last,
-            )
-
-        def _out_window(_):
-            out_rows = jnp.where(
-                ends,
-                jnp.where(
-                    last,
-                    local_end + (-local_end) % _ALIGNMENT_ROWS,
-                    local_end - local_end % _ALIGNMENT_ROWS,
-                ),
-                group_rows,
-            )
-            return pl.ds(q_start, out_rows), 0
-
+    pltpu.emit_pipeline(
+        _query_group,
+        grid=(num_groups_ref[0],),
+        in_specs=(
+            pl.BlockSpec(
+                (pl.BoundedSlice(group_rows), q_hbm_ref.shape[1]),
+                _q_window,
+                memory_space=pltpu.VMEM,
+            ),
+        ),
         # The group after the tile: a sequence ending at the tile's end carries
         # it, and the last sequence can write it.
-        pltpu.emit_pipeline(
-            _emit_output,
-            grid=(1,),
-            out_specs=(
-                pl.BlockSpec(
-                    (
-                        pl.BoundedSlice(group_rows + _ALIGNMENT_ROWS),
-                        out_hbm_ref.shape[1],
-                    ),
-                    _out_window,
-                    memory_space=pltpu.VMEM,
-                ),
+        out_specs=(
+            pl.BlockSpec(
+                (pl.BoundedSlice(group_rows + _ALIGNMENT_ROWS), out_hbm_ref.shape[1]),
+                _out_window,
+                memory_space=pltpu.VMEM,
             ),
-        )(out_hbm_ref)
+        ),
+    )(q_hbm_ref, out_hbm_ref)
 
-    def _q_window(_):
-        return pl.ds(q_start, jnp.minimum(group_rows, rows - q_start)), 0
 
-    # A program past the end of its sequence has nothing to compute or write.
-    @pl.when((length > 0) & (group_first < end))
-    def _stage_queries() -> None:
-        pltpu.emit_pipeline(
-            _query_group,
-            grid=(1,),
-            in_specs=(
-                pl.BlockSpec(
-                    (pl.BoundedSlice(group_rows), q_hbm_ref.shape[1]),
-                    _q_window,
-                    memory_space=pltpu.VMEM,
-                ),
-            ),
-        )(q_hbm_ref)
+def _sequence_blocks(
+    seq_offsets: jax.Array, block_rows: int, max_blocks: int
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """(sequence, block) of each ``block_rows``-row block that holds rows of its
+    sequence, in order, padded to ``max_blocks``, and their count. A sequence's
+    rows are its stage rows, which start at the 8-aligned row at or before it."""
+    num_sequences = seq_offsets.shape[0] - 1
+    lengths = seq_offsets[1:] - seq_offsets[:-1]
+    ends = seq_offsets[:-1] % _ALIGNMENT_ROWS + lengths
+    blocks = jnp.where(lengths > 0, (ends + block_rows - 1) // block_rows, 0)
+    block_sequence = jnp.repeat(
+        jnp.arange(num_sequences, dtype=jnp.int32),
+        blocks,
+        total_repeat_length=max_blocks,
+    )
+    first_block = jnp.cumsum(blocks) - blocks
+    block_index = jnp.arange(max_blocks, dtype=jnp.int32) - first_block[block_sequence]
+    return (
+        block_sequence,
+        block_index.astype(jnp.int32),
+        jnp.sum(blocks).astype(jnp.int32).reshape(1),
+    )
 
 
 def _native_jagged_hstu_attention(
@@ -690,6 +724,11 @@ def _native_jagged_hstu_attention(
             name="pallas_jagged_hstu_attention_fwd_single_block",
         )(*scalar_args, *hbm_args)
     else:
+        groups = _sequence_blocks(
+            scalar_args[0],
+            query_group_rows,
+            num_sequences * pl.cdiv(seq_rows, query_group_rows),
+        )
         output = pl.pallas_call(
             functools.partial(
                 _jagged_fwd_kernel,
@@ -702,21 +741,17 @@ def _native_jagged_hstu_attention(
             ),
             out_shape=out_shape,
             grid_spec=pltpu.PrefetchScalarGridSpec(
-                num_scalar_prefetch=4,
+                num_scalar_prefetch=7,
                 in_specs=[pl.BlockSpec(memory_space=pltpu.HBM)] * 3,
                 out_specs=pl.BlockSpec(memory_space=pltpu.HBM),
-                grid=(num_sequences, pl.cdiv(seq_rows, query_group_rows)),
+                grid=(1,),
                 scratch_shapes=(
                     pltpu.VMEM((num_heads, query_group_rows, dv), jnp.float32),
                     pltpu.VMEM((_ALIGNMENT_ROWS, num_heads * dv), q.dtype),
                 ),
             ),
-            # Sequences hand their last row group to the next one.
-            compiler_params=pltpu.CompilerParams(
-                dimension_semantics=("arbitrary", "arbitrary")
-            ),
             name="pallas_jagged_hstu_attention_fwd_pipelined",
-        )(*scalar_args, *hbm_args)
+        )(*scalar_args, *groups, *hbm_args)
     output = _zero_unvisited_tail(output, seq_offsets)
     return output[: q.shape[0]].reshape(q.shape[0], num_heads, dv)
 
@@ -1402,6 +1437,9 @@ def _jagged_bwd_fused_kernel(  # noqa: C901
     aligned_offsets_ref,
     num_targets_ref,
     attn_scale_ref,
+    block_sequence_ref,
+    block_index_ref,
+    num_blocks_ref,
     q_hbm_ref,
     k_hbm_ref,
     v_hbm_ref,
@@ -1422,30 +1460,35 @@ def _jagged_bwd_fused_kernel(  # noqa: C901
     num_heads: int,
     tanh_silu: bool = False,
 ) -> None:
-    """Program (sequence, key block) of the backward for sequences longer than a
-    block, on 2-D ``[rows, heads * dim]`` arrays in stage rows like
-    ``_jagged_fwd_kernel``.
+    """The backward for sequences longer than a block, on 2-D ``[rows, heads *
+    dim]`` arrays in stage rows like ``_jagged_fwd_kernel``.
 
-    It computes dK and dV of key rows [key_first, key_first + block_k) of the
-    sequence's stage against the query blocks that see them, and sums each
-    query's dQ over the sequence's key blocks in ``dq_acc_ref``; the sequence's
-    last program writes dQ. Each output hands its partial row groups on like the
-    forward's.
+    The key blocks that hold rows of their sequence are one pipeline, in order:
+    while one block computes, the next one's keys and values are staged and the
+    previous one's dK and dV are written. ``block_sequence_ref[i]`` and
+    ``block_index_ref[i]`` name the i-th block. A block computes dK and dV of
+    key rows [key_first, key_first + block_k) of its sequence's stage against
+    the query blocks that see them, and sums each query's dQ over the
+    sequence's key blocks in ``dq_acc_ref``; the sequence's last block writes
+    dQ. Each output hands its partial row groups on like the forward's.
     """
-    sequence = pl.program_id(0)
-    kv_block = pl.program_id(1)
     num_sequences = seq_offsets_ref.shape[0] - 1
-    stage_start, length, prefix = _single_block_stage(seq_offsets_ref, sequence)
-    end = prefix + length
-    first_target = end - num_targets_ref[sequence]
     inv_n = attn_scale_ref[0]
     rows = _tile_rows(q_hbm_ref.shape[0])
-    key_first = kv_block * block_k
-    kv_start = stage_start + key_first
     dim = dq_hbm_ref.shape[1] // num_heads
-    last = seq_offsets_ref[sequence + 1] == seq_offsets_ref[num_sequences]
 
-    def _out_rows(local_end, block: int):
+    def _block(index):
+        """(sequence, key block, stage start, length, prefix, the block's first
+        stage row) of the pipeline's ``index``-th block."""
+        sequence = block_sequence_ref[index]
+        kv_block = block_index_ref[index]
+        stage_start, length, prefix = _single_block_stage(seq_offsets_ref, sequence)
+        return sequence, kv_block, stage_start, length, prefix, kv_block * block_k
+
+    def _last(sequence):
+        return seq_offsets_ref[sequence + 1] == seq_offsets_ref[num_sequences]
+
+    def _out_rows(local_end, block: int, last):
         """Rows a block's output window writes, ``local_end`` being the
         sequence's end in the block's rows."""
         return jnp.where(
@@ -1458,7 +1501,28 @@ def _jagged_bwd_fused_kernel(  # noqa: C901
             block,
         )
 
-    def _key_block(k_stage_ref, v_stage_ref) -> None:
+    def _kv_window(index):
+        _, _, stage_start, _, _, key_first = _block(index)
+        kv_start = stage_start + key_first
+        return pl.ds(kv_start, jnp.minimum(block_k, rows - kv_start)), 0
+
+    def _dkv_window(index):
+        sequence, _, stage_start, length, prefix, key_first = _block(index)
+        local_end = prefix + length - key_first
+        return (
+            pl.ds(
+                stage_start + key_first, _out_rows(local_end, block_k, _last(sequence))
+            ),
+            0,
+        )
+
+    def _key_block(k_stage_ref, v_stage_ref, dk_ref, dv_ref) -> None:
+        sequence, kv_block, stage_start, length, prefix, key_first = _block(
+            pl.program_id(0)
+        )
+        end = prefix + length
+        first_target = end - num_targets_ref[sequence]
+        last = _last(sequence)
         dk_acc_ref[...] = jnp.zeros_like(dk_acc_ref)
         dv_acc_ref[...] = jnp.zeros_like(dv_acc_ref)
 
@@ -1594,97 +1658,89 @@ def _jagged_bwd_fused_kernel(  # noqa: C901
             dk = dk_acc_ref[...]
             dv = dv_acc_ref[...]
         local_end = end - key_first
+        for out_ref, grad, carry_ref in (
+            (dk_ref, dk, dk_carry_ref),
+            (dv_ref, dv, dv_carry_ref),
+        ):
+            for head in range(num_heads):
+                out_ref[:block_k, head * dim : (head + 1) * dim] = cast(
+                    Any, grad[head]
+                ).astype(out_ref.dtype)
+            _carry_row_groups(
+                out_ref,
+                carry_ref,
+                prefix,
+                local_end,
+                starts=kv_block == 0,
+                ends=local_end <= block_k,
+                last=last,
+            )
 
-        def _emit_dkv(dk_ref, dv_ref) -> None:
-            for out_ref, grad, carry_ref in (
-                (dk_ref, dk, dk_carry_ref),
-                (dv_ref, dv, dv_carry_ref),
-            ):
-                for head in range(num_heads):
-                    out_ref[:block_k, head * dim : (head + 1) * dim] = cast(
-                        Any, grad[head]
-                    ).astype(out_ref.dtype)
-                _carry_row_groups(
-                    out_ref,
-                    carry_ref,
-                    prefix,
-                    local_end,
-                    starts=kv_block == 0,
-                    ends=local_end <= block_k,
-                    last=last,
-                )
+        dq_scale = 0.5 * alpha * inv_n if tanh_silu else 1.0
 
-        pltpu.emit_pipeline(
-            _emit_dkv,
-            grid=(1,),
-            out_specs=tuple(
-                pl.BlockSpec(
-                    (pl.BoundedSlice(block_k + _ALIGNMENT_ROWS), ref.shape[1]),
-                    lambda _: (pl.ds(kv_start, _out_rows(local_end, block_k)), 0),
-                    memory_space=pltpu.VMEM,
-                )
-                for ref in (dk_hbm_ref, dv_hbm_ref)
-            ),
-        )(dk_hbm_ref, dv_hbm_ref)
+        def _emit_dq(dq_ref) -> None:
+            query_block = pl.program_id(0)
+            query_rows = pl.ds(pl.multiple_of(query_block * block_q, block_q), block_q)
+            for head in range(num_heads):
+                dq_ref[:block_q, head * dim : (head + 1) * dim] = cast(
+                    Any, dq_acc_ref[head, query_rows, :] * dq_scale
+                ).astype(dq_ref.dtype)
+            dq_end = end - query_block * block_q
+            _carry_row_groups(
+                dq_ref,
+                dq_carry_ref,
+                prefix,
+                dq_end,
+                starts=query_block == 0,
+                ends=dq_end <= block_q,
+                last=last,
+            )
 
-    def _kv_window(_):
-        return pl.ds(kv_start, jnp.minimum(block_k, rows - kv_start)), 0
+        def _dq_window(query_block):
+            query_start = pl.multiple_of(
+                stage_start + query_block * block_q, _ALIGNMENT_ROWS
+            )
+            dq_end = end - query_block * block_q
+            return pl.ds(query_start, _out_rows(dq_end, block_q, last)), 0
 
-    # A key block past the end of its sequence has nothing to compute or write.
-    @pl.when((length > 0) & (key_first < end))
-    def _stage_keys() -> None:
-        pltpu.emit_pipeline(
-            _key_block,
-            grid=(1,),
-            in_specs=tuple(
-                pl.BlockSpec(
-                    (pl.BoundedSlice(block_k), ref.shape[1]),
-                    _kv_window,
-                    memory_space=pltpu.VMEM,
-                )
-                for ref in (k_hbm_ref, v_hbm_ref)
-            ),
-        )(k_hbm_ref, v_hbm_ref)
-
-    dq_scale = 0.5 * alpha * inv_n if tanh_silu else 1.0
-
-    def _emit_dq(dq_ref) -> None:
-        query_block = pl.program_id(0)
-        query_rows = pl.ds(pl.multiple_of(query_block * block_q, block_q), block_q)
-        for head in range(num_heads):
-            dq_ref[:block_q, head * dim : (head + 1) * dim] = cast(
-                Any, dq_acc_ref[head, query_rows, :] * dq_scale
-            ).astype(dq_ref.dtype)
-        local_end = end - query_block * block_q
-        _carry_row_groups(
-            dq_ref,
-            dq_carry_ref,
-            prefix,
-            local_end,
-            starts=query_block == 0,
-            ends=local_end <= block_q,
-            last=last,
-        )
-
-    def _dq_window(query_block):
-        query_start = pl.multiple_of(
-            stage_start + query_block * block_q, _ALIGNMENT_ROWS
-        )
-        return pl.ds(query_start, _out_rows(end - query_block * block_q, block_q)), 0
-
-    @pl.when((length > 0) & (kv_block == pl.num_programs(1) - 1))
-    def _write_dq() -> None:
-        pltpu.emit_pipeline(
-            _emit_dq,
-            grid=(_cdiv(end, block_q),),
-            out_specs=(
-                pl.BlockSpec(
-                    (pl.BoundedSlice(block_q + _ALIGNMENT_ROWS), dq_hbm_ref.shape[1]),
-                    _dq_window,
-                    memory_space=pltpu.VMEM,
+        # The sequence's last key block writes its dQ.
+        @pl.when(local_end <= block_k)
+        def _write_dq() -> None:
+            pltpu.emit_pipeline(
+                _emit_dq,
+                grid=(_cdiv(end, block_q),),
+                out_specs=(
+                    pl.BlockSpec(
+                        (
+                            pl.BoundedSlice(block_q + _ALIGNMENT_ROWS),
+                            dq_hbm_ref.shape[1],
+                        ),
+                        _dq_window,
+                        memory_space=pltpu.VMEM,
+                    ),
                 ),
-            ),
-        )(dq_hbm_ref)
+            )(dq_hbm_ref)
+
+    pltpu.emit_pipeline(
+        _key_block,
+        grid=(num_blocks_ref[0],),
+        in_specs=tuple(
+            pl.BlockSpec(
+                (pl.BoundedSlice(block_k), ref.shape[1]),
+                _kv_window,
+                memory_space=pltpu.VMEM,
+            )
+            for ref in (k_hbm_ref, v_hbm_ref)
+        ),
+        out_specs=tuple(
+            pl.BlockSpec(
+                (pl.BoundedSlice(block_k + _ALIGNMENT_ROWS), ref.shape[1]),
+                _dkv_window,
+                memory_space=pltpu.VMEM,
+            )
+            for ref in (dk_hbm_ref, dv_hbm_ref)
+        ),
+    )(k_hbm_ref, v_hbm_ref, dk_hbm_ref, dv_hbm_ref)
 
 
 def _single_block_pipeline(
@@ -2152,9 +2208,8 @@ def _native_jagged_hstu_attention_backward(
                 num_heads=num_heads,
                 tanh_silu=_tanh_silu_enabled(),
             )
-            grid = (1,)
+            blocks = ()
             scratch = (*carries, *dkv_acc)
-            dimension_semantics = ("arbitrary",)
         else:
             seq_rows = _single_block_seq_rows(max_seq_len)
             kernel = functools.partial(
@@ -2165,21 +2220,14 @@ def _native_jagged_hstu_attention_backward(
                 num_heads=num_heads,
                 tanh_silu=_tanh_silu_enabled(),
             )
-            grid = (num_sequences, pl.cdiv(seq_rows, block_k))
+            blocks = _sequence_blocks(
+                scalar_args[0], block_k, num_sequences * pl.cdiv(seq_rows, block_k)
+            )
             # The sequence's dQ accumulator comes on top of the dK/dV tiles.
             dq_acc = pltpu.VMEM(
                 (num_heads, pl.cdiv(seq_rows, block_q) * block_q, dqk), jnp.float32
             )
             scratch = (*dkv_acc, dq_acc, *carries)
-            # Sequences hand their last row groups to the next one.
-            dimension_semantics = ("arbitrary", "arbitrary")
-        # `_carry_row_groups` passes a sequence's partial row groups to the
-        # next grid step through `carries`. Megacore splits a "parallel" axis
-        # across cores, which would read a carry the other core wrote.
-        assert all(s == "arbitrary" for s in dimension_semantics), (
-            "the fused backward carries row groups between grid steps, so its "
-            f"grid has to stay sequential, not {dimension_semantics}"
-        )
         dk, dv, dq = pl.pallas_call(
             kernel,
             out_shape=(
@@ -2188,18 +2236,17 @@ def _native_jagged_hstu_attention_backward(
                 jax.ShapeDtypeStruct((rows, num_heads * dqk), q.dtype),
             ),
             grid_spec=pltpu.PrefetchScalarGridSpec(
-                num_scalar_prefetch=4,
+                num_scalar_prefetch=4 + len(blocks),
                 in_specs=[pl.BlockSpec(memory_space=pltpu.HBM)] * 4,
                 out_specs=[pl.BlockSpec(memory_space=pltpu.HBM)] * 3,
-                grid=grid,
+                grid=(1,),
                 scratch_shapes=scratch,
             ),
             compiler_params=pltpu.CompilerParams(
-                dimension_semantics=dimension_semantics,
                 vmem_limit_bytes=_FUSED_BACKWARD_VMEM_LIMIT,
             ),
             name="pallas_jagged_hstu_attention_bwd_fused",
-        )(*scalar_args, *backward_hbm_args)
+        )(*scalar_args, *blocks, *backward_hbm_args)
         dq, dk, dv = (
             _zero_unvisited_tail(grad, seq_offsets)[: q.shape[0]].reshape(
                 q.shape[0], num_heads, -1
