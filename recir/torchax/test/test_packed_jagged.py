@@ -20,9 +20,18 @@ from recir.ops.packed_jagged_ops import (
     jagged_dense_bmm_add,
     jagged_dense_broadcast_add,
 )
+from recir.torchax.ops.jagged_dma_ops import (
+    concat_jagged_dma,
+    concat_jagged_tiled_dma,
+    split_jagged_dma,
+    split_jagged_tiled_dma,
+)
 from recir.torchax.ops.jagged_ops import (
+    _jax_concat_2d_jagged,
+    _jax_concat_2d_jagged_gather,
     _jax_dense_to_jagged_gather_impl,
     _jax_dense_to_jagged_scatter_impl,
+    _jax_split_2d_jagged_gather,
 )
 from recir.torchax.ops.packed_jagged_ops import (
     _local_supervision_gather,
@@ -61,8 +70,47 @@ def _reference(
     return out.to(x.dtype)
 
 
+def _concat_linear_loss(
+    left: jax.Array,
+    right: jax.Array,
+    offsets_left: jax.Array,
+    offsets_right: jax.Array,
+    cotangent: jax.Array,
+) -> jax.Array:
+    return jnp.sum(
+        _jax_concat_2d_jagged_gather(
+            left, offsets_left, right, offsets_right, cotangent.shape[0]
+        )
+        * cotangent
+    )
 
 
+def _segment_values(
+    dtype: Any, width: int, total_left: int, total_right: int
+) -> tuple[jax.Array, jax.Array]:
+    left = (
+        jnp.arange((total_left + 7) * width, dtype=jnp.int32)
+        .reshape(total_left + 7, width)
+        .astype(dtype)
+    )
+    right = (
+        -jnp.arange((total_right + 9) * width, dtype=jnp.int32)
+        .reshape(total_right + 9, width)
+        .astype(dtype)
+    )
+    if dtype == jnp.int64:
+        left = left * (1 << 40) - 11
+        right = right * (1 << 40) + 7
+    else:
+        left = left.at[0, 0].set(-0.0).at[-1, 0].set(jnp.nan)
+        if total_left > 8:
+            left = left.at[8, 0].set(jnp.nan)
+        if dtype == jnp.bfloat16 and total_left > 8:
+            bits = jax.lax.bitcast_convert_type(left, jnp.uint16)
+            left = jax.lax.bitcast_convert_type(
+                bits.at[8, 0].set(jnp.uint16(0x7FC1)), jnp.bfloat16
+            )
+    return left, right
 
 
 
@@ -72,9 +120,172 @@ class PackedJaggedTest(unittest.TestCase):
 
 
 
+    def test_segment_dma_mixed_dtype_fallback(self) -> None:
+        offsets = jnp.asarray([0, 1, 3], jnp.int32)
+        left = jnp.asarray([[1.0], [2.0], [3.0]], jnp.bfloat16)
+        right = jnp.asarray([[0.001], [0.003], [0.005]], jnp.float32)
+        reference = _jax_concat_2d_jagged_gather(left, offsets, right, offsets, 6)
+        with patch.dict(
+            "os.environ", {"RECIR_JAGGED_CONCAT_SPLIT_IMPL": "segment_dma"}
+        ):
+            actual = jax.jit(_jax_concat_2d_jagged, static_argnums=(4,))(
+                left, offsets, right, offsets, 6
+            )
+        self.assertEqual(actual.dtype, reference.dtype)
+        np.testing.assert_array_equal(np.asarray(actual), np.asarray(reference))
 
+    def test_segment_dma_bits_and_adjoint(self) -> None:
+        self._check_segment_dma_bits_and_adjoint(concat_jagged_dma, split_jagged_dma)
 
+    def test_output_tile_dma_bits_and_adjoint(self) -> None:
+        self._check_segment_dma_bits_and_adjoint(
+            concat_jagged_tiled_dma, split_jagged_tiled_dma, True
+        )
 
+    def _check_segment_dma_bits_and_adjoint(
+        self,
+        concat: Callable[..., Any],
+        split: Callable[..., tuple[Any, Any]],
+        multitile: bool = False,
+    ) -> None:
+        jax.config.update("jax_enable_x64", True)
+        cases = [
+            ([0, 1, 7, 129, 0], [0, 7, 0, 3, 0]),
+            ([7, 7, 7], [1, 3, 7]),
+            ([0, 0], [0, 0]),
+        ]
+        if multitile:
+            cases += [
+                ([0, 1, 511, 0, 513, 3554, 0], [128, 0, 7, 1, 129, 20, 0]),
+                ([1, 0, 513, 128, 0, 1025], [7, 1, 0, 129, 512, 0]),
+            ]
+        for dtype, width in ((jnp.float32, 128), (jnp.bfloat16, 224), (jnp.int64, 1)):
+            for lengths_left, lengths_right in cases:
+                offsets_left = jnp.asarray(
+                    np.concatenate(([0], np.cumsum(lengths_left))), jnp.int32
+                )
+                offsets_right = jnp.asarray(
+                    np.concatenate(([0], np.cumsum(lengths_right))), jnp.int32
+                )
+                total_left = sum(lengths_left)
+                total_right = sum(lengths_right)
+                left, right = _segment_values(dtype, width, total_left, total_right)
+                for capacity in (
+                    0,
+                    max(0, total_left + total_right - 1),
+                    total_left + total_right + 5,
+                ):
+                    reference = _jax_concat_2d_jagged_gather(
+                        left, offsets_left, right, offsets_right, capacity
+                    )
+                    expected = np.zeros((capacity, width), dtype=np.asarray(left).dtype)
+                    for group, (length_left, length_right) in enumerate(
+                        zip(lengths_left, lengths_right)
+                    ):
+                        destination = int(offsets_left[group] + offsets_right[group])
+                        for source, start, length in (
+                            (left, int(offsets_left[group]), length_left),
+                            (right, int(offsets_right[group]), length_right),
+                        ):
+                            copied = max(0, min(length, capacity - destination))
+                            expected[destination : destination + copied] = np.asarray(
+                                source
+                            )[start : start + copied]
+                            destination += length
+                    np.testing.assert_array_equal(
+                        np.asarray(
+                            reference,
+                            dtype=np.int64 if dtype == jnp.int64 else np.float32,
+                        ),
+                        np.asarray(
+                            expected,
+                            dtype=np.int64 if dtype == jnp.int64 else np.float32,
+                        ),
+                    )
+                    actual = concat(
+                        left, offsets_left, right, offsets_right, capacity, True
+                    )
+                    np.testing.assert_array_equal(
+                        np.asarray(actual).view(np.uint8),
+                        np.asarray(expected).view(np.uint8),
+                    )
+                values = concat(
+                    left,
+                    offsets_left,
+                    right,
+                    offsets_right,
+                    total_left + total_right + 5,
+                    True,
+                )
+                expected_pair = _jax_split_2d_jagged_gather(
+                    values,
+                    offsets_left,
+                    offsets_right,
+                    left.shape[0],
+                    right.shape[0],
+                )
+                actual_pair = split(
+                    values,
+                    offsets_left,
+                    offsets_right,
+                    left.shape[0],
+                    right.shape[0],
+                    True,
+                )
+                host_values = np.asarray(values)
+                host_type = np.int64 if dtype == jnp.int64 else np.float32
+                raw_expected_pair = (
+                    np.zeros(left.shape, host_values.dtype),
+                    np.zeros(right.shape, host_values.dtype),
+                )
+                for group, (length_left, length_right) in enumerate(
+                    zip(lengths_left, lengths_right)
+                ):
+                    source_start = int(offsets_left[group] + offsets_right[group])
+                    left_start = int(offsets_left[group])
+                    right_start = int(offsets_right[group])
+                    raw_expected_pair[0][left_start : left_start + length_left] = (
+                        host_values[source_start : source_start + length_left]
+                    )
+                    source_start += length_left
+                    raw_expected_pair[1][right_start : right_start + length_right] = (
+                        host_values[source_start : source_start + length_right]
+                    )
+                for actual, reference, expected in zip(
+                    actual_pair, expected_pair, raw_expected_pair
+                ):
+                    np.testing.assert_array_equal(
+                        np.asarray(actual).view(np.uint8), expected.view(np.uint8)
+                    )
+                    np.testing.assert_array_equal(
+                        np.asarray(reference, dtype=host_type),
+                        np.asarray(expected, dtype=host_type),
+                    )
+                if dtype != jnp.float32:
+                    continue
+                cotangent = (
+                    jnp.arange(values.size, dtype=jnp.float32).reshape(values.shape)
+                    / 128
+                )
+                reference_adjoint = jax.grad(_concat_linear_loss, argnums=(0, 1))(
+                    jnp.zeros_like(left),
+                    jnp.zeros_like(right),
+                    offsets_left,
+                    offsets_right,
+                    cotangent,
+                )
+                candidate_adjoint = split(
+                    cotangent,
+                    offsets_left,
+                    offsets_right,
+                    left.shape[0],
+                    right.shape[0],
+                    True,
+                )
+                for actual, expected in zip(candidate_adjoint, reference_adjoint):
+                    np.testing.assert_array_equal(
+                        np.asarray(actual), np.asarray(expected)
+                    )
 
     def test_native_pair_projection_boundaries(self) -> None:
         for raw_offsets in ([0, 0, 3, 3, 12, 14], [0, 0, 3, 3, 12], [0, 3]):
