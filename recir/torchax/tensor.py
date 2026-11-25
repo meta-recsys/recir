@@ -562,6 +562,7 @@ class Environment(contextlib.ContextDecorator):
             jrandom,
             jtorch,
             jtorchvision_nms,
+            packed_jagged_ops,
         )
 
         for k, v in itertools.chain(*(r.items() for r in ops_registry.ALL_REGISTRIES)):
