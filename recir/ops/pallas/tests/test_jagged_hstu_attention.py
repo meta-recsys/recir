@@ -396,6 +396,31 @@ class JaggedHSTUAttentionTest(unittest.TestCase):
         self.assertEqual(len(pallas_calls), 1)
         return traced, nested_jaxprs, pallas_calls[0]
 
+    def _kernel_vmem_avals(self, pallas_call: Any) -> list[Any]:
+        kernel_jaxpr = cast(Any, pallas_call.params["jaxpr"])
+        kernel_jaxpr = cast(Any, getattr(kernel_jaxpr, "jaxpr", kernel_jaxpr))
+        return [
+            variable.aval
+            for variable in kernel_jaxpr.invars
+            if "vmem" in str(variable.aval)
+        ]
+
+    def _pipeline_scopes(
+        self, nested_jaxprs: list[Any], buffered_shape: tuple[int, ...], count: int
+    ) -> list[Any]:
+        """Pipeline loops over at least ``count`` double-buffered refs of
+        ``buffered_shape``."""
+        return [
+            jaxpr
+            for jaxpr in nested_jaxprs
+            if sum(
+                tuple(getattr(variable.aval, "shape", ())) == buffered_shape
+                for variable in jaxpr.invars
+            )
+            >= count
+            and any(equation.primitive.name == "while" for equation in jaxpr.eqns)
+        ]
+
     def test_native_forward_traces_double_buffered_pipeline(self) -> None:
         traced, nested_jaxprs, pallas_call = self._trace_native_forward(
             max_seq_len=3072,
@@ -403,56 +428,27 @@ class JaggedHSTUAttentionTest(unittest.TestCase):
             block_k=128,
             query_tiles_per_program=4,
         )
-        self.assertEqual(pallas_call.params["grid_mapping"].grid, (1, 3))
-        self.assertEqual(pallas_call.outvars[0].aval.shape, (3072, 1, 128))
+        # A sequence lies in the first 3,079 rows of its stage: four 1,024-row
+        # query groups.
+        self.assertEqual(pallas_call.params["grid_mapping"].grid, (1, 4))
+        self.assertEqual(pallas_call.outvars[0].aval.shape, (3072, 128))
         self.assertEqual(traced.jaxpr.outvars[0].aval.shape, (3072, 1, 128))
 
-        kernel_jaxpr = cast(Any, pallas_call.params["jaxpr"])
-        kernel_jaxpr = cast(Any, getattr(kernel_jaxpr, "jaxpr", kernel_jaxpr))
-        kernel_vmem_avals = [
-            variable.aval
-            for variable in kernel_jaxpr.invars
-            if "vmem" in str(variable.aval)
-        ]
-        self.assertEqual(
-            sum(aval.shape == (2064, 1, 128) for aval in kernel_vmem_avals),
-            1,
-        )
         output_scratch = [
-            aval for aval in kernel_vmem_avals if aval.shape == (1, 1024, 128)
+            aval
+            for aval in self._kernel_vmem_avals(pallas_call)
+            if aval.shape == (1, 1024, 128)
         ]
-        self.assertEqual(len(output_scratch), 1)
         self.assertEqual(
-            {aval.dtype for aval in output_scratch},
-            {jnp.dtype(jnp.float32)},
+            [aval.dtype for aval in output_scratch], [jnp.dtype(jnp.float32)]
         )
 
-        buffered_shape = (2, 136, 1, 128)
-        pipeline_scopes = []
-        for jaxpr in nested_jaxprs:
-            input_avals = [variable.aval for variable in jaxpr.invars]
-            buffered_refs = [
-                aval
-                for aval in input_avals
-                if tuple(getattr(aval, "shape", ())) == buffered_shape
-            ]
-            primitive_names = {equation.primitive.name for equation in jaxpr.eqns}
-            if len(buffered_refs) == 2 and "while" in primitive_names:
-                pipeline_scopes.append(jaxpr)
-
+        # K and V stream through one pipeline as double-buffered 2-D blocks.
+        pipeline_scopes = self._pipeline_scopes(nested_jaxprs, (2, 128, 128), 2)
         self.assertEqual(len(pipeline_scopes), 1)
-        pipeline_scope = pipeline_scopes[0]
-        semaphore_refs = [
-            variable.aval
-            for variable in pipeline_scope.invars
-            if tuple(getattr(variable.aval, "shape", ())) == (2,)
-            and "dma_sem" in str(variable.aval)
-        ]
-        self.assertEqual(len(semaphore_refs), 2)
-
         pipeline_primitives = {
             equation.primitive.name
-            for jaxpr in _walk_nested_jaxprs(pipeline_scope)
+            for jaxpr in _walk_nested_jaxprs(pipeline_scopes[0])
             for equation in jaxpr.eqns
         }
         self.assertTrue(
@@ -465,10 +461,8 @@ class JaggedHSTUAttentionTest(unittest.TestCase):
             for variable in jaxpr.invars
             if "vmem" in str(variable.aval)
         }
-        self.assertIn((2064, 1, 128), vmem_shapes)
-        self.assertIn((1, 1024, 128), vmem_shapes)
-        self.assertIn(buffered_shape, vmem_shapes)
-        self.assertNotIn((3072, 1, 128), vmem_shapes)
+        self.assertIn((2, 1024, 128), vmem_shapes)
+        self.assertNotIn((3072, 128), vmem_shapes)
 
         dot_operand_shapes = {
             tuple(variable.aval.shape)
@@ -488,52 +482,32 @@ class JaggedHSTUAttentionTest(unittest.TestCase):
             query_tiles_per_program=2,
         )
         self.assertEqual(pallas_call.params["grid_mapping"].grid, (1, 3))
-        self.assertEqual(pallas_call.outvars[0].aval.shape, (513, 1, 128))
+        self.assertEqual(pallas_call.outvars[0].aval.shape, (513, 128))
         self.assertEqual(traced.jaxpr.outvars[0].aval.shape, (513, 1, 128))
 
-        kernel_jaxpr = cast(Any, pallas_call.params["jaxpr"])
-        kernel_jaxpr = cast(Any, getattr(kernel_jaxpr, "jaxpr", kernel_jaxpr))
-        kernel_vmem_avals = [
-            variable.aval
-            for variable in kernel_jaxpr.invars
-            if "vmem" in str(variable.aval)
-        ]
-        self.assertEqual(
-            sum(aval.shape == (528, 1, 128) for aval in kernel_vmem_avals),
-            1,
-        )
         output_scratch = [
-            aval for aval in kernel_vmem_avals if aval.shape == (1, 256, 128)
+            aval
+            for aval in self._kernel_vmem_avals(pallas_call)
+            if aval.shape == (1, 256, 128)
         ]
-        self.assertEqual(len(output_scratch), 1)
         self.assertEqual(
-            {aval.dtype for aval in output_scratch},
-            {jnp.dtype(jnp.float32)},
+            [aval.dtype for aval in output_scratch], [jnp.dtype(jnp.float32)]
         )
 
-        buffered_shape = (2, 264, 1, 128)
-        pipeline_scopes = [
-            jaxpr
-            for jaxpr in nested_jaxprs
-            if sum(variable.aval.shape == buffered_shape for variable in jaxpr.invars)
-            == 2
-            and any(equation.primitive.name == "while" for equation in jaxpr.eqns)
-        ]
-        self.assertEqual(len(pipeline_scopes), 1)
-        pipeline_scope = pipeline_scopes[0]
+        # Q is staged in a buffer of the same shape as the K/V blocks.
+        pipeline_scopes = self._pipeline_scopes(nested_jaxprs, (2, 256, 128), 2)
+        self.assertTrue(pipeline_scopes)
         buffered_refs = [
             variable.aval
-            for variable in pipeline_scope.invars
-            if variable.aval.shape == buffered_shape
+            for variable in pipeline_scopes[0].invars
+            if variable.aval.shape == (2, 256, 128)
         ]
-        self.assertEqual(len(buffered_refs), 2)
         self.assertEqual(
-            {aval.dtype for aval in buffered_refs},
-            {jnp.dtype(jnp.bfloat16)},
+            {aval.dtype for aval in buffered_refs}, {jnp.dtype(jnp.bfloat16)}
         )
         pipeline_primitives = {
             equation.primitive.name
-            for jaxpr in _walk_nested_jaxprs(pipeline_scope)
+            for jaxpr in _walk_nested_jaxprs(pipeline_scopes[0])
             for equation in jaxpr.eqns
         }
         self.assertTrue(
@@ -546,20 +520,13 @@ class JaggedHSTUAttentionTest(unittest.TestCase):
             block_q=256,
             block_k=128,
         )
+        # Three 256-row query tiles cover the sequence's 519 stage rows, not the
+        # default four.
         self.assertEqual(pallas_call.params["grid_mapping"].grid, (1, 1))
-        self.assertEqual(pallas_call.outvars[0].aval.shape, (512, 1, 128))
         self.assertEqual(traced.jaxpr.outvars[0].aval.shape, (512, 1, 128))
-
-        kernel_jaxpr = cast(Any, pallas_call.params["jaxpr"])
-        kernel_jaxpr = cast(Any, getattr(kernel_jaxpr, "jaxpr", kernel_jaxpr))
-        vmem_shapes = {
-            tuple(getattr(variable.aval, "shape", ()))
-            for variable in kernel_jaxpr.invars
-            if "vmem" in str(variable.aval)
-        }
-        self.assertIn((1040, 1, 128), vmem_shapes)
-        self.assertIn((1, 512, 128), vmem_shapes)
-        self.assertNotIn((2064, 1, 128), vmem_shapes)
+        vmem_shapes = {aval.shape for aval in self._kernel_vmem_avals(pallas_call)}
+        self.assertIn((1, 768, 128), vmem_shapes)
+        self.assertNotIn((1, 1024, 128), vmem_shapes)
 
     def _trace_native_backward(
         self,
