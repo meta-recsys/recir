@@ -1039,17 +1039,20 @@ def _packed_position_add_backward(
     )
     dv = jnp.where(valid[:, None], grad.astype(values.dtype), 0)
     dv = jnp.where(dv == 0, jnp.zeros_like(dv), dv)
-    position_order = jnp.argsort(pi, stable=True)
-    time_order = jnp.argsort(ti, stable=True)
+    # Sorting (index, row) pairs yields the sorted indices with the order, which
+    # spares the scalar gathers index[order] (2.4 ms each on 328k tokens).
+    rows = jnp.arange(pi.shape[0], dtype=jnp.int32)
+    sorted_pi, position_order = jax.lax.sort((pi, rows), num_keys=1, is_stable=True)
+    sorted_ti, time_order = jax.lax.sort((ti, rows), num_keys=1, is_stable=True)
     dp = jax.ops.segment_sum(
         dv[position_order].astype(position.dtype),
-        pi[position_order],
+        sorted_pi,
         num_segments=position.shape[0],
         indices_are_sorted=True,
     )
     dt = jax.ops.segment_sum(
         dv[time_order].astype(time.dtype),
-        ti[time_order],
+        sorted_ti,
         num_segments=time.shape[0],
         indices_are_sorted=True,
     )
@@ -1172,12 +1175,16 @@ def _local_supervision_gather(
     global_rows = indices // max_len
     columns = indices % max_len
     rows = jnp.clip(global_rows - owner * batch_size, 0, batch_size - 1)
-    offsets = jnp.concatenate((jnp.zeros((1,), lengths.dtype), jnp.cumsum(lengths)))
-    source = jnp.clip(offsets[rows] + columns, 0, values.shape[0] - 1)
+    starts = jnp.cumsum(lengths) - lengths
+    # One gather of (start, length) pairs instead of two scalar gathers.
+    row_start, row_length = jnp.moveaxis(
+        jnp.stack((starts, lengths), axis=-1)[rows], -1, 0
+    )
+    source = jnp.clip(row_start + columns, 0, values.shape[0] - 1)
     valid = (
         (global_rows >= owner * batch_size)
         & (global_rows < (owner + 1) * batch_size)
-        & (columns < lengths[rows])
+        & (columns < row_length)
     )
     return jnp.where(
         valid[:, None] if two_words else valid, values[source], jnp.uint32(0)
