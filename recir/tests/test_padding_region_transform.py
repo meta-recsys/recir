@@ -408,6 +408,121 @@ class PadJaggedPairToStaticTest(unittest.TestCase):
         self.assertEqual(int(padded_lengths.sum().item()), padded_values.shape[0])
 
 
+def _chip_rows(B: int, num_local: int, count: Any) -> List[int]:
+    if count is None:
+        return [B // num_local] * num_local
+    return [int(x) for x in count.reshape(num_local, -1).sum(1).tolist()]
+
+
+def _reference_values(
+    values: torch.Tensor,
+    lengths: torch.Tensor,
+    budgets: List[int],
+    num_local: int,
+    count: Any,
+    tile_pad: bool,
+    dim: int,
+) -> torch.Tensor:
+    """Per key, per chip: the chip's real values cut or padded to budget // num_local."""
+    rows = _chip_rows(lengths.shape[0] // len(budgets), num_local, count)
+    parts, offset, row = [], 0, 0
+    for budget in budgets:
+        size = budget // num_local
+        for rc in rows:
+            n = int(lengths[row : row + rc].sum())
+            row += rc
+            block = values.narrow(dim, offset, n)
+            offset += n
+            if n >= size:
+                parts.append(block.narrow(dim, 0, size))
+            elif tile_pad and n > 0:
+                parts.append(block.index_select(dim, torch.arange(size) % n))
+            else:
+                shape = list(values.shape)
+                shape[dim] = size - n
+                parts.append(torch.cat([block, values.new_zeros(shape)], dim))
+    return torch.cat(parts, dim)
+
+
+def _reference_lengths(
+    lengths: torch.Tensor,
+    budgets: List[int],
+    target_batch: int,
+    num_local: int,
+    count: Any,
+) -> torch.Tensor:
+    """Per key, per chip: real lengths trimmed to the chip budget, then dummies
+    sharing the deficit evenly."""
+    rows = _chip_rows(lengths.shape[0] // len(budgets), num_local, count)
+    tpb = target_batch // num_local
+    out, row = [], 0
+    for budget in budgets:
+        size = budget // num_local
+        for rc in rows:
+            bl = lengths[row : row + rc]
+            row += rc
+            if int(bl.sum()) > size:
+                bl = torch.diff(bl.cumsum(0).clamp(max=size), prepend=bl.new_zeros(1))
+            deficit, dummies = size - int(bl.sum()), tpb - rc
+            fill = [0] * dummies
+            if deficit > 0 and dummies > 0:
+                q, r = divmod(deficit, dummies)
+                fill = [q + (i < r) for i in range(dummies)]
+            out.append(torch.cat([bl, torch.tensor(fill, dtype=lengths.dtype)]))
+    return torch.cat(out)
+
+
+class PadJaggedRandomizedTest(unittest.TestCase):
+    """The ops against a direct per-block construction, over chip counts,
+    candidate-aware splits, trimming, tiling and a non-zero pad dim."""
+
+    def test_matches_per_block_construction(self) -> None:
+        gen = torch.Generator().manual_seed(0)
+        for case in range(60):
+            num_local = [1, 2, 4][case % 3]
+            num_keys = 1 + case % 3
+            spb = 1 + case % 4
+            count = None
+            if case % 2:
+                count = torch.randint(0, 4, (num_local * spb,), generator=gen)
+                B = int(count.sum())
+            else:
+                B = num_local * spb
+            lengths = torch.randint(0, 6, (num_keys * B,), generator=gen)
+            budgets = [
+                num_local * int(torch.randint(1, 3 * spb + 4, (1,), generator=gen))
+                for _ in range(num_keys)
+            ]
+            target_batch = num_local * (max(_chip_rows(B, num_local, count)) + 2)
+            total = int(lengths.sum())
+            dim = case % 2
+            values = torch.randn(total, 3, generator=gen)
+            if dim:
+                values = values.t().contiguous()
+            tile_pad = case % 5 < 2
+            with (
+                self.subTest(case=case),
+                patch(
+                    "recir.region_transforms.padding.runtime_num_local",
+                    return_value=num_local,
+                ),
+            ):
+                got = pad_jagged_values(
+                    values, lengths, budgets, dim, -1, 1, count, tile_pad
+                )
+                want = _reference_values(
+                    values, lengths, budgets, num_local, count, tile_pad, dim
+                )
+                self.assertTrue(torch.equal(got, want))
+                got_lengths = pad_jagged_lengths(
+                    lengths, budgets, target_batch, 1, count
+                )
+                want_lengths = _reference_lengths(
+                    lengths, budgets, target_batch, num_local, count
+                )
+                self.assertTrue(torch.equal(got_lengths, want_lengths))
+
+
 class PadCandidateAxisToStaticTest(unittest.TestCase):
     @patch("recir.region_transforms.padding.runtime_num_local", return_value=2)
     def test_builds_per_chip_real_value_mask(self, _mock_num_local: Any) -> None:
