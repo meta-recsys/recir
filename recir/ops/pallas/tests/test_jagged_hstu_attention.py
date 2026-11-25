@@ -191,6 +191,9 @@ class JaggedHSTUAttentionTest(unittest.TestCase):
         # The second sequence's rows cannot depend on the first's target count.
         np.testing.assert_array_equal(run([-8, 0])[4:], run([0, 0])[4:])
 
+    def test_sequences_within_max_seq_len_are_accepted(self) -> None:
+        self._assert_parity([12, 3], [0, 0], max_seq_len=12)
+
     def test_nonuniform_causal_sequences(self) -> None:
         self._assert_parity([7, 3, 9], [0, 0, 0], max_seq_len=9)
 
@@ -706,6 +709,35 @@ class JaggedHSTUAttentionTest(unittest.TestCase):
         self.assertIn((528, 1, 128), vmem_shapes)
         self.assertIn((1, 256, 128), vmem_shapes)
         self.assertIn((2, 392, 1, 128), vmem_shapes)
+
+    def test_native_backward_zeroes_each_gradient_tail(self) -> None:
+        """Each gradient's rows past ``seq_offsets[-1]`` are written by no grid
+        program, and are zero only because ``_zero_unvisited_tail`` clears them.
+
+        The kernel aliases its input into its output rather than allocating, so
+        dropping the call leaves whatever the buffer held. Executing it to see
+        that needs a TPU -- ``interpret=True`` takes the dense fallback, which
+        has no tail kernel at all -- so this checks the native trace instead.
+        """
+        _, nested_jaxprs, _, _ = self._trace_native_backward(
+            max_seq_len=3072,
+            block_q=256,
+            block_k=128,
+            query_tiles_per_program=1,
+        )
+        tail_calls = [
+            equation
+            for jaxpr in nested_jaxprs
+            for equation in jaxpr.eqns
+            if equation.primitive.name == "pallas_call"
+            and "tail_zero" in _kernel_name(equation)
+        ]
+        self.assertEqual(len(tail_calls), 3, "one per gradient: dq, dk and dv")
+        for call in tail_calls:
+            with self.subTest(kernel=_kernel_name(call)):
+                # Aliasing the input is what makes the call load-bearing: the
+                # output is not a fresh zeroed buffer.
+                self.assertEqual(call.params["input_output_aliases"], ((1, 0),))
 
     def test_rejects_invalid_shapes(self) -> None:
         q, k, v, offsets = self._inputs([3, 2])
