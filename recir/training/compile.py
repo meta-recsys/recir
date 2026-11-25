@@ -544,6 +544,15 @@ def compile_gspmd_step(
     """
     from recir.backends.xla import XLAGSPMDBackend
 
+    fuse_jagged_queries = os.environ.get("RECIR_FUSE_JAGGED_QUERIES", "0")
+    if fuse_jagged_queries not in ("0", "1"):
+        raise ValueError(f"Invalid RECIR_FUSE_JAGGED_QUERIES: {fuse_jagged_queries!r}")
+    # Opt-in: changes the summation order of bias gradients.
+    split_concat_row_sums = os.environ.get("RECIR_SPLIT_CONCAT_ROW_SUMS", "0")
+    if split_concat_row_sums not in ("0", "1"):
+        raise ValueError(
+            f"Invalid RECIR_SPLIT_CONCAT_ROW_SUMS: {split_concat_row_sums!r}"
+        )
     step_fn: Callable[..., Any] = train_step_fn or recir_train_step
     parallel_mode = GSPMDParallel(
         "replicate",
@@ -558,7 +567,10 @@ def compile_gspmd_step(
         (dense_opt,) if sparse_opt is None else (dense_opt, sparse_opt),
         trace_batch,
         parallel_mode=parallel_mode,
-        backend=XLAGSPMDBackend(),
+        backend=XLAGSPMDBackend(
+            fuse_jagged_queries=fuse_jagged_queries == "1",
+            split_concat_row_sums=split_concat_row_sums == "1",
+        ),
         dispatchers=dispatchers,
         region_transforms=spec.region_transforms,
         # GLOBAL loss denominator: the GSPMD program is a single global view
