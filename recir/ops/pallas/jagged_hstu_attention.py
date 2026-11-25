@@ -813,7 +813,6 @@ def _jagged_bwd_dq_kernel(
     k_hbm_ref,
     v_hbm_ref,
     do_hbm_ref,
-    dq_init_hbm_ref,
     dq_hbm_ref,
     q_stage_ref,
     do_stage_ref,
@@ -1050,8 +1049,6 @@ def _jagged_bwd_dkv_kernel(
     k_hbm_ref,
     v_hbm_ref,
     do_hbm_ref,
-    dk_init_hbm_ref,
-    dv_init_hbm_ref,
     dk_hbm_ref,
     dv_hbm_ref,
     k_stage_ref,
@@ -1361,7 +1358,7 @@ def _native_jagged_hstu_attention_backward(
     q_stage_rows = query_group_rows + _ALIGNMENT_ROWS
     dq_grid_spec = pltpu.PrefetchScalarGridSpec(
         num_scalar_prefetch=4,
-        in_specs=[pl.BlockSpec(memory_space=pltpu.HBM)] * 5,
+        in_specs=[pl.BlockSpec(memory_space=pltpu.HBM)] * 4,
         out_specs=pl.BlockSpec(memory_space=pltpu.HBM),
         grid=(num_sequences, num_query_groups),
         scratch_shapes=(
@@ -1385,24 +1382,16 @@ def _native_jagged_hstu_attention_backward(
         ),
         out_shape=jax.ShapeDtypeStruct((q.shape[0], num_heads, dqk), q.dtype),
         grid_spec=dq_grid_spec,
-        input_output_aliases={8: 0},
         compiler_params=pltpu.CompilerParams(
             dimension_semantics=("parallel", "parallel")
         ),
         name="pallas_jagged_hstu_attention_bwd_dq",
-    )(
-        *scalar_args,
-        *backward_hbm_args,
-        pltpu.with_memory_space_constraint(
-            jnp.zeros((q.shape[0], num_heads, dqk), q.dtype),
-            pltpu.HBM,
-        ),
-    )
+    )(*scalar_args, *backward_hbm_args)
 
     kv_stage_rows = block_k + _ALIGNMENT_ROWS
     dkv_grid_spec = pltpu.PrefetchScalarGridSpec(
         num_scalar_prefetch=4,
-        in_specs=[pl.BlockSpec(memory_space=pltpu.HBM)] * 6,
+        in_specs=[pl.BlockSpec(memory_space=pltpu.HBM)] * 4,
         out_specs=[
             pl.BlockSpec(memory_space=pltpu.HBM),
             pl.BlockSpec(memory_space=pltpu.HBM),
@@ -1431,23 +1420,14 @@ def _native_jagged_hstu_attention_backward(
             jax.ShapeDtypeStruct((q.shape[0], num_heads, dv_dim), v.dtype),
         ),
         grid_spec=dkv_grid_spec,
-        input_output_aliases={8: 0, 9: 1},
         compiler_params=pltpu.CompilerParams(
             dimension_semantics=("parallel", "parallel")
         ),
         name="pallas_jagged_hstu_attention_bwd_dkv",
-    )(
-        *scalar_args,
-        *backward_hbm_args,
-        pltpu.with_memory_space_constraint(
-            jnp.zeros((q.shape[0], num_heads, dqk), k.dtype),
-            pltpu.HBM,
-        ),
-        pltpu.with_memory_space_constraint(
-            jnp.zeros((q.shape[0], num_heads, dv_dim), v.dtype),
-            pltpu.HBM,
-        ),
-    )
+    )(*scalar_args, *backward_hbm_args)
+    # The programs write every row of every sequence; only the tail after the
+    # last sequence needs zeros.
+    dq, dk, dv = (_zero_unvisited_tail(grad, seq_offsets) for grad in (dq, dk, dv))
     return dq, dk, dv
 
 
@@ -1614,6 +1594,16 @@ def _validate_jagged_hstu_attention_inputs(
     block_q: int,
     query_tiles_per_program: int,
 ) -> int:
+    """Shape checks, returning the sequence count.
+
+    Every sequence must be at most ``max_seq_len`` long. That cannot be checked
+    here: the lengths live in ``seq_offsets``, which is traced, and the packed
+    buffer's own size says nothing about them -- it is allocated for
+    ``B + 1`` slots, so bounding ``q.shape[0]`` by ``B * max_seq_len`` rejects
+    valid input. A longer sequence leaves rows inside ``[0, seq_offsets[-1])``
+    that no grid program writes and the tail zeroing starts after; callers
+    truncate with ``jagged_to_padded_dense(..., [max_seq_len])``.
+    """
     if q.ndim != 3 or k.ndim != 3 or v.ndim != 3:
         raise ValueError("q, k, and v must have shape [T, H, D]")
     if q.shape[:2] != k.shape[:2] or q.shape[:2] != v.shape[:2]:
