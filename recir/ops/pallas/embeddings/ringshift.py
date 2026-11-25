@@ -540,6 +540,34 @@ def _unpad_per_peer(
     return jnp.where(in_real[:, None], gathered, 0).astype(out_padded.dtype)
 
 
+def _unpad_per_peer_to_caller(
+    out_padded: jax.Array,
+    send_counts_real: jax.Array,
+    send_counts_padded: jax.Array,
+    sort_perm: jax.Array,
+) -> jax.Array:
+    """Return caller-order rows using the permutation from `_bucketize_and_sort`."""
+    max_local_ids = sort_perm.shape[0]
+    real_offsets = jnp.cumsum(send_counts_real) - send_counts_real
+    padded_offsets = jnp.cumsum(send_counts_padded) - send_counts_padded
+    pos = jnp.arange(max_local_ids, dtype=jnp.int32)
+    padded_src = jnp.clip(
+        _peer_broadcast(padded_offsets, real_offsets, max_local_ids)
+        + pos
+        - _peer_broadcast(real_offsets, real_offsets, max_local_ids),
+        0,
+        out_padded.shape[0] - 1,
+    )
+    caller_src = (
+        jnp.zeros((max_local_ids,), dtype=jnp.int32)
+        .at[sort_perm]
+        .set(padded_src, unique_indices=True)
+    )
+    gathered = out_padded[caller_src]
+    in_real = pos < jnp.sum(send_counts_real)
+    return jnp.where(in_real[:, None], gathered, 0).astype(out_padded.dtype)
+
+
 def _derive_offsets(traffic_matrix: jax.Array) -> Tuple[jax.Array, jax.Array]:
     """Derive send / receive offset matrices from the traffic matrix.
 
@@ -1489,14 +1517,27 @@ def _ringshift_embedding_lookup_local(
     # sum_p send_counts_padded[p] <= sum_p send_counts_real[p] + W*(TILE-1)
     # <= max_local_ids + W*TILE.
     max_padded = max_local_ids + world_size * _TILE_INT32
-    sorted_row_padded = _pad_per_peer(
-        sorted_row_real,
-        send_counts_real,
-        send_counts_padded,
-        max_local_ids,
-        max_padded,
-        world_size,
-    )
+    pad_ids_impl = os.environ.get("RECIR_RINGSHIFT_PAD_IDS_DMA", "0")
+    if pad_ids_impl not in ("0", "1"):
+        raise ValueError(f"unknown RECIR_RINGSHIFT_PAD_IDS_DMA {pad_ids_impl}")
+    if pad_ids_impl == "1":
+        from recir.ops.pallas.embeddings.pad_ids_dma import pad_ids_dma
+
+        sorted_row_padded = pad_ids_dma(
+            sorted_row_real,
+            send_counts_real,
+            send_counts_padded,
+            interpret=interpret,
+        )
+    else:
+        sorted_row_padded = _pad_per_peer(
+            sorted_row_real,
+            send_counts_real,
+            send_counts_padded,
+            max_local_ids,
+            max_padded,
+            world_size,
+        )
 
     HBM = pltpu.MemorySpace.HBM
     SMEM = pltpu.MemorySpace.SMEM
@@ -1752,6 +1793,11 @@ def _ringshift_embedding_lookup_local(
         return apply_pooling_divisor(
             pooled_acc[:num_bags], bag_lengths, pooling=pooling
         )
+
+    if os.environ.get("RECIR_RINGSHIFT_COMPOSE_OUTPUT") == "1":
+        return _unpad_per_peer_to_caller(
+            sorted_emb_padded, send_counts_real, send_counts_padded, sort_perm
+        ).astype(dtype)
 
     sorted_emb = _unpad_per_peer(
         sorted_emb_padded,
@@ -2651,6 +2697,20 @@ def _ringshift_embedding_lookup_backward_local(
     # wave's received rows are unique (safe batched scatter). Small tables keep the
     # serial VMEM-prefetch scatter and the original per-id send order.
     use_dma_gather = _use_dma_gather(v_local, embedding_dim, acc_dtype)
+    pad_cast_control = os.environ.get("RECIR_RINGSHIFT_PAD_CAST_DMA", "0")
+    if pad_cast_control not in ("0", "1"):
+        raise ValueError(f"invalid RECIR_RINGSHIFT_PAD_CAST_DMA: {pad_cast_control!r}")
+    use_pad_cast_dma = use_dma_gather and exchange_bf16 and pad_cast_control == "1"
+    pad_ids_cast_control = os.environ.get("RECIR_RINGSHIFT_PAD_IDS_CAST_DMA", "0")
+    if pad_ids_cast_control not in ("0", "1"):
+        raise ValueError(
+            f"invalid RECIR_RINGSHIFT_PAD_IDS_CAST_DMA: {pad_ids_cast_control!r}"
+        )
+    if pad_ids_cast_control == "1" and pad_cast_control != "1":
+        raise ValueError(
+            "RECIR_RINGSHIFT_PAD_IDS_CAST_DMA requires RECIR_RINGSHIFT_PAD_CAST_DMA=1"
+        )
+    use_pad_ids_cast_dma = use_pad_cast_dma and pad_ids_cast_control == "1"
 
     # --- Re-derive splitter inputs (send layout) ---
     if use_dma_gather:
@@ -2661,7 +2721,11 @@ def _ringshift_embedding_lookup_backward_local(
         sorted_row_real, grad_emb_sorted_f32, send_counts_real = _dedup_grads_by_id(
             looked_up_ids, looked_up_id_count, grad_out, max_local_ids, world_size
         )
-        grad_emb_sorted = grad_emb_sorted_f32.astype(exch_dtype)
+        grad_emb_sorted = (
+            grad_emb_sorted_f32
+            if use_pad_cast_dma
+            else grad_emb_sorted_f32.astype(exch_dtype)
+        )
         row_pad_value = v_local
     else:
         sorted_row_real, send_counts_real, sort_perm, _reverse_perm = (
@@ -2701,24 +2765,43 @@ def _ringshift_embedding_lookup_backward_local(
 
     # --- Pad sorted_row + grad per-peer (sentinel padding to TILE) ---
     max_padded = max_local_ids + world_size * _TILE_INT32
-    sorted_row_padded = _pad_per_peer(
-        sorted_row_real,
-        send_counts_real,
-        send_counts_padded,
-        max_local_ids,
-        max_padded,
-        world_size,
-        pad_value=row_pad_value,
-    )
     # Grad padding is always zero rows (zero gradient = no contribution).
-    grad_emb_padded = _pad_per_peer_2d(
-        grad_emb_sorted,
-        send_counts_real,
-        send_counts_padded,
-        max_local_ids,
-        max_padded,
-        world_size,
-    )
+    if use_pad_ids_cast_dma:
+        from recir.ops.pallas.embeddings.pad_ids_cast_dma import pad_ids_cast_dma
+
+        grad_emb_padded, sorted_row_padded = pad_ids_cast_dma(
+            grad_emb_sorted,
+            sorted_row_real,
+            send_counts_real,
+            send_counts_padded,
+            row_pad_value,
+            interpret=interpret,
+        )
+    else:
+        sorted_row_padded = _pad_per_peer(
+            sorted_row_real,
+            send_counts_real,
+            send_counts_padded,
+            max_local_ids,
+            max_padded,
+            world_size,
+            pad_value=row_pad_value,
+        )
+    if use_pad_cast_dma and not use_pad_ids_cast_dma:
+        from recir.ops.pallas.embeddings.pad_cast_dma import pad_cast_dma
+
+        grad_emb_padded = pad_cast_dma(
+            grad_emb_sorted, send_counts_real, send_counts_padded, interpret=interpret
+        )
+    elif not use_pad_ids_cast_dma:
+        grad_emb_padded = _pad_per_peer_2d(
+            grad_emb_sorted,
+            send_counts_real,
+            send_counts_padded,
+            max_local_ids,
+            max_padded,
+            world_size,
+        )
 
     HBM = pltpu.MemorySpace.HBM
     SMEM = pltpu.MemorySpace.SMEM

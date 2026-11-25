@@ -30,10 +30,14 @@ is exercised by the real-TPU correctness tests under
 from __future__ import annotations
 
 import unittest
+from functools import partial
 
 import jax
 import jax.numpy as jnp
 import numpy as np
+from recir.ops.pallas.embeddings.pad_cast_dma import pad_cast_dma
+from recir.ops.pallas.embeddings.pad_ids_cast_dma import pad_ids_cast_dma
+from recir.ops.pallas.embeddings.pad_ids_dma import pad_ids_dma
 from recir.ops.pallas.embeddings.ringshift import (
     _block_to_mod_ids,
     _bucketize_and_sort,
@@ -48,8 +52,192 @@ from recir.ops.pallas.embeddings.ringshift import (
     _split_traffic_ringshift_globalpad,
     _TILE_INT32,
     _unpad_per_peer,
+    _unpad_per_peer_to_caller,
     ringshift_embedding_lookup_reference,
 )
+
+
+class PadCastIndexMapTest(unittest.TestCase):
+    def test_grid_indices_stay_int32_with_x64_enabled(self) -> None:
+        previous = jax.config.read("jax_enable_x64")
+        try:
+            for enabled in (False, True):
+                jax.config.update("jax_enable_x64", enabled)
+                traced = jax.make_jaxpr(pad_cast_dma)(
+                    jax.ShapeDtypeStruct((257, 256), jnp.float32),
+                    jax.ShapeDtypeStruct((128,), jnp.int32),
+                    jax.ShapeDtypeStruct((128,), jnp.int32),
+                )
+                calls = [
+                    equation
+                    for equation in traced.jaxpr.eqns
+                    if equation.primitive.name == "pallas_call"
+                ]
+                self.assertEqual(len(calls), 1)
+                output_mapping = calls[0].params["grid_mapping"].block_mappings[-1]
+                with self.subTest(x64=enabled):
+                    self.assertEqual(
+                        [
+                            aval.dtype
+                            for aval in output_mapping.index_map_jaxpr.out_avals
+                        ],
+                        [jnp.dtype("int32"), jnp.dtype("int32")],
+                    )
+        finally:
+            jax.config.update("jax_enable_x64", previous)
+
+
+class PadIdsCastTest(unittest.TestCase):
+    def test_joint_padding_preserves_zero_id_and_drop_sentinel(self) -> None:
+        counts = jnp.array([2, 0, 1, 0], dtype=jnp.int32)
+        padded = _round_up_tile(counts, _TILE_INT32)
+        rows = jnp.array([0, 27, 8, 999, 999], dtype=jnp.int32)
+        gradients = jnp.arange(5 * 256, dtype=jnp.float32).reshape(5, 256) / 16
+        sentinel = 23_437_500
+        actual_gradients, actual_rows = pad_ids_cast_dma(
+            gradients, rows, counts, padded, sentinel, interpret=True
+        )
+        capacity = rows.shape[0] + counts.shape[0] * _TILE_INT32
+        expected_rows = np.full(capacity, sentinel, np.int32)
+        expected_rows[:2] = [0, 27]
+        expected_rows[128] = 8
+        expected_gradients = jnp.zeros((capacity, 256), dtype=jnp.bfloat16)
+        expected_gradients = expected_gradients.at[:2].set(
+            gradients[:2].astype(jnp.bfloat16)
+        )
+        expected_gradients = expected_gradients.at[128].set(
+            gradients[2].astype(jnp.bfloat16)
+        )
+        np.testing.assert_array_equal(actual_rows, expected_rows)
+        np.testing.assert_array_equal(
+            np.asarray(actual_gradients).view(np.uint16),
+            np.asarray(expected_gradients).view(np.uint16),
+        )
+
+    def test_joint_padding_keeps_float_payload_bits(self) -> None:
+        bits = np.array(
+            [0x00000000, 0x80000000, 0x7F800000, 0xFF800000, 0x7FC12000, 0x3F808000],
+            dtype=np.uint32,
+        )
+        gradient = jnp.asarray(np.resize(bits.view(np.float32), (7, 256)))
+        counts = jnp.array([0, 3, 0, 4], dtype=jnp.int32)
+        padded = _round_up_tile(counts, _TILE_INT32)
+        actual, _rows = pad_ids_cast_dma(
+            gradient,
+            jnp.arange(7, dtype=jnp.int32),
+            counts,
+            padded,
+            23_437_500,
+            interpret=True,
+        )
+        expected = pad_cast_dma(gradient, counts, padded, interpret=True)
+        np.testing.assert_array_equal(
+            np.asarray(actual).view(np.uint16), np.asarray(expected).view(np.uint16)
+        )
+
+    def test_joint_padding_handles_every_row_dma_alignment(self) -> None:
+        counts = jnp.ones(128, dtype=jnp.int32)
+        padded = _round_up_tile(counts, _TILE_INT32)
+        rows = jnp.arange(128, dtype=jnp.int32)
+        gradient = jnp.arange(128 * 128, dtype=jnp.float32).reshape(128, 128) / 1024
+        sentinel = 23_437_500
+        actual_gradient, actual_rows = pad_ids_cast_dma(
+            gradient, rows, counts, padded, sentinel, interpret=True
+        )
+        capacity = rows.shape[0] + counts.shape[0] * _TILE_INT32
+        expected_rows = np.full(capacity, sentinel, np.int32)
+        expected_rows[: 128 * 128 : 128] = np.arange(128, dtype=np.int32)
+        expected_gradient = jnp.zeros((capacity, 128), dtype=jnp.bfloat16)
+        expected_gradient = expected_gradient.at[: 128 * 128 : 128].set(
+            gradient.astype(jnp.bfloat16)
+        )
+        np.testing.assert_array_equal(actual_rows, expected_rows)
+        np.testing.assert_array_equal(
+            np.asarray(actual_gradient).view(np.uint16),
+            np.asarray(expected_gradient).view(np.uint16),
+        )
+
+    def test_joint_grid_indices_stay_int32_with_x64(self) -> None:
+        previous = jax.config.read("jax_enable_x64")
+        try:
+            jax.config.update("jax_enable_x64", True)
+            traced = jax.make_jaxpr(pad_ids_cast_dma, static_argnums=(4,))(
+                jax.ShapeDtypeStruct((257, 256), jnp.float32),
+                jax.ShapeDtypeStruct((257,), jnp.int32),
+                jax.ShapeDtypeStruct((128,), jnp.int32),
+                jax.ShapeDtypeStruct((128,), jnp.int32),
+                23_437_500,
+            )
+            calls = [
+                equation
+                for equation in traced.jaxpr.eqns
+                if equation.primitive.name == "pallas_call"
+            ]
+            self.assertEqual(len(calls), 1)
+            mappings = calls[0].params["grid_mapping"].block_mappings[-2:]
+            self.assertEqual(
+                [
+                    [aval.dtype for aval in mapping.index_map_jaxpr.out_avals]
+                    for mapping in mappings
+                ],
+                [[jnp.dtype("int32"), jnp.dtype("int32")], [jnp.dtype("int32")]],
+            )
+        finally:
+            jax.config.update("jax_enable_x64", previous)
+
+
+class PadIdsTest(unittest.TestCase):
+    def test_padding_matches_integer_oracle(self) -> None:
+        for counts_host in (
+            np.array([0, 0, 0, 0], dtype=np.int32),
+            np.array([0, 33, 0, 0], dtype=np.int32),
+            np.array([0, 1027, 17, 2055], dtype=np.int32),
+            np.ones(128, dtype=np.int32),
+        ):
+            size = int(counts_host.sum()) + 19
+            rows_host = np.arange(size, dtype=np.int32) * 97
+            rows_host[::17] = 0
+            padded_host = (counts_host + 127) // 128 * 128
+            expected = np.zeros(size + counts_host.size * 128, dtype=np.int32)
+            source_start = destination_start = 0
+            for count, padded in zip(counts_host, padded_host):
+                expected[destination_start : destination_start + count] = rows_host[
+                    source_start : source_start + count
+                ]
+                source_start += int(count)
+                destination_start += int(padded)
+            actual = pad_ids_dma(
+                jnp.asarray(rows_host),
+                jnp.asarray(counts_host),
+                jnp.asarray(padded_host),
+                interpret=True,
+            )
+            with self.subTest(counts=counts_host.tolist()):
+                np.testing.assert_array_equal(actual, expected)
+                self.assertEqual(actual.dtype, jnp.int32)
+
+    def test_grid_indices_stay_int32_with_x64(self) -> None:
+        previous = jax.config.read("jax_enable_x64")
+        try:
+            jax.config.update("jax_enable_x64", True)
+            traced = jax.make_jaxpr(pad_ids_dma)(
+                jax.ShapeDtypeStruct((257,), jnp.int32),
+                jax.ShapeDtypeStruct((128,), jnp.int32),
+                jax.ShapeDtypeStruct((128,), jnp.int32),
+            )
+            calls = [
+                equation
+                for equation in traced.jaxpr.eqns
+                if equation.primitive.name == "pallas_call"
+            ]
+            self.assertEqual(len(calls), 1)
+            mapping = calls[0].params["grid_mapping"].block_mappings[-1]
+            self.assertEqual(
+                [aval.dtype for aval in mapping.index_map_jaxpr.out_avals],
+                [jnp.dtype("int32")],
+            )
+        finally:
+            jax.config.update("jax_enable_x64", previous)
 
 
 class SortPayloadTest(unittest.TestCase):
@@ -93,7 +281,7 @@ class CountDestinationsTest(unittest.TestCase):
         for world_size in (1, 4, 128):
             for size in (0, 1, 17, 1024, 1025):
                 inputs = (
-                    rng.integers(0, world_size + 1, size=size).astype(np.int32),
+                    rng.integers(0, world_size + 1, size=size).astype(np.dtype("int32")),
                     np.full(size, world_size, dtype=np.int32),
                     np.zeros(size, dtype=np.int32),
                 )
@@ -478,6 +666,66 @@ class PadUnpadTest(unittest.TestCase):
             world_size,
         )
         self.assertEqual(padded.dtype, jnp.float32)
+
+
+class ComposedUnpadTest(unittest.TestCase):
+    def test_caller_order_matches_separate_unpad_and_permutation(self) -> None:
+        rng = np.random.default_rng(347)
+        for size, world_size in ((0, 4), (17, 4), (513, 128)):
+            ids = jnp.asarray(rng.integers(0, 1024, size=size, dtype=np.dtype("int32")))
+            for valid_count in {0, max(size - 7, 0), size}:
+                _, counts, perm, inverse = _bucketize_and_sort(
+                    ids, jnp.int32(valid_count), size, world_size
+                )
+                padded_counts = _round_up_tile(counts, _TILE_INT32)
+                capacity = size + world_size * _TILE_INT32
+                payload = jnp.arange(capacity * 128, dtype=jnp.float32).reshape(
+                    capacity, 128
+                )
+                original = jax.jit(
+                    partial(
+                        _unpad_per_peer,
+                        max_local_ids=size,
+                        max_padded=capacity,
+                        world_size=world_size,
+                    )
+                )(payload, counts, padded_counts)[inverse]
+                actual = jax.jit(_unpad_per_peer_to_caller)(
+                    payload, counts, padded_counts, perm
+                )
+                with self.subTest(size=size, valid_count=valid_count):
+                    np.testing.assert_array_equal(actual, original)
+                    np.testing.assert_array_equal(actual[valid_count:], 0)
+                    self.assertEqual((size, 128), actual.shape)
+
+    def test_raw_float_payload_matches_original_select_semantics(self) -> None:
+        ids = jnp.array([5, 5, 7, 12, 5, 0], dtype=jnp.int32)
+        _, counts, perm, inverse = _bucketize_and_sort(ids, jnp.int32(5), 6, 4)
+        padded_counts = _round_up_tile(counts, _TILE_INT32)
+        capacity = ids.shape[0] + 4 * _TILE_INT32
+        patterns = (
+            (jnp.float32, jnp.uint32, [0, 0x80000000, 0x7FC12345, 0xFFC12345, 1]),
+            (jnp.bfloat16, jnp.uint16, [0, 0x8000, 0x7FC1, 0xFFC5, 1]),
+        )
+        for dtype, raw_dtype, bits in patterns:
+            raw = jnp.resize(jnp.asarray(bits, dtype=raw_dtype), (capacity, 128))
+            payload = jax.lax.bitcast_convert_type(raw, dtype)
+            original = jax.jit(
+                partial(
+                    _unpad_per_peer,
+                    max_local_ids=6,
+                    max_padded=capacity,
+                    world_size=4,
+                )
+            )(payload, counts, padded_counts)[inverse]
+            actual = jax.jit(_unpad_per_peer_to_caller)(
+                payload, counts, padded_counts, perm
+            )
+            with self.subTest(dtype=str(dtype)):
+                np.testing.assert_array_equal(
+                    np.asarray(actual).view(np.uint8),
+                    np.asarray(original).view(np.uint8),
+                )
 
 
 class RingshiftSplitterTest(unittest.TestCase):
