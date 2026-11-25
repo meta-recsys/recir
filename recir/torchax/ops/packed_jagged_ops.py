@@ -10,6 +10,7 @@ import jax
 import jax.numpy as jnp
 import recir.ops.packed_jagged_ops  # noqa: F401
 import torch
+from hammer.v3.modules.mot.loss import packed_supervision  # noqa: F401
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 from jax.experimental.pallas.ops.tpu.megablox import common
@@ -32,6 +33,7 @@ from recir.torchax.ops.jagged_ops import (
 
 
 
+
 def _valid_rows(offsets: Any, capacity: int, max_len: int) -> tuple[Any, Any]:
     positions = jnp.arange(capacity, dtype=jnp.int32)
     groups = _segment_id_by_cumsum(offsets[1:-1], capacity)
@@ -43,6 +45,9 @@ def _valid_rows(offsets: Any, capacity: int, max_len: int) -> tuple[Any, Any]:
 
 def _pad_rows(x: Any) -> Any:
     return jnp.pad(x, ((0, (-x.shape[0]) % 128), (0, 0)))
+
+
+
 
 
 
@@ -382,17 +387,236 @@ def _recir_packed_bmm_add_backward(
     )
 
 
+def _packed_position_indices(
+    values: Any, position_indices: Any, time_indices: Any, offsets: Any, max_len: int
+) -> tuple[Any, Any, Any]:
+    groups, valid = _valid_rows(offsets, values.shape[0], max_len)
+    starts = _segment_broadcast(offsets[:-1], offsets[:-1], values.shape[0])
+    columns = jnp.arange(values.shape[0], dtype=jnp.int32) - starts
+    columns = jnp.clip(columns, 0, max_len - 1)
+    return position_indices[groups, columns], time_indices[groups, columns], valid
 
 
+def _packed_position_add(
+    values: Any,
+    position: Any,
+    time: Any,
+    position_indices: Any,
+    time_indices: Any,
+    offsets: Any,
+    max_len: int,
+) -> Any:
+    if values.shape[0] == 0 or max_len == 0 or position_indices.shape[0] == 0:
+        return jnp.zeros_like(values)
+    pi, ti, valid = _packed_position_indices(
+        values, position_indices, time_indices, offsets, max_len
+    )
+    embedding = (time[ti] + position[pi]).astype(values.dtype)
+    out = jnp.where(valid[:, None], values + embedding, 0)
+    return jnp.where(out == 0, jnp.zeros_like(out), out)
 
 
+def _packed_position_add_backward(
+    grad: Any,
+    values: Any,
+    position: Any,
+    time: Any,
+    position_indices: Any,
+    time_indices: Any,
+    offsets: Any,
+    max_len: int,
+) -> tuple[Any, Any, Any]:
+    if values.shape[0] == 0 or max_len == 0 or position_indices.shape[0] == 0:
+        return jnp.zeros_like(values), jnp.zeros_like(position), jnp.zeros_like(time)
+    pi, ti, valid = _packed_position_indices(
+        values, position_indices, time_indices, offsets, max_len
+    )
+    dv = jnp.where(valid[:, None], grad.astype(values.dtype), 0)
+    dv = jnp.where(dv == 0, jnp.zeros_like(dv), dv)
+    position_order = jnp.argsort(pi, stable=True)
+    time_order = jnp.argsort(ti, stable=True)
+    dp = jax.ops.segment_sum(
+        dv[position_order].astype(position.dtype),
+        pi[position_order],
+        num_segments=position.shape[0],
+        indices_are_sorted=True,
+    )
+    dt = jax.ops.segment_sum(
+        dv[time_order].astype(time.dtype),
+        ti[time_order],
+        num_segments=time.shape[0],
+        indices_are_sorted=True,
+    )
+    return dv, dp, dt
 
 
+def _shard_position(
+    values: Any,
+    position: Any,
+    time: Any,
+    position_indices: Any,
+    time_indices: Any,
+    offsets: Any,
+    max_len: int,
+    grad: Any = None,
+) -> Any:
+    if values.shape[0] >= 2**31 or position_indices.size >= 2**31:
+        raise ValueError("Packed position indices must fit int32")
+    world_size = len(jax.devices())
+    if world_size == 1:
+        if grad is None:
+            return _packed_position_add(
+                values, position, time, position_indices, time_indices, offsets, max_len
+            )
+        return _packed_position_add_backward(
+            grad,
+            values,
+            position,
+            time,
+            position_indices,
+            time_indices,
+            offsets,
+            max_len,
+        )
+    if values.shape[0] % world_size or position_indices.shape[0] % world_size:
+        raise ValueError("Packed position capacity and batch must divide world size")
+    token_spec, index_spec, table_spec = (
+        P("torch_dist", None),
+        P("torch_dist", None),
+        P(),
+    )
+
+    def local(v: Any, p: Any, t: Any, pi: Any, ti: Any, sizes: Any, *g: Any) -> Any:
+        off = jnp.concatenate((jnp.zeros((1,), jnp.int32), jnp.cumsum(sizes)))
+        if not g:
+            return _packed_position_add(v, p, t, pi, ti, off, max_len)
+        dv, dp, dt = _packed_position_add_backward(g[0], v, p, t, pi, ti, off, max_len)
+        return dv, jax.lax.psum(dp, "torch_dist"), jax.lax.psum(dt, "torch_dist")
+
+    backward = grad is not None
+    mapped = cast(
+        Callable[..., Any],
+        jax.shard_map(
+            local,
+            mesh=Mesh(jax.devices(), ("torch_dist",)),
+            in_specs=(
+                token_spec,
+                table_spec,
+                table_spec,
+                index_spec,
+                index_spec,
+                P("torch_dist"),
+                *([token_spec] if backward else []),
+            ),
+            out_specs=(token_spec, table_spec, table_spec) if backward else token_spec,
+            check_vma=False,
+        ),
+    )
+    with jax.enable_x64(False):
+        return mapped(
+            values,
+            position,
+            time,
+            position_indices.astype(jnp.int32),
+            time_indices.astype(jnp.int32),
+            jnp.diff(offsets.astype(jnp.int32)),
+            *([grad] if backward else []),
+        )
 
 
+@op(torch.ops.recir.packed_position_add.default)
+def _recir_packed_position_add(
+    values: Any,
+    position: Any,
+    time: Any,
+    position_indices: Any,
+    time_indices: Any,
+    offsets: Any,
+    max_len: int,
+) -> Any:
+    return _shard_position(
+        values, position, time, position_indices, time_indices, offsets, max_len
+    )
 
 
+@op(torch.ops.recir.packed_position_add_backward.default)
+def _recir_packed_position_add_backward(
+    grad: Any,
+    values: Any,
+    position: Any,
+    time: Any,
+    position_indices: Any,
+    time_indices: Any,
+    offsets: Any,
+    max_len: int,
+) -> Any:
+    return _shard_position(
+        values, position, time, position_indices, time_indices, offsets, max_len, grad
+    )
 
 
+def _local_supervision_gather(
+    values: Any, lengths: Any, indices: Any, max_len: int, owner: Any, batch_size: int
+) -> Any:
+    two_words = values.ndim == 2
+    if values.shape[0] == 0 or max_len == 0:
+        return jnp.zeros(
+            (*indices.shape, 2) if two_words else indices.shape, jnp.uint32
+        )
+    global_rows = indices // max_len
+    columns = indices % max_len
+    rows = jnp.clip(global_rows - owner * batch_size, 0, batch_size - 1)
+    offsets = jnp.concatenate((jnp.zeros((1,), lengths.dtype), jnp.cumsum(lengths)))
+    source = jnp.clip(offsets[rows] + columns, 0, values.shape[0] - 1)
+    valid = (
+        (global_rows >= owner * batch_size)
+        & (global_rows < (owner + 1) * batch_size)
+        & (columns < lengths[rows])
+    )
+    return jnp.where(
+        valid[:, None] if two_words else valid, values[source], jnp.uint32(0)
+    )
 
 
+@op(torch.ops.hammer.packed_supervision_gather.default)
+def _recir_packed_supervision_gather(
+    values: Any, offsets: Any, indices: Any, max_len: int
+) -> Any:
+    world_size = len(jax.devices())
+    batch_size = (offsets.shape[0] - 1) // world_size
+    if max_len * (offsets.shape[0] - 1) >= 2**31 or values.shape[0] >= 2**31:
+        raise ValueError("Packed supervision indices must fit int32")
+    if (offsets.shape[0] - 1) % world_size or values.shape[0] % world_size:
+        raise ValueError("Packed supervision capacity and batch must divide world size")
+    if batch_size == 0 or values.shape[0] == 0 or max_len == 0:
+        return jnp.zeros(indices.shape, values.dtype)
+    bits_dtype = {1: jnp.uint8, 2: jnp.uint16, 4: jnp.uint32, 8: jnp.uint32}[
+        values.dtype.itemsize
+    ]
+    words = jax.lax.bitcast_convert_type(values, bits_dtype).astype(jnp.uint32)
+
+    def local(x: Any, lengths: Any, flat: Any) -> Any:
+        owner = jax.lax.axis_index("torch_dist")
+        result = _local_supervision_gather(x, lengths, flat, max_len, owner, batch_size)
+        return jax.lax.psum(result, "torch_dist")
+
+    mapped = cast(
+        Callable[..., Any],
+        jax.shard_map(
+            local,
+            mesh=Mesh(jax.devices(), ("torch_dist",)),
+            in_specs=(
+                P("torch_dist", None) if words.ndim == 2 else P("torch_dist"),
+                P("torch_dist"),
+                P(),
+            ),
+            out_specs=P(),
+            check_vma=False,
+        ),
+    )
+    with jax.enable_x64(False):
+        result = mapped(
+            words, jnp.diff(offsets.astype(jnp.int32)), indices.astype(jnp.int32)
+        )
+    result = jax.lax.optimization_barrier(result.astype(bits_dtype))
+    return jax.lax.bitcast_convert_type(result, values.dtype)
