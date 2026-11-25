@@ -34,6 +34,7 @@ from recir.torchax.ops.jagged_ops import (
 
 
 
+
 def _valid_rows(offsets: Any, capacity: int, max_len: int) -> tuple[Any, Any]:
     positions = jnp.arange(capacity, dtype=jnp.int32)
     groups = _segment_id_by_cumsum(offsets[1:-1], capacity)
