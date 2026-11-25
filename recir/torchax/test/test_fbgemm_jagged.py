@@ -473,6 +473,71 @@ class RecirJaggedOpsMultiDeviceJitTest(unittest.TestCase):
             np.testing.assert_allclose(np.asarray(left), vl)
             np.testing.assert_allclose(np.asarray(right), vr)
 
+    def test_split_backward_with_uneven_per_device_totals_multidevice_jit(
+        self,
+    ) -> None:
+        """split's backward when devices hold different left/right totals.
+
+        The lowering gives every device the same left and right shard sizes. A
+        device whose right part is short of its share has more left rows than its
+        left shard: the forward drops them, so the backward (concat) must give them
+        zero rather than rows read from the right-gradient shard, which would copy
+        real gradients onto rows the forward never used.
+        """
+        import jax
+        import jax.numpy as jnp
+        import numpy as np
+        from recir.torchax.ops.jagged_ops import (
+            _recir_concat_2d_jagged,
+            _recir_split_2d_jagged,
+        )
+
+        w = len(jax.devices())
+        if w < 2:
+            self.skipTest("need >= 2 jax devices")
+        keep, block, right_share = 4, 40, 12
+        # Per device: real samples, then a dummy sample absorbing the rest of the
+        # block. Even devices fill their right share; odd ones fall 3 rows short.
+        lengths = []
+        for device in range(w):
+            real = [7, 6] if device % 2 == 0 else [2, 3]
+            lengths += real + [block - sum(real)]
+        lb = np.array([min(n, keep) for n in lengths], dtype=np.int32)
+        la = np.array(lengths, dtype=np.int32) - lb
+        ol = np.array(_offsets(la.tolist()), dtype=np.int32)
+        orr = np.array(_offsets(lb.tolist()), dtype=np.int32)
+        seq_a, seq_b = w * (block - right_share), w * right_share
+
+        grad_right = np.arange(1, seq_b + 1, dtype=np.float32)
+        grad = jax.jit(lambda gl, a, gr, c: _recir_concat_2d_jagged(gl, a, gr, c))(
+            jnp.zeros((seq_a,), jnp.float32),
+            jnp.asarray(ol),
+            jnp.asarray(grad_right),
+            jnp.asarray(orr),
+        )
+
+        # Each device's right-gradient rows go back to the last `keep` rows of its
+        # samples, in order; every other row gets zero.
+        expected = np.zeros(w * block, dtype=np.float32)
+        per_device = len(lengths) // w
+        for device in range(w):
+            row, src = device * block, device * right_share
+            for n in lengths[device * per_device : (device + 1) * per_device]:
+                right = min(n, keep)
+                expected[row + n - right : row + n] = grad_right[src : src + right]
+                row, src = row + n, src + right
+        np.testing.assert_array_equal(np.asarray(grad), expected)
+
+        # The forward this is the backward of keeps exactly those rows.
+        values = np.arange(w * block, dtype=np.float32)
+        _, right = jax.jit(
+            lambda v, a, c: _recir_split_2d_jagged(v, a, c, seq_a, seq_b)
+        )(jnp.asarray(values), jnp.asarray(ol), jnp.asarray(orr))
+        kept = np.flatnonzero(expected)
+        np.testing.assert_array_equal(
+            np.sort(np.asarray(right)[np.asarray(right) > 0]), values[kept]
+        )
+
 
 class RecirConcatJaggedEdgeCaseTest(unittest.TestCase):
     """Empty and zero-length operands for ``_jax_concat_2d_jagged`` -- shapes a
