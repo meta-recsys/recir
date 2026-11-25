@@ -39,6 +39,10 @@ import jax.numpy as jnp
 import numpy as np
 from jax.sharding import NamedSharding, PartitionSpec as P
 from recir.lowering.xla_lower import _single_device_array_to_numpy_uncached
+from recir.ops.pallas.embeddings.sorted_segment_sum import (
+    sorted_segment_sum,
+    sorted_segment_sum_enabled,
+)
 from recir.ops.pallas.embeddings.sparsecore_rowwise_adagrad import (
     fp16_rounding_key,
     rowwise_adagrad_update,
@@ -642,11 +646,15 @@ class SparseCoreRowwiseTables:
             rounding_key: Optional[jax.Array],
         ) -> Any:
             cap, dim = caps[stack], g.shape[1]
-            send = jnp.zeros((world * cap + 1, dim), jnp.float32)
-            send = send.at[dest].add(g, indices_are_sorted=True)[:-1]
-            recv = jax.lax.all_to_all(
-                send.astype(transfer).reshape(world, cap, dim), axis, 0, 0
-            )
+            if sorted_segment_sum_enabled():
+                send = sorted_segment_sum(
+                    g, dest, world * cap, scale=self._grad_scale, out_dtype=transfer
+                )
+            else:
+                send = jnp.zeros((world * cap + 1, dim), jnp.float32)
+                send = send.at[dest].add(self._grad_scale * g, indices_are_sorted=True)
+                send = send[:-1].astype(transfer)
+            recv = jax.lax.all_to_all(send.reshape(world, cap, dim), axis, 0, 0)
             recv_rows = jax.lax.all_to_all(
                 send_rows.reshape(world, cap), axis, 0, 0
             ).reshape(-1)
@@ -708,7 +716,7 @@ class SparseCoreRowwiseTables:
                 )
                 w, m = exchange_update(
                     stack,
-                    self._grad_scale * sorted_grads[stack],
+                    sorted_grads[stack],
                     sorted_dest[stack],
                     send_rows[stack],
                     lr,
