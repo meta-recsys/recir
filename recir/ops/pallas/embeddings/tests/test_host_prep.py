@@ -30,10 +30,12 @@ is exercised by the real-TPU correctness tests under
 from __future__ import annotations
 
 import unittest
+from functools import partial
 
 import jax
 import jax.numpy as jnp
 import numpy as np
+from recir.ops.pallas.embeddings.pad_cast_dma import pad_cast_dma
 from recir.ops.pallas.embeddings.ringshift import (
     _block_to_mod_ids,
     _bucketize_and_sort,
@@ -48,8 +50,39 @@ from recir.ops.pallas.embeddings.ringshift import (
     _split_traffic_ringshift_globalpad,
     _TILE_INT32,
     _unpad_per_peer,
+    _unpad_per_peer_to_caller,
     ringshift_embedding_lookup_reference,
 )
+
+
+class PadCastIndexMapTest(unittest.TestCase):
+    def test_grid_indices_stay_int32_with_x64_enabled(self) -> None:
+        previous = jax.config.read("jax_enable_x64")
+        try:
+            for enabled in (False, True):
+                jax.config.update("jax_enable_x64", enabled)
+                traced = jax.make_jaxpr(pad_cast_dma)(
+                    jax.ShapeDtypeStruct((257, 256), jnp.float32),
+                    jax.ShapeDtypeStruct((128,), jnp.int32),
+                    jax.ShapeDtypeStruct((128,), jnp.int32),
+                )
+                calls = [
+                    equation
+                    for equation in traced.jaxpr.eqns
+                    if equation.primitive.name == "pallas_call"
+                ]
+                self.assertEqual(len(calls), 1)
+                output_mapping = calls[0].params["grid_mapping"].block_mappings[-1]
+                with self.subTest(x64=enabled):
+                    self.assertEqual(
+                        [
+                            aval.dtype
+                            for aval in output_mapping.index_map_jaxpr.out_avals
+                        ],
+                        [jnp.dtype("int32"), jnp.dtype("int32")],
+                    )
+        finally:
+            jax.config.update("jax_enable_x64", previous)
 
 
 class SortPayloadTest(unittest.TestCase):
@@ -93,7 +126,7 @@ class CountDestinationsTest(unittest.TestCase):
         for world_size in (1, 4, 128):
             for size in (0, 1, 17, 1024, 1025):
                 inputs = (
-                    rng.integers(0, world_size + 1, size=size).astype(np.int32),
+                    rng.integers(0, world_size + 1, size=size).astype(np.dtype("int32")),
                     np.full(size, world_size, dtype=np.int32),
                     np.zeros(size, dtype=np.int32),
                 )
@@ -478,6 +511,66 @@ class PadUnpadTest(unittest.TestCase):
             world_size,
         )
         self.assertEqual(padded.dtype, jnp.float32)
+
+
+class ComposedUnpadTest(unittest.TestCase):
+    def test_caller_order_matches_separate_unpad_and_permutation(self) -> None:
+        rng = np.random.default_rng(347)
+        for size, world_size in ((0, 4), (17, 4), (513, 128)):
+            ids = jnp.asarray(rng.integers(0, 1024, size=size, dtype=np.dtype("int32")))
+            for valid_count in {0, max(size - 7, 0), size}:
+                _, counts, perm, inverse = _bucketize_and_sort(
+                    ids, jnp.int32(valid_count), size, world_size
+                )
+                padded_counts = _round_up_tile(counts, _TILE_INT32)
+                capacity = size + world_size * _TILE_INT32
+                payload = jnp.arange(capacity * 128, dtype=jnp.float32).reshape(
+                    capacity, 128
+                )
+                original = jax.jit(
+                    partial(
+                        _unpad_per_peer,
+                        max_local_ids=size,
+                        max_padded=capacity,
+                        world_size=world_size,
+                    )
+                )(payload, counts, padded_counts)[inverse]
+                actual = jax.jit(_unpad_per_peer_to_caller)(
+                    payload, counts, padded_counts, perm
+                )
+                with self.subTest(size=size, valid_count=valid_count):
+                    np.testing.assert_array_equal(actual, original)
+                    np.testing.assert_array_equal(actual[valid_count:], 0)
+                    self.assertEqual((size, 128), actual.shape)
+
+    def test_raw_float_payload_matches_original_select_semantics(self) -> None:
+        ids = jnp.array([5, 5, 7, 12, 5, 0], dtype=jnp.int32)
+        _, counts, perm, inverse = _bucketize_and_sort(ids, jnp.int32(5), 6, 4)
+        padded_counts = _round_up_tile(counts, _TILE_INT32)
+        capacity = ids.shape[0] + 4 * _TILE_INT32
+        patterns = (
+            (jnp.float32, jnp.uint32, [0, 0x80000000, 0x7FC12345, 0xFFC12345, 1]),
+            (jnp.bfloat16, jnp.uint16, [0, 0x8000, 0x7FC1, 0xFFC5, 1]),
+        )
+        for dtype, raw_dtype, bits in patterns:
+            raw = jnp.resize(jnp.asarray(bits, dtype=raw_dtype), (capacity, 128))
+            payload = jax.lax.bitcast_convert_type(raw, dtype)
+            original = jax.jit(
+                partial(
+                    _unpad_per_peer,
+                    max_local_ids=6,
+                    max_padded=capacity,
+                    world_size=4,
+                )
+            )(payload, counts, padded_counts)[inverse]
+            actual = jax.jit(_unpad_per_peer_to_caller)(
+                payload, counts, padded_counts, perm
+            )
+            with self.subTest(dtype=str(dtype)):
+                np.testing.assert_array_equal(
+                    np.asarray(actual).view(np.uint8),
+                    np.asarray(original).view(np.uint8),
+                )
 
 
 class RingshiftSplitterTest(unittest.TestCase):
