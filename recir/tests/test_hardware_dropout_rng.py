@@ -9,7 +9,7 @@ import jax.numpy as jnp
 import numpy as np
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
 from recir.torchax.gspmd_context import gspmd_mesh_context
-from recir.torchax.ops.jrandom import _jbernoulli_keyed
+from recir.torchax.ops.jrandom import _bernoulli, _jbernoulli_keyed
 
 
 class HardwareRNGTests(unittest.TestCase):
@@ -139,3 +139,129 @@ class HardwareRNGTests(unittest.TestCase):
                 abs(float(np.mean(np.asarray(first) == np.asarray(second))) - 0.82),
                 0.005,
             )
+
+    def test_the_two_halves_of_an_rbg_word_are_independent(self) -> None:
+        """The 16-bit mask takes two draws from one 32-bit RBG word. If the
+        halves correlated, the paired masks would agree more often than
+        p**2 + (1 - p)**2 and dropout would stop being independent per row."""
+        p = 0.9
+        rows = 8192
+        with patch.dict(os.environ, {"RECIR_DROPOUT_MASK_BITS": "16"}):
+            mask = np.asarray(
+                jax.jit(
+                    lambda: _bernoulli(jax.random.key(0, impl="rbg"), p, (rows, 32))
+                )()
+            )
+
+        agree = float(np.mean(mask[: rows // 2] == mask[rows // 2 :]))
+        self.assertLess(abs(agree - (p**2 + (1 - p) ** 2)), 0.005)
+        self.assertLess(abs(float(mask.mean()) - p), 0.005)
+
+    def test_sixteen_bit_masks_need_the_rbg_impl(self) -> None:
+        """Without this the flag is a silent no-op and an A/B of it would
+        compare two 32-bit draws."""
+        with patch.dict(
+            os.environ,
+            {
+                "RECIR_DROPOUT_MASK_BITS": "16",
+                "RECIR_DROPOUT_PRNG_IMPL": "threefry2x32",
+            },
+        ):
+            with self.assertRaisesRegex(ValueError, "RECIR_DROPOUT_PRNG_IMPL=rbg"):
+                _jbernoulli_keyed(jnp.zeros((32, 16)), 0.9, jnp.uint32(0), 2, 0)
+
+    def test_an_odd_leading_dimension_cannot_pair_and_says_so(self) -> None:
+        with patch.dict(os.environ, {"RECIR_DROPOUT_MASK_BITS": "16"}):
+            with self.assertLogs("recir.torchax.ops.jrandom", level="WARNING"):
+                mask = jax.jit(
+                    lambda: _bernoulli(jax.random.key(0, impl="rbg"), 0.9, (7, 16))
+                )()
+
+        self.assertEqual(mask.shape, (7, 16))
+
+    def test_an_unshardable_shape_still_honours_the_mask_bits(self) -> None:
+        """The axis-is-None fallback used to bypass _bernoulli, so the flag
+        went unhonoured on exactly the shapes that log a warning."""
+        with patch.dict(
+            os.environ,
+            {"RECIR_DROPOUT_MASK_BITS": "16", "RECIR_DROPOUT_PRNG_IMPL": "rbg"},
+        ):
+            with self.assertLogs("recir.torchax.ops.jrandom", level="WARNING"):
+                mask = np.asarray(
+                    jax.jit(
+                        lambda: _jbernoulli_keyed(
+                            jnp.zeros((8190, 5)), 0.9, jnp.uint32(500), 2, 0
+                        )
+                    )()
+                )
+
+        key = jax.random.fold_in(jax.random.key(0, impl="rbg"), jnp.uint32(500))
+        key = jax.random.fold_in(key, 2)
+        with patch.dict(os.environ, {"RECIR_DROPOUT_MASK_BITS": "16"}):
+            expected = np.asarray(jax.jit(lambda: _bernoulli(key, 0.9, (8190, 5)))())
+        np.testing.assert_array_equal(mask, expected.astype(mask.dtype))
+
+
+class HashDropoutTests(unittest.TestCase):
+    def _mask(self, shape, p=0.9, counter=500, site=2, **jit_kwargs):
+        with patch.dict(os.environ, {"RECIR_DROPOUT_PRNG_IMPL": "hash"}):
+            return np.asarray(
+                jax.jit(
+                    lambda: _jbernoulli_keyed(
+                        jnp.zeros(shape), p, jnp.uint32(counter), site, 0
+                    ),
+                    **jit_kwargs,
+                )()
+            )
+
+    def test_keeps_each_element_with_the_16_bit_probability(self) -> None:
+        mask = self._mask((8192, 32))
+        self.assertEqual(set(np.unique(mask)), {0.0, 1.0})
+        # 262144 draws: five standard deviations are 0.003.
+        self.assertLess(abs(float(mask.mean()) - round(0.9 * 65536) / 65536), 0.003)
+        # Rows and columns are not correlated.
+        self.assertLess(float(np.abs(mask.mean(axis=1) - 0.9).max()), 0.3)
+        self.assertLess(float(np.abs(mask.mean(axis=0) - 0.9).max()), 0.02)
+
+    def test_counter_and_site_give_independent_masks(self) -> None:
+        first = self._mask((8192, 32))
+        np.testing.assert_array_equal(first, self._mask((8192, 32)))
+        for other in (
+            self._mask((8192, 32), site=3),
+            self._mask((8192, 32), counter=501),
+        ):
+            # Two independent masks agree with probability 0.9^2 + 0.1^2.
+            self.assertLess(abs(float(np.mean(first == other)) - 0.82), 0.005)
+
+    def test_positions_within_one_mask_are_independent(self) -> None:
+        """A row is hashed once and the hash reused for every column, so two
+        elements of one mask could agree more often than chance. The marginal
+        rates above cannot see that -- a mask whose columns were all copies of
+        one draw would pass them. Comparing the mask with itself shifted along
+        each axis is what measures it.
+        """
+        p = 0.9
+        agree = p**2 + (1 - p) ** 2
+        mask = self._mask((8192, 32), p=p).astype(bool)
+        # ~2.6e5 pairs per comparison: five standard deviations are ~0.004.
+        for name, a, b in (
+            ("column+1", mask[:, :-1], mask[:, 1:]),
+            ("column+7", mask[:, :-7], mask[:, 7:]),
+            ("row+1", mask[:-1, :], mask[1:, :]),
+            ("row+256", mask[:-256, :], mask[256:, :]),
+            ("diagonal", mask[:-1, :-1], mask[1:, 1:]),
+        ):
+            with self.subTest(shift=name):
+                self.assertLess(abs(float(np.mean(a == b)) - agree), 0.005)
+
+    def test_mask_depends_only_on_position_not_on_the_mesh(self) -> None:
+        shape = (4 * 1024, 16)
+        mesh = Mesh(np.asarray(jax.devices())[:4], ("batch",))
+        sharding = NamedSharding(mesh, PartitionSpec("batch", None))
+        with gspmd_mesh_context(mesh, "batch", 4, False):
+            sharded = self._mask(shape, out_shardings=sharding)
+        np.testing.assert_array_equal(sharded, self._mask(shape))
+
+    def test_probability_edges(self) -> None:
+        np.testing.assert_array_equal(self._mask((32, 16), p=0.0), 0.0)
+        np.testing.assert_array_equal(self._mask((32, 16), p=1.0), 1.0)

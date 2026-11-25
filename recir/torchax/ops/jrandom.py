@@ -6,6 +6,7 @@
 """Torchax JAX lowerings for explicitly keyed random ops."""
 
 import logging
+import math
 import os
 from typing import Any, cast
 
@@ -15,7 +16,7 @@ import jax.numpy as jnp
 # Defines torch.ops.recir.bernoulli_keyed (schema + fallbacks) before registering.
 import recir.ops.random_op  # noqa: F401
 import torch
-from jax.sharding import PartitionSpec as P
+from jax.sharding import NamedSharding, PartitionSpec as P
 from recir.torchax.gspmd_context import (
     batch_mesh_layout,
     batch_shard_index,
@@ -24,6 +25,33 @@ from recir.torchax.gspmd_context import (
 from recir.torchax.ops.decorators import op
 
 logger: logging.Logger = logging.getLogger(__name__)
+
+
+def _bernoulli(key: Any, p: Any, shape: tuple[int, ...]) -> Any:
+    """``jax.random.bernoulli``, or with ``RECIR_DROPOUT_MASK_BITS=16`` two masks per
+    32-bit RBG word.
+
+    Halving the generated words halves rng-bit-generator time. The keep
+    probability becomes ``round(p * 2**16) / 2**16`` (0.89999 for 0.9) and the
+    masks differ from the 32-bit draw, so it is opt-in.
+    """
+    bits = os.environ.get("RECIR_DROPOUT_MASK_BITS", "32")
+    if bits not in ("16", "32"):
+        raise ValueError(f"Unsupported RECIR_DROPOUT_MASK_BITS: {bits}")
+    if bits == "32":
+        return jax.random.bernoulli(key, p, shape)
+    if not shape or shape[0] % 2:
+        logger.warning(
+            "[Dropout hardware RNG] RECIR_DROPOUT_MASK_BITS=16 needs an even "
+            "leading dimension; shape=%s draws 32-bit masks",
+            shape,
+        )
+        return jax.random.bernoulli(key, p, shape)
+    words = jax.random.bits(key, (shape[0] // 2, *shape[1:]), jnp.uint32)
+    threshold = jnp.round(jnp.asarray(p, jnp.float32) * 65536).astype(jnp.uint32)
+    return jnp.concatenate(
+        ((words & 0xFFFF) < threshold, (words >> 16) < threshold), axis=0
+    )
 
 
 def _hardware_bernoulli_mask(key: Any, shape: tuple[int, ...], p: Any) -> Any:
@@ -39,7 +67,7 @@ def _hardware_bernoulli_mask(key: Any, shape: tuple[int, ...], p: Any) -> Any:
         )
     probability = jnp.asarray(p, dtype=jnp.float32)
     if chips <= 1:
-        return jax.random.bernoulli(jax.random.fold_in(key, 0), probability, shape)
+        return _bernoulli(jax.random.fold_in(key, 0), probability, shape)
     if axis is None:
         logger.warning(
             "[Dropout hardware RNG] no shardable axis for shape=%s chips=%d; "
@@ -47,18 +75,59 @@ def _hardware_bernoulli_mask(key: Any, shape: tuple[int, ...], p: Any) -> Any:
             shape,
             chips,
         )
-        return jax.random.bernoulli(key, probability, shape)
+        return _bernoulli(key, probability, shape)
     local_shape = (*shape[:axis], shape[axis] // chips, *shape[axis + 1 :])
     spec = P(*(resource if i == axis else None for i in range(len(shape))))
 
     def per_chip(local_key: Any) -> Any:
         chip_index = batch_shard_index(mesh, resource)
         local_key = jax.random.fold_in(local_key, chip_index)
-        return jax.random.bernoulli(local_key, probability, local_shape)
+        return _bernoulli(local_key, probability, local_shape)
 
     return jax.shard_map(
         per_chip, mesh=mesh, in_specs=P(), out_specs=spec, check_vma=False
     )(key)
+
+
+def _hash32(x: Any) -> Any:
+    """A bijective mix of uint32 values (the lowbias32 integer finalizer)."""
+    x = x ^ (x >> 16)
+    x = x * jnp.uint32(0x7FEB352D)
+    x = x ^ (x >> 15)
+    x = x * jnp.uint32(0x846CA68B)
+    return x ^ (x >> 16)
+
+
+def _hash_bernoulli_mask(key: Any, shape: tuple[int, ...], p: Any) -> Any:
+    """Keep mask from a hash of each element's (row, column) position, the last
+    dimension being the column, with 16-bit precision like
+    ``RECIR_DROPOUT_MASK_BITS=16``.
+
+    The mask is elementwise in its position, so XLA computes it inside the
+    fusions that consume it instead of materializing random bits, and each chip
+    computes only its own rows of the batch-sharded mask. Rows are hashed once
+    and broadcast, so each element costs one hash.
+    """
+    shape = shape or (1,)
+    if math.prod(shape[:-1]) >= 1 << 32:
+        raise ValueError(f"Dropout mask rows overflow uint32: shape={shape}")
+    row_shape = (*shape[:-1], 1)
+    row = jnp.zeros(row_shape, jnp.uint32)
+    stride = 1
+    for axis in reversed(range(len(shape) - 1)):
+        row = row + jax.lax.broadcasted_iota(jnp.uint32, row_shape, axis) * jnp.uint32(
+            stride
+        )
+        stride *= shape[axis]
+    column = jax.lax.broadcasted_iota(jnp.uint32, shape, len(shape) - 1)
+    mesh, resource, chips = batch_mesh_layout("dropout_chips")
+    if chips > 1 and shape[0] % chips == 0:
+        spec = P(resource, *(None,) * (len(shape) - 1))
+        row = jax.lax.with_sharding_constraint(row, NamedSharding(mesh, spec))
+        column = jax.lax.with_sharding_constraint(column, NamedSharding(mesh, spec))
+    bits = _hash32(_hash32(row ^ key) ^ column)
+    threshold = jnp.round(jnp.asarray(p, jnp.float32) * 65536).astype(jnp.uint32)
+    return (bits >> 16) < threshold
 
 
 def _fold_counter(counter: Any) -> Any:
@@ -81,8 +150,22 @@ def _jbernoulli_keyed(
     base_seed: Any,
 ) -> Any:
     impl = os.environ.get("RECIR_DROPOUT_PRNG_IMPL", "threefry2x32")
-    if impl not in ("threefry2x32", "rbg"):
+    if impl not in ("threefry2x32", "rbg", "hash"):
         raise ValueError(f"Unsupported dropout PRNG implementation: {impl}")
+    if impl == "hash":
+        key = _hash32(
+            _hash32(jnp.uint32(base_seed % (1 << 32))) ^ _fold_counter(counter)
+        )
+        key = _hash32(key ^ jnp.uint32(site))
+        mask = _hash_bernoulli_mask(key, tuple(self.shape), p)
+        return mask.reshape(self.shape).astype(self.dtype)
+    if os.environ.get("RECIR_DROPOUT_MASK_BITS", "32") == "16" and impl != "rbg":
+        # Only the RBG path draws the paired masks, so letting this through
+        # would measure a 32-bit draw and report it as the 16-bit one.
+        raise ValueError(
+            "RECIR_DROPOUT_MASK_BITS=16 needs RECIR_DROPOUT_PRNG_IMPL=rbg; "
+            f"impl={impl} draws 32-bit masks"
+        )
     if impl == "rbg":
         key = jax.random.key(base_seed, impl="rbg")
         key = jax.random.fold_in(key, _fold_counter(counter))
