@@ -69,7 +69,7 @@ def _jax_jagged_to_padded_dense_impl(
     )
 
 
-def _jax_dense_to_jagged_forward_impl(
+def _jax_dense_to_jagged_scatter_impl(
     dense: Any,
     offsets: Any,
     total_L: Any = None,
@@ -92,6 +92,68 @@ def _jax_dense_to_jagged_forward_impl(
         jnp.zeros((n,) + feature, dtype=dense.dtype),
         (seq_offsets[b],) + zeros_tail,
     )[:total_L]
+
+
+@jax.custom_jvp
+def _positive_zero(x: Any) -> Any:
+    return jnp.where(x == 0, jnp.zeros_like(x), x)
+
+
+@_positive_zero.defjvp
+def _positive_zero_jvp(primals: tuple[Any], tangents: tuple[Any]) -> tuple[Any, Any]:
+    return _positive_zero(primals[0]), tangents[0]
+
+
+def _jax_dense_to_jagged_gather_impl(
+    dense: Any, offsets: Any, total_L: Any = None
+) -> Any:
+    """Gather the represented prefix of each sequence into packed rows."""
+    seq_offsets = offsets[0]
+    b, n = dense.shape[:2]
+    if total_L is None:
+        total_L = b * n
+    if total_L == 0 or b == 0 or n == 0:
+        return jnp.zeros((total_L, *dense.shape[2:]), dtype=dense.dtype)
+
+    def gather() -> Any:
+        positions = jnp.arange(total_L, dtype=jnp.int32)
+        groups = jnp.minimum(_segment_id_by_cumsum(seq_offsets[1:-1], total_L), b - 1)
+        starts = _segment_broadcast(seq_offsets[:-1], seq_offsets[:-1], total_L)
+        local = positions - starts
+        valid = (positions < seq_offsets[-1]) & (local < n)
+        indices = jnp.clip(groups * n + local, 0, b * n - 1)
+        flat = dense.reshape((b * n, *dense.shape[2:]))
+        packed = os.environ.get("RECIR_PACKED_JAGGED_INT64", "0")
+        if packed not in ("0", "1"):
+            raise ValueError(f"invalid RECIR_PACKED_JAGGED_INT64: {packed!r}")
+        if packed == "1" and dense.dtype in (jnp.int64, jnp.uint64):
+            words = jax.lax.bitcast_convert_type(flat, jnp.uint32)
+            result = jax.lax.bitcast_convert_type(words[indices], dense.dtype)
+        else:
+            result = flat[indices]
+        result = jnp.where(_bcast_mask(valid, result.ndim), result, 0)
+        if jnp.issubdtype(result.dtype, jnp.floating):
+            return _positive_zero(result)
+        return result + jnp.zeros_like(result)
+
+    lengths = jnp.diff(seq_offsets)
+    fits = (seq_offsets[0] == 0) & jnp.all(lengths >= 0) & (seq_offsets[-1] <= total_L)
+    return jax.lax.cond(
+        fits,
+        gather,
+        lambda: _jax_dense_to_jagged_scatter_impl(dense, offsets, total_L),
+    )
+
+
+def _jax_dense_to_jagged_forward_impl(
+    dense: Any, offsets: Any, total_L: Any = None
+) -> Any:
+    gather = os.environ.get("RECIR_DENSE_TO_JAGGED_GATHER", "0")
+    if gather not in ("0", "1"):
+        raise ValueError(f"invalid RECIR_DENSE_TO_JAGGED_GATHER: {gather!r}")
+    if gather == "1":
+        return _jax_dense_to_jagged_gather_impl(dense, offsets, total_L)
+    return _jax_dense_to_jagged_scatter_impl(dense, offsets, total_L)
 
 
 @op(torch.ops.recir.dense_to_jagged.default)  # pyre-ignore[56]
@@ -258,7 +320,88 @@ def _segment_broadcast(per_segment: Any, starts: Any, n: int) -> Any:
     return jnp.cumsum(delta)
 
 
+def _segment_dma_enabled(values: Any) -> bool:
+    implementation = os.environ.get("RECIR_JAGGED_CONCAT_SPLIT_IMPL", "gather")
+    if implementation not in ("gather", "segment_dma", "output_tile_dma"):
+        raise ValueError(f"Invalid RECIR_JAGGED_CONCAT_SPLIT_IMPL: {implementation!r}")
+    return implementation != "gather" and values.dtype in (
+        jnp.bfloat16,
+        jnp.float32,
+        jnp.int32,
+        jnp.uint32,
+        jnp.int64,
+        jnp.uint64,
+    )
+
+
 def _jax_concat_2d_jagged(
+    values_left: Any,
+    offsets_left: Any,
+    values_right: Any,
+    offsets_right: Any,
+    out_total: int,
+) -> Any:
+    if not _segment_dma_enabled(values_left) or values_left.dtype != values_right.dtype:
+        return _jax_concat_2d_jagged_gather(
+            values_left, offsets_left, values_right, offsets_right, out_total
+        )
+    from recir.torchax.ops.jagged_dma_ops import (
+        concat_jagged_dma,
+        concat_jagged_tiled_dma,
+    )
+
+    concat = (
+        concat_jagged_tiled_dma
+        if os.environ["RECIR_JAGGED_CONCAT_SPLIT_IMPL"] == "output_tile_dma"
+        else concat_jagged_dma
+    )
+
+    valid_sources = (offsets_left[-1] <= values_left.shape[0]) & (
+        offsets_right[-1] <= values_right.shape[0]
+    )
+    return jax.lax.cond(
+        valid_sources,
+        lambda: concat(
+            values_left, offsets_left, values_right, offsets_right, out_total
+        ),
+        lambda: _jax_concat_2d_jagged_gather(
+            values_left, offsets_left, values_right, offsets_right, out_total
+        ),
+    )
+
+
+def _jax_split_2d_jagged(
+    values: Any,
+    offsets_left: Any,
+    offsets_right: Any,
+    seq_len_a: int,
+    seq_len_b: int,
+) -> Any:
+    if not _segment_dma_enabled(values):
+        return _jax_split_2d_jagged_gather(
+            values, offsets_left, offsets_right, seq_len_a, seq_len_b
+        )
+    from recir.torchax.ops.jagged_dma_ops import (
+        split_jagged_dma,
+        split_jagged_tiled_dma,
+    )
+
+    split = (
+        split_jagged_tiled_dma
+        if os.environ["RECIR_JAGGED_CONCAT_SPLIT_IMPL"] == "output_tile_dma"
+        else split_jagged_dma
+    )
+
+    return jax.lax.cond(
+        offsets_left[-1] + offsets_right[-1] <= values.shape[0],
+        lambda: split(values, offsets_left, offsets_right, seq_len_a, seq_len_b),
+        lambda: _jax_split_2d_jagged_gather(
+            values, offsets_left, offsets_right, seq_len_a, seq_len_b
+        ),
+    )
+
+
+def _jax_concat_2d_jagged_gather(
     values_left: Any,
     offsets_left: Any,
     values_right: Any,
@@ -314,7 +457,7 @@ def _jax_concat_2d_jagged(
     return jnp.where(_bcast_mask(valid, out.ndim), out, 0)
 
 
-def _jax_split_2d_jagged(
+def _jax_split_2d_jagged_gather(
     values: Any,
     offsets_left: Any,
     offsets_right: Any,
@@ -486,4 +629,145 @@ def _recir_split_2d_jagged(
     return (
         _with_sharding_constraint(left, out_spec),
         _with_sharding_constraint(right, out_spec),
+    )
+
+
+def _local_offsets(lengths: Any) -> Any:
+    return jnp.concatenate([jnp.zeros(1, dtype=lengths.dtype), jnp.cumsum(lengths)])
+
+
+def _replace_last_n_destinations(
+    offsets_left: Any, offsets_right: Any, num_left: int, num_right: int
+) -> tuple[Any, Any]:
+    """The left row each right row replaces (distinct out-of-range rows if none).
+
+    Right row ``i`` of sequence ``b`` replaces left row
+    ``offsets_left[b + 1] - (offsets_right[b + 1] - i)`` when that row is still
+    inside sequence ``b``, so only the right rows are touched instead of every
+    left row.
+    """
+    rows = jnp.arange(num_right, dtype=jnp.int32)
+    groups = jnp.minimum(
+        _segment_id_by_cumsum(offsets_right[1:-1], num_right),
+        offsets_right.shape[0] - 2,
+    )
+    left_end = offsets_left[1:].astype(jnp.int32)[groups]
+    right_end = offsets_right[1:].astype(jnp.int32)[groups]
+    destination = left_end - (right_end - rows)
+    valid = (rows < offsets_right[-1]) & (
+        destination >= offsets_left[:-1].astype(jnp.int32)[groups]
+    )
+    return jnp.where(valid, destination, num_left + rows), valid
+
+
+def _jax_replace_last_n_jagged(
+    values_left: Any, offsets_left: Any, values_right: Any, offsets_right: Any
+) -> Any:
+    if values_right.shape[0] == 0 or offsets_right.shape[0] < 2:
+        return values_left
+    destination, _ = _replace_last_n_destinations(
+        offsets_left, offsets_right, values_left.shape[0], values_right.shape[0]
+    )
+    return values_left.at[destination].set(
+        values_right, mode="drop", unique_indices=True
+    )
+
+
+def _jax_replace_last_n_jagged_backward(
+    grad: Any, offsets_left: Any, offsets_right: Any, num_right: int
+) -> tuple[Any, Any]:
+    if num_right == 0 or offsets_right.shape[0] < 2:
+        return grad, jnp.zeros((num_right, *grad.shape[1:]), grad.dtype)
+    destination, valid = _replace_last_n_destinations(
+        offsets_left, offsets_right, grad.shape[0], num_right
+    )
+    grad_right = jnp.where(
+        _bcast_mask(valid, grad.ndim),
+        grad[jnp.minimum(destination, grad.shape[0] - 1)],
+        0,
+    )
+    grad_left = grad.at[destination].set(0, mode="drop", unique_indices=True)
+    # The CPU form accumulates into zeros with index_add, which turns -0.0 into 0.0.
+    return grad_left, _positive_zero(grad_right)
+
+
+def _shard_replace_last_n(
+    fn: Any,
+    row_inputs: tuple[Any, ...],
+    offsets_left: Any,
+    offsets_right: Any,
+    out_specs: Any,
+) -> Any:
+    """Run ``fn(*row_shards, local_offsets_left, local_offsets_right)`` per device."""
+    world_size = len(jax.devices())
+    for x in row_inputs:
+        assert x.shape[0] % world_size == 0, (
+            f"replace rows {x.shape[0]} must be divisible by world_size={world_size}"
+        )
+
+    def _per_device(*args: Any) -> Any:
+        *shards, lengths_left, lengths_right = args
+        return fn(*shards, _local_offsets(lengths_left), _local_offsets(lengths_right))
+
+    row_specs = tuple(P(*([_DP_AXIS] + [None] * (x.ndim - 1))) for x in row_inputs)
+    return jax.shard_map(
+        _per_device,
+        mesh=Mesh(jax.devices(), (_DP_AXIS,)),
+        in_specs=(*row_specs, P(_DP_AXIS), P(_DP_AXIS)),
+        out_specs=out_specs,
+        check_vma=False,
+        # pyrefly: ignore [bad-argument-count]
+    )(*row_inputs, jnp.diff(offsets_left), jnp.diff(offsets_right))
+
+
+@op(torch.ops.recir.replace_last_n_jagged.default)  # pyre-ignore[56]
+def _recir_replace_last_n_jagged(
+    values_left: Any, offsets_left: Any, values_right: Any, offsets_right: Any
+) -> Any:
+    """recir::replace_last_n_jagged lowering: scatter the right rows inside shard_map."""
+    if len(jax.devices()) <= 1:
+        return _jax_replace_last_n_jagged(
+            values_left, offsets_left, values_right, offsets_right
+        )
+    out_spec = P(*([_DP_AXIS] + [None] * (values_left.ndim - 1)))
+    result = _shard_replace_last_n(
+        lambda left, right, off_l, off_r: _jax_replace_last_n_jagged(
+            left, off_l, right, off_r
+        ),
+        (values_left, values_right),
+        offsets_left,
+        offsets_right,
+        out_spec,
+    )
+    return _with_sharding_constraint(result, out_spec)
+
+
+@op(torch.ops.recir.replace_last_n_jagged_backward.default)  # pyre-ignore[56]
+def _recir_replace_last_n_jagged_backward(
+    grad: Any, offsets_left: Any, offsets_right: Any, num_right: int
+) -> Any:
+    """recir::replace_last_n_jagged_backward lowering inside shard_map."""
+    world_size = len(jax.devices())
+    if world_size <= 1:
+        return _jax_replace_last_n_jagged_backward(
+            grad, offsets_left, offsets_right, num_right
+        )
+    assert num_right % world_size == 0, (
+        f"replace rows {num_right} must be divisible by world_size={world_size}"
+    )
+    local_right = num_right // world_size
+    out_spec = P(*([_DP_AXIS] + [None] * (grad.ndim - 1)))
+    # pyrefly: ignore [not-iterable]
+    grad_left, grad_right = _shard_replace_last_n(
+        lambda g, off_l, off_r: _jax_replace_last_n_jagged_backward(
+            g, off_l, off_r, local_right
+        ),
+        (grad,),
+        offsets_left,
+        offsets_right,
+        (out_spec, out_spec),
+    )
+    return (
+        _with_sharding_constraint(grad_left, out_spec),
+        _with_sharding_constraint(grad_right, out_spec),
     )
