@@ -26,6 +26,12 @@ _LIB.define(
 _LIB.define(
     "packed_jagged_add_backward(Tensor grad, Tensor bias, Tensor offsets, int max_len) -> (Tensor, Tensor)"
 )
+_LIB.define(
+    "packed_position_add(Tensor values, Tensor position, Tensor time, Tensor position_indices, Tensor time_indices, Tensor offsets, int max_len) -> Tensor"
+)
+_LIB.define(
+    "packed_position_add_backward(Tensor grad, Tensor values, Tensor position, Tensor time, Tensor position_indices, Tensor time_indices, Tensor offsets, int max_len) -> (Tensor, Tensor, Tensor)"
+)
 
 
 
@@ -34,20 +40,103 @@ _LIB.define(
 
 
 
+def _position_add(
+    values: torch.Tensor,
+    position: torch.Tensor,
+    time: torch.Tensor,
+    position_indices: torch.Tensor,
+    time_indices: torch.Tensor,
+    offsets: torch.Tensor,
+    max_len: int,
+) -> torch.Tensor:
+    result = torch.zeros_like(values)
+    for row in range(position_indices.shape[0]):
+        start = int(offsets[row].item())
+        stop = min(int(offsets[row + 1].item()), start + max_len)
+        length = stop - start
+        embedding = (
+            time[time_indices[row, :length]] + position[position_indices[row, :length]]
+        ).to(values.dtype)
+        result[start:stop] = values[start:stop] + embedding
+    return result + torch.zeros_like(result)
 
 
+def _position_add_backward(
+    grad: torch.Tensor,
+    values: torch.Tensor,
+    position: torch.Tensor,
+    time: torch.Tensor,
+    position_indices: torch.Tensor,
+    time_indices: torch.Tensor,
+    offsets: torch.Tensor,
+    max_len: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    grad = grad.to(values.dtype)
+    dv, dp, dt = (
+        torch.zeros_like(values),
+        torch.zeros_like(position),
+        torch.zeros_like(time),
+    )
+    for row in range(position_indices.shape[0]):
+        start = int(offsets[row].item())
+        stop = min(int(offsets[row + 1].item()), start + max_len)
+        length = stop - start
+        dv[start:stop] = grad[start:stop]
+        dp.index_add_(
+            0, position_indices[row, :length], grad[start:stop].to(position.dtype)
+        )
+        dt.index_add_(0, time_indices[row, :length], grad[start:stop].to(time.dtype))
+    return dv + torch.zeros_like(dv), dp, dt
 
 
+_LIB.impl("packed_position_add", _position_add, "CompositeExplicitAutograd")
+_LIB.impl(
+    "packed_position_add_backward", _position_add_backward, "CompositeExplicitAutograd"
+)
 
 
+@torch.library.register_fake("recir::packed_position_add")
+def _position_add_fake(
+    values: torch.Tensor,
+    position: torch.Tensor,
+    time: torch.Tensor,
+    position_indices: torch.Tensor,
+    time_indices: torch.Tensor,
+    offsets: torch.Tensor,
+    max_len: int,
+) -> torch.Tensor:
+    return torch.empty_like(values)
 
 
+@torch.library.register_fake("recir::packed_position_add_backward")
+def _position_add_backward_fake(
+    grad: torch.Tensor,
+    values: torch.Tensor,
+    position: torch.Tensor,
+    time: torch.Tensor,
+    position_indices: torch.Tensor,
+    time_indices: torch.Tensor,
+    offsets: torch.Tensor,
+    max_len: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    return torch.empty_like(values), torch.empty_like(position), torch.empty_like(time)
 
 
+def _setup_position(ctx: Any, inputs: tuple[Any, ...], output: torch.Tensor) -> None:
+    *tensors, ctx.max_len = inputs
+    ctx.save_for_backward(*tensors)
 
 
+def _backward_position(ctx: Any, grad: torch.Tensor) -> tuple[Any, ...]:
+    dv, dp, dt = torch.ops.recir.packed_position_add_backward(
+        grad, *ctx.saved_tensors, ctx.max_len
+    )
+    return dv, dp, dt, None, None, None, None
 
 
+torch.library.register_autograd(
+    "recir::packed_position_add", _backward_position, setup_context=_setup_position
+)
 
 
 def _bmm(
