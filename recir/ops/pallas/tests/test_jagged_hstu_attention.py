@@ -396,6 +396,12 @@ class JaggedHSTUAttentionTest(unittest.TestCase):
         self.assertEqual(len(pallas_calls), 1)
         return traced, nested_jaxprs, pallas_calls[0]
 
+    def _pipeline_steps(self, pallas_call: Any) -> int:
+        """The most query groups or key blocks the kernel's one pipeline runs:
+        the length of its work list, the scalar operand after the four inputs."""
+        self.assertEqual(pallas_call.params["grid_mapping"].grid, (1,))
+        return pallas_call.invars[4].aval.shape[0]
+
     def _kernel_vmem_avals(self, pallas_call: Any) -> list[Any]:
         kernel_jaxpr = cast(Any, pallas_call.params["jaxpr"])
         kernel_jaxpr = cast(Any, getattr(kernel_jaxpr, "jaxpr", kernel_jaxpr))
@@ -430,7 +436,7 @@ class JaggedHSTUAttentionTest(unittest.TestCase):
         )
         # A sequence lies in the first 3,079 rows of its stage: four 1,024-row
         # query groups.
-        self.assertEqual(pallas_call.params["grid_mapping"].grid, (1, 4))
+        self.assertEqual(self._pipeline_steps(pallas_call), 4)
         self.assertEqual(pallas_call.outvars[0].aval.shape, (3072, 128))
         self.assertEqual(traced.jaxpr.outvars[0].aval.shape, (3072, 1, 128))
 
@@ -481,7 +487,7 @@ class JaggedHSTUAttentionTest(unittest.TestCase):
             block_k=256,
             query_tiles_per_program=2,
         )
-        self.assertEqual(pallas_call.params["grid_mapping"].grid, (1, 3))
+        self.assertEqual(self._pipeline_steps(pallas_call), 3)
         self.assertEqual(pallas_call.outvars[0].aval.shape, (513, 128))
         self.assertEqual(traced.jaxpr.outvars[0].aval.shape, (513, 1, 128))
 
@@ -522,7 +528,7 @@ class JaggedHSTUAttentionTest(unittest.TestCase):
         )
         # Three 256-row query tiles cover the sequence's 519 stage rows, not the
         # default four.
-        self.assertEqual(pallas_call.params["grid_mapping"].grid, (1, 1))
+        self.assertEqual(self._pipeline_steps(pallas_call), 1)
         self.assertEqual(traced.jaxpr.outvars[0].aval.shape, (512, 1, 128))
         vmem_shapes = {aval.shape for aval in self._kernel_vmem_avals(pallas_call)}
         self.assertIn((1, 768, 128), vmem_shapes)
@@ -907,7 +913,7 @@ class JaggedHSTUAttentionTest(unittest.TestCase):
 
     def test_fused_backward_accumulates_dq_over_kv_blocks(self) -> None:
         call = self._trace_fused_backward(max_seq_len=600, block=256)
-        self.assertEqual(call.params["grid_mapping"].grid, (1, 3))
+        self.assertEqual(self._pipeline_steps(call), 3)
         kernel_jaxpr = next(_walk_nested_jaxprs(call.params["jaxpr"]))
         accumulators = [
             variable.aval
