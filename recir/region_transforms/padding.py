@@ -509,10 +509,12 @@ def pad_jagged_values(
         for k in range(num_keys)
         for c in range(num_local)
     ]
-    # Each block is written once, straight into the output.
+    # Each block is written once, straight into the output. The output is zeroed
+    # in one pass first because faulting its fresh pages in block by block slows
+    # the copies ~3x.
     shape = list(values.shape)
     shape[dim] = num_local * sum(b // num_local for b in per_host_budgets)
-    out = values.new_empty(shape)
+    out = values.new_zeros(shape)
     offset = written = 0
     for k in range(num_keys):
         budget_pb = per_host_budgets[k] // num_local
@@ -524,9 +526,7 @@ def pad_jagged_values(
             written += budget_pb
             filled = min(current, budget_pb)
             block_out.narrow(dim, 0, filled).copy_(block_vals.narrow(dim, 0, filled))
-            if filled == budget_pb:
-                continue
-            if tile_pad and current > 0:
+            if tile_pad and 0 < current < budget_pb:
                 # Fill this block's deficit by tiling its own real ids instead of
                 # zero-filling. For embedding id-lists (pad positions masked out
                 # downstream) this keeps the pad tokens' block-owner distribution
@@ -538,8 +538,6 @@ def pad_jagged_values(
                     n = min(filled, budget_pb - filled)
                     block_out.narrow(dim, filled, n).copy_(block_out.narrow(dim, 0, n))
                     filled += n
-            else:
-                block_out.narrow(dim, filled, budget_pb - filled).zero_()
     if pad_id >= 0:
         _PAD_JAGGED_SIZES[pad_id] = (values.shape[dim], block_sizes, num_local)
     return out
