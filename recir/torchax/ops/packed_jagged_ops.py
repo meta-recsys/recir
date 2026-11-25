@@ -196,8 +196,13 @@ def _valid_rows(offsets: Any, capacity: int, max_len: int) -> tuple[Any, Any]:
     return groups, valid
 
 
+# Row tile of the grouped matmuls. On tpu7x 512 rows run the RankFM projections
+# 3-7x faster than 128 (fewer grid steps; group-boundary tiles cost the same).
+_GROUP_TILE_ROWS = 512
+
+
 def _pad_rows(x: Any) -> Any:
-    return jnp.pad(x, ((0, (-x.shape[0]) % 128), (0, 0)))
+    return jnp.pad(x, ((0, (-x.shape[0]) % _GROUP_TILE_ROWS), (0, 0)))
 
 
 def _native_pair_forward_enabled() -> bool:
@@ -581,7 +586,7 @@ def _packed_bmm(
             sizes,
             preferred_element_type=jnp.float32,
             tiling=(
-                128,
+                _GROUP_TILE_ROWS,
                 ((values.shape[1] + 127) // 128) * 128,
                 min(512, ((weights.shape[2] + 127) // 128) * 128),
             ),
@@ -594,7 +599,8 @@ def _packed_bmm(
 def _gmm_with_bias(lhs: Any, rhs: Any, bias: Any, sizes: Any, interpret: bool) -> Any:
     m, k = lhs.shape
     n = rhs.shape[2]
-    tm, tk, tn = 128, ((k + 127) // 128) * 128, min(512, ((n + 127) // 128) * 128)
+    tm = _GROUP_TILE_ROWS
+    tk, tn = ((k + 127) // 128) * 128, min(512, ((n + 127) // 128) * 128)
     metadata, active_tiles = make_group_metadata(
         group_sizes=sizes,
         m=m,
@@ -721,9 +727,9 @@ def _packed_bmm_backward(
             sizes,
             preferred_element_type=values.dtype,
             tiling=(
-                128,
+                _GROUP_TILE_ROWS,
                 ((grad.shape[1] + 127) // 128) * 128,
-                min(512, ((values.shape[1] + 127) // 128) * 128),
+                min(1024, ((values.shape[1] + 127) // 128) * 128),
             ),
             transpose_rhs=True,
             existing_out=jnp.zeros_like(lhs),
@@ -769,7 +775,11 @@ def _packed_weight_grad(
             rhs,
             jnp.diff(offsets).astype(jnp.int32),
             preferred_element_type=dtype,
-            tiling=(128, 128, min(512, ((grad.shape[1] + 127) // 128) * 128)),
+            tiling=(
+                _GROUP_TILE_ROWS,
+                min(1024, ((values.shape[1] + 127) // 128) * 128),
+                min(512, ((grad.shape[1] + 127) // 128) * 128),
+            ),
             interpret=interpret,
         )
     return result.astype(dtype)
