@@ -13,6 +13,7 @@ from unittest import mock
 import torch
 import torch.fx as fx
 from recir.api import make_compiled_runner
+from recir.composite import Part
 from recir.lowering.device_state import DeviceStateManager
 from recir.pipeline import (
     build_pipeline,
@@ -412,7 +413,7 @@ class PipelineTest(unittest.TestCase):
                 side_effect=get_external_object,
             ),
         ):
-            pipeline.lower_parts(lambda gm: lowered.append(gm) or gm)
+            pipeline.lower_parts(lambda part, gm: lowered.append(gm) or gm)
 
         self.assertEqual(len(lowered), 1)
         nodes = list(lowered[0].graph.nodes)
@@ -496,7 +497,7 @@ class PipelineTest(unittest.TestCase):
                 side_effect=get_external_object,
             ),
         ):
-            pipeline.lower_parts(lambda gm: lowered.append(gm) or gm)
+            pipeline.lower_parts(lambda part, gm: lowered.append(gm) or gm)
 
         nodes = list(lowered[0].graph.nodes)
         preprocessed = next(node for node in nodes if node.target is operator.add)
@@ -553,7 +554,7 @@ class PipelineTest(unittest.TestCase):
             ),
         ):
             pipeline.lower_parts(
-                lambda lowered_gm: lowered.append(lowered_gm) or lowered_gm
+                lambda part, lowered_gm: lowered.append(lowered_gm) or lowered_gm
             )
 
         targets = [node.target for node in lowered[0].graph.nodes]
@@ -750,7 +751,7 @@ class PipelineTest(unittest.TestCase):
         self.assertIsInstance(pipeline, SteadyStateGraphModule)
         lowered: list[fx.GraphModule] = []
 
-        def lower(gm: fx.GraphModule) -> torch.nn.Module:
+        def lower(part: Part, gm: fx.GraphModule) -> torch.nn.Module:
             lowered.append(gm)
             return gm
 

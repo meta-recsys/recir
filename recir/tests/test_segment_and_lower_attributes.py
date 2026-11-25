@@ -254,6 +254,30 @@ class SegmentAndLowerAttributesTest(unittest.TestCase):
             [torch.ops._c10d_functional.wait_tensor.default],
         )
 
+    def test_inductor_builds_run_with_the_bundled_autotune_cache_off(self) -> None:
+        graph = torch.fx.Graph()
+        current = graph.placeholder("value")
+        current.meta["val"] = torch.ones(2)
+        for _ in range(12):
+            current = graph.call_function(torch.ops.aten.relu.default, args=(current,))
+            current.meta["val"] = torch.ones(2)
+        graph.output(current)
+        lowered = partial_lower(torch.fx.GraphModule(root={}, graph=graph))
+        seen: list[bool | None] = []
+
+        def compile_fx(
+            compiled_gm: torch.fx.GraphModule,
+            _inputs: tuple[object, ...],
+            **_kwargs: object,
+        ) -> object:
+            seen.append(torch._inductor.config.bundled_autotune_remote_cache)
+            return compiled_gm
+
+        with mock.patch("torch._inductor.compile_fx.compile_fx", compile_fx):
+            lowered(torch.ones(2))
+
+        self.assertEqual(seen, [False])
+
     def test_shape_env_accepts_metadata_from_multiple_fake_modes(self) -> None:
         graph = torch.fx.Graph()
         value = graph.placeholder("value")

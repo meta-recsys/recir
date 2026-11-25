@@ -47,10 +47,13 @@ class _XLABackendBase(Backend):
         return False
 
     def dispatch(self, gm: fx.GraphModule) -> nn.Module:
-        return partial_lower_xla(
+        return self._lower_inputs(
             gm,
-            backend_type=self._backend_type,
-            capture_hlo_text=self._dump_hlo,
+            functools.partial(
+                partial_lower_xla,
+                backend_type=self._backend_type,
+                capture_hlo_text=self._dump_hlo,
+            ),
         )
 
     def device_state_manager(self) -> DeviceStateManager:

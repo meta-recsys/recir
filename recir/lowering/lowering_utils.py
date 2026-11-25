@@ -6,7 +6,9 @@
 
 import logging
 import operator
-from typing import Any, Callable, List, Set, Tuple
+from contextlib import AbstractContextManager, nullcontext
+from dataclasses import dataclass
+from typing import Any, Callable, List, Optional, Set, Tuple
 
 import torch
 
@@ -25,6 +27,35 @@ def has_meta_kernel(op: torch._ops.OpOverload) -> bool:
     direct Meta registration and rejects them.
     """
     return torch._C._dispatch_has_computed_kernel_for_dispatch_key(op.name(), "Meta")
+
+
+@dataclass(frozen=True)
+class ExtractedSubgraph:
+    """
+    One subgraph ``segment_and_lower`` extracted and spliced back into its parent.
+
+    ``name`` is the submodule name its call targets, ``gm`` the extracted graph,
+    and ``module`` the wrapper ``module_factory`` built around it.
+    """
+
+    name: str
+    gm: torch.fx.GraphModule
+    module: torch.nn.Module
+
+
+class LazilyBuiltModule(torch.nn.Module):
+    """
+    Base class for all extracted-subgraph modules that compile on their first forward.
+
+    This class is responsible for what an observer uses to see that build:
+    ``compile_scope()``, which the module runs its backend compile inside,
+    from its ``forward``, and which does nothing unless an observer replaced
+    it. This can be extended to a new backend by subclassing and entering
+    ``compile_scope()`` around exactly the work that compiles.
+    """
+
+    # A class default, so a module pickled before the attribute existed has it.
+    compile_scope: Callable[[], AbstractContextManager[object]] = nullcontext
 
 
 def strip_profiler_nodes(gm: torch.fx.GraphModule) -> torch.fx.GraphModule:
@@ -112,6 +143,8 @@ def lower_subgraph_nodes(
     module_factory: Callable[[torch.fx.GraphModule], torch.nn.Module],
     dumper: Callable[[str], str],
     all_lowered_nodes: Set[torch.fx.Node],
+    *,
+    on_subgraph_extracted: Optional[Callable[[ExtractedSubgraph], None]] = None,
 ) -> None:
     """Extract subgraph_nodes from gm, wrap via module_factory, and splice back.
 
@@ -278,6 +311,9 @@ def lower_subgraph_nodes(
         if len(node.users) == 0:
             gm.graph.erase_node(node, **erase_kwargs)
 
+    if on_subgraph_extracted is not None:
+        on_subgraph_extracted(ExtractedSubgraph(subgraph_name, subgraph_module, module))
+
 
 def segment_and_lower(
     gm: torch.fx.GraphModule,
@@ -287,6 +323,7 @@ def segment_and_lower(
     node_predicate: Callable[[torch.fx.Node], bool] = lambda x: True,
     subgraph_predicate: Callable[[List[torch.fx.Node]], bool] = lambda x: True,
     dumper: Callable[[str], str] = lambda x: "subgraph",
+    on_subgraph_extracted: Optional[Callable[[ExtractedSubgraph], None]] = None,
 ) -> torch.fx.GraphModule:
     """Segment a graph into compatible subgraphs and lower each one.
 
@@ -308,6 +345,9 @@ def segment_and_lower(
         node_predicate: Additional user predicate for node filtering.
         subgraph_predicate: Additional user predicate for subgraph filtering.
         dumper: Callback producing a human-readable label per subgraph.
+        on_subgraph_extracted: Called with each subgraph right after it is
+            spliced back into ``gm``. Lowering does not guard the call, so it
+            must not raise or edit the graph.
     """
     nodes_per_subgraph: List[List[torch.fx.Node]] = [[]]
     ptr = next(iter(gm.graph.nodes))
@@ -349,7 +389,13 @@ def segment_and_lower(
     for idx, subgraph_nodes in enumerate(nodes_per_subgraph):
         subgraph_name = f"{subgraph_prefix}_{idx}"
         lower_subgraph_nodes(
-            gm, subgraph_name, subgraph_nodes, module_factory, dumper, all_lowered_nodes
+            gm,
+            subgraph_name,
+            subgraph_nodes,
+            module_factory,
+            dumper,
+            all_lowered_nodes,
+            on_subgraph_extracted=on_subgraph_extracted,
         )
 
     gm.graph.lint()

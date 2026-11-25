@@ -29,7 +29,10 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from typing import Any, Callable, Optional, Sequence, TYPE_CHECKING
 
+from recir.composite import CompositeModule
 from recir.lowering.device_state import DeviceStateManager
+from recir.lowering.lowering_inputs import Lower, lower_inputs
+from recir.observability import snapshot
 from torch import fx, nn
 
 if TYPE_CHECKING:
@@ -48,6 +51,9 @@ class Backend(ABC):
     :meth:`default_optimize_passes`, decide whether the graph needs
     ``IterGraphModule`` wrapping via :attr:`uses_iter_graph`, and implement
     :meth:`dispatch` to lower the graph to executable form.
+
+    A backend that extracts subgraphs dispatches through :meth:`_lower_inputs`,
+    so snapshots observe every backend's dispatch the same way.
 
     Args:
         optimize_passes: optional override for stage 6.  When ``None`` (the
@@ -85,6 +91,17 @@ class Backend(ABC):
     @abstractmethod
     def dispatch(self, gm: fx.GraphModule) -> nn.Module:
         """Stage 8: lower ``gm`` to an executable ``nn.Module``."""
+
+    def _lower_inputs(
+        self, gm: fx.GraphModule | CompositeModule, lower: Lower
+    ) -> nn.Module:
+        """
+        Lower each input of ``gm`` with ``lower``, reporting to the snapshot
+        observer while a step compile dispatches. The observer is read from
+        the dispatch context, not passed in, so every backend's
+        :meth:`dispatch` keeps the one ``dispatch(gm)`` signature.
+        """
+        return lower_inputs(gm, lower, snapshot.lowering_observer())
 
     def device_state_manager(self) -> DeviceStateManager:
         """Return the device-state manager that mediates runtime I/O."""

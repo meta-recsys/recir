@@ -4,8 +4,11 @@
 # This source code is licensed under the BSD-3-Clause license found in the
 # LICENSE file in the root directory of this source tree.
 
+import sys
 import unittest
-from unittest.mock import patch
+from contextlib import contextmanager
+from typing import Callable, Iterator
+from unittest.mock import Mock, patch
 
 import torch
 import torch.distributed as dist
@@ -183,3 +186,58 @@ class TorchTPULowerTest(unittest.TestCase):
             torch.testing.assert_close(got, want)
         for want, got in zip(expected_inputs, actual_inputs):
             torch.testing.assert_close(got, want)
+
+    def test_both_compilers_run_inside_the_build_scope(self) -> None:
+        for static in (False, True):
+            with self.subTest(static=static):
+                self._check_compiler_scope(static)
+
+    def _check_compiler_scope(self, static: bool) -> None:
+        x = torch.randn(4)
+        module = _TorchTPUModule(make_fx(lambda x: x * 2)(x))
+        inside = False
+        seen: list[bool] = []
+
+        @contextmanager
+        def scope() -> Iterator[None]:
+            nonlocal inside
+            inside = True
+            try:
+                yield
+            finally:
+                inside = False
+
+        def compile_graph(
+            gm: torch.fx.GraphModule, args: list[torch.Tensor]
+        ) -> Callable[..., torch.Tensor]:
+            seen.append(inside)
+
+            def run(*args: torch.Tensor) -> torch.Tensor:
+                seen.append(inside)
+                return gm(*args)
+
+            return run
+
+        def compile_static(args: list[torch.Tensor], tag: str) -> None:
+            module.compiled = compile_graph(module.gm, args)
+
+        module.compile_scope = scope
+        with (
+            patch.dict(
+                sys.modules,
+                {
+                    "torch_tpu._internal.compile._backend": Mock(
+                        TpuBackend=lambda: compile_graph
+                    )
+                },
+            ),
+            patch.object(module, "_to_tpu", side_effect=list),
+            patch.object(module, "_compile_static", side_effect=compile_static),
+            patch(
+                "recir.lowering.torchtpu_lower._uses_static_compiler",
+                return_value=static,
+            ),
+        ):
+            torch.testing.assert_close(module(x), x * 2)
+            torch.testing.assert_close(module(x), x * 2)
+        self.assertEqual(seen, [True, False, False])

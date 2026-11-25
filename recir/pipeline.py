@@ -17,6 +17,7 @@ from typing import Any, Callable, cast, Iterable, Optional, Sequence
 import torch
 import torch.fx as fx
 import torch.nn as nn
+from recir.composite import Part
 from torch.fx.graph import map_arg
 from torch.fx.passes.split_module import split_module
 from torch.utils import _pytree as pytree
@@ -304,13 +305,19 @@ class PipelinedGraphModule(nn.Module):
         return tuple(stages)
 
     def lower_parts(
-        self, lower: Callable[[fx.GraphModule], nn.Module]
+        self, lower: Callable[[Part, fx.GraphModule], nn.Module]
     ) -> PipelinedGraphModule:
-        """Replace each stage's graph with ``lower(graph)``."""
-        for stage_call, stage in zip(
-            self._stage_calls, self.stage_graph_modules(), strict=True
-        ):
-            self.split_gm.set_submodule(cast(str, stage_call.target), lower(stage))
+        """Replace each stage's graph with ``lower(part, graph)``, the part named and numbered after the stage."""
+        stages = zip(
+            self._stage_names,
+            self._stage_calls,
+            self.stage_graph_modules(),
+            strict=True,
+        )
+        for index, (name, stage_call, stage) in enumerate(stages):
+            self.split_gm.set_submodule(
+                cast(str, stage_call.target), lower(Part(name, index), stage)
+            )
         return self
 
     def _build_segments(self) -> tuple[tuple[fx.Node, ...], ...]:
@@ -622,13 +629,13 @@ class SteadyStateGraphModule(nn.Module):
         return str(self.graph)
 
     def lower_parts(
-        self, lower: Callable[[fx.GraphModule], nn.Module]
+        self, lower: Callable[[Part, fx.GraphModule], nn.Module]
     ) -> SteadyStateGraphModule:
-        """Materialize stream semantics, then lower the flattened steady graph."""
+        """Materialize stream semantics, then lower the flattened graph as the part ``steady``."""
         if not isinstance(self.steady_gm, fx.GraphModule):
             raise TypeError("The steady-state graph has already been lowered")
         self._materialize_execution_streams(self.steady_gm)
-        self.steady_gm = lower(self.steady_gm)
+        self.steady_gm = lower(Part("steady"), self.steady_gm)
         return self
 
     @staticmethod
