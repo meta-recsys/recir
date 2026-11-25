@@ -881,6 +881,36 @@ class JaggedHSTUAttentionTest(unittest.TestCase):
             )
         )
 
+    def _dot_output_shapes(self, call: Any) -> set[tuple[int, ...]]:
+        return {
+            tuple(equation.outvars[0].aval.shape)
+            for jaxpr in _walk_nested_jaxprs(call.params["jaxpr"])
+            for equation in jaxpr.eqns
+            if equation.primitive.name == "dot_general"
+        }
+
+    def test_single_block_tiles_are_computed_in_causal_query_strips(self) -> None:
+        # 128-row strips of a 256-row tile see 128 and then 256 keys; nothing
+        # computes the full 256 x 256 scores.
+        _, _, forward = self._trace_native_forward(
+            max_seq_len=200, block_q=256, block_k=256
+        )
+        backward = self._trace_fused_backward(max_seq_len=200, block=256)
+        for call in (forward, backward):
+            shapes = self._dot_output_shapes(call)
+            self.assertIn((1, 128, 128), shapes)
+            self.assertIn((1, 128, 256), shapes)
+            self.assertNotIn((1, 256, 256), shapes)
+
+    def test_fused_backward_computes_diagonal_blocks_in_query_strips(self) -> None:
+        shapes = self._dot_output_shapes(
+            self._trace_fused_backward(max_seq_len=600, block=256)
+        )
+        # Off-diagonal blocks are whole; the diagonal one is in strips.
+        self.assertIn((1, 256, 256), shapes)
+        self.assertIn((1, 128, 128), shapes)
+        self.assertIn((1, 128, 256), shapes)
+
     def test_fused_backward_accumulates_dq_over_kv_blocks(self) -> None:
         call = self._trace_fused_backward(max_seq_len=600, block=256)
         self.assertEqual(call.params["grid_mapping"].grid, (1, 3))

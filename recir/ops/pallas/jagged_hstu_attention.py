@@ -43,6 +43,8 @@ _DEFAULT_QUERY_TILES_PER_PROGRAM = 4
 _DEFAULT_BACKWARD_QUERY_TILES_PER_PROGRAM = 2
 _FUSED_BACKWARD_VMEM_LIMIT = 56 * 1024 * 1024
 _FUSED_BACKWARD_SCORE_TILES = 4
+# Rows per query strip when a causal tile on the diagonal is computed in strips.
+_QUERY_STRIP_ROWS = 128
 _AXIS = "torch_dist"
 _PAD_SEQS_PER_DEVICE: int | None = None
 _PADDED_NUM_SEQUENCES: int | None = None
@@ -462,47 +464,71 @@ def _jagged_fwd_kernel(
 
                 def _accumulate_query_tile(
                     masked: bool,
+                    strips: list[tuple[int, int, int]],
                     query_offset=query_offset,
                     query_start=query_start,
                 ) -> None:
+                    """Accumulate each strip's query rows [first, first + rows)
+                    of the tile against keys [0, keys) of the KV tile."""
                     q_tile = jnp.swapaxes(
                         q_stage_ref[pl.ds(q_prefix + query_offset, block_q), :, :],
                         0,
                         1,
                     )
-                    scores = jax.lax.dot(
-                        q_tile,
-                        k_tile,
-                        dimension_numbers=(((2,), (2,)), ((0,), (0,))),
-                        preferred_element_type=jnp.float32,
-                    )
-                    if tanh_silu:
-                        h = scores * (0.5 * alpha)
-                        weights = h + h * jnp.tanh(h)
-                    else:
-                        weights = jax.nn.silu(scores * alpha) * inv_n
-                    if masked:
-                        valid = _attention_mask(
-                            query_start, block_q, key_positions, key_ids, max_id, length
+                    for first, rows, keys in strips:
+                        scores = jax.lax.dot(
+                            q_tile[:, first : first + rows, :],
+                            k_tile[:, :keys, :],
+                            dimension_numbers=(((2,), (2,)), ((0,), (0,))),
+                            preferred_element_type=jnp.float32,
                         )
-                        weights = jnp.where(valid[None, :, :], weights, 0)
-                    weights = cast(Any, weights).astype(v_tile.dtype)
-                    output_update = jax.lax.dot(
-                        weights,
-                        v_tile,
-                        dimension_numbers=(((2,), (1,)), ((0,), (0,))),
-                        preferred_element_type=jnp.float32,
-                    )
-                    output_acc_ref[:, pl.ds(query_offset, block_q), :] = (
-                        output_acc_ref[:, pl.ds(query_offset, block_q), :]
-                        + output_update
-                    )
+                        if tanh_silu:
+                            h = scores * (0.5 * alpha)
+                            weights = h + h * jnp.tanh(h)
+                        else:
+                            weights = jax.nn.silu(scores * alpha) * inv_n
+                        if masked:
+                            valid = _attention_mask(
+                                query_start + first,
+                                rows,
+                                key_positions[:keys],
+                                key_ids[:keys],
+                                max_id,
+                                length,
+                            )
+                            weights = jnp.where(valid[None, :, :], weights, 0)
+                        weights = cast(Any, weights).astype(v_tile.dtype)
+                        output_update = jax.lax.dot(
+                            weights,
+                            v_tile[:, :keys, :],
+                            dimension_numbers=(((2,), (1,)), ((0,), (0,))),
+                            preferred_element_type=jnp.float32,
+                        )
+                        acc_rows = pl.ds(query_offset + first, rows)
+                        output_acc_ref[:, acc_rows, :] = (
+                            output_acc_ref[:, acc_rows, :] + output_update
+                        )
 
+                whole = [(0, block_q, block_k)]
                 pl.when(active & interior)(
-                    functools.partial(_accumulate_query_tile, False)
+                    functools.partial(_accumulate_query_tile, False, whole)
                 )
-                pl.when(active & ~interior)(
-                    functools.partial(_accumulate_query_tile, True)
+                # On the diagonal, a query sees only keys at or before it. With
+                # logistic SiLU, Mosaic compiles the strips into a far slower
+                # kernel (8.8 -> 30 ms for a 3,584-row layer), so they are
+                # tanh-only here.
+                if block_q == block_k and tanh_silu:
+                    diagonal = kv_start == query_start
+                    pl.when(active & diagonal)(
+                        functools.partial(
+                            _accumulate_query_tile, True, _query_strips(block_q)
+                        )
+                    )
+                    masked_whole = active & ~interior & ~diagonal
+                else:
+                    masked_whole = active & ~interior
+                pl.when(masked_whole)(
+                    functools.partial(_accumulate_query_tile, True, whole)
                 )
 
         def _kv_window(kv_block):
@@ -1103,7 +1129,7 @@ def _jagged_bwd_dq_kernel(
         )(dq_hbm_ref)
 
 
-def _jagged_bwd_dkv_kernel(
+def _jagged_bwd_dkv_kernel(  # noqa: C901
     seq_offsets_ref,
     aligned_offsets_ref,
     num_targets_ref,
@@ -1211,10 +1237,15 @@ def _jagged_bwd_dkv_kernel(
                 1,
             )
 
-            def _update(masked: bool) -> None:
+            def _update(first: int, rows: int, keys: int) -> None:
+                """Accumulate query rows [first, first + rows) of the block
+                against keys [0, keys) of the KV tile."""
+                q_rows = q_tile[:, first : first + rows, :]
+                do_rows = do_tile[:, first : first + rows, :]
+                k_keys, v_keys = k_tile[:, :keys, :], v_tile[:, :keys, :]
                 scores = jax.lax.dot(
-                    q_tile,
-                    k_tile,
+                    q_rows,
+                    k_keys,
                     dimension_numbers=(((2,), (2,)), ((0,), (0,))),
                     preferred_element_type=jnp.float32,
                 )
@@ -1235,55 +1266,63 @@ def _jagged_bwd_dkv_kernel(
                     def _score_grad(dp: jax.Array) -> jax.Array:
                         return dp * _silu_grad(scaled_scores) * inv_n
 
-                valid = (
-                    _attention_mask(
-                        query_start, block_q, key_positions, key_ids, max_id, length
-                    )
-                    if masked
-                    else None
+                valid = _attention_mask(
+                    query_start + first,
+                    rows,
+                    key_positions[:keys],
+                    key_ids[:keys],
+                    max_id,
+                    length,
                 )
-                if valid is not None:
-                    weights = jnp.where(valid[None, :, :], weights, 0)
+                weights = jnp.where(valid[None, :, :], weights, 0)
                 dv_update = jax.lax.dot(
                     cast(Any, weights).astype(do_tile.dtype),
-                    do_tile,
+                    do_rows,
                     dimension_numbers=(((1,), (1,)), ((0,), (0,))),
                     preferred_element_type=jnp.float32,
                 )
                 dp = jax.lax.dot(
-                    do_tile,
-                    v_tile,
+                    do_rows,
+                    v_keys,
                     dimension_numbers=(((2,), (2,)), ((0,), (0,))),
                     preferred_element_type=jnp.float32,
                 )
                 ds = _score_grad(dp)
-                if valid is not None:
-                    ds = jnp.where(valid[None, :, :], ds, 0)
-                ds = cast(Any, ds).astype(q_tile.dtype)
+                ds = cast(Any, jnp.where(valid[None, :, :], ds, 0)).astype(q_tile.dtype)
                 dk_update = jax.lax.dot(
                     ds,
-                    q_tile,
+                    q_rows,
                     dimension_numbers=(((1,), (1,)), ((0,), (0,))),
                     preferred_element_type=jnp.float32,
                 )
-                if tanh_silu:
-                    dk_acc_ref[...] = dk_acc_ref[...] + dk_update
-                else:
-                    dk_acc_ref[...] = dk_acc_ref[...] + alpha * dk_update
-                dv_acc_ref[...] = dv_acc_ref[...] + dv_update
+                if not tanh_silu:
+                    dk_update = alpha * dk_update
+                dk_acc_ref[:, :keys, :] = dk_acc_ref[:, :keys, :] + dk_update
+                dv_acc_ref[:, :keys, :] = dv_acc_ref[:, :keys, :] + dv_update
                 if dq_acc_ref is not None:
                     dq_update = jax.lax.dot(
                         ds,
-                        k_tile,
+                        k_keys,
                         dimension_numbers=(((2,), (1,)), ((0,), (0,))),
                         preferred_element_type=jnp.float32,
                     )
                     if not tanh_silu:
                         dq_update = alpha * dq_update
-                    rows = pl.ds(pl.multiple_of(query_start, block_q), block_q)
-                    dq_acc_ref[:, rows, :] = dq_acc_ref[:, rows, :] + dq_update
+                    dq_rows = pl.ds(pl.multiple_of(query_start + first, 8), rows)
+                    dq_acc_ref[:, dq_rows, :] = dq_acc_ref[:, dq_rows, :] + dq_update
 
-            _update(masked=True)
+            if block_q == block_k:
+                # On the diagonal, a query sees only keys at or before it.
+                diagonal = query_block == kv_block
+
+                @pl.when(diagonal)
+                def _diagonal() -> None:
+                    for first, rows, keys in _query_strips(block_q):
+                        _update(first, rows, keys)
+
+                pl.when(~diagonal)(lambda: _update(0, block_q, block_k))
+            else:
+                _update(0, block_q, block_k)
 
         def _query_window(query_block):
             query_start = (first_query_block + query_block) * block_q
@@ -1549,6 +1588,17 @@ def _single_block_stage(seq_offsets_ref, sequence, rows: int, block: int):
     return stage_start, length, start - stage_start
 
 
+def _query_strips(block: int) -> list[tuple[int, int, int]]:
+    """(first row, rows, keys) per query strip of a causal single-block tile: a
+    query sees only keys at or before its own position, so a strip needs the
+    keys up to its last row, rounded up to whole lanes."""
+    strips = []
+    for first in range(0, block, _QUERY_STRIP_ROWS):
+        rows = min(_QUERY_STRIP_ROWS, block - first)
+        strips.append((first, rows, min(block, -(-(first + rows) // 128) * 128)))
+    return strips
+
+
 def _jagged_fwd_single_block_kernel(
     seq_offsets_ref,
     aligned_offsets_ref,
@@ -1583,33 +1633,37 @@ def _jagged_fwd_single_block_kernel(
         if mask_past_sequence:
             # The output sums over key rows; 0 * NaN is NaN.
             v_tile = jnp.where(positions[None, :, None] < length, v_tile, 0)
-        valid = _attention_mask(
-            0, block, positions, jnp.minimum(positions, max_id), max_id, length
-        )
-        scores = jax.lax.dot(
-            q_tile,
-            k_tile,
-            dimension_numbers=(((2,), (2,)), ((0,), (0,))),
-            preferred_element_type=jnp.float32,
-        )
-        if tanh_silu:
-            h = scores * (0.5 * alpha)
-            weights = h + h * jnp.tanh(h)
-        else:
-            weights = jax.nn.silu(scores * alpha) * inv_n
-        weights = jnp.where(valid[None, :, :], weights, 0)
-        output = jax.lax.dot(
-            cast(Any, weights).astype(v_tile.dtype),
-            v_tile,
-            dimension_numbers=(((2,), (1,)), ((0,), (0,))),
-            preferred_element_type=jnp.float32,
-        )
-        output = jnp.where(
-            positions[None, :, None] < length,
-            output * inv_n if tanh_silu else output,
-            0,
-        )
-        out_ref[...] = jnp.swapaxes(cast(Any, output).astype(out_ref.dtype), 0, 1)
+        key_ids = jnp.minimum(positions, max_id)
+        for first, rows, keys in _query_strips(block):
+            scores = jax.lax.dot(
+                q_tile[:, first : first + rows, :],
+                k_tile[:, :keys, :],
+                dimension_numbers=(((2,), (2,)), ((0,), (0,))),
+                preferred_element_type=jnp.float32,
+            )
+            if tanh_silu:
+                h = scores * (0.5 * alpha)
+                weights = h + h * jnp.tanh(h)
+            else:
+                weights = jax.nn.silu(scores * alpha) * inv_n
+            valid = _attention_mask(
+                first, rows, positions[:keys], key_ids[:keys], max_id, length
+            )
+            weights = jnp.where(valid[None, :, :], weights, 0)
+            output = jax.lax.dot(
+                cast(Any, weights).astype(v_tile.dtype),
+                v_tile[:, :keys, :],
+                dimension_numbers=(((2,), (1,)), ((0,), (0,))),
+                preferred_element_type=jnp.float32,
+            )
+            output = jnp.where(
+                positions[None, first : first + rows, None] < length,
+                output * inv_n if tanh_silu else output,
+                0,
+            )
+            out_ref[first : first + rows, :, :] = jnp.swapaxes(
+                cast(Any, output).astype(out_ref.dtype), 0, 1
+            )
 
     _single_block_pipeline(
         _sequence,
@@ -1632,6 +1686,8 @@ def _jagged_bwd_single_block_kernel(  # noqa: C901
     dk_hbm_ref,
     dv_hbm_ref,
     dq_hbm_ref,
+    dk_acc_ref,
+    dv_acc_ref,
     *,
     alpha: float,
     block: int,
@@ -1669,68 +1725,82 @@ def _jagged_bwd_single_block_kernel(  # noqa: C901
             q_tile = jnp.where(in_sequence, q_tile, 0)
             k_tile = jnp.where(in_sequence, k_tile, 0)
             do_tile = jnp.where(in_sequence, do_tile, 0)
-        valid = _attention_mask(
-            0, block, positions, jnp.minimum(positions, max_id), max_id, length
-        )
-        scores = jax.lax.dot(
-            q_tile,
-            k_tile,
-            dimension_numbers=(((2,), (2,)), ((0,), (0,))),
-            preferred_element_type=jnp.float32,
-        )
-        if tanh_silu:
-            h = scores * (0.5 * alpha)
-            t = jnp.tanh(h)
-            weights = h + h * t
+        key_ids = jnp.minimum(positions, max_id)
+        dk_acc_ref[...] = jnp.zeros_like(dk_acc_ref)
+        dv_acc_ref[...] = jnp.zeros_like(dv_acc_ref)
+        for first, rows, keys in _query_strips(block):
+            q_strip = q_tile[:, first : first + rows, :]
+            do_strip = do_tile[:, first : first + rows, :]
+            k_keys, v_keys = k_tile[:, :keys, :], v_tile[:, :keys, :]
+            valid = _attention_mask(
+                first, rows, positions[:keys], key_ids[:keys], max_id, length
+            )
+            scores = jax.lax.dot(
+                q_strip,
+                k_keys,
+                dimension_numbers=(((2,), (2,)), ((0,), (0,))),
+                preferred_element_type=jnp.float32,
+            )
+            if tanh_silu:
+                h = scores * (0.5 * alpha)
+                t = jnp.tanh(h)
+                weights = h + h * t
 
-            def _score_grad(dp: jax.Array) -> jax.Array:
-                return dp * _tanh_silu_grad_x2(h, t)
+                def _score_grad(dp: jax.Array, h=h, t=t) -> jax.Array:
+                    return dp * _tanh_silu_grad_x2(h, t)
 
-        else:
-            scaled_scores = scores * alpha
-            weights = jax.nn.silu(scaled_scores) * inv_n
+            else:
+                scaled_scores = scores * alpha
+                weights = jax.nn.silu(scaled_scores) * inv_n
 
-            def _score_grad(dp: jax.Array) -> jax.Array:
-                return dp * _silu_grad(scaled_scores) * inv_n
+                def _score_grad(
+                    dp: jax.Array, scaled_scores=scaled_scores
+                ) -> jax.Array:
+                    return dp * _silu_grad(scaled_scores) * inv_n
 
-        weights = jnp.where(valid[None, :, :], weights, 0)
-        dv = jax.lax.dot(
-            cast(Any, weights).astype(do_tile.dtype),
-            do_tile,
-            dimension_numbers=(((1,), (1,)), ((0,), (0,))),
-            preferred_element_type=jnp.float32,
-        )
-        dp = jax.lax.dot(
-            do_tile,
-            v_tile,
-            dimension_numbers=(((2,), (2,)), ((0,), (0,))),
-            preferred_element_type=jnp.float32,
-        )
-        ds = _score_grad(dp)
-        ds = cast(Any, jnp.where(valid[None, :, :], ds, 0)).astype(q_tile.dtype)
-        dk = jax.lax.dot(
-            ds,
-            q_tile,
-            dimension_numbers=(((1,), (1,)), ((0,), (0,))),
-            preferred_element_type=jnp.float32,
-        )
-        dq = jax.lax.dot(
-            ds,
-            k_tile,
-            dimension_numbers=(((2,), (1,)), ((0,), (0,))),
-            preferred_element_type=jnp.float32,
-        )
+            weights = jnp.where(valid[None, :, :], weights, 0)
+            dv_acc_ref[:, :keys, :] += jax.lax.dot(
+                cast(Any, weights).astype(do_tile.dtype),
+                do_strip,
+                dimension_numbers=(((1,), (1,)), ((0,), (0,))),
+                preferred_element_type=jnp.float32,
+            )
+            dp = jax.lax.dot(
+                do_strip,
+                v_keys,
+                dimension_numbers=(((2,), (2,)), ((0,), (0,))),
+                preferred_element_type=jnp.float32,
+            )
+            ds = _score_grad(dp)
+            ds = cast(Any, jnp.where(valid[None, :, :], ds, 0)).astype(q_tile.dtype)
+            dk_acc_ref[:, :keys, :] += jax.lax.dot(
+                ds,
+                q_strip,
+                dimension_numbers=(((1,), (1,)), ((0,), (0,))),
+                preferred_element_type=jnp.float32,
+            )
+            dq = jax.lax.dot(
+                ds,
+                k_keys,
+                dimension_numbers=(((2,), (1,)), ((0,), (0,))),
+                preferred_element_type=jnp.float32,
+            )
+            valid_row = positions[None, first : first + rows, None] < length
+            dq = jnp.where(
+                valid_row, dq * (0.5 * alpha * inv_n) if tanh_silu else alpha * dq, 0
+            )
+            dq_ref[first : first + rows, :, :] = jnp.swapaxes(
+                cast(Any, dq).astype(dq_ref.dtype), 0, 1
+            )
 
         valid_row = positions[None, :, None] < length
         if tanh_silu:
-            dk = jnp.where(valid_row, dk * (0.5 * alpha * inv_n), 0)
-            dq = jnp.where(valid_row, dq * (0.5 * alpha * inv_n), 0)
-            dv = jnp.where(valid_row, dv * inv_n, 0)
+            dk = jnp.where(valid_row, dk_acc_ref[...] * (0.5 * alpha * inv_n), 0)
+            dv = jnp.where(valid_row, dv_acc_ref[...] * inv_n, 0)
         else:
-            dk = jnp.where(valid_row, alpha * dk, 0)
-            dq = jnp.where(valid_row, alpha * dq, 0)
-            dv = jnp.where(valid_row, dv, 0)
-        for out_ref, grad in ((dq_ref, dq), (dk_ref, dk), (dv_ref, dv)):
+            dk = jnp.where(valid_row, alpha * dk_acc_ref[...], 0)
+            dv = jnp.where(valid_row, dv_acc_ref[...], 0)
+        for out_ref, grad in ((dk_ref, dk), (dv_ref, dv)):
             out_ref[...] = jnp.swapaxes(cast(Any, grad).astype(out_ref.dtype), 0, 1)
 
     _single_block_pipeline(
@@ -1850,7 +1920,10 @@ def _native_jagged_hstu_attention_backward(
                 tanh_silu=_tanh_silu_enabled(),
             )
             grid = (1,)
-            scratch = ()
+            scratch = (
+                pltpu.VMEM((num_heads, block_k, dqk), jnp.float32),
+                pltpu.VMEM((num_heads, block_k, dv_dim), jnp.float32),
+            )
             compiler_params = pltpu.CompilerParams(
                 vmem_limit_bytes=_FUSED_BACKWARD_VMEM_LIMIT
             )
