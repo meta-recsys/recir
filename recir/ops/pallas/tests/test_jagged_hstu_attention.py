@@ -160,6 +160,37 @@ class JaggedHSTUAttentionTest(unittest.TestCase):
         np.testing.assert_allclose(actual, expected, rtol=2e-5, atol=2e-5)
         self.assertEqual(actual.shape, (sum(lengths), 2, 6))
 
+    def test_a_negative_target_count_cannot_reach_the_next_sequence(self) -> None:
+        """num_targets is a count. A negative one puts max_id past length, and
+        _keys_precede_queries reads that as the next sequence's keys being this
+        sequence's history, so it skips the mask that would have excluded them.
+        Clamping is defensive: no shape tried in interpret mode writes a
+        different answer either way, and the output windows may be what stops
+        it. This pins the invariant the skip's docstring already claims."""
+        lengths = [4, 12]
+        q, k, v, offsets = self._inputs(lengths)
+        scale = 1.0 / math.sqrt(q.shape[-1])
+
+        def run(num_targets: list[int]) -> Any:
+            return np.asarray(
+                pallas_jagged_hstu_attention(
+                    q,
+                    k,
+                    v,
+                    offsets,
+                    jnp.asarray(num_targets, dtype=jnp.int32),
+                    max_seq_len=16,
+                    scale=scale,
+                    inv_n=0.17,
+                    interpret=True,
+                    block_q=4,
+                    block_k=4,
+                )
+            )
+
+        # The second sequence's rows cannot depend on the first's target count.
+        np.testing.assert_array_equal(run([-8, 0])[4:], run([0, 0])[4:])
+
     def test_nonuniform_causal_sequences(self) -> None:
         self._assert_parity([7, 3, 9], [0, 0, 0], max_seq_len=9)
 
