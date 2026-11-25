@@ -23,6 +23,7 @@ from recir.embedding.sparsecore_rowwise import (
     _split_table,
     _SUB_TABLE_MAX_ROWS,
     _SubTable,
+    _take_rows,
     _unique_inverse,
     SparseCoreRowwiseTables,
     SparseCoreTable,
@@ -87,6 +88,17 @@ class UniqueInverseTest(unittest.TestCase):
             self.assertEqual(got_values.dtype, want_values.dtype)
             self.assertTrue(np.array_equal(got_values, want_values))
             self.assertTrue(np.array_equal(got_inverse, want_inverse.reshape(-1)))
+
+
+class TakeRowsTest(unittest.TestCase):
+    def test_matches_indexing_for_any_count(self) -> None:
+        rng = np.random.default_rng(0)
+        table = jnp.asarray(rng.standard_normal((50, 3)).astype(np.float32))
+        for n in (1, 7, 8, 13, 16):
+            index = jnp.asarray(rng.integers(0, 50, size=n).astype(np.int32))
+            got = jax.jit(_take_rows)(table, index)
+            self.assertEqual(got.shape, (n, 3))
+            self.assertTrue(np.array_equal(got, np.asarray(table)[np.asarray(index)]))
 
 
 class ExchangeLayoutTest(unittest.TestCase):
