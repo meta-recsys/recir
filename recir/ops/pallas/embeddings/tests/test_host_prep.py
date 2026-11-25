@@ -37,6 +37,7 @@ import jax.numpy as jnp
 import numpy as np
 from recir.ops.pallas.embeddings.pad_cast_dma import pad_cast_dma
 from recir.ops.pallas.embeddings.pad_ids_cast_dma import pad_ids_cast_dma
+from recir.ops.pallas.embeddings.pad_ids_dma import pad_ids_dma
 from recir.ops.pallas.embeddings.ringshift import (
     _block_to_mod_ids,
     _bucketize_and_sort,
@@ -180,6 +181,60 @@ class PadIdsCastTest(unittest.TestCase):
                     for mapping in mappings
                 ],
                 [[jnp.dtype("int32"), jnp.dtype("int32")], [jnp.dtype("int32")]],
+            )
+        finally:
+            jax.config.update("jax_enable_x64", previous)
+
+
+class PadIdsTest(unittest.TestCase):
+    def test_padding_matches_integer_oracle(self) -> None:
+        for counts_host in (
+            np.array([0, 0, 0, 0], dtype=np.int32),
+            np.array([0, 33, 0, 0], dtype=np.int32),
+            np.array([0, 1027, 17, 2055], dtype=np.int32),
+            np.ones(128, dtype=np.int32),
+        ):
+            size = int(counts_host.sum()) + 19
+            rows_host = np.arange(size, dtype=np.int32) * 97
+            rows_host[::17] = 0
+            padded_host = (counts_host + 127) // 128 * 128
+            expected = np.zeros(size + counts_host.size * 128, dtype=np.int32)
+            source_start = destination_start = 0
+            for count, padded in zip(counts_host, padded_host):
+                expected[destination_start : destination_start + count] = rows_host[
+                    source_start : source_start + count
+                ]
+                source_start += int(count)
+                destination_start += int(padded)
+            actual = pad_ids_dma(
+                jnp.asarray(rows_host),
+                jnp.asarray(counts_host),
+                jnp.asarray(padded_host),
+                interpret=True,
+            )
+            with self.subTest(counts=counts_host.tolist()):
+                np.testing.assert_array_equal(actual, expected)
+                self.assertEqual(actual.dtype, jnp.int32)
+
+    def test_grid_indices_stay_int32_with_x64(self) -> None:
+        previous = jax.config.read("jax_enable_x64")
+        try:
+            jax.config.update("jax_enable_x64", True)
+            traced = jax.make_jaxpr(pad_ids_dma)(
+                jax.ShapeDtypeStruct((257,), jnp.int32),
+                jax.ShapeDtypeStruct((128,), jnp.int32),
+                jax.ShapeDtypeStruct((128,), jnp.int32),
+            )
+            calls = [
+                equation
+                for equation in traced.jaxpr.eqns
+                if equation.primitive.name == "pallas_call"
+            ]
+            self.assertEqual(len(calls), 1)
+            mapping = calls[0].params["grid_mapping"].block_mappings[-1]
+            self.assertEqual(
+                [aval.dtype for aval in mapping.index_map_jaxpr.out_avals],
+                [jnp.dtype("int32")],
             )
         finally:
             jax.config.update("jax_enable_x64", previous)
