@@ -36,6 +36,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from recir.ops.pallas.embeddings.pad_cast_dma import pad_cast_dma
+from recir.ops.pallas.embeddings.pad_ids_cast_dma import pad_ids_cast_dma
 from recir.ops.pallas.embeddings.ringshift import (
     _block_to_mod_ids,
     _bucketize_and_sort,
@@ -81,6 +82,105 @@ class PadCastIndexMapTest(unittest.TestCase):
                         ],
                         [jnp.dtype("int32"), jnp.dtype("int32")],
                     )
+        finally:
+            jax.config.update("jax_enable_x64", previous)
+
+
+class PadIdsCastTest(unittest.TestCase):
+    def test_joint_padding_preserves_zero_id_and_drop_sentinel(self) -> None:
+        counts = jnp.array([2, 0, 1, 0], dtype=jnp.int32)
+        padded = _round_up_tile(counts, _TILE_INT32)
+        rows = jnp.array([0, 27, 8, 999, 999], dtype=jnp.int32)
+        gradients = jnp.arange(5 * 256, dtype=jnp.float32).reshape(5, 256) / 16
+        sentinel = 23_437_500
+        actual_gradients, actual_rows = pad_ids_cast_dma(
+            gradients, rows, counts, padded, sentinel, interpret=True
+        )
+        capacity = rows.shape[0] + counts.shape[0] * _TILE_INT32
+        expected_rows = np.full(capacity, sentinel, np.int32)
+        expected_rows[:2] = [0, 27]
+        expected_rows[128] = 8
+        expected_gradients = jnp.zeros((capacity, 256), dtype=jnp.bfloat16)
+        expected_gradients = expected_gradients.at[:2].set(
+            gradients[:2].astype(jnp.bfloat16)
+        )
+        expected_gradients = expected_gradients.at[128].set(
+            gradients[2].astype(jnp.bfloat16)
+        )
+        np.testing.assert_array_equal(actual_rows, expected_rows)
+        np.testing.assert_array_equal(
+            np.asarray(actual_gradients).view(np.uint16),
+            np.asarray(expected_gradients).view(np.uint16),
+        )
+
+    def test_joint_padding_keeps_float_payload_bits(self) -> None:
+        bits = np.array(
+            [0x00000000, 0x80000000, 0x7F800000, 0xFF800000, 0x7FC12000, 0x3F808000],
+            dtype=np.uint32,
+        )
+        gradient = jnp.asarray(np.resize(bits.view(np.float32), (7, 256)))
+        counts = jnp.array([0, 3, 0, 4], dtype=jnp.int32)
+        padded = _round_up_tile(counts, _TILE_INT32)
+        actual, _rows = pad_ids_cast_dma(
+            gradient,
+            jnp.arange(7, dtype=jnp.int32),
+            counts,
+            padded,
+            23_437_500,
+            interpret=True,
+        )
+        expected = pad_cast_dma(gradient, counts, padded, interpret=True)
+        np.testing.assert_array_equal(
+            np.asarray(actual).view(np.uint16), np.asarray(expected).view(np.uint16)
+        )
+
+    def test_joint_padding_handles_every_row_dma_alignment(self) -> None:
+        counts = jnp.ones(128, dtype=jnp.int32)
+        padded = _round_up_tile(counts, _TILE_INT32)
+        rows = jnp.arange(128, dtype=jnp.int32)
+        gradient = jnp.arange(128 * 128, dtype=jnp.float32).reshape(128, 128) / 1024
+        sentinel = 23_437_500
+        actual_gradient, actual_rows = pad_ids_cast_dma(
+            gradient, rows, counts, padded, sentinel, interpret=True
+        )
+        capacity = rows.shape[0] + counts.shape[0] * _TILE_INT32
+        expected_rows = np.full(capacity, sentinel, np.int32)
+        expected_rows[: 128 * 128 : 128] = np.arange(128, dtype=np.int32)
+        expected_gradient = jnp.zeros((capacity, 128), dtype=jnp.bfloat16)
+        expected_gradient = expected_gradient.at[: 128 * 128 : 128].set(
+            gradient.astype(jnp.bfloat16)
+        )
+        np.testing.assert_array_equal(actual_rows, expected_rows)
+        np.testing.assert_array_equal(
+            np.asarray(actual_gradient).view(np.uint16),
+            np.asarray(expected_gradient).view(np.uint16),
+        )
+
+    def test_joint_grid_indices_stay_int32_with_x64(self) -> None:
+        previous = jax.config.read("jax_enable_x64")
+        try:
+            jax.config.update("jax_enable_x64", True)
+            traced = jax.make_jaxpr(pad_ids_cast_dma, static_argnums=(4,))(
+                jax.ShapeDtypeStruct((257, 256), jnp.float32),
+                jax.ShapeDtypeStruct((257,), jnp.int32),
+                jax.ShapeDtypeStruct((128,), jnp.int32),
+                jax.ShapeDtypeStruct((128,), jnp.int32),
+                23_437_500,
+            )
+            calls = [
+                equation
+                for equation in traced.jaxpr.eqns
+                if equation.primitive.name == "pallas_call"
+            ]
+            self.assertEqual(len(calls), 1)
+            mappings = calls[0].params["grid_mapping"].block_mappings[-2:]
+            self.assertEqual(
+                [
+                    [aval.dtype for aval in mapping.index_map_jaxpr.out_avals]
+                    for mapping in mappings
+                ],
+                [[jnp.dtype("int32"), jnp.dtype("int32")], [jnp.dtype("int32")]],
+            )
         finally:
             jax.config.update("jax_enable_x64", previous)
 
