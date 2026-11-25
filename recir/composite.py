@@ -8,9 +8,26 @@
 
 from __future__ import annotations
 
+import re
+from dataclasses import dataclass
 from typing import Callable, Protocol
 
 from torch import fx, nn
+
+
+@dataclass(frozen=True)
+class Part:
+    """One graph of a composite module: its ``name``, and its ``index`` when its kind numbers them."""
+
+    name: str
+    index: int | None = None
+
+    @property
+    def label(self) -> str:
+        """An identifier for the part, unique within its module: its name, or ``stage{index}_{name}`` for a numbered part."""
+        if self.index is None:
+            return self.name
+        return f"stage{self.index}_" + re.sub(r"[^0-9A-Za-z_]", "_", self.name)
 
 
 class CompositeModule(Protocol):
@@ -23,6 +40,8 @@ class CompositeModule(Protocol):
     ``lower_parts``.
     """
 
-    def lower_parts(self, lower: Callable[[fx.GraphModule], nn.Module]) -> nn.Module:
-        """Replace each of the module's graphs with ``lower(graph)``, and return the module."""
+    def lower_parts(
+        self, lower: Callable[[Part, fx.GraphModule], nn.Module]
+    ) -> nn.Module:
+        """Replace each of the module's graphs with ``lower(part, graph)``, and return the module."""
         ...

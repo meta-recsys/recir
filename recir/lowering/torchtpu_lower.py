@@ -27,7 +27,12 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import torch
 import torch.distributed as dist
 import torch.utils._pytree as pytree
-from recir.lowering.lowering_utils import segment_and_lower, strip_profiler_nodes
+from recir.lowering.lowering_utils import (
+    ExtractedSubgraph,
+    LazilyBuiltModule,
+    segment_and_lower,
+    strip_profiler_nodes,
+)
 from recir.ops.decompositions import SPMD_DECOMP_TABLE
 from torch._decomp import get_decompositions
 
@@ -297,7 +302,7 @@ def _functional_graph(
     return fgm, list(mutated)
 
 
-class _TorchTPUModule(torch.nn.Module):
+class _TorchTPUModule(LazilyBuiltModule):
     """Wraps an ``fx.GraphModule`` subgraph for lazy torch_tpu compilation.
 
     On the first forward call the subgraph is compiled via torch_tpu's
@@ -359,16 +364,17 @@ class _TorchTPUModule(torch.nn.Module):
                 tag,
                 sum(isinstance(a, torch.Tensor) and a.numel() == 0 for a in args),
             )
-            if _uses_static_compiler():
-                self._compile_static(tpu_args, tag)
-            else:
-                logger.info(
-                    "spmd_safe: marked %d collectives in subgraph (%s)",
-                    _mark_collectives_spmd_safe(self.gm),
-                    tag,
-                )
-                _check_same_graph_on_all_ranks(self.gm, tag)
-                self.compiled = TpuBackend()(self.gm, list(tpu_args))
+            with self.compile_scope():
+                if _uses_static_compiler():
+                    self._compile_static(tpu_args, tag)
+                else:
+                    logger.info(
+                        "spmd_safe: marked %d collectives in subgraph (%s)",
+                        _mark_collectives_spmd_safe(self.gm),
+                        tag,
+                    )
+                    _check_same_graph_on_all_ranks(self.gm, tag)
+                    self.compiled = TpuBackend()(self.gm, list(tpu_args))
             logger.info("Completed torch_tpu compilation for subgraph (%s)", tag)
         with torch.profiler.record_function(tag):
             assert self.compiled is not None
@@ -407,6 +413,7 @@ def partial_lower_torchtpu(
     node_predicate: Callable[[torch.fx.Node], bool] = lambda x: True,
     subgraph_predicate: Callable[[List[torch.fx.Node]], bool] = lambda x: True,
     dumper: Callable[[str], str] = lambda x: "subgraph",
+    on_subgraph_extracted: Optional[Callable[[ExtractedSubgraph], None]] = None,
 ) -> torch.fx.GraphModule:
     """Segment ``gm`` and lower each compatible subgraph via ``TpuBackend``.
 
@@ -425,4 +432,5 @@ def partial_lower_torchtpu(
         node_predicate=node_predicate,
         subgraph_predicate=subgraph_predicate,
         dumper=dumper,
+        on_subgraph_extracted=on_subgraph_extracted,
     )
