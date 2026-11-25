@@ -119,6 +119,12 @@ def _int32(a: np.ndarray) -> np.ndarray:
     return a.astype(np.int32) if a.dtype == np.int64 else a
 
 
+def _cumsum_mask(mask: np.ndarray) -> np.ndarray:
+    """``np.cumsum`` of a bool mask. numpy accumulates a bool array holding the
+    GIL, which stalls the trainer's other threads; an int64 one releases it."""
+    return mask.astype(np.int64).cumsum()
+
+
 def _unique_inverse(values: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     """``np.unique(values, return_inverse=True)`` for non-negative integers, as
     one sort of (value, position) keys packed into int64 instead of an argsort
@@ -139,7 +145,7 @@ def _unique_inverse(values: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     first[0] = True
     np.not_equal(sorted_values[1:], sorted_values[:-1], out=first[1:])
     inverse = np.empty(n, np.int64)
-    inverse[keys & ((1 << bits) - 1)] = np.cumsum(first) - 1
+    inverse[keys & ((1 << bits) - 1)] = _cumsum_mask(first) - 1
     return sorted_values[first].astype(values.dtype, copy=False), inverse
 
 
@@ -195,7 +201,7 @@ def _exchange_layout(
     for sorted_uniq, _, _, sub in parts:
         inside = (sorted_uniq >= sub.start) & (sorted_uniq < sub.start + sub.rows)
         cands.append(sorted_uniq[inside] - sub.start)
-        ranks.append(np.where(inside, np.cumsum(inside) - 1, -1))
+        ranks.append(np.where(inside, _cumsum_mask(inside) - 1, -1))
     ids = np.concatenate(cands)
     phys = ((ids % shards + rotation) % shards) * shard_size + ids // shards + offset
     rows, row_of = _unique_inverse(phys)
