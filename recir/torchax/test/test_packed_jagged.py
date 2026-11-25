@@ -14,6 +14,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import torch
+from hammer.v3.modules.mot.loss.packed_supervision import gather_padded_sequence
 from recir.ops.packed_jagged_ops import (
     jagged_dense_bmm,
     jagged_dense_bmm_add,
@@ -24,10 +25,13 @@ from recir.torchax.ops.jagged_ops import (
     _jax_dense_to_jagged_scatter_impl,
 )
 from recir.torchax.ops.packed_jagged_ops import (
+    _local_supervision_gather,
     _packed_bmm,
     _packed_bmm_add,
     _packed_bmm_add_backward,
     _packed_bmm_backward,
+    _packed_position_add,
+    _packed_position_add_backward,
 )
 from torch.fx.experimental.proxy_tensor import make_fx
 
@@ -72,8 +76,143 @@ class PackedJaggedTest(unittest.TestCase):
 
 
 
+    def test_packed_position_values_and_gradients(self) -> None:
+        offsets = torch.tensor([0, 0, 3, 9])
+        pi = torch.arange(12).reshape(3, 4) % 5
+        ti = torch.arange(12).reshape(3, 4) % 7
+        for dtype in (torch.float32, torch.bfloat16):
+            values = torch.randn(13, 128, dtype=dtype, requires_grad=True)
+            position = (
+                torch.arange(5).float()[:, None].expand(5, 128) / 8 + 1 + 2**-8
+            ).requires_grad_()
+            time = (
+                -torch.arange(7).float()[:, None].expand(7, 128) / 16 - 1
+            ).requires_grad_()
+            dense = torch.zeros(3, 4, 128, dtype=dtype)
+            for row in range(3):
+                start = int(offsets[row])
+                length = min(int(offsets[row + 1]) - start, 4)
+                dense[row, :length] = values[start : start + length]
+            dense = dense + (time[ti] + position[pi]).to(dtype)
+            want = torch.zeros_like(values)
+            for row in range(3):
+                start = int(offsets[row])
+                length = min(int(offsets[row + 1]) - start, 4)
+                want[start : start + length] = dense[row, :length]
+            got = torch.ops.recir.packed_position_add(
+                values, position, time, pi, ti, offsets, 4
+            )
+            grad = torch.randn_like(values)
+            expected_grads = torch.autograd.grad(want, (values, position, time), grad)
+            actual_grads = torch.autograd.grad(got, (values, position, time), grad)
+            torch.testing.assert_close(got, want, rtol=0, atol=0)
+            for actual, expected in zip(actual_grads, expected_grads):
+                torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+            jdtype = jnp.bfloat16 if dtype == torch.bfloat16 else jnp.float32
+            args = (
+                jnp.asarray(values.detach().float().numpy()).astype(jdtype),
+                jnp.asarray(position.detach().numpy()),
+                jnp.asarray(time.detach().numpy()),
+                jnp.asarray(pi.numpy(), jnp.int32),
+                jnp.asarray(ti.numpy(), jnp.int32),
+                jnp.asarray(offsets.numpy(), jnp.int32),
+                4,
+            )
+            native = _packed_position_add(*args)
+            native_grads = _packed_position_add_backward(
+                jnp.asarray(grad.float().numpy()).astype(jdtype), *args
+            )
+            np.testing.assert_array_equal(
+                np.asarray(native.astype(jnp.float32)), want.detach().float().numpy()
+            )
+            for actual, expected in zip(native_grads, expected_grads):
+                np.testing.assert_allclose(
+                    np.asarray(actual.astype(jnp.float32)),
+                    expected.float().numpy(),
+                    rtol=1e-6,
+                    atol=1e-6,
+                )
+        zeros = (
+            jnp.full((2, 128), -0.0, jnp.bfloat16),
+            jnp.full((2, 128), -0.0, jnp.float32),
+            jnp.full((2, 128), -0.0, jnp.float32),
+            jnp.zeros((1, 2), jnp.int32),
+            jnp.zeros((1, 2), jnp.int32),
+            jnp.asarray([0, 1], jnp.int32),
+            2,
+        )
+        zero_results = (
+            _packed_position_add(*zeros),
+            *_packed_position_add_backward(zeros[0], *zeros),
+        )
+        for actual in zero_results:
+            self.assertFalse(np.any(np.signbit(np.asarray(actual.astype(jnp.float32)))))
+        empty = (
+            *zeros[:3],
+            jnp.empty((0, 2), jnp.int32),
+            jnp.empty((0, 2), jnp.int32),
+            jnp.asarray([0], jnp.int32),
+            2,
+        )
+        np.testing.assert_array_equal(
+            _packed_position_add(*empty), jnp.zeros_like(zeros[0])
+        )
+        for actual in _packed_position_add_backward(zeros[0], *empty):
+            self.assertEqual(int(jnp.count_nonzero(actual)), 0)
 
 
+    def test_packed_supervision_gather(self) -> None:
+        offsets = torch.tensor([0, 0, 3, 3, 9], dtype=torch.int64)
+        indices = torch.tensor([0, 6, 7, 8, 9, 12, 18, 19, 23, 24])
+        for dtype in (torch.int64, torch.float32, torch.bfloat16):
+            source = torch.arange(13).to(dtype)
+            if dtype == torch.int64:
+                source = source * (1 << 40)
+            else:
+                source[0] = -0.0
+                source[1] = float("nan")
+                source[2] = float("inf")
+            padded = torch.zeros(4, 7, dtype=dtype)
+            for row in range(4):
+                start, stop = offsets[row : row + 2]
+                padded[row, : stop - start] = source[start:stop]
+            expected = padded.flatten()[indices]
+            actual = gather_padded_sequence(source, offsets, indices, 7)
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0, equal_nan=True)
+            torch.testing.assert_close(
+                torch.signbit(actual[actual == 0]),
+                torch.signbit(expected[expected == 0]),
+            )
+        torch.testing.assert_close(
+            gather_padded_sequence(torch.empty(0), torch.zeros(5).long(), indices, 7),
+            torch.zeros_like(indices, dtype=torch.float32),
+        )
+        gm = make_fx(gather_padded_sequence, tracing_mode="fake")(
+            torch.arange(13), offsets, indices, 7
+        )
+        targets = {str(n.target) for n in gm.graph.nodes if n.op == "call_function"}
+        self.assertIn("hammer.packed_supervision_gather.default", targets)
+
+    def test_supervision_chip_padding(self) -> None:
+        indices = jnp.asarray([0, 1, 2, 4, 5], jnp.int32)
+        words = jnp.zeros(indices.shape, jnp.uint32)
+        for owner, values, lengths in (
+            (0, [10, 11, 0, 0], [2]),
+            (1, [20, 0, 0, 0], [1]),
+        ):
+            words += _local_supervision_gather(
+                jax.lax.bitcast_convert_type(
+                    jnp.asarray(values, jnp.int32), jnp.uint32
+                ),
+                jnp.asarray(lengths, jnp.int32),
+                indices,
+                4,
+                owner,
+                1,
+            )
+        np.testing.assert_array_equal(
+            jax.lax.bitcast_convert_type(words, jnp.int32), [10, 11, 0, 20, 0]
+        )
 
     def test_values_and_vjp(self) -> None:
         offsets = torch.tensor([0, 0, 3, 3, 12, 12], dtype=torch.int64)
