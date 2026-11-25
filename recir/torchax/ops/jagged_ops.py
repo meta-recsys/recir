@@ -332,6 +332,8 @@ def _jax_concat_2d_jagged(
 
 
 
+
+
 ) -> Any:
     """Per-sample interleave: combined[b] = cat(left[b], right[b]).
 
