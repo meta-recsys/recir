@@ -26,6 +26,33 @@ from recir.torchax.ops.decorators import op
 logger: logging.Logger = logging.getLogger(__name__)
 
 
+def _bernoulli(key: Any, p: Any, shape: tuple[int, ...]) -> Any:
+    """``jax.random.bernoulli``, or with ``RECIR_DROPOUT_MASK_BITS=16`` two masks per
+    32-bit RBG word.
+
+    Halving the generated words halves rng-bit-generator time. The keep
+    probability becomes ``round(p * 2**16) / 2**16`` (0.89999 for 0.9) and the
+    masks differ from the 32-bit draw, so it is opt-in.
+    """
+    bits = os.environ.get("RECIR_DROPOUT_MASK_BITS", "32")
+    if bits not in ("16", "32"):
+        raise ValueError(f"Unsupported RECIR_DROPOUT_MASK_BITS: {bits}")
+    if bits == "32":
+        return jax.random.bernoulli(key, p, shape)
+    if not shape or shape[0] % 2:
+        logger.warning(
+            "[Dropout hardware RNG] RECIR_DROPOUT_MASK_BITS=16 needs an even "
+            "leading dimension; shape=%s draws 32-bit masks",
+            shape,
+        )
+        return jax.random.bernoulli(key, p, shape)
+    words = jax.random.bits(key, (shape[0] // 2, *shape[1:]), jnp.uint32)
+    threshold = jnp.round(jnp.asarray(p, jnp.float32) * 65536).astype(jnp.uint32)
+    return jnp.concatenate(
+        ((words & 0xFFFF) < threshold, (words >> 16) < threshold), axis=0
+    )
+
+
 def _hardware_bernoulli_mask(key: Any, shape: tuple[int, ...], p: Any) -> Any:
     """Generate per-chip RBG masks on the GSPMD leading batch axis."""
 
@@ -39,7 +66,7 @@ def _hardware_bernoulli_mask(key: Any, shape: tuple[int, ...], p: Any) -> Any:
         )
     probability = jnp.asarray(p, dtype=jnp.float32)
     if chips <= 1:
-        return jax.random.bernoulli(jax.random.fold_in(key, 0), probability, shape)
+        return _bernoulli(jax.random.fold_in(key, 0), probability, shape)
     if axis is None:
         logger.warning(
             "[Dropout hardware RNG] no shardable axis for shape=%s chips=%d; "
@@ -47,14 +74,14 @@ def _hardware_bernoulli_mask(key: Any, shape: tuple[int, ...], p: Any) -> Any:
             shape,
             chips,
         )
-        return jax.random.bernoulli(key, probability, shape)
+        return _bernoulli(key, probability, shape)
     local_shape = (*shape[:axis], shape[axis] // chips, *shape[axis + 1 :])
     spec = P(*(resource if i == axis else None for i in range(len(shape))))
 
     def per_chip(local_key: Any) -> Any:
         chip_index = batch_shard_index(mesh, resource)
         local_key = jax.random.fold_in(local_key, chip_index)
-        return jax.random.bernoulli(local_key, probability, local_shape)
+        return _bernoulli(local_key, probability, local_shape)
 
     return jax.shard_map(
         per_chip, mesh=mesh, in_specs=P(), out_specs=spec, check_vma=False
@@ -83,6 +110,13 @@ def _jbernoulli_keyed(
     impl = os.environ.get("RECIR_DROPOUT_PRNG_IMPL", "threefry2x32")
     if impl not in ("threefry2x32", "rbg"):
         raise ValueError(f"Unsupported dropout PRNG implementation: {impl}")
+    if os.environ.get("RECIR_DROPOUT_MASK_BITS", "32") == "16" and impl != "rbg":
+        # Only the RBG path draws the paired masks, so letting this through
+        # would measure a 32-bit draw and report it as the 16-bit one.
+        raise ValueError(
+            "RECIR_DROPOUT_MASK_BITS=16 needs RECIR_DROPOUT_PRNG_IMPL=rbg; "
+            f"impl={impl} draws 32-bit masks"
+        )
     if impl == "rbg":
         key = jax.random.key(base_seed, impl="rbg")
         key = jax.random.fold_in(key, _fold_counter(counter))
