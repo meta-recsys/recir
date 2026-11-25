@@ -220,11 +220,12 @@ class JaggedHSTUAttentionTest(unittest.TestCase):
                 self.assertEqual(int(start) + int(prefix), int(offsets[seq]))
                 self.assertEqual(int(length), int(offsets[seq + 1] - offsets[seq]))
 
-    def test_an_unaligned_block_keeps_the_single_block_path(self) -> None:
-        # Nothing is padded for alignment, so no shape loses the fast path.
-        self.assertTrue(_single_block_fits(max_seq_len=93, block_q=100, block_k=100))
+    def test_single_block_fits_counts_the_rows_a_sequence_can_occupy(self) -> None:
+        # A sequence can reach stage row max_seq_len + 7, rounded up to whole
+        # 8-row groups, so a block not a multiple of 8 can lose up to 7 rows.
         self.assertTrue(_single_block_fits(max_seq_len=93, block_q=104, block_k=104))
         self.assertFalse(_single_block_fits(max_seq_len=98, block_q=104, block_k=104))
+        self.assertFalse(_single_block_fits(max_seq_len=93, block_q=100, block_k=100))
 
     def test_packed_rows_are_not_padded_for_alignment(self) -> None:
         """Padding here fires a concatenate over the whole packed tensor."""
@@ -914,7 +915,8 @@ class JaggedHSTUAttentionTest(unittest.TestCase):
         }
 
     def test_single_block_tiles_are_computed_in_causal_query_strips(self) -> None:
-        # 128-row strips of a 256-row tile see 128 and then 256 keys; nothing
+        # A 200-row sequence lies in the first 208 rows of its 256-row stage: a
+        # 128-row strip sees 128 keys and the remaining 80 rows see 256; nothing
         # computes the full 256 x 256 scores.
         _, _, forward = self._trace_native_forward(
             max_seq_len=200, block_q=256, block_k=256
@@ -923,7 +925,8 @@ class JaggedHSTUAttentionTest(unittest.TestCase):
         for call in (forward, backward):
             shapes = self._dot_output_shapes(call)
             self.assertIn((1, 128, 128), shapes)
-            self.assertIn((1, 128, 256), shapes)
+            self.assertIn((1, 80, 256), shapes)
+            self.assertNotIn((1, 128, 256), shapes)
             self.assertNotIn((1, 256, 256), shapes)
 
     def test_fused_backward_computes_diagonal_blocks_in_query_strips(self) -> None:
