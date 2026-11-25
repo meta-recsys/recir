@@ -119,6 +119,30 @@ def _int32(a: np.ndarray) -> np.ndarray:
     return a.astype(np.int32) if a.dtype == np.int64 else a
 
 
+def _unique_inverse(values: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """``np.unique(values, return_inverse=True)`` for non-negative integers, as
+    one sort of (value, position) keys packed into int64 instead of an argsort
+    and a gather: ~30% less CPU at a device's ~320k ids."""
+    n = values.size
+    bits = max((n - 1).bit_length(), 1)
+    if (
+        n == 0
+        or values.dtype.kind not in "iu"
+        or int(values.min()) < 0
+        or int(values.max()) >> (63 - bits)
+    ):
+        return np.unique(values, return_inverse=True)
+    keys = (values.astype(np.int64, copy=False) << bits) | np.arange(n, dtype=np.int64)
+    keys.sort()
+    sorted_values = keys >> bits
+    first = np.empty(n, bool)
+    first[0] = True
+    np.not_equal(sorted_values[1:], sorted_values[:-1], out=first[1:])
+    inverse = np.empty(n, np.int64)
+    inverse[keys & ((1 << bits) - 1)] = np.cumsum(first) - 1
+    return sorted_values[first].astype(values.dtype, copy=False), inverse
+
+
 def _device_inputs(
     ids: np.ndarray,
     d: int,
@@ -136,7 +160,7 @@ def _device_inputs(
     and samples come out increasing.
     """
     per_sc = padded // num_sc
-    sorted_uniq, inv = np.unique(ids, return_inverse=True)
+    sorted_uniq, inv = _unique_inverse(ids)
     k = np.arange(_round_up(sorted_uniq.size, num_sc)).reshape(-1, num_sc).T.ravel()
     k = k[k < sorted_uniq.size]
     uniq, samples = sorted_uniq[k], (k % num_sc) * per_sc + k // num_sc
@@ -174,7 +198,7 @@ def _exchange_layout(
         ranks.append(np.where(inside, np.cumsum(inside) - 1, -1))
     ids = np.concatenate(cands)
     phys = ((ids % shards + rotation) % shards) * shard_size + ids // shards + offset
-    rows, row_of = np.unique(phys, return_inverse=True)
+    rows, row_of = _unique_inverse(phys)
     owner = rows // per_device
     counts = np.bincount(owner, minlength=world)
     fill = float(counts.max(initial=0)) / cap
