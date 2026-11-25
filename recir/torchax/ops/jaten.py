@@ -42,6 +42,12 @@ from recir.torchax.gspmd_context import (
 )
 from recir.torchax.ops import jax_reimplement, mappings, op_base, ops_registry
 from recir.torchax.ops.decorators import op
+from recir.torchax.ops.onehot_segment_sum import (
+    onehot_gather,
+    onehot_gather_enabled,
+    onehot_segment_sum,
+    onehot_segment_sum_enabled,
+)
 from recir.torchax.view import View
 
 logger: logging.Logger = logging.getLogger(__name__)
@@ -808,10 +814,47 @@ def _aten_embedding(
     sparse: Any = False,
 ) -> Any:
     if padding_idx == -1:
+        if _use_onehot_gather(a, w):
+            return _dp_onehot_gather(a, w)
         return jnp.take(a, w, axis=0)
     return _disable_pad_idx_grad_embedding_impl(  # pyre-ignore[29]
         a, w, padding_idx, scale_grad_by_freq, sparse
     )
+
+
+def _use_onehot_gather(table: Any, indices: Any) -> bool:
+    return (
+        table.ndim == 2
+        and table.dtype in (jnp.float32, jnp.bfloat16)
+        and onehot_gather_enabled(table.shape[0])
+        and indices.ndim >= 1
+        and indices.shape[0] % len(jax.devices()) == 0
+    )
+
+
+def _dp_onehot_gather(table: Any, indices: Any) -> Any:
+    """``jnp.take(table, indices, axis=0)`` as ``onehot_gather`` over each device's
+    indices, under the same layout assumptions as ``aten.embedding_dense_backward``:
+    the table is replicated and the indices are batch-sharded on axis 0."""
+
+    def per_device(table_s: Any, indices_s: Any) -> Any:
+        rows = onehot_gather(table_s, indices_s.reshape(-1))
+        return rows.reshape(*indices_s.shape, table_s.shape[1])
+
+    if (
+        len(jax.devices()) <= 1
+        or _DP_AXIS in jax.sharding.get_abstract_mesh().manual_axes
+    ):
+        return per_device(table, indices)
+    batch = P(_DP_AXIS, *([None] * (indices.ndim - 1)))
+    return jax.shard_map(
+        per_device,
+        mesh=jax.sharding.Mesh(jax.devices(), (_DP_AXIS,)),
+        in_specs=(P(), batch),
+        out_specs=P(*batch, None),
+        check_vma=False,
+        # pyrefly: ignore [bad-argument-count]
+    )(table, indices)
 
 
 @op(torch.ops.aten.embedding_renorm_)  # pyre-ignore[56]
@@ -1106,7 +1149,25 @@ def _aten_index(self: Any, indexes: Any) -> Any:
         full_indexes = indexes + (slice(None),) * (self.ndim - len(indexes))
         selected = bits[full_indexes + (slice(None),)]
         return jax.lax.bitcast_convert_type(selected, self.dtype)
+    if _gathers_scalars_densely(self, indexes):
+        # TPU's scalar gather is ~2.5x slower than gathering two-element rows, so
+        # duplicate the column and keep one: a table of 32896 int32 read at 325619
+        # indices takes 1.3 ms instead of 3.4 ms, with identical values.
+        return jnp.stack((self, self), axis=-1)[indexes][..., 0]
     return self[indexes]
+
+
+def _gathers_scalars_densely(self: Any, indexes: tuple[Any, ...]) -> bool:
+    """A 1-D 32-bit table read at many more positions than it has rows."""
+    if self.ndim != 1 or len(indexes) != 1 or self.dtype.itemsize != 4:
+        return False
+    index = indexes[0]
+    return (
+        hasattr(index, "dtype")
+        and jnp.issubdtype(index.dtype, jnp.integer)
+        and index.size >= 4096
+        and self.shape[0] <= 4 * index.size
+    )
 
 
 @op(torch.ops.aten.split)
@@ -2177,6 +2238,10 @@ def _aten_embedding_dense_backward(
     num_weights = int(num_weights)
 
     def _table_grad(grad_flat: Any, idx_flat: Any) -> Any:
+        if onehot_segment_sum_enabled(num_weights):
+            return onehot_segment_sum(grad_flat, idx_flat, num_weights).astype(
+                grad_flat.dtype
+            )
         gw = jnp.zeros((num_weights, dim), dtype=grad_flat.dtype)
         return gw.at[idx_flat].add(grad_flat)
 

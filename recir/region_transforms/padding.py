@@ -405,38 +405,36 @@ def pad_jagged_lengths(
     )
     tpb = per_host_target_batch // num_local
     rc = _per_chip_real_counts(B_real, num_local, count)
+    chip_bounds = list(itertools.accumulate(rc, initial=0))
 
     key_lengths = lengths.reshape(num_keys, B_real)
-    parts: List[torch.Tensor] = []
+    # Every block's total in one host read: the per-key cumulative lengths at the
+    # chip boundaries.
+    csum = torch.cat([key_lengths.new_zeros(num_keys, 1), key_lengths.cumsum(1)], 1)
+    at = csum[:, chip_bounds].tolist()
+    out = lengths.new_empty(num_keys * num_local * tpb)
+    pos = 0
     for k in range(num_keys):
         budget_pb = per_host_budgets[k] // num_local
-        offset = 0
-        blocks: List[torch.Tensor] = []
         for c in range(num_local):
             rc_c = rc[c]
-            bl = key_lengths[k][offset : offset + rc_c]
-            offset += rc_c
+            bl = key_lengths[k].narrow(0, chip_bounds[c], rc_c)
             num_dummy_c = tpb - rc_c
-            block_total = int(bl.sum().item())
+            block_total = int(at[k][c + 1] - at[k][c])
             if block_total > budget_pb:
                 bl = _trim_lengths(bl, budget_pb)
                 block_total = budget_pb
+            out.narrow(0, pos, rc_c).copy_(bl)
+            dummy_b = out.narrow(0, pos + rc_c, num_dummy_c)
+            pos += tpb
             block_pad = budget_pb - block_total
             if block_pad > 0 and num_dummy_c > 0:
-                per_d = block_pad // num_dummy_c
-                rem = block_pad % num_dummy_c
-                dummy_b = torch.full(
-                    (num_dummy_c,), per_d, dtype=lengths.dtype, device=lengths.device
-                )
-                if rem > 0:
-                    dummy_b[:rem] = dummy_b[:rem] + 1
+                per_d, rem = divmod(block_pad, num_dummy_c)
+                dummy_b.fill_(per_d)
+                dummy_b.narrow(0, 0, rem).add_(1)
             else:
-                dummy_b = torch.zeros(
-                    num_dummy_c, dtype=lengths.dtype, device=lengths.device
-                )
-            blocks.append(torch.cat([bl, dummy_b]))
-        parts.append(torch.cat(blocks))
-    return torch.cat(parts)
+                dummy_b.zero_()
+    return out
 
 
 @pad_jagged_lengths.register_fake  # pyre-ignore[56]
@@ -501,44 +499,48 @@ def pad_jagged_values(
         f"pad_jagged_values: lengths.shape[0]={lengths.shape[0]} is not "
         f"num_keys={num_keys} * B={B}"
     )
-    csum = lengths.cumsum(0).tolist()
     chip_bounds = list(itertools.accumulate(rc, initial=0))
-    block_sizes: List[int] = []
-    parts: List[torch.Tensor] = []
-    offset = 0
+    # Every block's value count in one host read: the cumulative lengths at the
+    # block boundaries.
+    csum = torch.cat([lengths.new_zeros(1), lengths.cumsum(0)])
+    at = csum[[k * B + b for k in range(num_keys) for b in chip_bounds]].tolist()
+    block_sizes = [
+        int(at[k * (num_local + 1) + c + 1] - at[k * (num_local + 1) + c])
+        for k in range(num_keys)
+        for c in range(num_local)
+    ]
+    # Each block is written once, straight into the output. The output is zeroed
+    # in one pass first because faulting its fresh pages in block by block slows
+    # the copies ~3x.
+    shape = list(values.shape)
+    shape[dim] = num_local * sum(b // num_local for b in per_host_budgets)
+    out = values.new_zeros(shape)
+    offset = written = 0
     for k in range(num_keys):
         budget_pb = per_host_budgets[k] // num_local
-        base = k * B
         for c in range(num_local):
-            start, end = base + chip_bounds[c], base + chip_bounds[c + 1]
-            block_total = int(csum[end - 1] if end > 0 else 0) - int(
-                csum[start - 1] if start > 0 else 0
-            )
-            block_sizes.append(block_total)
-            block_vals = values.narrow(dim, offset, block_total)
-            offset += block_total
-            current = block_vals.shape[dim]
-            if current == budget_pb:
-                parts.append(block_vals.clone())
-            elif current > budget_pb:
-                parts.append(block_vals.narrow(dim, 0, budget_pb).clone())
-            elif tile_pad and current > 0:
+            current = block_sizes[k * num_local + c]
+            block_vals = values.narrow(dim, offset, current)
+            block_out = out.narrow(dim, written, budget_pb)
+            offset += current
+            written += budget_pb
+            filled = min(current, budget_pb)
+            block_out.narrow(dim, 0, filled).copy_(block_vals.narrow(dim, 0, filled))
+            if tile_pad and 0 < current < budget_pb:
                 # Fill this block's deficit by tiling its own real ids instead of
                 # zero-filling. For embedding id-lists (pad positions masked out
                 # downstream) this keeps the pad tokens' block-owner distribution
                 # uniform -- matching the real ids -- instead of routing every pad
                 # to id 0 -> block-owner 0, which skews the ring-shift all-to-all.
                 # Real ids stay at the block front so backward/fake are unchanged.
-                reps = [1] * values.ndim
-                reps[dim] = -(-budget_pb // current)
-                parts.append(block_vals.repeat(reps).narrow(dim, 0, budget_pb))
-            else:
-                pw = [0] * (2 * values.ndim)
-                pw[2 * (values.ndim - 1 - dim) + 1] = budget_pb - current
-                parts.append(F.pad(block_vals, pw))
+                # Doubling copies of the block's own prefix repeat its values.
+                while filled < budget_pb:
+                    n = min(filled, budget_pb - filled)
+                    block_out.narrow(dim, filled, n).copy_(block_out.narrow(dim, 0, n))
+                    filled += n
     if pad_id >= 0:
         _PAD_JAGGED_SIZES[pad_id] = (values.shape[dim], block_sizes, num_local)
-    return torch.cat(parts, dim=dim)
+    return out
 
 
 @pad_jagged_values.register_fake  # pyre-ignore[56]
