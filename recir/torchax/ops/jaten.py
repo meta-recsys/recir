@@ -42,6 +42,10 @@ from recir.torchax.gspmd_context import (
 )
 from recir.torchax.ops import jax_reimplement, mappings, op_base, ops_registry
 from recir.torchax.ops.decorators import op
+from recir.torchax.ops.onehot_segment_sum import (
+    onehot_segment_sum,
+    onehot_segment_sum_enabled,
+)
 from recir.torchax.view import View
 
 logger: logging.Logger = logging.getLogger(__name__)
@@ -2195,6 +2199,10 @@ def _aten_embedding_dense_backward(
     num_weights = int(num_weights)
 
     def _table_grad(grad_flat: Any, idx_flat: Any) -> Any:
+        if onehot_segment_sum_enabled(num_weights):
+            return onehot_segment_sum(grad_flat, idx_flat, num_weights).astype(
+                grad_flat.dtype
+            )
         gw = jnp.zeros((num_weights, dim), dtype=grad_flat.dtype)
         return gw.at[idx_flat].add(grad_flat)
 

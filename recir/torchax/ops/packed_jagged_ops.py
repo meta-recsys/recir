@@ -27,6 +27,10 @@ from recir.torchax.ops.jagged_ops import (
     _segment_broadcast,
     _segment_id_by_cumsum,
 )
+from recir.torchax.ops.onehot_segment_sum import (
+    onehot_segment_sum,
+    onehot_segment_sum_enabled,
+)
 
 
 def select_concat_split_right(
@@ -1049,6 +1053,12 @@ def _packed_position_add_backward(
     )
     dv = jnp.where(valid[:, None], grad.astype(values.dtype), 0)
     dv = jnp.where(dv == 0, jnp.zeros_like(dv), dv)
+    if onehot_segment_sum_enabled(max(position.shape[0], time.shape[0])):
+        # No sort: the sorted segment sum spends 5 ms per table on 328k tokens,
+        # mostly serializing the runs of equal indices that sorting creates.
+        dp = onehot_segment_sum(dv, pi, position.shape[0]).astype(position.dtype)
+        dt = onehot_segment_sum(dv, ti, time.shape[0]).astype(time.dtype)
+        return dv, dp, dt
     # Sorting (index, row) pairs yields the sorted indices with the order, which
     # spares the scalar gathers index[order] (2.4 ms each on 328k tokens).
     rows = jnp.arange(pi.shape[0], dtype=jnp.int32)
