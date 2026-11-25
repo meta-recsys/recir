@@ -11,7 +11,7 @@ import importlib
 import math
 import os
 import unittest
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from typing import Any, cast
 from unittest import mock
 
@@ -19,6 +19,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from recir.ops.pallas.jagged_hstu_attention import (
+    _ALIGNMENT_ROWS,
+    _single_block_stage,
     jagged_hstu_attention_reference,
     pallas_jagged_hstu_attention,
     pallas_jagged_hstu_attention_backward,
@@ -126,6 +128,7 @@ class JaggedHSTUAttentionTest(unittest.TestCase):
         *,
         max_seq_len: int,
         inv_n: float = 0.17,
+        block: int = 4,
     ) -> None:
         q, k, v, offsets = self._inputs(lengths)
         targets = jnp.asarray(num_targets, dtype=jnp.int32)
@@ -141,8 +144,8 @@ class JaggedHSTUAttentionTest(unittest.TestCase):
             scale=scale,
             inv_n=inv_n,
             interpret=True,
-            block_q=4,
-            block_k=4,
+            block_q=block,
+            block_k=block,
         )
         expected = _pack_dense_output(
             jagged_hstu_attention_reference(
@@ -194,6 +197,31 @@ class JaggedHSTUAttentionTest(unittest.TestCase):
 
     def test_sequences_within_max_seq_len_are_accepted(self) -> None:
         self._assert_parity([12, 3], [0, 0], max_seq_len=12)
+
+    def test_a_sequence_near_the_end_still_starts_inside_the_stage(self) -> None:
+        """The stage is block + 8 rows because the sequence's first row is meant
+        to land at row start % 8. Clamping the stage start to keep the read
+        inside the tensor breaks that: the row index grows to as much as block
+        and the sequence's slice runs off the end of the stage."""
+        rows, block = 400, 256
+        offsets = jnp.asarray([0, 200, rows], dtype=jnp.int32)
+
+        for sequence in range(2):
+            with self.subTest(sequence=sequence):
+                stage_start, _, row_prefix = jax.jit(
+                    lambda s=sequence: _single_block_stage(offsets, s, rows, block)
+                )()
+
+                self.assertLess(int(row_prefix), _ALIGNMENT_ROWS)
+                self.assertEqual(int(stage_start) % _ALIGNMENT_ROWS, 0)
+                self.assertEqual(
+                    int(stage_start) + int(row_prefix), int(offsets[sequence])
+                )
+
+    def test_a_sequence_near_the_end_matches_the_reference(self) -> None:
+        # rows=400 against a 256 block: the second sequence starts at 200, past
+        # the 400 - 256 - 8 = 136 the stage start used to be clamped to.
+        self._assert_parity([200, 200], [0, 0], max_seq_len=200, block=256)
 
     def test_nonuniform_causal_sequences(self) -> None:
         self._assert_parity([7, 3, 9], [0, 0, 0], max_seq_len=9)
@@ -792,25 +820,13 @@ class JaggedHSTUAttentionTest(unittest.TestCase):
                 call = self._trace_fused_backward(
                     max_seq_len=max_seq_len, block=256, dv=64
                 )
-                kernel_jaxpr = next(_walk_nested_jaxprs(call.params["jaxpr"]))
                 vmem_widths = {
                     variable.aval.shape[-1]
-                    for variable in kernel_jaxpr.invars
+                    for jaxpr in _walk_nested_jaxprs(call.params["jaxpr"])
+                    for variable in jaxpr.invars
                     if "vmem" in str(variable.aval)
                 }
                 self.assertIn(64, vmem_widths)
-
-    def test_fused_backward_stages_room_for_a_pulled_back_read(self) -> None:
-        """Near the end of the buffer the single-block stage copy starts early,
-        so the sequence's tile can begin up to ``block + 8`` rows into it."""
-        call = self._trace_fused_backward(max_seq_len=200, block=256)
-        kernel_jaxpr = next(_walk_nested_jaxprs(call.params["jaxpr"]))
-        stage_shapes = [
-            variable.aval.shape
-            for variable in kernel_jaxpr.invars
-            if "vmem" in str(variable.aval) and variable.aval.shape[0] > 256
-        ]
-        self.assertEqual(stage_shapes, [(2 * (256 + 8), 1, 128)] * 4)
 
     def test_fused_backward_falls_back_when_dq_does_not_fit_vmem(self) -> None:
         """The fused dQ accumulator grows with the layer; past the VMEM limit
@@ -825,9 +841,45 @@ class JaggedHSTUAttentionTest(unittest.TestCase):
         self.assertNotIn("fused", _kernel_name(dq_call))
         self.assertNotIn("fused", _kernel_name(dkv_call))
 
-    def test_fused_backward_runs_one_program_per_single_block_sequence(self) -> None:
+    def _pipelines_with_buffers(
+        self, call: Any, shapes: Sequence[tuple[int, ...]]
+    ) -> list[Any]:
+        """The kernel's pipeline loops over double-buffered refs of ``shapes``."""
+        return [
+            jaxpr
+            for jaxpr in _walk_nested_jaxprs(call.params["jaxpr"])
+            if any(equation.primitive.name == "while" for equation in jaxpr.eqns)
+            and sorted(
+                tuple(variable.aval.shape)
+                for variable in jaxpr.invars
+                if len(getattr(variable.aval, "shape", ())) == 4
+                and variable.aval.shape[0] == 2
+            )
+            == sorted(shapes)
+        ]
+
+    def test_fused_backward_pipelines_single_block_sequences(self) -> None:
         call = self._trace_fused_backward(max_seq_len=200, block=256)
         self.assertEqual(call.params["grid_mapping"].grid, (1,))
+        # One pipeline over the sequences stages q, k, v and dO (the block plus
+        # 8 alignment rows) and writes dK, dV and dQ.
+        self.assertTrue(
+            self._pipelines_with_buffers(
+                call, [(2, 264, 1, 128)] * 4 + [(2, 256, 1, 128)] * 3
+            )
+        )
+
+    def test_native_forward_pipelines_single_block_sequences(self) -> None:
+        _, _, call = self._trace_native_forward(
+            max_seq_len=200, block_q=256, block_k=256
+        )
+        self.assertIn("fwd_single_block", _kernel_name(call))
+        self.assertEqual(call.params["grid_mapping"].grid, (1,))
+        self.assertTrue(
+            self._pipelines_with_buffers(
+                call, [(2, 264, 1, 128)] * 3 + [(2, 256, 1, 128)]
+            )
+        )
 
     def test_fused_backward_accumulates_dq_over_kv_blocks(self) -> None:
         call = self._trace_fused_backward(max_seq_len=600, block=256)
