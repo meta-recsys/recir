@@ -6,7 +6,7 @@
 import os
 from types import SimpleNamespace
 from unittest import TestCase
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 os.environ["JAX_PLATFORMS"] = "cpu"
 
@@ -47,30 +47,41 @@ class TestCapacitySelection(TestCase):
                 self.selector.select(demand)
 
     def test_remote_overflow_is_collective_before_error(self) -> None:
+        work = Mock()
+
+        def all_reduce(tensor: torch.Tensor, op: object, async_op: bool) -> Mock:
+            work.wait.side_effect = lambda: tensor.fill_(2)
+            return work
+
         with (
             patch("torch.distributed.is_initialized", return_value=True),
             patch("torch.distributed.get_world_size", return_value=2),
             patch("torch.distributed.get_backend", return_value="gloo"),
-            patch(
-                "torch.distributed.all_reduce",
-                side_effect=lambda tensor, op: tensor.fill_(2),
-            ) as reduce,
+            patch("torch.distributed.all_reduce", side_effect=all_reduce) as reduce,
         ):
-            with self.assertRaises(ValueError):
+            with self.assertRaisesRegex(ValueError, "maximum graph"):
                 self.selector.select({"nro": [1], "history": [1]})
             reduce.assert_called_once()
+            self.assertTrue(reduce.call_args.kwargs["async_op"])
+            work.wait.assert_called_once_with()
 
     def test_remote_host_selects_large_graph_for_everyone(self) -> None:
+        work = Mock()
+
+        def all_reduce(tensor: torch.Tensor, op: object, async_op: bool) -> Mock:
+            work.wait.side_effect = lambda: tensor.fill_(1)
+            return work
+
         with (
             patch("torch.distributed.is_initialized", return_value=True),
             patch("torch.distributed.get_world_size", return_value=2),
             patch("torch.distributed.get_backend", return_value="gloo"),
-            patch(
-                "torch.distributed.all_reduce",
-                side_effect=lambda tensor, op: tensor.fill_(1),
-            ),
+            patch("torch.distributed.all_reduce", side_effect=all_reduce) as reduce,
         ):
             self.assertEqual(self.selector.select({"nro": [1], "history": [1]}), 1)
+            reduce.assert_called_once()
+            self.assertTrue(reduce.call_args.kwargs["async_op"])
+            work.wait.assert_called_once_with()
 
 
 class _Preprocessor(torch.nn.Module):
