@@ -730,6 +730,39 @@ def _silu_grad(x: jax.Array) -> jax.Array:
     return sigmoid * (1.0 + x * (1.0 - sigmoid))
 
 
+def _tile_config(
+    block_k: int | None,
+    block_q: int | None,
+    query_tiles_per_program: int | None,
+    *,
+    max_seq_len: int,
+    backward: bool,
+) -> tuple[int, int, int]:
+    """Fill unset tile sizes from ``RECIR_HSTU_BLOCK`` (block_q = block_k) and
+    ``RECIR_HSTU_QUERY_TILES`` / ``RECIR_HSTU_QUERY_TILES_BWD``, else the defaults.
+
+    ``RECIR_HSTU_BLOCK`` may list several blocks (``640,512``): each call takes the
+    one that pads ``max_seq_len`` least, the first listed on ties.
+    """
+    blocks = os.environ.get("RECIR_HSTU_BLOCK", str(_DEFAULT_BLOCK)).split(",")
+    block = min((int(b) for b in blocks), key=lambda b: -(-max_seq_len // b) * b)
+    if backward:
+        tiles = int(
+            os.environ.get(
+                "RECIR_HSTU_QUERY_TILES_BWD", _DEFAULT_BACKWARD_QUERY_TILES_PER_PROGRAM
+            )
+        )
+    else:
+        tiles = int(
+            os.environ.get("RECIR_HSTU_QUERY_TILES", _DEFAULT_QUERY_TILES_PER_PROGRAM)
+        )
+    return (
+        block if block_k is None else block_k,
+        block if block_q is None else block_q,
+        tiles if query_tiles_per_program is None else query_tiles_per_program,
+    )
+
+
 def _tanh_silu_enabled() -> bool:
     """``RECIR_HSTU_TANH_SILU=1``: SiLU as ``h + h * tanh(h)`` with ``h = x / 2``.
 
@@ -1108,11 +1141,6 @@ def _jagged_bwd_dkv_kernel(
             0,
             1,
         )
-        # Queries past ``length`` would add into valid keys here, so unlike
-        # forward and dQ the tile must also lie wholly inside the sequence.
-        interior = _keys_precede_queries(kv_start, block_k, query_start, max_id) & (
-            query_start + block_q <= length
-        )
 
         def _update(masked: bool) -> None:
             scores = jax.lax.dot(
@@ -1174,8 +1202,7 @@ def _jagged_bwd_dkv_kernel(
                 dk_acc_ref[...] = dk_acc_ref[...] + alpha * dk_update
             dv_acc_ref[...] = dv_acc_ref[...] + dv_update
 
-        pl.when(interior)(functools.partial(_update, False))
-        pl.when(~interior)(functools.partial(_update, True))
+        _update(masked=True)
 
     def _query_window(query_block):
         query_start = (first_query_block + query_block) * block_q
@@ -1437,13 +1464,20 @@ def pallas_jagged_hstu_attention_backward(
     max_seq_len: int,
     alpha: float,
     interpret: bool,
-    block_k: int = _DEFAULT_BLOCK,
-    block_q: int = _DEFAULT_BLOCK,
-    query_tiles_per_program: int = _DEFAULT_BACKWARD_QUERY_TILES_PER_PROGRAM,
+    block_k: int | None = None,
+    block_q: int | None = None,
+    query_tiles_per_program: int | None = None,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Compute HSTU gradients while reading Q/K/V from packed storage."""
     from recir.ops.pallas.hstu_attention import pallas_hstu_attention_backward
 
+    block_k, block_q, query_tiles_per_program = _tile_config(
+        block_k,
+        block_q,
+        query_tiles_per_program,
+        max_seq_len=max_seq_len,
+        backward=True,
+    )
     _validate_jagged_hstu_attention_inputs(
         q,
         k,
@@ -1612,15 +1646,22 @@ def pallas_jagged_hstu_attention(
     scale: float | None = None,
     inv_n: float | jax.Array | None = None,
     interpret: bool = False,
-    block_k: int = _DEFAULT_BLOCK,
-    block_q: int = _DEFAULT_BLOCK,
-    query_tiles_per_program: int = _DEFAULT_QUERY_TILES_PER_PROGRAM,
+    block_k: int | None = None,
+    block_q: int | None = None,
+    query_tiles_per_program: int | None = None,
 ) -> jax.Array:
     """Compute HSTU attention from packed Q/K/V and return packed output.
 
     ``interpret=True`` uses the dense Pallas interpreter path because native
     runtime-sized DMA extents cannot be discharged by the CPU interpreter.
     """
+    block_k, block_q, query_tiles_per_program = _tile_config(
+        block_k,
+        block_q,
+        query_tiles_per_program,
+        max_seq_len=max_seq_len,
+        backward=False,
+    )
     num_sequences = _validate_jagged_hstu_attention_inputs(
         q,
         k,
