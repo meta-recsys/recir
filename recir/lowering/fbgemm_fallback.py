@@ -74,12 +74,22 @@ def _is_fbgemm_available() -> bool:
 # ── Pure PyTorch implementations ────────────────────────────────────────
 
 
+def _cumsum_lengths(lengths: torch.Tensor, dim: int) -> torch.Tensor:
+    # Offsets index a values tensor, so int32 holds them, and TPUs emulate an
+    # int64 cumsum about 25x slower. The total therefore has to stay under
+    # 2**31: past it the accumulator wraps to a negative offset rather than
+    # raising, and the caller reads rows from the wrong end of the tensor.
+    if lengths.dtype == torch.int64:
+        return torch.cumsum(lengths, dim=dim, dtype=torch.int32).to(torch.int64)
+    return torch.cumsum(lengths, dim=dim)
+
+
 def _batched_complete_cumsum_impl(values: torch.Tensor) -> torch.Tensor:
     # values: (B, N, ...) -> output: (B, N+1, ...)
     # Batched version of asynchronous_complete_cumsum: prepend zero slice on dim=1.
     # Use zeros_like(narrow) instead of zeros(shape) so the FX graph doesn't
     # hardcode concrete shape literals that break when XLA runtime shapes differ.
-    cumsum = torch.cumsum(values, dim=1)
+    cumsum = _cumsum_lengths(values, dim=1)
     zeros = torch.zeros_like(values.narrow(1, 0, 1))
     return torch.cat([zeros, cumsum], dim=1)
 
@@ -94,7 +104,7 @@ def _dense_to_jagged_impl(
 
 
 def _asynchronous_complete_cumsum_impl(lengths: torch.Tensor) -> torch.Tensor:
-    cumsum = torch.cumsum(lengths, dim=0)
+    cumsum = _cumsum_lengths(lengths, dim=0)
     zero = torch.zeros(1, dtype=lengths.dtype, device=lengths.device)
     return torch.cat([zero, cumsum], dim=0)
 
