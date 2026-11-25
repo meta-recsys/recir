@@ -320,6 +320,18 @@ def _segment_broadcast(per_segment: Any, starts: Any, n: int) -> Any:
     return jnp.cumsum(delta)
 
 
+def _segment_dma_enabled(values: Any) -> bool:
+    implementation = os.environ.get("RECIR_JAGGED_CONCAT_SPLIT_IMPL", "gather")
+    if implementation not in ("gather", "segment_dma", "output_tile_dma"):
+        raise ValueError(f"Invalid RECIR_JAGGED_CONCAT_SPLIT_IMPL: {implementation!r}")
+    return implementation != "gather" and values.dtype in (
+        jnp.bfloat16,
+        jnp.float32,
+        jnp.int32,
+        jnp.uint32,
+        jnp.int64,
+        jnp.uint64,
+    )
 
 
 def _jax_concat_2d_jagged(
@@ -328,12 +340,73 @@ def _jax_concat_2d_jagged(
     values_right: Any,
     offsets_right: Any,
     out_total: int,
+) -> Any:
+    if not _segment_dma_enabled(values_left) or values_left.dtype != values_right.dtype:
+        return _jax_concat_2d_jagged_gather(
+            values_left, offsets_left, values_right, offsets_right, out_total
+        )
+    from recir.torchax.ops.jagged_dma_ops import (
+        concat_jagged_dma,
+        concat_jagged_tiled_dma,
+    )
+
+    concat = (
+        concat_jagged_tiled_dma
+        if os.environ["RECIR_JAGGED_CONCAT_SPLIT_IMPL"] == "output_tile_dma"
+        else concat_jagged_dma
+    )
+
+    valid_sources = (offsets_left[-1] <= values_left.shape[0]) & (
+        offsets_right[-1] <= values_right.shape[0]
+    )
+    return jax.lax.cond(
+        valid_sources,
+        lambda: concat(
+            values_left, offsets_left, values_right, offsets_right, out_total
+        ),
+        lambda: _jax_concat_2d_jagged_gather(
+            values_left, offsets_left, values_right, offsets_right, out_total
+        ),
+    )
 
 
+def _jax_split_2d_jagged(
+    values: Any,
+    offsets_left: Any,
+    offsets_right: Any,
+    seq_len_a: int,
+    seq_len_b: int,
+) -> Any:
+    if not _segment_dma_enabled(values):
+        return _jax_split_2d_jagged_gather(
+            values, offsets_left, offsets_right, seq_len_a, seq_len_b
+        )
+    from recir.torchax.ops.jagged_dma_ops import (
+        split_jagged_dma,
+        split_jagged_tiled_dma,
+    )
+
+    split = (
+        split_jagged_tiled_dma
+        if os.environ["RECIR_JAGGED_CONCAT_SPLIT_IMPL"] == "output_tile_dma"
+        else split_jagged_dma
+    )
+
+    return jax.lax.cond(
+        offsets_left[-1] + offsets_right[-1] <= values.shape[0],
+        lambda: split(values, offsets_left, offsets_right, seq_len_a, seq_len_b),
+        lambda: _jax_split_2d_jagged_gather(
+            values, offsets_left, offsets_right, seq_len_a, seq_len_b
+        ),
+    )
 
 
-
-
+def _jax_concat_2d_jagged_gather(
+    values_left: Any,
+    offsets_left: Any,
+    values_right: Any,
+    offsets_right: Any,
+    out_total: int,
 ) -> Any:
     """Per-sample interleave: combined[b] = cat(left[b], right[b]).
 
@@ -384,7 +457,7 @@ def _jax_concat_2d_jagged(
     return jnp.where(_bcast_mask(valid, out.ndim), out, 0)
 
 
-def _jax_split_2d_jagged(
+def _jax_split_2d_jagged_gather(
     values: Any,
     offsets_left: Any,
     offsets_right: Any,
