@@ -125,6 +125,18 @@ def _cumsum_mask(mask: np.ndarray) -> np.ndarray:
     return mask.astype(np.int64).cumsum()
 
 
+def _take_rows(table: jax.Array, index: jax.Array) -> jax.Array:
+    """``table[index]`` for a 1-D index. libtpu offloads a row gather to SparseCore
+    only when the index count is a multiple of 8, and only in a program that does not
+    also run a SparseCore lookup; otherwise the gather runs on the TensorCore, ~13x
+    slower at a device's ~320k positions. Pad here, then slice."""
+    n = index.shape[0]
+    pad = -n % 8
+    if not pad:
+        return table[index]
+    return table[jnp.pad(index, (0, pad))][:n]
+
+
 def _unique_inverse(values: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     """``np.unique(values, return_inverse=True)`` for non-negative integers, as
     one sort of (value, position) keys packed into int64 instead of an argsort
@@ -535,29 +547,48 @@ class SparseCoreRowwiseTables:
                 ts.setting_in_stack.row_offset_in_shard,
             )
 
-        def fwd_local(
-            csr: Any, ev_w: Any, slots: Dict[str, jax.Array]
-        ) -> Dict[str, jax.Array]:
+        def fwd_local(csr: Any, ev_w: Any) -> Dict[str, jax.Array]:
             acts = jte.tpu_sparse_dense_matmul(csr, ev_w, feature_specs=specs, **kw)
             out: Dict[str, jax.Array] = {}
             for f, subs in sub_of.items():
                 total = acts[subs[0]]
                 for s in subs[1:]:
                     total = total + acts[s]
-                out[f] = total[slots[f]]
+                out[f] = total
             return out
 
+        def expand_local(
+            unique: Dict[str, jax.Array], slots: Dict[str, jax.Array]
+        ) -> Dict[str, jax.Array]:
+            return {f: _take_rows(u, slots[f]) for f, u in unique.items()}
+
         batch = P(axis)
-        fwd = jax.jit(
+        lookup_unique = jax.jit(
             jax.shard_map(
                 fwd_local,
                 mesh=mesh,
-                in_specs=(batch, batch, batch),
+                in_specs=(batch, batch),
+                out_specs=batch,
+                check_vma=False,
+            )
+        )
+        # Its own program, so that libtpu offloads the gather (see _take_rows).
+        expand = jax.jit(
+            jax.shard_map(
+                expand_local,
+                mesh=mesh,
+                in_specs=(batch, batch),
                 out_specs=batch,
                 check_vma=False,
             ),
             out_shardings=NamedSharding(mesh, P(axis, None)),
         )
+
+        def fwd(
+            csr: Any, ev_w: Any, slots: Dict[str, jax.Array]
+        ) -> Dict[str, jax.Array]:
+            return expand(lookup_unique(csr, ev_w), slots)
+
         stack_features = {
             stack: [
                 f
