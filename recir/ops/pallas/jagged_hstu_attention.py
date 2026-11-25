@@ -352,7 +352,13 @@ def _zero_unvisited_tail(packed: jax.Array, seq_offsets: jax.Array) -> jax.Array
 
 def _single_block_fits(max_seq_len: int, block_q: int, block_k: int) -> bool:
     """Whether every sequence fits one block from the 8-aligned row before it."""
-    return block_q == block_k and max_seq_len + _ALIGNMENT_ROWS - 1 <= block_k
+    return block_q == block_k and _single_block_seq_rows(max_seq_len) <= block_k
+
+
+def _single_block_seq_rows(max_seq_len: int) -> int:
+    """The stage rows a sequence can occupy when its stage starts at the 8-aligned
+    row at or before it."""
+    return pl.cdiv(max_seq_len + _ALIGNMENT_ROWS - 1, _ALIGNMENT_ROWS) * _ALIGNMENT_ROWS
 
 
 def _flat_rows(values: tuple[Any, ...]) -> tuple[Any, ...]:
@@ -680,6 +686,7 @@ def _native_jagged_hstu_attention(
                 _jagged_fwd_single_block_kernel,
                 alpha=scale,
                 block=block_k,
+                seq_rows=_single_block_seq_rows(max_seq_len),
                 num_heads=num_heads,
                 tanh_silu=_tanh_silu_enabled(),
             ),
@@ -1653,13 +1660,17 @@ def _causal_stage_mask(first: int, rows: int, keys: int, first_target):
     return (key_rows < jnp.minimum(query_rows, first_target)) | (key_rows == query_rows)
 
 
-def _query_strips(block: int) -> list[tuple[int, int, int]]:
-    """(first row, rows, keys) per query strip of a causal single-block tile: a
-    query sees only keys at or before its own position, so a strip needs the
-    keys up to its last row, rounded up to whole lanes."""
+def _query_strips(
+    block: int, query_rows: int | None = None
+) -> list[tuple[int, int, int]]:
+    """(first row, rows, keys) per query strip of a causal single-block tile's
+    first ``query_rows`` rows (all by default): a query sees only keys at or
+    before its own position, so a strip needs the keys up to its last row,
+    rounded up to whole lanes."""
+    query_rows = block if query_rows is None else query_rows
     strips = []
-    for first in range(0, block, _QUERY_STRIP_ROWS):
-        rows = min(_QUERY_STRIP_ROWS, block - first)
+    for first in range(0, query_rows, _QUERY_STRIP_ROWS):
+        rows = min(_QUERY_STRIP_ROWS, query_rows - first)
         strips.append((first, rows, min(block, -(-(first + rows) // 128) * 128)))
     return strips
 
@@ -1677,11 +1688,13 @@ def _jagged_fwd_single_block_kernel(
     *,
     alpha: float,
     block: int,
+    seq_rows: int,
     num_heads: int,
     tanh_silu: bool = False,
 ) -> None:
     """``_jagged_fwd_kernel`` for sequences that fit one ``block``, as one
-    pipeline over the sequences."""
+    pipeline over the sequences. A sequence lies in its stage's first
+    ``seq_rows`` rows, so only those are computed."""
     inv_n = attn_scale_ref[0]
     dim = out_hbm_ref.shape[1] // num_heads
 
@@ -1694,7 +1707,7 @@ def _jagged_fwd_single_block_kernel(
         k_tile = _split_heads(_sequence_rows(k_stage_ref, prefix, length), num_heads)
         v_tile = _split_heads(_sequence_rows(v_stage_ref, prefix, length), num_heads)
         first_target = prefix + length - num_targets_ref[sequence]
-        for first, rows, keys in _query_strips(block):
+        for first, rows, keys in _query_strips(block, seq_rows):
             scores = jax.lax.dot(
                 q_tile[:, first : first + rows, :],
                 k_tile[:, :keys, :],
@@ -1751,11 +1764,13 @@ def _jagged_bwd_single_block_kernel(  # noqa: C901
     *,
     alpha: float,
     block: int,
+    seq_rows: int,
     num_heads: int,
     tanh_silu: bool = False,
 ) -> None:
     """``_jagged_bwd_fused_kernel`` for sequences that fit one ``block``, as one
-    pipeline over the sequences."""
+    pipeline over the sequences. A sequence lies in its stage's first
+    ``seq_rows`` rows, so only those are computed."""
     inv_n = attn_scale_ref[0]
     dim = dq_hbm_ref.shape[1] // num_heads
 
@@ -1774,7 +1789,7 @@ def _jagged_bwd_single_block_kernel(  # noqa: C901
         first_target = prefix + length - num_targets_ref[sequence]
         dk_acc_ref[...] = jnp.zeros_like(dk_acc_ref)
         dv_acc_ref[...] = jnp.zeros_like(dv_acc_ref)
-        for first, rows, keys in _query_strips(block):
+        for first, rows, keys in _query_strips(block, seq_rows):
             q_strip = q_tile[:, first : first + rows, :]
             do_strip = do_tile[:, first : first + rows, :]
             k_keys, v_keys = k_tile[:, :keys, :], v_tile[:, :keys, :]
@@ -1843,8 +1858,8 @@ def _jagged_bwd_single_block_kernel(  # noqa: C901
             dv = dv_acc_ref[...]
         for out_ref, grad in ((dk_ref, dk), (dv_ref, dv)):
             for head in range(num_heads):
-                out_ref[:block, head * dim : (head + 1) * dim] = cast(
-                    Any, grad[head]
+                out_ref[:seq_rows, head * dim : (head + 1) * dim] = cast(
+                    Any, grad[head, :seq_rows]
                 ).astype(out_ref.dtype)
 
     _single_block_pipeline(
@@ -1956,6 +1971,7 @@ def _native_jagged_hstu_attention_backward(
                 _jagged_bwd_single_block_kernel,
                 alpha=alpha,
                 block=block_k,
+                seq_rows=_single_block_seq_rows(max_seq_len),
                 num_heads=num_heads,
                 tanh_silu=_tanh_silu_enabled(),
             ),
