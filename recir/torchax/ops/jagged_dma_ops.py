@@ -11,6 +11,9 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+# Block reads in flight, plus the one being merged.
+_COPY_SLOTS = 4
+
 
 def _copy_jagged_segment_bits(
     values: Any,
@@ -249,7 +252,7 @@ def split_jagged_dma(
     return left, right
 
 
-def _copy_jagged_output_tiles(
+def _copy_jagged_output_tiles(  # noqa: C901
     left: Any,
     right: Any,
     source_left: Any,
@@ -297,67 +300,107 @@ def _copy_jagged_output_tiles(
         a: Any,
         b: Any,
         out: Any,
-        tile: Any,
-        semaphore: Any,
+        tiles: Any,
+        semaphores: Any,
+        copies: Any,
     ) -> None:
         tile_start = pl.program_id(0) * block_rows
         column = pl.program_id(1) * columns
         tile_end = jnp.minimum(tile_start + block_rows, capacity)
+        groups = la.shape[0]
         if typed_output:
             out = out.bitcast(dtype)
         out[...] = jnp.zeros((block_rows, columns), dtype)
 
-        def copy_segment(
-            source: Any,
-            source_capacity: int,
-            source_start: Any,
-            destination_start: Any,
-            requested: Any,
-        ) -> None:
+        # The tile is filled by a sequence of 512-row block copies: per group
+        # overlapping the tile, its left then its right segment, each in the
+        # output blocks it overlaps. A copy is (group, side, block). Up to
+        # _COPY_SLOTS - 1 reads are in flight while the oldest one is merged;
+        # ``copies`` holds each slot's copy.
+
+        def segment(group: Any, side: Any) -> tuple[Any, Any, Any]:
+            group = jnp.minimum(group, groups - 1)
+            left = side == 0
+            source_start = jnp.where(left, sa[group], sb[group])
+            destination_start = jnp.where(left, da[group], db[group])
+            source_capacity = jnp.where(left, jnp.int32(cap_left), jnp.int32(cap_right))
             length = jnp.maximum(
                 0,
                 jnp.minimum(
-                    requested,
+                    jnp.where(left, la[group], lb[group]),
                     jnp.minimum(
                         source_capacity - source_start, capacity - destination_start
                     ),
                 ),
             )
+            return source_start, destination_start, length
+
+        def blocks(group: Any, side: Any) -> tuple[Any, Any]:
+            _, destination_start, length = segment(group, side)
             first = jnp.maximum(destination_start, tile_start)
             end = jnp.minimum(destination_start + length, tile_end)
             first_block = (first - tile_start) // 512
-            stop_block = jnp.where(
+            return first_block, jnp.where(
                 end > first, (end - tile_start + 511) // 512, first_block
             )
 
-            def block(index: Any, carry: Any) -> Any:
-                destination = tile_start + index * 512
-                source_position = source_start + 512 + destination - destination_start
-                aligned_source = pl.multiple_of(source_position // 8 * 8, 8)
-                shift = source_position - aligned_source
-                read = pltpu.async_copy(
-                    source.at[pl.ds(aligned_source, 520), pl.ds(column, columns)],
-                    tile,
-                    semaphore,
-                )
-                read.wait()
-                rotation = jnp.where(shift == 0, 0, 520 - shift)
-                raw = pltpu.roll(tile[...].astype(jnp.uint32), rotation, axis=0)[:512]
-                position = destination + jax.lax.broadcasted_iota(
-                    jnp.int32, (512, columns), 0
-                )
-                valid = (
-                    (position >= destination_start)
-                    & (position < destination_start + length)
-                    & (position < tile_end)
-                )
-                window = out.at[pl.ds(index * 512, 512), pl.ds(0, columns)]
-                window[...] = jnp.where(
-                    valid, raw, window[...].astype(jnp.uint32)
-                ).astype(dtype)
-                return carry
+        def overlaps(group: Any) -> Any:
+            return (group < groups) & (da[jnp.minimum(group, groups - 1)] < tile_end)
 
-            jax.lax.fori_loop(first_block, stop_block, block, jnp.int32(0))
+        def seek(group: Any, side: Any) -> tuple[Any, Any, Any, Any]:
+            """The first (group, side) at or after the given one with a block in
+            the tile, with its block range."""
+
+            def empty(cursor: tuple[Any, Any, Any, Any]) -> Any:
+                group, _, block, stop = cursor
+                return overlaps(group) & (block >= stop)
+
+            def step(cursor: tuple[Any, Any, Any, Any]) -> tuple[Any, Any, Any, Any]:
+                group, side, _, _ = cursor
+                group, side = group + side, 1 - side
+                return (group, side, *blocks(group, side))
+
+            return jax.lax.while_loop(empty, step, (group, side, *blocks(group, side)))
+
+        def read(group: Any, side: Any, block: Any, slot: Any) -> Any:
+            source_start, destination_start, _ = segment(group, side)
+            destination = tile_start + block * 512
+            source_position = source_start + 512 + destination - destination_start
+            aligned_source = pl.multiple_of(source_position // 8 * 8, 8)
+
+            def copy(source: Any) -> Any:
+                return pltpu.make_async_copy(
+                    source.at[pl.ds(aligned_source, 520), pl.ds(column, columns)],
+                    tiles.at[slot],
+                    semaphores.at[slot],
+                )
+
+            return copy, source_position - aligned_source
+
+        def start(group: Any, side: Any, block: Any, slot: Any) -> None:
+            copy, _ = read(group, side, block, slot)
+            pl.when(side == 0)(lambda: copy(a).start())
+            pl.when(side == 1)(lambda: copy(b).start())
+
+        def merge(group: Any, side: Any, block: Any, slot: Any) -> None:
+            copy, shift = read(group, side, block, slot)
+            copy(a).wait()
+            _, destination_start, length = segment(group, side)
+            destination = tile_start + block * 512
+            rotation = jnp.where(shift == 0, 0, 520 - shift)
+            raw = pltpu.roll(tiles[slot].astype(jnp.uint32), rotation, axis=0)[:512]
+            position = destination + jax.lax.broadcasted_iota(
+                jnp.int32, (512, columns), 0
+            )
+            valid = (
+                (position >= destination_start)
+                & (position < destination_start + length)
+                & (position < tile_end)
+            )
+            window = out.at[pl.ds(block * 512, 512), pl.ds(0, columns)]
+            window[...] = jnp.where(valid, raw, window[...].astype(jnp.uint32)).astype(
+                dtype
+            )
 
         def searching(bounds: tuple[Any, Any]) -> Any:
             return bounds[0] < bounds[1]
@@ -371,19 +414,61 @@ def _copy_jagged_output_tiles(
             )
 
         initial, _ = jax.lax.while_loop(
-            searching, narrow, (jnp.int32(0), jnp.int32(la.shape[0]))
+            searching, narrow, (jnp.int32(0), jnp.int32(groups))
         )
 
-        def more(group: Any) -> Any:
-            bounded = jnp.minimum(group, la.shape[0] - 1)
-            return (group < la.shape[0]) & (da[bounded] < tile_end)
+        def following(cursor: tuple[Any, Any, Any, Any]) -> tuple[Any, Any, Any, Any]:
+            group, side, block, stop = cursor
+            later = seek(group + side, 1 - side)
+            within = block + 1 < stop
+            return (
+                jnp.where(within, group, later[0]),
+                jnp.where(within, side, later[1]),
+                jnp.where(within, block + 1, later[2]),
+                jnp.where(within, stop, later[3]),
+            )
 
-        def group_body(group: Any) -> Any:
-            copy_segment(a, cap_left, sa[group], da[group], la[group])
-            copy_segment(b, cap_right, sb[group], db[group], lb[group])
-            return group + 1
+        def issue(cursor: tuple[Any, ...], issued: Any) -> tuple[Any, Any]:
+            """Start the read of the copy at ``cursor``, if any, into the next slot."""
+            group, side, block, _ = cursor
+            pending = overlaps(group)
+            slot = issued % _COPY_SLOTS
 
-        jax.lax.while_loop(more, group_body, initial)
+            @pl.when(pending)
+            def _issue() -> None:
+                copies[slot, 0] = group
+                copies[slot, 1] = side
+                copies[slot, 2] = block
+                start(group, side, block, slot)
+
+            advanced = following(cursor)
+            return (
+                tuple(jnp.where(pending, x, y) for x, y in zip(advanced, cursor)),
+                issued + pending.astype(jnp.int32),
+            )
+
+        def filling(state: tuple[Any, ...]) -> Any:
+            cursor, issued = state
+            return overlaps(cursor[0]) & (issued < _COPY_SLOTS - 1)
+
+        cursor, issued = jax.lax.while_loop(
+            filling,
+            lambda state: issue(*state),
+            (seek(initial, jnp.int32(0)), jnp.int32(0)),
+        )
+
+        def unmerged(state: tuple[Any, ...]) -> Any:
+            _, issued, merged = state
+            return merged < issued
+
+        def merge_next(state: tuple[Any, ...]) -> tuple[Any, ...]:
+            cursor, issued, merged = state
+            cursor, issued = issue(cursor, issued)
+            slot = merged % _COPY_SLOTS
+            merge(copies[slot, 0], copies[slot, 1], copies[slot, 2], slot)
+            return cursor, issued, merged + 1
+
+        jax.lax.while_loop(unmerged, merge_next, (cursor, issued, jnp.int32(0)))
 
     bits = pl.pallas_call(
         kernel,
@@ -401,7 +486,11 @@ def _copy_jagged_output_tiles(
                 lambda row, col, *unused: (row, col),
                 memory_space=pltpu.VMEM,
             ),
-            scratch_shapes=[pltpu.VMEM((520, columns), dtype), pltpu.SemaphoreType.DMA],
+            scratch_shapes=[
+                pltpu.VMEM((_COPY_SLOTS, 520, columns), dtype),
+                pltpu.SemaphoreType.DMA((_COPY_SLOTS,)),
+                pltpu.SMEM((_COPY_SLOTS, 3), jnp.int32),
+            ],
         ),
         interpret=interpret,
     )(
