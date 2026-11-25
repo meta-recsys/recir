@@ -47,22 +47,375 @@ def _pad_rows(x: Any) -> Any:
     return jnp.pad(x, ((0, (-x.shape[0]) % 128), (0, 0)))
 
 
+def _native_pair_forward_enabled() -> bool:
+    implementation = os.environ.get("RECIR_PACKED_FORWARD_IMPL", "gmm")
+    if implementation not in (
+        "gmm",
+        "native_pair",
+        "native_pair_slice",
+        "native_pair_dma",
+        "native_pair_prefix_dma",
+    ):
+        raise ValueError(f"Invalid RECIR_PACKED_FORWARD_IMPL: {implementation!r}")
+    return implementation != "gmm"
 
 
+def _packed_bmm_native_pair(
+    values: Any,
+    weights: Any,
+    bias: Any,
+    offsets: Any,
+    max_len: int,
+    interpret: bool = False,
+) -> Any:
+    groups, k, n = weights.shape
+    capacity = values.shape[0]
+    if groups == 0 or capacity == 0 or max_len == 0:
+        return jnp.zeros((capacity, n), jnp.float32)
+    extra_group = groups % 2
+    starts = offsets[:-1].astype(jnp.int32)
+    sizes = jnp.diff(offsets).astype(jnp.int32)
+    if extra_group:
+        starts = jnp.concatenate((starts, offsets[-1:].astype(jnp.int32)))
+        sizes = jnp.pad(sizes, (0, 1))
+    implementation = os.environ.get("RECIR_PACKED_FORWARD_IMPL")
+    use_prefix_read = implementation == "native_pair_prefix_dma"
+    use_dma = implementation in ("native_pair_dma", "native_pair_prefix_dma")
+    read_rows = ((max_len + 7 + 127) // 128) * 128 if use_dma else max_len
+    if use_prefix_read:
+        read_rows = max(read_rows, 520)
+    x = jnp.pad(values, ((0, read_rows), (0, (-k) % 128 if use_dma else 0)))
+    w = jnp.pad(weights, ((0, extra_group), (0, 0), (0, 0)))
+    b = jnp.pad(bias, ((0, extra_group), (0, 0)))
+    columns = jnp.arange(max_len, dtype=jnp.int32)
+    use_slice = implementation == "native_pair_slice"
+    store_impl = os.environ.get("RECIR_PACKED_STORE_IMPL", "full")
+    if store_impl not in ("full", "prefix_dma"):
+        raise ValueError(f"Invalid RECIR_PACKED_STORE_IMPL: {store_impl!r}")
+    use_prefix = store_impl == "prefix_dma" and n % 128 == 0
+
+    def project(pair: Any, out: Any) -> Any:
+        first = pair * 2
+        row_starts = jax.lax.dynamic_slice(starts, (first,), (2,))
+        lengths = jax.lax.dynamic_slice(sizes, (first,), (2,))
+        source = row_starts[:, None] + columns[None, :]
+        valid = (columns[None, :] < lengths[:, None]) & (source < capacity)
+        if use_prefix_read:
+            pair_values = _packed_native_pair_prefix_dma_read(
+                x, row_starts, lengths, max_len, k, capacity, interpret
+            ).reshape(2, max_len, k)
+        elif use_dma:
+            pair_values = _packed_native_pair_dma_read(
+                x, row_starts, max_len, k, interpret
+            ).reshape(2, max_len, k)
+        elif use_slice:
+            pair_values = jnp.stack(
+                (
+                    jax.lax.dynamic_slice(x, (row_starts[0], 0), (max_len, k)),
+                    jax.lax.dynamic_slice(x, (row_starts[1], 0), (max_len, k)),
+                )
+            )
+            pair_values = jax.lax.optimization_barrier(
+                pair_values.reshape(2 * max_len, k)
+            ).reshape(2, max_len, k)
+        else:
+            pair_values = x[source]
+        lhs = jnp.where(valid[:, :, None], pair_values, 0).astype(jnp.float32)
+        rhs = jax.lax.dynamic_slice(w, (first, 0, 0), (2, k, n)).astype(jnp.float32)
+        pair_bias = jax.lax.dynamic_slice(b, (first, 0), (2, n))
+        projected = lhs @ rhs + pair_bias[:, None, :].astype(jnp.float32)
+        projected = jnp.where(valid[:, :, None], projected, 0)
+        if use_prefix:
+            return _packed_native_pair_prefix_store(
+                projected, out, row_starts, lengths, capacity, interpret
+            )
+        out = jax.lax.dynamic_update_slice(out, projected[0], (row_starts[0], 0))
+        return jax.lax.dynamic_update_slice(out, projected[1], (row_starts[1], 0))
+
+    with jax.enable_x64(False):
+        out = jax.lax.fori_loop(
+            0,
+            (groups + 1) // 2,
+            project,
+            jnp.zeros(
+                (capacity + max(max_len, 128 if use_prefix else 0), n), jnp.float32
+            ),
+        )[:capacity]
+    return jnp.where(out == 0, jnp.zeros_like(out), out)
 
 
+def _packed_native_pair_dma_read(
+    values: Any, starts: Any, max_len: int, k: int, interpret: bool = False
+) -> Any:
+    rows = ((max_len + 7 + 127) // 128) * 128
+    kt = 128
+
+    def kernel(
+        off: Any,
+        xx: Any,
+        out: Any,
+        tile: Any,
+        pair: Any,
+        flat: Any,
+        read_sem: Any,
+        write_sem: Any,
+    ) -> None:
+        column = pl.program_id(0) * kt
+
+        def user(group: Any, unused: Any) -> Any:
+            start = off[group]
+            aligned = pl.multiple_of(start // 8 * 8, 8)
+            shift = start - aligned
+            copy = pltpu.async_copy(
+                xx.at[pl.ds(aligned, rows), pl.ds(column, kt)], tile, read_sem
+            )
+            copy.wait()
+            rotation = jnp.where(shift == 0, 0, rows - shift)
+            if values.dtype == jnp.bfloat16:
+                bits = jax.lax.bitcast_convert_type(tile[...], jnp.uint16).astype(
+                    jnp.uint32
+                )
+                rotated = pltpu.roll(bits, rotation, axis=0).astype(jnp.uint16)
+                selected = jax.lax.bitcast_convert_type(rotated, jnp.bfloat16)
+            else:
+                selected = pltpu.roll(tile[...], rotation, axis=0)
+            pair.at[group, :, :][...] = selected[:max_len]
+            return unused
+
+        jax.lax.fori_loop(0, 2, user, jnp.int32(0))
+        flat[...] = pair[...].reshape(2 * max_len, kt)
+        write = pltpu.async_copy(flat, out.at[:, pl.ds(column, kt)], write_sem)
+        write.wait()
+
+    result = pl.pallas_call(
+        kernel,
+        name="packed_native_pair_dma_read",
+        out_shape=jax.ShapeDtypeStruct((2 * max_len, values.shape[1]), values.dtype),
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=1,
+            grid=((k + kt - 1) // kt,),
+            in_specs=[pl.BlockSpec(memory_space=pltpu.HBM)],
+            out_specs=pl.BlockSpec(memory_space=pltpu.HBM),
+            scratch_shapes=[
+                pltpu.VMEM((rows, kt), values.dtype),
+                pltpu.VMEM((2, max_len, kt), values.dtype),
+                pltpu.VMEM((2 * max_len, kt), values.dtype),
+                pltpu.SemaphoreType.DMA,
+                pltpu.SemaphoreType.DMA,
+            ],
+        ),
+        interpret=interpret,
+    )(starts.astype(jnp.int32), values)
+    return result[:, :k]
 
 
+def _packed_native_pair_prefix_dma_read(
+    values: Any,
+    starts: Any,
+    sizes: Any,
+    max_len: int,
+    k: int,
+    capacity: int,
+    interpret: bool = False,
+) -> Any:
+    block_rows = 512
+    read_rows = 520
+    pair_rows = ((max_len + block_rows - 1) // block_rows) * block_rows
+    kt = 128
+    bitdtype = jnp.uint16 if values.dtype == jnp.bfloat16 else jnp.uint32
+    raw_values = jax.lax.bitcast_convert_type(values, bitdtype)
+
+    def kernel(
+        off: Any,
+        lengths: Any,
+        xx: Any,
+        out: Any,
+        tile: Any,
+        pair: Any,
+        flat: Any,
+        read_sem: Any,
+        write_sem: Any,
+    ) -> None:
+        column = pl.program_id(0) * kt
+        pair[...] = jnp.zeros((2, pair_rows, kt), bitdtype)
+
+        def user(group: Any, unused: Any) -> Any:
+            start = off[group]
+            length = jnp.maximum(
+                0, jnp.minimum(lengths[group], jnp.minimum(max_len, capacity - start))
+            )
+            aligned = pl.multiple_of(start // 8 * 8, 8)
+            shift = start - aligned
+            count = (length + block_rows - 1) // block_rows
+
+            def block(index: Any, carry: Any) -> Any:
+                source = aligned + index * block_rows
+                copy = pltpu.async_copy(
+                    xx.at[pl.ds(source, read_rows), pl.ds(column, kt)], tile, read_sem
+                )
+                copy.wait()
+                rotation = jnp.where(shift == 0, 0, read_rows - shift)
+                bits = tile[...].astype(jnp.uint32)
+                rotated = pltpu.roll(bits, rotation, axis=0)[:block_rows]
+                position = index * block_rows + jax.lax.broadcasted_iota(
+                    jnp.int32, (block_rows, kt), 0
+                )
+                selected_bits = jnp.where(
+                    position < length, rotated, jnp.zeros((block_rows, kt), jnp.uint32)
+                )
+                selected = selected_bits.astype(bitdtype)
+                pair.at[group, pl.ds(index * block_rows, block_rows), :][...] = selected
+                return carry
+
+            jax.lax.fori_loop(0, count, block, jnp.int32(0))
+            return unused
+
+        jax.lax.fori_loop(0, 2, user, jnp.int32(0))
+        flat[...] = pair[:, :max_len, :].reshape(2 * max_len, kt)
+        write = pltpu.async_copy(flat, out.at[:, pl.ds(column, kt)], write_sem)
+        write.wait()
+
+    result = pl.pallas_call(
+        kernel,
+        name="packed_native_pair_prefix_read",
+        out_shape=jax.ShapeDtypeStruct((2 * max_len, values.shape[1]), bitdtype),
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=2,
+            grid=((k + kt - 1) // kt,),
+            in_specs=[pl.BlockSpec(memory_space=pltpu.HBM)],
+            out_specs=pl.BlockSpec(memory_space=pltpu.HBM),
+            scratch_shapes=[
+                pltpu.VMEM((read_rows, kt), bitdtype),
+                pltpu.VMEM((2, pair_rows, kt), bitdtype),
+                pltpu.VMEM((2 * max_len, kt), bitdtype),
+                pltpu.SemaphoreType.DMA,
+                pltpu.SemaphoreType.DMA,
+            ],
+        ),
+        interpret=interpret,
+    )(starts.astype(jnp.int32), sizes.astype(jnp.int32), raw_values)
+    if k % 128 == 0:
+        pair_bits = jax.lax.optimization_barrier(result.reshape(2, max_len, k))
+        return jax.lax.bitcast_convert_type(pair_bits, values.dtype).reshape(
+            2 * max_len, k
+        )
+    return jax.lax.bitcast_convert_type(result[:, :k], values.dtype)
 
 
+def _packed_native_pair_prefix_store(
+    projected: Any,
+    existing: Any,
+    starts: Any,
+    sizes: Any,
+    capacity: int,
+    interpret: bool = False,
+) -> Any:
+    _, max_len, n = projected.shape
+    rows = ((max_len + 7 + 127) // 128) * 128 + 8
+    projected = jnp.pad(projected, ((0, 0), (0, rows - max_len), (0, 0)))
 
+    def kernel(
+        off: Any,
+        lengths: Any,
+        xx: Any,
+        old: Any,
+        out: Any,
+        tile: Any,
+        previous: Any,
+        result: Any,
+        read_sem: Any,
+        old_sem: Any,
+        write_sem: Any,
+    ) -> None:
+        def user(group: Any, unused: Any) -> Any:
+            start = off[group]
+            length = jnp.maximum(
+                0, jnp.minimum(lengths[group], jnp.minimum(max_len, capacity - start))
+            )
+            aligned = pl.multiple_of(start // 8 * 8, 8)
+            shift = start - aligned
+            count = jnp.where(length > 0, (length + shift + 127) // 128, 0)
 
+            def block(index: Any, carry: Any) -> Any:
+                destination = aligned + index * 128
+                source = jnp.maximum(0, index * 128 - jnp.where(shift > 0, 8, 0))
+                source = pl.multiple_of(source, 8)
+                copy = pltpu.async_copy(
+                    xx.at[group, pl.ds(source, 136), :], tile, read_sem
+                )
+                copy.wait()
+                rotation = jnp.where(
+                    index == 0, shift, jnp.where(shift > 0, 136 - (8 - shift), 0)
+                )
+                selected = pltpu.roll(tile[...], rotation, axis=0)[:128]
+                position = (
+                    index * 128
+                    + jax.lax.broadcasted_iota(jnp.int32, (128, n), 0)
+                    - shift
+                )
+                valid = (position >= 0) & (position < length)
 
+                def edge() -> None:
+                    read = pltpu.async_copy(
+                        out.at[pl.ds(destination, 128), :], previous, old_sem
+                    )
+                    read.wait()
+                    result[...] = jnp.where(valid, selected, previous[...])
+
+                def middle() -> None:
+                    result[...] = selected
+
+                full = (index * 128 >= shift) & ((index + 1) * 128 <= shift + length)
+                jax.lax.cond(full, middle, edge)
+                write = pltpu.async_copy(
+                    result, out.at[pl.ds(destination, 128), :], write_sem
+                )
+                write.wait()
+                return carry
+
+            jax.lax.fori_loop(0, count, block, jnp.int32(0))
+            return unused
+
+        jax.lax.fori_loop(0, 2, user, jnp.int32(0))
+
+    return pl.pallas_call(
+        kernel,
+        name="packed_native_pair_prefix_store",
+        out_shape=jax.ShapeDtypeStruct(existing.shape, existing.dtype),
+        input_output_aliases={3: 0},
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=2,
+            grid=(1,),
+            in_specs=[
+                pl.BlockSpec(memory_space=pltpu.HBM),
+                pl.BlockSpec(memory_space=pltpu.HBM),
+            ],
+            out_specs=pl.BlockSpec(memory_space=pltpu.HBM),
+            scratch_shapes=[
+                pltpu.VMEM((136, n), jnp.float32),
+                pltpu.VMEM((128, n), jnp.float32),
+                pltpu.VMEM((128, n), jnp.float32),
+                pltpu.SemaphoreType.DMA,
+                pltpu.SemaphoreType.DMA,
+                pltpu.SemaphoreType.DMA,
+            ],
+        ),
+        interpret=interpret,
+    )(starts.astype(jnp.int32), sizes.astype(jnp.int32), projected, existing)
 
 
 def _packed_bmm(
     values: Any, weights: Any, offsets: Any, max_len: int, interpret: bool = False
 ) -> Any:
+    if _native_pair_forward_enabled():
+        return _packed_bmm_native_pair(
+            values,
+            weights,
+            jnp.zeros((weights.shape[0], weights.shape[2]), jnp.float32),
+            offsets,
+            max_len,
+            interpret,
+        )
     if values.shape[0] == 0:
         return jnp.zeros((0, weights.shape[2]), jnp.float32)
     _, valid = _valid_rows(offsets, values.shape[0], max_len)
@@ -177,6 +530,10 @@ def _packed_bmm_add(
     max_len: int,
     interpret: bool = False,
 ) -> Any:
+    if _native_pair_forward_enabled():
+        return _packed_bmm_native_pair(
+            values, weights, bias, offsets, max_len, interpret
+        )
     if values.shape[0] == 0:
         return jnp.zeros((0, weights.shape[2]), jnp.float32)
     _, valid = _valid_rows(offsets, values.shape[0], max_len)
@@ -240,6 +597,13 @@ def _packed_weight_grad(
 ) -> Any:
     if values.dtype == jnp.bfloat16:
         grad = grad.astype(jnp.bfloat16)
+    reduction = os.environ.get("RECIR_PACKED_WEIGHT_GRAD_REDUCTION", "tgmm")
+    if reduction == "aligned_full_k":
+        return _packed_weight_grad_aligned(
+            values, grad, offsets, max_len, dtype, interpret
+        )
+    if reduction != "tgmm":
+        raise ValueError(f"Invalid RECIR_PACKED_WEIGHT_GRAD_REDUCTION: {reduction!r}")
     groups = offsets.shape[0] - 1
     if max_len == 0 or groups == 0 or values.shape[0] == 0:
         return jnp.zeros((groups, values.shape[1], grad.shape[1]), dtype)
@@ -258,6 +622,89 @@ def _packed_weight_grad(
     return result.astype(dtype)
 
 
+def _packed_weight_grad_aligned(
+    values: Any, grad: Any, offsets: Any, max_len: int, dtype: Any, interpret: bool
+) -> Any:
+    groups = offsets.shape[0] - 1
+    k, n = values.shape[1], grad.shape[1]
+    if max_len == 0 or groups == 0 or values.shape[0] == 0:
+        return jnp.zeros((groups, k, n), dtype)
+    if values.dtype == jnp.bfloat16:
+        grad = grad.astype(jnp.bfloat16)
+    input_dtype = common.select_input_dtype(values, grad)
+    rows = ((max_len + 7 + 127) // 128) * 128
+    tm, tn = min(256, ((k + 127) // 128) * 128), min(256, ((n + 127) // 128) * 128)
+    k_pad, n_pad = (-k) % tm, (-n) % tn
+    x = jnp.pad(values, ((0, rows), (0, k_pad)))
+    g = jnp.pad(grad, ((0, rows), (0, n_pad)))
+
+    def kernel(
+        off: Any,
+        xx: Any,
+        gg: Any,
+        out: Any,
+        x_tile: Any,
+        g_tile: Any,
+        x_sem: Any,
+        g_sem: Any,
+    ) -> None:
+        ki, ni, group = pl.program_id(0), pl.program_id(1), pl.program_id(2)
+        start = off[group]
+        aligned = pl.multiple_of((start // 8) * 8, 8)
+        shift = start - aligned
+        rotation = jnp.where(shift == 0, 0, rows - shift)
+        length = jnp.minimum(off[group + 1] - start, max_len)
+        x_copy = pltpu.async_copy(
+            xx.at[pl.ds(aligned, rows), pl.ds(ki * tm, tm)], x_tile, x_sem
+        )
+        g_copy = pltpu.async_copy(
+            gg.at[pl.ds(aligned, rows), pl.ds(ni * tn, tn)], g_tile, g_sem
+        )
+        x_copy.wait()
+        g_copy.wait()
+        valid = jnp.arange(rows)[:, None] < length
+        lhs = jnp.where(
+            valid, pltpu.roll(x_tile[...].astype(jnp.float32), rotation, axis=0), 0
+        )
+        rhs = jnp.where(
+            valid, pltpu.roll(g_tile[...].astype(jnp.float32), rotation, axis=0), 0
+        )
+        out[...] = jax.lax.dot_general(
+            lhs[:max_len].astype(input_dtype),
+            rhs[:max_len].astype(input_dtype),
+            (((0,), (0,)), ((), ())),
+            preferred_element_type=jnp.float32,
+        ).astype(dtype)
+
+    def output_index(ki: Any, ni: Any, group: Any, off: Any) -> Any:
+        return group, ki, ni
+
+    with jax.enable_x64(False):
+        result = pl.pallas_call(
+            kernel,
+            name="packed_weight_grad_aligned",
+            out_shape=jax.ShapeDtypeStruct((groups, k + k_pad, n + n_pad), dtype),
+            grid_spec=pltpu.PrefetchScalarGridSpec(
+                num_scalar_prefetch=1,
+                grid=((k + k_pad) // tm, (n + n_pad) // tn, groups),
+                in_specs=[
+                    pl.BlockSpec(memory_space=pltpu.HBM),
+                    pl.BlockSpec(memory_space=pltpu.HBM),
+                ],
+                out_specs=pl.BlockSpec((None, tm, tn), output_index),
+                scratch_shapes=[
+                    pltpu.VMEM((rows, tm), values.dtype),
+                    pltpu.VMEM((rows, tn), grad.dtype),
+                    pltpu.SemaphoreType.DMA,
+                    pltpu.SemaphoreType.DMA,
+                ],
+            ),
+            compiler_params=pltpu.CompilerParams(
+                dimension_semantics=("parallel", "parallel", "parallel")
+            ),
+            interpret=interpret,
+        )(offsets.astype(jnp.int32), x, g)
+    return result[:, :k, :n]
 
 
 def _packed_add(values: Any, bias: Any, offsets: Any, max_len: int) -> Any:
