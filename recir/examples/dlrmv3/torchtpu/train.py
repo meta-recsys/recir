@@ -8,8 +8,10 @@
 
 One process per TPU device, as on GPU: each process runs the dense model on its
 own device and gradients are averaged with explicit collectives. The embedding
-tables stay in torchrec on the host (``recir.embedding`` cpu backend, row-wise
-sharded over the processes with gloo) behind a graph break.
+tables sit behind a graph break: by default in torchrec on the host
+(``recir.embedding`` cpu backend, row-wise sharded over the processes with
+gloo), or with ``--embedding_backend sparsecore`` on the TPUs' SparseCores
+(``recir.embedding.torchtpu_sparsecore``).
 
     python -m recir.examples.dlrmv3.torchtpu.train --dataset debug --num_train_batches 10
 
@@ -20,11 +22,12 @@ Started without torchrun, the module relaunches itself under torchrun with
 from __future__ import annotations
 
 import argparse
+import inspect
 import logging
 import os
 import sys
 import time
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 # TorchTPU's launch environment has to be set before its runtime loads, so torch
 # must not autoload it.
@@ -44,6 +47,7 @@ from recir.backends.torchtpu import TorchTPUBackend
 from recir.distributed.parallel_mode import DataParallel
 from recir.embedding.backend import EmbeddingBackend
 from recir.embedding.cpu import CPUSparseArchDispatcher
+from recir.embedding.torchtpu_sparsecore import TorchTPUSparseCoreBackend
 from recir.examples.dlrmv3.common.config import DLRMv3TrainConfig, parse_config
 from recir.examples.dlrmv3.common.data import (
     make_dataset,
@@ -156,7 +160,11 @@ class DLRMv3TorchTPUModule(RecirCompiledModuleBase):
 
 class TorchTPUTrainer:
     def __init__(
-        self, cfg: DLRMv3TrainConfig, world: int, device: torch.device
+        self,
+        cfg: DLRMv3TrainConfig,
+        world: int,
+        device: torch.device,
+        embedding_backend: str = "cpu",
     ) -> None:
         self.cfg = cfg
         self.world = world
@@ -165,7 +173,15 @@ class TorchTPUTrainer:
         self.tables = cfg.embedding_tables()
         self.layout = cfg.layout(self.hstu)
         self.task_names = [t.task_name for t in self.hstu.multitask_configs]
-        self.backend: EmbeddingBackend = build_embedding_backend("cpu", self.tables)
+        self.backend: EmbeddingBackend
+        # Where the backend keeps the tables: torchrec on the host, or SparseCore.
+        self.table_device: torch.device
+        if embedding_backend == "sparsecore":
+            self.backend = TorchTPUSparseCoreBackend(EMBEDDING_COLLECTION_FQN)
+            self.table_device = device
+        else:
+            self.backend = build_embedding_backend("cpu", self.tables)
+            self.table_device = torch.device("cpu")
         set_dev_mode(True)
         self.module = DlrmV3TrainModule(
             self.hstu,
@@ -179,7 +195,7 @@ class TorchTPUTrainer:
             self.module,
             list(self.tables.values()),
             self.cfg.sparse_optimizer(),
-            torch.device("cpu"),
+            self.table_device,
             self.world,
         )
         assert isinstance(setup.model, DlrmV3TrainModule)
@@ -240,30 +256,82 @@ def _parse(
 ) -> Tuple[DLRMv3TrainConfig, argparse.Namespace]:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--nproc_per_node", type=int, default=8)
+    parser.add_argument(
+        "--embedding_backend",
+        choices=("cpu", "sparsecore"),
+        default="cpu",
+    )
     return parse_config(argv, parser)
 
 
-def main(argv: Optional[Sequence[str]] = None) -> None:
+def main(
+    argv: Optional[Sequence[str]] = None,
+    *,
+    step_hook: Optional[Callable[[int, int], None]] = None,
+) -> None:
     tpu_runtime.setup_logging()
     cli = list(sys.argv[1:] if argv is None else argv)
     cfg, args = _parse(cli)
-    if not torchtpu_runtime.under_torchrun():
+    if (
+        args.embedding_backend == "sparsecore"
+        and os.environ.get("RECIR_SPARSECORE_GRAPH_BREAK") != "1"
+    ):
+        sc_flag = "--xla_sc_enable_fixed_or_variable_window_conditional=true"
+        cur_libtpu = os.environ.get("LIBTPU_INIT_ARGS", "")
+        if "--xla_sc_enable_fixed_or_variable_window_conditional" not in cur_libtpu:
+            os.environ["LIBTPU_INIT_ARGS"] = f"{cur_libtpu} {sc_flag}".strip()
+        if not torchtpu_runtime.under_torchrun() and "RANK" not in os.environ:
+            torchtpu_runtime.relaunch_under_torchrun(
+                _MODULE, cli, args.nproc_per_node
+            )
+            return
+        if not dist.is_initialized() and torchtpu_runtime.under_torchrun():
+            torchtpu_runtime.load_runtime()
+            dist.init_process_group("cpu:gloo,tpu:tpu")
+            tpu_runtime.force_cpu_barrier()
+        from recir.examples.dlrmv3.torchtpu import sparsecore_train
+
+        sparsecore_train.run(cfg, step_hook=step_hook)
+        return
+    if args.embedding_backend == "sparsecore":
+        sc_flag = "--xla_sc_enable_fixed_or_variable_window_conditional=true"
+        cur_libtpu = os.environ.get("LIBTPU_INIT_ARGS", "")
+        if "--xla_sc_enable_fixed_or_variable_window_conditional" not in cur_libtpu:
+            os.environ["LIBTPU_INIT_ARGS"] = f"{cur_libtpu} {sc_flag}".strip()
+    if not torchtpu_runtime.under_torchrun() and "RANK" not in os.environ:
         torchtpu_runtime.relaunch_under_torchrun(_MODULE, cli, args.nproc_per_node)
         return
     if cfg.ckpt_dir or cfg.resume_from or cfg.eval_every:
         raise NotImplementedError(
             "checkpointing and evaluation are not wired up for TorchTPU yet"
         )
-    torchtpu_runtime.load_runtime()
-    dist.init_process_group("cpu:gloo,tpu:tpu")
-    rank, world = dist.get_rank(), dist.get_world_size()
-    # Metric all-gathers run on gloo; keep barrier off the TPU.
-    tpu_runtime.force_cpu_barrier()
+    if not dist.is_initialized():
+        if torchtpu_runtime.under_torchrun():
+            torchtpu_runtime.load_runtime()
+            dist.init_process_group("cpu:gloo,tpu:tpu")
+            tpu_runtime.force_cpu_barrier()
+        elif "RANK" in os.environ:
+            dist.init_process_group("tpu")
+    rank = dist.get_rank() if dist.is_initialized() else 0
+    world = dist.get_world_size() if dist.is_initialized() else 1
+    _ = torch.zeros(1, device="tpu")
     device = torch.device("tpu")
     torch.manual_seed(cfg.seed)
-    trainer = TorchTPUTrainer(cfg, world, device)
+    trainer = TorchTPUTrainer(cfg, world, device, args.embedding_backend)
 
-    dataset = make_dataset(cfg.dataset, cfg.data_root, trainer.hstu, trainer.tables)
+    make_ds: Any = make_dataset
+    if len(inspect.signature(make_dataset).parameters) >= 5:
+        dataset = make_ds(
+            cfg.dataset,
+            cfg.data_root,
+            trainer.hstu,
+            trainer.tables,
+            trainer.layout,
+        )
+    else:
+        dataset = make_ds(
+            cfg.dataset, cfg.data_root, trainer.hstu, trainer.tables
+        )
     collate = TokenBudgetCollate(trainer.layout, trainer.hstu, cfg.batch_size, 1)
     train_dl, _ = make_train_eval_loaders(
         dataset,
@@ -283,6 +351,10 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     logger.info(
         "[rank %d] train step compiled in %.1fs", rank, time.perf_counter() - t0
     )
+    # The random dataset draws its batches from the global RNG, which setting up
+    # the embedding backend uses differently per backend; reseeding gives every
+    # backend the same training batches.
+    torch.manual_seed(cfg.seed)
     metrics = make_metrics(
         trainer.hstu,
         trainer.layout.rows(cfg.batch_size) * trainer.layout.num_candidates,
@@ -291,17 +363,52 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         cfg.tb_dir if rank == 0 else "",
     )
 
+    use_tpu_dist = dist.is_initialized() and str(dist.get_backend()) in (
+        "tpu",
+        "tpu_dist",
+    )
+    if use_tpu_dist:
+
+        def _sync_tpu_metric(
+            r: torch.Tensor, group: Optional[Any] = None
+        ) -> List[torch.Tensor]:
+            g = getattr(torch, "tpu").ops.all_gather_dim(
+                r.to("tpu").unsqueeze(0), 0, group
+            )
+            return list(g.to(r.device).unbind(0))
+
+        for mode_metrics in metrics.all_metrics.values():
+            for m in mode_metrics:
+                m.dist_sync_fn = _sync_tpu_metric
+
     step = 0
+    batches_per_epoch = max(1, len(train_dl))
+    num_epochs = cfg.num_epochs
+    if cfg.num_train_batches is not None:
+        req = (cfg.num_train_batches + batches_per_epoch - 1) // batches_per_epoch
+        num_epochs = max(num_epochs, req)
+    total_steps = cfg.num_train_batches or (num_epochs * batches_per_epoch)
     t_last = time.perf_counter()
     done = False
-    for epoch in range(cfg.num_epochs):
+    for epoch in range(num_epochs):
         train_dl.sampler.set_epoch(epoch)  # pyrefly: ignore[missing-attribute]
         for batch in train_dl:
+            if step_hook is not None:
+                step_hook(step, total_steps)
             losses, named = train(batch.to(device))
             step += 1
             update_metrics(metrics, named, trainer.layout.num_candidates, "train")
             if step % cfg.log_every == 0:
-                log_metrics(metrics, "train", losses, trainer.task_names)
+                if use_tpu_dist:
+                    from recir.examples.dlrmv3.torchtpu.sparsecore_train import (
+                        log_torchtpu_metrics,
+                    )
+
+                    log_torchtpu_metrics(
+                        metrics, "train", losses, trainer.task_names
+                    )
+                else:
+                    log_metrics(metrics, "train", losses, trainer.task_names)
                 now = time.perf_counter()
                 if rank == 0:
                     logger.info(
@@ -317,6 +424,8 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 break
         if done:
             break
+    if step_hook is not None:
+        step_hook(step, total_steps)
     if metrics.tb_logger is not None:
         metrics.tb_logger.flush()
     dist.destroy_process_group()
