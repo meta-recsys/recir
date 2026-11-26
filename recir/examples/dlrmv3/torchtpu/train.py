@@ -8,8 +8,10 @@
 
 One process per TPU device, as on GPU: each process runs the dense model on its
 own device and gradients are averaged with explicit collectives. The embedding
-tables stay in torchrec on the host (``recir.embedding`` cpu backend, row-wise
-sharded over the processes with gloo) behind a graph break.
+tables sit behind a graph break: by default in torchrec on the host
+(``recir.embedding`` cpu backend, row-wise sharded over the processes with
+gloo), or with ``--embedding_backend sparsecore`` on the TPUs' SparseCores
+(``recir.embedding.torchtpu_sparsecore``).
 
     python -m recir.examples.dlrmv3.torchtpu.train --dataset debug --num_train_batches 10
 
@@ -44,6 +46,7 @@ from recir.backends.torchtpu import TorchTPUBackend
 from recir.distributed.parallel_mode import DataParallel
 from recir.embedding.backend import EmbeddingBackend
 from recir.embedding.cpu import CPUSparseArchDispatcher
+from recir.embedding.torchtpu_sparsecore import TorchTPUSparseCoreBackend
 from recir.examples.dlrmv3.common.config import DLRMv3TrainConfig, parse_config
 from recir.examples.dlrmv3.common.data import (
     make_dataset,
@@ -156,7 +159,11 @@ class DLRMv3TorchTPUModule(RecirCompiledModuleBase):
 
 class TorchTPUTrainer:
     def __init__(
-        self, cfg: DLRMv3TrainConfig, world: int, device: torch.device
+        self,
+        cfg: DLRMv3TrainConfig,
+        world: int,
+        device: torch.device,
+        embedding_backend: str = "cpu",
     ) -> None:
         self.cfg = cfg
         self.world = world
@@ -165,7 +172,15 @@ class TorchTPUTrainer:
         self.tables = cfg.embedding_tables()
         self.layout = cfg.layout(self.hstu)
         self.task_names = [t.task_name for t in self.hstu.multitask_configs]
-        self.backend: EmbeddingBackend = build_embedding_backend("cpu", self.tables)
+        self.backend: EmbeddingBackend
+        # Where the backend keeps the tables: torchrec on the host, or SparseCore.
+        self.table_device: torch.device
+        if embedding_backend == "sparsecore":
+            self.backend = TorchTPUSparseCoreBackend(EMBEDDING_COLLECTION_FQN)
+            self.table_device = device
+        else:
+            self.backend = build_embedding_backend("cpu", self.tables)
+            self.table_device = torch.device("cpu")
         set_dev_mode(True)
         self.module = DlrmV3TrainModule(
             self.hstu,
@@ -179,7 +194,7 @@ class TorchTPUTrainer:
             self.module,
             list(self.tables.values()),
             self.cfg.sparse_optimizer(),
-            torch.device("cpu"),
+            self.table_device,
             self.world,
         )
         assert isinstance(setup.model, DlrmV3TrainModule)
@@ -240,6 +255,9 @@ def _parse(
 ) -> Tuple[DLRMv3TrainConfig, argparse.Namespace]:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--nproc_per_node", type=int, default=8)
+    parser.add_argument(
+        "--embedding_backend", choices=("cpu", "sparsecore"), default="cpu"
+    )
     return parse_config(argv, parser)
 
 
@@ -261,7 +279,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     tpu_runtime.force_cpu_barrier()
     device = torch.device("tpu")
     torch.manual_seed(cfg.seed)
-    trainer = TorchTPUTrainer(cfg, world, device)
+    trainer = TorchTPUTrainer(cfg, world, device, args.embedding_backend)
 
     dataset = make_dataset(cfg.dataset, cfg.data_root, trainer.hstu, trainer.tables)
     collate = TokenBudgetCollate(trainer.layout, trainer.hstu, cfg.batch_size, 1)
@@ -283,6 +301,10 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     logger.info(
         "[rank %d] train step compiled in %.1fs", rank, time.perf_counter() - t0
     )
+    # The random dataset draws its batches from the global RNG, which setting up
+    # the embedding backend uses differently per backend; reseeding gives every
+    # backend the same training batches.
+    torch.manual_seed(cfg.seed)
     metrics = make_metrics(
         trainer.hstu,
         trainer.layout.rows(cfg.batch_size) * trainer.layout.num_candidates,
