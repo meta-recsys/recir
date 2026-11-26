@@ -33,6 +33,7 @@ already pulled transitively via parallel_mode -> xla_lower.)
 """
 
 import logging
+import operator
 import os
 from dataclasses import dataclass, field
 from enum import Enum
@@ -42,20 +43,34 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 from recir.backends.inductor import InductorBackend
+from recir.backends.torchtpu import TorchTPUBackend
 from recir.compiler.compilation import (
     _compile_and_transform,
     _compile_graphs,
     compile_from_gm,
 )
-from recir.compiler.runtime import make_compiled_runner, sync_device_state_to_torch
+from recir.compiler.runtime import (
+    COMPILED_OBJECT_KEY,
+    make_compiled_runner,
+    sync_device_state_to_torch,
+)
 from recir.compiler.tracing import _GraphSpec, _trace_graphs, trace
-from recir.distributed.parallel_mode import GSPMDParallel, HybridParallel
+from recir.distributed.parallel_mode import (
+    DataParallel,
+    GSPMDParallel,
+    HybridParallel,
+)
 from recir.distributed.sharding_plan import EmbeddingShardingPlan
+from recir.lowering.torchtpu_lower import (
+    _TorchTPUModule,
+    _uses_donated_static_compiler,
+)
 from recir.observability.compiles import entry_point
 from recir.pipeline import PipelineConfig
 from torch.distributed import ProcessGroup
 from torch.distributed.distributed_c10d import _get_default_group, _world
 from torch.distributed.tensor import DeviceMesh
+from torch.utils import _pytree as pytree
 from torchrec.distributed.model_parallel import DistributedModelParallel
 
 logger: logging.Logger = logging.getLogger(__name__)
@@ -592,3 +607,168 @@ def run_step_and_sync(
     )
     sync_device_state_to_torch(runner)
     return result
+
+
+def _make_fast_torchtpu_runner(compiled_obj: Any) -> Callable[..., Any]:
+    """Build a zero-pytree runner when gm lowers to one donated StaticCompiler call."""
+    if not _uses_donated_static_compiler():
+        return make_compiled_runner(compiled_obj)
+    gm: torch.fx.GraphModule = compiled_obj.gm
+    codegen = getattr(gm._graph, "_codegen", None)
+    pytree_info = getattr(codegen, "pytree_info", None)
+    out_spec = getattr(pytree_info, "out_spec", None)
+    if out_spec is None:
+        return make_compiled_runner(compiled_obj)
+
+    placeholders: List[torch.fx.Node] = []
+    sub_calls: List[torch.fx.Node] = []
+    getitem_map: Dict[torch.fx.Node, int] = {}
+    output_node: Optional[torch.fx.Node] = None
+    for node in gm.graph.nodes:
+        if node.op == "placeholder":
+            placeholders.append(node)
+        elif node.op == "call_module":
+            sub_calls.append(node)
+        elif (
+            node.op == "call_function"
+            and node.target is operator.getitem
+            and len(node.args) == 2
+            and isinstance(node.args[0], torch.fx.Node)
+            and isinstance(node.args[1], int)
+        ):
+            getitem_map[node] = node.args[1]
+        elif node.op == "output":
+            output_node = node
+        else:
+            return make_compiled_runner(compiled_obj)
+
+    if len(sub_calls) != 1 or output_node is None:
+        return make_compiled_runner(compiled_obj)
+    sub_call = sub_calls[0]
+    sub_mod = getattr(gm, str(sub_call.target), None)
+    if not isinstance(sub_mod, _TorchTPUModule):
+        return make_compiled_runner(compiled_obj)
+
+    placeholder_idx = {node: i for i, node in enumerate(placeholders)}
+    if not all(
+        isinstance(a, torch.fx.Node) and a in placeholder_idx for a in sub_call.args
+    ):
+        return make_compiled_runner(compiled_obj)
+    sub_input_indices = tuple(placeholder_idx[a] for a in sub_call.args)
+    sub_tag = str(sub_call.kwargs.get("tag", "subgraph"))
+
+    raw_out_leaves = output_node.args[0]
+    if not isinstance(raw_out_leaves, (list, tuple)):
+        return make_compiled_runner(compiled_obj)
+
+    sources: List[Tuple[bool, int]] = []
+    for leaf in raw_out_leaves:
+        if not isinstance(leaf, torch.fx.Node):
+            return make_compiled_runner(compiled_obj)
+        if leaf in getitem_map and leaf.args[0] is sub_call:
+            sources.append((True, getitem_map[leaf]))
+        elif leaf in placeholder_idx:
+            sources.append((False, placeholder_idx[leaf]))
+        else:
+            return make_compiled_runner(compiled_obj)
+
+    unflattened_idx = pytree.tree_unflatten(list(range(len(sources))), out_spec)
+    if not isinstance(unflattened_idx, tuple) or not unflattened_idx:
+        return make_compiled_runner(compiled_obj)
+    user_positions, user_out_spec = pytree.tree_flatten(unflattened_idx[0])
+    state_positions = pytree.tree_leaves(unflattened_idx[1:])
+    user_sources = tuple(sources[int(pos)] for pos in user_positions)
+    state_sources = tuple(sources[int(pos)] for pos in state_positions)
+
+    def _runner(*call_args: Any, **call_kwargs: Any) -> Any:
+        last_train_step = bool(call_kwargs.pop("last_train_step", False))
+        call_kwargs.pop("input_ready_event", None)
+        if not call_kwargs and all(
+            not isinstance(a, (dict, list, tuple)) for a in call_args
+        ):
+            user_inps = list(call_args)
+        else:
+            user_inps = pytree.arg_tree_leaves(*call_args, **call_kwargs)
+        sm = compiled_obj.state_manager
+        flat_inps = sm.prepare_inputs(
+            gm, compiled_obj.flat_state, user_inps, last_train_step
+        )
+        sub_args = [
+            t.to("tpu")
+            if isinstance(t, torch.Tensor) and t.device.type != "tpu"
+            else t
+            for t in (flat_inps[i] for i in sub_input_indices)
+        ]
+        with torch.no_grad():
+            raw_sub_out = sub_mod.run_tpu(sub_args, tag=sub_tag)
+        sub_out = (
+            raw_sub_out
+            if isinstance(raw_sub_out, (tuple, list))
+            else (raw_sub_out,)
+        )
+        updated_state = [
+            sub_out[idx] if from_sub else flat_inps[idx]
+            for from_sub, idx in state_sources
+        ]
+        sm.commit_step_state(
+            compiled_obj.flat_state, updated_state, last_train_step
+        )
+        user_leaves = [
+            sub_out[idx] if from_sub else flat_inps[idx]
+            for from_sub, idx in user_sources
+        ]
+        return pytree.tree_unflatten(user_leaves, user_out_spec)
+
+    _runner.__dict__[COMPILED_OBJECT_KEY] = compiled_obj
+    return _runner
+
+
+def compile_torchtpu_step(
+    model: nn.Module,
+    dense_opt: torch.optim.Optimizer,
+    trace_batch: Any,
+    *,
+    train_step_fn: Optional[Callable[..., Any]] = None,
+    flatten_batch: FlattenBatch,
+    device: torch.device,
+    world_size: int = 1,
+    rank: int = 0,
+    eval_step_fn: Optional[Callable[..., Any]] = None,
+) -> Any:
+    """Trace and compile train (and optional eval) steps via TorchTPUBackend."""
+    os.environ.setdefault("TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS", "0")
+    model_to_train = (
+        model.module if isinstance(model, DistributedModelParallel) else model
+    )
+    if world_size > 1 and dist.is_initialized():
+        mesh = build_default_pg_mesh(device.type, world_size, rank)
+    else:
+        mesh = DeviceMesh(
+            device.type, torch.arange(1), _init_backend=False, _rank=0
+        )
+
+    dp_mode = DataParallel(
+        "replicate",
+        num_ranks=world_size,
+        num_processes=world_size,
+        device_type=device.type,
+    )
+    dp_mode._device_mesh = mesh
+    dp_mode._process_mesh = mesh
+    out = compile_step(
+        train_step_fn or recir_train_step,
+        model_to_train,
+        (dense_opt,),
+        trace_batch,
+        parallel_mode=dp_mode,
+        backend=TorchTPUBackend(),
+        global_loss_denom=False,
+        flatten_batch=flatten_batch,
+        eval_step_fn=eval_step_fn,
+    )
+    if isinstance(out, tuple):
+        return tuple(
+            _make_fast_torchtpu_runner(r.__dict__[COMPILED_OBJECT_KEY])
+            for r in out
+        )
+    return _make_fast_torchtpu_runner(out.__dict__[COMPILED_OBJECT_KEY])

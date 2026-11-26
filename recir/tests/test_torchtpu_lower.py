@@ -103,7 +103,7 @@ class TorchTPULowerTest(unittest.TestCase):
         gm, (_, _, local, reduced, _) = _view_used_across_collective()
         self.assertEqual(_mark_collectives_spmd_safe(gm), 1)
         self.assertEqual(reduced.meta["custom"], {"spmd_safe": True})
-        self.assertNotIn("custom", local.meta)
+        self.assertEqual(local.meta["custom"], {"spmd_safe": True})
 
     def test_fingerprint_follows_structure_not_literal_values(self) -> None:
         def scale(factor: float) -> torch.fx.GraphModule:

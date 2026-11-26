@@ -16,7 +16,7 @@ process groups (torchrun), not the XLA fake-mesh path.
 
 from __future__ import annotations
 
-from typing import Any, TYPE_CHECKING
+from typing import Any, List, TYPE_CHECKING
 
 import torch
 from recir.backends.base import Backend
@@ -26,6 +26,21 @@ from torch import fx, nn
 
 if TYPE_CHECKING:
     from recir.distributed.parallel_mode import ParallelMode
+
+
+class _TorchTPUDeviceStateManager(DeviceStateManager):
+    """Rebind ``flat_state`` tensors to updated PJRT output buffers without ``copy_()``."""
+
+    def commit_step_state(
+        self,
+        flat_state: List[torch.Tensor],
+        updated_flat: List[Any],
+        last_train_step: bool,
+    ) -> None:
+        del last_train_step
+        for state_tensor, updated in zip(flat_state, updated_flat):
+            if isinstance(updated, torch.Tensor) and updated is not state_tensor:
+                state_tensor.data = updated.detach()
 
 
 class TorchTPUBackend(Backend):
@@ -52,7 +67,7 @@ class TorchTPUBackend(Backend):
         # back into the resident state tensors by index, matching recir's
         # state-as-output convention; per-subgraph device placement also happens
         # inside _TorchTPUModule.
-        return DeviceStateManager(torch.device("tpu"))
+        return _TorchTPUDeviceStateManager(torch.device("tpu"))
 
     def validate_with(self, parallel_mode: "ParallelMode") -> None:
         from recir.distributed.parallel_mode import (
