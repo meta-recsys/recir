@@ -34,7 +34,7 @@ from __future__ import annotations
 import itertools
 import operator
 import threading
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import recir.ops.marker  # noqa: F401 -- register recir::mark_boundary
 import torch
@@ -68,6 +68,9 @@ from torch.fx.node import has_side_effect
 # worth more than the bounded leak.
 _FWD_REGISTRY: Dict[int, Callable[..., Tuple[torch.Tensor, ...]]] = {}
 _BWD_REGISTRY: Dict[int, Callable[[torch.Tensor, int], None]] = {}
+# Callables that see a dispatch's outputs once a lookahead worker has computed
+# them, before the dispatch's graph break runs; keyed like the registries.
+_OUTPUT_OBSERVERS: Dict[int, List[Callable[[Sequence[torch.Tensor]], None]]] = {}
 
 # ``itertools.count().__next__`` is atomic under the GIL; combined with a
 # ``threading.Lock`` around registry writes this lets concurrent compiles
@@ -92,6 +95,42 @@ def _dispatch_bwd(grad: torch.Tensor, dispatch_id: int, grad_idx: int) -> torch.
     """Module-level backward dispatch target used by replaced markers."""
     _BWD_REGISTRY[dispatch_id](grad, grad_idx)
     return grad
+
+
+def dispatch_output_sources(
+    gm: fx.GraphModule, dispatch_id: int
+) -> Optional[List[Tuple[int, int]]]:
+    """Per input of dispatch ``dispatch_id`` in ``gm``, the (dispatch id, output
+    index) it reads; ``None`` unless every input is another dispatch's output."""
+    for node in gm.graph.nodes:
+        if node.target is not _dispatch_fwd or node.args[1] != dispatch_id:
+            continue
+        sources = []
+        for inp in node.args[0]:
+            if not isinstance(inp, fx.Node) or inp.target is not operator.getitem:
+                return None
+            src, index = inp.args
+            if not isinstance(src, fx.Node) or src.target is not _dispatch_fwd:
+                return None
+            sources.append((src.args[1], index))
+        return sources
+    return None
+
+
+def observe_dispatch_outputs(
+    dispatch_id: int, observer: Callable[[Sequence[torch.Tensor]], None]
+) -> None:
+    """Hand ``observer`` the outputs that ``notify_dispatch_outputs`` reports for
+    dispatch ``dispatch_id``."""
+    with _registry_lock:
+        _OUTPUT_OBSERVERS.setdefault(dispatch_id, []).append(observer)
+
+
+def notify_dispatch_outputs(dispatch_id: int, outputs: Sequence[torch.Tensor]) -> None:
+    """Report the flat outputs of dispatch ``dispatch_id`` for a coming step, so
+    that work depending on them can start before its graph break."""
+    for observer in _OUTPUT_OBSERVERS.get(dispatch_id, ()):
+        observer(outputs)
 
 
 # Pin the backward dispatch against eliminate_dead_code. Its result is consumed

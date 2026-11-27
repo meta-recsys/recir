@@ -60,6 +60,7 @@ import os
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import jax
+import numpy as np
 import recir.ops.seq_embedding_op  # noqa: F401  (defines torch.ops.recir.ringshift_embedding)
 
 # Registers the torchax op lowering (recir::ringshift_embedding -> ring-shift).
@@ -87,10 +88,12 @@ from recir.embedding.backend import (
 )
 from recir.embedding.sparsecore_rowwise import SparseCoreRowwiseTables, SparseCoreTable
 from recir.ops.eager_dispatch import (
+    dispatch_output_sources,
     install_graph_break_dispatch,
     mark_input,
     mark_output_with_bwd,
     mark_output_with_device_bwd,
+    observe_dispatch_outputs,
 )
 from recir.training.optim import OptimConfig, warmup_lr
 from recir.utils.meta_tensor_init import (
@@ -850,18 +853,23 @@ class TPUSparseArchDispatcher:
                 )
             sparsecore.expect_gradients(grad_indices)
 
+            def _host_ids(
+                values: torch.Tensor,
+                lengths: torch.Tensor,
+                sc_keys: List[str] = sc_keys,
+            ) -> Dict[str, np.ndarray]:
+                ids_2d, _ = _slice_per_feature(values, lengths, keys, seqlens)
+                return {k: ids_2d[keys.index(k)].reshape(-1).numpy() for k in sc_keys}
+
             def _sparsecore_fwd(
                 values: torch.Tensor,
                 lengths: torch.Tensor,
                 sparsecore: SparseCoreRowwiseTables = sparsecore,
-                sc_keys: List[str] = sc_keys,
+                host_ids: Callable[..., Dict[str, np.ndarray]] = _host_ids,
             ) -> List[Any]:
-                ids_2d, _ = _slice_per_feature(values, lengths, keys, seqlens)
-                return sparsecore.lookup(
-                    {k: ids_2d[keys.index(k)].reshape(-1).numpy() for k in sc_keys}
-                )
+                return sparsecore.lookup(host_ids(values, lengths))
 
-            install_graph_break_dispatch(
+            dispatch_id = install_graph_break_dispatch(
                 gm,
                 _sparsecore_prefix(oid),
                 _sparsecore_fwd,
@@ -870,7 +878,32 @@ class TPUSparseArchDispatcher:
                 bwd_fn=sparsecore.backward,
                 device_resident=True,
             )
+            self._prefetch_lookups(gm, dispatch_id, sparsecore, _host_ids)
         return gm, flat_state
+
+    @staticmethod
+    def _prefetch_lookups(
+        gm: torch.fx.GraphModule,
+        dispatch_id: Optional[int],
+        sparsecore: SparseCoreRowwiseTables,
+        host_ids: Callable[..., Dict[str, np.ndarray]],
+    ) -> None:
+        """Start the SparseCore lookup's host work as soon as a lookahead worker
+        produces its ids, when they are another graph break's outputs."""
+        sources = (
+            None if dispatch_id is None else dispatch_output_sources(gm, dispatch_id)
+        )
+        if sources is None or len(sources) != 2 or sources[0][0] != sources[1][0]:
+            logger.info(
+                "[in_graph] SparseCore lookup ids come from the graph; no prefetch"
+            )
+            return
+        (source, values), (_, lengths) = sources
+
+        def prefetch(outputs: Sequence[torch.Tensor]) -> None:
+            sparsecore.prefetch(host_ids(outputs[values], outputs[lengths]))
+
+        observe_dispatch_outputs(source, prefetch)
 
 
 def _seed_in_graph_tables_from_ec(old_ec: nn.Module, new_ec: "TPUSparseArch") -> None:

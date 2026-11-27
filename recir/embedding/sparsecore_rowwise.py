@@ -29,10 +29,10 @@ from __future__ import annotations
 import dataclasses
 import logging
 import os
+import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
-from itertools import repeat
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import jax
@@ -88,6 +88,63 @@ class _SubTable:
     rows: int
 
 
+@dataclass(frozen=True)
+class _ExchangeInputs:
+    """The backward's exchange layout, on device (see `_exchange_layout`)."""
+
+    dest: Dict[str, jax.Array]
+    send_rows: Dict[str, jax.Array]
+    fill: float
+
+
+@dataclass(frozen=True)
+class _HostInputs:
+    """A step's device inputs, built on the host from its ids."""
+
+    csr: Any
+    slots: Dict[str, jax.Array]
+    # Finished after the forward's inputs: only the backward reads it.
+    exchange: Future[_ExchangeInputs]
+    stats: Any
+
+
+def _same_arrays(a: Dict[str, np.ndarray], b: Dict[str, np.ndarray]) -> bool:
+    """Whether ``a`` and ``b`` view the same memory, feature by feature."""
+    return a.keys() == b.keys() and all(
+        a[f].ctypes.data == b[f].ctypes.data
+        and a[f].shape == b[f].shape
+        and a[f].strides == b[f].strides
+        and a[f].dtype == b[f].dtype
+        for f in a
+    )
+
+
+# Enough ids to catch a rewritten buffer; the whole array would cost ~1 ms per
+# million ids, on the very path the prefetch exists to keep clear.
+_EDGE_IDS = 64
+
+
+def _edge_ids(ids: Dict[str, np.ndarray]) -> Dict[str, Tuple[np.ndarray, np.ndarray]]:
+    return {f: (v[:_EDGE_IDS].copy(), v[-_EDGE_IDS:].copy()) for f, v in ids.items()}
+
+
+def _same_edge_ids(
+    edges: Dict[str, Tuple[np.ndarray, np.ndarray]], ids: Dict[str, np.ndarray]
+) -> bool:
+    """Whether ``ids`` still holds what it held when it was prefetched.
+
+    ``_same_arrays`` only says the memory is the same, so a producer that writes
+    the next step's ids into the buffer it already handed over would be served a
+    stale prefetch. Every producer allocates per step today; this keeps that from
+    turning into silently wrong embeddings if one stops.
+    """
+    return all(
+        np.array_equal(low, ids[f][:_EDGE_IDS])
+        and np.array_equal(high, ids[f][-_EDGE_IDS:])
+        for f, (low, high) in edges.items()
+    )
+
+
 def _round_up(x: int, m: int) -> int:
     return -(-x // m) * m
 
@@ -119,6 +176,48 @@ def _int32(a: np.ndarray) -> np.ndarray:
     return a.astype(np.int32) if a.dtype == np.int64 else a
 
 
+def _cumsum_mask(mask: np.ndarray) -> np.ndarray:
+    """``np.cumsum`` of a bool mask. numpy accumulates a bool array holding the
+    GIL, which stalls the trainer's other threads; an int64 one releases it."""
+    return mask.astype(np.int64).cumsum()
+
+
+def _take_rows(table: jax.Array, index: jax.Array) -> jax.Array:
+    """``table[index]`` for a 1-D index. libtpu offloads a row gather to SparseCore
+    only when the index count is a multiple of 8, and only in a program that does not
+    also run a SparseCore lookup; otherwise the gather runs on the TensorCore, ~13x
+    slower at a device's ~320k positions. Pad here, then slice."""
+    n = index.shape[0]
+    pad = -n % 8
+    if not pad:
+        return table[index]
+    return table[jnp.pad(index, (0, pad))][:n]
+
+
+def _unique_inverse(values: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """``np.unique(values, return_inverse=True)`` for non-negative integers, as
+    one sort of (value, position) keys packed into int64 instead of an argsort
+    and a gather: ~30% less CPU at a device's ~320k ids."""
+    n = values.size
+    bits = max((n - 1).bit_length(), 1)
+    if (
+        n == 0
+        or values.dtype.kind not in "iu"
+        or int(values.min()) < 0
+        or int(values.max()) >> (63 - bits)
+    ):
+        return np.unique(values, return_inverse=True)
+    keys = (values.astype(np.int64, copy=False) << bits) | np.arange(n, dtype=np.int64)
+    keys.sort()
+    sorted_values = keys >> bits
+    first = np.empty(n, bool)
+    first[0] = True
+    np.not_equal(sorted_values[1:], sorted_values[:-1], out=first[1:])
+    inverse = np.empty(n, np.int64)
+    inverse[keys & ((1 << bits) - 1)] = _cumsum_mask(first) - 1
+    return sorted_values[first].astype(values.dtype, copy=False), inverse
+
+
 def _device_inputs(
     ids: np.ndarray,
     d: int,
@@ -136,11 +235,17 @@ def _device_inputs(
     and samples come out increasing.
     """
     per_sc = padded // num_sc
-    sorted_uniq, inv = np.unique(ids, return_inverse=True)
-    k = np.arange(_round_up(sorted_uniq.size, num_sc)).reshape(-1, num_sc).T.ravel()
-    k = k[k < sorted_uniq.size]
-    uniq, samples = sorted_uniq[k], (k % num_sc) * per_sc + k // num_sc
-    slots[d] = (inv % num_sc) * per_sc + inv // num_sc
+    sorted_uniq, inv = _unique_inverse(ids)
+    spread = [sorted_uniq[c::num_sc] for c in range(num_sc)]
+    uniq = np.concatenate(spread)
+    samples = np.concatenate(
+        [np.arange(c * per_sc, c * per_sc + s.size) for c, s in enumerate(spread)]
+    )
+    if num_sc & (num_sc - 1) == 0:
+        # Bit ops instead of int64 % and //, which take twice as long.
+        slots[d] = (inv & (num_sc - 1)) * per_sc + (inv >> (num_sc.bit_length() - 1))
+    else:
+        slots[d] = (inv % num_sc) * per_sc + inv // num_sc
     out = []
     for sub in subs:
         inside = (uniq >= sub.start) & (uniq < sub.start + sub.rows)
@@ -167,14 +272,14 @@ def _exchange_layout(
     """
     shard_size, rotation, offset = layout
     shards, per_device = world * num_sc, shard_size * num_sc
-    cands, ranks = [], []
+    insides, cands = [], []
     for sorted_uniq, _, _, sub in parts:
         inside = (sorted_uniq >= sub.start) & (sorted_uniq < sub.start + sub.rows)
+        insides.append(inside)
         cands.append(sorted_uniq[inside] - sub.start)
-        ranks.append(np.where(inside, np.cumsum(inside) - 1, -1))
     ids = np.concatenate(cands)
     phys = ((ids % shards + rotation) % shards) * shard_size + ids // shards + offset
-    rows, row_of = np.unique(phys, return_inverse=True)
+    rows, row_of = _unique_inverse(phys)
     owner = rows // per_device
     counts = np.bincount(owner, minlength=world)
     fill = float(counts.max(initial=0)) / cap
@@ -189,10 +294,12 @@ def _exchange_layout(
     slot_of_row = owner * cap + j
     dest = np.full(sum(p[2] for p in parts), world * cap, np.int32)
     pos, cand = 0, 0
-    for (_, inv, padded, _), c, rank in zip(parts, cands, ranks):
-        r = rank[inv]
-        hit = np.flatnonzero(r >= 0)
-        dest[pos + hit] = slot_of_row[row_of[cand + r[hit]]]
+    for (sorted_uniq, inv, padded, _), inside, c in zip(parts, insides, cands):
+        # Each unique id's slot, then one gather per position: cheaper than
+        # composing the maps per position.
+        slot_of_id = np.full(sorted_uniq.size, world * cap, np.int32)
+        slot_of_id[inside] = slot_of_row[row_of[cand : cand + c.size]]
+        dest[pos : pos + inv.size] = slot_of_id[inv]
         pos, cand = pos + padded, cand + c.size
     return dest, send_rows, fill
 
@@ -292,7 +399,20 @@ class SparseCoreRowwiseTables:
         self._rounding_counter: int = 0
         self._layout: Dict[str, Tuple[int, int, int]] = {}
         self._host_blocks: Dict[Tuple[str, str], np.ndarray] = {}
-        self._pool = ThreadPoolExecutor(self._local_devices)
+        self._pool = ThreadPoolExecutor(2 * self._local_devices)
+        # Host inputs started by `prefetch`, with the ids they are built from;
+        # `prefetch` runs on another thread than `lookup`.
+        self._prefetcher: Optional[ThreadPoolExecutor] = None
+        self._prefetched: List[
+            Tuple[
+                Dict[str, np.ndarray],
+                Dict[str, Tuple[np.ndarray, np.ndarray]],
+                Future[_HostInputs],
+            ]
+        ] = []
+        self._prefetch_lock = threading.Lock()
+        # Collects the exchange layouts the pool builds for the backward.
+        self._collector: Optional[ThreadPoolExecutor] = None
         self.ev_w: Dict[str, Any] = {}
         self.momentum: Dict[str, jax.Array] = {}
 
@@ -479,7 +599,7 @@ class SparseCoreRowwiseTables:
                 out_shardings=fmt,
             )(ev, jnp.asarray(phys, jnp.int32), jnp.asarray(values))
 
-    def _program(self, sizes: Dict[str, Tuple[int, int]]) -> Any:
+    def _program(self, sizes: Dict[str, Tuple[int, int]]) -> Any:  # noqa: C901
         """``sizes``: per feature, (positions, positions padded to JTE's per-device multiple)."""
         key = tuple(sorted(sizes.items()))
         if key in self._programs:
@@ -505,29 +625,48 @@ class SparseCoreRowwiseTables:
                 ts.setting_in_stack.row_offset_in_shard,
             )
 
-        def fwd_local(
-            csr: Any, ev_w: Any, slots: Dict[str, jax.Array]
-        ) -> Dict[str, jax.Array]:
+        def fwd_local(csr: Any, ev_w: Any) -> Dict[str, jax.Array]:
             acts = jte.tpu_sparse_dense_matmul(csr, ev_w, feature_specs=specs, **kw)
             out: Dict[str, jax.Array] = {}
             for f, subs in sub_of.items():
                 total = acts[subs[0]]
                 for s in subs[1:]:
                     total = total + acts[s]
-                out[f] = total[slots[f]]
+                out[f] = total
             return out
 
+        def expand_local(
+            unique: Dict[str, jax.Array], slots: Dict[str, jax.Array]
+        ) -> Dict[str, jax.Array]:
+            return {f: _take_rows(u, slots[f]) for f, u in unique.items()}
+
         batch = P(axis)
-        fwd = jax.jit(
+        lookup_unique = jax.jit(
             jax.shard_map(
                 fwd_local,
                 mesh=mesh,
-                in_specs=(batch, batch, batch),
+                in_specs=(batch, batch),
+                out_specs=batch,
+                check_vma=False,
+            )
+        )
+        # Its own program, so that libtpu offloads the gather (see _take_rows).
+        expand = jax.jit(
+            jax.shard_map(
+                expand_local,
+                mesh=mesh,
+                in_specs=(batch, batch),
                 out_specs=batch,
                 check_vma=False,
             ),
             out_shardings=NamedSharding(mesh, P(axis, None)),
         )
+
+        def fwd(
+            csr: Any, ev_w: Any, slots: Dict[str, jax.Array]
+        ) -> Dict[str, jax.Array]:
+            return expand(lookup_unique(csr, ev_w), slots)
+
         stack_features = {
             stack: [
                 f
@@ -574,7 +713,8 @@ class SparseCoreRowwiseTables:
             rounding_key: Optional[jax.Array],
         ) -> Any:
             cap, dim = caps[stack], g.shape[1]
-            send = jnp.zeros((world * cap + 1, dim), jnp.float32).at[dest].add(g)[:-1]
+            send = jnp.zeros((world * cap + 1, dim), jnp.float32)
+            send = send.at[dest].add(g, indices_are_sorted=True)[:-1]
             recv = jax.lax.all_to_all(
                 send.astype(transfer).reshape(world, cap, dim), axis, 0, 0
             )
@@ -598,9 +738,31 @@ class SparseCoreRowwiseTables:
             if self._tables[sub.table].fp16
         }
 
+        def sort_local(
+            grads: Dict[str, jax.Array], dest: Dict[str, jax.Array]
+        ) -> Tuple[Dict[str, jax.Array], Dict[str, jax.Array]]:
+            """Each stack's position gradients and send-buffer slots, ordered by
+            slot. A sorted scatter-add takes half the time of an unsorted one, and
+            the stable sort keeps the order in which rows sharing a slot are summed."""
+            sorted_grads, sorted_dest = {}, {}
+            for stack in stacks:
+                g = jnp.concatenate(
+                    [
+                        jnp.pad(
+                            grads[f].astype(jnp.float32),
+                            ((0, sizes[f][1] - sizes[f][0]), (0, 0)),
+                        )
+                        for f in stack_features[stack]
+                    ]
+                )
+                order = jnp.argsort(dest[stack], stable=True).astype(jnp.int32)
+                sorted_grads[stack] = _take_rows(g, order)
+                sorted_dest[stack] = dest[stack][order]
+            return sorted_grads, sorted_dest
+
         def exchange_local(
-            grads: Dict[str, jax.Array],
-            dest: Dict[str, jax.Array],
+            sorted_grads: Dict[str, jax.Array],
+            sorted_dest: Dict[str, jax.Array],
             send_rows: Dict[str, jax.Array],
             lr: jax.Array,
             counter: jax.Array,
@@ -615,19 +777,10 @@ class SparseCoreRowwiseTables:
                     if stack in fp16_stacks
                     else None
                 )
-                g = self._grad_scale * jnp.concatenate(
-                    [
-                        jnp.pad(
-                            grads[f].astype(jnp.float32),
-                            ((0, sizes[f][1] - sizes[f][0]), (0, 0)),
-                        )
-                        for f in stack_features[stack]
-                    ]
-                )
                 w, m = exchange_update(
                     stack,
-                    g,
-                    dest[stack],
+                    self._grad_scale * sorted_grads[stack],
+                    sorted_dest[stack],
                     send_rows[stack],
                     lr,
                     ev_w[stack].table,
@@ -637,7 +790,17 @@ class SparseCoreRowwiseTables:
                 new_w[stack], new_m[stack] = ev_w[stack]._replace(table=w), m
             return new_w, new_m
 
-        bwd = jax.jit(
+        # Its own program, so that libtpu offloads the gather (see _take_rows).
+        sort = jax.jit(
+            jax.shard_map(
+                sort_local,
+                mesh=mesh,
+                in_specs=(batch, batch),
+                out_specs=batch,
+                check_vma=False,
+            )
+        )
+        exchange = jax.jit(
             jax.shard_map(
                 exchange_local,
                 mesh=mesh,
@@ -648,6 +811,12 @@ class SparseCoreRowwiseTables:
             donate_argnums=(5, 6),
             out_shardings=_keep_formats((self.ev_w, self.momentum)),
         )
+
+        def bwd(
+            grads: Dict[str, jax.Array], dest: Dict[str, jax.Array], *rest: Any
+        ) -> Any:
+            return exchange(*sort(grads, dest), *rest)
+
         self._programs[key] = (specs, fwd, bwd, (stack_features, caps, layout))
         return self._programs[key]
 
@@ -657,6 +826,57 @@ class SparseCoreRowwiseTables:
         shape = (local.shape[0] * self._hosts,) + local.shape[1:] if local.ndim else ()
         return jax.make_array_from_process_local_data(sharding, local, shape)
 
+    def _sizes(self, host_ids: Dict[str, np.ndarray]) -> Dict[str, Tuple[int, int]]:
+        # JTE splits each device's batch evenly over its SparseCores.
+        sizes = {}
+        for f, a in host_ids.items():
+            n = a.size // self._local_devices
+            sizes[f] = (n, -(-n // self._num_sc) * self._num_sc)
+        return sizes
+
+    def prefetch(self, host_ids: Dict[str, np.ndarray]) -> None:
+        """Start building ``lookup``'s host inputs for ``host_ids`` on a worker;
+        the ``lookup`` of the same arrays then waits for them rather than
+        building them itself. Does nothing for sizes no lookup has seen yet.
+        """
+        sizes = self._sizes(host_ids)
+        program = self._programs.get(tuple(sorted(sizes.items())))
+        if program is None:
+            return
+        specs, _, _, exchange = program
+        with self._prefetch_lock:
+            if self._prefetcher is None:
+                self._prefetcher = ThreadPoolExecutor(
+                    1, thread_name_prefix="sparsecore-prefetch"
+                )
+            future = self._prefetcher.submit(
+                self._host_inputs, host_ids, sizes, specs, exchange
+            )
+            # An entry holds its ids, so their memory cannot be reused by other
+            # ids while it can still match a lookup. Two cover the step being
+            # looked up and the next one.
+            self._prefetched = [
+                *self._prefetched[-1:],
+                (host_ids, _edge_ids(host_ids), future),
+            ]
+
+    def _take_prefetched(
+        self, host_ids: Dict[str, np.ndarray]
+    ) -> Optional[_HostInputs]:
+        with self._prefetch_lock:
+            match = next(
+                (
+                    i
+                    for i, (ids, edges, _) in enumerate(self._prefetched)
+                    if _same_arrays(ids, host_ids) and _same_edge_ids(edges, host_ids)
+                ),
+                None,
+            )
+            if match is None:
+                return None
+            _, _, future = self._prefetched.pop(match)
+        return future.result()
+
     def lookup(self, host_ids: Dict[str, np.ndarray]) -> List[jax.Array]:
         """Forward. ``host_ids``: this host's ids per feature, flat in local-device order.
 
@@ -665,89 +885,14 @@ class SparseCoreRowwiseTables:
         """
         if not self.ev_w:
             raise RuntimeError("SparseCoreRowwiseTables.initialize() must run first")
-        # JTE splits each device's batch evenly over its SparseCores.
-        sizes = {}
-        for f, a in host_ids.items():
-            n = a.size // self._local_devices
-            sizes[f] = (n, -(-n // self._num_sc) * self._num_sc)
+        sizes = self._sizes(host_ids)
         specs, fwd, _, exchange = self._program(sizes)
-        indices: Dict[str, np.ndarray] = {}
-        values: Dict[str, np.ndarray] = {}
-        shapes: Dict[str, np.ndarray] = {}
-        slots: Dict[str, np.ndarray] = {}
-        per_device: Dict[str, List[Any]] = {}
-        # Per-device work runs in worker threads writing into preallocated arrays:
-        # the main thread shares the GIL with the input pipeline's producer thread.
-        local = self._local_devices
-        for f, ids in host_ids.items():
-            n, padded = sizes[f]
-            subs = self._subs[self._feature_table[f]]
-            ids = ids.astype(np.int64, copy=False).reshape(local, n)
-            slots[f] = np.empty((local, n), np.int32)
-            per_device[f] = list(
-                self._pool.map(
-                    _device_inputs,
-                    ids,
-                    range(local),
-                    repeat(padded),
-                    repeat(self._num_sc),
-                    repeat(subs),
-                    repeat(slots[f]),
-                )
-            )
-            slots[f] = slots[f].reshape(-1)
-            for i, sub in enumerate(subs):
-                name = f"{f}@{sub.stack}"
-                rows = [p[0][i][0] for p in per_device[f]]
-                indices[name] = np.zeros((sum(r.size for r in rows), 2), np.int64)
-                np.concatenate(rows, out=indices[name][:, 0])
-                values[name] = np.concatenate([p[0][i][1] for p in per_device[f]])
-                shapes[name] = np.array([local * padded, 1], np.int64)
-        dest: Dict[str, np.ndarray] = {}
-        send_rows: Dict[str, np.ndarray] = {}
-        stack_features, caps, layout = exchange
-        for stack, features in stack_features.items():
-            sub = {
-                f: next(
-                    x for x in self._subs[self._feature_table[f]] if x.stack == stack
-                )
-                for f in features
-            }
-            parts = [
-                [
-                    (per_device[f][d][1], per_device[f][d][2], sizes[f][1], sub[f])
-                    for f in features
-                ]
-                for d in range(local)
-            ]
-            out = list(
-                self._pool.map(
-                    _exchange_layout,
-                    parts,
-                    repeat(layout[stack]),
-                    repeat(self._world),
-                    repeat(self._num_sc),
-                    repeat(caps[stack]),
-                )
-            )
-            dest[stack] = np.concatenate([o[0] for o in out])
-            send_rows[stack] = np.concatenate([o[1].reshape(-1) for o in out])
-            self._exchange_fill = max(self._exchange_fill, max(o[2] for o in out))
-        csr, stats = (
-            self._jte_embedding.preprocess_sparse_dense_matmul_input_from_sparse_tensor(
-                indices=indices,
-                values=values,
-                dense_shapes=shapes,
-                feature_specs=specs,
-                local_device_count=self._local_devices,
-                global_device_count=self._world,
-                num_sc_per_device=self._num_sc,
-                sharding_strategy="MOD",
-                allow_id_dropping=False,
-            )
-        )
+        inputs = self._take_prefetched(host_ids)
+        if inputs is None:
+            inputs = self._host_inputs(host_ids, sizes, specs, exchange)
         self._lookups += 1
         if self._lookups <= 3 or self._lookups % 100 == 0:
+            stats = inputs.stats
             logger.info(
                 "[sparsecore] lookup %d: max ids / unique ids per partition %s (limit %d); max exchange fill %.3f",
                 self._lookups,
@@ -761,17 +906,122 @@ class SparseCoreRowwiseTables:
                 self._limits[0],
                 self._exchange_fill,
             )
-        # JTE's inputs are int32; under JAX_ENABLE_X64 numpy integers default to int64.
-        csr = jax.tree.map(lambda x: self._global(_int32(np.asarray(x))), csr)
-        slots_g = {f: self._global(v) for f, v in slots.items()}
-        self._step_inputs = (
-            sizes,
-            jax.tree.map(self._global, dest),
-            jax.tree.map(self._global, send_rows),
-        )
+        self._step_inputs = (sizes, inputs.exchange)
         self._pending = {}
-        acts = fwd(csr, self.ev_w, slots_g)
+        acts = fwd(inputs.csr, self.ev_w, inputs.slots)
         return [acts[f] for f in host_ids]
+
+    def _host_inputs(
+        self,
+        host_ids: Dict[str, np.ndarray],
+        sizes: Dict[str, Tuple[int, int]],
+        specs: Any,
+        exchange: Any,
+    ) -> _HostInputs:
+        """The CSR input, slots and exchange layout of ``host_ids``, on device."""
+        indices: Dict[str, np.ndarray] = {}
+        values: Dict[str, np.ndarray] = {}
+        shapes: Dict[str, np.ndarray] = {}
+        slots: Dict[str, np.ndarray] = {}
+        per_device: Dict[str, List[Any]] = {}
+        # Per-device work runs in worker threads writing into preallocated arrays:
+        # the main thread shares the GIL with the input pipeline's producer thread.
+        # Each stage is a single map over all (feature or stack, device) jobs, so
+        # no thread idles at a feature boundary.
+        local = self._local_devices
+        jobs = []
+        for f, ids in host_ids.items():
+            n, padded = sizes[f]
+            subs = self._subs[self._feature_table[f]]
+            ids = ids.astype(np.int64, copy=False).reshape(local, n)
+            slots[f] = np.empty((local, n), np.int32)
+            jobs += [
+                (ids[d], d, padded, self._num_sc, subs, slots[f]) for d in range(local)
+            ]
+        done = self._pool.map(_device_inputs, *zip(*jobs))
+        for f in host_ids:
+            padded = sizes[f][1]
+            subs = self._subs[self._feature_table[f]]
+            per_device[f] = [next(done) for _ in range(local)]
+            slots[f] = slots[f].reshape(-1)
+            for i, sub in enumerate(subs):
+                name = f"{f}@{sub.stack}"
+                rows = [p[0][i][0] for p in per_device[f]]
+                indices[name] = np.zeros((sum(r.size for r in rows), 2), np.int64)
+                np.concatenate(rows, out=indices[name][:, 0])
+                values[name] = np.concatenate([p[0][i][1] for p in per_device[f]])
+                shapes[name] = np.array([local * padded, 1], np.int64)
+        stack_features, caps, layout = exchange
+        jobs = []
+        for stack, features in stack_features.items():
+            sub = {
+                f: next(
+                    x for x in self._subs[self._feature_table[f]] if x.stack == stack
+                )
+                for f in features
+            }
+            jobs += [
+                (
+                    [
+                        (per_device[f][d][1], per_device[f][d][2], sizes[f][1], sub[f])
+                        for f in features
+                    ],
+                    layout[stack],
+                    self._world,
+                    self._num_sc,
+                    caps[stack],
+                )
+                for d in range(local)
+            ]
+        # The exchange layout is the backward's: it is built while this thread
+        # builds the forward's CSR input.
+        layouts = [self._pool.submit(_exchange_layout, *job) for job in jobs]
+        with self._prefetch_lock:
+            if self._collector is None:
+                self._collector = ThreadPoolExecutor(
+                    1, thread_name_prefix="sparsecore-exchange"
+                )
+            exchange_inputs = self._collector.submit(
+                self._exchange_inputs, list(stack_features), layouts
+            )
+        csr, stats = (
+            self._jte_embedding.preprocess_sparse_dense_matmul_input_from_sparse_tensor(
+                indices=indices,
+                values=values,
+                dense_shapes=shapes,
+                feature_specs=specs,
+                local_device_count=self._local_devices,
+                global_device_count=self._world,
+                num_sc_per_device=self._num_sc,
+                sharding_strategy="MOD",
+                allow_id_dropping=False,
+            )
+        )
+        # JTE's inputs are int32; under JAX_ENABLE_X64 numpy integers default to int64.
+        return _HostInputs(
+            csr=jax.tree.map(lambda x: self._global(_int32(np.asarray(x))), csr),
+            slots={f: self._global(v) for f, v in slots.items()},
+            exchange=exchange_inputs,
+            stats=stats,
+        )
+
+    def _exchange_inputs(
+        self,
+        stacks: List[str],
+        layouts: List[Future[Tuple[np.ndarray, np.ndarray, float]]],
+    ) -> _ExchangeInputs:
+        """Each stack's per-device exchange layouts (stack-major, as submitted),
+        concatenated and put on device."""
+        local = self._local_devices
+        dest, send_rows, fill = {}, {}, 0.0
+        for i, stack in enumerate(stacks):
+            out = [f.result() for f in layouts[i * local : (i + 1) * local]]
+            dest[stack] = self._global(np.concatenate([o[0] for o in out]))
+            send_rows[stack] = self._global(
+                np.concatenate([o[1].reshape(-1) for o in out])
+            )
+            fill = max(fill, max(o[2] for o in out))
+        return _ExchangeInputs(dest=dest, send_rows=send_rows, fill=fill)
 
     def expect_gradients(self, indices: Sequence[int]) -> None:
         """The lookup outputs (``lookup`` order) the step delivers gradients for; an
@@ -790,12 +1040,19 @@ class SparseCoreRowwiseTables:
         )
         if not expected <= set(self._pending):
             return
-        self._apply(self._pending)
-        self._pending = {}
-        self._step_inputs = None
+        try:
+            # The exchange layout is built on a pool thread, so its overflow
+            # surfaces here rather than pre-flight; leaving the step's state
+            # behind would fold the next step's gradients into this one's.
+            self._apply(self._pending)
+        finally:
+            self._pending = {}
+            self._step_inputs = None
 
     def _apply(self, pending: Dict[int, Any]) -> None:
-        sizes, dest_g, send_rows_g = self._step_inputs
+        sizes, exchange_future = self._step_inputs
+        exchange = exchange_future.result()
+        self._exchange_fill = max(self._exchange_fill, exchange.fill)
         grads = {}
         for i, (f, (n, _)) in enumerate(sizes.items()):
             grad = pending.get(i)
@@ -832,7 +1089,13 @@ class SparseCoreRowwiseTables:
         counter = jnp.int32(self._rounding_counter)
         self._rounding_counter = (self._rounding_counter + 1) % (2**31)
         self.ev_w, self.momentum = bwd(
-            grads, dest_g, send_rows_g, lr, counter, self.ev_w, self.momentum
+            grads,
+            exchange.dest,
+            exchange.send_rows,
+            lr,
+            counter,
+            self.ev_w,
+            self.momentum,
         )
 
     @property
