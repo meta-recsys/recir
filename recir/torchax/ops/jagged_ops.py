@@ -69,7 +69,7 @@ def _jax_jagged_to_padded_dense_impl(
     )
 
 
-def _jax_dense_to_jagged_forward_impl(
+def _jax_dense_to_jagged_scatter_impl(
     dense: Any,
     offsets: Any,
     total_L: Any = None,
@@ -92,6 +92,66 @@ def _jax_dense_to_jagged_forward_impl(
         jnp.zeros((n,) + feature, dtype=dense.dtype),
         (seq_offsets[b],) + zeros_tail,
     )[:total_L]
+
+
+@jax.custom_jvp
+def _positive_zero(x: Any) -> Any:
+    return jnp.where(x == 0, jnp.zeros_like(x), x)
+
+
+@_positive_zero.defjvp
+def _positive_zero_jvp(primals: tuple[Any], tangents: tuple[Any]) -> tuple[Any, Any]:
+    return _positive_zero(primals[0]), tangents[0]
+
+
+def _jax_dense_to_jagged_gather_impl(
+    dense: Any, offsets: Any, total_L: Any = None
+) -> Any:
+    """Gather the represented prefix of each sequence into packed rows."""
+    seq_offsets = offsets[0]
+    b, n = dense.shape[:2]
+    if total_L is None:
+        total_L = b * n
+    if total_L == 0 or b == 0 or n == 0:
+        return jnp.zeros((total_L, *dense.shape[2:]), dtype=dense.dtype)
+
+    def gather() -> Any:
+        positions = jnp.arange(total_L, dtype=jnp.int32)
+        groups = jnp.minimum(_segment_id_by_cumsum(seq_offsets[1:-1], total_L), b - 1)
+        starts = _segment_broadcast(seq_offsets[:-1], seq_offsets[:-1], total_L)
+        local = positions - starts
+        valid = (positions < seq_offsets[-1]) & (local < n)
+        indices = jnp.clip(groups * n + local, 0, b * n - 1)
+        flat = dense.reshape((b * n, *dense.shape[2:]))
+        packed = os.environ.get("RECIR_PACKED_JAGGED_INT64", "0")
+        if packed not in ("0", "1"):
+            raise ValueError(f"invalid RECIR_PACKED_JAGGED_INT64: {packed!r}")
+        if packed == "1" and dense.dtype in (jnp.int64, jnp.uint64):
+            words = jax.lax.bitcast_convert_type(flat, jnp.uint32)
+            result = jax.lax.bitcast_convert_type(words[indices], dense.dtype)
+        else:
+            result = flat[indices]
+        result = jnp.where(_bcast_mask(valid, result.ndim), result, 0)
+        return result
+
+    lengths = jnp.diff(seq_offsets)
+    fits = (seq_offsets[0] == 0) & jnp.all(lengths >= 0) & (seq_offsets[-1] <= total_L)
+    return jax.lax.cond(
+        fits,
+        gather,
+        lambda: _jax_dense_to_jagged_scatter_impl(dense, offsets, total_L),
+    )
+
+
+def _jax_dense_to_jagged_forward_impl(
+    dense: Any, offsets: Any, total_L: Any = None
+) -> Any:
+    gather = os.environ.get("RECIR_DENSE_TO_JAGGED_GATHER", "0")
+    if gather not in ("0", "1"):
+        raise ValueError(f"invalid RECIR_DENSE_TO_JAGGED_GATHER: {gather!r}")
+    if gather == "1":
+        return _jax_dense_to_jagged_gather_impl(dense, offsets, total_L)
+    return _jax_dense_to_jagged_scatter_impl(dense, offsets, total_L)
 
 
 @op(torch.ops.recir.dense_to_jagged.default)  # pyre-ignore[56]
@@ -363,14 +423,32 @@ def _recir_concat_2d_jagged(
     offsets_left: Any,
     values_right: Any,
     offsets_right: Any,
+    output_size: int | None = None,
 ) -> Any:
     """recir::concat_2d_jagged lowering: per-sample interleave inside shard_map."""
-    out_total = values_left.shape[0] + values_right.shape[0]  # static
+    resolved_output_size: int = (
+        values_left.shape[0] + values_right.shape[0]
+        if output_size is None
+        else output_size
+    )
+    return _recir_concat_2d_jagged_with_output_size(
+        values_left, offsets_left, values_right, offsets_right, resolved_output_size
+    )
+
+
+def _recir_concat_2d_jagged_with_output_size(
+    values_left: Any,
+    offsets_left: Any,
+    values_right: Any,
+    offsets_right: Any,
+    output_size: int,
+) -> Any:
+    """Lower concat with independent physical input and output capacities."""
 
     world_size = len(jax.devices())
     if world_size <= 1:
         return _jax_concat_2d_jagged(
-            values_left, offsets_left, values_right, offsets_right, out_total
+            values_left, offsets_left, values_right, offsets_right, output_size
         )
 
     lengths_left = offsets_left[1:] - offsets_left[:-1]
@@ -381,7 +459,10 @@ def _recir_concat_2d_jagged(
         f"concat totals ({total_left},{total_right}) must be divisible by "
         f"world_size={world_size}"
     )
-    local_out = (total_left + total_right) // world_size
+    assert output_size % world_size == 0, (
+        f"concat output size {output_size} must be divisible by world_size={world_size}"
+    )
+    local_out = output_size // world_size
     mesh = Mesh(jax.devices(), (_DP_AXIS,))
 
     def _per_device(
